@@ -9,12 +9,25 @@
 // live to the exit by an opacity fallback, recorded as a pin gap at the
 // order-21 close. Host-free, so the interpreter equivalence gate checks it
 // against `node`.
-import std::io::print;
+//
+// The three `// witness:` lines are `corpus.rs`'s
+// `every_declared_witness_is_in_its_golden` check of the paragraph above: the
+// teardown at the declaration, the exit-code capture, and — the reason the
+// negative form exists at all — the absence of any `finally`, which no positive
+// substring can state.
+// witness: const guard = [ "teardown" ]; $b(guard); console.log("body");
+// witness: $a = 7; process.exit($a);
+// witness-absent: finally
 import std::drop::Drop;
+import std::io::print;
 
-resource struct Guard { tag: str }
+[resource] struct Guard {
+	tag: str,
+}
 impl Guard with Drop {
-	fun drop(&mut self) { print(self.tag); }
+	fun drop(&mut self) {
+		print(self.tag);
+	}
 }
 
 fun main(): i32 {

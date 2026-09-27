@@ -31,11 +31,16 @@ pub struct Manifest {
     pub library: Option<Library>,
     pub project: Option<Project>,
     pub build: Option<Build>,
+    /// `[fmt]` — `vilan fmt`'s per-package knobs (E205).
+    pub fmt: Option<Fmt>,
     /// `[macro]` — expansion budgets (macro-engine.md §5): `fuel` (interpreter
     /// steps per macro run, default 1_000_000) and `depth` (expansion fixpoint
     /// rounds, default 16).
     #[serde(rename = "macro", default)]
     pub macro_: Option<MacroSection>,
+    /// `[lints]` — the opt-in warnings (E221): each key a lint, each value
+    /// `"allow"` (the default) or `"warn"`.
+    pub lints: Option<LintsSection>,
     /// `[entry.<name>]` — the package's build entries, each with its own
     /// platform. Empty for the classic single-entry form.
     #[serde(rename = "entry", default)]
@@ -53,8 +58,79 @@ pub struct Manifest {
 /// pinned against. `server` / `client` are here only so [`Manifest::validate`]
 /// can point their users at the replacement; they are not valid content.
 pub const KNOWN_SECTIONS: &[&str] = &[
-    "package", "library", "project", "build", "macro", "entry", "server", "client",
+    "package", "library", "project", "build", "fmt", "macro", "lints", "entry", "server", "client",
 ];
+
+/// The `[lints]` section as written (E221): the warnings a package asks for
+/// that the compiler does not raise by default. Every key is optional and
+/// means `"allow"` when absent.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LintsSection {
+    /// `internal_use` — warn at every use of an `[internal("reason")]` item
+    /// outside the module that declares it. The label on its own is only for
+    /// the editor (it hides, dims and explains); a package that wants the
+    /// terminal to say so too asks here.
+    pub internal_use: Option<LintLevel>,
+}
+
+/// What a lint does when it applies.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintLevel {
+    /// Nothing — the default for every lint.
+    #[default]
+    Allow,
+    /// A non-fatal warning at each site.
+    Warn,
+}
+
+/// The resolved `[lints]` of the ENTRY package (E221), every key defaulted —
+/// what the analysis carries (`Workspace::lints`, then `Program::lints`) so
+/// the pass that reads it needs no manifest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Lints {
+    pub internal_use: LintLevel,
+}
+
+impl Lints {
+    /// The section as written, every absent key at its default.
+    pub fn from_section(section: Option<&LintsSection>) -> Lints {
+        Lints {
+            internal_use: section
+                .and_then(|section| section.internal_use)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The `[fmt]` section: `vilan fmt`'s per-package knobs (E205, E215).
+///
+/// Still not a knob for CODE. The formatter has one canonical layout and a
+/// code-width knob would fork the shape of every file in every project. What
+/// belongs here is the pair that cannot be settled globally, and both are
+/// about PROSE: whether the formatter may rewrite the author's comments at
+/// all, and — once it may — how wide the author writes them.
+#[derive(Debug, Default, Deserialize)]
+pub struct Fmt {
+    /// Re-fill a paragraph of `//` / `///` lines to the comment width, the way
+    /// the printer already lays out code. Default OFF for one release (E205's
+    /// R8): rewrapping somebody's comments is the one thing the formatter does
+    /// that no token comparison can check, so it is asked for rather than
+    /// arriving with an upgrade.
+    #[serde(rename = "wrap_comments")]
+    pub wrap_comments: Option<bool>,
+    /// The column budget a comment paragraph is re-filled to (E215's R1).
+    /// Default: the code width, which is what E205 shipped and what a package
+    /// that says nothing keeps.
+    ///
+    /// It is a SEPARATE width from the code's because prose is not code: std's
+    /// own comments are written to ~84 columns, so re-filling them to the code
+    /// width moved 6,719 lines to a width nobody had chosen. A package that
+    /// writes narrower prose than it writes code says so here, once.
+    #[serde(rename = "comment_width")]
+    pub comment_width: Option<usize>,
+}
 
 /// The `[macro]` section: per-package expansion budgets.
 #[derive(Debug, Default, Deserialize)]
@@ -836,8 +912,97 @@ pub fn generated_root_in(directory: &Path) -> Option<PathBuf> {
 /// and it is what makes "nearest manifest" mean what a reader expects), resolved
 /// second (which covers the editor opening the product by its real path). One
 /// resolution rule, both consumers: `vilan fmt` and format-on-save.
+///
+/// **A product that is not on disk yet (B198, RULED).** The subject and the
+/// declared root are both resolved with
+/// [`canonical_path_of_unwritten`](crate::util::canonical_path_of_unwritten)
+/// rather than `canonical_path`, because a containment test is only sound when
+/// its two sides are spelled alike. `outputs = "gen/lib.vl"` names a file the
+/// generator has not written, so `canonicalize` fails on it and the caller's
+/// spelling survives — while the declared root, which IS on disk, comes back as
+/// the filesystem spells it. Comparing those two is a folded root against a
+/// lexical child, and it answers NO for a product plainly inside its own root:
+/// on Windows for `GEN` against `gen`, and on unix for a root reached through a
+/// link. Resolving the deepest ancestor that does exist puts both sides in the
+/// same spelling; where nothing exists at all, both degrade lexically together,
+/// which is the spelled ladder and not a mixed comparison.
+/// What a package's manifests say about `vilan fmt`'s prose knobs — each key
+/// `None` when nothing above the file declared it, so a caller can tell "not
+/// asked for" from "asked for, and false".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FmtOpinions {
+    /// `[fmt] wrap_comments` (E205).
+    pub wrap_comments: Option<bool>,
+    /// `[fmt] comment_width` (E215).
+    pub comment_width: Option<usize>,
+}
+
+impl FmtOpinions {
+    /// Whether every key already has an answer, so the climb can stop.
+    fn settled(&self) -> bool {
+        self.wrap_comments.is_some() && self.comment_width.is_some()
+    }
+
+    /// Fills in the keys still unanswered from a manifest lower in the climb's
+    /// path — which is what makes the NEAREST declaration of each key win
+    /// INDEPENDENTLY: a workspace may set the width while a member turns the
+    /// wrapping off.
+    fn take_from(&mut self, declared: &Fmt) {
+        self.wrap_comments = self.wrap_comments.or(declared.wrap_comments);
+        self.comment_width = self.comment_width.or(declared.comment_width);
+    }
+}
+
+/// The `[fmt]` opinions covering `path` (a file or a directory) — E205's
+/// opt-in and E215's width, resolved in ONE climb.
+///
+/// It lives here, over a path, for exactly [`generated_root_covering`]'s
+/// reason: the CLI walks directories while an editor is handed one buffer by
+/// its exact path, and the two must answer identically or a file would be
+/// wrapped by `vilan fmt` and unwrapped by format-on-save. The search climbs
+/// to the filesystem root and takes, PER KEY, the NEAREST manifest that
+/// declares it, so a workspace can set one once and a member override it; a
+/// manifest that declares nothing is climbed past rather than read as a
+/// default.
+///
+/// Every failure answers `None`: no manifest, a manifest that does not parse,
+/// a manifest declaring nothing. That is the safe direction and the only one
+/// available here — an unreadable tree gets today's formatter, never a
+/// silently different one.
+pub fn fmt_opinions_covering(path: &Path) -> FmtOpinions {
+    let mut opinions = FmtOpinions::default();
+    let mut current = Some(crate::util::spelled_path(path));
+    while let Some(directory) = current {
+        if let Some(declared) = fmt_section_in(&directory) {
+            opinions.take_from(&declared);
+            if opinions.settled() {
+                break;
+            }
+        }
+        current = directory.parent().map(Path::to_path_buf);
+    }
+    opinions
+}
+
+/// Whether `[fmt] wrap_comments` is on for the package covering `path` — the
+/// ONE predicate behind E205's opt-in, and [`fmt_opinions_covering`]'s
+/// `wrap_comments` half with the default (off) applied.
+pub fn wrap_comments_covering(path: &Path) -> bool {
+    fmt_opinions_covering(path).wrap_comments.unwrap_or(false)
+}
+
+/// The `[fmt]` section `directory`'s own `vilan.toml` declares, or `None` when
+/// there is no manifest, it does not parse, or it has no `[fmt]` at all —
+/// which is what makes the climb in [`fmt_opinions_covering`] pass through a
+/// manifest that has no opinion.
+fn fmt_section_in(directory: &Path) -> Option<Fmt> {
+    let text = std::fs::read_to_string(directory.join("vilan.toml")).ok()?;
+    let (manifest, _warnings) = Manifest::parse(&text).ok()?;
+    manifest.fmt
+}
+
 pub fn generated_root_covering(path: &Path) -> Option<PathBuf> {
-    let resolved = crate::util::canonical_path(path);
+    let resolved = crate::util::canonical_path_of_unwritten(path);
     let spelled = crate::util::spelled_path(path);
     covering_from(&spelled, &resolved).or_else(|| covering_from(&resolved, &resolved))
 }
@@ -850,7 +1015,11 @@ fn covering_from(start: &Path, resolved: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(directory) = current {
         if let Some(root) = generated_root_in(directory) {
-            let root = crate::util::canonical_path(&root);
+            // The root gets the same resolution as the subject, and for the
+            // same reason: a generator that has not run yet has not made its
+            // root either, and a lexical root against a resolved child is the
+            // B198 mismatch with the sides swapped.
+            let root = crate::util::canonical_path_of_unwritten(&root);
             if resolved.starts_with(&root) {
                 return Some(root);
             }
@@ -1527,6 +1696,7 @@ pub fn resolve_workspace_with_hook_report(
     git: &GitDeps,
 ) -> Result<(Workspace, Vec<DependencyHooks>), WorkspaceError> {
     let manifest = load_manifest(package_dir)?;
+    let lints = Lints::from_section(manifest.lints.as_ref());
     let defaults = crate::macros::MacroLimits::default();
     let macro_limits = manifest
         .macro_
@@ -1552,6 +1722,7 @@ pub fn resolve_workspace_with_hook_report(
                 Workspace {
                     macro_limits,
                     entry_prelude,
+                    lints,
                     ..Workspace::default()
                 },
                 Vec::new(),
@@ -1592,6 +1763,12 @@ pub fn resolve_workspace_with_hook_report(
             entry_dependencies,
             macro_limits,
             entry_prelude,
+            lints,
+            // The front end fills the rest in: resolving the dependency graph
+            // says nothing about which entry coloured the file (E119), nor
+            // about which control can change the ambient scope (E120) — and
+            // this one resolved a manifest, so the default already names it.
+            ..Workspace::default()
         },
         hook_report.into_values().collect(),
     ))
@@ -1650,6 +1827,99 @@ pub fn resolve_std(std_dir: &Path) -> PackageSpec {
         }
     }
     resolve_library(std_dir)
+}
+
+/// The toolchain root a resolved `std` belongs to — the directory that holds
+/// the `std` package, and so the one place `macro_std` is looked for.
+///
+/// # One root answers for both packages (tracker B346)
+///
+/// A toolchain is TWO packages, `std` and `macro_std`, and only the first has a
+/// discovery path a user can point at: `$VILAN_STD`, `vilan.stdPath`, the
+/// ancestor walk for a checkout's `vilan/std`, the embedded std's
+/// materialization. `macro_std` has never had one — it is found by walking up
+/// from the resolved `std` and looking for a sibling, which reads the
+/// filesystem rather than the configuration.
+///
+/// That is fine as long as it is the SAME root, and the rule here is that it
+/// must be: whatever named `std`, `macro_std` comes from the directory holding
+/// it and from nowhere else. Falling back to a second root — the binary's
+/// embedded toolchain, an ancestor checkout — is the one outcome worse than
+/// refusing, because it mixes two std worlds in one compile and the mixture is
+/// invisible: B346's repro was a `cp -a` of `vilan/std` whose `diff -r` was
+/// empty and which mis-analyzed std anyway.
+///
+/// So the root is named once, here. [`split_toolchain`] is what a caller asks
+/// when the answer is that the root carries only half a toolchain.
+pub fn toolchain_root(std: &PackageSpec) -> Option<&Path> {
+    std_package_dir(std)?.parent()
+}
+
+/// The directory holding the resolved `std`'s own `vilan.toml`.
+///
+/// Read from where the MANIFEST is, not by counting levels off the source root
+/// (tracker N105). `base_root` is `<package>/<the [library] root>`, and that
+/// root DEFAULTS to `src` but is declared: a std whose `[library]` says
+/// `root = "."` has its package directory as its own source root, and counting
+/// one level up from it lands above the package — so `toolchain_root` answered
+/// one directory too high, and `macro_std` was looked for beside the toolchain
+/// instead of inside it. Nothing in the estate declares it, so the bug was
+/// latent; what it would have produced is B346's refusal naming a `macro_std`
+/// path that was never the right one to look at, which is worse than no answer
+/// at all.
+///
+/// TWO candidates and no walk: the source root itself (`root = "."`) and its
+/// parent (`src`, and every other single-segment root). Bounded deliberately —
+/// an unbounded climb would find an enclosing PROJECT's `vilan.toml` for a std
+/// that has no manifest of its own and answer with a root holding no toolchain,
+/// which is exactly the second-root outcome B346 ruled out. A candidate whose
+/// `file_name` is `None` is skipped, which is how `dir.join(".")`'s trailing
+/// component is stepped over without normalizing the borrowed path.
+///
+/// When neither candidate carries a manifest the answer is the old formula, so
+/// a std resolved outside a package — [`resolve_std`]'s orphan case — is
+/// unchanged.
+fn std_package_dir(std: &PackageSpec) -> Option<&Path> {
+    std.base_root
+        .ancestors()
+        .filter(|candidate| candidate.file_name().is_some())
+        .take(2)
+        .find(|candidate| manifest_is_present(&candidate.join("vilan.toml")))
+        .or_else(|| std.base_root.parent())
+}
+
+/// Whether a `vilan.toml` is there to be read — on disk, or in the open-document
+/// overlay, which under wasm is the only place the toolchain exists at all
+/// (the same test [`split_toolchain`] makes of `macro_std`'s manifest).
+fn manifest_is_present(manifest: &Path) -> bool {
+    manifest.is_file() || crate::analyzer::document_overlay_contains(manifest)
+}
+
+/// This toolchain's `macro_std` package directory: `<root>/macro_std`, with
+/// `<root>` from [`toolchain_root`]. `None` only when the resolved `std` sits
+/// so close to the filesystem root that it has no grandparent.
+pub fn macro_std_dir(std: &PackageSpec) -> Option<PathBuf> {
+    Some(toolchain_root(std)?.join("macro_std"))
+}
+
+/// `Some((std package directory, the `macro_std` path))` when the root that
+/// answers for this `std` carries no `macro_std` — a SPLIT toolchain, which is
+/// what a `std` copied, packaged or cached away from its own tree leaves
+/// behind. `None` when the toolchain is whole, which is the only state that
+/// compiles macros.
+///
+/// The two paths come back because they are what a refusal has to say: "no
+/// `macro_std`" names nothing a reader can act on, while "this `std`, that
+/// missing `macro_std`" names the mistake and the fix at once.
+pub fn split_toolchain(std: &PackageSpec) -> Option<(PathBuf, PathBuf)> {
+    let package = std_package_dir(std)?.to_path_buf();
+    let macro_std = macro_std_dir(std)?;
+    // Buffered counts as present, exactly as it does for a source file: with no
+    // filesystem behind the compiler (the wasm build) the toolchain lives
+    // entirely in the document overlay, and an `is_file()` gate alone would
+    // report every wasm compile as a split toolchain.
+    let present = manifest_is_present(&macro_std.join("vilan.toml"));
+    (!present).then_some((package, macro_std))
 }
 
 /// Builds a [`PackageSpec`] for the `[library]` rooted at `dir`: its base root
@@ -2047,22 +2317,42 @@ fn split_needs_a_browser_leg(key: &str, declared: &str) -> String {
 /// owner from an impostor, and a library's own name — unlike a dependency key
 /// — never binds an import root.
 pub(crate) fn reserved_package_name(name: &str) -> Option<&'static str> {
-    match name {
-        "std" => Some("the standard library owns it"),
-        "pkg" => Some("it always means the importing package's own modules"),
-        "macro_std" => Some("the macro standard library owns it"),
-        "vilan" => Some("the language owns its own name"),
-        _ => None,
-    }
+    RESERVED_PACKAGE_NAMES
+        .iter()
+        .find(|(reserved, _)| *reserved == name)
+        .map(|(_, reason)| *reason)
 }
+
+/// The reserved set and why each name is reserved — the one enumerable copy,
+/// which is what lets the sentence below be checked rather than believed.
+const RESERVED_PACKAGE_NAMES: [(&str, &str); 4] = [
+    ("std", "the standard library owns it"),
+    ("pkg", "it always means the importing package's own modules"),
+    ("macro_std", "the macro standard library owns it"),
+    ("vilan", "the language owns its own name"),
+];
+
+/// The clause every reserved-name refusal carries: the whole set, so a reader
+/// who hit one name learns the rule rather than the instance.
+///
+/// It is a CONSTANT because it forked once (N38). `vilan` joined the set at
+/// Order 11, and only the manifest's refusal learned it: the analyzer's
+/// sibling refusal — the one for a staged dependency EDGE — went on naming
+/// three of the four for two releases, so the same rule reached a reader as two
+/// different rules depending on which layer refused. One string, read by both,
+/// and [`the_reserved_clause_names_the_whole_set`] holds it against
+/// [`RESERVED_PACKAGE_NAMES`] so the set cannot grow past its own sentence
+/// again.
+pub(crate) const RESERVED_PACKAGE_NAMES_CLAUSE: &str =
+    "`std`, `pkg`, `macro_std`, and `vilan` are all reserved";
 
 /// The refusal for a reserved package name: the rule, the whole reserved set,
 /// and the one fix (`renamed` names the thing to rename — the package or the
 /// dependency).
 fn reserved_name_refusal(name: &str, reason: &str, renamed: &str) -> String {
     format!(
-        "`{name}` is a reserved package name: {reason} (`std`, `pkg`, \
-         `macro_std`, and `vilan` are all reserved); rename the {renamed}"
+        "`{name}` is a reserved package name: {reason} \
+         ({RESERVED_PACKAGE_NAMES_CLAUSE}); rename the {renamed}"
     )
 }
 
@@ -2233,11 +2523,37 @@ mod tests {
 
     /// The refusal's exact head for `name`, as [`reserved_name_refusal`]
     /// builds it — asserted verbatim so the ledger row's key stays honest.
+    ///
+    /// Deliberately a SECOND spelling of the sentence rather than a read of
+    /// `RESERVED_PACKAGE_NAMES_CLAUSE`: an independent copy is what makes these
+    /// pins say anything about the wording at all.
     fn reserved_head(name: &str, reason: &str, renamed: &str) -> String {
         format!(
             "`{name}` is a reserved package name: {reason} (`std`, `pkg`, \
              `macro_std`, and `vilan` are all reserved); rename the {renamed}"
         )
+    }
+
+    #[test]
+    fn the_reserved_clause_names_the_whole_set() {
+        // N38: the set grew and one of its two sentences did not, so the same
+        // rule reached a reader as two different rules. The sentence is now
+        // held against the set from both directions.
+        for (name, _) in RESERVED_PACKAGE_NAMES {
+            assert!(
+                RESERVED_PACKAGE_NAMES_CLAUSE.contains(&format!("`{name}`")),
+                "the reserved set contains `{name}`, but the clause every refusal \
+                 carries does not name it: {RESERVED_PACKAGE_NAMES_CLAUSE}"
+            );
+        }
+        let named = RESERVED_PACKAGE_NAMES_CLAUSE.matches('`').count() / 2;
+        assert_eq!(
+            named,
+            RESERVED_PACKAGE_NAMES.len(),
+            "the clause names {named} package name(s) and the set has {}: \
+             {RESERVED_PACKAGE_NAMES_CLAUSE}",
+            RESERVED_PACKAGE_NAMES.len()
+        );
     }
 
     #[test]
@@ -4193,6 +4509,167 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// B198's unix twin: the same fail-OPEN, expressed with a LINK instead of
+    /// with case folding.
+    ///
+    /// The Windows pin below reaches this defect through NTFS's case fold, and
+    /// so cannot run here. But case is only one of the ways a filesystem gives
+    /// a path two spellings; a symlink is the other, and it is portable. A
+    /// product the generator has not written yet has no on-disk path, so
+    /// `canonicalize` fails on it and the caller's spelling survives — while
+    /// the declared root, which IS on disk, comes back resolved. Reached
+    /// through `elsewhere/peek`, the two share no prefix at all, so the
+    /// containment test said the file was outside its own generated root and
+    /// `vilan fmt` would have rewritten a product: §12.1's fmt↔hook loop,
+    /// on unix, with no case folding anywhere near it.
+    ///
+    /// The pin above is its control — the same tree, the same link, the same
+    /// root, differing only in whether the product has been written — and it
+    /// was green before this, which is what makes "not yet on disk" the whole
+    /// difference under test.
+    #[cfg(unix)]
+    #[test]
+    fn a_product_the_generator_has_not_written_yet_is_covered_through_a_link() {
+        let root = std::env::temp_dir().join(format!(
+            "vilan-covering-peek-unwritten-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let package = root.join("package");
+        std::fs::create_dir_all(package.join("gen")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(
+            package.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../package/gen", root.join("elsewhere/peek")).unwrap();
+        let expected = Some(crate::util::canonical_path(package.join("gen")));
+
+        assert_eq!(
+            generated_root_covering(&package.join("gen/not_written_yet.vl")),
+            expected,
+            "the control: a product is a product before its generator has run"
+        );
+        assert_eq!(
+            generated_root_covering(&root.join("elsewhere/peek/not_written_yet.vl")),
+            expected,
+            "and reached through the link it is the same product — the link is on \
+             disk even though the file under it is not, so the containment test has \
+             a resolved ancestor to anchor both sides to"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Windows hazard neither pin above can reach (audit run 7, Order 24):
+    /// NTFS FOLDS CASE, so `gen` and `GEN` are two paths on unix and one
+    /// directory here. Nothing in this predicate folds case itself — it compares
+    /// `Path` components, which are bytes — so the answer rests entirely on
+    /// `fs::canonicalize` handing back the spelling that is ON DISK whichever
+    /// spelling it was asked about. It does, and this is the pin that says so:
+    /// a product asked about in the wrong case is the same product.
+    ///
+    /// Green, and worth stating as the control for the `#[ignore]`d pin below —
+    /// which is the same question one step past the edge of this one, where
+    /// there is no on-disk path to canonicalize and the case survives.
+    #[cfg(windows)]
+    #[test]
+    fn a_generated_root_covers_its_products_through_a_case_folded_spelling() {
+        let base = std::env::temp_dir().join(format!("vilan-covering-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("gen")).unwrap();
+        // `temp_dir` can answer with an 8.3 SHORT name, which canonicalizes to
+        // its long form — a second difference that would leave this pin
+        // measuring two things at once and passing or failing for the wrong
+        // reason. Resolve the fixture root once, up front, so the only
+        // difference below is the one under test.
+        let root = crate::util::canonical_path(&base);
+        std::fs::write(
+            root.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("gen/lib.vl"), "").unwrap();
+        let expected = Some(crate::util::canonical_path(root.join("gen")));
+
+        assert_eq!(
+            generated_root_covering(&root.join("gen/lib.vl")),
+            expected,
+            "the on-disk spelling, as everywhere else"
+        );
+        assert_eq!(
+            generated_root_covering(&root.join("GEN/lib.vl")),
+            expected,
+            "and the folded one: `GEN\\lib.vl` opens the same file NTFS holds at \
+             `gen\\lib.vl`, so it is the same product — a formatter that decided \
+             otherwise would rewrite a product because an editor spelled a drive \
+             path the way the user typed it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fail-OPEN corner of the same hazard, and the one RED measurement in
+    /// audit run 7's Windows batch — LIVE since B198 ruled (Order 25).
+    ///
+    /// A product that its generator HAS NOT WRITTEN YET is not on disk, so
+    /// `canonical_path` degraded to the lexical `normalize_components` and kept
+    /// whatever case it was handed — while the declared root, which IS on disk,
+    /// canonicalizes to the spelling NTFS holds. `covering_from`'s containment
+    /// test (`resolved.starts_with(&root)`) compares components byte-for-byte,
+    /// so the two disagreed, the file read as UNCOVERED, and the formatter
+    /// rewrote a product: §12.1's fmt↔hook loop, reached by a spelling rather
+    /// than by a link.
+    ///
+    /// The first half is the control and was always green — spelled as the
+    /// directory is on disk, a not-yet-written product is covered, which is the
+    /// property `outputs = "src/icons/lib.vl"` depends on before the first
+    /// build. Only the folded spelling failed.
+    ///
+    /// **The ruling: both sides canonical-or-fail** (B198, 2026-09-01). Neither
+    /// of the two directions the pin was filed against is what shipped.
+    /// `covering_from` does not fold case — it is a predicate two front ends
+    /// have to answer alike, and a platform-dependent comparison inside it is
+    /// exactly what that rules out — and `canonical_path`'s promise to its
+    /// every other caller is untouched. What changed is the resolution the
+    /// CONTAINMENT TEST uses: `util::canonical_path_of_unwritten` anchors both
+    /// sides at the deepest ancestor that is on disk, so a folded root is never
+    /// compared against a lexical child, and a tree with nothing on disk at all
+    /// degrades to G17's spelled ladder with both sides lexical together.
+    /// `a_product_the_generator_has_not_written_yet_is_covered_through_a_link`
+    /// is the same defect on unix, reached through a symlink instead of a case
+    /// fold, and is the pin that was red-proved locally.
+    #[cfg(windows)]
+    #[test]
+    fn a_product_the_generator_has_not_written_yet_is_still_covered() {
+        let base =
+            std::env::temp_dir().join(format!("vilan-covering-unwritten-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("gen")).unwrap();
+        // The same 8.3 precaution as the pin above, for the same reason.
+        let root = crate::util::canonical_path(&base);
+        std::fs::write(
+            root.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        let expected = Some(crate::util::canonical_path(root.join("gen")));
+
+        let on_disk_spelling = generated_root_covering(&root.join("gen/not_written_yet.vl"));
+        let folded_spelling = generated_root_covering(&root.join("GEN/not_written_yet.vl"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            on_disk_spelling, expected,
+            "a product is a product before its generator has run — the lexical \
+             fallback and the canonicalized root still agree"
+        );
+        assert_eq!(
+            folded_spelling, expected,
+            "and the same file spelled the way NTFS also accepts it is the same \
+             product, on disk yet or not"
+        );
+    }
+
     #[test]
     fn nothing_is_covered_without_a_manifest_declaring_it() {
         // A tree the predicate cannot read is a tree the formatter formats. Both
@@ -4249,6 +4726,60 @@ mod tests {
             "a `..` dependency path is the normal spelling, not an error: {:?}",
             manifest.validate()
         );
+    }
+
+    // --- E221: the `[lints]` section ----------------------------------------
+
+    #[test]
+    fn a_lints_section_parses_and_is_a_known_section() {
+        let (manifest, warnings) =
+            Manifest::parse("[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"warn\"\n")
+                .expect("parses");
+        assert!(
+            warnings.is_empty(),
+            "`[lints]` is not an unknown key: {warnings:?}"
+        );
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()).internal_use,
+            LintLevel::Warn
+        );
+        let (manifest, _) =
+            Manifest::parse("[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"allow\"\n")
+                .expect("parses");
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()).internal_use,
+            LintLevel::Allow
+        );
+    }
+
+    #[test]
+    fn an_absent_lint_is_allowed() {
+        // No section, and a section that names nothing, are both the default —
+        // a lint is opt-in.
+        let (manifest, _) = Manifest::parse("[package]\nname = \"app\"\n").expect("parses");
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()),
+            Lints::default()
+        );
+        let (manifest, _) =
+            Manifest::parse("[package]\nname = \"app\"\n\n[lints]\n").expect("parses");
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()),
+            Lints::default()
+        );
+        assert_eq!(Lints::default().internal_use, LintLevel::Allow);
+    }
+
+    #[test]
+    fn a_lint_level_or_a_lint_name_that_does_not_exist_is_refused() {
+        // `deny` is not a level this section has (a warning is the most a label
+        // asks for), and a misspelt lint must not silently do nothing.
+        let deny = Manifest::parse("[lints]\ninternal_use = \"deny\"\n")
+            .expect_err("`deny` is not a level");
+        assert!(deny.contains("allow") && deny.contains("warn"), "{deny}");
+        let typo = Manifest::parse("[lints]\ninternal_uses = \"warn\"\n")
+            .expect_err("an unknown lint is refused");
+        assert!(typo.contains("internal_uses"), "{typo}");
     }
 
     // --- A15's follow-up: a manifest-designated default `run` entry ---------
@@ -4586,5 +5117,80 @@ mod tests {
         assert!(!proper.layers.is_empty(), "the real std declares layers");
         assert_eq!(proper.base_root, forgiven.base_root);
         assert_eq!(proper.layers.len(), forgiven.layers.len());
+    }
+
+    /// N105: the toolchain root is read from where the MANIFEST is, so a std
+    /// whose `[library]` declares `root = "."` answers with the directory that
+    /// holds it rather than with the one above that.
+    ///
+    /// No std in the estate declares it, which is why this was latent rather
+    /// than broken: `toolchain_root` counted two levels up from the SOURCE
+    /// root, which is right only while the source root is `<package>/src`. A
+    /// source-root-less std put the answer one directory too high, and the one
+    /// thing that reads the answer is B346's refusal — so the failure mode was
+    /// a refusal naming a `macro_std` path that was never the right one to
+    /// look at, which is worse than no answer.
+    #[test]
+    fn n105_a_source_root_less_std_resolves_its_own_toolchain_root() {
+        let toolchain =
+            std::env::temp_dir().join(format!("vilan_manifest_flat_std_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&toolchain);
+        let package = toolchain.join("std");
+        std::fs::create_dir_all(&package).expect("stage the flat std");
+        std::fs::write(
+            package.join("vilan.toml"),
+            "[library]\nname = \"std\"\nroot = \".\"\n",
+        )
+        .expect("write the manifest");
+        std::fs::create_dir_all(toolchain.join("macro_std")).expect("stage macro_std");
+        std::fs::write(
+            toolchain.join("macro_std/vilan.toml"),
+            "[library]\nname = \"macro_std\"\n",
+        )
+        .expect("write macro_std's manifest");
+
+        let std = super::resolve_std(&package);
+        assert_eq!(
+            std.base_root, package,
+            "`root = \".\"` makes the package directory its own source root"
+        );
+        assert_eq!(
+            super::toolchain_root(&std),
+            Some(toolchain.as_path()),
+            "the toolchain root is the directory HOLDING the std package, \
+             whatever the `[library]` declares its source root to be"
+        );
+        assert_eq!(
+            super::macro_std_dir(&std),
+            Some(toolchain.join("macro_std")),
+            "and `macro_std` is looked for beside the std, not beside the \
+             toolchain"
+        );
+        assert!(
+            super::split_toolchain(&std).is_none(),
+            "this toolchain is whole — a split verdict here is the one-root \
+             rule answering off the wrong root"
+        );
+
+        let _ = std::fs::remove_dir_all(&toolchain);
+    }
+
+    /// The other half, so the fix cannot be a special case for one shape: the
+    /// ordinary `<package>/src` std still answers the same way it always did.
+    #[test]
+    fn n105_a_src_rooted_std_still_resolves_its_own_toolchain_root() {
+        let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std");
+        let std = super::resolve_std(&std_dir);
+        let root = super::toolchain_root(&std).expect("the real std has a toolchain root");
+        assert!(
+            root.join("macro_std/vilan.toml").is_file(),
+            "the tree's own std must resolve the root that carries its \
+             `macro_std`, got {}",
+            root.display()
+        );
+        assert!(
+            super::split_toolchain(&std).is_none(),
+            "the tree's own toolchain is whole"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Control flow
 
-> Normative rules: spec [§3 Grammar](../spec/grammar.md) and [§5.10 `!` and `?.`](../spec/types.md).
+> Normative rules: spec [§3 Grammar](../spec/grammar.md) and [§5.10 `!`, `?.` and `?`](../spec/types.md).
 
 ## `if` / `else`
 
@@ -41,6 +41,26 @@ fun main() {
 
 If you forget a variant, the compiler tells you. That's most of the
 reason enums plus `match` replace flag fields and `null` checks.
+
+A payload binds with `let` or with `mut`, the same two words that
+declare a variable — `let` immutably, `mut` mutably:
+
+```vilan,fragment
+match slot {
+	Some(mut items) => {
+		items.push(9);         // `let items` here is "cannot mutate immutable"
+		slot = Some(items);    // the binder is a copy: write it back
+	}
+	None => void,
+}
+```
+
+A binder is a binding, so it holds a **copy** of what it matched, like
+every other binding (see [the memory model](memory-model.md)). `mut`
+makes that copy writable; it does not reach the value you matched on.
+An arm that means to change the subject assigns back through it, as
+above. Writing both words (`Some(let mut items)`) is neither form, and
+the compiler says so.
 
 Completeness is judged over the whole pattern, not just its outermost
 name, so a payload you narrow has to be handled too:
@@ -92,6 +112,62 @@ pattern as a boolean:
 let present = entry.map(|current| current is Some(let _task));
 ```
 
+A `let` inside the pattern **captures**, and the capture is in scope
+wherever the test is known to have passed: the then-branch, and the rest
+of the condition after an `&&`. It is not in scope in the `else`, after
+the `if`, or in the other arm of a `||` — each of those is reached
+exactly when the test *didn't* pass, so there is no payload to name:
+
+```vilan,fragment
+if slot is Some(let task) && task.ready { start(task); }   // both fine
+if slot is Some(let task) { … } else { start(task); }      // error: unbound
+```
+
+The condition has to *say* the test passed, and it says that through
+`!`, `&&`, `||` and the `is` itself. Bury the test in a call argument
+and the condition's answer no longer reports it — `ready(slot is
+Some(let task))` is whatever `ready` returns — so the capture is out of
+scope in both branches:
+
+```vilan,fragment
+if ready(slot is Some(let task)) { start(task); }          // error: unbound
+```
+
+For the same reason, a test written outside a condition altogether binds
+nothing after itself. `let ready = slot is Some(let task);` gives you a
+`bool`, and a `bool` does not carry the payload — nothing later in the
+block proves the test passed, so reading `task` there is refused and the
+error points you at the shape that works:
+
+```vilan,fragment
+let ready = slot is Some(let task); start(task);           // error: not a condition
+let ready = slot is Some(let task) && task.ready;          // fine: `&&`, as always
+```
+
+Negating the test swaps the two branches: `!(slot is Some(let task))` is
+true where the pattern *didn't* match, so the capture is unbound in that
+branch and in scope in the `else` — the branch reached only by a match.
+
+```vilan,fragment
+if !(slot is Some(let task)) { start(task); }              // error: unbound
+if !(slot is Some(let task)) { … } else { start(task); }   // fine: it matched
+```
+
+That swap is what makes the **guard clause** work. Negate the test, leave
+the `if` through a `ret` or a `jump`, and the code after it is reachable
+only on the path where the pattern matched — so the capture is in scope
+there, for the rest of the block:
+
+```vilan,fragment
+if !(slot is Some(let task)) { ret; }
+start(task);                                               // fine: it matched
+```
+
+It needs all three parts. The then-branch has to actually leave (a branch
+that can fall through reaches the continuation on a miss), the `if` has to
+have no `else`, and the test has to be negated — `if slot is Some(let
+task) { ret; }` continues exactly where the pattern *didn't* match.
+
 One edge to know: a `match` can't sit directly inside a larger operator
 expression. Bind it to a local first.
 
@@ -131,8 +207,24 @@ fun main() {
 ```
 
 There is also a bare `for { … }` for an infinite loop. Loop control is
-spelled `jump break` and `jump continue`. Iterating with `for _ in …`
+spelled `jump break` and `jump continue`. A bare `for` that nothing
+breaks out of never finishes, so the code after it is unreachable and a
+function that ends in one owes no return value. Iterating with `for _ in …`
 skips the binding.
+
+The header's binder is the same one `let` takes, so an element that is a
+tuple can be destructured right there:
+
+```vilan
+fun main() {
+	for (index, item) in ["a", "b"].iter().enumerate() {
+		print(i"{index}: {item}");
+	}
+}
+```
+
+Any other pattern in the header — a variant, a literal — is refused by
+name: bind the element and destructure it in the body.
 
 One more form matters once you care about performance:
 `for e in &mut list` iterates *views* of the elements so you can mutate
@@ -299,3 +391,18 @@ instead.
 that should be impossible, not for expected failures; those are
 `Result`s. `assert(condition, message)` panics when the condition is
 false, and it's how `vilan test` decides a test failed.
+
+A `panic` never returns, so it fits wherever a value is expected and owes
+nothing back: a function whose body ends in one needs no return value,
+and neither does one that ends in a `for { … }` nothing breaks out of.
+
+```vilan,fragment
+fun parse_id(text: str): i32 {
+	match text.parse_i32() {
+		Some(let id) => id,
+		None => {
+			panic("not a number: " + text);   // no `0` after it
+		},
+	}
+}
+```

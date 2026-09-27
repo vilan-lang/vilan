@@ -43,10 +43,10 @@ function compare2(self, b) {
 }
 function $a(self) {
 	let result = [  ];
-	let index = self.length - 1;
-	while (index >= 0) {
-		result.push(__clone(__at(self, index)));
+	let index = self.length;
+	while (index > 0) {
 		index = index - 1;
+		result.push(__clone(__at(self, index)));
 	}
 	return result;
 }

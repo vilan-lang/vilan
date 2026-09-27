@@ -37,13 +37,14 @@
 //! tracked listing, and `digest`'s fingerprint.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 mod support;
+use support::port::{free_port, wait_for_port};
 
 /// The resource the client bundles. An `.svg` deliberately: it is not a `.js`,
 /// a `.css` or a `.json`, so nothing about it can be confused with an artifact
@@ -57,7 +58,7 @@ const ORPHAN: &str = "no `const` names this file\n";
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_asset_bundle_{tag}_{}_{unique}",
         std::process::id()
     ));
@@ -77,14 +78,6 @@ fn vilan(args: &[&str]) -> Output {
         .env("NO_COLOR", "1")
         .output()
         .expect("run vilan")
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
 }
 
 /// A two-entry project: a browser client that bundles `static/icon.svg`, and a
@@ -157,17 +150,6 @@ fn serve(dir: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the server")
-}
-
-fn wait_for_port(port: u16) -> bool {
-    let deadline = Instant::now() + support::run_liveness();
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 /// A plain HTTP GET, returning `(status line + headers, body)`.

@@ -96,7 +96,7 @@ fn without_lines(shell: &str, needle: &str) -> String {
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let staged = std::env::temp_dir().join(format!(
+    let staged = support::scratch_root().join(format!(
         "vilan_shell_check_{tag}_{}_{unique}",
         std::process::id()
     ));

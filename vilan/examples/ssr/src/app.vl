@@ -12,9 +12,15 @@
 // on the client. Nothing here reaches for `std::dom`, so the same source compiles
 // on both platforms. Components are just functions returning a `View`, so the app
 // is composition.
+//
+// This file imports NOTHING, and that is the prelude rather than a small file:
+// `Signal`, `SignalCell`, `view` and `View` are all ambient under
+// `prelude = "std::web"` (vilan.toml), and every one of them is base-layer or
+// declared by both platform layers — so the empty import block means the same
+// thing in the browser leg and in the node leg, which is what a shared component
+// needs.
 
-import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, view };
+export *;
 
 // A signal-fed list, a conditional note, an escaped heading, and a button whose
 // click writes a signal bound to its own text.
@@ -37,12 +43,12 @@ fun heading(): View {
 
 // The signal-fed list: one `<li>` per task, read once on the server.
 fun task_list(tasks: SignalCell<List<str>>): View {
-	view("ul").bind_each(tasks, |task| task, |task| view("li").text(task))
+	view("ul").child(each(tasks, |task| task, |task| view("li").text(task)))
 }
 
 // A conditional note — `when` renders the taken branch on the server.
 fun note(show: SignalCell<bool>): View {
-	view("section").when(show, || view("p").text("server-rendered, then replaced"))
+	view("section").child(when(show, || view("p").text("server-rendered, then replaced")))
 }
 
 // A button whose click writes `label`, which is bound to its own text: inert on

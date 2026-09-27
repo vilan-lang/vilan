@@ -1,6 +1,7 @@
 //! The editor-facing queries the language server and the playground share
 //! (`proposal/playground-completion.md`): a line index, the completion engine,
-//! and the navigation primitives it reads.
+//! the navigation primitives it reads, and the numeric-mismatch edits the
+//! language server's quick fixes and `vilan check --fix` share (I5 §8.3).
 //!
 //! Nothing here is a protocol. The language server maps [`Position`] to
 //! `lsp_types::Position` and a [`Completion`] to a `CompletionItem` at its own
@@ -16,12 +17,19 @@
 
 pub mod analysis;
 pub mod completion;
+pub mod html_attributes;
 pub mod line_index;
+pub mod numeric_fix;
+
+/// E69's gate: the generated table above, re-rendered from its vendored TSV
+/// and diffed. Test-only — nothing ships it.
+#[cfg(test)]
+mod html_attributes_sync;
 
 pub use analysis::{Analysis, entity_spans, signature_label, source_call_subject, span_of};
 pub use completion::{
-    AUTO_IMPORT_COMPLETION_CAP, AutoImport, BOOK_BASE, CONSTRUCT_SNIPPETS, Completion,
-    CompletionFunctionCall, CompletionKind, ImportRoots, InsertText, KEYWORD_DOCS,
-    SnippetInsertion, call_insertion, keyword_lexeme,
+    ATTRIBUTE_DOCS, AUTO_IMPORT_COMPLETION_CAP, AutoImport, BOOK_BASE, CONSTRUCT_SNIPPETS,
+    Completion, CompletionFunctionCall, CompletionIndex, CompletionKind, ImportRoots, InsertText,
+    KEYWORD_DOCS, SnippetInsertion, call_insertion, keyword_lexeme,
 };
 pub use line_index::{LineIndex, Position};

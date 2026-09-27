@@ -42,6 +42,20 @@ included; a field's `name: type` and a method's full signature behind a
 `.`; your own doc comments; and documentation on the language's own
 keywords, deep-linked into this book.
 
+A `///` above a struct FIELD reaches every position that field appears in:
+its declaration, a read of it, the field name inside a `Point { x = … }`
+literal, and both completion lists that offer it (where the popup shows
+the first paragraph, as it does for a function). Hovering a field answers
+about the field; the struct's whole declaration block is what its own
+name answers.
+
+Hovering a call to a GENERIC function shows two signatures in one block:
+the declaration as it is written, then the same signature under the
+bindings this call solved — `fun get_or(self, key: K, make: || V): V`
+above `fun get_or(self, key: UserId, make: || SignalCell<Option<User>>):
+SignalCell<Option<User>>`. A call that substitutes nothing, and a hover on
+the declaration itself, show the one line they always did.
+
 **Inlay hints** — the inferred type of a binding you left unannotated
 (`let`/`mut`, a `for` binder, a comprehension binder). A parameter is not
 hinted: its type is written in the signature already.
@@ -56,10 +70,83 @@ a symbol, they also find the open files that import it.
 
 **Formatting** — the same `vilan_core` formatter `vilan fmt` runs, so the
 editor and the CLI cannot disagree. Whole-document only; there is no range
-or on-type formatting.
+formatting. When the printer *declines* a file — it does not
+parse, or it carries a construct the printer has no rule for — the server
+says so in a message naming the line and the construct, rather than
+leaving a save that did nothing looking like a save that had nothing to
+do. Once per file per cause, so format-on-save does not repeat it. It reads
+your package's `[fmt] wrap_comments` from the nearest `vilan.toml` above the
+file, the same climb `vilan fmt` walks, so a save and a command-line format
+produce the same bytes.
 
 **Linked editing** for markup tag pairs: rename `<div>` and `</div>`
 follows.
+
+**Which platform, and why, before any error.** The platform a file is
+analyzed under decides which `std` twin its types come from, so the status
+bar says it for the vilan file in front of you — `analyzed as: browser —
+declared`, `analyzed as: node — default-entry` — with the whole reason in
+its tooltip. A file can say it itself: `[platform("browser")] mod self;` as
+its first line — and at the top of a file, completion offers that line.
+
+**A generic `<` closes itself.** `List<`, `Map<`, `fun pair<` and a
+generic call's own argument list each get their `>` as you type the `<`.
+The editor's static bracket pairs cannot do this — `<` is also the
+comparison operator, and `a < b` must not grow a `>` — so the server
+decides, on what the name before the `<` means: a struct, an enum, a
+trait or a generic function, or a declaration's own name right after
+`fun`, `struct`, `enum`, `trait`, `impl` or `type`. Everything else is
+left alone. In VS Code the placed `>` is also typed over when you reach
+it, so `List<i32>` never becomes `List<i32>>` — which takes over the
+editor's `type` command, and only one extension can own that: turn
+`vilan.autoClosing.generics` off to coexist with Vim emulation, and the
+server places the `>` without the type-over. Selecting text and typing
+`<` wraps it either way, and so does a backtick, which pairs everywhere
+except inside a string.
+
+**Dead code, faded.** Code nothing uses is dimmed rather than warned
+about: it does not enter the Problems count, does not badge the file, and
+gates nothing. Five things fade — an unused import, a `let` inside a
+function body that nothing reads, the statements after one that cannot
+return, a top-level item no entry of your package reaches, and every
+top-level item of a module no entry loads at all.
+
+The last two are the whole-package ones, and they are worth knowing
+precisely, because a fade means "you may delete this."
+
+- **What can fade:** a top-level `fun` and a module-level `let`. A
+  `struct`, an `enum`, a `trait` and an `impl` block never fade, used or
+  unused — they compile to nothing either way, so "does the build keep
+  it" is not a question that has an answer for them.
+- **What "unused" means:** no entry of the package reaches it. A package
+  with several entries is a union — an item only your `probe` entry calls
+  is used. An item behind a `[platform]` fence is used if the entry for
+  that platform reaches it.
+- **A `[library]` never fades a top-level item.** A library has no
+  entries, so there is nothing to compute the answer from, and every
+  top-level item is surface a consumer may import — which is what keeps
+  you from having to fork a library that forgot to export something. This
+  holds for a library inside a workspace too, even when the only consumer
+  today is a sibling package. To keep a name out of consumers' completion
+  without forbidding it, do not `export` it: a private item is offered by
+  neither completion nor the add-import fix, and an importer who needs it
+  anyway writes the reach (`import pkg::a::{ #helper };`). `[doc(hidden)]`
+  used to be the spelling for this and is retired — it meant exactly what
+  a private item means, and no tool ever read it.
+- **A declared `generated` root never fades.** `[package] generated =
+  "src/icons"` already tells `vilan fmt` to leave a machine-written
+  directory alone; it tells the fade the same thing.
+- **`_`-led names never fade**, the way an unused local does not. It is
+  the "I know" marker.
+- **Trait impl members never fade in this version.** Whether a trait
+  method is reached depends on which types your program constructs, so
+  the answer moves in blocks as you edit; inherent impl members do fade.
+- **The fade goes off while you type** and comes back a moment after you
+  stop. The fact that would prove an item used lives in another file, so
+  a fade held across an edit could say "dead" about code you have just
+  started calling — and that is the one mistake a fade must not make.
+  Being late is fine; being wrong is not. A syntax error anywhere in the
+  package holds the whole package's fades off for the same reason.
 
 ## Completion
 
@@ -79,8 +166,25 @@ Where the cursor is decides what is offered.
   method `ListIterator`'s own `impl` block writes out, and a type that
   implements `Ord` offers `min`/`max`/`clamp` with the comparisons its
   supertraits provide.
+- **Inside a struct initializer** — `Point { ` — offers that struct's
+  **fields**, and nothing that is merely in scope: the one thing you are
+  writing there is a field name. The fields you have already written drop out
+  of the list, each candidate shows its declared type and its own doc, and
+  accepting one writes `name = ` — or just `name`, the shorthand, when a
+  binding of that name is in scope and `Point { x }` already means
+  `Point { x = x }`. Past the `=` you are writing an expression again, so the
+  ordinary answers come back.
 - **Inside a string or a comment** nothing is offered. A caption is text, not
   code, and a `.` in one is not a member access.
+- **Visibility filters the list, once the module has an opinion.** A module
+  that carries `export` anywhere is *curated*, and completion offers only
+  what it exports — the same filter the add-import fix and the "import it
+  first" steer use. A module with **no marker anywhere** is uncurated and
+  offers everything, so a package that has never thought about visibility
+  is unchanged. The filter is presentation only: nothing here blocks a
+  name, and an importer who wants a private item writes the reach
+  (`import pkg::a::{ #helper };`) and gets it. std is curated, which is why
+  `std::rpc::` offers its surface rather than its dispatcher internals.
 - **Inside a `css` block** the vocabulary is CSS, and nothing in scope is
   offered at all. An undotted item completes **property names** — every slot
   a `Style` method writes, so the list is std's own surface rather than an
@@ -105,7 +209,11 @@ Where the cursor is decides what is offered.
   file that has never mentioned `std::random`. A brace set completes at the
   same level as its module, so `import std::json::{ Json, ` keeps going.
   (Imports are read as single-line items; a braced group's later lines are
-  not recognized.)
+  not recognized.) Inside an impl SELECTOR the answer is not a name the
+  module offers but a block it writes: after `impl ` the module's impl
+  subjects (`import std::style::{ (impl ` offers `Length`, `Color`, …), and
+  after `)::` that block's members (`(impl Length)::` offers `rem`). Both
+  come from the module's parsed text, like every other answer here.
 - **A name you have not imported** is offered too, labeled with the module
   it comes from and carrying the `import` as part of accepting it — one
   action writes both. Your own package's names rank ahead of `std`'s, so a
@@ -121,23 +229,34 @@ sees it.
 
 ## Quick fixes
 
-Seven, each attached to the diagnostic that earns it:
+Eighteen, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
 | ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable. One action per module when more than one exports the name — never a guess between them |
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
+| ``Analyze this file under its platform: add `[platform("browser")] mod self;` `` | a member the OTHER `std` twin declares (`struct 'Region' has no field 'anchor'` in a file analyzed under node, whose note names the `browser` twin that has it). The edit is the file's first line — the one place a file's platform may be written — and the attribute is the one the note spells |
 | ``Insert `;` `` | ``expected `;` to end this statement``, at the gap the diagnostic points at |
 | ``Remove `;` `` | ``the `;` discards this body's last value`` — it finds the right `;` from the diagnostic's own bookkeeping, and declines rather than guess when a comment sits in the gap |
-| ``Wrap as `{Color::hex("#333")}` `` | a `#` in a `css` block. The character cannot lex at all, so the diagnostic is one column wide; the fix reads the whole colour off the line and routes it through `Color`, which carries its own `:root` line. Offered only when the run really is a colour (3, 4, 6 or 8 hex digits) |
+| ``Import as `#hidden` `` | a plain import of an item its module does not export. A zero-width insertion of the reach marker at the leaf — the whole edit — which says the reach was deliberate and silences the warning |
+| ``Delete the `#` `` | a reach marker on an item that IS exported. The marker states a belief about the module that is not true, and the fix removes the one character |
 | ``Use `.md { … }` `` | ``@media (min-width: …)`` in a `css` block. The breakpoint is chosen by the query's own min-width, and an arbitrary one becomes `.media("900px")` rather than no fix. The other at-rules have no combinator spelling, so they get the explanation alone |
+| ``Declare the inferred contexts`` | ``…'s body reads context `b`, which this `context` clause does not declare`` — a `fun`'s declared `context` clause narrower than what its body reads. The refusal spells the clause the body needs and the fix writes exactly that, over the clause's own name list |
+| ``Declare it `const let` `` | either half of G24's `const` steer — ``a `const` expression reads only compile-time-known bindings`` at a read, or ``a `const` result must be plain data; this evaluates to a closure`` at a `let x = const ..`. One edit either way: the declaration keyword. At a read it is a zero-width `const ` in front of the binding the message names, ahead of the read and only where this file's own text still opens it with `let`; at the closure result the `const` MOVES to the head of the declaration, which is entirely the text in front of the diagnostic's span |
+| ``Write it as a call: `padding(px(4));` `` | ``a `css` declaration is a CALL`` — the `property: value;` spelling A101 retired, which is what every CSS author types and what every migrating program hits. The rewrite is the codemod's: one `{expr}` hole becomes the expression, a text value becomes the typed constructor where a unit names one (`4px` → `px(4)`) and a string literal otherwise, and a whitespace-separated value becomes several arguments, which the block joins with one space exactly as CSS's own value lists do. A GLUED value (`calc({w} + 2px)`, `{150}ms`) and one carrying `!important` are declined rather than guessed: the first wants an i-string with a `piece(..)` per hole, which is a decision about the value, and the second has its own fix |
+| ``Write all 2 `css` declarations as calls`` | the same refusal, when the file carries more than one rewritable declaration — A101 reports per declaration, so a migrating block offers one fix per row and this one action for all of them. A declaration the rewrite declines travels through the edit exactly as you wrote it |
 | ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |
+| ``Parenthesize the closure type`` | a `fun` whose RETURN type is an un-parenthesized closure type carrying a `context` clause (B343) — the type grammar's own `context` suffix is greedy, so the clause lands on the closure's own return type, which cannot carry one. The edit covers the written return type and adds the parentheses that give the clause to the FUNCTION; the refusal also names the other reading (the clause on the closure that is RETURNED), which is a second pair of parentheses and yours to choose |
+| ``Rewrite as `child(each(…))` `` | one of the six `View` methods A99 retired — `when`, `swap`, `swap_split`, `bind_each`, `bind_each_values`, `bind_each_by`. The edit covers the call alone, so the receiver, the chain around it and the arguments are untouched text; the `{each(…)}` hole the diagnostic also names is left to you, since whether a hole is right is a question about the markup around the call |
+| ``Convert with `.as_u53()` `` | ``Expected u53, but got i32 instead. There are no implicit numeric conversions; convert with `.as_u53()` `` — a value of one numeric width where another is declared (an argument, a `let` annotation, a reassignment, a return, a field, a subscript's index). The edit writes the conversion the message names after the value, parenthesizing it first unless it is already a name, a field path or a call chain, so `xs.len() + 1` becomes `(xs.len() + 1).as_u53()` — the whole value, not its last operand. Where the message names an index (``Expected usize (an index: a position, a length or a count), but got i32 instead. …``) it is the same edit, and it is also offered on an operator between a `usize` and another integer width (`` `<` compares two values of the same type, but the operands are `i32` and `usize` ``), where nothing is declared: the non-index operand converts to `usize` |
+| ``Declare `at` a `usize` `` | the same index mismatch, when the value is a counter bound by a bare literal earlier in the same function (`mut at = 0;`). The edit writes `: usize` after the counter's name, because the counter IS an index — converting at each of its uses would leave `.as_usize()` on a value that should never have been anything else. Offered ahead of the conversion |
+| ``Convert all 2 indexes in this file`` | any index mismatch, when the file carries more than one — a file migrating to `usize` meets one per index, and this action takes each one's first fix (the declaration where there is one, else the conversion) in ONE edit. It is the edit `vilan check --fix` makes, file by file, until nothing is left to fix |
 
 and two source actions:
 
 | Action | Does |
 |---|---|
-| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. Offered only when it would change something |
+| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. A statement whose every leaf is unused is *rewritten* rather than deleted when the module's file is where an `impl` the code calls a method from lives — `impl`s travel with any import that reaches the module, so deleting the statement would break the build. The rewrite is the narrowest statement that keeps it: an impl SELECTOR (`import pkg::a::b;` becomes `import pkg::a::{ (impl Style) };`) when everything the file uses from that module is one subject's blocks, and the bare module import (`import pkg::a;`) when it is not. A selector is a leaf like any other: one whose implementation the file never calls a method from fades and prunes, one it does use stays. Visibility spellings are preserved verbatim, never rewritten: a reach marker (`#helper`) stays on its leaf, a trailing `only` stays on its statement, and a selector keeps the type it was written with. The module-level `export *;` is not an import and does not move — a NEW leading import is inserted above it, so the marker keeps the slot `vilan fmt` gives it, just below the file's import run. Offered only when it would change something |
 | **Add All Missing Imports** | applies every unambiguous import quickfix in the file at once, skipping the ambiguous ones |
 
 An import the **prelude** covers is stripped for the same reason an unused
@@ -166,16 +285,17 @@ diagnostic or on the file:
 | Action | Does |
 |---|---|
 | **Convert to a `style()` chain** | rewrites the `css { … }` block the cursor is in as the builder chain it lowers to — a declaration becomes a `.raw` link, a nested rule becomes a combinator link carrying the inner chain |
-| **Convert to a `css` block** | the inverse, on a `style()` chain. Only the two rows of that lowering have a block spelling, so a chain carrying a typed property method (`.padding(space(4))`, which writes its slot through `with_length`) is not offered the conversion at all |
+| **Reflow this comment** | re-prints the file with comment wrapping on, whatever `[fmt] wrap_comments` says — an explicit action is consent where a format-on-save is not. Offered with the cursor in a comment, and only where the wrap changes something: a run already filled, one no line of which is over the width, a trailing comment after code, and each of the ten never-reflow classes get no action. The edit is the whole buffer, because the fill is the formatter's own and asking it is what keeps this and format-on-save in agreement |
+| **Convert to a `css` block** | the inverse, on a `style()` chain — seeded by any path ending in `style()`, so `style::style()` (what the web prelude publishes) reads as one. A typed property method is converted by *inlining its std body*: `.padding_x(space(4))` is `with_length("padding-left", value).with_length("padding-right", value)`, so it writes both declarations with the argument in each. A link with no block spelling — a user extension, a method whose body is not a chain (`.border(…)`), `.class_list()` — *splits* the chain instead of refusing it: everything before it becomes the block and the rest is written as a postfix chain on it (`css { … }.select_off()`). Not offered when no link converts |
 
 Both directions decline rather than guess. A **comment** inside the
 construct stops the conversion, because its attachment is not recoverable
 across the reshape — the same refusal `vilan fmt` makes when it declines to
-reorder a commented block. So does a value carrying a **backslash**: a
-chain's string literal has its escapes processed at emission and a block's
-token run does not, so the two spellings would stop meaning the same thing.
-A quoted value is fine — escaping a `"` into the literal round-trips
-exactly — and the two directions are inverses on everything they accept.
+reorder a commented block. So does a declaration with **several
+arguments** (`margin(px(4), px(8))`): its chain twin needs
+`std::style::piece`, which is ambient inside a block and nowhere else, so
+the chain written out would name something the file does not import. The
+two directions are inverses on everything they accept.
 
 ## What it does while you type
 
@@ -227,8 +347,20 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 | `vilan.inlayHints.enabled` | `true` | |
 | `vilan.semanticTokens.enabled` | `true` | off falls back to the TextMate grammar |
 | `vilan.completion.functionCall` | `full` | `parensOnly`, or `none` |
+| `vilan.autoClosing.generics` | `true` | pair a generic `<` and type over its `>`; off for Vim emulation |
 | `vilan.organizeImports.onSave` | `false` | |
 
 Everything but the two paths applies live. **Vilan: Restart Language
 Server** is in the command palette when you want the blunt instrument, and
 the **Vilan Language Server** output channel carries the server's own log.
+
+**Vilan: Show Language Server Status** writes this session's profile to that
+same channel: the extension's request tally first — session age, server
+starts, per-request count / mean / max, slowest total first — and then the
+server's own page, which adds its retained-state cardinalities (open
+documents, how many still hold a program, caches, pending analyses), the
+analysis counts, its own per-request profile, and its memory reading:
+resident size with the heap split into in-use and retained-free. The server
+writes that page by itself every 500 requests; the command asks for it now,
+which is when a session has started feeling slow. A figure the host declines
+to report prints `?` rather than a zero.

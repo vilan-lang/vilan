@@ -1,7 +1,9 @@
 // `std::debug` — `[derive(Debug)]` synthesizes `debug(self): str`, a developer
-// representation `Type { field = value, … }` built from the fields. Scalars
-// format via the host `JSON.stringify` (numbers/bools raw, strings quoted and
-// escaped); nested derived structs recurse through their own `debug`.
+// representation `Type { field = value, … }` built from the fields. Scalars format
+// via the host `JSON.stringify` (numbers/bools raw, strings quoted and escaped);
+// nested derived structs recurse through their own `debug`.
+
+export *;
 
 trait Debug {
 	fun debug(self): str;
@@ -38,13 +40,13 @@ macro fun Debug(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, quote, join };
 
-	// Debug output glues text fragments around each `.debug()` call, so the
-	// pieces join on ` + ", " + ` — a quoted separator between quoted labels.
+	// Debug output glues text fragments around each `.debug()` call, so the pieces
+	// join on ` + ", " + ` — a quoted separator between quoted labels.
 	let glued_comma = " + " + quote(", ") + " + ";
 
 	if item.as_struct() is Some(let target) {
-		// `"T { " + "a = " + self.a.debug() + ", " + … + " }"`; a
-		// field-less struct is just its name.
+		// `"T { " + "a = " + self.a.debug() + ", " + … + " }"`; a field-less struct
+		// is just its name.
 		mut body = "";
 		if target.fields.len() == 0 {
 			body = quote(target.name);
@@ -53,10 +55,15 @@ macro fun Debug(item: Item): Source {
 			for field in target.fields {
 				parts.push(quote(i"{field.name} = ") + i" + self.{field.name}.debug()");
 			}
-			body = quote(i"{target.name} \{ ") + " + " + join(parts, glued_comma) + " + " + quote(" }");
+			body = quote(i"{target.name} \{ ")
+				+ " + "
+				+ join(parts, glued_comma)
+				+ " + "
+				+ quote(" }");
 		}
 		let printer = fun_of("debug").parameter("self").returns("str").expr(body);
 		ret source("import std::debug::Debug;\n" + impl_of(target.name)
+			.generics(target.binders("Debug"))
 			.implements("Debug")
 			.method(printer)
 			.render());
@@ -79,12 +86,17 @@ macro fun Debug(item: Item): Source {
 					index = index + 1;
 				}
 				let bind_pattern = join(binds, ", ");
-				let rendering = quote(i"{variant.name}(") + " + " + join(parts, glued_comma) + " + " + quote(")");
+				let rendering = quote(i"{variant.name}(")
+					+ " + "
+					+ join(parts, glued_comma)
+					+ " + "
+					+ quote(")");
 				arms = arms.arm(i"{target.name}::{variant.name}({bind_pattern})", rendering);
 			}
 		}
 		let printer = fun_of("debug").parameter("self").returns("str").expr(arms.render());
 		ret source("import std::debug::Debug;\n" + impl_of(target.name)
+			.generics(target.binders("Debug"))
 			.implements("Debug")
 			.method(printer)
 			.render());
@@ -122,6 +134,11 @@ impl i53 with Debug {
 }
 
 impl u53 with Debug {
+	[extern("JSON.stringify")]
+	external fun debug(self): str;
+}
+
+impl usize with Debug {
 	[extern("JSON.stringify")]
 	external fun debug(self): str;
 }

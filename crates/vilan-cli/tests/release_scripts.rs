@@ -27,6 +27,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -62,7 +64,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, changelog: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!(
+        let root = support::scratch_root().join(format!(
             "vilan-release-scripts-{name}-{}",
             std::process::id()
         ));
@@ -166,7 +168,7 @@ impl Drop for Fixture {
     }
 }
 
-/// One entry of each family, deliberately out of §7.2's order, and every
+/// One entry of each of the six families, deliberately out of §7.2's order, and every
 /// separator irregularity a week of lane merges actually produces: a `---`
 /// with no blank line after it, a doubled rule where two lanes each brought
 /// their own, and a trailing rule before the next section's heading.
@@ -192,11 +194,20 @@ A second paragraph, which belongs to the breaking entry.
 **A feature entry.** What is newly possible.
 
 ---
+<!-- family: performance -->
+**A performance entry.** What costs less now.
+
+---
 
 ---
 
 <!-- family: miscompile -->
 **A miscompile entry.** What the compiler was wrong about.
+
+---
+
+<!-- family: fix -->
+**A fix entry.** What was wrongly refused or reported.
 
 ---
 
@@ -224,8 +235,8 @@ fn the_cut_retitles_the_section_and_orders_it_by_family() {
     // Sweep (a): every entry traces to the commit that introduced it.
     assert_eq!(
         traced_entries(&report),
-        4,
-        "expected four traced entries:\n{report}"
+        6,
+        "expected six traced entries:\n{report}"
     );
 
     // The whole file, byte for byte. The retitle, §7.2's family order, the
@@ -250,8 +261,18 @@ A second paragraph, which belongs to the breaking entry.
 
 ---
 
+<!-- family: fix -->
+**A fix entry.** What was wrongly refused or reported.
+
+---
+
 <!-- family: feature -->
 **A feature entry.** What is newly possible.
+
+---
+
+<!-- family: performance -->
+**A performance entry.** What costs less now.
 
 ---
 
@@ -302,7 +323,7 @@ fn the_cut_refuses_an_entry_it_cannot_classify_instead_of_guessing() {
     );
     // Refusing is not a reason to stop reporting: the sweep still runs, so one
     // run tells the operator everything that is wrong.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
     assert!(!out.exists(), "a refused cut must write nothing");
 
     // An unknown family is refused the same way, naming what it does not know.
@@ -375,7 +396,7 @@ fn the_cut_refuses_a_marker_that_opens_no_entry() {
     );
     // Refusing is not a reason to stop reporting: the sweep still traces the
     // four entries the section does hold.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
 
     // A `commit:` marker is a marker too.
     let stranded = SCRAMBLED.replace(
@@ -525,7 +546,7 @@ fn the_cut_accepts_a_commit_marker_on_either_side_of_the_family_marker() {
         ok,
         "the cut refused a commit marker beside a family marker:\n{report}"
     );
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
     let proposed = fs::read_to_string(&out).expect("read the proposed changelog");
     for family in ["breaking", "feature"] {
         let expected =
@@ -816,7 +837,7 @@ fn refuse_ci(name: &str, verdict: &str) -> String {
     assert!(!out.exists(), "a refused cut must write nothing");
     // Fail-closed is not fail-degraded: the sweep still traces every entry,
     // so one run tells the operator everything.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
     report
 }
 
@@ -920,7 +941,7 @@ fn the_cut_refuses_when_no_gh_can_read_ci_at_all() {
     );
     assert!(report.contains("refusing to cut"), "{report}");
     // Fail-closed is not fail-degraded here either.
-    assert_eq!(traced_entries(&report), 4, "{report}");
+    assert_eq!(traced_entries(&report), 6, "{report}");
 }
 
 #[test]
@@ -1047,6 +1068,65 @@ fn both_scripts_are_committed_executable() {
     }
 }
 
+/// The release commit stages EVERY workspace member's manifest (N125, from
+/// the cut plan's dry run): `bump-version.sh` rewrites `crates/*/Cargo.toml`,
+/// and a hand-named list in `cut-release.sh` had gone stale — it named the six
+/// manifests v0.40.0 had and omitted `vilan-rt`, `vilan-rt-sqlite` and
+/// `vilan-rust`, so a `--commit` cut would have left three bumped manifests
+/// unstaged and tagged the wrong tree.
+///
+/// The pin RUNS the script's own `release_files` (extracted, so nothing else
+/// in the script executes) from the repository root and holds its manifests
+/// to the root `Cargo.toml`'s `members`, both directions — a crate that joins
+/// the workspace joins the release commit, and nothing outside it does.
+#[test]
+fn the_release_commit_stages_every_workspace_members_manifest() {
+    let root = repository_root();
+    let script = fs::read_to_string(root.join("scripts").join("cut-release.sh"))
+        .expect("read scripts/cut-release.sh");
+    let start = script
+        .find("release_files() {")
+        .expect("cut-release.sh defines `release_files`");
+    let end = start
+        + script[start..]
+            .find("\n}\n")
+            .expect("`release_files` has a closing brace")
+        + 3;
+    let definition = &script[start..end];
+    let listed = Command::new("sh")
+        .current_dir(&root)
+        .arg("-c")
+        .arg(format!("{definition}\nrelease_files"))
+        .output()
+        .expect("run release_files");
+    assert!(listed.status.success(), "release_files failed");
+    let staged: std::collections::BTreeSet<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter(|line| line.ends_with("Cargo.toml"))
+        .map(str::to_string)
+        .collect();
+
+    let workspace = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let members_start = workspace.find("members = [").expect("a members list");
+    let members_end = members_start + workspace[members_start..].find(']').expect("its end");
+    let members: std::collections::BTreeSet<String> = workspace[members_start..members_end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('"'))
+        .map(|line| format!("{}/Cargo.toml", line.trim_matches(|c| c == '"' || c == ',')))
+        .collect();
+
+    assert!(!members.is_empty(), "the workspace names its members");
+    assert_eq!(
+        staged, members,
+        "the release commit must stage exactly the workspace members' manifests"
+    );
+    assert!(
+        script.contains("RELEASE_FILES=\"$(release_files)\""),
+        "the staged list and the printed `git add` line are both `release_files`"
+    );
+}
+
 // --- The installer's checksum step (backlog §L item 15, the "S half") ------
 //
 // `scripts/install.sh` downloads a release tarball, verifies it against the
@@ -1150,7 +1230,7 @@ impl Installer {
     fn new(name: &str, sha256_tool: Option<&Path>) -> Installer {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!(
+        let root = support::scratch_root().join(format!(
             "vilan-install-script-{name}-{}",
             std::process::id()
         ));

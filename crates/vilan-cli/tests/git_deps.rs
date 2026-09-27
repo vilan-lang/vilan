@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod support;
+
 /// A scratch world: a HOME whose `.vilan/git-deps` is the cache under test,
 /// a place for fixture repositories, and a place for projects.
 struct Fixture {
@@ -25,7 +27,7 @@ impl Fixture {
     fn new(tag: &str) -> Fixture {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let root = support::scratch_root().join(format!(
             "vilan_gitdep_{tag}_{}_{unique}",
             std::process::id()
         ));

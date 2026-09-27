@@ -199,7 +199,10 @@ fn bumps_propagates_through_a_forwarding_call() {
 fn bumps_extern_off_table_defaults_to_bumping() {
     // A bodyless extern with a `&mut` parameter may do anything — the safe
     // default — and the verdict propagates to its caller.
-    let source = "external fun grow(xs: &mut List<i32>);\nfun call_it(xs: &mut List<i32>) { grow(xs); }\nfun main() { mut xs = [ 1 ]; call_it(&mut xs); }\n";
+    // B360: the extern carries a host binding, because a bodiless one with
+    // none names nothing at all. The verdict under test is unchanged — an
+    // OFF-TABLE extern still defaults to bumping.
+    let source = "[extern(\"globalThis.grow\")]\nexternal fun grow(xs: &mut List<i32>);\nfun call_it(xs: &mut List<i32>) { grow(xs); }\nfun main() { mut xs = [ 1 ]; call_it(&mut xs); }\n";
     assert_bumps(source, "grow", &[0]);
     assert_bumps(source, "call_it", &[0]);
 }
@@ -238,7 +241,7 @@ fn a_bumping_call_under_a_live_borrows_call_view_is_rejected() {
     // later push fires E2 exactly as a direct `&mut xs[0]` view always did.
     assert_fails_with(
         r#"
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         fun main() {
@@ -258,7 +261,7 @@ fn reassigning_the_root_under_a_live_borrows_call_view_is_rejected() {
     // E1 through the anchored view: whole-root reassignment, not a call.
     assert_fails_with(
         r#"
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         fun main() {
@@ -279,7 +282,7 @@ fn holding_a_borrows_call_view_across_await_is_rejected() {
     assert_fails_with(
         r#"
         import std::time::sleep;
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         async fun work() {
@@ -300,7 +303,7 @@ fn a_mutation_of_a_sibling_root_under_a_borrows_call_view_is_accepted() {
     // The anchor is precise: pushing a DIFFERENT list never touches v's root.
     assert_compiles(
         r#"
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         fun main() {
@@ -393,7 +396,7 @@ fn a_bumping_call_on_a_user_container_inside_for_mut_is_rejected() {
     assert_fails_with(
         r#"
         import std::option::Option::{ self, Some, None };
-        struct Bag { items: List<i32>, cursor: i32 }
+        struct Bag { items: List<i32>, cursor: usize }
         impl Bag {
             fun next_mut(&mut self): Option<&mut i32> {
                 if self.cursor < self.items.len() {
@@ -428,7 +431,7 @@ fn a_content_stable_call_on_a_user_container_inside_for_mut_is_accepted() {
     assert_compiles(
         r#"
         import std::option::Option::{ self, Some, None };
-        struct Bag { items: List<i32>, cursor: i32 }
+        struct Bag { items: List<i32>, cursor: usize }
         impl Bag {
             fun next_mut(&mut self): Option<&mut i32> {
                 if self.cursor < self.items.len() {
@@ -787,7 +790,7 @@ fn a_std_drop_with_a_by_value_receiver_is_caught_by_the_general_rule() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        resource struct R { handle: i32 }
+        [resource] struct R { handle: i32 }
         impl R with Drop { fun drop(self) {} }
         fun main() { let r = R { handle = 1 }; }
         "#,
@@ -1627,15 +1630,15 @@ fn bind_styled_cannot_construct_its_style_at_runtime() {
 }
 
 #[test]
-fn ssr_bind_each_renders_current_list() {
+fn ssr_each_renders_current_list() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, each, render, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             let items: SignalCell<List<str>> = Signal::new(["a", "b", "c"]);
-            print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
+            print(render(view("ul").child(each(items, |s| s, |s| view("li").text(s)))));
         }
         "#,
         "<ul><li>a</li><li>b</li><li>c</li></ul>\n",
@@ -1643,15 +1646,15 @@ fn ssr_bind_each_renders_current_list() {
 }
 
 #[test]
-fn ssr_bind_each_over_empty_list_renders_no_rows() {
+fn ssr_each_over_empty_list_renders_no_rows() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, each, render, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             let items: SignalCell<List<str>> = Signal::new([]);
-            print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
+            print(render(view("ul").child(each(items, |s| s, |s| view("li").text(s)))));
         }
         "#,
         "<ul></ul>\n",
@@ -1663,12 +1666,12 @@ fn ssr_when_renders_the_taken_branch_only() {
     // Both branches: true renders the body, false renders nothing.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, render, view, when };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
-            print(render(view("div").when(Signal::new(true), || view("p").text("shown"))));
-            print(render(view("div").when(Signal::new(false), || view("p").text("shown"))));
+            print(render(view("div").child(when(Signal::new(true), || view("p").text("shown")))));
+            print(render(view("div").child(when(Signal::new(false), || view("p").text("shown")))));
         }
         "#,
         "<div><p>shown</p></div>\n<div></div>\n",
@@ -1679,16 +1682,16 @@ fn ssr_when_renders_the_taken_branch_only() {
 fn ssr_swap_renders_the_current_value_branch() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, render, swap, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         [derive(PartialEq)]
         enum Tab { A, B }
         fun main() {
-            print(render(view("nav").swap(Signal::new(Tab::B), |t| match t {
+            print(render(view("nav").child(swap(Signal::new(Tab::B), |t| match t {
                 Tab::A => view("a").text("first"),
                 Tab::B => view("a").text("second"),
-            })));
+            }))));
         }
         "#,
         "<nav><a>second</a></nav>\n",
@@ -1697,8 +1700,9 @@ fn ssr_swap_renders_the_current_value_branch() {
 
 #[test]
 fn ssr_show_toggles_the_hidden_attribute() {
-    // `show(true)` renders nothing extra; `show(false)` adds `hidden` (mirrors the
-    // DOM's `element.hidden`).
+    // `show(true)` renders nothing extra; `show(false)` adds BOTH the `hidden`
+    // attribute and the inline `display:none` — the two writes the browser twin
+    // makes, because the attribute alone loses to any app `display` (A60).
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
@@ -1709,7 +1713,7 @@ fn ssr_show_toggles_the_hidden_attribute() {
             print(render(view("span").show(Signal::new(false))));
         }
         "#,
-        "<span></span>\n<span hidden=\"\"></span>\n",
+        "<span></span>\n<span hidden=\"\" style=\"display:none\"></span>\n",
     );
 }
 
@@ -2117,28 +2121,154 @@ fn hyphenated_attribute_names_parse_and_emit_verbatim() {
 }
 
 #[test]
-fn an_element_without_view_in_scope_fails_at_the_element_head() {
-    // No auto-import: the desugared `view` accessor spans `<tag`, so the
-    // unresolved-name diagnostic underlines the element head the user wrote —
-    // and carries the import steer as a note (element-syntax S4).
-    assert_fails_spanning(
+fn an_element_needs_no_view_import_at_all() {
+    // B270, replacing `an_element_without_view_in_scope_fails_at_the_element_
+    // head`, which pinned the behaviour this reverses. The desugar's callee is
+    // a scope-independent reference to `std::ui::view` and the loader seeds
+    // `std::ui` off that reference, so an element compiles with nothing
+    // imported — the import steer survives only for a std that cannot supply
+    // `view` at all.
+    assert_compiles(
         r#"
         fun main() {
             let _x = <div/>;
         }
         "#,
-        "<div",
+    );
+}
+
+// --- A35, SUPERSEDED by B270: the element desugar's `view` is HYGIENIC -----
+//
+// The desugar's callee was a bare `view`, so a user item of that name captured
+// it: lucide ships an icon called `view`, its generated `fun view(): View`
+// silently took over, and every `<tag />` in the file reported
+// `` `view` expects 0 arguments, but got 1 instead `` against the ELEMENT — an
+// arity nobody wrote. A35 RULED that to a curated message (2026-09-01), on the
+// ground that shadowing a name is a ruled feature.
+//
+// B270 (the owner's find, 2026-09-07) overturns the ground: the `css` block's
+// twin seed made the whole form UNUSABLE under `prelude = "std::web"`, where
+// the ambient `style` is a module, and no message can rescue a form that
+// cannot be written. Both desugars now name their std item directly, so
+// neither is capturable and A35's message has nothing left to report — it is
+// deleted here with its ledger row (360) and its errors-appendix entry.
+// Shadowing is untouched as a language feature: what changed is that a
+// GENERATED callee nobody wrote is no longer a name the site can bind.
+
+#[test]
+fn b270_a_shadowing_view_does_not_capture_the_element_desugar() {
+    // A35's own repro, inverted. `view` is the file's own function AND the
+    // element head's callee is std's — both live in one file.
+    assert_compiles(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _n = view();
+            let _x = <div/>;
+        }
+        "#,
+    );
+    // And the local form, which is the one a `let` in a function body makes:
+    // a non-callable binding, which used to report "1 is not callable" at the
+    // element head.
+    assert_compiles(
+        r#"
+        fun main() {
+            let view = 1;
+            let _x = <div/>;
+            let _n = view + 1;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b270_the_lowered_call_still_needs_its_module() {
+    // The control: hygiene is for the DESUGAR's callee, not for hand-written
+    // code. `ui::view("div")` typed out still resolves through the import the
+    // author wrote, and a bare `view()` still means the file's own.
+    assert_compiles(
+        r#"
+        import std::ui;
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = ui::view("div");
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a35_a_hand_written_view_call_keeps_the_ordinary_arity_message() {
+    // The control the detection rests on: element origin is the SUBJECT's
+    // markup span (it starts with `<`), so a `view(..)` the author actually
+    // typed — whose subject span is the ident — is an ordinary arity mistake
+    // and must not be told about element syntax it never used.
+    assert_fails_with(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = view(1);
+        }
+        "#,
+        "`view` expects 0 arguments, but got 1 instead",
+    );
+    assert_fails_without(
+        r#"
+        fun view(): i32 { 1 }
+        fun main() {
+            let _x = view(1);
+        }
+        "#,
+        "element syntax lowers to",
+    );
+}
+
+#[test]
+fn n69_an_unresolved_view_is_reported_without_an_import_steer() {
+    // N69: `element_view_import_note` is deleted, not narrowed. It attached
+    // "element syntax lowers to std::ui::view; add `import std::ui::{ view,
+    // View };`" to an unresolved `view` whose span was MARKUP, and after B270
+    // an element's callee is a scope-independent reference to `std::ui::view`
+    // — so the note could only fire for a std with no `ui::view` at all, where
+    // the import it steers at would miss exactly the same way. A note that can
+    // only fire where its own advice is false is worse than no note; the
+    // reachability half is held by `an_element_needs_no_view_import_at_all`
+    // above, which goes red the moment an element needs the import again.
+    //
+    // What is left is the ordinary miss, for the author who wrote the lowered
+    // call by hand: the plain message, and nothing about element syntax they
+    // did not use.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _x = view("div");
+        }
+        "#,
         "cannot find 'view' in this scope",
     );
-    assert_fails_noting(
+    assert_fails_without(
         r#"
         fun main() {
-            let _x = <div/>;
+            let _x = view("div");
         }
         "#,
-        "cannot find 'view' in this scope",
-        "<div",
-        "element syntax lowers to std::ui::view",
+        "element syntax lowers to",
+    );
+}
+
+#[test]
+fn b270_an_explicit_view_import_is_still_redundant_rather_than_wrong() {
+    // The other control: files that already import `view` — every file written
+    // before B270 — keep compiling, and the import keeps meaning what it said.
+    assert_compiles(
+        r#"
+        import std::ui::view;
+        fun main() {
+            let _x = <div/>;
+            let _y = view("span");
+        }
+        "#,
     );
 }
 
@@ -2197,6 +2327,190 @@ fn a_macro_generated_element_desugars() {
         }
         "#,
         "<p>from a macro</p>\n",
+    );
+}
+
+// --- A46: the fragment `<>…</>` lowers to a `List<View>` LITERAL -------------
+//
+// The nameless head is a different LOWERING, not an element with no tag: the
+// desugar emits the list its children make, so the fragment's TYPE is
+// `List<View>` — which the child contract's static arm already places, and
+// whose reactive twin keeps position through A71's region. No runtime type is
+// introduced, which is exactly why the pins below are typing and emission
+// claims rather than a new surface's behavior.
+
+#[test]
+fn a46_a_fragment_lowers_to_a_list_literal_byte_for_byte() {
+    // The strongest form of "no new runtime type": the fragment program and
+    // the list-literal program emit the same JS, byte for byte.
+    let fragment = r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let group: List<View> = <>
+                <i>"a"</i>
+                <b>"b"</b>
+            </>;
+            print(render(view("p").child(group)));
+        }
+        "#;
+    let list = r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let group: List<View> = [view("i").child("a"), view("b").child("b")];
+            print(render(view("p").child(group)));
+        }
+        "#;
+    assert_eq!(
+        compile(fragment).expect("the fragment program compiles"),
+        compile(list).expect("the list program compiles"),
+        "a fragment must emit the list literal's exact JS"
+    );
+}
+
+#[test]
+fn a46_an_empty_fragment_is_an_empty_list() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let nothing: List<View> = <></>;
+            print(render(view("p").child(nothing)));
+        }
+        "#,
+        "<p></p>\n",
+    );
+}
+
+#[test]
+fn a46_a_fragment_fills_a_child_position_bare_and_in_a_hole() {
+    // Both spellings of a child: the fragment written bare among the siblings,
+    // and the same fragment through a `{hole}`. Element syntax lowers each to
+    // `.child(…)`, and `List<View>`'s Slot arm places the run in order.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun pair(): List<View> {
+            <><i>"a"</i><b>"b"</b></>
+        }
+        fun main() {
+            print(render(<p><span>"head"</span><>{view("u").child("u")}</>{pair()}</p>));
+        }
+        "#,
+        "<p><span>head</span><u>u</u><i>a</i><b>b</b></p>\n",
+    );
+}
+
+#[test]
+fn a46_a_fragment_does_not_flatten_into_a_fragment() {
+    // The other face of "no new runtime type": a fragment IS a list literal,
+    // so a fragment written directly inside one is a `List<View>` where a
+    // `View` element belongs, and the list literal's own element-type rule
+    // refuses it. Nesting works through a CHILD position (the pin above),
+    // where the `Slot` arm places the run — not through the literal, which
+    // would have to concatenate. Documented as the limit it is.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _group: List<View> = <><i>"a"</i><>{view("b").child("b")}</></>;
+        }
+        "#,
+        "Expected View (this literal's element type), but got List<View> instead",
+    );
+}
+
+#[test]
+fn a46_a_fragment_is_a_list_and_not_a_view() {
+    // A46's documented LIMIT, pinned where a reader meets it: a fragment is
+    // legal in child position and wherever a list is, and it is not a `View`,
+    // so a `fun …: View` return refuses it by the ordinary type rule — no
+    // special-cased message, and the span is the whole fragment.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun toolbar(): View {
+            <><i>"a"</i><b>"b"</b></>
+        }
+        "#,
+        "Expected View, but got List<View> instead",
+    );
+}
+
+#[test]
+fn a46_a_fragment_close_must_be_the_nameless_one() {
+    // `<>` opens the nameless head, so only `</>` closes it — a named close
+    // inside a fragment is the mismatch, reported against `</>`.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <><i>"a"</i></div>;
+        }
+        "#,
+        "`</>`",
+    );
+}
+
+#[test]
+fn a46_a_named_close_still_names_its_own_tag_inside_a_fragment() {
+    // The converse of the pin above: the fragment arm must not swallow a
+    // NESTED element's own close-tag mismatch.
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <><div>"x"</span></>;
+        }
+        "#,
+        "expected `</div>`",
+    );
+}
+
+#[test]
+fn a46_a_reactive_fragment_is_the_source_list_arm() {
+    // The half A46's recommendation left open, closed by A71: a `Source` of
+    // fragments is the `Source<List<View>>` child arm, so the run is replaced
+    // in place rather than appended behind its siblings. Typing is the claim
+    // here; `ui_rows.rs` holds the positional behavior.
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            let mark: SignalCell<i32> = Signal::new(1);
+            let _root = mount_root("app", || {
+                <main>
+                    <header>"head"</header>
+                    {mark.map(|value: i32| <><i>{i"m{value}"}</i><b>"b"</b></>)}
+                    <footer>"foot"</footer>
+                </main>
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a46_the_ssr_twin_renders_a_fragment_as_its_run() {
+    // The process twin needs nothing of its own: `List<View>`'s Slot arm is
+    // already declared there, so the fragment serializes as the run it is.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(<ul>{rows()}</ul>));
+        }
+        fun rows(): List<View> {
+            <><li>"one"</li><li>"two"</li></>
+        }
+        "#,
+        "<ul><li>one</li><li>two</li></ul>\n",
     );
 }
 
@@ -2259,17 +2573,17 @@ fn a_generic_method_dispatches_a_bound_on_a_closure_parameter() {
 }
 
 #[test]
-fn bind_each_rows_dispatch_slot_children() {
+fn each_rows_dispatch_slot_children() {
     // The same bug's std face, the one every real app hits: a row closure's
     // `.child(t)` dropped the text (empty stub) while a literal child worked.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, render, view };
+        import std::ui::{ View, each, render, view };
         fun main() {
             let items: SignalCell<List<str>> = Signal::new(["alpha", "beta"]);
-            print(render(view("ul").bind_each(items, |t| t, |t| view("li").child(t))));
+            print(render(view("ul").child(each(items, |t| t, |t| view("li").child(t)))));
         }
         "#,
         "<ul><li>alpha</li><li>beta</li></ul>\n",
@@ -2307,19 +2621,22 @@ fn a_closure_parameter_of_an_unimplemented_type_fails_the_bound() {
 
 #[test]
 fn a_let_bound_closure_with_an_untypable_parameter_reports_honestly() {
-    // The one shape the deferral cannot finish: a let-bound closure whose
-    // parameter no owning call ever types. Before the fix this misrendered
-    // silently; now it is an honest unresolved-type diagnostic (annotating
-    // the parameter resolves it).
-    assert_fails_with(
+    // The shape the deferral could not finish: a let-bound closure whose
+    // parameter no OWNING call types. Before that fix this misrendered
+    // silently; then it was an honest unresolved-type diagnostic; since B392
+    // the parameter takes its first call site's type when the fixpoint stalls
+    // (`wrap("later")` makes `x` a `str`), and the page renders.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         import std::ui::{ View, render, view };
         fun main() {
             let wrap = |x| view("p").child(x);
-            let _page = render(wrap("later"));
+            print(render(wrap("later")));
         }
+        main();
         "#,
-        "could not be resolved",
+        "<p>later</p>\n",
     );
 }
 
@@ -2946,7 +3263,7 @@ fn ssr_example_app_renders_the_served_markup() {
     // then replaces (proposal/ssr.md §1, §3).
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, each, render, view, when };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun app(): View {
@@ -2956,8 +3273,8 @@ fn ssr_example_app_renders_the_served_markup() {
             view("main")
                 .class("app")
                 .child(view("h1").text("Tasks & <notes>"))
-                .child(view("ul").bind_each(tasks, |task| task, |task| view("li").text(task)))
-                .child(view("section").when(show_note, || view("p").text("server-rendered, then replaced")))
+                .child(view("ul").child(each(tasks, |task| task, |task| view("li").text(task))))
+                .child(view("section").child(when(show_note, || view("p").text("server-rendered, then replaced"))))
                 .child(view("button").bind_text(label).on("click", || label.set("clicked")))
         }
         fun main() {
@@ -3300,6 +3617,13 @@ fn a_backslash_before_a_crlf_break_after_a_hole_in_a_triple_quoted_string_emits_
 /// platform coloring gave a layer requirement — the observable that says
 /// whether the file was recognized as library territory or silently demoted to
 /// "user code".
+///
+/// `cfg(unix)` because its one caller is (tracker N45): the symlink pin below
+/// is the only thing that needs it, and a helper compiled with no caller is
+/// `dead_code` — which `-D warnings` makes an ERROR, so on the Windows target
+/// this one function was the whole reason a `cargo clippy --all-targets` leg
+/// could not be added for it.
+#[cfg(unix)]
 fn entry_functions_with_a_requirement(entry: &Path) -> (usize, usize) {
     let std = std_spec();
     let source: &'static str = Box::leak(
@@ -3355,12 +3679,11 @@ fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
         .canonicalize()
         .expect("the browser layer is on disk");
 
-    let scratch = std::env::temp_dir().join(format!(
+    let scratch = scratch_dir(&format!(
         "vilan-layer-symlink-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("create the scratch directory");
     let link = scratch.join("layer");
     std::os::unix::fs::symlink(&real, &link).expect("symlink the browser layer");
@@ -3419,9 +3742,7 @@ fn analyze_package(files: &[(&str, &str)], entry: &str) -> PackageOutcome {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let directory =
-        std::env::temp_dir().join(format!("vilan_init_order_{}_{unique}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = scratch_dir(&format!("vilan_init_order_{}_{unique}", std::process::id()));
     for (relative, contents) in files {
         let path = directory.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3505,13 +3826,11 @@ fn compile_and_run_package(
 
     let js = compile_package(files, entry)?;
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "vilan_init_order_run_{}_{unique}.js",
-        std::process::id()
-    ));
-    std::fs::write(&path, &js).map_err(|error| vec![error.to_string()])?;
-    let output = std::process::Command::new("node").arg(&path).output();
-    let _ = std::fs::remove_file(&path);
+    let file = ScratchFile::write(
+        &format!("vilan_init_order_run_{}_{unique}.js", std::process::id()),
+        &js,
+    )?;
+    let output = std::process::Command::new("node").arg(file.path()).output();
     match output {
         Ok(output) if output.status.success() => {
             Ok((js, String::from_utf8_lossy(&output.stdout).into_owned()))
@@ -4902,14 +5221,14 @@ fn a_const_site_reads_its_module_bindings_afresh_and_never_another_sites() {
 
         let TABLE: List<i32> = const seed();
 
-        fun grown(): i32 {
+        fun grown(): usize {
             mut local = TABLE;
             local.push(9);
             local.len()
         }
 
-        let FIRST: i32 = const grown();
-        let SECOND: i32 = const grown();
+        let FIRST: usize = const grown();
+        let SECOND: usize = const grown();
 
         fun main() {
             print(FIRST);
@@ -5497,7 +5816,7 @@ fn an_async_drop_in_a_module_is_attributed_to_the_module() {
             (
                 "alpha.vl",
                 "import std::drop::Drop;\n\
-                 resource struct Res { x: i32 }\n\
+                 [resource] struct Res { x: i32 }\n\
                  impl Res with Drop {\n\tasync fun drop(&mut self) {}\n}\n\
                  fun make(): Res { Res { x = 1 } }\n",
             ),
@@ -5582,14 +5901,17 @@ fn an_unresolved_value_in_a_module_is_attributed_to_the_module_too() {
 #[test]
 fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
     // The other diagnostic the same drain raises, carrying the same defect: an
-    // annotation that RESOLVED, to a trait, in value position (§12.2).
-    const ALPHA: &str =
-        "trait Shape {\n\tfun area(&self): i32;\n}\n\nfun size(shape: Shape): i32 {\n\t0\n}\n";
+    // annotation that RESOLVED, to a trait, in value position (§12.2). A RETURN
+    // since B184 — the parameter this was written on became B186's implicit
+    // generic and the field became B184's hidden parameter, so the return is
+    // the nearest position that still refuses.
+    const ALPHA: &str = "trait Shape {\n\tfun area(&self): i32;\n}\n\nfun shape(): \
+                         Shape {\n\t0\n}\n\nfun size(): i32 {\n\t0\n}\n";
     let outcome = analyze_package(
         &[
             (
                 "main.vl",
-                "import pkg::alpha::size;\nfun main() { size(1); }\n",
+                "import pkg::alpha::size;\nfun main() { size(); }\n",
             ),
             ("alpha.vl", ALPHA),
         ],
@@ -5600,7 +5922,7 @@ fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
         .iter()
         .find(|(message, _, _)| message.contains("'Shape' is a trait, not a type"))
         .expect("the bare trait in value position is refused");
-    let start = ALPHA.find("shape: Shape").unwrap() + "shape: ".len();
+    let start = ALPHA.find("shape(): Shape").unwrap() + "shape(): ".len();
     assert_eq!(
         (file.as_deref(), span.clone()),
         (Some("alpha.vl"), start..start + "Shape".len()),
@@ -5633,6 +5955,1172 @@ fn an_entry_global_does_not_satisfy_a_std_import_path() {
         import std::math::helper;
         fun helper(): i32 { 7 }
         fun main() { let x = helper(); }
+        "#,
+    );
+}
+
+// --- B172: a module-qualified path is a type in every type position ----------
+//
+// `style::Style` used to be a PARSE error wherever a type is written, while
+// `style::style()` and `style::Display::Flex` resolved and ran: the type
+// grammar's nominal form was a bare `IDENT`, so the `::` never belonged to the
+// type and whatever the position demanded next found it instead. That made the
+// `std::web` prelude — which carries `style` and `ui` as MODULE names — able to
+// reach every VALUE in `std::style` and no TYPE in it, and both web templates
+// carried a forced `import std::style::Style;` to work around it.
+//
+// The positions below are the whole list a type can be written in. Each one is
+// its own pin, per file policy: a class of positions closed on one
+// representative is how a "closed" item turns out never to have been covered.
+
+/// The module every position pin qualifies through: a struct, a trait it
+/// implements, and a function — so a path can name a type, a bound, and a
+/// non-type member in the same namespace.
+const SHAPES: &str = r#"
+        mod shapes {
+            trait Named {
+                fun name(&self): str;
+            }
+
+            struct Dot {
+                x: i32,
+            }
+
+            impl Dot with Named {
+                fun name(&self): str { "dot" }
+            }
+
+            fun make(): Dot {
+                Dot { x = 1 }
+            }
+        }
+"#;
+
+/// `SHAPES` followed by `rest` — the two-part source every pin below builds.
+fn with_shapes(rest: &str) -> String {
+    format!("{SHAPES}\n{rest}\n")
+}
+
+#[test]
+fn a_qualified_path_is_a_return_type() {
+    assert_compiles(&with_shapes(
+        "fun first(): shapes::Dot { shapes::make() }\n\
+         fun main() { let d = first(); print(i\"{d.x}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_let_annotation() {
+    assert_compiles(&with_shapes(
+        "fun main() { let d: shapes::Dot = shapes::make(); print(i\"{d.x}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_parameter_type() {
+    assert_compiles(&with_shapes(
+        "fun width(d: shapes::Dot): i32 { d.x }\n\
+         fun main() { print(i\"{width(shapes::make())}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_struct_field_type() {
+    assert_compiles(&with_shapes(
+        "struct Holder {\n\tinner: shapes::Dot,\n}\n\
+         fun main() { let h = Holder { inner = shapes::make() }; print(i\"{h.inner.x}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_an_impl_subject() {
+    assert_compiles(&with_shapes(
+        "impl shapes::Dot {\n\tfun doubled(&self): i32 { self.x * 2 }\n}\n\
+         fun main() { print(i\"{shapes::make().doubled()}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_trait_bound() {
+    assert_compiles(&with_shapes(
+        "fun label<T: shapes::Named>(value: &T): str { value.name() }\n\
+         fun main() { print(label(&shapes::make())); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_generic_argument() {
+    assert_compiles(&with_shapes(
+        "fun main() { let all: List<shapes::Dot> = [shapes::make()]; print(i\"{all.len()}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_nests_inside_another_type() {
+    // The type grammar is a cycle, so the path form has to be reachable from
+    // every arm of it, not just from the position the annotation opened in.
+    assert_compiles(&with_shapes(
+        "fun main() {\n\
+         \tlet nested: List<List<shapes::Dot>> = [[shapes::make()]];\n\
+         \tlet viewed: |shapes::Dot| i32 = |d: shapes::Dot| d.x;\n\
+         \tlet pair: (shapes::Dot, i32) = (shapes::make(), 2);\n\
+         \tlet boxed: [shapes::Dot; 1] = [shapes::make(); 1];\n\
+         \tlet seen: &shapes::Dot = &pair.0;\n\
+         \tprint(i\"{nested.len()}{viewed(shapes::make())}{boxed.len()}{seen.x}\");\n\
+         }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_carries_generic_arguments_on_its_last_segment() {
+    // `std::reactive::SignalCell<i32>` — a path of any depth whose tail is a
+    // generic application. The arguments parameterize the type the path names,
+    // exactly as they do on a bare `SignalCell<i32>`.
+    assert_compiles(
+        r#"
+        import std::reactive;
+        fun main() {
+            let cell: reactive::SignalCell<i32> = reactive::Signal::new(1);
+            print(i"{cell.get()}");
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_qualified_path_reaches_through_several_modules() {
+    assert_compiles(
+        r#"
+        mod outer {
+            mod inner {
+                struct Dot {
+                    x: i32,
+                }
+
+                fun make(): Dot {
+                    Dot { x = 3 }
+                }
+            }
+        }
+        fun main() {
+            let d: outer::inner::Dot = outer::inner::make();
+            print(i"{d.x}");
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_qualified_path_to_a_non_type_member_is_refused() {
+    // The negative the positive needs: the path resolves — `make` IS in
+    // `shapes` — and still is not a type. Before this the member's own type
+    // (a closure) was written into the annotation's slot and the mistake
+    // surfaced, if at all, as a mismatch at the initializer.
+    assert_fails_with(
+        &with_shapes("fun main() { let d: shapes::make = 1; print(i\"{d}\"); }"),
+        "'make' in module 'shapes' is not a type",
+    );
+}
+
+#[test]
+fn a_qualified_path_to_a_missing_member_is_refused() {
+    assert_fails_with(
+        &with_shapes("fun main() { let d: shapes::Blob = 1; print(i\"{d}\"); }"),
+        "cannot find 'Blob' in module 'shapes'",
+    );
+}
+
+#[test]
+fn a_qualified_path_through_a_non_module_is_refused() {
+    assert_fails_with(
+        &with_shapes("fun main() { let d: shapes::Dot::Inner = 1; print(i\"{d}\"); }"),
+        "is not a module",
+    );
+}
+
+#[test]
+fn a_qualified_path_refusal_is_attributed_to_the_module_that_wrote_it() {
+    // E108's rule, extended to the drain this item gave diagnostics to. These
+    // are raised in `build()`, after every per-file walk, so an unattributed
+    // push keeps whatever `current_source_id` the last walk left — std's
+    // `lib.vl` — and the span then indexes a file the author never opened.
+    const ALPHA: &str = "mod shapes {\n\
+        \tfun make(): i32 {\n\
+        \t\t1\n\
+        \t}\n\
+        }\n\n\
+        fun size(): shapes::make {\n\
+        \t0\n\
+        }\n";
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::alpha::size;\nfun main() { size(); }\n",
+            ),
+            ("alpha.vl", ALPHA),
+        ],
+        "main.vl",
+    );
+    let (message, span, file) = outcome
+        .diagnostics
+        .iter()
+        .find(|(message, _, _)| message.contains("'make' in module 'shapes' is not a type"))
+        .expect("the non-type path member is refused");
+    let start = ALPHA.find("shapes::make").unwrap();
+    assert_eq!(
+        (file.as_deref(), span.clone()),
+        (Some("alpha.vl"), start..start + "shapes::make".len()),
+        "the refusal belongs to the module that wrote the annotation: {message}"
+    );
+}
+
+// The web-prelude half of B172 — that a module-carried name reaches its TYPES
+// as well as its values — needs a manifest prelude, so it is pinned beside the
+// prelude harness in `tests/module_resolution.rs`.
+
+// --- B190: a struct LITERAL takes the same qualified head ---------------------
+//
+// B172 admitted `type-path` in every TYPE position and left one spelling
+// behind: the literal, whose rule keyed on a bare identifier followed by `{`.
+// So `shapes::Dot` was a type, `shapes::make()` was a call, and
+// `shapes::Dot { x = 1 }` was a PARSE error ("expected `;` to end this
+// statement") — which is why two of B172's own pins construct through a
+// `make()` helper instead of saying what they mean. The literal now reads the
+// same production, and the condition-position rule is untouched: a condition
+// parses through the no-struct mode, which never reaches the literal rule at
+// all, so a qualified path before a `{` there stays an operand exactly as the
+// bare form does.
+
+/// A module with a nested module, an enum and a struct — enough to write a
+/// literal head of one segment, of two, and one that is not a struct at all.
+/// The enum's `PartialEq` was a hand-written `impl` standing in for the derive
+/// until B201 let a `[derive(..)]` inside a `mod` generate into that `mod`.
+const QUALIFIED: &str = r#"
+        mod shapes {
+            import std::compare::PartialEq;
+
+            mod deep {
+                struct Ring {
+                    r: i32,
+                }
+            }
+
+            [derive(PartialEq)]
+            enum Kind {
+                Round(i32),
+                Flat,
+            }
+
+            struct Dot {
+                x: i32,
+            }
+        }
+"#;
+
+fn with_qualified(rest: &str) -> String {
+    format!("{QUALIFIED}\n{rest}\n")
+}
+
+#[test]
+fn a_qualified_struct_literal_takes_one_segment() {
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() { let d = shapes::Dot { x = 1 }; print(i\"{d.x}\"); }\nmain();",
+        ),
+        "1\n",
+    );
+}
+
+#[test]
+fn a_qualified_struct_literal_takes_two_segments() {
+    // The production is a repetition, not a special case for one `::`, so the
+    // nested module has to work for the same reason `std::reactive::SignalCell`
+    // works as a type.
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() { let r = shapes::deep::Ring { r = 2 }; print(i\"{r.r}\"); }\nmain();",
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn a_qualified_literal_head_that_is_not_a_struct_is_refused_by_name_not_by_the_parser() {
+    // The enum-variant twin. This language's variants carry a POSITIONAL
+    // payload (`Kind::Round(1)`), so there is no such thing as
+    // `Kind::Round { r = 1 }` — but the mistake is now a semantic one, told in
+    // the vocabulary of what the path names, where before the parser refused
+    // the whole statement with "expected `;`" and said nothing about `Round`.
+    // The path walks a module and then an enum, whose namespace holds its
+    // variants exactly as a `use` statement reads it.
+    let source = with_qualified("fun main() { let k = shapes::Kind::Round { r = 1 }; }\nmain();");
+    assert_fails_with(
+        &source,
+        "cannot initialize a non-struct: shapes::Kind::Round",
+    );
+    assert_fails_without(&source, "expected `;`");
+}
+
+#[test]
+fn an_unknown_qualified_literal_head_names_the_path_as_written() {
+    // The miss reports the spelling the author used, not the last segment on
+    // its own — `Nope` alone would send them looking in the wrong file.
+    assert_fails_with(
+        &with_qualified("fun main() { let n = shapes::Nope { x = 1 }; }\nmain();"),
+        "unknown struct: shapes::Nope",
+    );
+}
+
+#[test]
+fn a_qualified_path_before_a_brace_in_condition_position_is_still_an_operand() {
+    // The disambiguation, at the spelling the change introduces. A condition's
+    // operands exclude struct literals so that `if Foo { … }` is a block; the
+    // qualified form has to obey the same rule, or every `if x == mod::Enum::V
+    // { … }` in the language would start reading its own body as a field list.
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() {\n\
+             \tlet k = shapes::Kind::Flat;\n\
+             \tif k == shapes::Kind::Flat { print(\"flat\"); }\n\
+             \tfor _ in [1] { print(\"once\"); }\n\
+             }\nmain();",
+        ),
+        "flat\nonce\n",
+    );
+}
+
+#[test]
+fn a_parenthesised_qualified_literal_is_admitted_in_a_condition() {
+    // The escape the spec names for the bare form, which the qualified form
+    // inherits unchanged: parenthesise the literal and the condition takes it.
+    assert_compiles_and_runs(
+        &with_qualified(
+            "fun main() { if (shapes::Dot { x = 1 }).x == 1 { print(\"one\"); } }\nmain();",
+        ),
+        "one\n",
+    );
+}
+
+// --- B201: a derive inside an inline `mod` generates into THAT scope ----------
+//
+// Expansion is unified — a `[derive(..)]` runs the same channel a macro
+// attribute does — and every generated list used to walk into the FILE's
+// module scope, whatever scope the deriving item was written in. The impl a
+// derive writes names its subject by the bare name the author wrote, and that
+// name resolves in exactly one scope: the `mod`'s. So `mod shapes {
+// [derive(PartialEq)] enum Kind { .. } }` reported `cannot find type 'Kind'`
+// twice over, plus a follow-on per variant from inside the generated body —
+// four diagnostics for a program with no mistake in it. Each generated list
+// now records the inline-`mod` path it was written in and walks into that
+// module's scope. Both channels are covered, because both had the bug: the
+// macro-generated lists (the real std's derives) and the Rust generators'
+// fallback text (a backed enum's `value()`/`parse()`, which is not a derive at
+// all and reaches every enum however it is wrapped).
+
+#[test]
+fn a_derived_enum_inside_a_mod_gets_its_impl_in_that_mod() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod shapes {
+            import std::compare::PartialEq;
+
+            [derive(PartialEq)]
+            enum Kind {
+                Flat,
+                Round,
+            }
+        }
+
+        fun main() {
+            let a = shapes::Kind::Flat;
+            print(a == shapes::Kind::Flat);
+            print(a == shapes::Kind::Round);
+        }
+
+        main();
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn a_derived_struct_inside_a_mod_gets_its_impl_in_that_mod() {
+    // The struct twin, on a different derive, so the placement is pinned as a
+    // property of the expansion rather than of `PartialEq`'s template.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod shapes {
+            import std::debug::Debug;
+
+            [derive(Debug)]
+            struct Dot {
+                x: i32,
+            }
+        }
+
+        fun main() {
+            print(shapes::Dot { x = 1 }.debug());
+        }
+
+        main();
+        "#,
+        "Dot { x = 1 }\n",
+    );
+}
+
+#[test]
+fn a_derive_in_a_nested_mod_walks_the_whole_path() {
+    // The path is a repetition, not a one-`mod` special case: the list walks
+    // down every segment it was written under.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod outer {
+            mod inner {
+                import std::compare::PartialEq;
+
+                [derive(PartialEq)]
+                enum Kind {
+                    Flat,
+                    Round,
+                }
+            }
+        }
+
+        fun main() {
+            print(outer::inner::Kind::Flat == outer::inner::Kind::Flat);
+        }
+
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn two_mods_deriving_the_same_trait_each_keep_their_own_impl() {
+    // The buckets are per declaring scope, and a derive in one `mod` must not
+    // be visible from — or collide with — the same derive in another. Both
+    // types are named `Kind`, which is only legal *because* they live in
+    // different scopes; one shared bucket would put two `impl Kind` blocks in
+    // one scope.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod left {
+            import std::compare::PartialEq;
+
+            [derive(PartialEq)]
+            enum Kind {
+                Flat,
+            }
+        }
+
+        mod right {
+            import std::compare::PartialEq;
+
+            [derive(PartialEq)]
+            enum Kind {
+                Round,
+            }
+        }
+
+        fun main() {
+            print(left::Kind::Flat == left::Kind::Flat);
+            print(right::Kind::Round == right::Kind::Round);
+        }
+
+        main();
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+#[test]
+fn a_backed_enum_inside_a_mod_gets_its_conversions_in_that_mod() {
+    // The other channel. A backing value is not a `[derive]` — the synthesized
+    // `value()`/`parse()` come from the Rust generators, accumulated per file
+    // and flushed as one list — so a `mod`-nested backed enum reported
+    // `'value' is already defined for 'unknown'` on top of the missing type.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        mod shapes {
+            enum Kind {
+                Flat = "flat",
+                Round = "round",
+            }
+        }
+
+        fun main() {
+            print(shapes::Kind::Flat.value());
+            print(shapes::Kind::Round.value());
+        }
+
+        main();
+        "#,
+        "flat\nround\n",
+    );
+}
+
+#[test]
+fn a_derive_at_a_files_top_level_is_unchanged() {
+    // The control: an empty path is the file's own scope, which is where it
+    // always landed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        [derive(PartialEq)]
+        enum Kind {
+            Flat,
+            Round,
+        }
+
+        fun main() {
+            print(Kind::Flat == Kind::Flat);
+        }
+
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+// --- B212: one declaration per name in a module; a bound names a trait ---
+
+#[test]
+fn b212_two_structs_of_one_name_are_refused() {
+    assert_fails_with(
+        r#"
+        struct N { a: i32 }
+        struct N { b: i32 }
+        fun main() { print("hi"); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_two_traits_of_one_name_are_refused() {
+    assert_fails_with(
+        r#"
+        trait N { fun go(self): i32; }
+        trait N { fun go2(self): i32; }
+        fun main() { print("hi"); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_a_struct_and_an_enum_of_one_name_are_refused() {
+    // Different SORTS collide too: one name, one meaning, per module.
+    assert_fails_with(
+        r#"
+        struct N { a: i32 }
+        enum N { One, Two }
+        fun main() { print("hi"); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_a_trait_and_a_struct_of_one_name_are_refused_naming_the_first() {
+    // The B184 ambiguity, and the case that shows why the note matters: with
+    // the trait first, `N { a = 41 }` ran (the struct won the map); with the
+    // struct first, the same program failed at the literal with `cannot
+    // initialize a non-struct: N`, which names neither declaration. The note
+    // names the first, at its own span.
+    assert_fails_noting(
+        r#"
+        trait N { fun go(self): i32; }
+        struct N { a: i32 }
+        fun main() { let x = N { a = 41 }; print(x.a); }
+        "#,
+        "'N' is already declared in this module; remove or rename this one",
+        // The first `N` in the source is the TRAIT's name: the note points at
+        // the name, not the block (A1/A4).
+        "N",
+        "'N' is already declared here, as a trait",
+    );
+}
+
+#[test]
+fn b212_two_functions_of_one_name_are_refused() {
+    // Functions were the same silence — `dup()` called the second one — and
+    // they are declarations of a sort like any other.
+    assert_fails_with(
+        r#"
+        fun dup(): i32 { 1 }
+        fun dup(): i32 { 2 }
+        fun main() { print(dup()); }
+        "#,
+        "'dup' is already declared in this module; remove or rename this one",
+    );
+}
+
+#[test]
+fn b212_three_declarations_of_one_name_report_twice() {
+    // Each later declaration is reported against the FIRST, so three copies
+    // produce two reports rather than one or three (the duplicate family's
+    // shape).
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct N { a: i32 }
+        struct N { b: i32 }
+        struct N { c: i32 }
+        fun main() { print("hi"); }
+        "#,
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|(message, _)| message.contains("'N' is already declared in this module"))
+            .count(),
+        2,
+        "three declarations, two reports; got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b212_a_name_declared_once_beside_an_import_of_the_same_name_is_not_a_duplicate() {
+    // An import is not a declaration: it binds a name that another module
+    // declared. The rule counts what THIS module declares.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Show { v: i32 }
+        fun main() { print(Show { v = 3 }.v); }
+        "#,
+        "3\n",
+    );
+}
+
+// --- E142: `import a::b::c as d` — the import alias ---------------------------
+//
+// The prerequisite the `::` line rule assumes: a path that is too long to sit on
+// one line is imported under a shorter NAME rather than wrapped. `as` renames
+// the leaf and changes nothing else — the path resolves exactly as it would
+// without one, and the item is the same item under a second spelling.
+
+#[test]
+fn e142_an_import_alias_binds_the_leaf_under_the_new_name() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print as say;
+        fun main() { say("aliased"); }
+        "#,
+        "aliased\n",
+    );
+}
+
+#[test]
+fn e142_an_import_alias_reaches_a_brace_set_and_a_self_leaf() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self as Maybe, Some, None };
+        fun main() {
+            let held: Maybe<i32> = Some(3);
+            match held {
+                Some(let n) => print(n),
+                None => print(0),
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn e142_an_import_alias_does_not_also_bind_the_original_name() {
+    // The control that says the alias is a RENAME and not a second binding: a
+    // rule that bound both would make every alias silently optional and hide
+    // the misspelling the alias is supposed to make impossible.
+    assert_fails_with(
+        r#"
+        import std::json::Json as Document;
+        fun main() {
+            let held: Json = Document::Bool(true);
+        }
+        "#,
+        "cannot find type 'Json'",
+    );
+}
+
+#[test]
+fn e142_an_aliased_import_resolves_to_the_item_it_renames() {
+    // Proof the alias is not a fresh, unrelated name: reaching a member the
+    // target does NOT have reports against the TARGET's own name.
+    assert_fails_with(
+        r#"
+        import std::json::Json as Document;
+        fun main() {
+            let held = Document::NotAVariant;
+        }
+        "#,
+        "cannot find 'NotAVariant' in Json",
+    );
+}
+
+// --- B317: a type's associated functions are importable under a bare name ----
+//
+// `spec/names.md` §4.3 has said `use path` binds "variants, statics" from an
+// already-visible type's namespace since it was written, and §4.6 says a type
+// has ONE namespace holding its variants, its impls' statics and its methods.
+// Only the variants ever travelled: `use Length::rem` answered "`use` requires
+// a namespace (a module or an enum)", and every import form — direct, a brace
+// set, a re-export — answered "cannot find `rem` in the imported path". Both
+// rows read a type's self-less functions now, keyed by the module whose file
+// writes the `impl` block, so the enum shape and the struct shape are one rule.
+
+#[test]
+fn b317_a_types_static_imports_under_its_bare_name() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::Length::rem;
+        fun main() {
+            print(rem(2f).text);
+        }
+        "#,
+        "2rem\n",
+    );
+}
+
+#[test]
+fn b317_a_brace_set_of_statics_imports_and_aliases() {
+    // The prelude shape's other half: several statics at once, one of them
+    // renamed. `as` renames the BINDING and nothing else — the path is walked
+    // exactly as it would be without one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::Length::{ px, auto as automatic };
+        fun main() {
+            print(px(4f).text);
+            print(automatic().text);
+        }
+        "#,
+        "4px\nauto\n",
+    );
+}
+
+#[test]
+fn b317_use_binds_a_static_out_of_a_visible_type() {
+    // `use` walks no module path and loads nothing: the type is already in
+    // scope, and the statement reaches into the namespace it has. Exactly what
+    // it does for an enum's variants, and what §4.3 promised for statics.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::Length;
+        use Length::em;
+        use Length::{ pct as percent };
+        fun main() {
+            print(em(1f).text);
+            print(percent(50f).text);
+        }
+        "#,
+        "1em\n50%\n",
+    );
+}
+
+#[test]
+fn b317_a_self_method_is_refused_by_name_under_the_import_form() {
+    // The one curated refusal. "cannot find" would be false — the type plainly
+    // has the member — so the message says what is true about it instead.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::style::Style::text_align;
+        fun main() {
+            print("x");
+        }
+        "#,
+        "`Style::text_align` takes `self` — a method is called on a value, not imported",
+    );
+}
+
+#[test]
+fn b317_a_self_method_is_refused_by_name_under_the_use_form() {
+    // The same sentence from the other form, which is why it is one row.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::style::Style;
+        use Style::text_align;
+        fun main() {
+            print("x");
+        }
+        "#,
+        "`Style::text_align` takes `self` — a method is called on a value, not imported",
+    );
+}
+
+#[test]
+fn b317_a_use_of_something_that_is_no_namespace_names_all_three() {
+    // The fence is lifted, not removed: a FUNCTION still has no namespace to
+    // reach into, and the message now names the three things that do.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun helper(): i32 {
+            1
+        }
+        fun main() {
+            use helper::inner;
+            print("x");
+        }
+        "#,
+        "`use` requires a namespace (a module, an enum or a struct)",
+    );
+}
+
+#[test]
+fn b317_an_enums_variants_are_unchanged() {
+    // The row B317 generalises, held where it was: a variant travels every one
+    // of these paths exactly as it did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let slot: Option<i32> = Some(1);
+            match slot {
+                Some(let n) => print(i"{n}"),
+                None => print("none"),
+            }
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b317_a_missing_static_still_says_it_cannot_be_found() {
+    // The type is a namespace now, and a name it does not hold is still the
+    // path's own miss rather than something about namespaces.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::style::Length::furlongs;
+        fun main() {
+            print("x");
+        }
+        "#,
+        "cannot find 'furlongs' in the imported path",
+    );
+}
+
+// --- B318 S3: the impl selector's grammar refusals ---------------------------
+//
+// `proposal/visibility.md` §2.5. Every one of these is a CURATED parser rule
+// (`diagnostics-standard.md` B6), so the message states the prohibition and
+// names the sanctioned spelling — and, critically, is anchored INSIDE the
+// selector: before this slice a typo in one made the whole statement fail and
+// the recovery reported `found 'import' expected an expression` at column one
+// (probes P5/P5b/P5c/P10b, all four identical).
+
+/// A selector written outside a brace set is refused where it is written, with
+/// the braced spelling named.
+#[test]
+fn an_impl_selector_outside_a_brace_set_is_refused() {
+    assert_fails_with(
+        "import pkg::a::(impl Thing);\n\nfun main() {}\n",
+        "an `impl` selector is a brace-set ELEMENT",
+    );
+}
+
+/// RULED 2026-09-12: no binders are written in a selector. A NAMED binder and a
+/// BOUND `_` are both refused; the bare `_` placeholder is not.
+#[test]
+fn a_selector_writes_no_binders() {
+    assert_fails_with(
+        "import pkg::a::{ (impl List<type T>) };\n\nfun main() {}\n",
+        "an `impl` selector writes no binders",
+    );
+    assert_fails_with(
+        "import pkg::a::{ (impl List<_: Display>) };\n\nfun main() {}\n",
+        "an `impl` selector writes no binders",
+    );
+}
+
+/// RULED: a method selector refuses `as` — a method is called by NAME on a
+/// receiver, so an alias would produce a name nothing can call. The refusal
+/// names `import a::Length::rem` (B317), which is the spelling that DOES take
+/// an alias, so the two remain tellable apart.
+#[test]
+fn a_selector_refuses_an_alias() {
+    assert_fails_with(
+        "import pkg::a::{ (impl Length)::rem as r };\n\nfun main() {}\n",
+        "an `impl` selector takes no `as`",
+    );
+    assert_fails_with(
+        "import pkg::a::{ (impl Length) as L };\n\nfun main() {}\n",
+        "an `impl` selector takes no `as`",
+    );
+}
+
+/// A malformed selector reports INSIDE the selector — the `)` it is missing —
+/// rather than at the `import` keyword, and says what the shape is.
+#[test]
+fn a_malformed_selector_reports_inside_the_selector() {
+    assert_fails_with(
+        "import pkg::a::{ (impl Thing };\n\nfun main() {}\n",
+        "an `impl` selector is `(impl TYPE)`",
+    );
+    assert_fails_without(
+        "import pkg::a::{ (impl Thing };\n\nfun main() {}\n",
+        "found 'import'",
+    );
+}
+
+/// A selector inside a `use` is refused rather than silently doing nothing: a
+/// `use` reaches no MODULE, and the two productions share a brace set, so the
+/// selector parses there.
+#[test]
+fn a_use_takes_no_impl_selector() {
+    assert_fails_with(
+        "use pkg::a::{ (impl Thing) };\n\nfun main() {}\n",
+        "an `impl` selector belongs to `import`",
+    );
+}
+
+/// B318 §2.4: `only` belongs to `import`. A `use` never brought an
+/// implementation along — it destructures a namespace the file already reaches
+/// — so the word would subtract nothing and read as though it did.
+#[test]
+fn a_use_takes_no_only() {
+    assert_fails_with(
+        "use pkg::a::b only;\n\nfun main() {}\n",
+        "`only` belongs to `import`",
+    );
+}
+
+// --- B360 (R4): an `external fun` that names no body at all -------------------
+//
+// `external` says the body lives where the compiler does not look, and there
+// are exactly two such places: an `[extern(..)]` binding naming the host form,
+// or a lowering the compiler carries itself (`str`'s methods, `List::new` /
+// `push`, `panic`, `print`, `drop`, `Context`'s four, the nursery pair — every
+// one of them a bodiless std declaration on purpose). A declaration with
+// NEITHER named nothing: emission fell through to "a normal function" and
+// emitted a call to a mangled name no declaration defines — clean through
+// `vilan check`, a `TypeError` at the first line that reached it. B359 closed
+// the DISPATCHED half; this is the ordinary call site, refused where the fix
+// goes.
+
+#[test]
+fn b360_an_external_method_with_no_binding_is_refused_at_its_declaration() {
+    assert_fails_spanning(
+        r#"
+        external struct Thing;
+
+        impl Thing {
+        	external fun poke(&mut self, v: str);
+        }
+
+        [extern("globalThis.thing")]
+        external fun make(): Thing;
+
+        fun main() {
+        	mut t = make();
+        	t.poke("x");
+        }
+        "#,
+        "poke",
+        "`external fun poke` names no body",
+    );
+}
+
+/// A FREE external function with no binding, which has no receiver and so
+/// reaches the emitter by a different arm — refused at the same place.
+#[test]
+fn b360_a_free_external_function_with_no_binding_is_refused() {
+    assert_fails_with(
+        r#"
+        external fun compute(value: i32): i32;
+
+        fun main() {
+        	print(compute(1));
+        }
+        "#,
+        "`external fun compute` names no body",
+    );
+}
+
+/// The refusal is at the DECLARATION, so it fires even where nothing calls it:
+/// the dangling name is a property of the declaration, and waiting for a call
+/// means an unreached branch ships it.
+#[test]
+fn b360_an_uncalled_external_with_no_binding_is_still_refused() {
+    assert_fails_with(
+        r#"
+        external fun unused(value: i32): i32;
+
+        fun main() {
+        	print("ok");
+        }
+        "#,
+        "`external fun unused` names no body",
+    );
+}
+
+/// The CONTROLS: a bound external compiles, and so does std's own bodiless set
+/// — every one of those is a compiler lowering, which is the whole reason the
+/// check asks the finished program rather than the declaration's own syntax.
+#[test]
+fn b360_a_bound_external_and_stds_own_lowerings_still_compile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [extern("Math.max")]
+        external fun largest(a: f64, b: f64): f64;
+
+        fun main() {
+        	print(largest(2f, 5f));
+        	// std's compiler-lowered bodiless externals, one of each family:
+        	print("  hi  ".trim());
+        	mut items = List<i32>::new();
+        	items.push(7);
+        	print(items.len());
+        }
+        "#,
+        "5\nhi\n1\n",
+    );
+}
+
+/// Every extern FORM counts as a binding, not just the two-string one — a
+/// method binding, a property read and a property write each name a host form.
+#[test]
+fn b360_every_extern_form_counts_as_a_binding() {
+    assert_compiles(
+        r#"
+        external struct Node;
+
+        impl Node {
+        	[extern("method")]
+        	external fun click(self): void;
+
+        	[extern("get", "id")]
+        	external fun id(self): str;
+
+        	[extern("set", "id")]
+        	external fun set_id(&mut self, value: str): void;
+        }
+
+        fun main() { print("ok"); }
+        "#,
+    );
+}
+
+// --- N113 (the fourth edge): a global PROPERTY bound in the FUNCTION form ----
+//
+// `[extern("document.activeElement")]` emits `document.activeElement()`. The
+// function form addresses a CALLABLE, so binding a property through it ships a
+// program that compiles clean and dies at the first line that reaches it. std
+// paid the coin three times before it was written down — `__dom_window`,
+// `__router_path` and `__dom_active_element` are all runtime helpers that
+// exist only because the value on the other side is a property.
+
+#[test]
+fn n113_a_global_property_bound_as_a_function_is_refused_at_its_declaration() {
+    assert_fails_spanning(
+        r#"
+        external struct Element;
+
+        [extern("document.activeElement")]
+        external fun focus_holder(): Element;
+
+        fun main() {
+        	let _held = focus_holder();
+        }
+        "#,
+        "focus_holder",
+        "`document.activeElement` is a host PROPERTY, not a function",
+    );
+}
+
+/// A BARE global is the same hole — `[extern("window")]` emits `window()` —
+/// and it is the one `__dom_window` exists for, so the refusal has to reach
+/// it too.
+#[test]
+fn n113_a_bare_global_property_is_refused_the_same_way() {
+    assert_fails_with(
+        r#"
+        external struct Window;
+
+        [extern("window")]
+        external fun host_window(): Window;
+
+        fun main() {
+        	let _held = host_window();
+        }
+        "#,
+        "`window` is a host PROPERTY, not a function",
+    );
+}
+
+/// Refused at the DECLARATION, so an uncalled binding is refused too: the
+/// dangling call is a property of the declaration, and waiting for a call
+/// means an unreached branch ships it (B360's rule, same reason).
+#[test]
+fn n113_an_uncalled_global_property_binding_is_still_refused() {
+    assert_fails_with(
+        r#"
+        external struct Element;
+
+        [extern("location.pathname")]
+        external fun path(): Element;
+
+        fun main() {
+        	print("ok");
+        }
+        "#,
+        "`location.pathname` is a host PROPERTY, not a function",
+    );
+}
+
+/// The CONTROLS, and they are what keep the table from becoming a guess: the
+/// two spellings that DO work are untouched — a runtime helper (what std
+/// writes for its own), and `[extern(get, ..)]` on a receiver that holds the
+/// property — and so is a dotted global the table does not know, which is
+/// bound exactly as before.
+#[test]
+fn n113_the_helper_the_getter_and_an_unknown_global_still_compile() {
+    assert_compiles(
+        r#"
+        external struct Element;
+
+        [extern("__dom_active_element")]
+        external fun active(): Element;
+
+        impl Element {
+        	[extern(get, "activeElement")]
+        	external fun active_child(self): Element;
+        }
+
+        [extern("globalThis.myApp.boot")]
+        external fun boot(): void;
+
+        fun main() {
+        	let held = active();
+        	let _inner = held.active_child();
+        	boot();
+        }
         "#,
     );
 }

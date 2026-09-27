@@ -3,7 +3,7 @@ use crate::analyzer::{
     GenericDispatch, Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
-use crate::error::Error;
+use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::impl_select;
@@ -19,6 +19,31 @@ use std::rc::Rc;
 
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options).transform_entry()
+}
+
+/// Emission run for its DIAGNOSTICS alone — what `vilan check` of an ENTRY
+/// needs from the transformer, and nothing else (backlog M34).
+///
+/// `check` used to call [`transform`] and throw the JavaScript away, so a
+/// `vilan check .` cost what a `vilan build .` cost. Skipping the transformer
+/// outright was the other option on the table and is wrong: `transform` refuses
+/// FOUR ways, and only the first of them is knowable before the walk. The
+/// missing `main` is decided at the top of [`Transformer::assemble`]; B55's
+/// body-less emission, B68's unresolved `drop` sink and B176's unrendered
+/// concatenation are the never-silent refusals, and each is a fact about what
+/// the WALK produced. A `check` that skipped the walk would go green over a
+/// program `build` refuses to ship, which is the one thing `check` may never do.
+///
+/// So the walk runs, in full, through the same `assemble` an emitting build
+/// runs, and what is skipped is the part that has nothing to say: the scope
+/// rename (`rename_for_scopes`, whose return type is `()`) and the formatting
+/// of the node tree into text. Every `Err` [`transform`] can produce, this
+/// produces, at the same span with the same message — by construction, because
+/// it is the same function.
+pub fn diagnose<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<(), Error> {
+    let mut transformer = Transformer::new(program, options);
+    transformer.diagnose_only = true;
+    transformer.assemble().map(|_| ())
 }
 
 /// The transformed program one step before formatting: the whole JS AST plus
@@ -62,7 +87,11 @@ pub fn transform_functions<'src>(
     // The macro world emits the same `const` declarations as a normal build, so
     // it needs the same initialization order (`b33-emission-order.md` §4).
     let global_variables = crate::init_order::initialization_order(program, program.call_graph());
-    let t_global_variables = transformer.walk_list(&global_variables);
+    // B349: each binding under ITS OWN declaring file, as `assemble` does.
+    let t_global_variables: Vec<js::Node<'src>> = global_variables
+        .iter()
+        .flat_map(|&binding| transformer.walk_module_binding(binding))
+        .collect();
 
     let mut names = HashMap::default();
     for root in roots {
@@ -74,7 +103,7 @@ pub fn transform_functions<'src>(
         .required_functions
         .into_iter()
         .collect::<Vec<_>>();
-    t_functions.sort_by(|a, b| (a.0.0).cmp(&b.0.0));
+    t_functions.sort_by_key(|a| a.0.0);
     let t_functions = t_functions.into_iter().map(|x| x.1);
     let t_instances = transformer.monomorphized.into_iter();
 
@@ -111,6 +140,13 @@ pub struct EmittedChunk {
     /// The artifact's file name, beside the entry bundle.
     pub file: String,
     pub source: String,
+    /// How many references to a SIBLING chunk's functions this chunk emitted as
+    /// registry reads — one property lookup apiece, at the use rather than at
+    /// evaluation (`bundle-boundaries.md` D5). The route partition makes this 0
+    /// by construction (nothing reachable from two arms is chunked at all), so
+    /// it is also the measurement that says whether a partition introduced a
+    /// cross-chunk edge.
+    pub cross_chunk_references: usize,
 }
 
 /// A split entry's artifacts (`bundle-splitting.md` §3): the eager bundle plus
@@ -158,7 +194,23 @@ pub fn transform_split<'src>(
     options: &BuildOptions,
     leg: &str,
 ) -> Result<SplitProgram, Error> {
-    let plan = crate::chunks::plan(program);
+    transform_split_with_plan(program, options, leg, &crate::chunks::plan(program))
+}
+
+/// [`transform_split`] over a GIVEN partition, which is the whole of the
+/// emitter's contract: where a chunk's membership came from is the planner's
+/// business, and the emission below asks the plan for nothing but its buckets,
+/// its tags and its gate. Route splitting passes `chunks::plan`'s verdict;
+/// a partition that puts two mutually-referencing functions in different chunks
+/// — which the route partition cannot produce (`bundle-boundaries.md` §1.6,
+/// fact 2) and a declared boundary produces by definition — is emitted by the
+/// same code, and is what the cross-chunk reference form below exists for.
+pub fn transform_split_with_plan<'src>(
+    program: &'src Program<'src>,
+    options: &BuildOptions,
+    leg: &str,
+    plan: &crate::chunks::ChunkPlan,
+) -> Result<SplitProgram, Error> {
     if plan.chunks.is_empty() {
         // Nothing splittable: the entry is a single file, exactly as if the
         // flag were absent. Reported by `--print-chunks`, not by a failure.
@@ -179,8 +231,7 @@ pub fn transform_split<'src>(
     transformer.chunk_members = plan.members();
     transformer.chunk_count = plan.chunks.len();
     transformer.chunk_gate = plan.gate.as_ref().map(|gate| ChunkGate {
-        swap: gate.swap,
-        swap_split: gate.swap_split,
+        retarget: gate.retarget.clone(),
         preload: gate.preload,
         calls: gate.calls.iter().copied().collect::<HashSet<Id>>(),
     });
@@ -220,9 +271,33 @@ pub fn transform_split<'src>(
     }
     // …and registers everything a chunk reads back out of it.
     let mut chunk_sources: Vec<String> = Vec::new();
+    let mut crossings: Vec<usize> = Vec::new();
     for (index, nodes) in assembled.chunks.iter().enumerate() {
+        // A name a SIBLING chunk owns cannot be read at evaluation time: the
+        // sibling may not have been fetched yet, and a `const` initialized from
+        // a missing property is not a live view of it — it takes `undefined` and
+        // KEEPS it after the sibling registers (`bundle-boundaries.md` §4.1, D5;
+        // probe P3). Such a reference is emitted as a registry read at the use
+        // instead, exactly the form the eager forwarder already carries, so
+        // arrival order stops mattering at the cost of one property lookup per
+        // use. The route partition produces no such reference at all (§1.6, fact
+        // 2), which is why this is inert for every chunk plan v1 can make.
+        let siblings: BTreeSet<String> = chunk_names
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .flat_map(|(_, names)| names.iter().cloned())
+            .collect();
+        let mut own_nodes: Vec<js::Node<'src>> = nodes.to_vec();
+        let mut crossed = 0usize;
+        rewrite_sibling_references(&mut own_nodes, &siblings, &mut crossed);
+        crossings.push(crossed);
+
+        // What is left to snapshot is EAGER names only, and a snapshot of one is
+        // sound by construction: the eager registrations run in the entry's own
+        // module evaluation, strictly before any chunk can be fetched.
         let mut references = BTreeSet::new();
-        collect_references(nodes, &mut references);
+        collect_references(&own_nodes, &mut references);
         let needs: Vec<String> = references
             .into_iter()
             .filter(|name| eager_names.contains(name) && !chunk_names[index].contains(name))
@@ -242,7 +317,7 @@ pub fn transform_split<'src>(
                 value: Box::new(registry_slot(name)),
             }));
         }
-        chunk_nodes.extend(nodes.iter().cloned());
+        chunk_nodes.extend(own_nodes);
         for name in &chunk_names[index] {
             chunk_nodes.push(js::Node::Assignment(
                 Box::new(registry_slot(name)),
@@ -318,11 +393,13 @@ pub fn transform_split<'src>(
             .chunks
             .iter()
             .zip(chunk_sources)
-            .map(|(chunk, source)| EmittedChunk {
+            .zip(crossings)
+            .map(|((chunk, source), cross_chunk_references)| EmittedChunk {
                 arm: chunk.arm.clone(),
                 tag: chunk.tag,
                 file: crate::chunks::chunk_file_name(leg, &chunk.arm),
                 source,
+                cross_chunk_references,
             })
             .collect(),
     })
@@ -359,6 +436,314 @@ fn chunk_forwarder<'src>(function: &js::Function<'src>) -> js::Node<'src> {
     })
 }
 
+/// Rewrites every reference a chunk makes to a name a SIBLING chunk owns into a
+/// read of that name's registry slot AT THE USE — `__vilan_chunks.fn.docs_nav`
+/// where the body said `docs_nav` — and counts them. The call form that comes
+/// out, `__vilan_chunks.fn.docs_nav(page)`, is the eager forwarder's own body,
+/// which is what proves the shape emittable.
+///
+/// This is the one place the split's two sides differ on how a name is read.
+/// An EAGER name is snapshotted once in the chunk preamble, because the eager
+/// registrations happen in the entry's module evaluation and no chunk can be
+/// fetched before that; a sibling chunk's name has no such order behind it, and
+/// a `const` taken from a slot the sibling has not filled binds `undefined`
+/// permanently — it does not become the function when the sibling lands
+/// (`bundle-boundaries.md` §4.1, D5; probe P3). Reading at the use costs one
+/// property lookup per reference and makes arrival order irrelevant, which is
+/// what a nested or shared boundary needs and what the route partition can then
+/// stop guaranteeing by construction.
+///
+/// Scope-correct rather than name-correct: a reference is rewritten only where
+/// the name is not bound by an enclosing declaration inside the chunk. The
+/// scope rename runs over the whole program before the chunk runs are lifted
+/// out, so a local can never take a top-level chunk name today — but a rewrite
+/// that silently depended on that would corrupt a body the day it could.
+fn rewrite_sibling_references(
+    nodes: &mut [js::Node],
+    siblings: &BTreeSet<String>,
+    count: &mut usize,
+) {
+    if siblings.is_empty() {
+        return;
+    }
+    rewrite_sibling_block(nodes, siblings, &HashSet::default(), count);
+}
+
+/// One statement list is one JS block scope: its `function`, `const` and `let`
+/// declarations bind over the whole list (a use before the declaration is a
+/// temporal-dead-zone error, not a reference to an outer binding), so they are
+/// collected before anything in the list is rewritten.
+fn rewrite_sibling_block(
+    nodes: &mut [js::Node],
+    siblings: &BTreeSet<String>,
+    outer: &HashSet<String>,
+    count: &mut usize,
+) {
+    let mut bound = outer.clone();
+    for node in nodes.iter() {
+        match node {
+            js::Node::Function(function) => {
+                bound.insert(function.name.clone());
+            }
+            js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                bound.insert(variable.name.clone());
+            }
+            _ => {}
+        }
+    }
+    for node in nodes.iter_mut() {
+        rewrite_sibling_node(node, siblings, &bound, count);
+    }
+}
+
+/// Must be exhaustive over the node tree in both directions: a reference this
+/// walk misses stays a dangling free name, and a binding it fails to see would
+/// take a local's reference out to the registry.
+fn rewrite_sibling_node(
+    node: &mut js::Node,
+    siblings: &BTreeSet<String>,
+    bound: &HashSet<String>,
+    count: &mut usize,
+) {
+    match node {
+        // A vtable's VALUES are references to emitted functions; its keys are
+        // member names and never identifiers this walk may touch.
+        js::Node::Vtable(entries) => {
+            for (_, value) in entries {
+                rewrite_sibling_node(value, siblings, bound, count);
+            }
+        }
+        js::Node::Local(name) => {
+            if siblings.contains(name) && !bound.contains(name) {
+                let name = name.clone();
+                *count += 1;
+                *node = registry_slot(&name);
+            }
+        }
+        js::Node::Function(function) => {
+            let mut inner = bound.clone();
+            inner.extend(
+                function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone()),
+            );
+            rewrite_sibling_block(&mut function.body, siblings, &inner, count);
+        }
+        js::Node::Closure(closure) => {
+            let mut inner = bound.clone();
+            inner.extend(
+                closure
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone()),
+            );
+            rewrite_sibling_block(&mut closure.body, siblings, &inner, count);
+        }
+        js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+            rewrite_sibling_node(&mut variable.value, siblings, bound, count)
+        }
+        js::Node::ForOf(binding, iterable, body) => {
+            rewrite_sibling_node(iterable, siblings, bound, count);
+            let mut inner = bound.clone();
+            inner.insert(binding.clone());
+            rewrite_sibling_block(body, siblings, &inner, count);
+        }
+        js::Node::While(condition, body) => {
+            rewrite_sibling_node(condition, siblings, bound, count);
+            rewrite_sibling_block(body, siblings, bound, count);
+        }
+        // A LABEL is not a binding and `break <label>` is not a reference: JS
+        // resolves both in their own namespace, so only the body is walked.
+        js::Node::Labeled(_, body) => rewrite_sibling_block(body, siblings, bound, count),
+        js::Node::If(branch) => rewrite_sibling_if(branch, siblings, bound, count),
+        js::Node::Try(body, finally) => {
+            rewrite_sibling_block(body, siblings, bound, count);
+            rewrite_sibling_block(finally, siblings, bound, count);
+        }
+        js::Node::Call(subject, arguments) => {
+            rewrite_sibling_node(subject, siblings, bound, count);
+            for argument in arguments {
+                rewrite_sibling_node(argument, siblings, bound, count);
+            }
+        }
+        js::Node::Assignment(left, right)
+        | js::Node::Binary(_, left, right)
+        | js::Node::PropertyIndex(left, right) => {
+            rewrite_sibling_node(left, siblings, bound, count);
+            rewrite_sibling_node(right, siblings, bound, count);
+        }
+        js::Node::Await(inner)
+        | js::Node::Unary(_, inner)
+        | js::Node::Return(inner)
+        | js::Node::Throw(inner)
+        | js::Node::Spread(inner)
+        // `Property`'s member is a property name, not a binding — recurse only
+        // the subject, exactly as the rename walk does.
+        | js::Node::Property(inner, _) => rewrite_sibling_node(inner, siblings, bound, count),
+        // A `Sequence`'s items are expressions in a row, exactly like an
+        // array literal's (B224) — same walk.
+        js::Node::Array(items) | js::Node::Sequence(items) => {
+            for item in items {
+                rewrite_sibling_node(item, siblings, bound, count);
+            }
+        }
+        js::Node::String(_)
+        | js::Node::Number(_, _)
+        | js::Node::Bool(_)
+        | js::Node::Null
+        | js::Node::Void
+        | js::Node::Break
+        | js::Node::BreakLabel(_)
+        | js::Node::Continue => {}
+    }
+}
+
+fn rewrite_sibling_if(
+    branch: &mut js::IfBranch,
+    siblings: &BTreeSet<String>,
+    bound: &HashSet<String>,
+    count: &mut usize,
+) {
+    match branch {
+        js::IfBranch::If(condition, body, else_branch) => {
+            rewrite_sibling_node(condition, siblings, bound, count);
+            rewrite_sibling_block(body, siblings, bound, count);
+            if let Some(else_branch) = else_branch {
+                rewrite_sibling_if(else_branch, siblings, bound, count);
+            }
+        }
+        js::IfBranch::Else(body) => rewrite_sibling_block(body, siblings, bound, count),
+    }
+}
+
+/// The label B214 wraps `main`'s inlined body in. A JS label lives in its own
+/// namespace — it can neither collide with a binding nor be reached by one — so
+/// it is spelled for the reader rather than generated, and `rename_for_scopes`
+/// leaves it alone.
+const MAIN_LABEL: &str = "main";
+
+/// Wraps `main`'s inlined body in [`MAIN_LABEL`] and lowers every `return` it
+/// would have emitted at MODULE scope to a break out of that block (B214).
+///
+/// `main` is inlined at module scope, where `return` is a `SyntaxError` that
+/// refuses the whole module at parse time — so `fun main() { if flag { ret; } }`
+/// compiled clean and then failed to load. A labeled block is the lowering that
+/// costs nothing: a `main` with no such `return` is wrapped in nothing and emits
+/// exactly as it did before, and one that has them pays a `main: { … }` and a
+/// `break main` per `ret` rather than a function call around every program.
+///
+/// `exit_temp` is where a RETURNED value goes — `main`'s exit code, read by the
+/// `process.exit` the caller emits after the block. Without one (a `void` main,
+/// or a host with no exit code) a returned value is emitted for its side effects
+/// and dropped, which is what the tail already does on those hosts.
+///
+/// An ASYNC `main` is never wrapped: `execution.md` §7.1 already runs it inside
+/// an invoked `async () => { … }`, which is a real function, so its `return` was
+/// legal all along. Only the bare inlining needs this.
+fn wrap_main_returns(nodes: &mut Vec<js::Node<'_>>, exit_temp: Option<&str>) {
+    if !returns_at_module_scope(nodes) {
+        return;
+    }
+    let mut body = std::mem::take(nodes);
+    lower_returns_to_break(&mut body, exit_temp);
+    nodes.push(js::Node::Labeled(MAIN_LABEL.to_string(), body));
+}
+
+/// Whether `nodes` contains a `return` that would land at module scope — one
+/// outside every nested function and closure, which are real JS functions where
+/// `return` is legal and must be left alone.
+///
+/// Statement lists only, which is the whole set: a divergent node is emitted AS
+/// a statement everywhere ([`js::Node::is_divergent`], B152), never wrapped into
+/// an expression, so there is nowhere else for one to be.
+fn returns_at_module_scope(nodes: &[js::Node<'_>]) -> bool {
+    nodes.iter().any(|node| match node {
+        js::Node::Return(_) => true,
+        js::Node::Function(_) | js::Node::Closure(_) => false,
+        js::Node::While(_, body) | js::Node::ForOf(_, _, body) | js::Node::Labeled(_, body) => {
+            returns_at_module_scope(body)
+        }
+        js::Node::Try(body, finally) => {
+            returns_at_module_scope(body) || returns_at_module_scope(finally)
+        }
+        js::Node::If(branch) => returns_at_module_scope_in_if(branch),
+        _ => false,
+    })
+}
+
+fn returns_at_module_scope_in_if(branch: &js::IfBranch<'_>) -> bool {
+    match branch {
+        js::IfBranch::If(_, body, else_branch) => {
+            returns_at_module_scope(body)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|else_branch| returns_at_module_scope_in_if(else_branch))
+        }
+        js::IfBranch::Else(body) => returns_at_module_scope(body),
+    }
+}
+
+/// [`returns_at_module_scope`]'s traversal, rewriting instead of asking: each
+/// module-scope `return` becomes `break <label>`, preceded by the assignment
+/// that hands its value to `exit_temp` (or, with no temp to hand it to, by the
+/// value as a statement, so its side effects still run).
+fn lower_returns_to_break<'src>(nodes: &mut Vec<js::Node<'src>>, exit_temp: Option<&str>) {
+    let mut lowered: Vec<js::Node<'src>> = Vec::with_capacity(nodes.len());
+    for node in std::mem::take(nodes) {
+        match node {
+            js::Node::Return(value) => {
+                match (*value, exit_temp) {
+                    (js::Node::Void, _) => {}
+                    (value, Some(temp)) => lowered.push(js::Node::Assignment(
+                        Box::new(js::Node::Local(temp.to_string())),
+                        Box::new(value),
+                    )),
+                    (value, None) => lowered.push(value),
+                }
+                lowered.push(js::Node::BreakLabel(MAIN_LABEL.to_string()));
+            }
+            // A real JS function: its `return` is legal and stays.
+            node @ (js::Node::Function(_) | js::Node::Closure(_)) => lowered.push(node),
+            js::Node::While(condition, mut body) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lowered.push(js::Node::While(condition, body));
+            }
+            js::Node::ForOf(binding, iterable, mut body) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lowered.push(js::Node::ForOf(binding, iterable, body));
+            }
+            js::Node::Labeled(label, mut body) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lowered.push(js::Node::Labeled(label, body));
+            }
+            js::Node::Try(mut body, mut finally) => {
+                lower_returns_to_break(&mut body, exit_temp);
+                lower_returns_to_break(&mut finally, exit_temp);
+                lowered.push(js::Node::Try(body, finally));
+            }
+            js::Node::If(mut branch) => {
+                lower_returns_to_break_in_if(&mut branch, exit_temp);
+                lowered.push(js::Node::If(branch));
+            }
+            node => lowered.push(node),
+        }
+    }
+    *nodes = lowered;
+}
+
+fn lower_returns_to_break_in_if(branch: &mut js::IfBranch<'_>, exit_temp: Option<&str>) {
+    match branch {
+        js::IfBranch::If(_, body, else_branch) => {
+            lower_returns_to_break(body, exit_temp);
+            if let Some(else_branch) = else_branch {
+                lower_returns_to_break_in_if(else_branch, exit_temp);
+            }
+        }
+        js::IfBranch::Else(body) => lower_returns_to_break(body, exit_temp),
+    }
+}
+
 /// Plants `__chunk_preload(<route signal>)` ahead of every statement that
 /// mounts a recognized route swap (`bundle-splitting.md` §S3), and reports the
 /// indices it inserted at in `body` itself so a caller holding a position into
@@ -377,7 +762,7 @@ fn chunk_forwarder<'src>(function: &js::Function<'src>) -> js::Node<'src> {
 /// which is the behaviour that shipped with S2.
 fn plant_boot_preloads<'src>(
     body: &mut Vec<js::Node<'src>>,
-    gates: &BTreeMap<String, String>,
+    gates: &BTreeMap<String, (String, usize)>,
     total: &mut usize,
 ) -> Vec<usize> {
     if gates.is_empty() {
@@ -414,7 +799,7 @@ fn plant_boot_preloads<'src>(
 /// body wherever it sits, and the block forms — planting there.
 fn descend_for_preload<'src>(
     node: &mut js::Node<'src>,
-    gates: &BTreeMap<String, String>,
+    gates: &BTreeMap<String, (String, usize)>,
     total: &mut usize,
 ) {
     match node {
@@ -430,6 +815,9 @@ fn descend_for_preload<'src>(
         }
         js::Node::While(condition, block) => {
             descend_for_preload(condition, gates, total);
+            plant_boot_preloads(block, gates, total);
+        }
+        js::Node::Labeled(_, block) => {
             plant_boot_preloads(block, gates, total);
         }
         js::Node::If(branch) => descend_if_for_preload(branch, gates, total),
@@ -458,7 +846,7 @@ fn descend_for_preload<'src>(
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => descend_for_preload(inner, gates, total),
-        js::Node::Array(items) => {
+        js::Node::Array(items) | js::Node::Sequence(items) => {
             for item in items {
                 descend_for_preload(item, gates, total);
             }
@@ -469,7 +857,7 @@ fn descend_for_preload<'src>(
 
 fn descend_if_for_preload<'src>(
     branch: &mut js::IfBranch<'src>,
-    gates: &BTreeMap<String, String>,
+    gates: &BTreeMap<String, (String, usize)>,
     total: &mut usize,
 ) {
     match branch {
@@ -490,12 +878,18 @@ fn descend_if_for_preload<'src>(
 /// such a call with a plainly-named source. Deliberately does NOT descend into
 /// function or closure bodies or into block forms: those are statement lists of
 /// their own, and [`plant_boot_preloads`] has already planted in them.
-fn gate_source_name(node: &js::Node, gates: &BTreeMap<String, String>) -> Option<(String, String)> {
+fn gate_source_name(
+    node: &js::Node,
+    gates: &BTreeMap<String, (String, usize)>,
+) -> Option<(String, String)> {
     match node {
         js::Node::Call(subject, arguments) => {
+            // The route source sits at the index the gate recorded: argument 1
+            // for the `View` METHOD (whose receiver is emitted first) and 0 for
+            // A85's value form.
             if let js::Node::Local(name) = subject.as_ref()
-                && let Some(preload) = gates.get(name)
-                && let Some(js::Node::Local(source)) = arguments.get(1)
+                && let Some((preload, source_at)) = gates.get(name)
+                && let Some(js::Node::Local(source)) = arguments.get(*source_at)
             {
                 return Some((preload.clone(), source.clone()));
             }
@@ -519,7 +913,9 @@ fn gate_source_name(node: &js::Node, gates: &BTreeMap<String, String>) -> Option
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => gate_source_name(inner, gates),
-        js::Node::Array(items) => items.iter().find_map(|item| gate_source_name(item, gates)),
+        js::Node::Array(items) | js::Node::Sequence(items) => {
+            items.iter().find_map(|item| gate_source_name(item, gates))
+        }
         _ => None,
     }
 }
@@ -566,7 +962,7 @@ fn imported_symbols(imports: &[String]) -> Vec<String> {
 /// (a local shadowing a global is counted too), which is the safe direction:
 /// the extra name is bound from the registry and then shadowed, costing one
 /// declaration and never a missing one.
-fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>) {
+pub(crate) fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>) {
     for node in nodes {
         collect_reference(node, out);
     }
@@ -574,6 +970,11 @@ fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>) {
 
 fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
     match node {
+        js::Node::Vtable(entries) => {
+            for (_, value) in entries {
+                collect_reference(value, out);
+            }
+        }
         js::Node::Local(name) => {
             out.insert(name.clone());
         }
@@ -590,6 +991,8 @@ fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
             collect_reference(condition, out);
             collect_references(body, out);
         }
+        // The label is not an identifier the body can reference.
+        js::Node::Labeled(_, body) => collect_references(body, out),
         js::Node::If(branch) => collect_reference_if(branch, out),
         js::Node::Try(body, finally) => {
             collect_references(body, out);
@@ -611,13 +1014,14 @@ fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => collect_reference(inner, out),
-        js::Node::Array(items) => collect_references(items, out),
+        js::Node::Array(items) | js::Node::Sequence(items) => collect_references(items, out),
         js::Node::String(_)
         | js::Node::Number(_, _)
         | js::Node::Bool(_)
         | js::Node::Null
         | js::Node::Void
         | js::Node::Break
+        | js::Node::BreakLabel(_)
         | js::Node::Continue => {}
     }
 }
@@ -648,7 +1052,7 @@ fn collect_reference_if(branch: &js::IfBranch, out: &mut BTreeSet<String>) {
 /// line break whatever the file's on-disk encoding, exactly as a triple-quoted
 /// literal already does. An ESCAPED `\r` is unaffected — it is written, not read
 /// from the line ending — and a lone `\r` in the text is preserved.
-fn unescape_string(raw: &str) -> Cow<'_, str> {
+pub fn unescape_string(raw: &str) -> Cow<'_, str> {
     let raw = crate::util::normalize_newlines(raw);
     if !raw.contains('\\') {
         return raw;
@@ -697,6 +1101,10 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_close",
         "__db_exec_guarded",
         "__db_run_guarded",
+        "__with_finally",
+        "__guarded",
+        "__guarded_async",
+        "__with_finally_async",
         "__fs_close",
         "__fs_close_awaited",
         "__fs_stat",
@@ -704,9 +1112,16 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_watch",
         "__fs_watch_stop",
         "__local_get",
+        "__response_header",
         "__session_get",
         "__dom_window",
+        "__dom_active_element",
+        "__dom_computed_style",
+        "__dom_bounding_rect",
+        "__dom_query_all",
         "__router_path",
+        "__router_url",
+        "__percent_decode",
         "__nursery_new",
         "__nursery_new_detached",
         "__nursery_run",
@@ -853,9 +1268,15 @@ fn helper_source(name: &str) -> &'static str {
         "__is_null" => {
             "function __is_null(value) {\n\treturn value === null || value === undefined;\n}"
         }
+        // A118: HALF-OPEN, `[low, high)` — the contract `docs/std/numbers.md`
+        // has always stated, and the one the float twin below has always
+        // implemented (`Math.random()` is itself `[0, 1)`). The `+ 1` made the
+        // integer arm inclusive, so `random::range(1, 7)` answered 7 about one
+        // run in eight while the doc beside it said `1..=6`. A degenerate range
+        // answers `low`: `high - low` is 0, and there is nothing else to answer.
         "__random_int" => {
             "function __random_int(low, high) {\n\
-             \treturn Math.floor(Math.random() * (high - low + 1)) + low;\n\
+             \treturn Math.floor(Math.random() * (high - low)) + low;\n\
              }"
         }
         "__random_float" => {
@@ -878,6 +1299,17 @@ fn helper_source(name: &str) -> &'static str {
         "__shared_new" => {
             "function __shared_new(value) {\n\
              \treturn { v: value };\n\
+             }"
+        }
+        // `Shared.identity()` — the cell's identity, stamped on the first ask
+        // and kept (M66). `??=` writes only when the property is absent, so the
+        // first caller mints and every later one reads; the counter starts at 1
+        // so no identity is ever `0 - 1`, the sentinel the rpc runtime's
+        // capability table uses for "no cell identity applies".
+        "__shared_identity" => {
+            "let __shared_identity_next = 1;\n\
+             function __shared_identity(cell) {\n\
+             \treturn cell.__id ??= __shared_identity_next++;\n\
              }"
         }
         // `process::env(key): Option<str>` — a missing variable reads back
@@ -922,6 +1354,19 @@ fn helper_source(name: &str) -> &'static str {
             "async function __sha512(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-512\", data));\n}"
         }
         // Web Storage glue (std::storage): a missing key reads null; flatten to "".
+        // A120 S3: one header off a host `fetch` Response. `Headers` is not a
+        // plain object — its entries are not own properties, so the `JsonValue`
+        // reading `std::http::Request::header` uses on node's request object
+        // cannot serve here — and `Headers.get` answers `null` for a header
+        // that is not there. The absent case is `""`, which is
+        // `__local_get`'s convention at this boundary and is unambiguous: a
+        // present header with an empty value and an absent one are the same
+        // fact to every caller this has.
+        "__response_header" => {
+            "function __response_header(response, name) {\n\
+             \treturn (response && response.headers ? response.headers.get(name) : null) ?? \"\";\n\
+             }"
+        }
         "__local_get" => {
             "function __local_get(key) {\n\treturn localStorage.getItem(key) ?? \"\";\n}"
         }
@@ -933,9 +1378,70 @@ fn helper_source(name: &str) -> &'static str {
         // `__router_path` exists. This is what makes `window` a listen TARGET
         // with the same verbs `Element` carries (`proposal/router.md` §5.1).
         "__dom_window" => "function __dom_window() {\n\treturn window;\n}",
+        // `std::dom::active_element`: the SAME reason `__dom_window` exists —
+        // `document.activeElement` is a global PROPERTY, and the
+        // function-extern form addresses only callables, so
+        // `[extern("document.activeElement")]` emits a CALL to it (A121; the
+        // refusal that says so is `check_global_property_externs`).
+        "__dom_active_element" => {
+            "function __dom_active_element() {\n\treturn document.activeElement;\n}"
+        }
+        // `Element::computed_style`: the RESOLVED value of one property. Two
+        // host calls behind one binding — `getComputedStyle` hands back a live
+        // declaration block and the value is read off it — which is why this
+        // is a helper and not a property path.
+        "__dom_computed_style" => {
+            "function __dom_computed_style(element, name) {\n\
+             \treturn getComputedStyle(element).getPropertyValue(name);\n\
+             }"
+        }
+        // `Element::bounding_rect`: ONE `getBoundingClientRect()` (which forces
+        // layout) read into the four numbers `std::dom`'s `DomRect` carries.
+        // The array IS the struct's runtime form — a struct is an array in
+        // FIELD ORDER — so this builds a `DomRect` the same way `__parse_i32`
+        // builds an `Option`. Its order is `left, top, width, height`, and
+        // `DomRect`'s field order in `vilan/std/src/browser/dom.vl` must match;
+        // `ui_rows.rs`'s `a59_bounding_rect_reads_the_host_box` asserts the
+        // four values by name, so a reorder is a red test rather than silence.
+        "__dom_bounding_rect" => {
+            "function __dom_bounding_rect(element) {\n\
+             \tconst rect = element.getBoundingClientRect();\n\
+             \treturn [ rect.left, rect.top, rect.width, rect.height ];\n\
+             }"
+        }
+        // `Element::query_selector_all`: the scoped twin of the document-level
+        // `Intrinsic::QuerySelectorAll`, and `Array.from` for the same reason —
+        // `querySelectorAll` yields a NodeList, which a `List` would mishandle.
+        "__dom_query_all" => {
+            "function __dom_query_all(element, selector) {\n\
+             \treturn Array.from(element.querySelectorAll(selector));\n\
+             }"
+        }
         // Router glue (std::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",
+        // The whole relative URL, for the query and fragment `location.pathname`
+        // leaves out. Deliberately NOT what `current_path()` tracks: a route
+        // signal that advanced on every `#anchor` would re-render the page for a
+        // scroll, so the path signal stays the pathname and this is the reach
+        // for the rest.
+        "__router_url" => {
+            "function __router_url() {\n\treturn location.pathname + location.search + location.hash;\n}"
+        }
+        // `router::percent_decode`: `decodeURIComponent`, made TOTAL. The host
+        // function throws a `URIError` on a malformed escape (`%zz`, a lone
+        // `%`), and a URL is attacker-supplied text — a router that crashes on
+        // one is a denial of service, so an undecodable piece decodes to
+        // itself.
+        "__percent_decode" => {
+            "function __percent_decode(text) {\n\
+             \ttry {\n\
+             \t\treturn decodeURIComponent(text);\n\
+             \t} catch {\n\
+             \t\treturn text;\n\
+             \t}\n\
+             }"
+        }
         // HMR activity guard (std::dev, `hmr.md` §4/§5): true only when a `run
         // --watch` shim installed its `window.__VILAN_HMR__` singleton. A
         // self-contained `typeof` test (safe with no shim, in any host), so the
@@ -999,6 +1505,84 @@ fn helper_source(name: &str) -> &'static str {
              \t\treturn [ 1 ];\n\
              \t} catch (error) {\n\
              \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
+             \t}\n\
+             }"
+        }
+        // The reactive core's two exception seams (`std::reactive`, tracker
+        // B292). vilan has no `try`/`catch` syntax, so the runtime's is glue
+        // here, in the `__db_*_guarded` shape above.
+        //
+        // `__with_finally` is the one the drain loop wants: an observer that
+        // throws unwound past `draining = false` and left the turn draining
+        // forever, and a FINALLY restores the flag without touching the throw
+        // — the original error keeps its type, its message and its stack, and
+        // leaves from where it was thrown. Nothing is allocated per call, which
+        // is what lets the drain hot path carry it.
+        "__with_finally" => {
+            "function __with_finally(body, after) {\n\
+             \ttry {\n\
+             \t\tbody();\n\
+             \t} finally {\n\
+             \t\tafter();\n\
+             \t}\n\
+             }"
+        }
+        // `__guarded` is the one a loop that must FINISH wants — `Owner`'s
+        // cleanup group, where a throwing cleanup would otherwise leave every
+        // later one in the group undisposed. `None` when `body` returned;
+        // `Some(text)` with the host's own diagnosis when it threw, the same
+        // `error.message`-else-`String(error)` reading as the db pair.
+        "__guarded" => {
+            "function __guarded(body) {\n\
+             \ttry {\n\
+             \t\tbody();\n\
+             \t\treturn [ 1 ];\n\
+             \t} catch (error) {\n\
+             \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
+             \t}\n\
+             }"
+        }
+        // `__guarded` for a body that SUSPENDS (`std::rpc`'s `HttpTransport`,
+        // tracker B374). The sync twin cannot serve: a rejected host promise
+        // is not a throw on the calling stack, so `try { body() }` around a
+        // `fetch` catches nothing and the rejection leaves the process as an
+        // unhandled one — which is exactly how an unreachable host used to
+        // take the program down through a transport whose own contract says
+        // `Err(reason)`. It answers the `Result` array form (`[ 0, value ]` /
+        // `[ 1, reason ]`) rather than `__guarded`'s `Option`, because the
+        // value is what the caller came for.
+        //
+        // The host's `fetch` rejection is the reason this reads `cause` too:
+        // its own message is the bare "fetch failed", and everything an
+        // operator needs — `connect ECONNREFUSED 127.0.0.1:59999` — is on the
+        // cause undici hangs off it.
+        "__guarded_async" => {
+            "async function __guarded_async(body) {\n\
+             \ttry {\n\
+             \t\treturn [ 0, await body() ];\n\
+             \t} catch (error) {\n\
+             \t\tlet reason = error && error.message ? error.message : String(error);\n\
+             \t\tif (error && error.cause && error.cause.message) {\n\
+             \t\t\treason = reason + \": \" + error.cause.message;\n\
+             \t\t}\n\
+             \t\treturn [ 1, reason ];\n\
+             \t}\n\
+             }"
+        }
+        // `__with_finally` for a body that SUSPENDS (`std::time::Debounce`'s
+        // driving loop, tracker B277). It is a separate helper rather than a
+        // thenable test inside `__with_finally` on purpose: the sync one is on
+        // the reactive drain's hot path and the async one is not, and "does
+        // this body suspend" is a question the compiler already answered at the
+        // call site. An abort — the nursery's cancellation reaching the loop's
+        // parked `wait` — is an ordinary rejection through `await`, so the
+        // `finally` runs on it exactly as it does on a normal return.
+        "__with_finally_async" => {
+            "async function __with_finally_async(body, after) {\n\
+             \ttry {\n\
+             \t\tawait body();\n\
+             \t} finally {\n\
+             \t\tafter();\n\
              \t}\n\
              }"
         }
@@ -1246,6 +1830,27 @@ fn helper_source(name: &str) -> &'static str {
              \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
              }"
         }
+        // `List.remove(i): T` — the checked splice read. `splice` is the native
+        // `memmove`, but it reads a NEGATIVE index from the END and clamps one
+        // past it, so a bare `list.splice(index, 1)[0]` would silently answer
+        // exactly the indices `[]` panics on. The guard is `__at`'s, word for
+        // word, so a caller cannot tell which of the two refused.
+        "__remove_at" => {
+            "function __remove_at(list, index) {\n\
+             \tif (index >= 0 && index < list.length) return list.splice(index, 1)[0];\n\
+             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             }"
+        }
+        // `List.insert(i, v)` — the checked splice write. `index == length`
+        // appends (a `push`, which is what the vilan shift loop did); anything
+        // outside `0..=length` panics in `__at`'s words.
+        "__insert_at" => {
+            "function __insert_at(list, index, value) {\n\
+             \tif (index >= 0 && index < list.length) return void list.splice(index, 0, value);\n\
+             \tif (index === list.length) return void list.push(value);\n\
+             \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             }"
+        }
         // `list[i] = v` — the checked subscript write: writing never creates a
         // slot (growth is `push`), so out of bounds panics.
         "__at_put" => {
@@ -1323,6 +1928,45 @@ fn helper_source(name: &str) -> &'static str {
         // `for x in set`: `Set` is a struct `[table]` over a `NativeMap`, so the
         // elements are the backing map's stored originals, in insertion order (I1).
         "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
+        // proposal/lazy.md §5 — the memo cell, and the ONE forcing helper both
+        // lazy positions share (a `lazy` parameter and a `lazy let` module
+        // binding). `{ state, value, thunk }` is the paper's shape; `name` is
+        // the fourth slot, carried because the cycle and poison messages have
+        // to say WHICH binding, and the forcing site has no other way to know.
+        //
+        // States: 0 pending, 1 running, 2 done, 3 poisoned. `running` IS the
+        // cycle trap — an initializer that (transitively) touches its own
+        // binding re-enters here and finds its own flag set, which is a clear
+        // panic rather than a silent hang. A panicking thunk POISONS (§6a, the
+        // user's call): the failure propagates at the touching site, and every
+        // later touch re-panics naming the poison, because retrying would turn
+        // "at most once" into "at least once per attempt".
+        //
+        // `thunk = null` after a successful force so the closure — and
+        // everything it captured — is collectable once the value exists.
+        "__lazy" => {
+            "function __lazy(name, thunk) {\n\
+             \treturn { name: name, state: 0, value: undefined, thunk: thunk };\n\
+             }"
+        }
+        "__force" => {
+            "function __force(cell) {\n\
+             \tif (cell.state === 2) return cell.value;\n\
+             \tif (cell.state === 1) throw \"lazy initialization cycle: `\" + cell.name + \"`\";\n\
+             \tif (cell.state === 3) throw \"lazy `\" + cell.name + \"` is poisoned: its initializer panicked: \" + cell.value;\n\
+             \tcell.state = 1;\n\
+             \ttry {\n\
+             \t\tcell.value = cell.thunk();\n\
+             \t} catch (failure) {\n\
+             \t\tcell.state = 3;\n\
+             \t\tcell.value = failure;\n\
+             \t\tthrow failure;\n\
+             \t}\n\
+             \tcell.state = 2;\n\
+             \tcell.thunk = null;\n\
+             \treturn cell.value;\n\
+             }"
+        }
         // The trap arm of an exhaustive `match` over a BACKED enum
         // (backed-enums.md §9): the enum lowers to a bare host primitive, so its
         // runtime domain is the host's, not the variant set the analyzer proved
@@ -1335,8 +1979,25 @@ fn helper_source(name: &str) -> &'static str {
         }
         // The externally-tagged enum discriminator: a bare `"Variant"` is its own
         // tag, a `{"Variant":..}` object's tag is its single key.
+        //
+        // A116: everything ELSE answers `""` — a tag no variant can be spelled
+        // with, so the derived decoder's `_` arm reports "unknown variant"
+        // instead of the helper throwing. `Object.keys(null)` is a `TypeError`,
+        // which took `FromJson`'s never-crash contract (json.vl §"Decoding is
+        // fallible and NEVER crashes") down over a document the caller did not
+        // choose — a frame off a socket could abort the process. `null`, a
+        // number, a boolean and an array are all "not a tagged enum", and so is
+        // `{}`, whose first key is `undefined`: none of them names a variant,
+        // and the decode error is the honest answer for all five. An object
+        // with SEVERAL keys still tags by its first, exactly as before — a
+        // document carrying extra keys beside the tag is not this item's
+        // question.
         "__json_tag" => {
-            "function __json_tag(value) {\n\treturn typeof value === \"string\" ? value : Object.keys(value)[0];\n}"
+            "function __json_tag(value) {\n\
+             \tif (typeof value === \"string\") return value;\n\
+             \tif (value === null || typeof value !== \"object\" || Array.isArray(value)) return \"\";\n\
+             \treturn Object.keys(value)[0] ?? \"\";\n\
+             }"
         }
         // The normalized JSON type of a parsed value: `typeof` buckets arrays and
         // `null` as `"object"`, so name them explicitly. Basis for the decode
@@ -1648,6 +2309,13 @@ fn binary<'src>(op: BinaryOp, lhs: js::Node<'src>, rhs: js::Node<'src>) -> js::N
 /// member. The member may be an intrinsic or an `[extern]` external (a host form),
 /// not just a normal emitted function — so resolution is split from emission, and
 /// `args` is consumed only once the form is known (see `resolve_dispatch`).
+///
+/// It had two more variants until N109 — `ListNew` and `ListPush`, for the only
+/// two compiler-lowered externals the `intrinsics` table did not carry. They
+/// were B359's fix rather than its cause: a dispatch resolving to one had no
+/// arm at all and minted a mangled name for a function nothing emits. Both are
+/// `Intrinsic` rows now, so the class is closed at the table instead of
+/// patched at each reader.
 enum Dispatch<'src> {
     /// A built-in lowering (`str.len()` → `.length`, etc.).
     Intrinsic(Intrinsic),
@@ -1655,6 +2323,16 @@ enum Dispatch<'src> {
     Extern(Id, ExternBinding<'src>),
     /// A normal emitted function: its JS name and whether it is async.
     Call(String, bool),
+    /// A124 R3: the receiver is a TRAIT OBJECT, so the member is read out of
+    /// the pair's own table at runtime. The blanket, as a dispatch rule: a
+    /// generic body written over `S: Trait` reaches this arm whenever `S` bound
+    /// to a `dyn Trait`, so nothing has to be written as an
+    /// `impl dyn Trait with Trait`. The flag is whether the trait DECLARES the
+    /// member async: a call through a table is emitted once for every value
+    /// the object may hold, so the declaration decides the await
+    /// (trait-objects.md §5 (i); the analyzer refuses a coercion whose
+    /// implementation is async under a sync declaration).
+    Object(String, bool),
 }
 
 /// One lowered `match` leg, kept in pieces until the whole match is compiled:
@@ -1682,12 +2360,45 @@ struct BackedTest<'src> {
     value: js::Node<'src>,
 }
 
+/// B318 S4 — one member lookup the per-importer namespace turned down, kept so
+/// the never-silent check can report the author's imports instead of an
+/// internal error. See [`Transformer::admission_miss`].
+struct AdmissionMiss {
+    /// The member the body asked for.
+    member: String,
+    /// The file the emitting body was DECLARED in — the file whose imports
+    /// decided this (`visibility.md` §3.5), which is NOT necessarily the file
+    /// that instantiated the body.
+    importer: crate::analyzer::SourceId,
+    /// E185: the body itself, so the refusal can NAME the importing module.
+    /// `importer` is `[derive(..)]`-synthesized code's sentinel source
+    /// ([`crate::analyzer::DERIVED_SOURCE`]) whenever the emitting body is a
+    /// generated one — which is every `Wire` visitor, and so every miss the
+    /// sweep actually saw — and that sentinel is outside `sources`, so the
+    /// module name came out as the placeholder `that module`, sixteen times in
+    /// one report. The entity resolves through `note_source_of` to the file the
+    /// derive was WRITTEN in, which is the file whose import the reader has to
+    /// widen.
+    importing_body: Option<Id>,
+    /// The file declaring the `impl` the lookup would otherwise have taken.
+    declared_in: crate::analyzer::SourceId,
+}
+
+/// What [`Transformer::enter_instance`] displaces while a body is emitted, and
+/// [`Transformer::restore_instance`] puts back. A named record rather than a
+/// tuple since B318 S4 made it a fourth field: three positional `saved.2`s were
+/// already at the limit of what a reader can hold.
+struct SavedInstance<'src> {
+    adapted: Vec<Id>,
+    instance: Option<crate::analyzer::AdaptedInstance>,
+    origin: Option<&'src str>,
+    admitting_file: Option<crate::analyzer::SourceId>,
+}
+
 struct Transformer<'src> {
     formatter: Formatter,
     ng: NameGenerator,
     print_fn_id: Id,
-    list_new_fn_id: Option<Id>,
-    list_push_fn_id: Option<Id>,
     panic_fn_id: Option<Id>,
     drop_fn_id: Option<Id>,
     program: &'src Program<'src>,
@@ -1712,6 +2423,43 @@ struct Transformer<'src> {
     // ORIGIN stamped into `__task` calls, so an unobserved task failure can
     // name where it was spawned. `None` at module level ("top level").
     current_origin: Option<&'src str>,
+    // B318 S4 (`visibility.md` §3.5) — the FILE whose admitted-impl set this
+    // body's member lookups run under: the file the body was DECLARED in, not
+    // the file that instantiated it.
+    //
+    // A generic function in `a.vl` means what `a.vl`'s imports say it means, at
+    // every instantiation. That is `prelude.md` §7's rule ("a consumer cannot
+    // change what a dependency's source means") and it is the only rule under
+    // which a library is analysable at all — the alternative, resolving a
+    // monomorphized body under the INSTANTIATING file's set, makes one source
+    // text mean different things in different callers.
+    //
+    // It matters here and nowhere else in emission because `select_member`
+    // takes `maxima(..).first()`: with two equally specific inherent impls both
+    // declaring the name it picks one arbitrarily, which is exactly the silent
+    // pick B57 exists to prevent. Until S4 that pair was impossible (the
+    // declaration-site rule refused it program-wide); now it is a per-FILE
+    // fact, so the file has to travel with the lookup.
+    //
+    // `None` while nothing in the program restricts anything — the estate's
+    // path, and `admitting_file`'s own short-circuit.
+    current_admitting_file: Option<crate::analyzer::SourceId>,
+    // B318 S4 — the FIRST member lookup this emission lost to the per-importer
+    // namespace: a member `select_member` would have found with no file scope
+    // and did not find under the emitting body's own file.
+    //
+    // A body-less call target is the never-silent check's business (B55), and
+    // its message says "internal … please report this program" because until
+    // S4 every way of reaching it WAS a compiler bug. It is now also a legal
+    // program's honest outcome: a file whose selector admits no `tag` and whose
+    // generic body calls `.tag()` has written something the compiler must
+    // refuse, and refuse in the author's own terms. So the losing lookup leaves
+    // its evidence here and the check reads it.
+    //
+    // A `RefCell` because the lookup sites are `&self` — they resolve, they do
+    // not emit — and threading `&mut` through them to carry a diagnostic would
+    // put the sink in four signatures to serve one message.
+    admission_miss: std::cell::RefCell<Option<AdmissionMiss>>,
     // Every entity emitted as a VALUE reference (the `Expr::Local` arm) —
     // consulted at assembly to tree-shake module-level bindings (F6): a
     // binding emits only if something reachable referenced it.
@@ -1725,6 +2473,10 @@ struct Transformer<'src> {
     // Trait default methods specialized per concrete type, keyed by
     // (default function, concrete type) so each is emitted once.
     default_instances: HashMap<(Id, String), String>,
+    /// A124 R3: the emitted vtable for each coerced `(trait, type)` pair, by
+    /// its JS name. One table per pair, reachability-driven (§6.2) — a pair
+    /// nothing coerces emits nothing.
+    vtables: HashMap<(Id, String), String>,
     // Per-type `__drop` helpers (destruction.md §7), keyed by `type_key`. `None`
     // records a type whose destruction is a complete no-op (no `Drop` impl, no
     // resource members) so callers skip it; `Some(name)` is the emitted helper.
@@ -1745,6 +2497,17 @@ struct Transformer<'src> {
     // instead of re-evaluating: a compound assignment's INDEXED target subscript,
     // walked once for the write and once for the synthesized re-read (B105).
     hoisted_values: HashMap<Id, js::Node<'src>>,
+    /// G24: while a closure SNAPSHOT is being written out, the compile-time
+    /// value each binding it closed over held — substituted wherever the body
+    /// reads one, so the emitted arrow carries literals instead of names it
+    /// could not resolve at runtime. Empty outside a snapshot, and SCOPED (a
+    /// nested snapshot extends it and restores on the way out).
+    const_capture_values: HashMap<Id, js::Node<'src>>,
+    /// G24: the snapshot bodies currently being written out. A `const let`'s
+    /// initializer IS its own result's site, so walking the closure would find
+    /// the snapshot again; this is what makes the body's one emission
+    /// terminate.
+    emitting_snapshots: HashSet<Id>,
     // While `Some`, every `is_bindings` lookup records the capture it resolved.
     // A match guard is walked with this on, so the leg's lowering can tell
     // whether the guard READS a capture whose copy has to be declared ahead of
@@ -1767,7 +2530,21 @@ struct Transformer<'src> {
     // output is `function f(self) {\n}`: a clean compile whose first use of the
     // result is a runtime `TypeError`. Collected here and turned into a hard
     // compile error at assembly, so the class cannot recur silently.
-    bodyless_emissions: Vec<Id>,
+    // E190 adds the REQUESTER: the function whose body was being emitted when
+    // the requirement was first reached, as `(bodyless function, requester)`.
+    // The bodyless function's own span is the requirement's NAME in std, which
+    // the CLI never renders — the refusal printed one bare `Error:` line with no
+    // file, no line and no hint which of kolt's 19 files to look in, and the
+    // integrator had to instrument this seam by hand to learn that `app_shell`
+    // was the frame that asked. That frame is the only location the reader can
+    // act on, so it is recorded WITH the emission rather than reconstructed
+    // afterwards.
+    bodyless_emissions: Vec<(Id, Option<Id>)>,
+    // E190: the emission frames currently on the stack, innermost last.
+    // `emitting` above is a SET (its question is "am I already inside this
+    // body?", which order cannot answer), and `function_with_name` is the one
+    // funnel every emitted callable passes through, so the stack is kept here.
+    emitting_stack: Vec<Id>,
     // B135: memo for `reaches_bare_requirement` — whether a function's body,
     // transitively through the program call graph, contains a dispatch that
     // would fall through to a bodyless trait requirement if emitted without a
@@ -1805,11 +2582,16 @@ struct Transformer<'src> {
     // boot preload for the same route type (`bundle-splitting.md` §S3). Recorded
     // at emission, so these are PRE-rename names — which is what the planting
     // pass, which runs before the rename, matches against.
-    gate_call_names: BTreeMap<String, String>,
+    gate_call_names: BTreeMap<String, (String, usize)>,
     // The const pass's per-emission attribution (`const-eval.md` §10.6). `None`
     // for every other transform — an entry build records nothing, and the field
     // is what keeps the emission path it shares with the const pass unchanged.
     recorder: Option<EmissionRecorder>,
+    // Set by [`diagnose`]: this walk is being run for its REFUSALS and its
+    // output will be dropped, so the cosmetic tail of `assemble` is skipped
+    // (backlog M34). `false` for every emitting transform, which is what keeps
+    // the emitted text byte-identical.
+    diagnose_only: bool,
 }
 
 /// One thing the shared const world declares: a concrete function, or a KEYED
@@ -1849,24 +2631,86 @@ struct SharedBody {
     emission: Option<EmissionId>,
 }
 
-/// One emitted instance body as text, with the instance's OWN name normalized
-/// away — the key [`Transformer::push_or_share`] compares bodies by.
+/// One emitted instance body as text, with the instance's OWN name and every
+/// generated name the body BINDS normalized away — the key
+/// [`Transformer::push_or_share`] compares bodies by.
 ///
-/// The name is removed through the same [`rename_node`] walk the release
+/// The names are removed through the same [`rename_node`] walk the release
 /// rename uses, not by substituting text: a string LITERAL that happened to
 /// contain another instance's name would make two different bodies look alike
 /// to a textual swap, and that would be a miscompile rather than a missed
-/// optimization. `@` is not an identifier character, so the placeholder cannot
-/// collide with a real name.
-fn canonical_instance_body(node: &js::Node, name: &str) -> String {
+/// optimization. `@` is not an identifier character, so the placeholders
+/// cannot collide with a real name.
+///
+/// **The local gensyms are normalized too (backlog M80), and that is what
+/// makes the key about the CODE rather than about the counter.** The
+/// generator's anonymous temporaries are minted from one monotonic counter, so
+/// two monomorphizations of one function get different ones — and then their
+/// bodies, identical in every other character, stopped sharing. C14 S3 gave
+/// `std::reactive`'s `observe` two compiler-minted temporaries and the
+/// function was emitted TWICE in `reactive-flatten.mjs` and
+/// `reactive-on-change.mjs` where it had been emitted once, `$D`/`$H`
+/// identical modulo `$E$F` against `$I$J`.
+///
+/// Two conditions keep the wider equivalence exact rather than merely
+/// plausible, and both are needed:
+///
+///  - only names in the generator's `minted` set are renamed. One generated
+///    name is one binding program-wide — `allocate_scope`'s `debug_assert` is
+///    that invariant — so a minted name the body binds cannot ALSO be a free
+///    reference to something else in the same body, which is the one way a
+///    scope-blind rename could make two different bodies look alike. A source
+///    name is left alone precisely because it can shadow;
+///  - only names the body itself BINDS are renamed, collected through the same
+///    hand-written walk the release rename uses. That walk may be incomplete
+///    (`rename_for_scopes` reserves the complement for exactly that reason),
+///    and an incomplete answer here costs a missed share and nothing else: an
+///    unnormalized name simply makes two bodies compare unequal.
+///
+/// Numbered in walk order, which is deterministic for a given body, so two
+/// bodies that differ only in their temporaries' numbering render the same
+/// text.
+fn canonical_instance_body(node: &js::Node, name: &str, minted: &HashSet<String>) -> String {
     let mut probe = node.clone();
     let mut rename: HashMap<String, String> = HashMap::default();
     rename.insert(name.to_string(), "@".to_string());
+    let mut declarations = Vec::new();
+    let mut children = Vec::new();
+    collect_declarations(
+        std::slice::from_ref(node),
+        minted,
+        &mut declarations,
+        &mut children,
+    );
+    let scope = JsScope {
+        declarations,
+        children,
+    };
+    let mut bound = Vec::new();
+    collect_bound_names_in_order(&scope, &mut bound);
+    for (position, name) in bound.into_iter().enumerate() {
+        rename.entry(name).or_insert_with(|| format!("@{position}"));
+    }
     rename_node(&mut probe, &rename);
     // The tightest rendering: whitespace options are a fact about the output
     // file, and two bodies are the same body or not regardless of how they
     // will be printed.
     Formatter::from_options(false, false).node(&probe, "", 0)
+}
+
+/// Every binding name a scope tree accounts for, in WALK order and without
+/// repeats — [`canonical_instance_body`]'s numbering. [`collect_reached_names`]
+/// answers the same question as a set, which is the right shape for reserving
+/// the complement and the wrong one for numbering.
+fn collect_bound_names_in_order(scope: &JsScope, into: &mut Vec<String>) {
+    for name in &scope.declarations {
+        if !into.contains(name) {
+            into.push(name.clone());
+        }
+    }
+    for child in &scope.children {
+        collect_bound_names_in_order(child, into);
+    }
 }
 
 /// What one emission contributed DIRECTLY, recorded the first — and, in the
@@ -1880,7 +2724,7 @@ fn canonical_instance_body(node: &js::Node, name: &str) -> String {
 /// function once would lose all three for every site after the first — so each
 /// emission records them, together with what it directly required, and a site
 /// recovers its exact set by closing over `requires` from its own walk.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EmissionRecord {
     globals: HashSet<Id>,
     helpers: BTreeSet<&'static str>,
@@ -1965,6 +2809,43 @@ pub fn instance_log() -> Vec<String> {
     INSTANCE_LOG.with(|log| log.borrow().clone())
 }
 
+thread_local! {
+    /// The largest composed substitution any instance emission on this thread
+    /// has walked a body under since [`reset_substitution_peak`] — the entry
+    /// count of `current_substitution`, at its high-water mark.
+    ///
+    /// B244 made `emit_instance` COMPOSE the enclosing substitution with the
+    /// instantiation's own rather than replace it, which is what keeps a
+    /// constructor-headed binding's inner parameter reachable through however
+    /// many constructors sit between it and its concrete type. The composition
+    /// is also the only thing in the transformer that GROWS with monomorphization
+    /// depth: every nested emission clones the map in force and extends it, so a
+    /// chain n deep clones n times and the innermost map carries every outer
+    /// entry the inner ones did not shadow. Nothing measured that (tracker N62),
+    /// which means nothing would notice a program whose chain made the clone the
+    /// dominant cost of its emission.
+    ///
+    /// The peak and not a total, because the question is what the deepest point
+    /// of a compile costs, and a `Cell<usize>` max on a path that already clones
+    /// a `HashMap` is not a cost anyone can measure. Always on, for
+    /// [`INSTANCE_LOG`]'s reason: a `cfg(test)` instrument does not survive
+    /// `vilan-core` being built as a non-test dependency of another crate's test
+    /// binary.
+    static SUBSTITUTION_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The largest composed substitution an instance emission on this thread has
+/// walked a body under since the last [`reset_substitution_peak`]. See
+/// [`SUBSTITUTION_PEAK`].
+pub fn substitution_peak() -> usize {
+    SUBSTITUTION_PEAK.with(std::cell::Cell::get)
+}
+
+/// Puts this thread's [`substitution_peak`] back to zero.
+pub fn reset_substitution_peak() {
+    SUBSTITUTION_PEAK.with(|peak| peak.set(0));
+}
+
 /// Empties this thread's [`instance_log`].
 pub fn reset_instance_log() {
     INSTANCE_LOG.with(|log| log.borrow_mut().clear());
@@ -1977,12 +2858,14 @@ type FrameSets = (
     BTreeMap<String, BTreeSet<String>>,
 );
 
-/// What a split build's route gate rewires: `View.swap` becomes
-/// `View.swap_split` at the recognized calls, and `std::ui::chunk_preload` is
-/// planted ahead of the statement that mounts each one.
+/// What a split build's route gate rewires: a recognized `swap` call becomes
+/// its `swap_split` twin — the `View` METHOD or, since A85, the free VALUE form
+/// — and `std::ui::chunk_preload` is planted ahead of the statement that mounts
+/// each one. `retarget`'s third element is the emitted call's route-source
+/// argument index, which differs between the two shapes (the method carries its
+/// receiver first).
 struct ChunkGate {
-    swap: Id,
-    swap_split: Id,
+    retarget: Vec<(Id, Id, usize)>,
     preload: Id,
     calls: HashSet<Id>,
 }
@@ -2068,8 +2951,6 @@ impl<'src> Transformer<'src> {
             formatter: Formatter::from_options(options.indent, options.spaces),
             ng: NameGenerator::new(names),
             print_fn_id,
-            list_new_fn_id: program.list_new_fn_id,
-            list_push_fn_id: program.list_push_fn_id,
             panic_fn_id: program.panic_fn_id,
             drop_fn_id: program.drop_fn_id,
             program,
@@ -2079,20 +2960,26 @@ impl<'src> Transformer<'src> {
             current_adapted: Vec::new(),
             current_instance: None,
             current_origin: None,
+            current_admitting_file: None,
+            admission_miss: std::cell::RefCell::new(None),
             referenced_globals: HashSet::default(),
             instances: HashMap::default(),
             current_self_type: None,
             default_instances: HashMap::default(),
+            vtables: HashMap::default(),
             drop_helpers: HashMap::default(),
             shared_bodies: HashMap::default(),
             monomorphized: Vec::new(),
             is_bindings: HashMap::default(),
             hoisted_values: HashMap::default(),
+            const_capture_values: HashMap::default(),
+            emitting_snapshots: HashSet::default(),
             is_binding_reads: None,
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
+            emitting_stack: Vec::new(),
             bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
             unrendered_concatenations: Vec::new(),
@@ -2102,6 +2989,7 @@ impl<'src> Transformer<'src> {
             chunk_gate: None,
             gate_call_names: BTreeMap::new(),
             recorder: None,
+            diagnose_only: false,
         }
     }
 
@@ -2192,14 +3080,18 @@ impl<'src> Transformer<'src> {
         let gate_roots: Vec<Id> = self
             .chunk_gate
             .as_ref()
-            .map(|gate| vec![gate.swap_split, gate.preload])
+            .map(|gate| {
+                let mut roots: Vec<Id> = gate.retarget.iter().map(|(_, to, _)| *to).collect();
+                roots.push(gate.preload);
+                roots
+            })
             .unwrap_or_default();
         let reachable_bindings =
             crate::platform_color::reachable_bindings(self.program, graph, main_fn.id, &gate_roots);
         let binding_nodes: Vec<(Id, Vec<js::Node<'src>>)> = global_variables
             .iter()
             .filter(|binding| reachable_bindings.contains(binding))
-            .map(|&binding| (binding, self.walk_list(&[binding])))
+            .map(|&binding| (binding, self.walk_module_binding(binding)))
             .collect();
 
         let saved_instance = self.enter_instance(main_fn.id, Vec::new());
@@ -2217,24 +3109,35 @@ impl<'src> Transformer<'src> {
                 Some(Expr::Void) | None
             );
             if tail_is_void || !self.program.platform.has_process_exit() {
-                self.walk_scope_body(
+                let mut body = self.walk_scope_body(
                     &main_fn.body.0,
                     0,
                     main_fn.body.0.len(),
                     Some((main_fn.body.1, TailDisposition::Discard)),
-                )
+                );
+                // B214: no exit code to carry — a `ret` here just leaves.
+                if !main_is_async {
+                    wrap_main_returns(&mut body, None);
+                }
+                body
             } else {
                 let exit_temp = self.ng.next_name();
                 let mut body = vec![js::Node::LetVariable(js::Variable {
                     name: exit_temp.clone(),
                     value: Box::new(js::Node::Void),
                 })];
-                let wrapped = self.walk_scope_body(
+                let mut wrapped = self.walk_scope_body(
                     &main_fn.body.0,
                     0,
                     main_fn.body.0.len(),
                     Some((main_fn.body.1, TailDisposition::AssignTo(exit_temp.clone()))),
                 );
+                // B214: the label wraps the BODY only — the temp is declared
+                // before it and the `process.exit` runs after it, so an early
+                // `ret` that breaks out still exits with the code it set.
+                if !main_is_async {
+                    wrap_main_returns(&mut wrapped, Some(&exit_temp));
+                }
                 body.extend(wrapped);
                 body.push(js::Node::Call(
                     Box::new(js::Node::Property(
@@ -2253,24 +3156,76 @@ impl<'src> Transformer<'src> {
             // void tail (e.g. a block ending in a loop) exits normally. The browser has
             // no exit code, so the tail is emitted as a plain statement — its side
             // effects still run (a `main` that ends in `render()`), the value discarded.
-            if let Some(value) = self.walk_entity(main_fn.body.1, &mut t_main_fn_body)
-                && !matches!(value, js::Node::Void)
-            {
+            let tail = self
+                .walk_entity(main_fn.body.1, &mut t_main_fn_body)
+                .filter(|value| !matches!(value, js::Node::Void));
+            // B152: a tail that already LEAVES the scope (`ret` / `jump` written
+            // as `main`'s final expression) is the statement it is under every
+            // disposition — exiting or assigning one emits `process.exit(return)`.
+            let tail = match tail {
+                Some(value) if value.is_divergent() => {
+                    t_main_fn_body.push(value);
+                    None
+                }
+                other => other,
+            };
+            // B214: a `ret` in this `main` needs the labeled-block wrapper, and
+            // the wrapper has to sit between the exit-code temp and the
+            // `process.exit` that reads it — so the exit is decided here rather
+            // than by pushing the tail straight into the body. A `main` with no
+            // such `ret` takes the `None` arm, which is the emission that shipped.
+            let exit_code_temp = (!main_is_async
+                && returns_at_module_scope(&t_main_fn_body)
+                && tail.is_some()
+                && self.program.platform.has_process_exit())
+            .then(|| self.ng.next_name());
+            match (tail, &exit_code_temp) {
+                // An exit code AND an early `ret`: the tail lands in the temp
+                // inside the block, every `ret` assigns the same temp on its way
+                // out, and one `process.exit` after the block reads it.
+                (Some(value), Some(temp)) => {
+                    t_main_fn_body.push(js::Node::Assignment(
+                        Box::new(js::Node::Local(temp.clone())),
+                        Box::new(value),
+                    ));
+                }
                 // A host with `process.exit` (Node) forwards `main`'s result as the
                 // exit code; the browser (and the host-less `none`, which the CLI
                 // refuses to *build*) has none, so the tail is a plain statement.
-                let statement = if self.program.platform.has_process_exit() {
-                    js::Node::Call(
-                        Box::new(js::Node::Property(
-                            Box::new(js::Node::Local("process".to_string())),
-                            "exit".to_string(),
-                        )),
-                        vec![value],
-                    )
-                } else {
-                    value
-                };
-                t_main_fn_body.push(statement);
+                (Some(value), None) => {
+                    let statement = if self.program.platform.has_process_exit() {
+                        js::Node::Call(
+                            Box::new(js::Node::Property(
+                                Box::new(js::Node::Local("process".to_string())),
+                                "exit".to_string(),
+                            )),
+                            vec![value],
+                        )
+                    } else {
+                        value
+                    };
+                    t_main_fn_body.push(statement);
+                }
+                (None, _) => {}
+            }
+            if !main_is_async {
+                wrap_main_returns(&mut t_main_fn_body, exit_code_temp.as_deref());
+            }
+            if let Some(temp) = exit_code_temp {
+                t_main_fn_body.insert(
+                    0,
+                    js::Node::LetVariable(js::Variable {
+                        name: temp.clone(),
+                        value: Box::new(js::Node::Void),
+                    }),
+                );
+                t_main_fn_body.push(js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(js::Node::Local("process".to_string())),
+                        "exit".to_string(),
+                    )),
+                    vec![js::Node::Local(temp)],
+                ));
             }
             t_main_fn_body
         };
@@ -2306,6 +3261,7 @@ impl<'src> Transformer<'src> {
                     parameters: Vec::new(),
                     body: t_main_fn_body,
                     is_async: true,
+                    origin: None,
                 })),
                 Vec::new(),
             );
@@ -2342,6 +3298,7 @@ impl<'src> Transformer<'src> {
                             ),
                         ],
                         is_async: false,
+                        origin: None,
                     })],
                 )]
             } else {
@@ -2393,12 +3350,24 @@ impl<'src> Transformer<'src> {
                     TransferForm::SharedPayload => {
                         js::Node::Property(Box::new(js::Node::Local(name)), "v".to_string())
                     }
+                    // A102: the getter reads the memo cell WITHOUT forcing it —
+                    // exposing a lazy binding must not run the initializer the
+                    // program chose not to run — and throws when the cell is not
+                    // `done`, which is how the capture already spells "this key
+                    // carries nothing" (`hmr.md` §3 step 1 skips a throwing
+                    // getter). So a pending or poisoned binding re-mints, and a
+                    // forced one hands over its value.
+                    TransferForm::LazyValue => js::Node::Call(
+                        Box::new(js::Node::Local("__hmr_lazy_value".to_string())),
+                        vec![js::Node::Local(name)],
+                    ),
                     TransferForm::Excluded => unreachable!("filtered above"),
                 };
                 let getter = js::Node::Closure(js::Closure {
                     parameters: Vec::new(),
                     body: vec![js::Node::Return(Box::new(getter_body))],
                     is_async: false,
+                    origin: None,
                 });
                 hmr_expose.push(js::Node::Call(
                     Box::new(js::Node::Local("__hmr_expose".to_string())),
@@ -2411,12 +3380,72 @@ impl<'src> Transformer<'src> {
             }
         }
 
+        // B318 S4 (`visibility.md` §3.5): the body-less target below is USUALLY
+        // a compiler bug, and since the per-importer namespace it can also be a
+        // legal program's honest outcome — a generic body whose DECLARING file
+        // admits no implementation of the member it calls. That is the author's
+        // to fix and the message has to say so, in the author's own terms,
+        // rather than asking them to report a program that is working exactly
+        // as ruled. Checked FIRST because it is the specific diagnosis of the
+        // general symptom below.
+        if let Some(miss) = self.admission_miss.borrow_mut().take() {
+            let module = |source: crate::analyzer::SourceId| -> Option<String> {
+                self.program
+                    .canonical_sources
+                    .get(source.0 as usize)
+                    .and_then(|path: &std::path::PathBuf| path.file_stem())
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+            };
+            let member = miss.member;
+            let declaring = module(miss.declared_in).unwrap_or_else(|| "that module".to_string());
+            // E185: the importing module's SPELLED name. The body that asked
+            // may be `[derive(..)]`-synthesized, whose source id is the
+            // sentinel outside `sources` — `note_source_of` resolves it to the
+            // file the derive was written in, which is the file whose import
+            // the steer below asks the reader to widen.
+            let here = miss
+                .importing_body
+                .and_then(|body| self.program.note_source_of(body))
+                .and_then(module)
+                .or_else(|| module(miss.importer))
+                .unwrap_or_else(|| "that module".to_string());
+            let error = Error {
+                trace: Vec::new(),
+                note: None,
+                span: Span::default(),
+                msg: format!(
+                    "'{member}' is provided by an `impl` in module `{declaring}`, and module \
+                     `{here}` does not admit it: a generic body resolves under the file it was \
+                     DECLARED in, not the file that instantiated it, so widening the import at \
+                     the CALLER does not reach it. Widen `{here}`'s own import of \
+                     `{declaring}` — `(impl _)` admits every implementation it declares"
+                ),
+            };
+            // E185: and PLACED — through the one anchoring rule every
+            // post-`analyze` pass uses (E16), which re-spans generated code at
+            // the attribute that generated it. The file rides in the note, the
+            // channel the CLI reads a transformer refusal's location from; the
+            // refusal used to carry `0..0` against the entry, so it rendered at
+            // the entry's first byte whatever module it was about.
+            let Some(body) = miss.importing_body else {
+                return Err(error);
+            };
+            let (mut error, source) = self.program.anchored(error, body);
+            error.note = Some(Note {
+                span: error.span,
+                msg: format!("`{here}` is the module whose import decides this"),
+                source: Some(source),
+            });
+            return Err(error);
+        }
+
         // Never-silent (B55): refuse to ship a program that emitted a body-less
         // function as a call target. The emitted body is empty, so the call
         // yields `undefined` and the first use of the result is a runtime
         // `TypeError` — from a compile that reported nothing. Whatever failed to
         // resolve upstream, it must not leave here quietly.
-        if let Some(&function_id) = self.bodyless_emissions.first() {
+        if let Some(&(function_id, requester)) = self.bodyless_emissions.first() {
             let function = self.program.functions.get(&function_id);
             let name = function.map(|function| function.name).unwrap_or("?");
             let declaring_trait = self
@@ -2429,18 +3458,46 @@ impl<'src> Transformer<'src> {
                 Some(trait_name) => format!("`{trait_name}`'s requirement `{name}`"),
                 None => format!("`{name}`"),
             };
-            return Err(Error {
-                trace: Vec::new(),
-                note: None,
-                span: function
+            // E190: the frame that asked. The requirement's own name span sits
+            // in std (or wherever the trait is declared), and the CLI attributes
+            // a transformer refusal to the ENTRY — so the span rendered nothing
+            // at all. The requester's name span is a real location in a file the
+            // author owns, and the note carries the file so the attribution can
+            // follow it.
+            let requester = requester.and_then(|id| {
+                let frame = self.program.functions.get(&id)?;
+                let file = self.program.source_of(id);
+                let path = file
+                    .and_then(|source| self.program.source_path(source))
+                    .map(|path| path.display().to_string());
+                Some((frame.name, frame.name_span, file, path))
+            });
+            let asked = bodyless_refusal_frame(
+                requester
+                    .as_ref()
+                    .map(|(frame, _, _, path)| (*frame, path.as_deref())),
+            );
+            let span = match &requester {
+                Some((_, name_span, _, _)) => *name_span,
+                None => function
                     .map(|function| function.name_span)
                     .unwrap_or_default(),
+            };
+            let note = requester.as_ref().map(|(frame, name_span, file, _)| Note {
+                span: *name_span,
+                msg: format!("`{frame}` is the body that reached the requirement"),
+                source: *file,
+            });
+            return Err(Error {
+                trace: Vec::new(),
+                note,
+                span,
                 msg: format!(
                     "internal: a call resolved to {source}, which has no body — \
                      emitting it would produce an empty function and a runtime \
                      `TypeError`. The receiver's type could not be resolved to a \
-                     concrete implementation at this call; please report this \
-                     program"
+                     concrete implementation at this call{asked}; please report \
+                     this program"
                 ),
             });
         }
@@ -2495,7 +3552,7 @@ impl<'src> Transformer<'src> {
         }
 
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
-        t_functions.sort_by(|a, b| (a.0.0).cmp(&b.0.0));
+        t_functions.sort_by_key(|a| a.0.0);
 
         // The route-chunk partition (`bundle-splitting.md` §1): a function
         // reachable from exactly one route arm and nothing eager leaves the
@@ -2577,7 +3634,17 @@ impl<'src> Transformer<'src> {
         // Re-allocate names over the JS scope tree so disjoint scopes share them
         // (readable: both sibling `value`s stay `value`; release: reuse short
         // names per function).
-        rename_for_scopes(&self.ng, self.program, &mut nodes);
+        //
+        // Everything this function can REFUSE has already been decided above —
+        // the missing `main` at the top, then B55's body-less emission, B68's
+        // unresolved `drop` sink and B176's unrendered concatenation — and this
+        // pass returns `()`, so there is nothing left here for a `check` to
+        // learn. It is also 5.8% of a cold check's instructions (backlog M34),
+        // which is why a caller that is going to drop the text says so rather
+        // than paying for names nobody will read.
+        if !self.diagnose_only {
+            rename_for_scopes(&self.ng, self.program, &mut nodes);
+        }
         // Lift the chunk runs out, last first so the earlier ranges stay valid.
         let mut chunks: Vec<Vec<js::Node<'src>>> = Vec::with_capacity(chunk_ranges.len());
         for (start, end) in chunk_ranges.iter().rev() {
@@ -2611,6 +3678,30 @@ impl<'src> Transformer<'src> {
                 Box::new(value),
             )),
         }
+    }
+
+    /// One MODULE-LEVEL binding, walked under the file that DECLARES it
+    /// (B349, `visibility.md` §3.5).
+    ///
+    /// `current_admitting_file` had exactly one writer — `enter_instance`, a
+    /// FUNCTION-body seam — so a top-level initializer resolved its members
+    /// under `None`, which is "no file restricts anything": every impl in the
+    /// program was admissible from a module-level `let`, however narrow the
+    /// declaring file's own `(impl ..)` selector was. It was harmless in the
+    /// estate only because a module binding sits in the file that declares it
+    /// and that file admits its own blocks — a coincidence of where the code
+    /// is written, not the rule §3.5 states — and a binding whose initializer
+    /// calls a GENERIC whose body needs an impl the declaring file does not
+    /// admit went through the hole.
+    ///
+    /// `admitting_file` answers `None` when nothing in the program restricts
+    /// anything, so a program with no selector walks exactly as before.
+    fn walk_module_binding(&mut self, binding: Id) -> Vec<js::Node<'src>> {
+        let file = self.program.admitting_file(binding);
+        let saved = std::mem::replace(&mut self.current_admitting_file, file);
+        let nodes = self.walk_list(&[binding]);
+        self.current_admitting_file = saved;
+        nodes
     }
 
     fn walk_list(&mut self, list: &[Id]) -> Vec<js::Node<'src>> {
@@ -2853,6 +3944,7 @@ impl<'src> Transformer<'src> {
                     parameters: vec![js::Parameter { name: parameter }],
                     body: closure_body,
                     is_async: false,
+                    origin: None,
                 }),
             ],
         )
@@ -3032,44 +4124,139 @@ impl<'src> Transformer<'src> {
     /// assignment, or anything containing one. An unused `let` binding can be
     /// dropped only if its initializer is side-effect-free; a side-effecting one
     /// (e.g. a call that mutates through `&mut self`) must still run.
+    ///
+    /// **The match is EXHAUSTIVE, deliberately (B377).** It was written with a
+    /// `_ => false` catch-all, and the arms it happened to list were the
+    /// *value* shapes — so every COMPOUND shape that is really a statement
+    /// form (a block, an `if`, a `match`, a loop, a `ret`) answered "pure" and
+    /// an unused binding over one was dropped whole, statements and side
+    /// effects with it: `(value in values => { note(1); value })` emitted
+    /// nothing at all while `(value in values => note(1))` emitted the `.map`.
+    /// The default on an unknown shape must be "may have effects", and the only
+    /// way to keep that true as `Expr` grows is to force a new variant through
+    /// this list — so add the variant's arm rather than a catch-all.
     fn expr_has_side_effects(&self, expr_id: Id) -> bool {
-        match self.program.entity_map.get(&expr_id) {
-            Some(Expr::Call(_)) | Some(Expr::Await(_)) | Some(Expr::Assignment(_, _)) => true,
+        let Some(entity) = self.program.entity_map.get(&expr_id) else {
+            return false;
+        };
+        match entity {
+            Expr::Call(_) | Expr::Await(_) | Expr::Assignment(_, _) => true,
             // An `async { .. }` block is an *invoked* async arrow — it starts
             // executing its body immediately, so it is effectful even when its
             // promise is discarded (`let _ = async { pump loop }`).
-            Some(Expr::Async(_)) => true,
-            Some(Expr::Binary(_, lhs, rhs)) => {
+            Expr::Async(_) => true,
+            Expr::Binary(_, lhs, rhs) => {
                 self.expr_has_side_effects(*lhs) || self.expr_has_side_effects(*rhs)
             }
-            Some(Expr::Unary(_, operand))
-            | Some(Expr::Reference(operand, _))
-            | Some(Expr::Dereference(operand)) => self.expr_has_side_effects(*operand),
-            Some(Expr::Field(subject, _, _))
-            | Some(Expr::TupleIndex(subject, _, _))
-            | Some(Expr::ArrayLen(subject, _)) => self.expr_has_side_effects(*subject),
+            Expr::Unary(_, operand)
+            | Expr::Reference(operand, _)
+            | Expr::Dereference(operand)
+            | Expr::Is(operand, _)
+            | Expr::Destructure(operand, _) => self.expr_has_side_effects(*operand),
+            Expr::Field(subject, _, _)
+            | Expr::TupleIndex(subject, _, _)
+            | Expr::ArrayLen(subject, _) => self.expr_has_side_effects(*subject),
             // `[value; n]` evaluates its value expression once.
-            Some(Expr::Repeat(value, _)) => self.expr_has_side_effects(*value),
+            Expr::Repeat(value, _) => self.expr_has_side_effects(*value),
             // A lift region runs its steps and (conditionally) its body.
-            Some(Expr::LiftRegion(steps, body_id)) => {
+            Expr::LiftRegion(steps, body_id) => {
                 steps
                     .iter()
                     .any(|(step_id, _, _)| self.expr_has_side_effects(*step_id))
                     || self.expr_has_side_effects(*body_id)
             }
+            // `a?.b.c` — the subject always runs, the continuation runs when the
+            // subject carries a value.
+            Expr::Lift(subject, _, continuation) => {
+                self.expr_has_side_effects(*subject) || self.expr_has_side_effects(*continuation)
+            }
             // A checked subscript can panic, so an indexing expression is
             // effectful in itself: dropping it would drop its bounds check.
-            Some(Expr::Index(_, _)) => true,
-            Some(Expr::List(ids)) | Some(Expr::Tuple(ids)) => {
+            Expr::Index(_, _) => true,
+            // Control leaving the expression is itself the effect: dropping a
+            // `ret`, a `jump` or a `?` short-circuit changes where the program
+            // goes, not just what it computes.
+            Expr::FunctionReturn(_) | Expr::Jump(_) | Expr::TryAssert(_) => true,
+            // A loop is a statement form: it may not terminate, and "pure body"
+            // does not make an endless `for { .. }` droppable.
+            Expr::For(..) | Expr::ForEach(..) => true,
+            Expr::List(ids) | Expr::Tuple(ids) => {
                 ids.iter().any(|id| self.expr_has_side_effects(*id))
             }
-            Some(Expr::StructInitializer(_, fields)) => {
+            Expr::StructInitializer(_, fields) => {
                 fields.values().any(|id| self.expr_has_side_effects(*id))
             }
             // A comprehension runs its body per element (`combine` subscribes each
-            // source this way), so it inherits the body's side effects.
-            Some(Expr::TupleComprehension(_, _, body_id)) => self.expr_has_side_effects(*body_id),
-            _ => false,
+            // source this way), so it inherits the body's side effects — and its
+            // SOURCE is evaluated once whatever the body does.
+            Expr::TupleComprehension(_, source_id, body_id) => {
+                self.expr_has_side_effects(*source_id) || self.expr_has_side_effects(*body_id)
+            }
+            // The compound shapes B377 was: a block runs its statements, an
+            // `if`/`match` runs the subject plus whichever continuation fires.
+            Expr::Block((statements, tail)) => {
+                statements.iter().any(|id| self.expr_has_side_effects(*id))
+                    || self.expr_has_side_effects(*tail)
+            }
+            Expr::If(branch) => self.if_branch_has_side_effects(branch),
+            Expr::Match(subject, legs) => {
+                self.expr_has_side_effects(*subject)
+                    || legs.iter().any(|leg| {
+                        leg.guard
+                            .is_some_and(|guard| self.expr_has_side_effects(guard))
+                            || self.expr_has_side_effects(leg.body)
+                    })
+            }
+            // A `let` inside a block: the declaration itself does nothing, its
+            // initializer may.
+            Expr::Variable(id) => self
+                .program
+                .variables
+                .get(id)
+                .and_then(|variable| variable.initial)
+                .is_some_and(|value_id| self.expr_has_side_effects(value_id)),
+            // Pure: literals and names, a closure that is defined and not called,
+            // and the declaration forms, which emit nothing here at all.
+            Expr::Bool(_)
+            | Expr::Closure(_)
+            | Expr::Enum(_)
+            | Expr::EnumVariant(_, _)
+            | Expr::Error
+            | Expr::ExternalFunction(_)
+            | Expr::Function(_)
+            | Expr::Generic(_)
+            | Expr::Impl(_)
+            | Expr::LiftBinder
+            | Expr::Local(_)
+            | Expr::Macro
+            | Expr::Module(_)
+            | Expr::MultilineString(_)
+            | Expr::Null
+            | Expr::Number(_, _, _)
+            | Expr::Parameter(_)
+            | Expr::String(_)
+            | Expr::Struct(_)
+            | Expr::Trait(_)
+            | Expr::Void => false,
+        }
+    }
+
+    /// The `if`/`else if`/`else` half of [`Self::expr_has_side_effects`]: a
+    /// condition always runs, and any branch's body may.
+    fn if_branch_has_side_effects(&self, branch: &ExprIfBranch) -> bool {
+        match branch {
+            ExprIfBranch::If(condition, (statements, tail), otherwise) => {
+                self.expr_has_side_effects(*condition)
+                    || statements.iter().any(|id| self.expr_has_side_effects(*id))
+                    || self.expr_has_side_effects(*tail)
+                    || otherwise
+                        .as_ref()
+                        .is_some_and(|next| self.if_branch_has_side_effects(next))
+            }
+            ExprIfBranch::Else((statements, tail)) => {
+                statements.iter().any(|id| self.expr_has_side_effects(*id))
+                    || self.expr_has_side_effects(*tail)
+            }
         }
     }
 
@@ -3226,7 +4413,9 @@ impl<'src> Transformer<'src> {
     /// Concrete verdicts were recorded by the analyzer; a generic operand
     /// resolves under the active monomorphization's substitution.
     fn binary_operands_are_integer(&self, binary_id: Id) -> bool {
-        const INTEGER_PRIMITIVES: &[&str] = &["i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53"];
+        const INTEGER_PRIMITIVES: &[&str] = &[
+            "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize",
+        ];
         if self.program.integer_division.contains(&binary_id) {
             return true;
         }
@@ -3378,7 +4567,140 @@ impl<'src> Transformer<'src> {
         )
     }
 
+    /// A const RESULT as emitted code (const-eval.md §1, §11). Plain data
+    /// serializes; G24's closure snapshot is the closure's own body, walked
+    /// here by the REAL emitter with its captured compile-time values
+    /// substituted for the bindings it closed over — so the arrow the program
+    /// gets is the one the program wrote, monomorphized and named like every
+    /// other, with `0.25` where `rem` stood.
+    ///
+    /// The substitution is a SCOPE, not a replacement: a snapshot nested
+    /// inside another (a closure returned from a closure) keeps the outer
+    /// captures in force while the inner is emitted.
+    fn const_value_node(
+        &mut self,
+        value: &ConstValue,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let ConstValue::Callable { body, captures } = value else {
+            return const_value_to_js(value);
+        };
+        let saved = self.const_capture_values.clone();
+        for (name, captured) in captures {
+            // The capture is keyed by the CONST WORLD's name for the binding.
+            // The real emission resolves it through the table that world
+            // handed the program; the const world itself — which is where a
+            // `const let` snapshot is written into a LATER site's prelude, and
+            // which runs before that table exists — resolves it through its
+            // own generator, where the name came from.
+            let binding = if self.program.const_snapshot_bindings.is_empty() {
+                self.ng.binding_named(name)
+            } else {
+                self.program.const_snapshot_bindings.get(name).copied()
+            };
+            let Some(binding) = binding else {
+                continue;
+            };
+            let node = self.const_value_node(captured, block);
+            self.const_capture_values.insert(binding, node);
+        }
+        // The closure's own initializer IS this result's site, so the
+        // const-results short-circuit in `walk_entity_inner` would hand back
+        // the snapshot again. Suspend it for exactly this id while its body
+        // is written out.
+        let reentered = self.emitting_snapshots.insert(*body);
+        let node = self.walk_entity(*body, block).unwrap_or(js::Node::Void);
+        if reentered {
+            self.emitting_snapshots.remove(body);
+        }
+        self.const_capture_values = saved;
+        node
+    }
+
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
+        let node = self.walk_entity_seams(id, block)?;
+        // B340 Q1: a `Callable` value in a closure-typed position. A struct is
+        // a plain JS array — it cannot be applied — so the coercion IS the
+        // wrapping closure, built here around the finished value so the copy
+        // seams below have already run on the receiver. Outermost on purpose:
+        // what the position receives is the function, and what the function
+        // closes over is whatever the seams decided the value is.
+        if let Some(&(arity, type_id)) = self.program.callable_coercions.get(&id) {
+            if let Some(wrapped) = self.wrap_callable_coercion(type_id, arity, node.clone()) {
+                return Some(wrapped);
+            }
+            return Some(node);
+        }
+        // A124 R3: a concrete value landing in a `dyn`-typed position. Built
+        // here for the reason the `Callable` wrap above is: this is where the
+        // finished value is, after the copy seams have run on it, and what the
+        // position receives is the pair.
+        if let Some((subject_type_id, trait_id, trait_arguments)) =
+            self.program.dyn_coercions.get(&id).cloned()
+        {
+            // B412: a site erasing the enclosing declaration's own parameter
+            // may be instantiated at an OBJECT (a `dyn Source<T>` handed to a
+            // generic), and an object landing in a `dyn` position is already
+            // the pair — wrapping it again would nest one inside the other.
+            if matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(subject_type_id)),
+                Some(Type::Dyn(..))
+            ) {
+                return Some(node);
+            }
+            let vtable = self.emit_vtable(subject_type_id, trait_id, &trait_arguments);
+            return Some(js::Node::Array(vec![node, js::Node::Local(vtable)]));
+        }
+        Some(node)
+    }
+
+    /// The wrapping closure a recorded `Callable` coercion lowers to (B340 Q1):
+    /// `(a, b) => <call>(<value>, a, b)`, with `call` resolved against the
+    /// value's own type through the same dispatch every method call uses — so a
+    /// coerced `Callable` and a written `x.call(a, b)` reach the same emitted
+    /// member, including a generic impl's instance.
+    ///
+    /// `None` when `call` does not resolve: the analyzer admitted the coercion,
+    /// so that cannot happen for a program that compiled, and falling back to
+    /// the bare value keeps a compiler bug a wrong answer rather than a panic.
+    fn wrap_callable_coercion(
+        &mut self,
+        type_id: TypeId,
+        arity: usize,
+        value: js::Node<'src>,
+    ) -> Option<js::Node<'src>> {
+        let parameters: Vec<js::Parameter> = (0..arity)
+            .map(|_| js::Parameter {
+                name: self.ng.next_name(),
+            })
+            .collect();
+        let mut arguments = Vec::with_capacity(arity + 1);
+        arguments.push(value);
+        arguments.extend(
+            parameters
+                .iter()
+                .map(|parameter| js::Node::Local(parameter.name.clone())),
+        );
+        let dispatch = self.resolve_dispatch_with(type_id, "call", &[], None)?;
+        let call = self.emit_dispatch(dispatch, arguments, None);
+        Some(js::Node::Closure(js::Closure {
+            parameters,
+            body: vec![js::Node::Return(Box::new(call))],
+            is_async: false,
+            origin: None,
+        }))
+    }
+
+    /// [`Self::walk_entity`] without B340's coercion wrap: the value itself,
+    /// through the ownership seams (a lifted resource temporary, a scalar view
+    /// read, a return-position copy).
+    fn walk_entity_seams(
+        &mut self,
+        id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
         // C11 (`temporary-drop.md`): a resource value that is neither bound nor
         // moved is owned by its STATEMENT. It has no name of its own, so it is
@@ -3424,8 +4746,10 @@ impl<'src> Transformer<'src> {
         // in-place serialization (const-eval.md §1). The const world itself is
         // lowered with the results map still empty for the expression being
         // evaluated, so this arm never short-circuits an evaluation.
-        if let Some(value) = self.program.const_results.get(&id) {
-            return Some(const_value_to_js(value));
+        if !self.emitting_snapshots.contains(&id)
+            && let Some(value) = self.program.const_results.get(&id).cloned()
+        {
+            return Some(self.const_value_node(&value, block));
         }
         // An expression already evaluated into a temp (B105) names the temp: the
         // whole point is that the second occurrence does not run it again.
@@ -3443,7 +4767,19 @@ impl<'src> Transformer<'src> {
                 // A flat tuple is a JS array, so the comprehension lowers to a
                 // runtime `source.map((x) => body)` — arity-independent, no
                 // monomorphization needed. The binder is the closure parameter.
+                //
+                // B397: ...unless an element is itself a TUPLE, which storage
+                // FLATTENS (types.md §5.9): a source element then spans several
+                // slots of the array `.map` walks one slot at a time, and a
+                // tuple-valued body result must SPLICE into the result rather
+                // than nest in it. That instance is emitted unrolled — see
+                // `unrolled_comprehension`.
                 let (binder_id, source_id, body_id) = (*binder_id, *source_id, *body_id);
+                if let Some(unrolled) =
+                    self.unrolled_comprehension(id, binder_id, source_id, body_id, block)
+                {
+                    return Some(unrolled);
+                }
                 let source = self.walk_entity(source_id, block).unwrap_or(js::Node::Void);
                 let parameter_name = self.ng.name_for(binder_id);
                 let mut body = Vec::new();
@@ -3456,6 +4792,7 @@ impl<'src> Transformer<'src> {
                     }],
                     body,
                     is_async: false,
+                    origin: None,
                 });
                 js::Node::Call(
                     Box::new(js::Node::Property(Box::new(source), "map".to_string())),
@@ -3467,8 +4804,24 @@ impl<'src> Transformer<'src> {
             Expr::Bool(x) => js::Node::Bool(*x),
             Expr::Number(whole, fraction, suffix) => {
                 // `n`-suffixed literals are JS BigInts (`5n`); other suffixes
-                // only affect typing and are dropped in the output.
-                let whole = if matches!(*suffix, Some("n")) {
+                // only affect typing and are dropped in the output. B404: an
+                // UNSUFFIXED integer literal its context typed `BigInt` (`tb(3)`
+                // for `fun tb(v: BigInt)`, `let b: BigInt = 7`) is a BigInt too —
+                // written as a JS number it met `v + 1n` and threw "Cannot mix
+                // BigInt and other types".
+                let typed_bigint = suffix.is_none()
+                    && fraction.is_none()
+                    && self
+                        .program
+                        .expr_type_ids
+                        .get(&id)
+                        .and_then(|type_id| self.program.type_id_to_type_map.get(type_id))
+                        .is_some_and(|type_| {
+                            matches!(type_, Type::Struct(struct_id, _)
+                                if self.program.structs.get(struct_id)
+                                    .is_some_and(|struct_| struct_.name == "BigInt"))
+                        });
+                let whole = if matches!(*suffix, Some("n")) || typed_bigint {
                     format!("{whole}n")
                 } else {
                     whole.to_string()
@@ -3520,6 +4873,11 @@ impl<'src> Transformer<'src> {
                 self.variant_value(*enum_id, *variant_index, Vec::new())
             }
             Expr::Local(id) => {
+                // G24: inside a snapshot's body, a binding the closure closed
+                // over IS its compile-time value — baked, not read.
+                if let Some(captured) = self.const_capture_values.get(id) {
+                    return Some(captured.clone());
+                }
                 self.referenced_globals.insert(*id);
                 // A capture from an `is` test aliases the subject's payload slot.
                 if let Some(accessor) = self.is_bindings.get(id) {
@@ -3545,6 +4903,25 @@ impl<'src> Transformer<'src> {
                     self.ensure_function_emitted(function_id);
                     return Some(js::Node::Local(self.ng.name_for(function_id)));
                 }
+                // lazy.md §1/§2: the binding holds a memo cell, so a READ of it
+                // is a force. This is the whole of "the parameter reads as a
+                // plain `T` — fully transparent": every use in the body goes
+                // through here, and the first one to run evaluates the thunk.
+                // The two positions that must NOT force — a forward into
+                // another lazy position, and the cell's own declaration — never
+                // reach this arm (`lazy_argument` intercepts the first,
+                // `Expr::Parameter` / the binding emission the second).
+                // M81: a lazy PARAMETER every call site filled inertly holds
+                // the plain value, not a cell, so its reads must not force.
+                if self.program.lazy_cells.contains(id)
+                    && !self.program.lazy_eager_parameters.contains(id)
+                {
+                    self.used_helpers.insert("__force");
+                    return Some(js::Node::Call(
+                        Box::new(js::Node::Local("__force".to_string())),
+                        vec![js::Node::Local(self.ng.name_for(*id))],
+                    ));
+                }
                 // A boxed scalar local reads through its cell's slot 0.
                 if self.local_is_boxed(*id) {
                     return Some(js::Node::PropertyIndex(
@@ -3565,11 +4942,15 @@ impl<'src> Transformer<'src> {
             }
             // `pair.0` — tuples store flat: a width-1 element reads its slot,
             // a tuple-typed element reslices its region (like destructuring).
+            // Offset and width come from the recorded path under this
+            // instance's substitution (B310), not from the analyzer's
+            // generic-body answer.
             Expr::TupleIndex(subject_id, offset, width) => {
+                let (offset, width) = self.tuple_index_slot(id, (*offset, *width));
                 let subject = self
                     .walk_entity(*subject_id, block)
                     .unwrap_or(js::Node::Void);
-                if *width == 1 {
+                if width == 1 {
                     js::Node::PropertyIndex(
                         Box::new(subject),
                         Box::new(js::Node::Number(offset.to_string(), None)),
@@ -3603,6 +4984,15 @@ impl<'src> Transformer<'src> {
                     .argument_ids
                     .iter()
                     .filter_map(|arg| {
+                        // lazy.md §1: an argument standing in a `lazy` position
+                        // is not evaluated here at all — it is packaged, or it
+                        // forwards a cell it already holds. Both answers are
+                        // built whole, so neither passes through `maybe_clone`:
+                        // a memo cell is an identity, and copying one would give
+                        // the callee a second memo of the same thunk.
+                        if let Some(cell) = self.lazy_argument(*arg) {
+                            return Some(cell);
+                        }
                         // An argument to an `own` parameter is copied (marked in
                         // `clone_sites`), like a binding copy.
                         self.walk_entity(*arg, block)
@@ -3645,6 +5035,28 @@ impl<'src> Transformer<'src> {
                     ) {
                         return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                     }
+                }
+
+                // A124 R3: `a.member()` where `a` is a TRAIT OBJECT. Nothing
+                // is resolved here — that is the point of erasure — so the
+                // call reads the member out of the pair's own table. The
+                // receiver is argument 0 and is read TWICE (once for the
+                // table, once for the value), so a receiver that is not a
+                // pure read is bound first; see `emit_object_call`.
+                if let Some(member_name) = self.program.dyn_method_calls.get(id).copied() {
+                    let call = self.emit_object_call(member_name, args);
+                    // The DECLARATION's asyncness is the call's (§5 (i)): the
+                    // call is emitted once for every value the object holds.
+                    let declared_async = matches!(
+                        self.program.entity_map.get(&function_call.subject_id),
+                        Some(Expr::Local(member_id))
+                            if self.program.async_functions.contains(member_id)
+                    );
+                    return Some(if declared_async {
+                        js::Node::Await(Box::new(call))
+                    } else {
+                        call
+                    });
                 }
 
                 // `a.member()` where `a`'s type is a trait-bounded generic `T`:
@@ -3734,7 +5146,8 @@ impl<'src> Transformer<'src> {
                         // letting the view advance (`bundle-splitting.md` §2).
                         // Same shape, so the call's own type binding carries
                         // over by position; every argument is emitted unchanged.
-                        if let Some((gate_target, preload)) = self.split_gate_target(*id, target_id)
+                        if let Some((gate_target, preload, source_at)) =
+                            self.split_gate_target(*id, target_id)
                         {
                             let call_substitution = self.call_substitution(
                                 *id,
@@ -3759,7 +5172,8 @@ impl<'src> Transformer<'src> {
                                 .unwrap_or_default();
                             let preload_name = self.emit_instance(preload, &preload_substitution);
                             let name = self.emit_instance(gate_target, &substitution);
-                            self.gate_call_names.insert(name.clone(), preload_name);
+                            self.gate_call_names
+                                .insert(name.clone(), (preload_name, source_at));
                             return Some(js::Node::Call(Box::new(js::Node::Local(name)), args));
                         }
                         // An external std intrinsic lowers to native JS or a
@@ -3795,23 +5209,6 @@ impl<'src> Transformer<'src> {
                                 args,
                             ));
                         }
-                        // `List::new()` builds an empty JS array.
-                        if Some(target_id) == self.list_new_fn_id {
-                            return Some(js::Node::Array(Vec::new()));
-                        }
-                        // `list.push(x)` lowers to the native array method; the
-                        // receiver is the method call's first (`self`) argument.
-                        if Some(target_id) == self.list_push_fn_id {
-                            let mut arguments = args.into_iter();
-                            let receiver = arguments.next().unwrap_or(js::Node::Void);
-                            return Some(js::Node::Call(
-                                Box::new(js::Node::Property(
-                                    Box::new(receiver),
-                                    "push".to_string(),
-                                )),
-                                arguments.collect(),
-                            ));
-                        }
                         // `panic(msg)` lowers to a thrown error. It's wrapped in
                         // an immediately-invoked arrow so it stays valid in
                         // expression position (e.g. a match leg).
@@ -3822,6 +5219,7 @@ impl<'src> Transformer<'src> {
                                     parameters: Vec::new(),
                                     body: vec![js::Node::Throw(Box::new(message))],
                                     is_async: false,
+                                    origin: None,
                                 })),
                                 Vec::new(),
                             ));
@@ -4008,6 +5406,8 @@ impl<'src> Transformer<'src> {
                             .current_instance
                             .as_ref()
                             .is_some_and(|instance| instance.async_closures.contains(closure_id)),
+                    // G24: the one arrow a `const` result can BE.
+                    origin: Some(*closure_id),
                 })
             }
             // `async <body>` — the spawn: `__task(async () => { <body> },
@@ -4106,6 +5506,7 @@ impl<'src> Transformer<'src> {
                                 parameters: vec![js::Parameter { name: parameter }],
                                 body: closure_body,
                                 is_async: false,
+                                origin: None,
                             }),
                         ],
                     ));
@@ -4292,6 +5693,38 @@ impl<'src> Transformer<'src> {
             }
             Expr::Binary(op, lhs, rhs) => {
                 let lhs = self.walk_entity(*lhs, block).unwrap_or(js::Node::Void);
+                // B224: `&&` and `||` are the only operators whose right
+                // operand may not run at all, and the emitter had no statement
+                // slot for a condition — so a right operand that lowers to
+                // STATEMENTS (an `is` subject temp and its materialized
+                // captures, an if-expression, a `?` lift) was walked into the
+                // ENCLOSING block and ran unconditionally, before the test that
+                // was supposed to gate it. `a is Some(let x) && x.f is Some(let
+                // y)` read a `None`'s payload and threw; `flag && probe() is
+                // Some(let n)` called `probe` with `flag` false. So the right
+                // operand is walked into a SCRATCH list instead and whatever it
+                // needed is put back where the operand itself runs
+                // (`emit_short_circuit`).
+                //
+                // Returning here skips none of the operator rewrites below:
+                // `&&`/`||` are not overloadable (`operator_trait_method` has
+                // no arm for them, so `binary_op_dispatch`, `generic_dispatch`
+                // and `concat_render_dispatch` never hold one), and they are
+                // neither bitwise nor division.
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let mark = self.pending_temporaries.len();
+                    let mut scratch = Vec::new();
+                    let t_rhs = self
+                        .walk_entity(*rhs, &mut scratch)
+                        .unwrap_or(js::Node::Void);
+                    // The overwhelmingly common case — a right operand that
+                    // needed no statement — emits exactly as it always did,
+                    // byte for byte.
+                    if scratch.is_empty() && self.pending_temporaries.len() == mark {
+                        return Some(binary(*op, lhs, t_rhs));
+                    }
+                    return Some(self.emit_short_circuit(*op, lhs, t_rhs, scratch, mark, block));
+                }
                 let mut rhs = self.walk_entity(*rhs, block).unwrap_or(js::Node::Void);
                 // B176: `"v=" + value` where `value: T` is bounded to a trait
                 // that provides `to_string`. The analyzer ADMITS this — the
@@ -4334,12 +5767,33 @@ impl<'src> Transformer<'src> {
                 // A CONCRETE receiver whose operator method is an inherited trait
                 // default (`instant < instant` over `PartialOrd`'s `lt`) records
                 // `OnType` instead — same re-dispatch, the type known up front.
-                if let Some(GenericDispatch::OnType(Some(receiver_type_id), member_name)) =
+                //
+                // B193: and `OnType(None, ..)` — a `self` operand inside a trait
+                // DEFAULT body — dispatches on the type the default is being
+                // SPECIALIZED for, exactly as a `self`-CALL in a default body
+                // does (`Expr::Call`'s own `OnType` arm, which has read
+                // `current_self_type` since B55). This arm demanded a type up
+                // front, so a default body's `self + self` matched nothing here
+                // and fell through to the native emission below: over two
+                // lowered structs the host's `+` is a string concatenation, so
+                // `Money { cents = 21 }.twice()` was `[21] + [21]` — `"2121"` —
+                // and slot 0 of that is `"2"`. `-` and `*` over the same pair
+                // were `undefined`, and `==` was a reference compare that
+                // ignored the impl.
+                if let Some(GenericDispatch::OnType(receiver_type_id, member_name)) =
                     self.program.generic_dispatch.get(&id).copied()
+                    && let Some(receiver_type_id) = receiver_type_id.or(self.current_self_type)
                 {
                     let concrete = self.resolve_type_id(receiver_type_id);
+                    // B359 (R1): an operator inside a trait DEFAULT body names
+                    // the trait's member; dispatch strictly within the trait
+                    // the analyzer resolved it through, exactly as the method
+                    // path does, so an implementor's same-named inherent
+                    // `add`/`eq` cannot win the by-name lookup.
+                    let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
                     if !self.compares_natively(concrete)
-                        && let Some(dispatch) = self.resolve_dispatch(concrete, member_name)
+                        && let Some(dispatch) =
+                            self.resolve_dispatch_with(concrete, member_name, &[], preferred)
                     {
                         let substitution = self
                             .program
@@ -4519,8 +5973,16 @@ impl<'src> Transformer<'src> {
                     // An unused binding is dropped — but a side-effecting
                     // initializer (a call mutating through `&mut`, say) must still
                     // run; emit it as a bare statement, discarding the value.
+                    //
+                    // A `lazy` binding is the one exception, and it is the whole
+                    // feature (lazy.md §2): its initializer runs at the
+                    // binding's FIRST USE, so a binding nothing uses runs
+                    // nothing. Emitting the initializer here for its effects
+                    // would run at load exactly what `lazy` was written to
+                    // defer.
                     let initial = self.program.variables.get(id).and_then(|v| v.initial);
                     if let Some(value_id) = initial
+                        && !self.program.lazy_cells.contains(id)
                         && self.expr_has_side_effects(value_id)
                     {
                         return self.walk_entity(value_id, block);
@@ -4543,7 +6005,66 @@ impl<'src> Transformer<'src> {
                 } else {
                     None
                 };
-                let value = if let Some(hmr_binding) = hmr_binding {
+                // lazy.md §2: the declaration builds the memo cell, and nothing
+                // else. The initializer is walked into the THUNK's own block —
+                // every statement its lowering needs goes inside, exactly as a
+                // lazy argument's does — so module load evaluates one object
+                // literal and the initializer waits for the first read, which
+                // `Expr::Local`'s `__force` arm performs.
+                //
+                // A102 (R13): under HMR the fresh cell is handed to
+                // `__hmr_adopt_lazy`, which writes the OLD bundle's value into
+                // it and marks it `done` when the seed carries one at a matching
+                // fingerprint. The cell is always minted here — the new bundle's
+                // thunk is the new bundle's, and adopting the old one would run
+                // the old bundle's functions — so this is the one adopt shape
+                // that takes the built value rather than a thunk to skip.
+                let value = if self.program.lazy_cells.contains(id) {
+                    let name = self
+                        .program
+                        .variables
+                        .get(id)
+                        .map(|variable| variable.name)
+                        .unwrap_or("");
+                    let mark = self.pending_temporaries.len();
+                    let mut thunk_block: Vec<js::Node<'src>> = Vec::new();
+                    let inner = initial
+                        .and_then(|value_id| {
+                            self.walk_entity(value_id, &mut thunk_block)
+                                .map(|node| self.maybe_clone(value_id, node))
+                        })
+                        .unwrap_or(js::Node::Void);
+                    if inner.is_divergent() {
+                        thunk_block.push(inner);
+                    } else {
+                        thunk_block.push(js::Node::Return(Box::new(inner)));
+                    }
+                    self.seal_pending_temporaries(mark, &mut thunk_block);
+                    self.used_helpers.insert("__lazy");
+                    let cell = js::Node::Call(
+                        Box::new(js::Node::Local("__lazy".to_string())),
+                        vec![
+                            js::Node::String(Cow::Owned(name.to_string())),
+                            js::Node::Closure(js::Closure {
+                                parameters: Vec::new(),
+                                body: thunk_block,
+                                is_async: false,
+                                origin: None,
+                            }),
+                        ],
+                    );
+                    match hmr_binding {
+                        Some(hmr_binding) => js::Node::Call(
+                            Box::new(js::Node::Local("__hmr_adopt_lazy".to_string())),
+                            vec![
+                                js::Node::String(Cow::Owned(hmr_binding.key.clone())),
+                                js::Node::Number(hmr_binding.fingerprint.to_string(), None),
+                                cell,
+                            ],
+                        ),
+                        None => cell,
+                    }
+                } else if let Some(hmr_binding) = hmr_binding {
                     let mut thunk_block = Vec::new();
                     let inner = initial
                         .and_then(|value_id| {
@@ -4581,11 +6102,15 @@ impl<'src> Transformer<'src> {
                         parameters: Vec::new(),
                         body: thunk_block,
                         is_async: false,
+                        origin: None,
                     });
                     let callee = match hmr_binding.form {
                         TransferForm::Value => "__hmr_adopt",
                         TransferForm::SignalPayload => "__hmr_adopt_signal",
                         TransferForm::SharedPayload => "__hmr_adopt_shared",
+                        // A lazy binding never reaches this arm: its cell is
+                        // built by the branch above, which wraps it itself.
+                        TransferForm::LazyValue => unreachable!("the lazy branch owns this"),
                         TransferForm::Excluded => unreachable!("filtered above"),
                     };
                     js::Node::Call(
@@ -4748,8 +6273,10 @@ impl<'src> Transformer<'src> {
                 // each slot of the region from the value (evaluated once).
                 // Statically-known width keeps this plain slot assignments —
                 // the const-eval interpreter runs them like any other write.
-                if let Some(&Expr::TupleIndex(subject_id, offset, width)) =
+                if let Some(&Expr::TupleIndex(subject_id, baked_offset, baked_width)) =
                     self.program.entity_map.get(target_id)
+                    && let (offset, width) =
+                        self.tuple_index_slot(*target_id, (baked_offset, baked_width))
                     && width > 1
                 {
                     let subject = self
@@ -5042,25 +6569,61 @@ impl<'src> Transformer<'src> {
                 _ => js::Node::Void,
             },
             Expr::If(branch) => {
+                /// `is_root` distinguishes the chain's OWN `if` from its `else
+                /// if`s (B224). The root's condition runs unconditionally, so
+                /// its statements belong in the enclosing block exactly as
+                /// before; an `else if`'s condition runs only once every
+                /// earlier branch has missed, so its statements walk into a
+                /// prelude of their own and the branch is re-shaped as `else {
+                /// <prelude> if (..) {..} else {..} }`. Before this they were
+                /// walked into the OUTER block with the root's, so `if a is
+                /// Some(let n) { .. } else if probe() is Some(let m) { .. }`
+                /// called `probe` before the chain ran — and even when `a`
+                /// matched.
                 fn walk_branch<'src>(
                     t: &mut Transformer<'src>,
                     branch: &ExprIfBranch,
                     block: &mut Vec<js::Node<'src>>,
+                    is_root: bool,
                     expr_variable_name: &mut Option<String>,
                 ) -> js::IfBranch<'src> {
                     match branch {
                         ExprIfBranch::If(condition, body, else_) => {
+                            let mark = t.pending_temporaries.len();
+                            let mut prelude = Vec::new();
+                            let slot = if is_root { &mut *block } else { &mut prelude };
                             let t_condition = t
-                                .walk_entity(*condition, block)
+                                .walk_entity(*condition, slot)
                                 .unwrap_or(js::Node::Bool(false));
                             let t_body = t.walk_branch_body(&body.0, body.1, expr_variable_name);
-                            js::IfBranch::If(
+                            let inner = js::IfBranch::If(
                                 Box::new(t_condition),
                                 t_body,
                                 else_.as_ref().map(|x| {
-                                    Box::new(walk_branch(t, x, block, expr_variable_name))
+                                    Box::new(walk_branch(t, x, block, false, expr_variable_name))
                                 }),
-                            )
+                            );
+                            // The ROOT's condition already emitted into `block`,
+                            // where the enclosing statement closes whatever it
+                            // lifted — and an `if` that IS the statement cannot
+                            // be re-shaped into an `else` anyway. Only an `else
+                            // if` reaches the rest of this arm.
+                            //
+                            // A statement-free `else if` condition — every one
+                            // in the estate — also stays in the chain
+                            // untouched, so its emission is byte-identical.
+                            if is_root
+                                || (prelude.is_empty() && t.pending_temporaries.len() == mark)
+                            {
+                                return inner;
+                            }
+                            // The `if` goes into the prelude BEFORE the
+                            // temporaries are closed, so a resource the
+                            // condition acquired is destroyed after the branch
+                            // that reads it rather than before it.
+                            prelude.push(js::Node::If(inner));
+                            t.close_temporaries(mark, 0, &mut prelude);
+                            js::IfBranch::Else(prelude)
                         }
                         ExprIfBranch::Else(body) => {
                             let t_body = t.walk_branch_body(&body.0, body.1, expr_variable_name);
@@ -5069,7 +6632,7 @@ impl<'src> Transformer<'src> {
                     }
                 }
                 let mut expr_variable_name = None;
-                let branch = walk_branch(self, branch, block, &mut expr_variable_name);
+                let branch = walk_branch(self, branch, block, true, &mut expr_variable_name);
                 match expr_variable_name {
                     Some(variable_name) => {
                         let expr_variable = js::Node::LetVariable(js::Variable {
@@ -5648,7 +7211,7 @@ impl<'src> Transformer<'src> {
             }
             ExprPattern::Tuple(elements) => {
                 let mut leaves = Vec::new();
-                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                self.flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
                 for (sub_pattern, element) in leaves {
                     self.backed_pattern_tests(sub_pattern, element, out);
                 }
@@ -5729,6 +7292,61 @@ impl<'src> Transformer<'src> {
             }
             _ => false,
         }
+    }
+
+    /// proposal/lazy.md §1 — what a call site emits for an argument standing in
+    /// a `lazy` parameter. `None` for every other argument, which is every
+    /// argument in a program that writes no `lazy`.
+    ///
+    /// Two answers, decided by the analyzer (`record_lazy_arguments`) rather
+    /// than re-derived here, because the question is "what did this call
+    /// resolve to" and that is the solver's answer:
+    ///
+    /// - a FORWARD — the argument is a bare reference to a binding that already
+    ///   holds a cell, so the cell travels as-is. One memo however deep the
+    ///   chain, which is the whole of §1's forwarding rule: the eventual first
+    ///   read forces the ORIGINAL thunk, and nothing in between re-wraps it;
+    /// - a THUNK — `__lazy(<name>, () => <the expression>)`. The expression is
+    ///   walked into the closure's OWN block, so every statement its lowering
+    ///   needs (temporaries, short-circuit slots, scope-end teardown) lands
+    ///   INSIDE the thunk. Walking it into the enclosing block would evaluate at
+    ///   the call site the very thing the whole feature defers.
+    fn lazy_argument(&mut self, argument_id: Id) -> Option<js::Node<'src>> {
+        if self.program.lazy_argument_forwards.contains(&argument_id) {
+            let Some(Expr::Local(binding)) = self.program.entity_map.get(&argument_id) else {
+                return None;
+            };
+            let binding = *binding;
+            self.referenced_globals.insert(binding);
+            return Some(js::Node::Local(self.ng.name_for(binding)));
+        }
+        let name = *self.program.lazy_argument_thunks.get(&argument_id)?;
+        let mark = self.pending_temporaries.len();
+        let mut body: Vec<js::Node<'src>> = Vec::new();
+        let value = self.walk_entity(argument_id, &mut body);
+        if let Some(value) = value {
+            // The same tail seam a closure body takes (B152): a divergent tail
+            // is the statement, never a value to `return`.
+            if value.is_divergent() {
+                body.push(value);
+            } else {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+        }
+        self.seal_pending_temporaries(mark, &mut body);
+        self.used_helpers.insert("__lazy");
+        Some(js::Node::Call(
+            Box::new(js::Node::Local("__lazy".to_string())),
+            vec![
+                js::Node::String(std::borrow::Cow::Owned(name.to_string())),
+                js::Node::Closure(js::Closure {
+                    parameters: Vec::new(),
+                    body,
+                    is_async: false,
+                    origin: None,
+                }),
+            ],
+        ))
     }
 
     /// The `__enum_trap` sequence for a set of backed tests read while
@@ -5869,6 +7487,165 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// Emits `lhs && rhs` / `lhs || rhs` where the right operand needed
+    /// STATEMENTS (B224), keeping them on the short-circuit's own side of the
+    /// test. `scratch` is what walking the right operand emitted, `mark` the
+    /// resource-temporary watermark from before that walk.
+    ///
+    /// Two shapes, and the first is preferred because it leaves the operator an
+    /// EXPRESSION — so an `if` head, a `while` head, a `let` initializer and a
+    /// nested operand all keep taking one node:
+    ///
+    /// - **A comma sequence.** Every scratch statement becomes an expression: a
+    ///   `const`/`let` splits into an UNINITIALIZED declaration hoisted to the
+    ///   enclosing block and an assignment inside the sequence, and everything
+    ///   else is already one. `$a[0] === 0 && (($b = $a[1][0]), $b[0] === 0)`.
+    ///
+    ///   The hoist is not a convenience — it is what keeps B187's continuation
+    ///   nameable. `if !(a is Some(let x) && x.f is Some(let y)) { ret; }
+    ///   print(y)` reads `y` AFTER the `if`, and `y` aliases (or is declared
+    ///   from) the right operand's temp, so that declaration cannot be nested
+    ///   inside the condition. It is sound because the continuation is reached
+    ///   only when the whole `&&` was true, which is exactly when the sequence
+    ///   ran and assigned it.
+    ///
+    /// - **A statement fallback**, when some part has no expression form: an
+    ///   if-expression's `if`, a resource temporary's `try`/`finally`, or a
+    ///   divergent operand (`is_divergent`, B152 — a statement everywhere).
+    ///   `let $r = lhs; if ($r) { <scratch> $r = rhs; }` — `if (!$r)` for `||`
+    ///   — with the operator yielding `$r`. That is `&&`/`||` exactly: JS
+    ///   yields the LEFT operand when it settles the test and the right one
+    ///   otherwise, which is what the conditional overwrite of `$r` does.
+    fn emit_short_circuit(
+        &mut self,
+        op: BinaryOp,
+        lhs: js::Node<'src>,
+        t_rhs: js::Node<'src>,
+        scratch: Vec<js::Node<'src>>,
+        mark: usize,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let expressible = self.pending_temporaries.len() == mark
+            && !t_rhs.is_divergent()
+            && scratch.iter().all(Self::node_is_expressible);
+        if expressible {
+            let mut sequence = Vec::with_capacity(scratch.len() + 1);
+            for node in scratch {
+                match node {
+                    js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                        // Declared `undefined` rather than with its own value:
+                        // the value is what must not run yet. (The same split
+                        // `hoist_declaration_out_of` makes when a temporary's
+                        // `try` closes over a declaration.)
+                        let already_split = matches!(*variable.value, js::Node::Void);
+                        block.push(js::Node::LetVariable(js::Variable {
+                            name: variable.name.clone(),
+                            value: Box::new(js::Node::Void),
+                        }));
+                        // A declaration THIS split already made one level in —
+                        // a nested `&&`'s own hoist — re-declares here and has
+                        // nothing left to assign; emitting `($b = undefined)`
+                        // into the sequence would be a no-op written out.
+                        if !already_split {
+                            sequence.push(js::Node::Assignment(
+                                Box::new(js::Node::Local(variable.name)),
+                                variable.value,
+                            ));
+                        }
+                    }
+                    node => sequence.push(node),
+                }
+            }
+            // Every scratch statement was a declaration and nothing was left to
+            // run before the operand: the hoists alone did the work, and the
+            // operator emits as it always did.
+            if sequence.is_empty() {
+                return binary(op, lhs, t_rhs);
+            }
+            sequence.push(t_rhs);
+            return binary(op, lhs, js::Node::Sequence(sequence));
+        }
+        let result_name = self.ng.next_name();
+        block.push(js::Node::LetVariable(js::Variable {
+            name: result_name.clone(),
+            value: Box::new(lhs),
+        }));
+        let mut branch_body = scratch;
+        if t_rhs.is_divergent() {
+            branch_body.push(t_rhs);
+        } else {
+            branch_body.push(js::Node::Assignment(
+                Box::new(js::Node::Local(result_name.clone())),
+                Box::new(t_rhs),
+            ));
+        }
+        // A resource temporary the right operand lifted is closed HERE, inside
+        // the branch that acquired it: the `finally` then covers the operand's
+        // own use of the value (the assignment is already in `branch_body`) and
+        // nothing outside the short-circuit, and the pending entry's index —
+        // recorded against `scratch`, which `branch_body` still is — is the one
+        // `close_temporaries` reads.
+        self.close_temporaries(mark, 0, &mut branch_body);
+        let test = match op {
+            BinaryOp::And => js::Node::Local(result_name.clone()),
+            _ => js::Node::Unary('!', Box::new(js::Node::Local(result_name.clone()))),
+        };
+        block.push(js::Node::If(js::IfBranch::If(
+            Box::new(test),
+            branch_body,
+            None,
+        )));
+        js::Node::Local(result_name)
+    }
+
+    /// Whether an emitted STATEMENT also has an expression form — whether it
+    /// can be spliced into a [`js::Node::Sequence`] (B224). A declaration
+    /// counts: `emit_short_circuit` splits it into a hoisted declaration and an
+    /// assignment. Nothing with a body of its own does, and nothing divergent
+    /// does; both take the statement fallback instead.
+    ///
+    /// Exhaustive on purpose — a new JS node has to answer this question rather
+    /// than inherit a wrong default, because saying "yes" wrongly emits a
+    /// bundle that does not parse.
+    fn node_is_expressible(node: &js::Node<'src>) -> bool {
+        match node {
+            js::Node::ConstVariable(_)
+            | js::Node::LetVariable(_)
+            | js::Node::Assignment(_, _)
+            | js::Node::Call(_, _)
+            | js::Node::Await(_)
+            | js::Node::Binary(_, _, _)
+            | js::Node::Unary(_, _)
+            | js::Node::Property(_, _)
+            | js::Node::PropertyIndex(_, _)
+            | js::Node::Array(_)
+            | js::Node::Vtable(_)
+            | js::Node::Closure(_)
+            | js::Node::Sequence(_)
+            | js::Node::Local(_)
+            | js::Node::Number(_, _)
+            | js::Node::String(_)
+            | js::Node::Bool(_)
+            | js::Node::Null
+            | js::Node::Void => true,
+            // A block form (no expression spelling), a hoisted `function`
+            // declaration, a `...spread` (legal only inside a literal), or a
+            // divergent statement.
+            js::Node::If(_)
+            | js::Node::While(_, _)
+            | js::Node::ForOf(_, _, _)
+            | js::Node::Try(_, _)
+            | js::Node::Labeled(_, _)
+            | js::Node::Function(_)
+            | js::Node::Spread(_)
+            | js::Node::Return(_)
+            | js::Node::Break
+            | js::Node::BreakLabel(_)
+            | js::Node::Continue
+            | js::Node::Throw(_) => false,
+        }
+    }
+
     /// Turn an ALIASED pattern's captures (`is`, a guarded match leg) into real
     /// declarations. That path binds nothing — each capture is recorded as an
     /// accessor into the subject and substituted at every reference — so a
@@ -5982,7 +7759,7 @@ impl<'src> Transformer<'src> {
             }
             ExprPattern::Tuple(elements) => {
                 let mut leaves = Vec::new();
-                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                self.flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
                 for (sub_pattern, element) in leaves {
                     self.compile_is_pattern(sub_pattern, element, conditions);
                 }
@@ -6009,19 +7786,26 @@ impl<'src> Transformer<'src> {
     /// for flat storage: a nested tuple pattern recurses (accumulating the flat
     /// offset), a width-1 element reads `subject[offset]`, and a multi-slot capture
     /// (a binding/wildcard of tuple type) reslices `subject.slice(offset, end)`.
+    ///
+    /// Each element carries its TYPE and the width is computed here, under the
+    /// instance's substitution (B310) — the pattern was resolved once for a
+    /// generic body, where an element typed `V` looks one slot wide however wide
+    /// the binding makes it.
     fn flatten_tuple_pattern<'a>(
-        elements: &'a [(ExprPattern, usize)],
+        &self,
+        elements: &'a [(ExprPattern, TypeId)],
         subject: &js::Node<'src>,
         base: usize,
         out: &mut Vec<(&'a ExprPattern, js::Node<'src>)>,
     ) {
         let mut offset = base;
-        for (sub_pattern, width) in elements {
+        for (sub_pattern, element_type_id) in elements {
+            let width = self.flat_width(*element_type_id);
             match sub_pattern {
                 ExprPattern::Tuple(inner) => {
-                    Self::flatten_tuple_pattern(inner, subject, offset, out);
+                    self.flatten_tuple_pattern(inner, subject, offset, out);
                 }
-                _ if *width == 1 => out.push((
+                _ if width == 1 => out.push((
                     sub_pattern,
                     js::Node::PropertyIndex(
                         Box::new(subject.clone()),
@@ -6044,6 +7828,221 @@ impl<'src> Transformer<'src> {
             }
             offset += width;
         }
+    }
+
+    /// B397 — a tuple comprehension `(x in source => body)` emitted UNROLLED,
+    /// for the instance whose flat layout a runtime `.map` would get wrong.
+    ///
+    /// The source is a mapped tuple `(U in T: F<U>)`; in this instance `T` is a
+    /// concrete tuple `(X0, .., Xn)`, so element `i` is `F[U := Xi]`, which is
+    /// `width(F[U := Xi])` slots of the flat source array, and the body's value
+    /// for it is `B[U := Xi]` — spliced into the result when it is a tuple. With
+    /// every source element one non-tuple slot and every result a non-tuple,
+    /// `.map` is exactly right and this answers `None`, which is what keeps every
+    /// comprehension that was correct byte-identical (`combine` over scalar
+    /// cells). Otherwise: the source is evaluated ONCE into a temporary, each
+    /// element is read at its flat offset (a slot, or a `.slice` for a
+    /// multi-slot element), and the body runs once per element as `((x) =>
+    /// body)(element)` with `U` bound to that element's type while it is
+    /// emitted — so a call inside the body specializes per element too.
+    ///
+    /// `combine((SignalCell::new((1, 2)), SignalCell::new("c")))` is the
+    /// exhibit: the `.map` answered `[[1, 2], "c"]`, which the flat reader
+    /// `((x, y), l)` read as `x = 1,2`, `y = c`, `l = undefined`.
+    fn unrolled_comprehension(
+        &mut self,
+        comprehension_id: Id,
+        binder_id: Id,
+        source_id: Id,
+        body_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
+        let source_type_id = self.expr_type_id(source_id)?;
+        let Some(Type::Mapped(binder, source_tuple, template)) = self
+            .program
+            .type_id_to_type_map
+            .get(&source_type_id)
+            .cloned()
+        else {
+            return None;
+        };
+        let comprehension_type_id = self.expr_type_id(comprehension_id)?;
+        let Some(Type::Mapped(_, _, body_template)) = self
+            .program
+            .type_id_to_type_map
+            .get(&comprehension_type_id)
+            .cloned()
+        else {
+            return None;
+        };
+        let Some(Type::Tuple(elements)) = self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(source_tuple))
+            .cloned()
+        else {
+            return None;
+        };
+        // Each element's (source width, whether the body's value is a tuple).
+        let mut layout: Vec<(TypeId, usize, bool)> = Vec::with_capacity(elements.len());
+        for element in &elements {
+            let element = self.resolve_type_id(*element);
+            let outer = self.enter_comprehension_element(binder, element);
+            let source_width = self.flat_width(template);
+            let source_is_tuple = matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(template)),
+                Some(Type::Tuple(_))
+            );
+            let result_is_tuple = matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(body_template)),
+                Some(Type::Tuple(_))
+            );
+            self.current_substitution = outer;
+            if source_is_tuple && source_width == 1 {
+                // A one-slot tuple element still reads as an ARRAY; `.slice`
+                // below is what gives it one.
+                layout.push((element, usize::MAX, result_is_tuple));
+            } else {
+                layout.push((element, source_width, result_is_tuple));
+            }
+        }
+        if layout
+            .iter()
+            .all(|(_, width, result_is_tuple)| *width == 1 && !*result_is_tuple)
+        {
+            return None;
+        }
+        let source = self.walk_entity(source_id, block).unwrap_or(js::Node::Void);
+        let source = match source {
+            js::Node::Local(name) => js::Node::Local(name),
+            other => {
+                let name = self.ng.next_name();
+                block.push(js::Node::ConstVariable(js::Variable {
+                    name: name.clone(),
+                    value: Box::new(other),
+                }));
+                js::Node::Local(name)
+            }
+        };
+        let parameter_name = self.ng.name_for(binder_id);
+        let mut offset = 0usize;
+        let mut items = Vec::with_capacity(layout.len());
+        for (element, width, result_is_tuple) in layout {
+            let slots = match width {
+                usize::MAX => 1,
+                width => width,
+            };
+            let slot = match width {
+                1 => js::Node::PropertyIndex(
+                    Box::new(source.clone()),
+                    Box::new(js::Node::Number(offset.to_string(), None)),
+                ),
+                _ => js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(source.clone()),
+                        "slice".to_string(),
+                    )),
+                    vec![
+                        js::Node::Number(offset.to_string(), None),
+                        js::Node::Number((offset + slots).to_string(), None),
+                    ],
+                ),
+            };
+            offset += slots;
+            let outer = self.enter_comprehension_element(binder, element);
+            let mut body = Vec::new();
+            if let Some(value) = self.walk_entity(body_id, &mut body) {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+            self.current_substitution = outer;
+            let call = js::Node::Call(
+                Box::new(js::Node::Closure(js::Closure {
+                    parameters: vec![js::Parameter {
+                        name: parameter_name.clone(),
+                    }],
+                    body,
+                    is_async: false,
+                    origin: None,
+                })),
+                vec![slot],
+            );
+            items.push(match result_is_tuple {
+                true => js::Node::Spread(Box::new(call)),
+                false => call,
+            });
+        }
+        Some(js::Node::Array(items))
+    }
+
+    /// Binds a comprehension's element binder to one element's type on top of
+    /// the substitution in force, answering the substitution to restore.
+    fn enter_comprehension_element(
+        &mut self,
+        binder: TypeId,
+        element: TypeId,
+    ) -> HashMap<TypeId, TypeId> {
+        let mut inner = self.current_substitution.clone();
+        inner.insert(binder, element);
+        std::mem::replace(&mut self.current_substitution, inner)
+    }
+
+    /// The number of flat slots a value of `type_id` occupies once tuples are
+    /// flattened, under the substitution in force: a tuple is the sum of its
+    /// elements', anything else (including a generic this instance does not
+    /// bind) is one. The emission-side twin of the analyzer's
+    /// `tuple_flat_width`, which answers the same question for the walk that
+    /// sees a generic body's parameters abstract.
+    fn flat_width(&self, type_id: TypeId) -> usize {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return 1;
+        };
+        match self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(type_id))
+        {
+            Some(Type::Tuple(elements)) => {
+                elements.clone().iter().map(|id| self.flat_width(*id)).sum()
+            }
+            _ => 1,
+        }
+    }
+
+    /// The flat offset and width of one positional tuple access
+    /// (`Expr::TupleIndex`), recomputed from the layout-free path the analyzer
+    /// recorded — the root subject's tuple type and the chain of element
+    /// indices — under the substitution this instance was emitted with (B310).
+    ///
+    /// The `Expr`'s own offset and width are the analyzer's answer, and the
+    /// analyzer walks a generic body ONCE with its parameters abstract: a
+    /// `(K, V)` whose `V` instantiates to `(str, str)` is two slots there and
+    /// three here, so `entry.1` has to reslice rather than read a slot. They
+    /// stay as the fallback for an access with no recorded path.
+    fn tuple_index_slot(&self, expr_id: Id, baked: (usize, usize)) -> (usize, usize) {
+        let Some((root_type_id, path)) = self.program.tuple_index_paths.get(&expr_id) else {
+            return baked;
+        };
+        let mut type_id = self.resolve_type_id(*root_type_id);
+        let mut offset = 0;
+        for index in path {
+            let Some(Type::Tuple(elements)) = self.program.type_id_to_type_map.get(&type_id) else {
+                return baked;
+            };
+            let elements = elements.clone();
+            let Some(element_type_id) = elements.get(*index) else {
+                return baked;
+            };
+            offset += elements[..*index]
+                .iter()
+                .map(|id| self.flat_width(*id))
+                .sum::<usize>();
+            type_id = self.resolve_type_id(*element_type_id);
+        }
+        (offset, self.flat_width(type_id))
     }
 
     /// Lowers an `[extern]`-bound call to its host (JS) form. The first argument
@@ -6193,6 +8192,16 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
+            // `List::new()` builds an empty JS array literal. Receiverless,
+            // like `Set::new` and `Map::new` beside it.
+            Intrinsic::ListNew => js::Node::Array(Vec::new()),
+            // `list.push(x)` is the native array method — the receiver is the
+            // method call's first (`self`) argument, which is what
+            // `native_method` does, so this rides it rather than repeating the
+            // shape (N109: the id-keyed arm it replaces was written out twice,
+            // once for a named call and once for a dispatch, and keeping those
+            // two byte-identical was a standing obligation).
+            Intrinsic::ListPush => native_method(&mut args, "push"),
             Intrinsic::StrLen | Intrinsic::ListLen => js::Node::Property(
                 Box::new(args.next().unwrap_or(js::Node::Void)),
                 "length".to_string(),
@@ -6209,6 +8218,23 @@ impl<'src> Transformer<'src> {
                 self.used_helpers.insert("__list_pop");
                 js::Node::Call(
                     Box::new(js::Node::Local("__list_pop".to_string())),
+                    args.collect(),
+                )
+            }
+            // NOT `native_method`: `splice` clamps and reads from the end, so
+            // the bounds panic `remove`/`insert` document has to be a helper's
+            // (the same reason `substring` is not the native method).
+            Intrinsic::ListRemove => {
+                self.used_helpers.insert("__remove_at");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__remove_at".to_string())),
+                    args.collect(),
+                )
+            }
+            Intrinsic::ListInsert => {
+                self.used_helpers.insert("__insert_at");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__insert_at".to_string())),
                     args.collect(),
                 )
             }
@@ -6294,8 +8320,50 @@ impl<'src> Transformer<'src> {
             }
             // `shared.clone()` -> the same cell (the receiver, unchanged).
             Intrinsic::SharedClone => args.next().unwrap_or(js::Node::Void),
-            // `shared.read()` / `shared.write()` -> the cell's value, `self.v`.
-            // `write` returns a view of the slot; the write-*through* (rebind vs
+            // `shared.downgrade()` -> the same cell, for `clone`'s reason and
+            // one more: nothing counts on this backend, so a weak handle has
+            // nothing to be weaker THAN and the cell object is the whole of it
+            // (C14 S2). What lands is the SHAPE — the type, the `Option` on the
+            // way back, the graph edge that says "follow me, do not keep me
+            // alive" — ahead of the count that makes `None` reachable (C14 S4).
+            Intrinsic::SharedDowngrade => args.next().unwrap_or(js::Node::Void),
+            // `weak.upgrade()` -> `[ 0, cell ]`, the `Some` arm of the Option
+            // array form. Always `Some` here; under counting, `Some` while a
+            // strong handle lives and `None` the instant the last one dies.
+            Intrinsic::WeakUpgrade => js::Node::Array(vec![
+                js::Node::Number("0".to_string(), None),
+                args.next().unwrap_or(js::Node::Void),
+            ]),
+            // `weak.get()` -> `[ 0, cell.v ]`: `Some` of the same slot
+            // `SharedValue` names. The payload is a VIEW (`Option<&T> borrows
+            // self`), so — unlike a `read()` in a storing position — the clone
+            // pass never wraps it, which is what makes this its own intrinsic.
+            // `Arena::get` lowers to the same shape (`[ 0, slot ]`), which is
+            // the point of the two verbs matching.
+            Intrinsic::WeakGet => js::Node::Array(vec![
+                js::Node::Number("0".to_string(), None),
+                js::Node::Property(
+                    Box::new(args.next().unwrap_or(js::Node::Void)),
+                    "v".to_string(),
+                ),
+            ]),
+            // `shared.identity()` -> the cell's stamped identity, taken on the
+            // first ask (M66). The stamp goes on the cell OBJECT, beside its
+            // `v` slot, so every handle to the cell reads the one number and a
+            // cell nothing ever asks about carries no property at all.
+            Intrinsic::SharedIdentity => {
+                self.used_helpers.insert("__shared_identity");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__shared_identity".to_string())),
+                    vec![args.next().unwrap_or(js::Node::Void)],
+                )
+            }
+            // `shared.read()` / `shared.write()` -> the cell's slot, `self.v`.
+            // Both name the storage; what separates them is what the ANALYZER
+            // does with it. A `read` in a storing position is wrapped in
+            // `__clone` by the clone pass (B256 — §6.1's value return copies),
+            // and one B267's cell-aware elision admits is not; a `write` is a
+            // view and is never wrapped, and the write-*through* (rebind vs
             // merge) is handled where the assignment is lowered.
             Intrinsic::SharedValue | Intrinsic::SharedWrite => js::Node::Property(
                 Box::new(args.next().unwrap_or(js::Node::Void)),
@@ -6520,7 +8588,7 @@ impl<'src> Transformer<'src> {
                 // Tuples store flat: read each leaf at its flat offset, reslicing a
                 // multi-slot (sub-tuple) capture.
                 let mut leaves = Vec::new();
-                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                self.flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
                 for (sub_pattern, element) in leaves {
                     self.compile_pattern(sub_pattern, element, conditions, bindings);
                 }
@@ -6561,8 +8629,12 @@ impl<'src> Transformer<'src> {
         // it is never the answer to a call, only what a call falls back to when
         // the receiver's generic never got bound. Record it; assembly refuses.
         if !function.has_body {
-            self.bodyless_emissions.push(function.id);
+            // E190: with the frame that asked for it — the innermost emission
+            // already on the stack, which is the caller's body, not this one.
+            let requester = self.emitting_stack.last().copied();
+            self.bodyless_emissions.push((function.id, requester));
         }
+        self.emitting_stack.push(function.id);
         let parameters = function
             .parameters
             .iter()
@@ -6581,6 +8653,7 @@ impl<'src> Transformer<'src> {
         // the split form when the last use is short of the end; this wraps the
         // whole body otherwise, keeping parameters last in the reverse order.
         let body = self.wrap_own_param_drops(function, body);
+        self.emitting_stack.pop();
         js::Node::Function(js::Function {
             name,
             parameters,
@@ -6784,10 +8857,15 @@ impl<'src> Transformer<'src> {
     /// The gate this call is retargeted to, if it is one of the split build's
     /// recognized route matches. `None` for every other call in every other
     /// build — which is why a flagless build emits exactly what it always did.
-    fn split_gate_target(&self, call_id: Id, target_id: Id) -> Option<(Id, Id)> {
+    fn split_gate_target(&self, call_id: Id, target_id: Id) -> Option<(Id, Id, usize)> {
         let gate = self.chunk_gate.as_ref()?;
-        (target_id == gate.swap && gate.calls.contains(&call_id))
-            .then_some((gate.swap_split, gate.preload))
+        if !gate.calls.contains(&call_id) {
+            return None;
+        }
+        gate.retarget
+            .iter()
+            .find(|(from, _, _)| *from == target_id)
+            .map(|(_, to, source_at)| (*to, gate.preload, *source_at))
     }
 
     /// Re-keys a type substitution from one function's generic parameters onto
@@ -6899,7 +8977,7 @@ impl<'src> Transformer<'src> {
         landed_before: usize,
     ) -> Option<SharedBody> {
         if self.monomorphized.len() == landed_before {
-            let body = canonical_instance_body(&js_function, name);
+            let body = canonical_instance_body(&js_function, name, &self.ng.minted);
             if let Some(shared) = self.shared_bodies.get(&(subject, body.clone())) {
                 return Some(shared.clone());
             }
@@ -7051,6 +9129,21 @@ impl<'src> Transformer<'src> {
         preferred_trait: Option<(Id, Vec<TypeId>)>,
     ) -> Option<Dispatch<'src>> {
         let type_id = self.resolve_type_id(type_id);
+        // A124 R3, THE BLANKET: a generic body whose parameter bound to a trait
+        // OBJECT. There is no impl to select — the concrete type is gone — so
+        // the member comes out of the value's own table, which is the same
+        // lowering a written `o.member()` on a `dyn` takes.
+        //
+        // Only for a member the object's trait DECLARES (its own or a
+        // supertrait's) — those are the table's. A member some BLANKET
+        // provides (`impl type S: Src with Loud`) is not in the table, and
+        // falls through to the ordinary selection with the object as the
+        // concrete type, where the blanket is what applies.
+        if let Some(Type::Dyn(trait_id, _)) = self.program.type_id_to_type_map.get(&type_id)
+            && let Some(declared_async) = self.object_member_declared_async(*trait_id, member)
+        {
+            return Some(Dispatch::Object(member.to_string(), declared_async));
+        }
         if let Some((trait_id, trait_arguments)) = preferred_trait {
             // Resolve strictly within the trait AND its instantiation (B73 R1).
             // The impl's override first...
@@ -7065,7 +9158,9 @@ impl<'src> Transformer<'src> {
                 ));
             }
             // ...else the trait's own default, specialized for this type.
-            if let Some(default_id) = self.trait_default_member(trait_id, member) {
+            if let Some(default_id) =
+                crate::mono::trait_default_member(self.program, trait_id, member)
+            {
                 let is_async = self.program.async_functions.contains(&default_id);
                 return Some(Dispatch::Call(
                     self.emit_default_instance(default_id, type_id),
@@ -7083,7 +9178,12 @@ impl<'src> Transformer<'src> {
                 own_generic_values,
             ));
         }
-        let default_id = self.resolve_inherited_default(type_id, member)?;
+        let default_id = crate::mono::resolve_inherited_default(
+            self.program,
+            self.current_admitting_file,
+            type_id,
+            member,
+        )?;
         let is_async = self.program.async_functions.contains(&default_id);
         Some(Dispatch::Call(
             self.emit_default_instance(default_id, type_id),
@@ -7117,6 +9217,17 @@ impl<'src> Transformer<'src> {
         {
             return Dispatch::Extern(member_id, binding);
         }
+        // The two arms above are the WHOLE external surface, and that is N109's
+        // point. `List`'s `new` and `push` used to carry neither an `Intrinsic`
+        // row nor an `[extern]` binding — the named-callee path recognized them
+        // by function id — so a DISPATCH reaching one had no arm here, fell
+        // through to the emitted-function name below, and minted a mangled name
+        // for a function nothing ever emits: `impl List<type T> with Pusher<T>`
+        // plus a `self.push(v)` in a trait default compiled clean and threw
+        // `ReferenceError: $b is not defined` at runtime (B359). They are rows
+        // in `intrinsics` now, so every external a dispatch can land on has a
+        // lowering keyed by member id and this function cannot be incomplete
+        // again for the same reason.
         let mut substitution = HashMap::default();
         self.bind_generics(impl_subject, type_id, &mut substitution);
         if !own_generic_values.is_empty()
@@ -7152,16 +9263,78 @@ impl<'src> Transformer<'src> {
         member: &str,
     ) -> Option<(Id, TypeId)> {
         let arguments = self.wanted_trait_arguments(trait_arguments);
-        let selected = impl_select::select_member(
-            self.program,
+        if let Some(selected) = self.select_member_here(
             type_id,
             member,
             Some(impl_select::WantedTrait {
                 trait_id,
                 arguments: &arguments,
             }),
-        )?;
-        Some((selected.member_id, selected.impl_subject))
+        ) {
+            return Some((selected.member_id, selected.impl_subject));
+        }
+        // B359: the member may be declared by a SUPERTRAIT while the
+        // implementor named only a sub-trait of it — `Source<T>::sub`'s body
+        // calls `self.on_change(..)`, and a type that writes `impl C with
+        // Signal<T>` provides `Source`'s members through that clause and never
+        // names `Source`. The wanted-trait filter is a membership test on the
+        // clause's own traits, so it turns that impl down and the caller falls
+        // to the by-name lookup — which is exactly the lookup an inherent
+        // member of the same name wins. So ask the type's PROVIDED traits
+        // (most specific first) for the ones whose supertrait closure reaches
+        // `trait_id`, and take the member from there.
+        //
+        // The retries go through `impl_select::select_member` rather than
+        // `select_member_here`: a failed scoped lookup RECORDS an admission
+        // miss (E185's plumbing), and a probe that is expected to miss must not
+        // leave one behind.
+        for provided in
+            impl_select::applying_trait_ids(self.program, self.current_admitting_file, type_id)
+        {
+            if provided == trait_id || !self.trait_reaches_supertrait(provided, trait_id) {
+                continue;
+            }
+            if let Some(selected) = impl_select::select_member(
+                self.program,
+                self.current_admitting_file,
+                type_id,
+                member,
+                Some(impl_select::WantedTrait {
+                    trait_id: provided,
+                    arguments: &[],
+                }),
+            ) {
+                return Some((selected.member_id, selected.impl_subject));
+            }
+        }
+        None
+    }
+
+    /// Whether `trait_id`'s supertrait closure contains `supertrait_id` — "is
+    /// an impl of `trait_id` also an impl of `supertrait_id`'s surface"
+    /// (B359's supertrait face).
+    fn trait_reaches_supertrait(&self, trait_id: Id, supertrait_id: Id) -> bool {
+        let mut stack = vec![trait_id];
+        let mut seen = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if id == supertrait_id {
+                return true;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        false
     }
 
     /// Lowers a resolved [`Dispatch`] to its call node with `args` (the receiver
@@ -7186,6 +9359,295 @@ impl<'src> Transformer<'src> {
                     call
                 }
             }
+            Dispatch::Object(member_name, declared_async) => {
+                let call = self.emit_object_call(&member_name, args);
+                if declared_async {
+                    js::Node::Await(Box::new(call))
+                } else {
+                    call
+                }
+            }
+        }
+    }
+
+    /// A124 R3 / trait-objects.md §6.2: the module-level vtable for one coerced
+    /// `(type, trait)` pair, emitted once and shared by every coercion of that
+    /// pair.
+    ///
+    /// ```js
+    /// const $vt = { get: get3, on_change: on_change4 };
+    /// ```
+    ///
+    /// A member name maps to the emitted free function for that pair. **No
+    /// adapter shim is needed** for the common case, which is §6.2's own
+    /// finding: a method is already a free function taking the receiver as
+    /// argument 0, so the slot is the function itself. An intrinsic or an
+    /// `[extern]`-bound member has no such function, so those slots take a
+    /// wrapping arrow — the only shape that needs one.
+    ///
+    /// The slot set is what an object can dispatch, which is NOT the trait's
+    /// whole surface: a generic member (`Source::map<U>`) and one naming `Self`
+    /// are unreachable through an object (the analyzer refuses those calls by
+    /// name) and take no slot. `Source` therefore has exactly two, which is the
+    /// two-slot table A124's cost table prices.
+    ///
+    /// Keyed by `(trait, type key)` so deduplication is free, exactly as §6.2
+    /// asks: two coercions of one pair share one table because the key is
+    /// identical.
+    fn emit_vtable(&mut self, type_id: TypeId, trait_id: Id, trait_arguments: &[TypeId]) -> String {
+        let type_id = self.resolve_type_id(type_id);
+        let key = (trait_id, self.type_key(type_id));
+        if let Some(name) = self.vtables.get(&key) {
+            return name.clone();
+        }
+        let name = self.ng.next_name();
+        // Inserted BEFORE the slots are resolved: a member's body may coerce a
+        // value of this very pair (a node holding a `dyn` of its own kind), and
+        // the recursion has to find the name rather than build a second table.
+        self.vtables.insert(key, name.clone());
+        let members = self.object_dispatchable_members(trait_id);
+        let mut entries: Vec<(String, js::Node<'src>)> = Vec::with_capacity(members.len());
+        for member_name in members {
+            let preferred = Some((trait_id, trait_arguments.to_vec()));
+            let Some(dispatch) = self.resolve_dispatch_with(type_id, member_name, &[], preferred)
+            else {
+                continue;
+            };
+            let slot = match dispatch {
+                // §6.2: the emitted function IS the slot.
+                Dispatch::Call(function_name, false) => js::Node::Local(function_name),
+                // An async member, an intrinsic or an extern has no plain
+                // receiver-first function to name, so the slot is the one-line
+                // arrow that calls it. The arity is the member's, so the
+                // wrapper forwards exactly what the call site passes.
+                other => {
+                    let arity = self.object_member_arity(trait_id, member_name);
+                    let parameters: Vec<js::Parameter> = (0..arity)
+                        .map(|_| js::Parameter {
+                            name: self.ng.next_name(),
+                        })
+                        .collect();
+                    let arguments: Vec<js::Node<'src>> = parameters
+                        .iter()
+                        .map(|parameter| js::Node::Local(parameter.name.clone()))
+                        .collect();
+                    let is_async = matches!(other, Dispatch::Call(_, true));
+                    let call = self.emit_dispatch(other, arguments, None);
+                    js::Node::Closure(js::Closure {
+                        parameters,
+                        body: vec![js::Node::Return(Box::new(call))],
+                        is_async,
+                        origin: None,
+                    })
+                }
+            };
+            entries.push((member_name.to_string(), slot));
+        }
+        self.monomorphized
+            .push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(js::Node::Vtable(entries)),
+            }));
+        name
+    }
+
+    /// The members an object over `trait_id` can dispatch, in declaration order
+    /// (the trait's own, then each supertrait's) — the trait's members minus the
+    /// two shapes no table slot can hold: a generic one, and one naming `Self`.
+    ///
+    /// Shares its filter with the analyzer's per-call refusal, which is what
+    /// keeps the two from drifting: a member this list drops is a member
+    /// `resolve_method_call` reports `NotThroughObject` for, so no call can
+    /// reach a slot that was never built.
+    fn object_dispatchable_members(&self, trait_id: Id) -> Vec<&'src str> {
+        let mut out: Vec<&'src str> = Vec::new();
+        let mut stack = vec![trait_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            for (member_name, member_id) in &trait_.declared_members {
+                let Some(function) = self.program.functions.get(member_id) else {
+                    continue;
+                };
+                if !function.generic_parameter_constraint_ids.is_empty() {
+                    continue;
+                }
+                let names_self = |type_id: &TypeId| {
+                    matches!(
+                        self.program.type_id_to_type_map.get(type_id),
+                        Some(Type::Trait(mentioned, _)) if *mentioned == id
+                    )
+                };
+                if function.return_type_id.as_ref().is_some_and(names_self) {
+                    continue;
+                }
+                let receiverless = function
+                    .parameters
+                    .first()
+                    .and_then(|parameter_id| self.program.parameters.get(parameter_id))
+                    .is_none_or(|parameter| parameter.name != "self");
+                if receiverless {
+                    continue;
+                }
+                // §6.2's reachability: a slot for a member no call reaches
+                // through an object would make that member a monomorphization
+                // root for nothing.
+                if !self
+                    .program
+                    .dyn_dispatched_members
+                    .contains(&(trait_id, *member_name))
+                {
+                    continue;
+                }
+                if out.contains(member_name) {
+                    continue;
+                }
+                out.push(member_name);
+            }
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `trait_id` (or the supertrait that declares it) declares
+    /// `member` async — the await a call through the object's table takes —
+    /// or `None` when no trait in the chain declares it at all.
+    fn object_member_declared_async(&self, trait_id: Id, member: &str) -> Option<bool> {
+        let mut stack = vec![trait_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            if let Some(member_id) = trait_.declarations.get(member) {
+                return Some(self.program.async_functions.contains(member_id));
+            }
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        None
+    }
+
+    /// A trait member's parameter count INCLUDING the receiver — the arity a
+    /// vtable slot's wrapping arrow forwards.
+    fn object_member_arity(&self, trait_id: Id, member: &str) -> usize {
+        let mut stack = vec![trait_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            if let Some(member_id) = trait_.declarations.get(member)
+                && let Some(function) = self.program.functions.get(member_id)
+            {
+                return function.parameters.len();
+            }
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        1
+    }
+
+    /// A call through a trait object's table (A124 R3): `o[1].get(o[0], ..)`.
+    ///
+    /// The pair is read twice, so a receiver whose evaluation is observable
+    /// cannot simply be written twice. A PURE receiver — a local, or an index
+    /// or property read reaching one — is duplicated, which is the common case
+    /// (a binding, a parameter, a struct field) and costs nothing; anything
+    /// else is bound by a one-argument arrow applied to it, which evaluates it
+    /// exactly once and keeps the whole thing an expression, so no statement
+    /// slot is needed and no short-circuit context changes meaning.
+    fn emit_object_call(
+        &mut self,
+        member_name: &str,
+        mut args: Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if args.is_empty() {
+            // The analyzer wires a method call's receiver as argument 0, so an
+            // empty list is a compiler bug rather than a program's mistake.
+            return js::Node::Void;
+        }
+        let receiver = args.remove(0);
+        if Self::node_is_pure_read(&receiver) {
+            return Self::object_call_node(receiver.clone(), receiver, member_name, args);
+        }
+        let binder = self.ng.next_name();
+        let bound = js::Node::Local(binder.clone());
+        let call = Self::object_call_node(bound.clone(), bound, member_name, args);
+        js::Node::Call(
+            Box::new(js::Node::Closure(js::Closure {
+                parameters: vec![js::Parameter { name: binder }],
+                body: vec![js::Node::Return(Box::new(call))],
+                is_async: false,
+                origin: None,
+            })),
+            vec![receiver],
+        )
+    }
+
+    fn object_call_node(
+        table_of: js::Node<'src>,
+        value_of: js::Node<'src>,
+        member_name: &str,
+        rest: Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let index = |node: js::Node<'src>, slot: &str| {
+            js::Node::PropertyIndex(
+                Box::new(node),
+                Box::new(js::Node::Number(slot.to_string(), None)),
+            )
+        };
+        let mut arguments = vec![index(value_of, "0")];
+        arguments.extend(rest);
+        js::Node::Call(
+            Box::new(js::Node::Property(
+                Box::new(index(table_of, "1")),
+                member_name.to_string(),
+            )),
+            arguments,
+        )
+    }
+
+    /// Whether re-evaluating this node is unobservable — a name, or a read
+    /// chain that bottoms out in one. Deliberately narrow: anything with a
+    /// call, an assignment or an operator in it answers `false` and takes the
+    /// binding arrow.
+    fn node_is_pure_read(node: &js::Node<'src>) -> bool {
+        match node {
+            js::Node::Local(_) => true,
+            js::Node::Property(subject, _) => Self::node_is_pure_read(subject),
+            js::Node::PropertyIndex(subject, index) => {
+                Self::node_is_pure_read(subject)
+                    && matches!(**index, js::Node::Number(..) | js::Node::String(_))
+            }
+            _ => false,
         }
     }
 
@@ -7209,7 +9671,29 @@ impl<'src> Transformer<'src> {
             let emission = self.record_keyed(|recorder, id| {
                 recorder.defaults.insert(key.clone(), id);
             });
-            let substitution = self.trait_parameter_substitution(default_id, type_id);
+            let mut substitution = self.trait_parameter_substitution(default_id, type_id);
+            // The receiver may still NAME the enclosing instance's parameters
+            // (`Mapped<S, i32, str>` built inside `fun doubled<S: Src<i32>>`
+            // and read through a default there): its binders bind TO them
+            // (`S := S`), and the body runs under this substitution alone, so
+            // the enclosing instance's `S := Root` was dropped at the door and
+            // the impl's `self.up.get()` reached `Src`'s body-less `get` (the
+            // never-silent internal error). Resolve what the receiver binds
+            // through the enclosing substitution, and carry the bindings of
+            // the parameters the receiver's own type mentions. The instance
+            // key (`type_key`) already spells those parameters resolved.
+            for value in substitution.values_mut() {
+                *value = self.resolve_type_id(*value);
+            }
+            let mut mentioned = Vec::new();
+            crate::mono::collect_type_generics(self.program, type_id, 0, &mut mentioned);
+            for generic in mentioned {
+                if !substitution.contains_key(&generic)
+                    && let Some(bound) = self.current_substitution.get(&generic).copied()
+                {
+                    substitution.insert(generic, self.resolve_type_id(bound));
+                }
+            }
             let saved_self = self.current_self_type.replace(type_id);
             let saved_substitution =
                 std::mem::replace(&mut self.current_substitution, substitution);
@@ -7261,50 +9745,12 @@ impl<'src> Transformer<'src> {
         default_id: Id,
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
-        let mut substitution = HashMap::default();
-        // The default's own trait — the one whose declarations hold it. A
-        // supertrait's default reached through a subtrait's impl keeps its own
-        // parameters, so key on the declaring trait, not the implemented one.
-        let Some((trait_id, trait_)) = self
-            .program
-            .traits
-            .iter()
-            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
-        else {
-            return substitution;
-        };
-        if trait_.generic_parameter_constraint_ids.is_empty() {
-            return substitution;
-        }
-        // The impl of THAT trait for this type, selected like every other
-        // dispatch lookup here (the impl subject is in its own generic terms,
-        // the receiver in concrete ones) — so the arguments this default
-        // specializes under are the ones the WINNING impl writes, not the
-        // first-declared one's.
-        let Some(implementation) =
-            impl_select::select_implementation(self.program, type_id, *trait_id)
-        else {
-            return substitution;
-        };
-        self.bind_generics(implementation.subject, type_id, &mut substitution);
-        let Some((_, arguments)) = implementation
-            .trait_args
-            .iter()
-            .find(|(provided, _)| provided == trait_id)
-        else {
-            return substitution;
-        };
-        // A trait argument written in the impl's terms (`with Holder<E>`)
-        // stays keyed to the binder above, so `resolve_type_id` composes the
-        // two hops within this same map.
-        for (parameter_id, argument_id) in trait_
-            .generic_parameter_constraint_ids
-            .iter()
-            .zip(arguments)
-        {
-            substitution.insert(*parameter_id, *argument_id);
-        }
-        substitution
+        crate::mono::trait_parameter_substitution(
+            self.program,
+            self.current_admitting_file,
+            default_id,
+            type_id,
+        )
     }
 
     /// Whether a scope needs `try`/`finally` teardown: some direct statement
@@ -7971,63 +10417,6 @@ impl<'src> Transformer<'src> {
         Some(name)
     }
 
-    /// Resolves `member` as an inherited trait *default* on a concrete type — a
-    /// member none of the type's impls declare, but a (super)trait it implements
-    /// provides with a body. Mirrors the analyzer's Gap E resolution.
-    fn resolve_inherited_default(&self, type_id: TypeId, member: &str) -> Option<Id> {
-        // The impl subject is written in its own generic terms (`SignalCell<T>`),
-        // the receiver in concrete ones (`SignalCell<i32>`), so the search is over
-        // the impls that APPLY to the receiver ([`crate::impl_select`]) — exact
-        // type equality only ever matched non-generic subjects, silently
-        // dropping inherited defaults on generic types (the emitted call then
-        // bound to the trait's abstract member), and a nominal head match
-        // never saw a blanket impl at all (B158).
-        impl_select::applying_trait_ids(self.program, type_id)
-            .into_iter()
-            .find_map(|trait_id| self.trait_default_member(trait_id, member))
-    }
-
-    /// Searches a trait and its supertraits for a default (bodied) member.
-    fn trait_default_member(&self, trait_id: Id, member: &str) -> Option<Id> {
-        let mut stack = vec![trait_id];
-        let mut seen = HashSet::default();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let Some(trait_) = self.program.traits.get(&id) else {
-                continue;
-            };
-            if let Some(&member_id) = trait_.declarations.get(member)
-                && self.function_has_body(member_id)
-            {
-                return Some(member_id);
-            }
-            for supertrait_type_id in &trait_.supertraits {
-                if let Some(Type::Trait(super_id, _)) =
-                    self.program.type_id_to_type_map.get(supertrait_type_id)
-                {
-                    stack.push(*super_id);
-                }
-            }
-        }
-        None
-    }
-
-    /// Whether `member_id` is a function with a source-provided body (a trait
-    /// default, as opposed to a signature-only requirement).
-    fn function_has_body(&self, member_id: Id) -> bool {
-        match self.program.entity_map.get(&member_id) {
-            Some(Expr::Function(function_id)) => self
-                .program
-                .functions
-                .get(function_id)
-                .map(|function| function.has_body)
-                .unwrap_or(false),
-            _ => false,
-        }
-    }
-
     /// The generic binding to monomorphize a call's callee with, drawn from
     /// whichever channel carries it — so the transformer reads a call's binding in
     /// one place and emits through the one [`Self::emit_instance`] path. In
@@ -8038,6 +10427,18 @@ impl<'src> Transformer<'src> {
     /// from the enclosing instantiation, the inherited slice of the active
     /// substitution. `None` means the callee is non-generic (or nothing binds it),
     /// so it is emitted as a plain function.
+    ///
+    /// B192: the written list is a PREFIX, not the whole binding. It binds the
+    /// parameters it reaches and NOTHING about the ones it does not — those are
+    /// inference's, exactly as they are when nothing is written at all. So the
+    /// three channels are MERGED rather than raced: the written prefix is laid
+    /// over the recorded substitution instead of replacing it. Racing them left
+    /// every unwritten parameter abstract in the emitted instance, where a call
+    /// through its bound resolved to the trait's bodyless requirement — an
+    /// internal error at emission for a program the analyzer had fully typed.
+    /// (The analyzer seeds its own context with the same written arguments, so
+    /// the two agree wherever both speak; the overlay states the precedence
+    /// rather than relying on that.)
     fn call_substitution(
         &self,
         call_id: Id,
@@ -8046,22 +10447,22 @@ impl<'src> Transformer<'src> {
     ) -> Option<HashMap<TypeId, TypeId>> {
         let function = self.program.functions.get(&target_id);
         let is_generic = function.is_some_and(|f| !f.generic_parameter_constraint_ids.is_empty());
+        let mut substitution = match self.program.method_call_substitution.get(&call_id) {
+            Some(recorded) => recorded.clone(),
+            None => self.inherited_substitution(target_id),
+        };
         if is_generic && !generic_argument_ids.is_empty() {
-            return Some(
-                function
-                    .unwrap()
-                    .generic_parameter_constraint_ids
-                    .iter()
-                    .copied()
-                    .zip(generic_argument_ids.iter().copied())
-                    .collect(),
-            );
+            for (constraint_id, argument_id) in function
+                .expect("a generic callee is a function")
+                .generic_parameter_constraint_ids
+                .iter()
+                .copied()
+                .zip(generic_argument_ids.iter().copied())
+            {
+                substitution.insert(constraint_id, argument_id);
+            }
         }
-        if let Some(recorded) = self.program.method_call_substitution.get(&call_id) {
-            return Some(recorded.clone());
-        }
-        let inherited = self.inherited_substitution(target_id);
-        (!inherited.is_empty()).then_some(inherited)
+        (!substitution.is_empty()).then_some(substitution)
     }
 
     /// Emits (or reuses) a monomorphized instance of `function_id` specialized by
@@ -8107,7 +10508,27 @@ impl<'src> Transformer<'src> {
             self.record_hit(|recorder| recorder.instances.get(&key).copied());
             return name;
         }
-        let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
+        // COMPOSE with the substitution in force, rather than replacing it
+        // (B244). `resolve_type_id` grounds a bound type only when it is a bare
+        // `Generic`; a bound type that is CONSTRUCTOR-HEADED with a generic
+        // inside — `Option<T>`, the element `List<Option<T>>`'s own conditional
+        // impl binds — cannot be grounded here at all, because the transformer
+        // reads an immutable `Program` and there is no `Option<i32>` to mint.
+        // Replacing the outer bindings therefore stranded that inner `T`: the
+        // nested dispatch bound it to a parameter with nothing behind it, and
+        // the innermost call fell through to the trait's bodyless requirement
+        // (the never-silent `internal:` error). Keeping the outer entries the
+        // inner ones do not shadow leaves the chain walkable — `resolve_type_id`
+        // already follows a binding to a binding — so `T` still reaches `i32`
+        // however many constructors sit between them. Inner wins on a collision;
+        // constraint ids are per-declaration, so the two sets are otherwise
+        // disjoint.
+        let mut substitution: HashMap<TypeId, TypeId> = self.current_substitution.clone();
+        substitution.extend(entries);
+        // The composition's high-water mark, which is what a deep chain costs
+        // (tracker N62). Recorded here rather than at the install below because
+        // this is the map that was BUILT — the install moves it.
+        SUBSTITUTION_PEAK.with(|peak| peak.set(peak.get().max(substitution.len())));
         // One entry per distinct instance KEY (see [`INSTANCE_LOG`]): the memo
         // hit above returned, so reaching here is a mint.
         if let Some(function) = self.program.functions.get(&function_id) {
@@ -8164,15 +10585,7 @@ impl<'src> Transformer<'src> {
     /// Swap in the adapted-instance context for a body about to be emitted;
     /// returns the previous context for `restore_instance`. Also tracks the
     /// function's source name as the spawn origin for `__task` calls.
-    fn enter_instance(
-        &mut self,
-        function_id: Id,
-        bits: Vec<Id>,
-    ) -> (
-        Vec<Id>,
-        Option<crate::analyzer::AdaptedInstance>,
-        Option<&'src str>,
-    ) {
+    fn enter_instance(&mut self, function_id: Id, bits: Vec<Id>) -> SavedInstance<'src> {
         let info = self
             .program
             .adapted_instances
@@ -8183,24 +10596,23 @@ impl<'src> Transformer<'src> {
             .functions
             .get(&function_id)
             .map(|function| function.name);
-        (
-            std::mem::replace(&mut self.current_adapted, bits),
-            std::mem::replace(&mut self.current_instance, info),
-            std::mem::replace(&mut self.current_origin, origin),
-        )
+        // B318 S4 §3.5: the DECLARING file, taken from the function entity
+        // itself, so an instantiation reached from anywhere resolves under the
+        // set the body was written against.
+        let file = self.program.admitting_file(function_id);
+        SavedInstance {
+            adapted: std::mem::replace(&mut self.current_adapted, bits),
+            instance: std::mem::replace(&mut self.current_instance, info),
+            origin: std::mem::replace(&mut self.current_origin, origin),
+            admitting_file: std::mem::replace(&mut self.current_admitting_file, file),
+        }
     }
 
-    fn restore_instance(
-        &mut self,
-        saved: (
-            Vec<Id>,
-            Option<crate::analyzer::AdaptedInstance>,
-            Option<&'src str>,
-        ),
-    ) {
-        self.current_adapted = saved.0;
-        self.current_instance = saved.1;
-        self.current_origin = saved.2;
+    fn restore_instance(&mut self, saved: SavedInstance<'src>) {
+        self.current_adapted = saved.adapted;
+        self.current_instance = saved.instance;
+        self.current_origin = saved.origin;
+        self.current_admitting_file = saved.admitting_file;
     }
 
     /// The bindings the active substitution provides for the generics a callee's
@@ -8212,19 +10624,7 @@ impl<'src> Transformer<'src> {
         if self.current_substitution.is_empty() {
             return HashMap::default();
         }
-        let Some(function) = self.program.functions.get(&target_id) else {
-            return HashMap::default();
-        };
-        let mut generics = Vec::new();
-        for parameter_id in &function.parameters {
-            if let Some(parameter) = self.program.parameters.get(parameter_id) {
-                self.collect_type_generics(parameter.type_id, 0, &mut generics);
-            }
-        }
-        if let Some(return_type_id) = function.return_type_id {
-            self.collect_type_generics(return_type_id, 0, &mut generics);
-        }
-        generics
+        crate::mono::signature_generics(self.program, target_id)
             .into_iter()
             .filter_map(|constraint_id| {
                 self.current_substitution
@@ -8234,72 +10634,53 @@ impl<'src> Transformer<'src> {
             .collect()
     }
 
-    /// Collects the `Generic` constraint ids a type's structure mentions (its own
-    /// id, or those nested in a struct/enum/tuple/closure's arguments).
-    fn collect_type_generics(&self, type_id: TypeId, depth: usize, out: &mut Vec<TypeId>) {
-        if depth > 24 {
-            return;
-        }
-        match self.program.type_id_to_type_map.get(&type_id) {
-            Some(Type::Generic(constraint_id)) => {
-                if !out.contains(constraint_id) {
-                    out.push(*constraint_id);
-                }
-            }
-            Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
-            ) => {
-                for argument in arguments.clone() {
-                    self.collect_type_generics(argument, depth + 1, out);
-                }
-            }
-            Some(Type::Closure(parameters, return_type_id)) => {
-                let parameters = parameters.clone();
-                let return_type_id = *return_type_id;
-                for parameter in parameters {
-                    self.collect_type_generics(parameter, depth + 1, out);
-                }
-                self.collect_type_generics(return_type_id, depth + 1, out);
-            }
-            Some(Type::Array(element_id, _)) => {
-                self.collect_type_generics(*element_id, depth + 1, out);
-            }
-            _ => {}
-        }
-    }
-
     /// Resolves a type id to its concrete form under the active substitution,
     /// following generic parameters to the type they're currently bound to.
     /// The resolved type id of an expression, used for tuple flat-layout
     /// decisions. Falls back through a binding reference to the binding's type
     /// (a bare `Expr::Local`/`Parameter` use carries no type on its own id).
+    ///
+    /// B328: an `Expr::Local` naming a PARAMETER answers too. A reference to a
+    /// parameter is spelled `Expr::Local(parameter_id)` — `Expr::Parameter` is
+    /// the DECLARATION — so `variables.get` alone missed every one of them, and
+    /// this read `None` for a form the program writes constantly. It was
+    /// harmless only by accident: the tuple decision consults
+    /// `tuple_element_types` second (B310) and that entry covers every element
+    /// form, and `drop_argument_type_id` carried a private copy of this arm.
+    /// Neither is a reason for the general answer to be wrong, and the next
+    /// consumer to read a parameter's type through here would not have had one.
     fn expr_type_id(&self, expr_id: Id) -> Option<TypeId> {
         if let Some(type_id) = self.program.expr_type_ids.get(&expr_id) {
             return Some(*type_id);
         }
         match self.program.entity_map.get(&expr_id)? {
-            Expr::Local(binding) | Expr::Variable(binding) => {
-                self.program.variables.get(binding).map(|v| v.type_id)
-            }
+            Expr::Local(binding) | Expr::Variable(binding) => self
+                .program
+                .variables
+                .get(binding)
+                .map(|variable| variable.type_id)
+                .or_else(|| {
+                    self.program
+                        .parameters
+                        .get(binding)
+                        .map(|parameter| parameter.type_id)
+                }),
             Expr::Parameter(binding) => self.program.parameters.get(binding).map(|p| p.type_id),
             _ => None,
         }
     }
 
     /// The type of a `drop(x)` argument, for the early-teardown rewrite. Like
-    /// `expr_type_id` but a bare `Expr::Local` of a PARAMETER id also resolves (a
-    /// plain `drop(param)` would otherwise read as untyped and no-op, leaking the
-    /// parameter), and a VALUE argument — a call result, which stores no type on
-    /// its own id and names no binding — resolves through the analyzer's B68
-    /// recording (`drop_sink_value_types`, affine-moves.md §9.4). Kept separate
-    /// from `expr_type_id` so the tuple/set layout decisions that read it stay
-    /// byte-identical.
+    /// `expr_type_id`, plus a VALUE argument — a call result, which stores no
+    /// type on its own id and names no binding — resolved through the
+    /// analyzer's B68 recording (`drop_sink_value_types`, affine-moves.md
+    /// §9.4).
+    ///
+    /// The parameter arm that used to live here is `expr_type_id`'s now (B328):
+    /// a plain `drop(param)` reading as untyped and no-opping — which leaks the
+    /// parameter — was this function's own bug report about the general one.
     fn drop_argument_type_id(&self, expr_id: Id) -> Option<TypeId> {
         self.expr_type_id(expr_id)
-            .or_else(|| match self.program.entity_map.get(&expr_id)? {
-                Expr::Local(binding) => self.program.parameters.get(binding).map(|p| p.type_id),
-                _ => None,
-            })
             .or_else(|| self.program.drop_sink_value_types.get(&expr_id).copied())
     }
 
@@ -8317,12 +10698,15 @@ impl<'src> Transformer<'src> {
     /// for that very element and it covers every form; it is consulted second so
     /// an expression that already answered keeps its answer byte for byte.
     ///
-    /// The element entry is read UNRESOLVED, unlike the general one. The
-    /// analyzer bakes a `.n` read's flat offset into the AST from
-    /// `tuple_flat_width`, which counts a still-generic element as one slot
-    /// because a generic body is walked once for every instantiation — so
-    /// splicing one would move every offset past it. Reading the entry as
-    /// written keeps emission and those offsets on the same layout.
+    /// The element entry is RESOLVED, like the general one (B310). It used to be
+    /// read as written, because the analyzer baked a `.n` read's flat offset
+    /// into the AST from `tuple_flat_width`, which counts a still-generic
+    /// element as one slot — so splicing one here moved every offset past it.
+    /// Emission now recomputes those offsets from the analyzer's recorded path
+    /// under the instance's substitution (`tuple_index_slot`), so both halves
+    /// read the SAME layout: the instantiated one, which is also the layout the
+    /// concrete caller builds and reads. Boxing a `(K, V)` inside `Map::insert`
+    /// and reslicing it flat at `entries()` was the miscompile.
     fn is_tuple_typed(&self, expr_id: Id) -> bool {
         if matches!(self.program.entity_map.get(&expr_id), Some(Expr::Tuple(_))) {
             return true;
@@ -8337,7 +10721,11 @@ impl<'src> Transformer<'src> {
         self.program
             .tuple_element_types
             .get(&expr_id)
-            .and_then(|type_id| self.program.type_id_to_type_map.get(type_id))
+            .and_then(|type_id| {
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(*type_id))
+            })
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
@@ -8575,7 +10963,12 @@ impl<'src> Transformer<'src> {
                 out.push_str("Tup");
                 self.write_type_key_arguments(elements, out);
             }
-            Type::Closure(parameters, return_type_id) => {
+            // B309: the clause is NOT part of the monomorphization key — by
+            // the time the transformer runs, `context::thread_contexts` has
+            // already rewritten every threading site into ordinary parameters
+            // and arguments, so two instantiations differing only in a clause
+            // emit the same code.
+            Type::Closure(parameters, return_type_id, _) => {
                 out.push_str("Fn");
                 self.write_type_key_arguments(parameters, out);
                 out.push_str("->");
@@ -8594,6 +10987,20 @@ impl<'src> Transformer<'src> {
                 out.push(')');
             }
             Type::Generic(constraint_id) => {
+                // A generic the active substitution binds spells as what it
+                // STANDS FOR (B244). The top-level bound types are resolved
+                // before they reach here, but a generic NESTED inside a bound
+                // type is not — and spelling `List<Option<T>>`'s element as
+                // `G(T)` gave every instantiation of the outer function the
+                // same instance key, merging `Option<i32>` with `Option<str>`.
+                // Following the binding is the same walk `resolve_type_id`
+                // performs and stops at an unbound (or self-bound) parameter,
+                // which stays id-keyed as before.
+                let resolved = self.resolve_type_id(type_id);
+                if resolved != type_id {
+                    self.write_type_key(resolved, out);
+                    return;
+                }
                 let _ = write!(out, "G{}", constraint_id.0);
             }
             // No nested type ids to spell — `Any`, `Never`, `Function(Id)`,
@@ -8623,19 +11030,80 @@ impl<'src> Transformer<'src> {
     /// `List<Generic(T)>`) so the caller can bind the impl's generics from the
     /// concrete type's arguments.
     fn resolve_member_on_type(&self, type_id: TypeId, member: &str) -> Option<(Id, TypeId)> {
-        // Nominal RECEIVERS only (the check below is on the receiver's type;
-        // impl subjects of every shape, blankets included, are admitted past
-        // it by select_member): a re-dispatch with no trait to steer by is
-        // the fallback path, and widening the receiver set would change which
-        // body existing programs reach without a bound asking.
+        // Nominal receivers, and the two STRUCTURAL shapes a user may write an
+        // impl for — a tuple and an array (the check below is on the receiver's
+        // type; impl subjects of every shape, blankets included, are admitted
+        // past it by select_member). A re-dispatch with no trait to steer by
+        // is the fallback path, so the receiver set is widened only where a
+        // bound asks — and B210 asked for tuples, B220 for arrays. A tuple or
+        // an array is an impl subject like any other (spec §5.7), and once
+        // method resolution admits one as a receiver, a call inside a trait
+        // DEFAULT specialized for it has to find the impl that provides it:
+        // `impl (i32, i32) with Tagged` reached the default `label`, whose body
+        // calls `self.tag()`, and this guard sent that inner call past the impl
+        // to the trait's bodyless requirement — which the emitter's never-silent
+        // check caught rather than shipping an empty function. `impl [i32; 2]
+        // with PartialOrd` had the identical shape one level up, through the
+        // inherited `lt` that `a < b` dispatches to.
         if !matches!(
             self.program.type_id_to_type_map.get(&type_id),
-            Some(Type::Struct(..) | Type::Enum(..))
+            Some(Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..))
         ) {
             return None;
         }
-        let selected = impl_select::select_member(self.program, type_id, member, None)?;
+        let selected = self.select_member_here(type_id, member, None)?;
         Some((selected.member_id, selected.impl_subject))
+    }
+
+    /// [`impl_select::select_member`] under the file the emitting body was
+    /// DECLARED in (B318 S4, `visibility.md` §3.5), recording an ADMISSION MISS
+    /// when the same lookup succeeds with no file scope.
+    ///
+    /// The re-ask costs a second selection ONLY on the failing path, and only
+    /// while some file in the program restricts something — a lookup that found
+    /// its member never asks, and a program with no `only` and no selector has
+    /// `current_admitting_file` at `None` and never reaches the branch. What it
+    /// buys is the difference between "internal: … please report this program"
+    /// and a refusal naming the import that caused it.
+    fn select_member_here(
+        &self,
+        type_id: TypeId,
+        member: &str,
+        wanted: Option<impl_select::WantedTrait>,
+    ) -> Option<impl_select::SelectedMember> {
+        let selected = impl_select::select_member(
+            self.program,
+            self.current_admitting_file,
+            type_id,
+            member,
+            wanted,
+        );
+        if selected.is_some() {
+            return selected;
+        }
+        let importer = self.current_admitting_file?;
+        if self.admission_miss.borrow().is_some() {
+            return None;
+        }
+        let unscoped = impl_select::select_member(self.program, None, type_id, member, wanted)?;
+        let declared_in = self
+            .program
+            .implementations
+            .iter()
+            .find(|implementation| {
+                implementation
+                    .declarations
+                    .values()
+                    .any(|id| *id == unscoped.member_id)
+            })
+            .map(|implementation| implementation.source)?;
+        *self.admission_miss.borrow_mut() = Some(AdmissionMiss {
+            member: member.to_string(),
+            importer,
+            importing_body: self.emitting_stack.last().copied(),
+            declared_in,
+        });
+        None
     }
 
     /// Binds the generic parameters in `pattern` (an impl subject in its own
@@ -8814,6 +11282,29 @@ impl Formatter {
                     "[{}{}{}]{}",
                     self.array_surround, s_items, self.array_surround, terminator
                 )
+            }
+            js::Node::Vtable(entries) => {
+                let s_entries = entries
+                    .iter()
+                    .map(|(name, value)| {
+                        format!("{}:{}{}", name, self.space, self.node(value, "", level))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(format!(",{}", self.space).as_str());
+                format!("Object.create({{{}}}){}", s_entries, terminator)
+            }
+            // `(a, b, c)` (B224). Always parenthesized: the comma binds looser
+            // than every operator, so an unwrapped sequence would be re-parsed
+            // by whatever encloses it — and looser than assignment too, so an
+            // assignment item keeps the parentheses `operand` gives it while
+            // everything else passes through bare.
+            js::Node::Sequence(items) => {
+                let s_items = items
+                    .iter()
+                    .map(|item| self.operand(item, level, |_| true))
+                    .collect::<Vec<_>>()
+                    .join(format!(",{}", self.space).as_str());
+                format!("({}){}", s_items, terminator)
             }
             js::Node::Spread(operand) => {
                 format!("...{}{}", self.node(operand, "", level), terminator)
@@ -9042,6 +11533,22 @@ impl Formatter {
                 )
             }
             js::Node::Break => format!("break{}", terminator),
+            // `<label>: { <body> }` / `break <label>;` (B214). The label is
+            // emitted verbatim — `rename_for_scopes` leaves it alone, since a JS
+            // label lives in its own namespace and cannot collide with a local.
+            js::Node::Labeled(label, body) => {
+                let s_body = self.sequence(body, ";", level + 1);
+                format!(
+                    "{}:{}{{{}{}{}{}}}",
+                    label,
+                    self.space,
+                    self.line_break,
+                    s_body,
+                    self.line_break,
+                    self.indentation.repeat(level),
+                )
+            }
+            js::Node::BreakLabel(label) => format!("break {}{}", label, terminator),
             js::Node::Continue => format!("continue{}", terminator),
             js::Node::Closure(closure) => {
                 let s_parameters = closure
@@ -9115,6 +11622,13 @@ fn const_value_to_js<'src>(value: &ConstValue) -> js::Node<'src> {
                     .collect(),
             )],
         ),
+        // G24's snapshot is not serialized: it is the closure's own body,
+        // WALKED, with the captures substituted for its free bindings — which
+        // needs the emitter and so lives on [`Transformer::const_value_node`].
+        // Every caller goes through that method; this arm exists because the
+        // match must be total, and emitting `void 0` for a value nothing can
+        // reach here keeps a compiler bug a wrong answer rather than a panic.
+        ConstValue::Callable { .. } => js::Node::Void,
     }
 }
 
@@ -9165,6 +11679,14 @@ pub struct ConstWorld<'src> {
     transformer: Transformer<'src>,
     seed: ConstProgramSeed,
     sites: HashMap<Id, SiteWalk<'src>>,
+    /// The END-OF-EVALUATION finalisers (G23), by the emitted name of the
+    /// function each one calls. A finaliser is not an expression in the
+    /// program — nothing in the source spells `flush()` — so it gets a
+    /// SYNTHETIC body of its own (`const __const_result = flush();`), seeded
+    /// with the emission record of the site that scheduled it, which is the
+    /// site that reached the function and therefore already carries its whole
+    /// transitive requirement set.
+    finalisers: HashMap<String, SiteWalk<'src>>,
 }
 
 /// One site's own lowering, cached: the statements its expression emitted (the
@@ -9208,6 +11730,23 @@ pub struct ConstSite<'a> {
 }
 
 impl<'src> ConstWorld<'src> {
+    /// G24: every name this world's emitter has handed an entity, inverted.
+    ///
+    /// A snapshot's captures arrive keyed by THIS world's generated names —
+    /// the interpreter sees names, not entities — and the real emission's
+    /// names are its own. This is the one table that joins them, handed to the
+    /// program beside the results so the emitter can turn "the value bound to
+    /// `$c` here" into "the value bound to this binding", which it can then
+    /// substitute under its own naming.
+    pub fn emitted_binding_names(&self) -> HashMap<String, Id> {
+        self.transformer
+            .ng
+            .names
+            .iter()
+            .map(|(id, name)| (name.clone(), *id))
+            .collect()
+    }
+
     pub fn new(program: &'src Program<'src>, options: &BuildOptions) -> Self {
         let seed = ConstProgramSeed::build(program, options);
         let mut transformer = Transformer::with_name_seed(program, options, seed.names.clone());
@@ -9216,6 +11755,7 @@ impl<'src> ConstWorld<'src> {
             transformer,
             seed,
             sites: HashMap::default(),
+            finalisers: HashMap::default(),
         }
     }
 
@@ -9283,10 +11823,18 @@ impl<'src> ConstWorld<'src> {
                 if let Some(value) = variable
                     .initial
                     .and_then(|initial| const_values.get(&initial))
+                    .cloned()
                 {
+                    // G24: a snapshot in the prelude is written out the same
+                    // way it is written into the program — the closure's body
+                    // with its captures baked — so a later `const` expression
+                    // can CALL a `const let` closure.
+                    let mut scratch = Vec::new();
+                    let node = transformer.const_value_node(&value, &mut scratch);
+                    prelude.extend(scratch);
                     prelude.push(js::Node::ConstVariable(js::Variable {
                         name,
-                        value: Box::new(const_value_to_js(value)),
+                        value: Box::new(node),
                     }));
                     continue;
                 }
@@ -9335,6 +11883,24 @@ impl<'src> ConstWorld<'src> {
         reach: &SiteReach,
         prelude: Vec<js::Node<'src>>,
     ) -> ConstSite<'world> {
+        let mut site = self.site_shell(reach, prelude);
+        site.body = self
+            .sites
+            .get(&expr_id)
+            .map(|site| site.body.as_slice())
+            .unwrap_or_default();
+        site
+    }
+
+    /// Everything a site's program is except its BODY — the reached world
+    /// declarations, this site's own imports and helpers, its prelude. Shared
+    /// by the expression sites and by G23's finaliser sites, which differ from
+    /// them in the body and in nothing else.
+    fn site_shell<'world>(
+        &'world self,
+        reach: &SiteReach,
+        prelude: Vec<js::Node<'src>>,
+    ) -> ConstSite<'world> {
         let mut world: Vec<&'world js::Node<'world>> =
             Vec::with_capacity(reach.functions.len() + reach.slots.len());
         for function_id in &reach.functions {
@@ -9352,12 +11918,56 @@ impl<'src> ConstWorld<'src> {
             imports: reach.imports.clone(),
             helpers: reach.helpers.clone(),
             prelude,
-            body: self
-                .sites
-                .get(&expr_id)
-                .map(|site| site.body.as_slice())
-                .unwrap_or_default(),
+            body: &[],
         }
+    }
+
+    /// Registers an end-of-evaluation finaliser's synthetic body (G23), once
+    /// per finaliser: `const __const_result = <name>();`, where `<name>` is
+    /// the EMITTED name of the scheduled function.
+    ///
+    /// `scheduler` is the const site whose evaluation asked for the finaliser.
+    /// Its emission record is the seed, and that is the whole trick: the site
+    /// referenced the function (it passed it to `schedule_at_end`), so the
+    /// record already requires it, and [`ConstWorld::reach_from`] closes over
+    /// `requires` to reach everything the function itself calls. No second
+    /// walk, and no way for a finaliser to reach code its scheduling site
+    /// could not.
+    pub fn stage_finaliser(&mut self, name: &str, scheduler: Id) {
+        if self.finalisers.contains_key(name) {
+            return;
+        }
+        let record = self
+            .sites
+            .get(&scheduler)
+            .map(|site| site.record.clone())
+            .unwrap_or_default();
+        let body = vec![js::Node::ConstVariable(js::Variable {
+            name: "__const_result".to_string(),
+            value: Box::new(js::Node::Call(
+                Box::new(js::Node::Local(name.to_string())),
+                Vec::new(),
+            )),
+        })];
+        self.finalisers
+            .insert(name.to_string(), SiteWalk { body, record });
+    }
+
+    /// A staged finaliser's program: [`ConstWorld::site`]'s body swapped for
+    /// the synthetic call [`ConstWorld::stage_finaliser`] registered.
+    pub fn finaliser_site<'world>(
+        &'world self,
+        name: &str,
+        reach: &SiteReach,
+        prelude: Vec<js::Node<'src>>,
+    ) -> ConstSite<'world> {
+        let mut site = self.site_shell(reach, prelude);
+        site.body = self
+            .finalisers
+            .get(name)
+            .map(|staged| staged.body.as_slice())
+            .unwrap_or_default();
+        site
     }
 
     /// Lowers one site's expression into the world, once per pass. The three
@@ -9503,6 +12113,9 @@ pub mod js {
         Unary(char, Box<Self>),
         Bool(bool),
         Break,
+        // `break <label>;` — leaves the enclosing [`Node::Labeled`] block. Only
+        // B214's `main` wrapper emits one, and only into the block it wrapped.
+        BreakLabel(String),
         Call(Box<Self>, Vec<Self>),
         Closure(Closure<'src>),
         ConstVariable(Variable<'src>),
@@ -9513,14 +12126,54 @@ pub mod js {
         // `for (const <binding> of <iterable>) { <body> }`. The binding name is
         // `_` for a discarded element.
         ForOf(String, Box<Self>, Vec<Self>),
+        // `<label>: { <body> }` — a labeled block (B214). `main` is INLINED at
+        // module scope, where `return` is a `SyntaxError` that refuses the whole
+        // module at parse time, so a `main` containing an early `ret` has its
+        // body wrapped in one of these and each of those `ret`s lowered to
+        // `break <label>`. A `main` without one is wrapped in nothing, which is
+        // what keeps every other program's emission byte-identical.
+        Labeled(String, Vec<Self>),
         LetVariable(Variable<'src>),
         Local(String),
         Null,
+        // `Object.create({ name: <value>, … })` — A124 R3's vtable
+        // (`emit_vtable`), the one producer: a trait object's table maps a
+        // member's name to the emitted function for that `(type, trait)` pair,
+        // and the name is what makes the emitted bundle readable —
+        // `x[1].get(x[0])` says which member is being dispatched, where a
+        // positional `x[1][0](x[0])` would not. Keys are emitted verbatim and
+        // are always vilan identifiers, so no quoting rule is needed.
+        //
+        // The slots sit on the table's PROTOTYPE, not on the table, and that is
+        // measured rather than stylistic: every table written as a bare literal
+        // shares one hidden class, so `x[1].get` at a call site that sees two
+        // concrete types loads a field whose value varies and calls through it
+        // blind — 5.3-7.0x a direct call in node 24 at two and three types. A
+        // table whose slots live on its own prototype has a class of its own,
+        // the load caches per class with a constant target, and the same site
+        // costs 2.0-2.9x (1.4-1.9x monomorphic, where the literal is 1.6-1.8x).
+        // The interpreter reads it as the plain object it is.
+        Vtable(Vec<(String, Self)>),
         Number(String, Option<String>),
         // Object(Vec<(&'src str, Self)>),
         Property(Box<Self>, String),
         PropertyIndex(Box<Self>, Box<Self>),
         Return(Box<Self>),
+        // `(<a>, <b>, …)` — a parenthesized comma sequence (B224). The one JS
+        // form that runs a STATEMENT in expression position, and so the one
+        // that gives a short-circuit operator's right operand a statement slot
+        // on its own side of the test: `$a[0] === 0 && (($b = $a[1][0]), $b[0]
+        // === 0)`. The parentheses are part of the rendering — the comma binds
+        // looser than every operator, so a bare sequence would be re-parsed by
+        // whatever encloses it.
+        //
+        // **Invariant: no item is divergent** ([`Node::is_divergent`]) and none
+        // is a block form. `emit_short_circuit` builds every one of these and
+        // checks both (`node_is_expressible`), falling back to a real statement
+        // slot otherwise — which is what lets the post-walk statement rewrites
+        // (`returns_at_module_scope`, `lower_returns_to_break`) keep ignoring
+        // this node: there is no `return` inside one for them to find.
+        Sequence(Vec<Self>),
         String(Cow<'src, str>),
         Throw(Box<Self>),
         // `try { <body> } finally { <finally> }` — scope-end destruction
@@ -9544,11 +12197,18 @@ pub mod js {
         /// The set is every variant the emitter renders as a bare statement:
         /// `Throw` is in it for the same reason, though no walk hands one back
         /// today (the only `Throw` is built directly into a generated closure
-        /// body) — a future one must not be wrapped either.
+        /// body) — a future one must not be wrapped either. `BreakLabel` joins
+        /// them as what B214 rewrites a divergent `Return` INTO: the rewrite
+        /// runs after the walk, so a `ret` that reached a tail seam as a
+        /// divergent node must still be one afterwards.
         pub fn is_divergent(&self) -> bool {
             matches!(
                 self,
-                Self::Return(_) | Self::Break | Self::Continue | Self::Throw(_)
+                Self::Return(_)
+                    | Self::Break
+                    | Self::BreakLabel(_)
+                    | Self::Continue
+                    | Self::Throw(_)
             )
         }
     }
@@ -9583,6 +12243,15 @@ pub mod js {
         pub parameters: Vec<Parameter>,
         pub body: Vec<Node<'src>>,
         pub is_async: bool,
+        /// G24: the CLOSURE ENTITY this arrow was emitted from, when it was
+        /// emitted from one. A const evaluation that yields a closure yields
+        /// the const world's lowering of it, whose generated names are that
+        /// world's and not the real emission's — so the snapshot stored for
+        /// the transformer is this id plus the captured values, and the real
+        /// emitter walks the entity itself. `None` for every arrow the
+        /// emitter synthesizes (a getter, a thunk, a `__task` body), none of
+        /// which any program can hold as a `const` result.
+        pub origin: Option<crate::id::Id>,
     }
 }
 
@@ -9638,6 +12307,14 @@ const RESERVED_NAMES: &[&str] = &[
     "private",
     "protected",
     "public",
+    // Strict mode forbids BINDING these two, and an ES module is always strict
+    // — so emitting `const arguments = …` is a `SyntaxError` at load, before a
+    // line of the program runs. Found shipping B178's `process::args()` pin:
+    // `let arguments = args()` is the obvious spelling and it compiled to a
+    // module node refused to parse ("Unexpected eval or arguments in strict
+    // mode"). They are not reserved WORDS, which is why they were missing here.
+    "arguments",
+    "eval",
     // Globals the runtime helpers / codegen reference as free identifiers.
     "console",
     "process",
@@ -9681,6 +12358,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__args",
     "__env",
     "__shared_new",
+    "__shared_identity",
     "__list_get",
     "__list_pop",
     "__list_sort_by",
@@ -9881,6 +12559,17 @@ impl NameGenerator {
         self.seed.reserved.contains(name) || self.minted.contains(name)
     }
 
+    /// The entity this generator handed `name` to, if any — the inverse of
+    /// [`NameGenerator::name_for`], for G24's snapshot captures (which arrive
+    /// keyed by name and must be substituted by entity). Linear in the names
+    /// minted, and asked once per capture of one snapshot.
+    fn binding_named(&self, name: &str) -> Option<Id> {
+        self.names
+            .iter()
+            .find(|(_, minted)| minted.as_str() == name)
+            .map(|(id, _)| *id)
+    }
+
     fn name_for(&mut self, id: Id) -> String {
         if let Some(name) = self.names.get(&id) {
             return name.clone();
@@ -10078,6 +12767,11 @@ fn collect_node(
     children: &mut Vec<JsScope>,
 ) {
     match node {
+        js::Node::Vtable(entries) => {
+            for (_, value) in entries {
+                collect_node(value, renameable, declarations, children);
+            }
+        }
         js::Node::Function(function) => {
             if renameable.contains(&function.name) {
                 declarations.push(function.name.clone());
@@ -10112,6 +12806,11 @@ fn collect_node(
             collect_node(condition, renameable, declarations, children);
             collect_declarations(body, renameable, declarations, children);
         }
+        // A labeled block declares nothing of its own — a JS label lives in its
+        // own namespace and is never renamed with the locals.
+        js::Node::Labeled(_, body) => {
+            collect_declarations(body, renameable, declarations, children)
+        }
         js::Node::If(branch) => collect_if(branch, renameable, declarations, children),
         js::Node::Try(body, finally) => {
             collect_declarations(body, renameable, declarations, children);
@@ -10133,7 +12832,12 @@ fn collect_node(
         | js::Node::Throw(inner)
         | js::Node::Spread(inner)
         | js::Node::Property(inner, _) => collect_node(inner, renameable, declarations, children),
-        js::Node::Array(items) => collect_declarations(items, renameable, declarations, children),
+        // A `Sequence` declares nothing of its own: B224 hoists the right
+        // operand's declarations to the ENCLOSING block and leaves assignments
+        // here, so this only has to reach the values.
+        js::Node::Array(items) | js::Node::Sequence(items) => {
+            collect_declarations(items, renameable, declarations, children)
+        }
         js::Node::Local(_)
         | js::Node::String(_)
         | js::Node::Number(_, _)
@@ -10141,6 +12845,7 @@ fn collect_node(
         | js::Node::Null
         | js::Node::Void
         | js::Node::Break
+        | js::Node::BreakLabel(_)
         | js::Node::Continue => {}
     }
 }
@@ -10241,6 +12946,11 @@ fn rename_one(name: &mut String, rename: &HashMap<String, String>) {
 
 fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
     match node {
+        js::Node::Vtable(entries) => {
+            for (_, value) in entries {
+                rename_node(value, rename);
+            }
+        }
         js::Node::Local(name) => rename_one(name, rename),
         js::Node::Function(function) => {
             rename_one(&mut function.name, rename);
@@ -10268,6 +12978,9 @@ fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
             rename_node(condition, rename);
             rename_nodes(body, rename);
         }
+        // The LABEL is deliberately not renamed: a JS label resolves in its own
+        // namespace, so it neither collides with a local nor needs to follow one.
+        js::Node::Labeled(_, body) => rename_nodes(body, rename),
         js::Node::If(branch) => rename_if(branch, rename),
         js::Node::Try(body, finally) => {
             rename_nodes(body, rename);
@@ -10290,13 +13003,14 @@ fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
         | js::Node::Spread(inner)
         // `Property`'s member is a property name, not a binding — recurse only the subject.
         | js::Node::Property(inner, _) => rename_node(inner, rename),
-        js::Node::Array(items) => rename_nodes(items, rename),
+        js::Node::Array(items) | js::Node::Sequence(items) => rename_nodes(items, rename),
         js::Node::String(_)
         | js::Node::Number(_, _)
         | js::Node::Bool(_)
         | js::Node::Null
         | js::Node::Void
         | js::Node::Break
+        | js::Node::BreakLabel(_)
         | js::Node::Continue => {}
     }
 }
@@ -10405,9 +13119,134 @@ fn collect_reached_names(scope: &JsScope, reached: &mut HashSet<String>) {
     }
 }
 
+/// E190 — the sentence the never-silent body-less refusal (B55) adds naming
+/// the frame that asked for the requirement, and where that frame is written.
+///
+/// A free function because the refusal's live trigger is a compiler defect: the
+/// one on record is B351's reproduction, which is another lane's to rebuild, and
+/// the construction still has to be held to the tree. The rest of the message is
+/// the ledger's row 330.
+fn bodyless_refusal_frame(requester: Option<(&str, Option<&str>)>) -> String {
+    match requester {
+        Some((frame, Some(path))) => {
+            format!(". It was first reached while emitting `{frame}` ({path})")
+        }
+        Some((frame, None)) => format!(". It was first reached while emitting `{frame}`"),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Formatter, unescape_string};
+    use super::{
+        Formatter, HashSet, bodyless_refusal_frame, canonical_instance_body, js, unescape_string,
+    };
+
+    /// One emitted instance: `function <name>(self) { const <temp> = self;
+    /// return <temp>; }` — the smallest body that BINDS a generated
+    /// temporary, which is what M80 is about.
+    fn instance(name: &str, temporary: &str) -> js::Node<'static> {
+        js::Node::Function(js::Function {
+            name: name.to_string(),
+            parameters: vec![js::Parameter {
+                name: "self".to_string(),
+            }],
+            body: vec![
+                js::Node::ConstVariable(js::Variable {
+                    name: temporary.to_string(),
+                    value: Box::new(js::Node::Local("self".to_string())),
+                }),
+                js::Node::Return(Box::new(js::Node::Local(temporary.to_string()))),
+            ],
+            is_async: false,
+        })
+    }
+
+    /// **M80** — two monomorphizations whose bodies differ only in the NUMBER
+    /// the generator gave a local temporary share one body.
+    ///
+    /// `canonical_instance_body` normalized the instance's own name and
+    /// nothing else, so two instances of one generic function stopped sharing
+    /// the moment their bodies bound a compiler-minted local: the names come
+    /// out of one monotonic counter, so the second instance's are simply
+    /// later. C14 S3 gave `std::reactive`'s `observe` two temporaries and it
+    /// was emitted TWICE in `reactive-flatten.mjs` and
+    /// `reactive-on-change.mjs` where it had been emitted once.
+    #[test]
+    fn two_bodies_differing_only_in_a_generated_temporary_share_one_key() {
+        let minted: HashSet<String> = ["$D", "$H", "$E", "$I"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let first = canonical_instance_body(&instance("$D", "$E"), "$D", &minted);
+        let second = canonical_instance_body(&instance("$H", "$I"), "$H", &minted);
+        assert_eq!(
+            first, second,
+            "the key must be about the CODE, not about the counter"
+        );
+    }
+
+    /// The controls, and they are what keep the wider equivalence exact.
+    ///
+    /// A name the generator did NOT mint is left alone: a source name can
+    /// shadow, so renaming it through a scope-blind walk could make two
+    /// different bodies look alike. And a body that calls a DIFFERENT function
+    /// is a different body — the call target is a free reference, not a
+    /// binding, so nothing normalizes it.
+    #[test]
+    fn a_source_name_and_a_different_call_target_keep_two_bodies_apart() {
+        let minted: HashSet<String> = ["$D", "$H"].into_iter().map(str::to_string).collect();
+        // `total` and `spent` are not in `minted`, so they are not normalized.
+        let first = canonical_instance_body(&instance("$D", "total"), "$D", &minted);
+        let second = canonical_instance_body(&instance("$H", "spent"), "$H", &minted);
+        assert_ne!(
+            first, second,
+            "a name the generator did not mint must not be normalized: it can \
+             shadow, and one generated name is one binding program-wide only \
+             for the minted ones"
+        );
+
+        let calling = |target: &str| {
+            js::Node::Function(js::Function {
+                name: "$D".to_string(),
+                parameters: Vec::new(),
+                body: vec![js::Node::Return(Box::new(js::Node::Call(
+                    Box::new(js::Node::Local(target.to_string())),
+                    Vec::new(),
+                )))],
+                is_async: false,
+            })
+        };
+        let minted: HashSet<String> = ["$D", "$E", "$F"].into_iter().map(str::to_string).collect();
+        assert_ne!(
+            canonical_instance_body(&calling("$E"), "$D", &minted),
+            canonical_instance_body(&calling("$F"), "$D", &minted),
+            "a body calling a different function is a different body — the \
+             target is a free reference and the body binds nothing"
+        );
+    }
+
+    /// E190 — the body-less refusal names the frame that asked and its file.
+    /// kolt's report was one bare `Error:` line with no file, no line and no
+    /// hint which of nineteen files to look in; the integrator had to
+    /// instrument `ensure_function_emitted` by hand to learn that `app_shell`
+    /// was the frame. That answer is in the message now.
+    #[test]
+    fn the_bodyless_refusal_names_the_frame_that_asked() {
+        assert_eq!(
+            bodyless_refusal_frame(Some(("app_shell", Some("src/views.vl")))),
+            ". It was first reached while emitting `app_shell` (src/views.vl)"
+        );
+        // A frame whose file the program cannot name still names the frame —
+        // half an answer beats the bare `Error:` line this replaces.
+        assert_eq!(
+            bodyless_refusal_frame(Some(("app_shell", None))),
+            ". It was first reached while emitting `app_shell`"
+        );
+        // And a requirement reached from no frame at all (an emission root)
+        // adds nothing rather than an empty parenthesis.
+        assert_eq!(bodyless_refusal_frame(None), "");
+    }
 
     /// The junctions where dropping the padding would change the token stream.
     /// Only `- -` is reachable from Vilan source today (`-` is the only

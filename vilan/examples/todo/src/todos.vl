@@ -8,15 +8,22 @@
 // Mutations go through the typed `TodoClient` stub. Note what's ABSENT: no
 // local list edit, no refetch — the change comes back over the wire and lands
 // in `items` like anyone else's would.
+//
+// `Signal`, `SignalCell`, `view`, `View` and `Result`/`Ok`/`Err` are ambient
+// under `prelude = "std::web"` (vilan.toml), and the style chains below reach
+// `std::style` through the ambient MODULE — one ambient name for the whole
+// namespace, which is why every spelling is `style::…` and nothing imports it.
+// Importing the member `style` would shadow that module and take `style::Color`
+// down with it, so even the builder stays qualified. `format`, `combine` and
+// `std::rpc` are outside the set and are imported by name.
 
 import std::display::format;
-import std::reactive::{ Signal, SignalCell, combine };
-import std::result::Result::{ Err, Ok, self };
+import std::reactive::combine;
 import std::rpc::{ RpcError, SocketTransport };
-import std::style::{ AlignItems, Color, Cursor, Display, Length, Style, space, style };
-import std::ui::{ View, view };
 import pkg::store::TodoClient;
 import pkg::todo::Todo;
+
+export *;
 
 // The styles (proposal/ui-styling.md): typed values built inside `const`, so
 // every rule below lands in `dist/client.css` at BUILD time — app.html's old
@@ -24,65 +31,71 @@ import pkg::todo::Todo;
 // `raw(..)` is the escape hatch for what the typed surface still lacks —
 // `list-style` here, and nothing else since the value types landed.
 
-let shell = const style()
-	.padding_x(space(4))
-	.padding_y(space(8))
-	.margin_x(Length::auto())
-	.max_width(Length::rem(32))
+let shell = const style::style()
+	.padding_x(style::space(4))
+	.padding_y(style::space(8))
+	.margin_x(style::Length::auto())
+	.max_width(style::Length::rem(32))
 	.font_family("system-ui, sans-serif")
-	.font_size(Length::px(16))
+	.font_size(style::Length::px(16))
 	.line_height(1.5);
 
-let row = const style().display(Display::Flex).gap(space(2));
+let row = const style::style().display(style::Display::Flex).gap(style::space(2));
 
-let list = const style().padding(space(0)).raw("list-style", "none");
+let list = const style::style().padding(style::space(0)).raw("list-style", "none");
 
-let item = const style()
-	.display(Display::Flex)
-	.gap(space(2))
-	.align_items(AlignItems::Center)
-	.padding_y(space(1));
+let item = const style::style()
+	.display(style::Display::Flex)
+	.gap(style::space(2))
+	.align_items(style::AlignItems::Center)
+	.padding_y(style::space(1));
 
-let done_label = const style().text_decoration("line-through").opacity(0.5);
+let done_label = const style::style().text_decoration("line-through").opacity(0.5);
 
-let button = const style()
-	.padding_x(space(2))
-	.padding_y(space(1))
-	.background(Color::gray(50))
-	.radius(space(1))
-	.border(Length::px(1), Color::gray(300))
-	.cursor(Cursor::Pointer)
-	.hover(style().background(Color::gray(100)));
+let button = const style::style()
+	.padding_x(style::space(2))
+	.padding_y(style::space(1))
+	.background(style::Color::gray(50))
+	.radius(style::space(1))
+	.border(style::Length::px(1), style::Color::gray(300))
+	.cursor(style::Cursor::Pointer)
+	.hover(style::style().background(style::Color::gray(100)));
 
-let remove_button = const button + style().margin_left(Length::auto());
+let remove_button = const button + style::style().margin_left(style::Length::auto());
 
-let empty_note = const style().opacity(0.6);
+let empty_note = const style::style().opacity(0.6);
 
 fun todos(client: TodoClient<SocketTransport>): View {
-	let items = client.todos.or([]);
+	let items = client.todos.or([]).cell();
 	let draft = Signal::new("");
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 
-	let remaining: SignalCell<i32> = items.map(|list| {
-		mut open = 0;
-		for todo in list {
-			if !todo.done {
-				open += 1;
+	let remaining: SignalCell<i32> = items
+		.map(|list| {
+			mut open = 0;
+			for todo in list {
+				if !todo.done {
+					open += 1;
+				}
 			}
-		}
-		open
-	});
+			open
+		})
+		.cell();
 
-	let visible: SignalCell<List<Todo>> = combine((items, filter)).map(|(list, current)| {
-		mut shown: List<Todo> = [];
-		for todo in list {
-			let keep = current == "all" || (current == "active" && !todo.done) || (current == "done" && todo.done);
-			if keep {
-				shown.push(todo);
+	let visible: SignalCell<List<Todo>> = combine((items, filter))
+		.map(|(list, current)| {
+			mut shown: List<Todo> = [];
+			for todo in list {
+				let keep = current == "all"
+					|| (current == "active" && !todo.done)
+					|| (current == "done" && todo.done);
+				if keep {
+					shown.push(todo);
+				}
 			}
-		}
-		shown
-	});
+			shown
+		})
+		.cell();
 
 	let add = || {
 		let label = draft.get(); // a one-shot SAMPLE — we want the value, not a dependency
@@ -106,11 +119,11 @@ fun todos(client: TodoClient<SocketTransport>): View {
 			.child(filter_button(filter, "all", "All"))
 			.child(filter_button(filter, "active", "Active"))
 			.child(filter_button(filter, "done", "Done")))
-		// `bind_each` renders one row per element and re-renders as `visible`
+		// `each` renders one row per element and re-renders as `visible`
 		// changes — whether this tab caused the change or another one did.
 		.child(view("ul")
 			.styled(list)
-			.bind_each(visible, |todo| todo.id, |todo| todo_row(client, todo)))
+			.child(each(visible, |todo| todo.id, |todo| todo_row(client, todo))))
 		.child(view("p")
 			.styled(empty_note)
 			.text("Nothing here 🎉")
@@ -121,7 +134,9 @@ fun todos(client: TodoClient<SocketTransport>): View {
 // two const styles, selected at runtime: `bind_class` over their class lists
 // is the recorded composition for signal-driven style switching.
 fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
-	let active = const button + style().font_weight(700).border(Length::px(1), Color::gray(700));
+	let active = const button + style::style()
+		.font_weight(700)
+		.border(style::Length::px(1), style::Color::gray(700));
 	let base_classes = button.class_list();
 	let active_classes = active.class_list();
 	view("button")
@@ -134,7 +149,7 @@ fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 		.on("click", || filter.set(value))
 }
 
-// One row — a snapshot from `bind_each`; any change to the list re-renders it.
+// One row — a snapshot from `each`; any change to the list re-renders it.
 // The checkbox reflects `done` and its edits go through the client stub.
 fun todo_row(client: TodoClient<SocketTransport>, todo: Todo): View {
 	// The done state is a VARIANT: plain `if` over const styles (CVA-free).
@@ -142,11 +157,7 @@ fun todo_row(client: TodoClient<SocketTransport>, todo: Todo): View {
 	view("li")
 		.styled(item)
 		.child(checkbox(client, todo))
-		.child(if todo.done {
-			label.styled(done_label)
-		} else {
-			label
-		})
+		.child(if todo.done { label.styled(done_label) } else { label })
 		.child(view("button")
 			.styled(remove_button)
 			.text("✕")

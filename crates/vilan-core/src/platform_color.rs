@@ -33,10 +33,10 @@
 //! every function gets a shortest witness chain to the layer it requires.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::analyzer::{GenericDispatch, Program, SourceId};
-use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -147,24 +147,33 @@ fn known_hosts() -> [Platform; 4] {
 fn check_fences(program: &Program, graph: &CallGraph) -> Vec<Violation> {
     let mut diagnostics = Vec::new();
     for (id, function) in &program.functions {
-        if function.platform_fence.is_empty() {
-            continue;
-        }
-        let fence_label = function
+        // F27 R1: a function under a file's or an impl's declaration makes
+        // that declaration's promise, exactly as its own fence would; its own
+        // fence, when it writes one, is the promise it makes.
+        let own: Vec<(String, Span)> = function
             .platform_fence
             .iter()
-            .map(|(pattern, _)| format!("\"{pattern}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|(text, span)| (text.to_string(), *span))
+            .collect();
+        let (fence, scope, report_unknown): (&[(String, Span)], Option<&str>, bool) =
+            if !own.is_empty() {
+                (&own, None, true)
+            } else if let Some(declared) = program.declared_requirements.covering(program, *id) {
+                // Unknown patterns in a declaration are reported once, where
+                // it is written, by `record_declared_platforms`.
+                (&declared.written, Some(declared.scope.as_str()), false)
+            } else {
+                continue;
+            };
+        let fence_label = spelled(fence);
         let mut checked_platforms: Vec<Platform> = Vec::new();
-        for (pattern_text, pattern_span) in &function.platform_fence {
+        for (pattern_text, pattern_span) in fence {
             let Some(patterns) = crate::target::PlatformPattern::parse(pattern_text) else {
+                if !report_unknown {
+                    continue;
+                }
                 // The pattern is written in the fenced function's own file.
-                let msg = format!(
-                    "unknown platform pattern `{pattern_text}` in `[platform(…)]` \
-                     (expected `node`/`deno`/`bun`/`browser`, or a family like \
-                     `@process`)"
-                );
+                let msg = unknown_pattern_message(pattern_text);
                 diagnostics.push(Violation {
                     cause: msg.clone(),
                     error: Error {
@@ -191,6 +200,7 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<Violation> {
             traversal.origin = Origin::Fence {
                 function: function.name.to_string(),
                 fence: fence_label.clone(),
+                scope: scope.map(str::to_string),
             };
             traversal.walk(*id, &SubstitutionContext::default(), None);
             diagnostics.extend(traversal.diagnostics);
@@ -202,16 +212,29 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<Violation> {
 /// What a violation chain hangs from: the build's entry, or a declared fence.
 enum Origin {
     Entry,
-    Fence { function: String, fence: String },
+    Fence {
+        function: String,
+        fence: String,
+        /// The declaration the fence is, when it is a file's or an impl's
+        /// rather than the function's own (F27 R1) — the functions under one
+        /// declaration make ONE promise.
+        scope: Option<String>,
+    },
 }
 
 impl Origin {
     /// The origin's contribution to a violation's cause key — two fences are two
-    /// promises and each wants its own diagnostic, but the entry is one.
+    /// promises and each wants its own diagnostic, but the entry is one, and so
+    /// is one file's or one impl's declaration however many functions it covers.
     fn key(&self) -> String {
         match self {
             Origin::Entry => "entry".to_string(),
-            Origin::Fence { function, fence } => format!("fence {function} {fence}"),
+            Origin::Fence {
+                scope: Some(scope), ..
+            } => scope.clone(),
+            Origin::Fence {
+                function, fence, ..
+            } => format!("fence {function} {fence}"),
         }
     }
 }
@@ -245,7 +268,8 @@ struct Violation {
 ///
 /// `extra_roots` covers a root the call graph cannot see: a split build's route
 /// gate is selected by the EMITTER at a recognized `swap` call, so nothing in
-/// source calls `View.swap_split` and the bindings its body reads (the pending
+/// source calls `View.swap_split` — or, since A85, the free `swap_split` the
+/// value form retargets to — and the bindings its body reads (the pending
 /// signal) would otherwise be shaken out from under it
 /// (`bundle-splitting.md` §2).
 pub(crate) fn reachable_bindings(
@@ -260,6 +284,46 @@ pub(crate) fn reachable_bindings(
         traversal.walk(*root, &SubstitutionContext::default(), None);
     }
     traversal.reached_bindings
+}
+
+/// E124's paint walk: every graph node — function, closure, module-level
+/// binding — that the program's own `main` reaches, under the SAME
+/// per-instantiation refinement admission and emission use, plus the two edge
+/// kinds only the paint follows.
+///
+/// It differs from [`reachable_bindings`] in exactly two ways, and both are
+/// `dead-code-paint.md`'s findings rather than preferences:
+///
+/// - it collects **nodes**, not only bindings — the paint's question is "does
+///   any entry reach this declaration", and a `fun` is not a binding;
+/// - it follows a `const` module binding's initializer edges, which
+///   [`crate::call_graph::CallGraph`] deliberately drops for emission. A
+///   function called only from `let x = const f();` is unreached and unemitted
+///   and deleting it breaks the build (§1.6, probe P3).
+///
+/// `None` when the program has no `main` — which is most files in the editor,
+/// where the OPEN file is the entry (§2.1, probe P5). That is the whole reason
+/// the paint's per-entry sets are computed out of band rather than off the
+/// analysis in hand.
+///
+/// Over-approximation is deliberate and always the safe direction here: a
+/// missed gray is late, a false gray is a lie (§1.4, determination 2).
+pub fn paint_reachable_nodes(program: &Program) -> Option<HashSet<Id>> {
+    let entry = entry_function(program)?;
+    let graph = program.call_graph();
+    let mut traversal = Traversal::new(program, graph, None);
+    traversal.collect_nodes = true;
+    traversal.follow_const_initializers = true;
+    traversal.walk(entry, &SubstitutionContext::default(), None);
+    // B269: every `const` region is a root of its own. The compile-time
+    // interpreter evaluates `Program::const_exprs` unconditionally, so a
+    // function a const region calls is used at BUILD time however the runtime
+    // walk arrives — or never arrives, which is the case for the three shapes
+    // `CallGraph::const_regions` names.
+    for root in graph.const_regions().to_vec() {
+        traversal.walk_const_region(root);
+    }
+    Some(traversal.reached_nodes)
 }
 
 /// A per-call type binding: the analyzer's constraint id → bound type id.
@@ -298,6 +362,20 @@ struct Traversal<'a, 'src> {
     diagnostics: Vec<Violation>,
     module_bindings: HashSet<Id>,
     reached_bindings: HashSet<Id>,
+    /// E124: every node the walk reached, collected only when
+    /// `collect_nodes` is set. Admission and emission ask "which BINDINGS
+    /// run", which `reached_bindings` answers; the paint asks "which
+    /// declarations does any entry reach", which is every node — so the set
+    /// is opt-in rather than always built, and the admission walk pays
+    /// nothing for it.
+    reached_nodes: HashSet<Id>,
+    collect_nodes: bool,
+    /// E124: whether to follow the edges out of a `const` module binding's
+    /// initializer (`CallGraph`'s paint-only maps). Off for emission and
+    /// admission, whose answer about a const initializer — data, not code —
+    /// is right; on for the paint, whose answer would otherwise gray a
+    /// function whose deletion breaks the build (`dead-code-paint.md` §1.6).
+    follow_const_initializers: bool,
     origin: Origin,
 }
 
@@ -312,7 +390,53 @@ impl<'a, 'src> Traversal<'a, 'src> {
             diagnostics: Vec::new(),
             module_bindings: program.module_level_bindings().into_iter().collect(),
             reached_bindings: HashSet::default(),
+            reached_nodes: HashSet::default(),
+            collect_nodes: false,
+            follow_const_initializers: false,
             origin: Origin::Entry,
+        }
+    }
+
+    /// B269: the edges OUT of one `const` region, without the region itself.
+    ///
+    /// `walk` would do the traversal, but it would also record the region as
+    /// reached — and a region's key is a module-level BINDING for the
+    /// initializer shape, which is a paintable item. A binding nothing
+    /// references is dead by the paint's own definition whatever its
+    /// initializer calls, and this walk exists to answer for the CALLEES.
+    fn walk_const_region(&mut self, region: Id) {
+        for call in self.graph.const_initializer_calls_of(region).to_vec() {
+            match call.target {
+                CallTarget::Function(callee)
+                | CallTarget::Closure(callee)
+                | CallTarget::External(callee) => {
+                    self.walk(callee, &SubstitutionContext::default(), None);
+                }
+                // A const region's dispatch is resolved by the interpreter, not
+                // by a type substitution this walk could supply; every
+                // candidate is kept, which is the over-approximation the paint
+                // wants (§1.4, determination 2).
+                CallTarget::Indirect(_) => {
+                    let candidates = crate::async_infer::dispatch_candidates_for(
+                        self.program,
+                        call.call_id,
+                        None,
+                    );
+                    for candidate in candidates {
+                        self.walk(candidate, &SubstitutionContext::default(), None);
+                    }
+                }
+                CallTarget::Variant(_) => {}
+            }
+        }
+        for (_, global) in self.graph.const_global_references_of(region).to_vec() {
+            self.walk(global, &SubstitutionContext::default(), None);
+        }
+        for (_, function) in self.graph.const_function_references_of(region).to_vec() {
+            self.walk(function, &SubstitutionContext::default(), None);
+        }
+        for closure in self.graph.const_initializer_closures_of(region).to_vec() {
+            self.walk(closure, &SubstitutionContext::default(), None);
         }
     }
 
@@ -329,6 +453,9 @@ impl<'a, 'src> Traversal<'a, 'src> {
 
         if self.module_bindings.contains(&node) {
             self.reached_bindings.insert(node);
+        }
+        if self.collect_nodes {
+            self.reached_nodes.insert(node);
         }
 
         if let Some(platform) = self.platform
@@ -357,11 +484,17 @@ impl<'a, 'src> Traversal<'a, 'src> {
             }
         }
 
+        let const_calls: &[Call] = if self.follow_const_initializers {
+            self.graph.const_initializer_calls_of(node)
+        } else {
+            &[]
+        };
         for call in self
             .graph
             .calls_of(node)
             .iter()
             .chain(self.graph.initializer_calls_of(node))
+            .chain(const_calls)
         {
             let arrived = self.arrival(call.call_id);
             match call.target {
@@ -395,13 +528,33 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
         // Referencing a module-level binding runs its initializer (F6);
         // initializers are never generic, so they walk context-free.
-        for (reference, global) in self.graph.global_references_of(node) {
+        let const_globals: &[(Id, Id)] = if self.follow_const_initializers {
+            self.graph.const_global_references_of(node)
+        } else {
+            &[]
+        };
+        for (reference, global) in self
+            .graph
+            .global_references_of(node)
+            .iter()
+            .chain(const_globals)
+        {
             let arrived = self.arrival(*reference);
             self.walk(*global, &SubstitutionContext::default(), arrived);
         }
         // A function passed as a value charges at the reference site; with no
         // call record there is no binding to thread.
-        for (reference, function) in self.graph.function_references_of(node) {
+        let const_functions: &[(Id, Id)] = if self.follow_const_initializers {
+            self.graph.const_function_references_of(node)
+        } else {
+            &[]
+        };
+        for (reference, function) in self
+            .graph
+            .function_references_of(node)
+            .iter()
+            .chain(const_functions)
+        {
             let arrived = self.arrival(*reference);
             self.walk(*function, &SubstitutionContext::default(), arrived);
         }
@@ -418,6 +571,11 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
         for closure in self.graph.initializer_closures_of(node).to_vec() {
             self.walk(closure, &SubstitutionContext::default(), None);
+        }
+        if self.follow_const_initializers {
+            for closure in self.graph.const_initializer_closures_of(node).to_vec() {
+                self.walk(closure, &SubstitutionContext::default(), None);
+            }
         }
         // Synthetic destruction edges (destruction.md §8): the transformer inserts
         // the teardown at each scope exit, so this walk can't see the call
@@ -633,6 +791,162 @@ struct Requirement<'program> {
     patterns: &'program [crate::target::PlatformPattern],
 }
 
+// ── What a file, or an impl in it, DECLARES (F27 R1) ────────────────────────
+
+/// One declared platform requirement: `[platform("…")] mod self;` leading a file, or
+/// `[platform("…")]` on an `impl` block — "everything inside requires that
+/// platform". Resolved once per program by [`record_declared_platforms`], so
+/// the walks read parsed patterns rather than re-parsing text per node.
+#[derive(Debug, Clone)]
+struct Declared {
+    /// The requirement's label, as a chain renders it: "the `browser` platform
+    /// its file declares".
+    label: String,
+    patterns: Vec<crate::target::PlatformPattern>,
+    /// The patterns as written, for the fence walk's message (`[platform(..)]`).
+    written: Vec<(String, Span)>,
+    /// What the fence walk keys a violation's cause on: every function under
+    /// one declaration shares ONE promise, so a bad call reached from twenty of
+    /// them is one mistake (E98), not twenty.
+    scope: String,
+}
+
+/// Every declaration of a program (F27 R1): by file, and by `impl` member.
+#[derive(Debug, Default)]
+pub struct DeclaredRequirements {
+    by_source: HashMap<SourceId, Declared>,
+    by_function: HashMap<Id, Declared>,
+}
+
+impl DeclaredRequirements {
+    /// The declaration that covers `node`: its own `impl`'s, else its file's.
+    fn covering(&self, program: &Program, node: Id) -> Option<&Declared> {
+        if let Some(declared) = self.by_function.get(&node) {
+            return Some(declared);
+        }
+        self.by_source.get(&program.source_of(node)?)
+    }
+}
+
+/// The patterns a declaration wrote, parsed — the ones that parse. An unknown
+/// one is reported once, at its own span, by [`record_declared_platforms`].
+fn parsed_patterns(written: &[(String, Span)]) -> Vec<crate::target::PlatformPattern> {
+    written
+        .iter()
+        .filter_map(|(text, _)| crate::target::PlatformPattern::parse(text))
+        .flatten()
+        .collect()
+}
+
+/// `"browser", "@process"` — a declaration's patterns as a label spells them.
+fn spelled(written: &[(String, Span)]) -> String {
+    written
+        .iter()
+        .map(|(text, _)| format!("\"{text}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `` `browser` `` / `` `node`, `deno` `` — a declaration as a sentence names it.
+fn named(written: &[(String, Span)]) -> String {
+    written
+        .iter()
+        .map(|(text, _)| format!("`{text}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The refusal for a pattern no platform answers to — one wording for a
+/// function's fence and a file's or an impl's declaration.
+fn unknown_pattern_message(pattern_text: &str) -> String {
+    format!(
+        "unknown platform pattern `{pattern_text}` in `[platform(…)]` \
+         (expected `node`/`deno`/`bun`/`browser`, or a family like \
+         `@process`)"
+    )
+}
+
+/// Resolves the program's file- and impl-level `[platform(..)]` declarations
+/// into [`Program::declared_requirements`] (F27 R1), reporting each pattern no
+/// platform answers to once, where it is written. Run by
+/// [`crate::post_analysis_passes`] ahead of [`check`] and before any tooling
+/// reads [`requirements`], so both pipelines see one answer.
+pub fn record_declared_platforms(program: &mut Program) {
+    let mut declared = DeclaredRequirements::default();
+    let mut unknown: Vec<(Span, SourceId, String)> = Vec::new();
+    let mut sources: Vec<(SourceId, Vec<(String, Span)>)> = program
+        .module_platforms
+        .iter()
+        .map(|(source, patterns)| {
+            (
+                *source,
+                patterns
+                    .iter()
+                    .map(|(text, span)| (text.to_string(), *span))
+                    .collect(),
+            )
+        })
+        .collect();
+    sources.sort_by_key(|(source, _)| source.0);
+    for (source, written) in sources {
+        for (text, span) in &written {
+            if crate::target::PlatformPattern::parse(text).is_none() {
+                unknown.push((*span, source, unknown_pattern_message(text)));
+            }
+        }
+        declared.by_source.insert(
+            source,
+            Declared {
+                label: format!("the {} platform its file declares", named(&written)),
+                patterns: parsed_patterns(&written),
+                scope: format!("file {} {}", source.0, spelled(&written)),
+                written,
+            },
+        );
+    }
+    for implementation in &program.implementations {
+        let Some(labels) = program.item_labels.get(&implementation.impl_id) else {
+            continue;
+        };
+        if labels.platform.is_empty() {
+            continue;
+        }
+        let written: Vec<(String, Span)> = labels
+            .platform
+            .iter()
+            .map(|(text, span)| (text.to_string(), *span))
+            .collect();
+        for (text, span) in &written {
+            if crate::target::PlatformPattern::parse(text).is_none() {
+                unknown.push((*span, implementation.source, unknown_pattern_message(text)));
+            }
+        }
+        let requirement = Declared {
+            label: format!("the {} platform its `impl` declares", named(&written)),
+            patterns: parsed_patterns(&written),
+            scope: format!("impl {} {}", implementation.impl_id.0, spelled(&written)),
+            written,
+        };
+        for (_, member) in &implementation.declared_members {
+            declared.by_function.insert(*member, requirement.clone());
+        }
+    }
+    program.declared_requirements = declared;
+    unknown.sort_by_key(|(span, source, _)| (source.0, span.start));
+    unknown.dedup();
+    for (span, source, msg) in unknown {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
+    }
+}
+
 /// Whether `id` is a binding whose initializer is `const`-marked: evaluated
 /// by the compile-time interpreter and serialized as a value, so at runtime
 /// it is data — it runs nothing and requires nothing of the build platform.
@@ -652,16 +966,23 @@ fn requirement_of<'program>(program: &'program Program, node: Id) -> Option<Requ
     if is_const_global(program, node) {
         return None;
     }
-    let source = program.source_of(node)?;
-    // Canonicalized on both sides — `layer_platforms`' roots and
-    // `canonical_sources` alike (`windows-support.md` §5).
-    let path = program.canonical_sources.get(source.0 as usize)?;
-    for (root, _library, label, patterns) in &program.layer_platforms {
-        if !patterns.is_empty() && path.starts_with(root) {
-            return Some(Requirement { label, patterns });
-        }
+    // F27 R1: a declaration outranks the layer — `[platform("browser")] mod self;`
+    // leading a file makes everything it declares require that platform, and
+    // an `impl`'s does the same for its members.
+    if let Some(declared) = program.declared_requirements.covering(program, node) {
+        return Some(Requirement {
+            label: &declared.label,
+            patterns: &declared.patterns,
+        });
     }
-    None
+    let source = program.source_of(node)?;
+    // M53: the containment walk this used to run per node is resolved per
+    // SOURCE at `Program` construction (`Program::source_layers`), from the
+    // same canonicalized pair — the roots and `canonical_sources` alike
+    // (`windows-support.md` §5).
+    let index = program.source_layers.get(source.0 as usize)?.requiring? as usize;
+    let (_root, _library, label, patterns) = program.layer_platforms.get(index)?;
+    Some(Requirement { label, patterns })
 }
 
 /// A frame's display name: bare for user code, `name (lib::module)` for
@@ -676,18 +997,14 @@ fn frame_label(program: &Program, id: Id) -> String {
         .source_of(id)
         .and_then(|source| {
             // The STEM comes from the spelling the user gave; the containment
-            // test from the canonical form (`windows-support.md` §5).
+            // test from the canonical form, resolved per source (M53).
             let path = program.sources.get(source.0 as usize)?;
-            let canonical = program.canonical_sources.get(source.0 as usize)?;
-            Some((path, canonical))
+            let containing = program.source_layers.get(source.0 as usize)?.containing?;
+            Some((path, containing as usize))
         })
-        .and_then(|(path, canonical)| {
+        .and_then(|(path, containing)| {
             let stem = path.file_stem()?.to_string_lossy().into_owned();
-            let library = program
-                .layer_platforms
-                .iter()
-                .find(|(root, _, _, _)| canonical.starts_with(root))
-                .map(|(_, library, _, _)| library.clone())?;
+            let library = program.layer_platforms.get(containing)?.1.clone();
             Some(if stem == "lib" {
                 library
             } else {
@@ -706,15 +1023,13 @@ fn is_user_code(program: &Program, id: Id) -> bool {
     let Some(source) = program.source_of(id) else {
         return false;
     };
-    // Canonicalized on both sides (`windows-support.md` §5) — a mismatch here
-    // silently reclassifies library code as the user's own.
-    let Some(path) = program.canonical_sources.get(source.0 as usize) else {
-        return false;
-    };
-    !program
-        .layer_platforms
-        .iter()
-        .any(|(root, _, _, _)| path.starts_with(root))
+    // M53: resolved per SOURCE at `Program` construction, from the same
+    // canonicalized pair the walk used to compare here (`windows-support.md`
+    // §5) — an unrecorded source keeps the old answer, "not the user's own".
+    program
+        .source_layers
+        .get(source.0 as usize)
+        .is_some_and(|layer| layer.containing.is_none())
 }
 
 fn violation(
@@ -747,8 +1062,19 @@ fn violation(
         .unwrap_or((Span { start: 0, end: 0 }, SourceId(0)));
     let from = match origin {
         Origin::Entry => "reachable from the entry".to_string(),
-        Origin::Fence { function, fence } => {
+        Origin::Fence {
+            function,
+            fence,
+            scope: None,
+        } => {
             format!("reachable from `{function}`, fenced `[platform({fence})]`")
+        }
+        Origin::Fence {
+            function, fence, ..
+        } => {
+            format!(
+                "reachable from `{function}`, which its declaration `[platform({fence})]` fences"
+            )
         }
     };
     Violation {
@@ -829,6 +1155,207 @@ fn name_of(program: &Program, id: Id) -> String {
 /// shape G20 established — it simply unified them on the manifest's default
 /// rather than on reachability.
 pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<Platform> {
+    file_platform_choices(pkg_root, manifest, file)
+        .into_iter()
+        .map(|choice| choice.platform)
+        .collect()
+}
+
+/// WHY a file is analyzed under the platform it is (E119). The color decides
+/// which `std` layer overlays the program, and therefore what the file's types
+/// ARE — so a diagnostic about a type that only exists under the *other* overlay
+/// is unreadable without the reason, and reads as a compiler mistake. E113
+/// computes the color; this is the sentence that goes with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlatformReason {
+    /// The classic single-entry package: its `target` colors every file under
+    /// the source root, whatever reaches what.
+    PackageTarget,
+    /// A multi-entry package, and this entry's leg loads the file.
+    ReachedBy(String),
+    /// A multi-entry package where NO leg loads the file — a module in
+    /// progress, or one whose importer was just deleted — so the designated
+    /// `default-entry` answers.
+    DefaultEntry(String),
+    /// The caller overrode everything: `--platform <p>` on the command line.
+    Flag,
+    /// The file said so itself (F27 R1): a leading `[platform("…")] mod self;`, or the
+    /// `[platform(..)]` its items carry. The declaration outranks inference and
+    /// the `default-entry` colour; the clause names what was written.
+    Declared(String),
+}
+
+impl PlatformReason {
+    /// The clause a diagnostic appends after "this file is analyzed under
+    /// `<platform>`". Written to complete that sentence, not to stand alone.
+    pub fn clause(&self) -> String {
+        match self {
+            PlatformReason::PackageTarget => {
+                "the package's `target` colors every file in it".into()
+            }
+            PlatformReason::ReachedBy(entry) => format!("the `{entry}` entry reaches it"),
+            PlatformReason::DefaultEntry(entry) => {
+                format!("no entry reaches it (default-entry is `{entry}`)")
+            }
+            PlatformReason::Flag => "`--platform` was passed".into(),
+            PlatformReason::Declared(declaration) => format!("it declares {declaration}"),
+        }
+    }
+
+    /// The one word the editor's status line puts after the platform
+    /// ("analyzed as: browser — declared", F27 R1/R6): which KIND of fact chose
+    /// it. The clause is the tooltip; this is what fits in a status bar.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            PlatformReason::PackageTarget => "package target",
+            PlatformReason::ReachedBy(_) => "entry",
+            PlatformReason::DefaultEntry(_) => "default-entry",
+            PlatformReason::Flag => "--platform",
+            PlatformReason::Declared(_) => "declared",
+        }
+    }
+}
+
+/// Whether `file` is a MODULE of the package rather than one of its declared
+/// programs: under the source root, and not the single `[package] entry`
+/// (default `main.vl`) nor any `[entry.<name>]` path.
+///
+/// The question every path-addressed analysis has to answer about the file it
+/// was handed, and — like [`file_platform_choices`] — it must get ONE answer
+/// from both surfaces, because both hand it to the same analysis. `vilan check
+/// <file>` reads it to skip the `main` demand and the emission walk (E113); the
+/// editor and the CLI both read it to say whether the analyzed entry is
+/// [`crate::EntryMode::Declared`] or an open module (B239).
+///
+/// A file OUTSIDE the source root is not the package's module — it is a program
+/// that happens to sit in the directory — and neither is a file under a
+/// manifest with no `[package]` at all. Both answer `false`, which is what keeps
+/// a bare file the program it has always been.
+///
+/// Compared canonically on both sides, never textually: `./src/main.vl` and
+/// `src/main.vl` name one file and must get one answer, and — the symlink
+/// doctrine, `spec/const.md` §9.2 — so must a file reached through a link.
+pub fn is_package_module(pkg_root: &Path, manifest: &Manifest, file: &Path) -> bool {
+    let Some(package) = manifest.package.as_ref() else {
+        return false;
+    };
+    let file = crate::util::canonical_path(file);
+    if !file.starts_with(crate::util::canonical_path(pkg_root)) {
+        return false;
+    }
+    let same = |candidate: PathBuf| crate::util::canonical_path(candidate) == file;
+    if manifest.entries.is_empty() {
+        return !same(pkg_root.join(package.entry()));
+    }
+    !manifest
+        .entries
+        .iter()
+        .any(|(name, declared)| same(pkg_root.join(declared.path(name))))
+}
+
+/// The module names `pkg::…` addresses the package's DECLARED PROGRAMS by: the
+/// single `[package] entry` (default `main.vl`) and every `[entry.<name>]` path.
+///
+/// [`is_package_module`] read from the other side, and the fact FILE MODE was
+/// missing (B240). An analysis in [`crate::EntryMode::OpenFile`] is looking at
+/// one of the package's modules, and it knows that its OWN file is importable
+/// (B239) — but it could not tell that a SIBLING is a program: `views.vl`
+/// importing `pkg::client::helper` was clean in the editor and refused by
+/// `vilan check .`, whose `client` leg compiles that very file as the entry.
+/// Only the front end reads the manifest, so only the front end can say.
+///
+/// Read LEXICALLY off the declared paths, never against the filesystem (which
+/// is why it takes no root): the name is the one the loader would resolve —
+/// `<name>.vl` or `<name>/lib.vl` directly under the source root. A declared
+/// entry deeper than that is not addressable as `pkg::<name>` at all, so it is
+/// not listed.
+pub fn declared_entry_module_names(manifest: &Manifest) -> Vec<String> {
+    /// `foo.vl` -> `foo`, `foo/lib.vl` -> `foo`, and (A65) `a/b.vl` -> `a::b`,
+    /// `a/b/lib.vl` -> `a::b`: a declared entry anywhere under the source root
+    /// is addressable as `pkg::<its path>`, so it is named here at whatever
+    /// depth the manifest puts it. Anything that is not a `.vl` file, or whose
+    /// path has a segment Rust cannot spell in UTF-8 (never a vilan
+    /// identifier), is not addressable at all and is not listed.
+    fn module_name(relative: &Path) -> Option<String> {
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in relative.iter() {
+            segments.push(segment.to_str()?);
+        }
+        let last = segments.pop()?;
+        match last {
+            // `a/lib.vl` is the module `a` — the directory's own body.
+            "lib.vl" if !segments.is_empty() => {}
+            _ => segments.push(last.strip_suffix(".vl")?),
+        }
+        match segments.is_empty() {
+            true => None,
+            false => Some(segments.join("::")),
+        }
+    }
+    let Some(package) = manifest.package.as_ref() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = match manifest.entries.is_empty() {
+        true => module_name(package.entry()).into_iter().collect(),
+        false => manifest
+            .entries
+            .iter()
+            .filter_map(|(name, declared)| module_name(&declared.path(name)))
+            .collect(),
+    };
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// One color a file is analyzed under, with the reason it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformChoice {
+    pub platform: Platform,
+    pub reason: PlatformReason,
+}
+
+/// [`file_platforms`], each color carrying WHY it was chosen (E119). The
+/// coloring rule is stated in full on `file_platforms`; nothing here decides
+/// anything it does not.
+pub fn file_platform_choices(
+    pkg_root: &Path,
+    manifest: &Manifest,
+    file: &Path,
+) -> Vec<PlatformChoice> {
+    // F27 R1: what the file DECLARES outranks the colour below — read off the
+    // file as it is on disk. The language server asks
+    // [`file_platform_choices_for`] with its live buffer instead.
+    let declared = crate::util::read_source(file)
+        .ok()
+        .and_then(|text| declared_platform(&text));
+    apply_declared(
+        colored_platform_choices(pkg_root, manifest, file),
+        declared.as_ref(),
+    )
+}
+
+/// [`file_platform_choices`] over the file's text as the caller holds it — the
+/// editor's live buffer, whose declaration may not be saved yet.
+pub fn file_platform_choices_for(
+    pkg_root: &Path,
+    manifest: &Manifest,
+    file: &Path,
+    text: &str,
+) -> Vec<PlatformChoice> {
+    apply_declared(
+        colored_platform_choices(pkg_root, manifest, file),
+        declared_platform(text).as_ref(),
+    )
+}
+
+/// The colour a file takes from its package alone — E113's reachability and
+/// the `default-entry` fallback, before the file's own declaration is read.
+fn colored_platform_choices(
+    pkg_root: &Path,
+    manifest: &Manifest,
+    file: &Path,
+) -> Vec<PlatformChoice> {
     let Some(package) = manifest.package.as_ref() else {
         return Vec::new();
     };
@@ -840,7 +1367,10 @@ pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<
     let root = crate::util::canonical_path(pkg_root);
     if manifest.entries.is_empty() {
         return if file.starts_with(&root) {
-            vec![package.resolved_target().unwrap_or_default()]
+            vec![PlatformChoice {
+                platform: package.resolved_target().unwrap_or_default(),
+                reason: PlatformReason::PackageTarget,
+            }]
         } else {
             Vec::new()
         };
@@ -854,18 +1384,21 @@ pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<
         .map(|(name, entry)| (name.as_str(), entry.resolved_target().unwrap_or_default()))
         .collect();
     legs.sort_by_key(|(_, platform)| !matches!(platform, Platform::Browser));
-    let mut platforms: Vec<Platform> = Vec::new();
+    let mut choices: Vec<PlatformChoice> = Vec::new();
     for (name, platform) in &legs {
-        if platforms.contains(platform) {
+        if choices.iter().any(|choice| choice.platform == *platform) {
             continue;
         }
         let entry = pkg_root.join(manifest.entries[*name].path(name));
         if crate::analyzer::package_modules_reachable_from(&entry, pkg_root).contains(&file) {
-            platforms.push(*platform);
+            choices.push(PlatformChoice {
+                platform: *platform,
+                reason: PlatformReason::ReachedBy((*name).to_string()),
+            });
         }
     }
-    if !platforms.is_empty() {
-        return platforms;
+    if !choices.is_empty() {
+        return choices;
     }
     // Unreached: the designated leg's platform, for a file that is the
     // package's to color at all. A file outside the source root is not (it
@@ -877,9 +1410,202 @@ pub fn file_platforms(pkg_root: &Path, manifest: &Manifest, file: &Path) -> Vec<
     }
     manifest
         .default_entry()
-        .and_then(|name| manifest.entries.get(name))
-        .map(|entry| vec![entry.resolved_target().unwrap_or_default()])
+        .and_then(|name| Some((name, manifest.entries.get(name)?)))
+        .map(|(name, entry)| {
+            vec![PlatformChoice {
+                platform: entry.resolved_target().unwrap_or_default(),
+                reason: PlatformReason::DefaultEntry(name.to_string()),
+            }]
+        })
         .unwrap_or_default()
+}
+
+// ── Which platform a file DECLARES (F27 R1) ──────────────────────────────────
+
+/// What a file says about the platform it is ANALYZED under (F27 R1): a leading
+/// `[platform("…")] mod self;`, or the `[platform(..)]` fences and labels its items
+/// carry.
+///
+/// **Why the items count at all.** A fenced function's body is written for its
+/// platform — `region.anchor` in a `[platform("browser")]` function names the
+/// browser twin's field — and one analysis types one file under ONE platform.
+/// Before R1 the fence was a promise and nothing else: it changed nothing about
+/// how its own body resolved, so a fence and the file-level form would have
+/// disagreed about the same function. One analysis can honour a platform every
+/// declaration in the file admits. When they share none — a browser item beside
+/// a `@process` one — the file is a PAIR of twins, which is R3's shape and not
+/// this one, and the file's colour stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredPlatform {
+    /// The hosts every declaration admits, in [`known_hosts`] order — so a
+    /// `@process` declaration analyzes under `node`.
+    pub hosts: Vec<Platform>,
+    /// Whether a leading `[platform(..)] mod self;` decided it. It outranks the file's
+    /// colour outright; items only decide where no colour admits them.
+    pub module_level: bool,
+    /// The declaration as the reason clause names it:
+    /// `` `[platform("browser")]` ``.
+    pub written: String,
+}
+
+impl DeclaredPlatform {
+    /// Whether `platform` is one this declaration admits.
+    pub fn admits(&self, platform: Platform) -> bool {
+        self.hosts
+            .iter()
+            .any(|host| host.runtime_name() == platform.runtime_name())
+    }
+}
+
+/// The platform `source` declares, read off its own text (F27 R1) — `None` for
+/// the overwhelming majority of files, which declare nothing, and for a file
+/// whose declarations share no platform (R3's twins). A source that does not
+/// parse declares what its salvaged tree shows.
+///
+/// Syntactic on purpose: it decides which `std` overlay the file is analyzed
+/// under, so it runs BEFORE the analysis and cannot ask it anything.
+pub fn declared_platform(source: &str) -> Option<DeclaredPlatform> {
+    let (tree, _errors) = crate::parsing::parse(source);
+    declared_platform_in(&tree?.0)
+}
+
+/// [`declared_platform`] over a tree already in hand.
+pub fn declared_platform_in(root: &crate::node::NodeList) -> Option<DeclaredPlatform> {
+    fn items<'a>(node: &'a crate::node::Node<'a>, into: &mut Vec<Vec<&'a str>>) {
+        use crate::node::Node;
+        let texts = |patterns: &'a [crate::span::Spanned<&'a str>]| {
+            patterns.iter().map(|(text, _)| *text).collect::<Vec<_>>()
+        };
+        match node {
+            Node::Export(_, inner, _)
+            | Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::Const(inner)
+            | Node::MacroAttribute(_, _, _, inner) => items(&inner.0, into),
+            Node::Func(function) if !function.platform_fence.is_empty() => {
+                into.push(texts(&function.platform_fence));
+            }
+            Node::Struct(.., Some(labels))
+            | Node::Enum(.., Some(labels))
+            | Node::Trait(.., Some(labels))
+                if !labels.platform.is_empty() =>
+            {
+                into.push(texts(&labels.platform));
+            }
+            Node::Impl(_, _, body, labels) => {
+                if let Some(labels) = labels
+                    && !labels.platform.is_empty()
+                {
+                    into.push(texts(&labels.platform));
+                }
+                for member in &body.0 {
+                    items(&member.0, into);
+                }
+            }
+            Node::Module(_, body) => {
+                for item in &body.0 {
+                    items(&item.0, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let hosts_of = |written: &[&str]| -> Vec<Platform> {
+        known_hosts()
+            .into_iter()
+            .filter(|host| {
+                written.iter().any(|text| {
+                    crate::target::PlatformPattern::parse(text)
+                        .is_some_and(|patterns| patterns.iter().any(|p| host.matches(*p).is_some()))
+                })
+            })
+            .collect()
+    };
+    let spelled = |written: &[&str]| {
+        let patterns = written
+            .iter()
+            .map(|text| format!("\"{text}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("`[platform({patterns})]`")
+    };
+    // The file's own line: only its FIRST statement may be one (the parser
+    // refuses it anywhere else).
+    if let Some((crate::node::Node::ModulePlatform(patterns), _)) = root.first()
+        && !patterns.is_empty()
+    {
+        let written: Vec<&str> = patterns.iter().map(|(text, _)| *text).collect();
+        let hosts = hosts_of(&written);
+        return (!hosts.is_empty()).then(|| DeclaredPlatform {
+            hosts,
+            module_level: true,
+            written: spelled(&written),
+        });
+    }
+    let mut declarations: Vec<Vec<&str>> = Vec::new();
+    for item in root {
+        items(&item.0, &mut declarations);
+    }
+    let first = declarations.first()?;
+    let hosts: Vec<Platform> = hosts_of(first)
+        .into_iter()
+        .filter(|host| {
+            declarations.iter().all(|declaration| {
+                hosts_of(declaration)
+                    .iter()
+                    .any(|other| other.runtime_name() == host.runtime_name())
+            })
+        })
+        .collect();
+    let mut distinct: Vec<String> = Vec::new();
+    for declaration in &declarations {
+        let spelling = spelled(declaration);
+        if !distinct.contains(&spelling) {
+            distinct.push(spelling);
+        }
+    }
+    (!hosts.is_empty()).then(|| DeclaredPlatform {
+        hosts,
+        module_level: false,
+        written: distinct.join(" and "),
+    })
+}
+
+/// A file's colours with its own declaration applied (F27 R1).
+///
+/// - A leading `[platform(..)] mod self;` OUTRANKS the colour: of the colours the
+///   package gives the file, only those it admits are kept, and when it admits
+///   none (the `default-entry` leg is a server, an unreached file, a package
+///   target) the file is analyzed under the declared platform. A leg that
+///   reaches the file and is not admitted is not the file's to type-check —
+///   reaching it is the error, and the leg's own entry reports it with the
+///   chain.
+/// - Item declarations decide only where the colour admits none of them: a
+///   shared module keeps every leg it is compiled in, since unfenced code in
+///   it is compiled under each.
+pub fn apply_declared(
+    choices: Vec<PlatformChoice>,
+    declared: Option<&DeclaredPlatform>,
+) -> Vec<PlatformChoice> {
+    let Some(declared) = declared else {
+        return choices;
+    };
+    let admitted: Vec<PlatformChoice> = choices
+        .iter()
+        .filter(|choice| declared.admits(choice.platform))
+        .cloned()
+        .collect();
+    if !admitted.is_empty() {
+        return if declared.module_level {
+            admitted
+        } else {
+            choices
+        };
+    }
+    vec![PlatformChoice {
+        platform: declared.hosts[0],
+        reason: PlatformReason::Declared(declared.written.clone()),
+    }]
 }
 
 /// The program's entry: a function named `main` defined in user code. Also
@@ -891,4 +1617,121 @@ pub(crate) fn entry_function(program: &Program) -> Option<Id> {
         .iter()
         .find(|(id, function)| function.name == "main" && is_user_code(program, **id))
         .map(|(id, _)| *id)
+}
+
+#[cfg(test)]
+mod declared_tests {
+    //! F27 R1's resolver, on its own: what a file declares, and what that does
+    //! to the colour its package gives it.
+    use super::*;
+
+    fn node() -> Platform {
+        Platform::Node {
+            version: crate::target::NODE_LTS,
+        }
+    }
+
+    fn choice(platform: Platform, reason: PlatformReason) -> PlatformChoice {
+        PlatformChoice { platform, reason }
+    }
+
+    #[test]
+    fn a_file_leading_platform_is_declared_at_module_level() {
+        let declared = declared_platform("[platform(\"browser\")] mod self;\n\nfun f() {}\n")
+            .expect("declares");
+        assert!(declared.module_level);
+        assert_eq!(declared.hosts, vec![Platform::Browser]);
+        assert_eq!(declared.written, "`[platform(\"browser\")]`");
+        // A family declares its first host first: `@process` analyzes as node.
+        let process = declared_platform("[platform(\"@process\")] mod self;\n").expect("declares");
+        assert_eq!(process.hosts[0].runtime_name(), "node");
+    }
+
+    #[test]
+    fn a_fence_or_a_label_is_declared_at_item_level() {
+        for source in [
+            "export [platform(\"browser\")]\nfun f() {}\n",
+            "[platform(\"browser\")]\nimpl X {\n\tfun f(self) {}\n}\n",
+            "impl X {\n\t[platform(\"browser\")]\n\tfun f(self) {}\n}\n",
+            "[platform(\"browser\")]\nstruct X {}\n",
+        ] {
+            let declared = declared_platform(source).unwrap_or_else(|| panic!("{source:?}"));
+            assert!(!declared.module_level, "{source:?}");
+            assert_eq!(declared.hosts, vec![Platform::Browser], "{source:?}");
+        }
+        // Items that agree keep their common platform; items that share none are
+        // twins (R3), and declare nothing a single analysis can honour.
+        let agreeing = "[platform(\"@process\")]\nfun a() {}\n[platform(\"node\")]\nfun b() {}\n";
+        assert_eq!(
+            declared_platform(agreeing).expect("declares").hosts,
+            vec![node()]
+        );
+        let twins = "[platform(\"browser\")]\nfun a() {}\n[platform(\"@process\")]\nfun b() {}\n";
+        assert_eq!(declared_platform(twins), None);
+        // And nearly every file declares nothing.
+        assert_eq!(declared_platform("fun main() {}\n"), None);
+    }
+
+    #[test]
+    fn a_module_declaration_outranks_the_colour() {
+        let declared = declared_platform("[platform(\"browser\")] mod self;\n").expect("declares");
+        // The owner's case: an unreached module, `default-entry` a server.
+        let resolved = apply_declared(
+            vec![choice(
+                node(),
+                PlatformReason::DefaultEntry("server".into()),
+            )],
+            Some(&declared),
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].platform, Platform::Browser);
+        assert_eq!(resolved[0].reason.kind(), "declared");
+        assert_eq!(
+            resolved[0].reason.clause(),
+            "it declares `[platform(\"browser\")]`"
+        );
+        // A shared module: only the leg it admits type-checks it.
+        let resolved = apply_declared(
+            vec![
+                choice(
+                    Platform::Browser,
+                    PlatformReason::ReachedBy("client".into()),
+                ),
+                choice(node(), PlatformReason::ReachedBy("server".into())),
+            ],
+            Some(&declared),
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].reason,
+            PlatformReason::ReachedBy("client".into())
+        );
+    }
+
+    #[test]
+    fn an_item_declaration_decides_only_where_no_colour_admits_it() {
+        let declared =
+            declared_platform("export [platform(\"browser\")]\nfun f() {}\n").expect("declares");
+        let shared = vec![
+            choice(
+                Platform::Browser,
+                PlatformReason::ReachedBy("client".into()),
+            ),
+            choice(node(), PlatformReason::ReachedBy("server".into())),
+        ];
+        // A shared module keeps every leg: its unfenced code compiles in each.
+        assert_eq!(apply_declared(shared.clone(), Some(&declared)), shared);
+        let resolved = apply_declared(
+            vec![choice(
+                node(),
+                PlatformReason::DefaultEntry("server".into()),
+            )],
+            Some(&declared),
+        );
+        assert_eq!(resolved[0].platform, Platform::Browser);
+        assert_eq!(resolved[0].reason.kind(), "declared");
+        // And a file that declares nothing keeps its colour exactly.
+        let colour = vec![choice(node(), PlatformReason::PackageTarget)];
+        assert_eq!(apply_declared(colour.clone(), None), colour);
+    }
 }

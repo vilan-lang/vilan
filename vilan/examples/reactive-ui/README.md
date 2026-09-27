@@ -21,7 +21,7 @@ are the reference; this is the working code they describe.
 
 - **`combine`**: a two-input dependency (`items` and `filter`) yielding a
   source of the tuple; the combinator tree *is* the dependency graph.
-- **`bind_each`**: a keyed reactive list, where rows move with their keys,
+- **`each`**: a keyed reactive list, where rows move with their keys,
   only a changed row re-renders, and a removed row is disposed.
 - **`bind_value`**: two-way binding on an `<input>`.
 - **`show` vs `when`**: `show` toggles visibility with the node still mounted

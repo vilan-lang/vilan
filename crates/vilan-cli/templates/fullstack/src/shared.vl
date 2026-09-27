@@ -2,6 +2,8 @@
 // both import it — one source tree, nothing to declare. Keep the code the two
 // sides must agree on (payload types, routes, greetings) here.
 
+export *;
+
 fun greeting(): str {
 	"hello from Vilan"
 }

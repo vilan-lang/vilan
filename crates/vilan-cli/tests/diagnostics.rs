@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod support;
+
 /// A fresh temp directory holding one test's single-package project.
 fn temp_package(tag: &str, source: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_diagnostics_{tag}_{}_{unique}",
         std::process::id()
     ));
@@ -177,7 +179,7 @@ fn build_stdout_javascript_is_never_mixed_with_a_diagnostic() {
 fn temp_files(tag: &str, files: &[(&str, &str)]) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_diagnostics_{tag}_{}_{unique}",
         std::process::id()
     ));
@@ -405,11 +407,17 @@ fn a_module_warning_renders_in_the_module_file() {
 }
 
 #[test]
-fn a_macro_registration_diagnostic_renders_in_the_file_that_defines_the_macro() {
+fn a_macro_registration_diagnostic_renders_once_at_the_entry_and_leads() {
     // E16's original repro (`macros.rs`): a std file that defines a macro, with
-    // no `macro_std` beside `std`. The error's span belongs to the STD file, and
-    // before this it was rendered against the entry — whose text is far shorter,
-    // so the label silently vanished and the message printed location-less.
+    // no `macro_std` beside `std`. E16 made the error render in the STD file that
+    // holds the span (before it, the label vanished against the entry's shorter
+    // text). E212 (Order 39) then found that refusal firing ONCE PER
+    // MACRO-DEFINING STD FILE, each anchored inside std, after a first diagnostic
+    // blaming the user's own code — so the split-toolchain refusal is now asked
+    // once, before any registration, attributed to the ENTRY at offset 0 so it
+    // leads, and de-duplicated. What this pins is E212's contract: one sentence,
+    // first, naming both paths, rendered in the entry — and no rendering inside
+    // the std file, which is not the user's to fix.
     let dir = temp_files(
         "macro_std_missing",
         &[
@@ -447,9 +455,22 @@ fn a_macro_registration_diagnostic_renders_in_the_file_that_defines_the_macro() 
         stderr.contains("`macro_std` package was not found"),
         "the macro-registration error is reported: {stderr}"
     );
+    // The renderer prints a diagnostic's message twice (the headline and the
+    // label), so the count that says "once" is the count of headlines.
+    assert_eq!(
+        stderr
+            .matches("Error: the `macro_std` package was not found")
+            .count(),
+        1,
+        "and it is reported exactly once, not once per macro-defining std file: {stderr}"
+    );
     assert!(
-        renders_in(&stderr, "mine.vl", "macro fun Marker(item: Item): Source {"),
-        "and renders in the file that defines the macro: {stderr}"
+        renders_in(&stderr, "main.vl", "import std::mine::Marker;"),
+        "and it renders at the entry, leading, where the user can act on it: {stderr}"
+    );
+    assert!(
+        !renders_in(&stderr, "mine.vl", "macro fun Marker(item: Item): Source {"),
+        "and not inside the std file, which is not the user's to fix: {stderr}"
     );
 }
 
@@ -608,22 +629,168 @@ fn phase_timing_env_var_prints_the_post_pass_breakdown() {
          stderr was: {stderr}"
     );
     for bucket in [
-        "call-graph",
+        // N43: the bucket is named after WHAT IT TIMES. `contexts+graph` is
+        // `context::thread_contexts` (which builds its own graph when it
+        // rewrites, and falls back to `CallGraph::build` when it does not) —
+        // reading it as "the call graph" cost the editor-perf lane a detour.
+        "contexts+graph",
         "async-infer",
         "view-suspensions",
         "async-drops",
         "context-drops",
         "platform-color",
-        "const-eval",
+        // Likewise: the bucket is the whole const PASS, whose 1,189 ms on
+        // kolt was `check_const_only`'s dispatch refinement and NOT const
+        // evaluation (the real const work was 11 ms). `const-lower` /
+        // `const-interp` remain its evaluation sub-split.
+        "const-pass",
         "const-lower",
         "const-interp",
         "init-order",
+        // The constant both mislabelled buckets were really spending their
+        // time in, now readable without a detour: total wall inside
+        // `dispatch_refine::refined_edges` across the analysis.
+        "dispatch-refine",
     ] {
         assert!(
             stderr.contains(bucket),
             "the post-pass line must carry the `{bucket}` bucket — the whole \
              point is that the next attribution is a run, not a hand-patch; \
              stderr was: {stderr}"
+        );
+    }
+    // The old names must be GONE, not merely joined: a line carrying both
+    // spellings would let the next reader pick the wrong one.
+    for stale in ["call-graph ", "const-eval "] {
+        assert!(
+            !stderr.contains(stale),
+            "the post-pass line still carries the mislabelled `{stale}`bucket \
+             (N43); stderr was: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every `[vilan phase]` figure carries a CPU reading beside its wall
+/// (backlog M78).
+///
+/// The marks were `Instant` alone, so every number the perf arc reads was
+/// WALL — and wall on a loaded box is a share, never an absolute: M73's stage
+/// split had to be reported as percentages for exactly that reason, and
+/// E121's ledger could take no absolute figure while nine other jobs ran. A
+/// thread CPU clock is immune to the load, so the phase line prints
+/// `wall/cpu` and both facts are readable from one run.
+///
+/// The pin DECLINES where the host exposes no thread CPU clock (anything but
+/// LP64 Linux): it then asserts the `?cpu` rendering — a missing measurement
+/// saying so — and stops, because "the figures advance" is not a property of
+/// a clock that is not there.
+#[test]
+fn the_phase_line_carries_a_cpu_figure_beside_every_wall_figure() {
+    let dir = temp_package(
+        "phasecpu",
+        "import std::io::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_PHASE_TIMING", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let phase_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[vilan phase]"))
+        .collect();
+    assert!(
+        !phase_lines.is_empty(),
+        "VILAN_PHASE_TIMING=1 printed no phase line; stderr was: {stderr}"
+    );
+
+    // Every timing token on every phase line, with the field name that
+    // precedes it. A token is a timing exactly when it ends in `cpu` — the
+    // non-timing fields (`macro-worlds 1`, `const-fuel-max 0`, `legs 2`,
+    // the whole `reused 0/25` row) carry bare numbers and are skipped.
+    let mut timings: Vec<(String, f64, Option<f64>)> = Vec::new();
+    for line in &phase_lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for (position, word) in words.iter().enumerate() {
+            if !word.ends_with("cpu") {
+                continue;
+            }
+            let name = words
+                .get(position.wrapping_sub(1))
+                .copied()
+                .unwrap_or("<first word>")
+                .to_string();
+            let (wall, cpu) = word
+                .split_once("ms/")
+                .unwrap_or_else(|| panic!("`{name} {word}` is not a `<wall>ms/<cpu>cpu` token"));
+            let wall: f64 = wall
+                .parse()
+                .unwrap_or_else(|_| panic!("`{name} {word}`'s wall figure must be a number"));
+            let cpu = cpu.strip_suffix("cpu").expect("just matched the suffix");
+            let cpu = (cpu != "?").then(|| {
+                cpu.parse::<f64>().unwrap_or_else(|_| {
+                    panic!("`{name} {word}`'s cpu figure must be `?` or a number")
+                })
+            });
+            timings.push((name, wall, cpu));
+        }
+    }
+    assert!(
+        timings.len() >= 20,
+        "the four core phase lines carry more than twenty timing fields \
+         between them; found {} in: {phase_lines:#?}",
+        timings.len()
+    );
+
+    if !vilan_core::phase_cpu_clock_available() {
+        // The decline, and it is still an assertion: a host without the clock
+        // must print `?cpu` everywhere rather than a zero that reads as a
+        // measurement.
+        println!(
+            "M78-DECLINE: this host exposes no thread CPU clock, so the phase \
+             line's cpu figures are `?` and cannot be checked for advance"
+        );
+        for (name, _, cpu) in &timings {
+            assert!(
+                cpu.is_none(),
+                "`{name}` printed a cpu number on a host with no thread CPU \
+                 clock; a missing measurement must print `?cpu`"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // The clock is there, so it must ADVANCE: a whole analysis of a package
+    // burns CPU, and a reader who cannot tell a stuck clock from a fast
+    // compiler has no instrument.
+    assert!(
+        timings
+            .iter()
+            .any(|(_, _, cpu)| cpu.is_some_and(|cpu| cpu > 0.0)),
+        "every cpu figure read 0.0 for a complete analysis — the clock is \
+         present but not advancing, so the instrument is reporting nothing: \
+         {phase_lines:#?}"
+    );
+    // And it must stay UNDER the wall: each phase brackets work on one
+    // thread, so the CPU it burned cannot exceed the time it took. The
+    // tolerance is two printed digits' worth of rounding, since both figures
+    // are rendered to 0.1 ms.
+    for (name, wall, cpu) in &timings {
+        let Some(cpu) = *cpu else {
+            panic!(
+                "`{name}` printed `?cpu` although this host has the clock; \
+                 the rendering must follow the capability"
+            );
+        };
+        assert!(
+            cpu <= wall + 0.2,
+            "`{name}` burned {cpu} ms of CPU in {wall} ms of wall — a phase \
+             runs on one thread, so this is a clock mismatch and not a \
+             measurement: {phase_lines:#?}"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -676,6 +843,91 @@ fn depth_stats_env_var_prints_the_depth_line() {
         "the depth line must be off by default; stderr was: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// N111: the depth line survives a build that never ANALYSES.
+///
+/// The report rides the end of `post_analysis_passes`, and `vilan build` drops
+/// the tree of a file that did not parse cleanly — so the one case the
+/// instrument exists for was the one case it said nothing about. The parser's
+/// own bound (B142, `NESTING_DEPTH_LIMIT` = 500) is that case by construction:
+/// the refusal comes from the family with the deepest measured recursion, and
+/// before this the run printed the refusal and no numbers.
+///
+/// Both halves are pinned. On the refusal the line is printed ONCE and its
+/// `parse` family carries a depth past the bound; and a build that DOES
+/// analyse still prints exactly one line, because the release is on the
+/// no-tree path only — a second call would double the line.
+#[test]
+fn n111_a_parse_bound_refusal_still_prints_the_depth_line() {
+    // 600 nested parentheses: past the parser's 500-level bound, and flat to
+    // everything downstream of it (nothing is analysed at all).
+    let deep = format!(
+        "import std::io::print;\nfun main() {{ print({}1{}); }}\n",
+        "(".repeat(600),
+        ")".repeat(600)
+    );
+    let dir = temp_package("depthbound", &deep);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_DEPTH_STATS", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the 600-level program must be refused; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("nests more than 500 levels deep, which parsing refuses"),
+        "the refusal must be the PARSER's bound; stderr was: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("[vilan depth]").count(),
+        1,
+        "the depth line must be printed exactly once for a refused parse; \
+         stderr was: {stderr}"
+    );
+    // The line is the anchored parse's own measurement, not an empty frame:
+    // the peak sits one past the bound, which is where the refusal fires.
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("[vilan depth]"))
+        .expect("the depth line");
+    let parse_depth: usize = line
+        .split_whitespace()
+        .skip_while(|word| *word != "parse")
+        .nth(1)
+        .expect("the `parse` family's depth")
+        .parse()
+        .expect("the depth is a number");
+    assert!(
+        parse_depth > 500,
+        "the `parse` peak must show the bound being reached, not 0; the line \
+         was: {line}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The other half: a build that reaches analysis still prints ONE line.
+    let clean = temp_package(
+        "depthclean",
+        "import std::io::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&clean)
+        .args(["build"])
+        .env("VILAN_DEPTH_STATS", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("[vilan depth]").count(),
+        1,
+        "an analysed build must print the line once, not twice; stderr was: \
+         {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&clean);
 }
 
 /// The batch half of the blackout (`editing-dx.md` S6/§13.1, the P29 shape).
@@ -827,7 +1079,7 @@ fn e76_the_generic_leak_notes_sub_header_agrees_with_its_label() {
     let dir = temp_package(
         "e76_generic_leak",
         "import std::option::Option::{ self, Some };\n\
-         resource struct Db { handle: i32 }\n\
+         [resource] struct Db { handle: i32 }\n\
          fun main() {\n\
          \tlet db = Db { handle = 1 };\n\
          \tlet opt: Option<Db> = Some(db);\n\
@@ -1008,5 +1260,873 @@ fn e90_a_workspace_member_read_reports_at_itself() {
     assert!(
         renders_in(&stderr, "main.vl", "print(entry());"),
         "the user-side hop still renders in main.vl: {stderr}"
+    );
+}
+
+// --- B182: one round, one report per distinct error --------------------------
+//
+// A multi-entry package's `check` is one analysis PER ENTRY over one source
+// tree, so a module every leg reaches produced its diagnostics once per leg:
+// kolt's two refused fields were six of its 53 errors, the one report each is
+// owed arriving once per entry. The loader already refuses to report a module's
+// parse errors once per importing seam (E102); an entry is that seam one level
+// up, and the ledger keys the same three things — file, position, reason.
+
+/// The rendered diagnostics of a failing `vilan check .`, as one string. The
+/// dedup is a CHECK property: `build` stops at the first failing leg, so it
+/// never reaches a second entry to repeat anything.
+fn check_stderr(dir: &Path) -> (Output, String) {
+    let output = vilan(dir, &["check", "."], true);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output, stderr)
+}
+
+/// One line per rendered diagnostic — ariadne opens each report with its
+/// message on an `Error:` line.
+fn error_headers(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("Error:"))
+        .collect()
+}
+
+/// A package with three entries, all reaching one module — kolt's own layout.
+const THREE_ENTRY_MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\
+                                    \n[entry.client]\ntarget = \"browser\"\n\
+                                    \n[entry.server]\n\n[entry.probe]\n";
+
+/// The three entries, each importing the shared module and doing nothing else.
+fn three_entries() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "src/client.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\nfun main() {\n\tprint(\"client\");\n}\n",
+        ),
+        (
+            "src/server.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+        ),
+        (
+            "src/probe.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\nfun main() {\n\tprint(\"probe\");\n}\n",
+        ),
+    ]
+}
+
+#[test]
+fn a_shared_modules_error_reports_once_per_check_not_once_per_entry() {
+    // A plain type error, nothing to do with the refusal family: the dedup is
+    // the round's, not one family's.
+    let mut files = vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        (
+            "src/store.vl",
+            "struct Store {\n\tname: str,\n}\n\nfun oops(): i32 {\n\t\"not an int\"\n}\n",
+        ),
+    ];
+    files.extend(three_entries());
+    let dir = temp_files("per_entry_dedup", &files);
+    let (output, stderr) = check_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the broken check must fail");
+    let headers = error_headers(&stderr);
+    assert_eq!(
+        headers.len(),
+        1,
+        "one mistake in a module all three entries reach is one report: {stderr}"
+    );
+    assert!(
+        headers[0].contains("Expected i32, but got str"),
+        "and it is the mistake itself: {stderr}"
+    );
+}
+
+#[test]
+fn the_service_exhibits_refused_fields_report_only_their_roots() {
+    // kolt's shape and kolt's mistake (B182): two `[expose]` fields annotated
+    // with the reactive TRAIT rather than the cell, in a module all three
+    // entries reach. That produced 53 diagnostics — six curated roots, fifteen
+    // setter calls on a receiver with no type, twelve generated-code inference
+    // failures, and field-access noise — with the cascade printed FIRST.
+    let mut files = vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        (
+            "src/store.vl",
+            "import std::reactive::Signal;\n\
+             \n\
+             [service(StoreClient)]\n\
+             struct Store {\n\
+             \t[expose] tasks: Signal<List<i32>>,\n\
+             \t[expose] names: Signal<List<str>>,\n\
+             }\n\
+             \n\
+             impl Store {\n\
+             \t[rpc]\n\
+             \tfun add(self, id: i32): i32 {\n\
+             \t\tself.tasks.set_with(|list| {\n\
+             \t\t\tmut updated = list;\n\
+             \t\t\tupdated.push(id);\n\
+             \t\t\tupdated\n\
+             \t\t});\n\
+             \t\tid\n\
+             \t}\n\
+             }\n",
+        ),
+    ];
+    files.extend(three_entries());
+    let dir = temp_files("service_roots", &files);
+    let (output, stderr) = check_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the broken check must fail");
+    let headers = error_headers(&stderr);
+    assert_eq!(
+        headers.len(),
+        2,
+        "two refused annotations are two reports — one each, not one per entry: {stderr}"
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|header| header.contains("'Signal' is a trait, not a type")),
+        "and both are the refusal itself, not a consequence of it: {stderr}"
+    );
+    for cascade in [
+        "on unknown",
+        "cannot infer",
+        "in code generated by this attribute",
+    ] {
+        assert!(
+            !stderr.contains(cascade),
+            "no follow-on may survive the refusal ({cascade:?}): {stderr}"
+        );
+    }
+}
+
+#[test]
+fn an_entry_self_import_keeps_main_and_says_the_import_is_a_no_op() {
+    // B226, end to end: `import pkg::main::..` inside the ENTRY resolved back
+    // to the entry file, which the loader then loaded as a MODULE — and an
+    // entry that is a module skips the entry-as-program walk, so `main` itself
+    // disappeared and the build died with "Cannot execute program without a
+    // main function". The build must succeed now, and the import — a no-op,
+    // since the entry's own declarations are already in scope — must be told
+    // about in the entry, on its own line.
+    let dir = temp_files(
+        "entry_self_import",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import std::io::print;\nimport pkg::main::helper;\n\n\
+                 fun helper(): i32 { 41 }\n\nfun main() {\n\tprint(helper());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "the entry keeps its `main` under a self-import: {stderr}"
+    );
+    assert!(
+        !stderr.contains("without a main function"),
+        "and never loses the item table: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "import pkg::main::helper;"),
+        "the telling renders at the import, in the entry: {stderr}"
+    );
+    assert!(
+        stderr.contains("is this program's own entry file"),
+        "and says why the import does nothing: {stderr}"
+    );
+}
+
+/// The file named on the FIRST rendered block's location line — the primary
+/// label's file, which is the one a reader looks at first. B228 is entirely
+/// about this line, so it is asked for by itself rather than through
+/// [`renders_in`], which any block in the diagnostic can satisfy.
+fn primary_label_file(stderr: &str) -> String {
+    stderr
+        .split("╭─[")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The browser fixture the zero-argument pins share: a `std::ui` method that
+/// takes an argument, called with none.
+const BROWSER_MANIFEST: &str = "[package]\nname = \"app\"\ntarget = \"browser\"\n";
+
+#[test]
+fn a_zero_argument_std_method_call_reports_in_the_callers_file() {
+    // B228, the plain form. `MethodArgCheck` anchored on its first ARGUMENT
+    // and fell back to the declaration when there was none — so with zero
+    // arguments the diagnostic's source became std's file while its span still
+    // held the caller's byte offsets. The whole thing rendered against
+    // `std/src/browser/ui.vl`, at offsets belonging to another file, and the
+    // user's own file was never named: it read as no diagnostic at all.
+    let dir = temp_files(
+        "zero_arg_std_method",
+        &[
+            ("vilan.toml", BROWSER_MANIFEST),
+            (
+                "src/main.vl",
+                "import std::ui::{ View, view, mount_root };\n\n\
+                 fun broken(): View {\n\tview(\"div\").styled()\n}\n\n\
+                 fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the missing argument must fail");
+    assert!(
+        stderr.contains("expects 1 argument, but got 0"),
+        "the arity is checked: {stderr}"
+    );
+    assert!(
+        primary_label_file(&stderr).contains("main.vl"),
+        "the primary label belongs to the CALLER's file: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "view(\"div\").styled()"),
+        "and quotes the caller's own line: {stderr}"
+    );
+    assert!(
+        stderr.contains("is declared here"),
+        "the declaration note survives, in std's file: {stderr}"
+    );
+}
+
+#[test]
+fn a_zero_argument_std_method_in_an_element_head_reports_in_the_callers_file() {
+    // The spelling it was found through: `<div .styled() />`, where the call is
+    // built by the element desugar. `redirect_derived_diagnostics` already
+    // handles a `DERIVED_SOURCE` `call_id`, so the caller-side anchor holds
+    // through the desugar too — which is the half that had to be checked
+    // separately from the hand-written chain above.
+    let dir = temp_files(
+        "zero_arg_element_method",
+        &[
+            ("vilan.toml", BROWSER_MANIFEST),
+            (
+                "src/main.vl",
+                "import std::ui::{ View, view, mount_root };\n\n\
+                 fun broken(): View {\n\t<div .styled() />\n}\n\n\
+                 fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the missing argument must fail");
+    assert!(
+        primary_label_file(&stderr).contains("main.vl"),
+        "the element form anchors caller-side too: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "<div .styled() />"),
+        "and quotes the element head: {stderr}"
+    );
+}
+
+#[test]
+fn a_too_many_arguments_std_method_call_still_reports_in_the_callers_file() {
+    // The control that already rendered right, and must keep doing so: with at
+    // least one argument the old anchor was that argument, which is caller-side
+    // — the same file `call_id` names. This is what makes the fix a
+    // restatement rather than a move.
+    let dir = temp_files(
+        "too_many_args_std_method",
+        &[
+            ("vilan.toml", BROWSER_MANIFEST),
+            (
+                "src/main.vl",
+                "import std::ui::{ View, view, mount_root };\n\
+                 import std::style::style;\n\n\
+                 fun broken(): View {\n\tview(\"div\").styled(style(), 1, 2)\n}\n\n\
+                 fun main() {\n\tlet _root = mount_root(\"app\", || broken());\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the extra arguments must fail");
+    assert!(
+        stderr.contains("expects 1 argument, but got 3"),
+        "the arity is checked: {stderr}"
+    );
+    assert!(
+        primary_label_file(&stderr).contains("main.vl"),
+        "and reports where the call is written: {stderr}"
+    );
+}
+
+#[test]
+fn checking_a_module_file_a_sibling_imports_is_clean() {
+    // B239, end to end: `vilan check src/views.vl` analyzes the named file AS
+    // the entry, because a file is all it was given — and `views.vl` is one of
+    // the package's MODULES, which `channel.vl` imports back. B226's refusal
+    // (correct for a declared entry, which is the program and not a module) fired
+    // there too, and everything `channel` took from `views` missed after it: the
+    // owner saw seven errors in the editor over a package `vilan check .`
+    // compiled clean.
+    //
+    // Both verdicts are asserted, in one fixture, because the whole complaint
+    // was that they disagreed.
+    let dir = temp_files(
+        "open_module_file",
+        &[
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                 [entry.client]\n\n[entry.server]\n",
+            ),
+            (
+                "src/views.vl",
+                "import pkg::channel::render;\n\n\
+                 [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 struct Style { padding: i32 }\n\n\
+                 impl Style {\n\tfun flex_row(self): Style {\n\t\t\
+                 Style { padding = self.padding + 1 }\n\t}\n}\n\n\
+                 fun button_style(): Style { Style { padding = 1 } }\n\n\
+                 fun icon(name: str): str { name }\n\n\
+                 fun shown(): bool { Tab::Messages == Tab::Other }\n\n\
+                 fun total(): i32 { render() }\n",
+            ),
+            (
+                "src/channel.vl",
+                "import pkg::views::{ Style, button_style, icon };\n\n\
+                 fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
+                 let label = icon(\"x\");\n\tbase.padding\n}\n",
+            ),
+            (
+                "src/client.vl",
+                "import std::io::print;\nimport pkg::views::{ shown, total };\n\n\
+                 fun main() {\n\tprint(i\"{shown()} {total()}\");\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ],
+    );
+    let file = vilan(&dir, &["check", "src/views.vl"], true);
+    let file_stderr = String::from_utf8_lossy(&file.stderr).into_owned();
+    let package = vilan(&dir, &["check", "."], true);
+    let package_stderr = String::from_utf8_lossy(&package.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        package.status.success() && error_headers(&package_stderr).is_empty(),
+        "the package itself compiles: {package_stderr}"
+    );
+    assert!(
+        file.status.success(),
+        "and so does the module the editor opens: {file_stderr}"
+    );
+    assert!(
+        error_headers(&file_stderr).is_empty(),
+        "with no refusal of the sibling's import: {file_stderr}"
+    );
+}
+
+// --- M34: `check` runs emission for its refusals, not for its text ---
+//
+// `vilan check` of an ENTRY used to call `transform` and drop the JavaScript,
+// so a check cost what a build cost. It now calls `transformer::diagnose`,
+// which runs the same `assemble` and skips only the scope rename and the
+// formatting. `transform` refuses four ways — the missing `main`, and the
+// never-silent B55/B68/B176 internal refusals, each of which is a fact about
+// what the WALK produced — so the walk cannot be skipped, and these pins hold
+// `check` to `build`'s answer rather than to a claim about the code.
+
+/// The one refusal an author can actually reach: emission's missing `main`.
+/// It is decided at the top of `assemble`, before any of the walk, and a
+/// `check` that stopped calling the transformer would go green here — which is
+/// exactly what makes this pin non-vacuous. Both verdicts and both renderings
+/// are compared, so it also holds `check` to the ENTRY-attribution E113's
+/// twin above asserts for `build`.
+#[test]
+fn check_refuses_a_missing_main_exactly_as_build_does() {
+    let dir = temp_files(
+        "m34_no_main",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import pkg::alpha::value;\n\nfun helper(): str {\n\tvalue()\n}\n",
+            ),
+            ("src/alpha.vl", "fun value(): str {\n\t\"ok\"\n}\n"),
+        ],
+    );
+    let built = vilan(&dir, &["build", "."], true);
+    let built_stderr = String::from_utf8_lossy(&built.stderr).into_owned();
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "the check fails: {checked_stderr}"
+    );
+    assert!(
+        checked_stderr.contains("Cannot execute program without a main function"),
+        "and says why: {checked_stderr}"
+    );
+    assert_eq!(
+        checked_stderr, built_stderr,
+        "check and build render the same refusal, byte for byte"
+    );
+    assert!(
+        renders_in(&checked_stderr, "main.vl", "import pkg::alpha::value;"),
+        "in the entry, quoting its first line: {checked_stderr}"
+    );
+}
+
+/// The other half of the same claim: for a program the ANALYZER refuses, the
+/// two commands still say the same thing. A `check` that skipped emission
+/// would pass this one, which is why it is a control and not the pin — it
+/// guards the direction the change could break by accident (a diagnostic
+/// dropped, re-ordered, or rendered against the wrong text once the emission
+/// tail stopped running).
+#[test]
+fn check_and_build_render_an_analyzer_refusal_identically() {
+    let dir = temp_files(
+        "m34_module_error",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import std::io::print;\nimport pkg::alpha::value;\n\nfun main() {\n\tprint(value());\n}\n",
+            ),
+            (
+                "src/alpha.vl",
+                "fun value(): str {\n\tlet x: i32 = \"not an int\";\n\t\"ok\"\n}\n",
+            ),
+        ],
+    );
+    let built = vilan(&dir, &["build", "."], true);
+    let built_stderr = String::from_utf8_lossy(&built.stderr).into_owned();
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!built.status.success(), "the build fails: {built_stderr}");
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "and so does the check: {checked_stderr}"
+    );
+    assert_eq!(
+        checked_stderr, built_stderr,
+        "with the same rendering, byte for byte"
+    );
+}
+
+/// The clean control. A program with a `main` that emits is green under both,
+/// and `check` still writes no artifact — the walk it now runs is for its
+/// refusals, and a `check` that started emitting would be a different bug.
+#[test]
+fn check_of_a_sound_entry_is_green_and_writes_nothing() {
+    let dir = temp_package(
+        "m34_clean",
+        "import std::io::print;\nfun main() { print(7); }\n",
+    );
+    let checked = vilan(&dir, &["check", "."], true);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    let wrote_dist = dir.join("dist").exists();
+    let wrote_beside = dir.join("src/main.mjs").exists();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        checked.status.success(),
+        "the check passes: {checked_stderr}"
+    );
+    assert!(
+        checked_stderr.is_empty(),
+        "with nothing on stderr: {checked_stderr}"
+    );
+    assert!(!wrote_dist && !wrote_beside, "and no emitted artifact");
+}
+
+// --- M35: a multi-entry check compiles its entries in parallel -------------
+//
+// The members of a workspace are independent analyses that shared one thread.
+// They now share a process instead: the first runs alone (it fills the
+// process-global caches every later one hits), and the rest run one thread
+// each. Their diagnostics are captured rather than raced to stderr, and
+// replayed in MEMBER order with the B182 ledger applied there — so what a
+// reader sees is what a sequential round wrote, and nothing about the
+// scheduler reaches the terminal.
+
+/// A three-entry package with a mistake in the module all three reach AND one
+/// mistake of its own per entry — the shape that makes both halves of the
+/// ordering observable: the shared error is claimed by exactly one member, and
+/// the per-entry errors say which member reported when.
+fn three_entries_each_with_a_mistake() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        (
+            "src/store.vl",
+            "struct Store {\n\tname: str,\n}\n\nfun shared_oops(): i32 {\n\t\"shared\"\n}\n",
+        ),
+        (
+            "src/client.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun client_oops(): i32 {\n\t\"client\"\n}\n\n\
+             fun main() {\n\tprint(\"client\");\n}\n",
+        ),
+        (
+            "src/server.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun server_oops(): i32 {\n\t\"server\"\n}\n\n\
+             fun main() {\n\tprint(\"server\");\n}\n",
+        ),
+        (
+            "src/probe.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\n\
+             fun probe_oops(): i32 {\n\t\"probe\"\n}\n\n\
+             fun main() {\n\tprint(\"probe\");\n}\n",
+        ),
+    ]
+}
+
+/// `vilan check .` with the members compiled one after another
+/// (`VILAN_SEQUENTIAL_CHECK=1`) — the reference a parallel round is held to.
+fn check_stderr_sequential(dir: &Path) -> (Output, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .current_dir(dir)
+        .args(["check", "."])
+        .env("NO_COLOR", "1")
+        .env("VILAN_SEQUENTIAL_CHECK", "1")
+        .output()
+        .expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output, stderr)
+}
+
+/// Determinism, asserted the only way it can be: the same round, run again,
+/// writes the same bytes. Three runs, because two agreeing could be two runs
+/// the scheduler happened to order the same way.
+#[test]
+fn a_parallel_check_writes_the_same_bytes_every_run() {
+    let dir = temp_files("m35_determinism", &three_entries_each_with_a_mistake());
+    let runs: Vec<(Option<i32>, String)> = (0..3)
+        .map(|_| {
+            let (output, stderr) = check_stderr(&dir);
+            (output.status.code(), stderr)
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        error_headers(&runs[0].1).len(),
+        4,
+        "the fixture must actually produce several diagnostics from several \
+         members: {}",
+        runs[0].1
+    );
+    for (index, run) in runs.iter().enumerate().skip(1) {
+        assert_eq!(
+            run, &runs[0],
+            "run {index} differs from the first — the round's output must not \
+             depend on which member finished when"
+        );
+    }
+}
+
+/// And the bytes are the SEQUENTIAL round's bytes, which is the stronger
+/// claim: a parallel round that were merely self-consistent could still have
+/// re-ordered or re-attributed what it printed.
+#[test]
+fn a_parallel_check_writes_what_a_sequential_one_writes() {
+    let dir = temp_files("m35_sequential_twin", &three_entries_each_with_a_mistake());
+    let (parallel, parallel_stderr) = check_stderr(&dir);
+    let (sequential, sequential_stderr) = check_stderr_sequential(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        parallel.status.code(),
+        sequential.status.code(),
+        "the verdict is the same"
+    );
+    assert_eq!(
+        parallel_stderr, sequential_stderr,
+        "and so is every byte of the report"
+    );
+}
+
+/// The order itself, named rather than inferred from the twin above: members
+/// arrive alphabetically (a `BTreeMap`), and the report follows them — so the
+/// shared module's one error is claimed by the FIRST member that reaches it,
+/// exactly as it was when the loop was a loop.
+#[test]
+fn a_parallel_check_reports_in_member_order() {
+    let dir = temp_files("m35_member_order", &three_entries_each_with_a_mistake());
+    let (output, stderr) = check_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the broken check must fail");
+    // The file each diagnostic renders in, which is what the location header
+    // names — the function names are a line above the quoted one and never
+    // reach the report.
+    let positions: Vec<(&str, usize)> = ["client.vl", "probe.vl", "server.vl"]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                stderr
+                    .find(name)
+                    .unwrap_or_else(|| panic!("{name} must be reported: {stderr}")),
+            )
+        })
+        .collect();
+    assert!(
+        positions[0].1 < positions[1].1 && positions[1].1 < positions[2].1,
+        "client, probe, server — the members' own order: {positions:?}\n{stderr}"
+    );
+    // And the shared module's one report sits with the FIRST member that
+    // reached it, not wherever a thread happened to finish.
+    let shared_at = stderr.find("store.vl").expect("the shared error renders");
+    assert!(
+        positions[0].1 < shared_at && shared_at < positions[1].1,
+        "the shared error is the first member's: {stderr}"
+    );
+    let shared = error_headers(&stderr)
+        .iter()
+        .filter(|header| header.contains("Expected i32, but got str"))
+        .count();
+    assert_eq!(
+        shared, 4,
+        "three per-entry mistakes and the shared one, reported once: {stderr}"
+    );
+}
+
+// --- E221: `[lints] internal_use` -------------------------------------------
+//
+// The warning is the one part of `[internal("reason")]` that needs a manifest
+// to exist at all, so it is pinned here, through the binary, where a manifest
+// can say so. Every position the label rides is used from `main.vl`, and the
+// declaring module uses one of them itself.
+
+/// `helper.vl`: one of each labelled position, and a use of its own label.
+const LABELLED_HELPER: &str = concat!(
+    "export [internal(\"a struct\")]\n",
+    "struct Region {\n\t[internal(\"a field\")] anchor: str,\n\tlabel: str,\n}\n\n",
+    "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+    "export [internal(\"a binding\")]\n",
+    "let cache = 3;\n\n",
+    "export [internal(\"a function\")]\n",
+    "fun seam(): i32 {\n\tcache\n}\n",
+);
+
+/// `main.vl`: a use of each, from outside the declaring module.
+const LABELLED_MAIN: &str = concat!(
+    "import pkg::helper::{ Region, Side, cache, seam };\n\n",
+    "fun main() {\n",
+    "\tlet region = Region { anchor = \"a\", label = \"b\" };\n",
+    "\tlet side = Side::Auto;\n",
+    "\tprint(i\"{region.anchor} {cache} {seam()}\");\n",
+    "}\n",
+);
+
+fn labelled_package(tag: &str, manifest: &str) -> PathBuf {
+    let dir = temp_package(tag, LABELLED_MAIN);
+    std::fs::write(dir.join("vilan.toml"), manifest).unwrap();
+    std::fs::write(dir.join("src/helper.vl"), LABELLED_HELPER).unwrap();
+    dir
+}
+
+/// The warning lines `vilan check` wrote, in order.
+fn warning_lines(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("Warning: ").map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn internal_use_warns_at_every_use_outside_the_declaring_module() {
+    let dir = labelled_package(
+        "internal_use",
+        "[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"warn\"\n",
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "a lint warns, it does not fail the check"
+    );
+    let warnings = warning_lines(&output);
+    for expected in [
+        "`Region` is internal: a struct",
+        "`anchor` is internal: a field",
+        "`Auto` is internal: a variant",
+        "`cache` is internal: a binding",
+        "`seam` is internal: a function",
+    ] {
+        assert!(
+            warnings.iter().any(|warning| warning == expected),
+            "missing {expected:?} in {warnings:?}"
+        );
+    }
+    // `cache`: once for the import and once for the read in `main` — never for
+    // `seam`'s own read of it, which is in the module that declares it.
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.starts_with("`cache`"))
+            .count(),
+        2,
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn internal_use_is_silent_unless_the_package_asks() {
+    for (tag, manifest) in [
+        ("internal_use_absent", "[package]\nname = \"app\"\n"),
+        (
+            "internal_use_allow",
+            "[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"allow\"\n",
+        ),
+    ] {
+        let dir = labelled_package(tag, manifest);
+        let output = vilan(&dir, &["check", "."], true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success());
+        let warnings = warning_lines(&output);
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("is internal")),
+            "{tag}: {warnings:?}"
+        );
+    }
+}
+
+// --- B382: `[deprecated("use …")]` on a type and on a re-export ------------
+//
+// The warning is the function attribute's own (`` `{name}` is deprecated;
+// {steer} ``), and it needs a second module to be seen at all: the declaring
+// module's uses are silent. So it is pinned here, through the binary.
+
+/// `inner.vl`: a deprecated struct beside its replacement, used by its own
+/// module; `re.vl`: a deprecated renaming re-export, and a deprecated
+/// NON-renaming one.
+const DEPRECATED_INNER: &str = concat!(
+    "export [deprecated(\"use DeltaCursor\")]\n",
+    "struct KeyedThing {\n\tat: i32,\n}\n\n",
+    "export struct DeltaCursor {\n\tat: i32,\n}\n\n",
+    "export struct Kept {\n\tat: i32,\n}\n\n",
+    "export fun own_use(): KeyedThing {\n\tKeyedThing { at = 1 }\n}\n",
+);
+const DEPRECATED_RE: &str = concat!(
+    "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n",
+    "export [deprecated(\"import it from pkg::inner\")] import pkg::inner::Kept;\n",
+);
+
+fn deprecated_package(tag: &str, main: &str) -> PathBuf {
+    let dir = temp_package(tag, main);
+    std::fs::write(dir.join("src/inner.vl"), DEPRECATED_INNER).unwrap();
+    std::fs::write(dir.join("src/re.vl"), DEPRECATED_RE).unwrap();
+    dir
+}
+
+#[test]
+fn b382_a_deprecated_type_warns_at_each_use_in_another_module() {
+    let dir = deprecated_package(
+        "b382_type",
+        concat!(
+            "import pkg::inner::{ KeyedThing, DeltaCursor };\n\n",
+            "fun main() {\n",
+            "\tlet thing: KeyedThing = KeyedThing { at = 2 };\n",
+            "\tlet cursor: DeltaCursor = DeltaCursor { at = 3 };\n",
+            "\tprint(i\"{thing.at} {cursor.at}\");\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "a deprecation warns, it does not fail"
+    );
+    let warnings = warning_lines(&output);
+    // The import, the annotation and the literal's head — and nothing for the
+    // replacement beside it, or for the declaring module's own `own_use`.
+    assert_eq!(
+        warnings,
+        vec!["`KeyedThing` is deprecated; use DeltaCursor".to_string(); 3],
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn b382_a_deprecated_re_export_warns_at_the_import_that_reaches_through_it() {
+    let dir = deprecated_package(
+        "b382_reexport",
+        concat!(
+            "import pkg::re::{ KeyedCursor, Kept };\n",
+            "import pkg::inner::DeltaCursor;\n\n",
+            "fun takes(cursor: DeltaCursor): i32 {\n\tcursor.at\n}\n\n",
+            "fun main() {\n",
+            "\tlet cursor = KeyedCursor { at = 3 };\n",
+            "\tlet kept = Kept { at = 4 };\n",
+            "\tprint(i\"{takes(cursor)} {kept.at}\");\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success());
+    let warnings = warning_lines(&output);
+    // Once each, at the leaf that names the deprecated re-export — and the
+    // renamed name stays TRANSPARENT: a `KeyedCursor` is a `DeltaCursor`.
+    assert_eq!(
+        warnings,
+        vec![
+            "`KeyedCursor` is deprecated; use pkg::inner::DeltaCursor".to_string(),
+            "`Kept` is deprecated; import it from pkg::inner".to_string(),
+        ],
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn b382_importing_the_original_is_not_a_use_of_the_re_export() {
+    // `re` re-exports `Kept` WITHOUT renaming it, deprecated; `inner` still
+    // publishes the same name for the same item, and importing it from there
+    // is exactly what the steer asks for.
+    let dir = deprecated_package(
+        "b382_original",
+        concat!(
+            "import pkg::inner::{ Kept, DeltaCursor };\n",
+            // `re` is LOADED — its re-exports are published in this program —
+            // and only the renamed one is reached through it.
+            "import pkg::re::KeyedCursor;\n\n",
+            "fun main() {\n\tlet kept = Kept { at = 4 };\n",
+            "\tlet cursor: DeltaCursor = KeyedCursor { at = 5 };\n",
+            "\tprint(i\"{kept.at} {cursor.at}\");\n}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success());
+    let warnings = warning_lines(&output);
+    assert_eq!(
+        warnings,
+        vec!["`KeyedCursor` is deprecated; use pkg::inner::DeltaCursor".to_string()],
+        "`Kept` imported from `inner` is not a use of `re`'s deprecated re-export: {warnings:?}"
     );
 }

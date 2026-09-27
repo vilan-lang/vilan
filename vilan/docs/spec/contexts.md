@@ -186,29 +186,133 @@ fun with_flavor<T>(body: (|| T) context flavor): T {
 }
 ```
 
-A parameter (or `let` binding) whose closure type carries
-`context <name>` declares an **injected** closure:
+A parameter, a `let` binding, a **struct field**, a **generic argument**
+or a **return type** whose closure type carries `context <name>`
+declares an **injected** closure:
 
-- A closure **literal** supplied to that position does not capture at
-  creation; it takes its own hidden parameter, bound anew at each call.
+- A closure **literal** written where one is expected does not capture
+  at creation; it takes its own hidden parameter, bound anew at each
+  call.
 - Each **call through** the injected value demands the context from the
   *caller* like a strict read, and supplies the caller's value.
 - An unannotated local binding holding a closure literal, passed into a
   clause position, **adopts** the clause (as if the literal were
   written inline).
 
+The clause is part of the closure **type**, not a property of the
+parameter that happened to write it, so it travels wherever the type
+does. A struct can hold an injected body:
+
+```vilan,fragment
+struct Conditional {
+	body: (|| i32) context flavor,
+}
+
+fun hold(body: (|| i32) context flavor): Conditional {
+	Conditional { body }
+}
+
+fun value(held: Conditional): i32 {
+	flavor.run(2, held.body)
+}
+```
+
+Reading such a field yields an injected value carrying the same
+restrictions the parameter had, and a closure literal written where the
+field is initialised is born under the clause's extent — which is what
+makes the value's body run under the ambient value at the **call**, not
+at the value's construction. A generic argument carries the clause the
+same way (`Conditional<(|| i32) context flavor>`, where the field is
+declared as the parameter), and so does a return type:
+
+```vilan,fragment
+fun make(): (|| i32) context flavor {
+	|| flavor.get()
+}
+```
+
+A clause written after a **non-closure** return type is the function's
+own declared requirement instead (§8.6): `fun f(): i32 context flavor`
+says what the body may read, while `fun f(): (|| i32) context flavor`
+says what the returned closure demands of its caller. The return type
+decides which reading applies, because only a closure type can carry a
+clause at all. The parentheses are required for the closure reading:
+`fun f(): || i32 context flavor` is refused, because the type grammar's
+greed takes the clause onto the closure's own return type — `i32`, which
+cannot carry one — and the declaration then means neither of the two
+things it could have meant.
+
 Because the binding is deferred, an injected value may only flow where
 the threading can follow it: it can be **called**, **forwarded** to a
-parameter with the same clause, or passed as **`run`'s body**. Any
-other use (storing it in a field, returning it, putting it in a
-collection) is a compile error ("an injected (`context`-typed) closure
-can only be called, forwarded …, or passed to `run`").
+position with the same clause, or passed as **`run`'s body**. Any other
+use (putting it in a collection, handing it to a position with no
+clause) is a compile error ("an injected (`context`-typed) closure can
+only be called, forwarded …, or passed to `run`"). Forwarding is
+clause-for-clause: a value carrying one clause landing in a position
+demanding another is refused naming both.
 
 A clause may name several contexts (`context (a, b)`); the clause must
 name context bindings, and it composes with the closure-type markers of
 §7.4 (`(sync || T) context turn_scope` is the reactive layer's shape).
+The `sync` marker itself stays a **parameter** contract: it means "an
+async argument is refused here", and a parameter is the only position
+that could otherwise accept one — a plain closure type already refuses
+an async store everywhere else.
 
-## 8.6 Interactions
+## 8.6 Declared requirements: the `context` clause on a `fun`
+
+A function's requirement is **inferred** from its body by default (§8.3):
+it is whatever its body transitively reads, and it flows to every caller.
+A function may instead **declare** it, with the same clause spelling,
+after the return type:
+
+```vilan,fragment
+fun render(row: Row): str context (app_ctx, turn_scope) {
+	app_ctx.get().theme + row.label()
+}
+```
+
+The clause closes the signature and names context bindings, in any order.
+Written after a return type it precedes a `borrows` clause; written
+without one it follows it (grammar §3.3). A function with no clause keeps
+inference; the two forms coexist in one program.
+
+A declaration changes three things, and all three follow from one idea:
+the requirement becomes a fact about the **signature** rather than about
+the body.
+
+- **The body's reads must be a subset of the clause.** A strict read the
+  clause does not declare is a compile error *at the declaration*
+  (``…'s body reads context `b`, which this `context` clause does not
+  declare``), naming the clause the body needs. Safe reads (§8.2) impose
+  no requirement and are never part of the subset.
+- **A clause may be wider than the body reads.** Declaring a context the
+  body does not (yet) read is a **warning**, not an error: the signature
+  is the promise, and adding the read later must not break callers. The
+  function takes the value and ignores it.
+- **Callers are checked against the clause alone.** A call from code that
+  is neither inside a `run` of that context nor itself declaring it is a
+  compile error *at the call*, naming the clause and the callee — one hop
+  (``context `X` is required by `f`'s `context` clause, but this code can
+  be reached without an enclosing `run` …``). The declaring function's own
+  body is never the site of a coverage refusal: its signature says the
+  value arrives, and the check moves to where that promise is made or
+  broken.
+
+This is what makes the clause a **boundary**. Nothing a caller is told
+depends on the callee's body any more, so a diagnostic about a deep read
+cannot surface at an unrelated call, and a call the type solver could not
+resolve cannot cascade past the declaration.
+
+A clause on a **trait or `impl` method** is not supported: a dispatched
+call selects its callee at the call site, so there is no single
+declaration to check the requirement against. Declare a free `fun` and
+call it from the method.
+
+The editor shows the clause in a hovered signature, and offers
+**Declare the inferred contexts** on the subset refusal.
+
+## 8.7 Interactions
 
 - **Async** (§7.5): captures are fixed at creation, so a context value
   is stable across every suspension of the extent by construction. An
@@ -221,7 +325,7 @@ name context bindings, and it composes with the closure-type markers of
   target; contexts work identically on process and browser platforms
   (no host storage is involved).
 
-## 8.7 The standard library's ambient values (informative)
+## 8.8 The standard library's ambient values (informative)
 
 `std` builds its ambient machinery on this one mechanism: `owner_scope`
 (the reactive disposal owner: `run_with_owner`, `comp`),

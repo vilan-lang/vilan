@@ -106,7 +106,7 @@ awaited), while every sync call site keeps the untouched original.
 ```vilan,norun
 import std::time::sleep;
 
-fun fetch_len(url: str): i32 {
+fun fetch_len(url: str): usize {
 	sleep(1);
 	url.len()
 }
@@ -126,7 +126,7 @@ concurrency by starting them all first:
 ```vilan,norun
 import std::time::sleep;
 
-fun fetch_len(url: str): i32 {
+fun fetch_len(url: str): usize {
 	sleep(1);
 	url.len()
 }

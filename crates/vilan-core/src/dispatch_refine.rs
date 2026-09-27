@@ -34,7 +34,7 @@
 //! site-enumeration policy (which calls count as dispatch sites) and pass it
 //! in as [`DispatchSite`]s; this module owns the resolution.
 
-use crate::analyzer::{Expr, GenericDispatch, Program};
+use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -73,6 +73,90 @@ pub struct RefinedEdge {
     pub callee: Id,
 }
 
+thread_local! {
+    /// How many impl SELECTIONS [`refined_edges`] has evaluated on this thread
+    /// since [`reset_selection_count`] — the memo's instrument, and the only
+    /// thing that can see it working. A selection is the expensive unit here
+    /// (a scan of every implementation, each entry of which may recurse into
+    /// another such scan), the memo changes no output whatsoever, and a
+    /// timing assertion on a shared machine is not a test — so the count is
+    /// what the pin reads, exactly as `call_graph::build_count` pins the
+    /// one-graph-per-analysis invariant it could not otherwise observe.
+    ///
+    /// Thread-local for that same reason: an analysis is single-threaded, and
+    /// plain `cargo test` runs analyses concurrently in one process.
+    static SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Total wall AND CPU spent inside [`refined_edges`] on this thread since
+    /// [`reset_refine_time`] — the `dispatch-refine` bucket of the
+    /// `VILAN_PHASE_TIMING` post-pass line (N43).
+    ///
+    /// This call is reached from TWO passes that the line names separately
+    /// (`context::thread_contexts` and the const pass's `check_const_only`),
+    /// so its cost used to be split across two buckets whose names described
+    /// neither it nor them — reading the split cost the editor-perf lane a
+    /// detour through a profiler. One accumulator, summed across both call
+    /// sites, is what makes the shared constant readable from the line.
+    /// Accumulated unconditionally, like the const pass's own sub-split: two
+    /// clock reads per call are noise next to a program-wide scan.
+    static REFINE_TIME: std::cell::Cell<crate::PhaseSpan> =
+        const { std::cell::Cell::new(crate::PhaseSpan::ZERO) };
+    /// Every site [`refined_edges`] could not resolve, with the candidate list
+    /// it widened to — B279's fence, given a face that is not a diagnostic
+    /// (B355).
+    ///
+    /// The fence's soundness property is "every fallback widens to the WHOLE
+    /// candidate list" (stated in this module's own documentation and
+    /// load-bearing in `context.rs`'s dead-code exemption), and until now the
+    /// only thing that could OBSERVE it was a coverage refusal — in a program
+    /// that carries another diagnostic by construction, because a generic
+    /// taken as a value is what makes the level unresolvable in the first
+    /// place. That is why E189's broad gate could not be built: under it the
+    /// property had no observable face at all. It has one here, on the same
+    /// terms as [`SELECTION_COUNT`] — a thread-local the analysis fills and a
+    /// pin reads, because the property is not a fact about any one `Program`
+    /// field and an analysis is single-threaded while the suite is not.
+    static FALLBACK_SITES: std::cell::RefCell<Vec<(Id, Vec<Id>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The number of impl selections [`refined_edges`] has evaluated on this
+/// thread since the last [`reset_selection_count`]. See [`SELECTION_COUNT`].
+pub fn selection_count() -> usize {
+    SELECTION_COUNT.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`selection_count`].
+pub fn reset_selection_count() {
+    SELECTION_COUNT.with(|count| count.set(0));
+}
+
+/// The dispatch sites [`refined_edges`] could not resolve on this thread since
+/// the last [`reset_dispatch_fallbacks`], each with the candidate list it
+/// widened to: B279's fence, observable without a diagnostic (B355). One entry
+/// per fallback, so a site that falls back at several levels appears several
+/// times — the property being observed is "this site widened to all of these",
+/// not how many times it did.
+pub fn dispatch_fallbacks() -> Vec<(Id, Vec<Id>)> {
+    FALLBACK_SITES.with(|sites| sites.borrow().clone())
+}
+
+/// Empties this thread's [`dispatch_fallbacks`].
+pub fn reset_dispatch_fallbacks() {
+    FALLBACK_SITES.with(|sites| sites.borrow_mut().clear());
+}
+
+/// How long this thread has spent inside [`refined_edges`] since the last
+/// [`reset_refine_time`]. See [`REFINE_TIME`].
+pub(crate) fn refine_time() -> crate::PhaseSpan {
+    REFINE_TIME.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`refine_time`] — called once per analysis, at the
+/// top of `post_analysis_passes`, which is where both call sites live.
+pub(crate) fn reset_refine_time() {
+    REFINE_TIME.with(|time| time.set(crate::PhaseSpan::ZERO));
+}
+
 /// The trait-member name a call's dispatch record names, when the call also
 /// has a `function_calls` entry. This is the `context` pass's historical site
 /// gate — an iterator-protocol `for` loop records its dispatch on the loop id
@@ -80,6 +164,12 @@ pub struct RefinedEdge {
 /// [`crate::async_infer::dispatch_at`] alone would not; a consumer that wants
 /// those sites too reads the record directly.
 pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'src str> {
+    // A124 R3: a call through a trait OBJECT's table is a dispatch like a
+    // bound's — any implementation of the member may answer it, so a hidden
+    // context parameter one of them needs has to be threaded at the site.
+    if let Some(name) = program.dyn_method_calls.get(&call_id) {
+        return Some(name);
+    }
     let subject_id = program.function_calls.get(&call_id)?.subject_id;
     for key in [call_id, subject_id] {
         match program.generic_dispatch.get(&key) {
@@ -94,7 +184,40 @@ pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'sr
 /// Every candidate a dispatch of `name` selects among: for each trait
 /// declaring `name`, the trait's own default body (when it has one) plus
 /// every implementation's override, across the traits declaring that name.
-pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
+///
+/// **KEYED BY THE MEMBER NAME, and by nothing else.** Not by the receiver,
+/// not by the bound, not by the trait: two unrelated traits that both declare
+/// `label` contribute to one list, and every implementation of either is in
+/// it. The list is therefore an OVER-APPROXIMATION of what any one site can
+/// select, and it is the source of the B254/B258 class — a name-keyed list
+/// consumed as though it were receiver-specific. B279 is the sweep of its
+/// consumers; each is named here with the DIRECTION it reads an edge in,
+/// because that direction is what decides whether widening is safe:
+///
+/// - `context::analyze`'s dispatch sites — an edge is a DEMAND (the callee
+///   may need the hidden value, so the caller must thread it). Widening adds
+///   threading a callee ignores, which is sound. It is NOT sound for the
+///   site's FLAVOR (`settle_strict` promotes a whole site off one strict
+///   candidate) nor for COVERAGE, and both are narrowed: the flavor by
+///   [`known_receiver_candidates`] at the site (B258), coverage by
+///   [`refined_edges`] over the recorded instantiations. B279's structural
+///   guard in that pass is what holds the two narrowings apart from the wide
+///   list they came from.
+/// - the const-only capability check (`const_eval`'s three site scans) — an
+///   edge is a REFUSAL (a runtime path that reaches a const-only capability
+///   is rejected). Widening REFUSES MORE, never less, so the name-keyed list
+///   is safe there BY DIRECTION and is deliberately left unnarrowed: a
+///   narrowing that dropped a real edge would let a `[const_only]` capability
+///   ship in a runtime path, which is the failure this check exists to
+///   prevent. The cost of the over-approximation is a refusal an author can
+///   see and argue with; the cost of the under-approximation is silence.
+///
+/// A consumer that reads the candidate SET as a property of the site — "these
+/// and no others" — must narrow first. There is no third direction.
+pub fn candidates_of(program: &Program, file: Option<SourceId>, name: &str) -> Vec<Id> {
+    // B318 S4: asked once for the FILE — the per-block test below runs inside
+    // two nested loops over every trait and every implementation.
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let mut candidates = Vec::new();
     for trait_ in program.traits.values() {
         let Some(&declaration_id) = trait_.declarations.get(name) else {
@@ -108,10 +231,19 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
         {
             candidates.push(declaration_id);
         }
-        // Every implementation's override of this trait's member.
+        // Every implementation's override of this trait's member — every one
+        // the asking FILE admits (B318 S4). An override in a block this file's
+        // imports declined is not one of its candidates, which is the same
+        // narrowing the rest of the module already applies by receiver and by
+        // bound, applied by import instead.
         for implementation in &program.implementations {
             if implementation.trait_ids.contains(&trait_.id)
                 && let Some(&member_id) = implementation.declarations.get(name)
+                && scope.is_none_or(|file| {
+                    program
+                        .impl_admission
+                        .admits_member(file, implementation, member_id)
+                })
             {
                 candidates.push(member_id);
             }
@@ -125,17 +257,28 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
 /// (the `dispatch_candidates_for` shape, widened to primitive subjects —
 /// `impl str with Slot` is real here).
 ///
+/// KEYED BY (subject type, member name) — the narrowing twin of
+/// [`candidates_of`]'s name-only key, and what a consumer that reads the set
+/// as a property of the SITE has to go through (B279).
+///
 /// Matching is deliberately LOOSER than emission's
 /// ([`crate::impl_select::select_member`]): the nominal head alone, plus every
 /// impl whose subject pattern applies — which is what brings a blanket
 /// `impl type T with Trait` into view, B158's body that these consumers could
 /// not see at all. The extra impls only ever add members, which is the
 /// direction this module's guarantee allows.
-pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str) -> Vec<Id> {
-    impl_members_for_bound(program, subject_type_id, member, &[])
+pub fn impl_members_for(
+    program: &Program,
+    file: Option<SourceId>,
+    subject_type_id: TypeId,
+    member: &str,
+) -> Vec<Id> {
+    impl_members_for_bound(program, file, subject_type_id, member, &[])
 }
 
 /// [`impl_members_for`], narrowed to the impls that provide one of `traits`.
+///
+/// KEYED BY (subject type, member name, bound traits).
 ///
 /// A call through a BOUND can only reach an impl of the bound's own trait:
 /// `v.bind(..)` under `V: MaybeSignal<str>` is answered by an impl of
@@ -153,6 +296,7 @@ pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str
 /// back wherever it cannot tell.
 pub fn impl_members_for_bound(
     program: &Program,
+    file: Option<SourceId>,
     subject_type_id: TypeId,
     member: &str,
     traits: &[Id],
@@ -160,6 +304,9 @@ pub fn impl_members_for_bound(
     let Some(resolved) = program.type_id_to_type_map.get(&subject_type_id) else {
         return Vec::new();
     };
+    // B318 S4: asked once for the FILE, not once per registered block (std
+    // registers hundreds, and this loop runs per dispatch site).
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let matches_subject = |subject: &Type| match (subject, resolved) {
         (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => a == b,
         (a, b) => a == b,
@@ -167,6 +314,12 @@ pub fn impl_members_for_bound(
     let mut matching: Vec<&crate::analyzer::Implementation> = program
         .implementations
         .iter()
+        // B318 S4: the per-importer namespace, applied BEFORE the subject test
+        // — the cheap filter first, and the one that says whether this file may
+        // see the block at all.
+        .filter(|implementation| {
+            scope.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
+        })
         .filter(|implementation| {
             program
                 .type_id_to_type_map
@@ -211,6 +364,42 @@ pub fn impl_members_for_bound(
                 .and_then(|trait_| trait_.declarations.get(member).copied())
         })
         .collect()
+}
+
+/// The candidates an `OnType` site with a KNOWN receiver can actually select
+/// among — the members the receiver's HEAD selects — KEYED BY (receiver type,
+/// member name) — or `None` when nothing narrows the site: an `OnConstraint` or unrecorded dispatch, a receiver-less
+/// `OnType` (a `self` call inside a shared trait default body), a receiver
+/// that resolves to a generic or opaque type, or an empty selection. Every
+/// `None` means "keep the union", so this only ever narrows where the
+/// language says it may.
+///
+/// [`candidates_of`] is NAME-keyed and therefore program-wide: every override
+/// of every trait declaring the name, whatever the receiver. That
+/// over-approximation is sound for a consumer that reads an edge as a DEMAND
+/// (coverage asks for more; the const-only check refuses more) and unsound for
+/// one that reads the candidate SET as a property of the site — the `context`
+/// pass's flavor promotion is the case B258 found: one strict candidate
+/// promotes the whole site, so `RemoteSource`'s strict override of
+/// `Source::map` rewrote `self.cache.map(..)`, a call on a `SignalCell` field
+/// that inherits the OWNER-OPTIONAL default, into a bare-owner hand-off with
+/// no owner to hand.
+pub fn known_receiver_candidates(program: &Program, call_id: Id) -> Option<Vec<Id>> {
+    let Some(GenericDispatch::OnType(Some(receiver), member)) =
+        crate::async_infer::dispatch_at(program, call_id)
+    else {
+        return None;
+    };
+    let resolved = program.type_id_to_type_map.get(&receiver)?;
+    if !crate::impl_select::is_resolvable(resolved) {
+        return None;
+    }
+    // B318 S4: the file the CALL is in, which is where its method namespace is
+    // written (`analyzer.rs`'s invariant: "`call_id` is caller-side always").
+    // `admitting_file` costs one `is_empty` in a program that restricts
+    // nothing, which is the whole estate.
+    let selected = impl_members_for(program, program.admitting_file(call_id), receiver, member);
+    (!selected.is_empty()).then_some(selected)
 }
 
 /// The traits a generic parameter's constraint names, transitively through
@@ -288,7 +477,25 @@ fn resolve_through(
 /// per-site rules; the guarantees are (a) every edge's `callee` is one of the
 /// site's candidates, and (b) fallbacks always widen to the whole candidate
 /// list, so a consumer can miss nothing a candidate list covered.
+///
+/// The wall of every call lands in [`REFINE_TIME`], which the phase line's
+/// `dispatch-refine` bucket reads back (N43). The measured region is the
+/// whole call INCLUDING the empty-`sites` early return, so the bucket
+/// answers "what did dispatch refinement cost this analysis" rather than
+/// "what did the calls that did work cost".
 pub fn refined_edges(
+    program: &Program,
+    graph: &CallGraph,
+    sites: &[DispatchSite],
+) -> Vec<RefinedEdge> {
+    let started = crate::PhaseClock::now();
+    let edges = refined_edges_timed(program, graph, sites);
+    REFINE_TIME.with(|time| time.set(time.get() + started.elapsed()));
+    edges
+}
+
+/// [`refined_edges`] itself; the public name is its timing wrapper.
+fn refined_edges_timed(
     program: &Program,
     graph: &CallGraph,
     sites: &[DispatchSite],
@@ -367,7 +574,23 @@ pub fn refined_edges(
 
     let mut edges: Vec<RefinedEdge> = Vec::new();
     for site in sites {
+        // B355: the fence's non-diagnostic face. Every path below that hands
+        // back `site.candidates` INSTEAD of a resolution is a fallback, and
+        // each records itself here — so the widening is observable without a
+        // coverage refusal to read it through.
+        let record_fallback = || {
+            FALLBACK_SITES.with(|recorded| {
+                recorded
+                    .borrow_mut()
+                    .push((site.call, site.candidates.clone()));
+            });
+        };
+        let widened = || {
+            record_fallback();
+            site.candidates.clone()
+        };
         let union_fallback = |edges: &mut Vec<RefinedEdge>| {
+            record_fallback();
             for &candidate in &site.candidates {
                 edges.push(RefinedEdge {
                     caller: site.owner,
@@ -378,30 +601,26 @@ pub fn refined_edges(
         };
         let (constraint, member) = match crate::async_infer::dispatch_at(program, site.call) {
             Some(GenericDispatch::OnConstraint(constraint, member)) => (constraint, member),
-            Some(GenericDispatch::OnType(Some(receiver), member)) => {
+            Some(GenericDispatch::OnType(Some(_), _)) => {
                 // A concrete-receiver re-dispatch (the Gap-E shape: an
                 // inherited trait default). The receiver's HEAD cannot
                 // change under substitution, and the head is what selects
                 // among candidates, so the site narrows to the members the
-                // head selects — edges from the site's owner, no entry
-                // enumeration. A receiver resolving to a generic or opaque
-                // type keeps the union, as does an empty selection.
-                match program.type_id_to_type_map.get(&receiver) {
-                    Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
-                        let selected = impl_members_for(program, receiver, member);
-                        if selected.is_empty() {
-                            union_fallback(&mut edges);
-                        } else {
-                            for candidate in selected {
-                                edges.push(RefinedEdge {
-                                    caller: site.owner,
-                                    anchor: site.call,
-                                    callee: candidate,
-                                });
-                            }
+                // head selects ([`known_receiver_candidates`]) — edges from
+                // the site's owner, no entry enumeration. A receiver
+                // resolving to a generic or opaque type keeps the union, as
+                // does an empty selection.
+                match known_receiver_candidates(program, site.call) {
+                    Some(selected) => {
+                        for candidate in selected {
+                            edges.push(RefinedEdge {
+                                caller: site.owner,
+                                anchor: site.call,
+                                callee: candidate,
+                            });
                         }
                     }
-                    _ => union_fallback(&mut edges),
+                    None => union_fallback(&mut edges),
                 }
                 continue;
             }
@@ -419,13 +638,48 @@ pub fn refined_edges(
         // Concrete resolution → the impl members the type selects; an
         // empty selection (defensive — the bound audit rejects no-impl
         // types) falls back to every candidate.
-        let selected_for = |resolved: TypeId| -> Vec<Id> {
-            let selected = impl_members_for_bound(program, resolved, member, &constraint_traits);
-            if selected.is_empty() {
-                site.candidates.clone()
+        //
+        // Memoized on the RESOLVED TYPE, not the type id (M19/E106). The
+        // selection scans every implementation, and each scan may recurse
+        // through `impl_select::provides_trait` — itself a scan of every
+        // implementation — so one call is O(impls²); the walk below asks once
+        // per ENTRY of the dispatching function, and an entry count is a
+        // program-size quantity. kolt's generated icon module made that
+        // concrete: 17,895 selections per pass, run twice per analysis (the
+        // context pass and the const-only check both refine the same sites),
+        // for **32** distinct (type, member) answers — 2.5 s of a 5 s
+        // keystroke. Keying on the id memoizes nothing (a program mints one
+        // id per expression: 17,802 distinct ids for those 32 answers), and
+        // keying on the type is exact: `impl_members_for_bound` reads the id
+        // only through `type_id_to_type_map`, and every walk under it
+        // (`subject_shape_matches`, `bind_subject`, `provides_trait`) recurses
+        // through the argument ids the resolved `Type` itself carries — so two
+        // ids resolving to equal `Type`s drive an identical walk.
+        let mut selection_memo: HashMap<Type, Vec<Id>> = HashMap::default();
+        let mut selected_for = |resolved: TypeId| -> Vec<Id> {
+            // An id with no resolved type selects nothing and falls back, the
+            // same answer `impl_members_for_bound`'s own guard gives.
+            let Some(key) = program.type_id_to_type_map.get(&resolved) else {
+                return widened();
+            };
+            if let Some(selected) = selection_memo.get(key) {
+                return selected.clone();
+            }
+            SELECTION_COUNT.with(|count| count.set(count.get() + 1));
+            let selected = impl_members_for_bound(
+                program,
+                program.admitting_file(site.call),
+                resolved,
+                member,
+                &constraint_traits,
+            );
+            let selected = if selected.is_empty() {
+                widened()
             } else {
                 selected
-            }
+            };
+            selection_memo.insert(key.clone(), selected.clone());
+            selected
         };
         let root = match site.owner {
             RefinedCaller::Node(owner) => enclosing_function(owner),
@@ -459,9 +713,9 @@ pub fn refined_edges(
                             walk.push((outer, parameter));
                             continue;
                         }
-                        None => site.candidates.clone(),
+                        None => widened(),
                     },
-                    Resolution::Opaque => site.candidates.clone(),
+                    Resolution::Opaque => widened(),
                 };
                 for candidate in selected {
                     edges.push(RefinedEdge {
@@ -477,7 +731,7 @@ pub fn refined_edges(
                     Resolution::Concrete(resolved) => selected_for(resolved),
                     // Top-level code has no generic parameters to recurse
                     // into — an unresolved binding marks every candidate.
-                    _ => site.candidates.clone(),
+                    _ => widened(),
                 };
                 for candidate in selected {
                     edges.push(RefinedEdge {

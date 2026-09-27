@@ -18,7 +18,7 @@
 	hljs.registerLanguage("vilan", function (hljs) {
 		const KEYWORDS = {
 			// GENERATED(keyword-groups): lexing.rs KEYWORDS split by grammar_sync.rs's KEYWORD_ROLES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-			keyword: "async await borrows const css else enum export external for fun if impl import in is jump let macro match mod mut own resource ret struct trait type use with",
+			keyword: "async await borrows const css dyn else enum export external for fun if impl import in is jump lazy let macro match mod mut own ret struct trait type use with",
 			literal: "true false null void self Self",
 			// END GENERATED(keyword-groups)
 			built_in: "print panic assert",
@@ -27,8 +27,8 @@
 			className: "number",
 			variants: [
 				// GENERATED(number-suffixes): type_.rs NUMERIC_SUFFIXES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-				{ begin: "\\b0x[0-9a-fA-F]+(?:f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
-				{ begin: "\\b\\d+(?:\\.\\d+)?(?:f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
+				{ begin: "\\b0x[0-9a-fA-F]+(?:usize|f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
+				{ begin: "\\b\\d+(?:\\.\\d+)?(?:usize|f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
 				// END GENERATED(number-suffixes)
 			],
 		};
@@ -72,22 +72,34 @@
 		const ATTRIBUTE = {
 			className: "meta",
 			// GENERATED(attribute-markers): parsing.rs KNOWN_ATTRIBUTE_MARKERS — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-			begin: "^\\s*\\[(?:derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b",
+			begin: "^\\s*\\[(?:derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated|internal|resource)\\b",
 			// END GENERATED(attribute-markers)
 			end: "\\]",
 		};
 		// `context` and `sync` are CONTEXTUAL: the lexer hands both back as
 		// identifiers, so they only read as keywords in the one position each
-		// occupies — `context` after a closure type's `)`, `sync` right after
-		// the `(` that opens one. Anchored, so a variable named `context` or a
-		// type named `Sync` is untouched.
+		// occupies — `sync` right after the `(` that opens a closure type, and
+		// `context` after what its clause follows: a closure type's `)`, a
+		// parameter list's `)`, or the RETURN type of a `fun` declaration
+		// (`fun f(): i32 context settings` — contexts.md §3's position, kept by
+		// B343/R9). Guarded on both sides, so a variable named `context` and the
+		// reads through it (`context.run(..)`, `context.get()`) stay plain, as
+		// does a type named `Sync`.
 		const CONTEXT_CLAUSE = {
 			className: "keyword",
-			begin: "(?<=\\)\\s{0,8})context\\b",
+			begin: "(?<=[A-Za-z0-9_>\\)\\]]\\s{1,8})context\\b(?=\\s{0,8}[\\(A-Za-z_])",
 		};
 		const SYNC_MARKER = {
 			className: "keyword",
 			begin: "(?<=\\()sync\\b",
+		};
+		// `as` is CONTEXTUAL the same way (E142/E145): it names an import
+		// alias — `import a::b as c;` — and a value may still be NAMED `as`.
+		// Guarded on BOTH sides, since between two identifiers is the only
+		// place the alias sits.
+		const IMPORT_ALIAS = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_]\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_])",
 		};
 		const TYPE = {
 			className: "type",
@@ -101,9 +113,31 @@
 		// Regex-level like the rest — `<` glued to a name reads as markup,
 		// which is the grammar's own atom-position rule; a spaced comparison
 		// (`a < b`) never matches.
+		//
+		// The `<` may not follow an identifier character either (E161), which
+		// is the same atom-position rule read from the other side: a tag `<`
+		// STARTS an atom, so the `<` in `Option<type _>` or `SignalCell<str>`
+		// opens a generic argument list and the lowercase word after it is a
+		// binder keyword or a primitive, never a tag. Without the guard this
+		// rule fired on `<type`, `<str`, `<sync` — any lowercase word glued to
+		// a `<` — and painted the binder keyword as an element name, the same
+		// mistake the TextMate grammar made in the same head.
+		//
+		// That guard belongs to the OPENING form only (E171). Written
+		// `(?<=(?<![A-Za-z0-9_])</?)` it sat before the `<` of both, so a
+		// CLOSING tag glued to text — `<span>hello</span>`, where `hello`
+		// ends in an identifier character — was refused for a reason that is
+		// only ever about an argument list, and a `</` is never one whatever
+		// precedes it. The TextMate grammar had the same defect in the same
+		// head and E164 fixed it there by giving the closing tag a guardless
+		// rule of its own; here the two forms are one regex, so the guard
+		// moves inside it: `</` unconditionally, or a bare `<` in atom
+		// position. Latent rather than live — a bare text child is a parse
+		// error in vilan, so every closing tag in the book follows a `"`, a
+		// `}` or a `>` — and this is what it costs to keep it that way.
 		const ELEMENT_TAG = {
 			className: "name",
-			begin: "(?<=</?)[a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*",
+			begin: "(?<=</|(?<![A-Za-z0-9_])<)[a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*",
 		};
 		const ELEMENT_EVENT = {
 			className: "attr",
@@ -122,6 +156,7 @@
 				NUMBER,
 				CONTEXT_CLAUSE,
 				SYNC_MARKER,
+				IMPORT_ALIAS,
 				ELEMENT_TAG,
 				ELEMENT_EVENT,
 				FUNCTION,

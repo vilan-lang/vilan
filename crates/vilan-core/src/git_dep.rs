@@ -10,7 +10,7 @@
 //! other spellings (`manifest::Dependency::source`).
 //!
 //! **The cache** (`~/.vilan/git-deps/<key>/`) mirrors the std cache next door
-//! (`vilan-embedded-std`), which is the same problem — a tree that several
+//! (`vilan-embedded`), which is the same problem — a tree that several
 //! processes may want at once:
 //!
 //! - **Content-addressed.** The key is a fingerprint of the *declaration*

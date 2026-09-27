@@ -1,26 +1,25 @@
-// `std::json` — JSON serialization (`to_json`) and parsing (`from_json`), plus
-// the JSON pair of the wire visitor (`JsonWriter`/`JsonReader`, §6.1).
+// `std::json` — JSON serialization (`to_json`) and parsing (`from_json`), plus the
+// JSON pair of the wire visitor (`JsonWriter`/`JsonReader`, §6.1).
 //
 // `[derive(Json)]` on a struct synthesizes BOTH directions from its fields: a
-// faithful JSON object with real field names (which a bare host-`JSON.stringify`
-// of a vilan struct can't produce, since structs lower to field-less arrays) and
-// a `from_json` that rebuilds the struct from that object. The scalar impls bind
-// to the host `JSON.stringify`/`JSON.parse` and the host coercions.
+// faithful JSON object with real field names (which a bare host-`JSON.stringify` of
+// a vilan struct can't produce, since structs lower to field-less arrays) and a
+// `from_json` that rebuilds the struct from that object. The scalar impls bind to
+// the host `JSON.stringify`/`JSON.parse` and the host coercions.
 
 import pkg::bytes::decode_utf8;
-import pkg::option::Option::{ None, Some, self };
-import pkg::result::Result::{ Err, Ok, self };
-import pkg::shared::Shared;
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializer, Wire };
 
 // --- Serialization (`to_json`) ------------------------------------------------
 
-trait Json {
+export trait Json {
 	fun to_json(self): str;
 }
 
 // An absent `Option` is JSON `null`; a present one serializes its value.
-impl Option<type T: Json> with Json {
+export impl Option<type T: Json> with Json {
 	fun to_json(self): str {
 		match self {
 			Option::Some(let value) => value.to_json(),
@@ -30,7 +29,7 @@ impl Option<type T: Json> with Json {
 }
 
 // A `List` is a JSON array — each element serialized via its own `to_json`.
-impl List<type T: Json> with Json {
+export impl List<type T: Json> with Json {
 	fun to_json(self): str {
 		mut result = "[";
 		mut first = true;
@@ -45,27 +44,27 @@ impl List<type T: Json> with Json {
 	}
 }
 
-impl str with Json {
+export impl str with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl i32 with Json {
+export impl i32 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl u32 with Json {
+export impl u32 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl f64 with Json {
+export impl f64 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl bool with Json {
+export impl bool with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
@@ -76,18 +75,18 @@ impl bool with Json {
 /// bool, or object. `from_json` parses a document into one of these once, then
 /// `from_json_value` walks it, reading named fields and coercing the leaves back
 /// to vilan scalars.
-external struct JsonValue;
+export external struct JsonValue;
 
 /// `JSON.parse(text)` — parse a document into a `JsonValue`. TRUSTING: malformed
 /// text is a host exception. The validating decode paths (`decode_json`, the
 /// codec's reader) go through `try_parse_json` instead.
-[extern("JSON.parse")]
+export [extern("JSON.parse")]
 external fun parse_json_value(text: str): JsonValue;
 
-// `JSON.parse`, guarded (an intrinsic): `None` for malformed text instead of a
-// host exception — a wire frame is attacker-supplied input, so the codec must
-// refuse it as a decode error, never a crash.
-impl str {
+// `JSON.parse`, guarded (an intrinsic): `None` for malformed text instead of a host
+// exception — a wire frame is attacker-supplied input, so the codec must refuse it
+// as a decode error, never a crash.
+export impl str {
 	external fun try_parse_json(self): Option<JsonValue>;
 }
 
@@ -98,10 +97,10 @@ impl str {
 ///
 /// The set is closed over JSON, not over every `JsonValue`. A `JsonValue` is
 /// whatever the host handed over, so `value.field("absent")` — a key the object
-/// does not have — has a kind outside this set. `==` answers `false` for it, as
-/// it always did; an exhaustive `match` over `JsonKind` traps and names it.
+/// does not have — has a kind outside this set. `==` answers `false` for it, as it
+/// always did; an exhaustive `match` over `JsonKind` traps and names it.
 /// `has_field` is the check that keeps you out of that case.
-enum JsonKind {
+export enum JsonKind {
 	Null = "null",
 	Bool = "boolean",
 	Number = "number",
@@ -110,14 +109,14 @@ enum JsonKind {
 	Object = "object",
 }
 
-impl JsonValue {
+export impl JsonValue {
 	/// `self[name]` — the value at a named object field (an intrinsic: there is no
 	/// host function for dynamic property access).
 	external fun field(self, name: str): JsonValue;
 
-	/// The externally-tagged discriminator of an enum value: the string itself
-	/// when this is a bare `"Variant"`, else the single key of a `{"Variant":..}`
-	/// object (an intrinsic — `typeof`/`Object.keys` have no plain extern shape).
+	/// The externally-tagged discriminator of an enum value: the string itself when
+	/// this is a bare `"Variant"`, else the single key of a `{"Variant":..}` object
+	/// (an intrinsic — `typeof`/`Object.keys` have no plain extern shape).
 	external fun tag(self): str;
 
 	/// The elements of a parsed JSON array, each a `JsonValue`.
@@ -127,8 +126,8 @@ impl JsonValue {
 	external fun is_null(self): bool;
 
 	/// The normalized JSON type (an intrinsic: `typeof` mis-buckets arrays and
-	/// null). The decode type checks below read it so a leaf refuses a
-	/// wrong-shaped value instead of coercing it to garbage.
+	/// null). The decode type checks below read it so a leaf refuses a wrong-shaped
+	/// value instead of coercing it to garbage.
 	external fun kind(self): JsonKind;
 
 	/// Whether an object has a named field — the missing-field check the derived
@@ -139,13 +138,13 @@ impl JsonValue {
 	}
 }
 
-/// Decoding is fallible and NEVER crashes: a missing field, a wrong shape, or
-/// text that is not JSON at all is a decode error, not `undefined` garbage and
-/// not a thrown `JSON.parse` (the same rule the wire codec follows — I3). Both
-/// methods return `Result`; `from_json` parses the text (non-crashing) and hands
-/// off to `from_json_value`, which validates the value's shape. Callers thread
-/// failures with `!` or handle the `Result`.
-trait FromJson {
+/// Decoding is fallible and NEVER crashes: a missing field, a wrong shape, or text
+/// that is not JSON at all is a decode error, not `undefined` garbage and not a
+/// thrown `JSON.parse` (the same rule the wire codec follows — I3). Both methods
+/// return `Result`; `from_json` parses the text (non-crashing) and hands off to
+/// `from_json_value`, which validates the value's shape. Callers thread failures
+/// with `!` or handle the `Result`.
+export trait FromJson {
 	/// Parse a JSON document into a value of this type.
 	fun from_json(text: str): Result<Self, str>;
 	/// Rebuild this type from an already-parsed value (used when nesting).
@@ -155,9 +154,9 @@ trait FromJson {
 /// The scalar leaves check the JSON type before coercing (`Number`/`String`/
 /// `Boolean` would otherwise turn `undefined`/a wrong type into `NaN`/`"undefined"`
 /// /`true`). The raw coercion stays a host extern, now reached only past the check.
-[extern("String")]
+export [extern("String")]
 external fun coerce_str(value: JsonValue): str;
-[extern("Boolean")]
+export [extern("Boolean")]
 external fun coerce_bool(value: JsonValue): bool;
 [extern("Number")]
 external fun coerce_i8(value: JsonValue): i8;
@@ -176,11 +175,13 @@ external fun coerce_i53(value: JsonValue): i53;
 [extern("Number")]
 external fun coerce_u53(value: JsonValue): u53;
 [extern("Number")]
+external fun coerce_usize(value: JsonValue): usize;
+[extern("Number")]
 external fun coerce_f32(value: JsonValue): f32;
 [extern("Number")]
 external fun coerce_f64(value: JsonValue): f64;
 
-impl str with FromJson {
+export impl str with FromJson {
 	fun from_json(text: str): Result<str, str> {
 		match text.try_parse_json() {
 			Some(let value) => str::from_json_value(value),
@@ -196,39 +197,49 @@ impl str with FromJson {
 	}
 }
 
-impl i32 with FromJson {
+export impl i32 with FromJson {
 	fun from_json(text: str): Result<i32, str> {
 		match text.try_parse_json() {
 			Some(let value) => i32::from_json_value(value),
 			None => Err("not valid JSON"),
 		}
 	}
+	/// The kind gate, then the LANE gate (B373): a JSON number that is not a whole
+	/// number is not an `i32`, and answering `Ok(1.5)` typed `i32` is the same
+	/// defect as answering `Ok` for a string — a value outside its own type, handed
+	/// on as though it were inside it.
 	fun from_json_value(value: JsonValue): Result<i32, str> {
-		if value.kind() == JsonKind::Number {
-			Ok(coerce_i32(value))
-		} else {
-			Err("expected a number")
+		if value.kind() != JsonKind::Number {
+			ret Err("expected a number")
+		}
+		match integer_lane_failure(value, true) {
+			Some(let reason) => Err(reason),
+			None => Ok(coerce_i32(value)),
 		}
 	}
 }
 
-impl u32 with FromJson {
+export impl u32 with FromJson {
 	fun from_json(text: str): Result<u32, str> {
 		match text.try_parse_json() {
 			Some(let value) => u32::from_json_value(value),
 			None => Err("not valid JSON"),
 		}
 	}
+	/// The kind gate, then the LANE gate (B373) — whole AND non-negative:
+	/// `u32::from_json("-1")` answered `Ok(-1)` typed `u32`.
 	fun from_json_value(value: JsonValue): Result<u32, str> {
-		if value.kind() == JsonKind::Number {
-			Ok(coerce_u32(value))
-		} else {
-			Err("expected a number")
+		if value.kind() != JsonKind::Number {
+			ret Err("expected a number")
+		}
+		match integer_lane_failure(value, false) {
+			Some(let reason) => Err(reason),
+			None => Ok(coerce_u32(value)),
 		}
 	}
 }
 
-impl f64 with FromJson {
+export impl f64 with FromJson {
 	fun from_json(text: str): Result<f64, str> {
 		match text.try_parse_json() {
 			Some(let value) => f64::from_json_value(value),
@@ -244,7 +255,7 @@ impl f64 with FromJson {
 	}
 }
 
-impl bool with FromJson {
+export impl bool with FromJson {
 	fun from_json(text: str): Result<bool, str> {
 		match text.try_parse_json() {
 			Some(let value) => bool::from_json_value(value),
@@ -261,7 +272,7 @@ impl bool with FromJson {
 }
 
 // A JSON `null` is `None`; anything else is `Some` of the parsed value.
-impl Option<type T: FromJson> with FromJson {
+export impl Option<type T: FromJson> with FromJson {
 	fun from_json(text: str): Result<Option<T>, str> {
 		match text.try_parse_json() {
 			Some(let value) => Option::from_json_value(value),
@@ -279,7 +290,7 @@ impl Option<type T: FromJson> with FromJson {
 
 // A JSON array rebuilds into a `List`, each element parsed via its own type; the
 // first bad element short-circuits the decode.
-impl List<type T: FromJson> with FromJson {
+export impl List<type T: FromJson> with FromJson {
 	fun from_json(text: str): Result<List<T>, str> {
 		match text.try_parse_json() {
 			Some(let value) => List::from_json_value(value),
@@ -300,303 +311,392 @@ impl List<type T: FromJson> with FromJson {
 
 // --- The wire visitor's JSON pair (transport-rpc.md §6.1) -----------------------
 
-/// Whether a parsed object has a named field (`Object.hasOwn`) — the missing-
-/// field check behind the reader's sticky decode errors.
-[extern("Object.hasOwn")]
+/// Whether a parsed object has a named field (`Object.hasOwn`) — the missing- field
+/// check behind the reader's sticky decode errors.
+export [extern("Object.hasOwn")]
 external fun has_json_field(value: JsonValue, name: str): bool;
 
 /// The write side: builds the JSON text as a `Wire` value describes itself.
-/// Separator discipline is one flag plus a stack: `pending_comma` says whether
-/// the next value at the current level needs a `,` first; opening an aggregate
-/// saves the parent's flag and starts fresh, closing restores it. A `field`
-/// writes its own separator and glues its value (no comma between `"name":` and
-/// the value). Variant arities are tracked so `end_variant` knows what to close.
+/// Separator discipline is one flag plus a stack: `pending_comma` says whether the
+/// next value at the current level needs a `,` first; opening an aggregate saves
+/// the parent's flag and starts fresh, closing restores it. A `field` writes its
+/// own separator and glues its value (no comma between `"name":` and the value).
+/// Variant arities are tracked so `end_variant` knows what to close.
+///
+/// PLAIN FIELDS behind `&mut self` (A108). Until the visitor's receivers moved,
+/// every one of these four was a `Shared` cell — not because the state is
+/// shared with anything, but because `Serialize` declared `begin_struct(self)`
+/// and a by-value receiver cannot write a field. The cells were the language
+/// telling the code what shape it may have
+/// (`signal-cell-representation.md` §2.4's frame-scoped class); the receiver
+/// was the thing to fix.
 struct JsonWriter {
-	out: Shared<str>,
-	pending_comma: Shared<bool>,
-	saved_commas: Shared<List<bool>>,
-	variant_arities: Shared<List<i32>>,
+	out: str,
+	pending_comma: bool,
+	saved_commas: List<bool>,
+	variant_arities: List<i32>,
 }
 
 impl JsonWriter {
 	fun new(): JsonWriter {
-		JsonWriter {
-			out = Shared::new(""),
-			pending_comma = Shared::new(false),
-			saved_commas = Shared::new([]),
-			variant_arities = Shared::new([]),
-		}
+		JsonWriter { out = "", pending_comma = false, saved_commas = [], variant_arities = [] }
 	}
 
-	/// Appends `text` as one value at the current level: separator first, and
-	/// the NEXT value here will need one too.
-	fun value(self, text: str) {
-		if self.pending_comma.read() {
-			self.out.write() = self.out.read() + ",";
+	/// Appends `text` as one value at the current level: separator first, and the
+	/// NEXT value here will need one too.
+	fun value(&mut self, text: str) {
+		if self.pending_comma {
+			self.out = self.out + ",";
 		}
-		self.out.write() = self.out.read() + text;
-		self.pending_comma.write() = true;
+		self.out = self.out + text;
+		self.pending_comma = true;
 	}
 
 	/// Opens an aggregate: the opener is a value at the parent level; inside,
 	/// the first item needs no separator.
-	fun open(self, opener: str) {
+	fun open(&mut self, opener: str) {
 		self.value(opener);
-		self.saved_commas.write().push(true);
-		self.pending_comma.write() = false;
+		self.saved_commas.push(true);
+		self.pending_comma = false;
 	}
 
 	/// Closes an aggregate and restores the parent level's separator state.
-	fun close(self, closer: str) {
-		self.out.write() = self.out.read() + closer;
-		self.pending_comma.write() = match self.saved_commas.write().pop() {
+	fun close(&mut self, closer: str) {
+		self.out = self.out + closer;
+		self.pending_comma = match self.saved_commas.pop() {
 			Some(let saved) => saved,
 			None => false,
 		};
 	}
 
 	/// The finished document.
-	fun result(self): str {
-		self.out.read()
-	}
-
-	/// The closure record a `Codec` hands out — thin delegates to the trait
-	/// methods below (the codec-as-a-value erasure; direct `encode_json` skips it).
-	fun serializer(self): Serializer {
-		Serializer {
-			begin_struct = |fields| self.begin_struct(fields),
-			field = |name| self.field(name),
-			end_struct = || self.end_struct(),
-			begin_list = |length| self.begin_list(length),
-			end_list = || self.end_list(),
-			begin_variant = |name, arity| self.begin_variant(name, arity),
-			end_variant = || self.end_variant(),
-			null_value = || self.null_value(),
-			some_value = || self.some_value(),
-			str_value = |value| self.str_value(value),
-			i32_value = |value| self.i32_value(value),
-			u32_value = |value| self.u32_value(value),
-			i53_value = |value| self.i53_value(value),
-			f64_value = |value| self.f64_value(value),
-			bool_value = |value| self.bool_value(value),
-		}
+	fun result(&self): str {
+		self.out
 	}
 }
 
-// The visitor's write half, natively — `describe` monomorphizes straight onto
-// these methods on the direct path.
-impl JsonWriter with Serialize {
-	fun begin_struct(self, fields: i32) {
+// The visitor's write half, natively — `describe` monomorphizes straight onto these
+// methods on the direct path. EXPORTED deliberately, and B354 is the reason: a
+// `[derive(Wire)]` visitor is generated code, and its admitting file is the file
+// the ATTRIBUTE was written in - a USER's file, which cannot reach a private std
+// block and cannot be asked to write `#(impl JsonWriter)` for one. The Order 36
+// sweep exported these under the sentinel rule; they stay exported under the right
+// one. The plain blocks above/below need no export: a derived body only ever calls
+// the VISITOR methods.
+export impl JsonWriter with Serialize {
+	fun begin_struct(&mut self, fields: i32) {
 		self.open("{");
 	}
 
-	fun field(self, name: str) {
-		if self.pending_comma.read() {
-			self.out.write() = self.out.read() + ",";
+	fun field(&mut self, name: str) {
+		if self.pending_comma {
+			self.out = self.out + ",";
 		}
-		self.out.write() = self.out.read() + name.to_json() + ":";
-		self.pending_comma.write() = false;
+		self.out = self.out + name.to_json() + ":";
+		self.pending_comma = false;
 	}
 
-	fun end_struct(self) {
+	fun end_struct(&mut self) {
 		self.close("}");
 	}
 
-	fun begin_list(self, length: i32) {
+	fun begin_list(&mut self, length: i32) {
 		self.open("[");
 	}
 
-	fun end_list(self) {
+	fun end_list(&mut self) {
 		self.close("]");
 	}
 
-	fun begin_variant(self, name: str, arity: i32) {
-		self.variant_arities.write().push(arity);
+	fun begin_variant(&mut self, name: str, arity: i32) {
+		self.variant_arities.push(arity);
 		if arity == 0 {
 			// A payload-less variant is its bare name: `"Ready"`.
 			self.value(name.to_json());
 		} else {
 			self.open("{");
-			self.out.write() = self.out.read() + name.to_json() + ":";
-			self.pending_comma.write() = false;
+			self.out = self.out + name.to_json() + ":";
+			self.pending_comma = false;
 			if arity > 1 {
 				// Several payloads ride in an array: `{"Pair":[1,2]}`.
-				self.out.write() = self.out.read() + "[";
+				self.out = self.out + "[";
 			}
 		}
 	}
 
-	fun end_variant(self) {
-		let arity = match self.variant_arities.write().pop() {
+	fun end_variant(&mut self) {
+		let arity = match self.variant_arities.pop() {
 			Some(let opened) => opened,
 			None => 0,
 		};
 		if arity > 1 {
-			self.out.write() = self.out.read() + "]";
+			self.out = self.out + "]";
 		}
 		if arity > 0 {
 			self.close("}");
 		}
 	}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		self.value("null");
 	}
 
-	/// JSON has no Some marker — a present Option is its bare value (which
-	/// keeps the format's Some(None) ≡ None collapse).
-	fun some_value(self) {}
+	/// JSON has no Some marker — a present Option is its bare value (which keeps
+	/// the format's Some(None) ≡ None collapse).
+	fun some_value(&mut self) {}
 
-	fun str_value(self, value: str) {
+	fun str_value(&mut self, value: str) {
 		self.value(value.to_json());
 	}
 
-	fun i32_value(self, value: i32) {
+	fun i32_value(&mut self, value: i32) {
 		self.value(i"{value}");
 	}
 
-	fun u32_value(self, value: u32) {
+	fun u32_value(&mut self, value: u32) {
 		self.value(i"{value}");
 	}
 
-	/// A JSON number; exact for the runtime's whole i53 range (integers to
-	/// 2^53 — the f64 representation).
-	fun i53_value(self, value: i53) {
+	/// A JSON number; exact for the runtime's whole i53 range (integers to 2^53 —
+	/// the f64 representation).
+	fun i53_value(&mut self, value: i53) {
 		self.value(i"{value}");
 	}
 
-	fun f64_value(self, value: f64) {
+	fun f64_value(&mut self, value: f64) {
 		self.value(i"{value}");
 	}
 
-	fun bool_value(self, value: bool) {
+	fun bool_value(&mut self, value: bool) {
 		self.value(i"{value}");
 	}
 }
 
 /// The read side: walks a parsed `JsonValue` with a value stack. `field(name)`
-/// pushes the named member (or fails and pushes a null sentinel); scalar reads
-/// pop; `begin_list`/arity>0 variants replace their aggregate with its elements
+/// pushes the named member (or fails and pushes a null sentinel); scalar reads pop;
+/// `begin_list`/arity>0 variants replace their aggregate with its elements
 /// (reversed, so pops come off in order). Errors are sticky: after `fail`, every
-/// operation is a no-op returning a zero value, and `decode_json` reports the
-/// first reason.
+/// operation is a no-op returning a zero value, and `decode_json` reports the first
+/// reason. Plain fields behind `&mut self`, for the reason `JsonWriter`'s headnote
+/// gives (A108).
 struct JsonReader {
-	stack: Shared<List<JsonValue>>,
-	error: Shared<Option<str>>,
+	stack: List<JsonValue>,
+	error: Option<str>,
+	/// The stack depth each open list must be back down to when it is closed (FIND
+	/// papers-39). `begin_list` records one; `end_list` checks it, so a document
+	/// whose list is LONGER than what the caller read is a decode failure rather
+	/// than an element left lying on the stack for whatever reads next to take.
+	list_marks: List<usize>,
 }
 
 impl JsonReader {
 	fun new(root: JsonValue): JsonReader {
-		let stack: Shared<List<JsonValue>> = Shared::new([]);
-		stack.write().push(root);
-		JsonReader { stack = stack, error = Shared::new(None) }
+		mut stack: List<JsonValue> = [];
+		stack.push(root);
+		JsonReader { stack, error = None, list_marks = [] }
 	}
 
-	fun ok(self): bool {
-		match self.error.read() {
+	fun ok(&self): bool {
+		match self.error {
 			Some(let _reason) => false,
 			None => true,
 		}
 	}
 
-	fun report(self, reason: str) {
-		match self.error.read() {
+	fun report(&mut self, reason: str) {
+		match self.error {
 			Some(let _first) => {},
 			None => {
-				self.error.write() = Some(reason);
+				self.error = Some(reason);
 			},
 		}
 	}
 
-	/// The current value without consuming it (a null sentinel when poisoned
-	/// or unbalanced — reads stay crash-free either way).
-	fun top(self): JsonValue {
-		if !self.ok() || self.stack.read().is_empty() {
+	/// The current value without consuming it (a null sentinel when poisoned or
+	/// unbalanced — reads stay crash-free either way).
+	fun top(&self): JsonValue {
+		if !self.ok() || self.stack.is_empty() {
 			parse_json_value("null")
 		} else {
-			let values = self.stack.read();
-			values[values.len() - 1]
+			self.stack[self.stack.len() - 1]
 		}
 	}
 
-	fun take(self): JsonValue {
+	fun take(&mut self): JsonValue {
 		if !self.ok() {
 			ret parse_json_value("null");
 		}
-		match self.stack.write().pop() {
+		match self.stack.pop() {
 			Some(let value) => value,
 			None => {
-				// A balanced rebuild never underflows — reading past the
-				// document is a structural mismatch, not a zero value.
+				// A balanced rebuild never underflows — reading past the document
+				// is a structural mismatch, not a zero value.
 				self.report("unexpected end of document");
 				parse_json_value("null")
 			},
 		}
 	}
 
-	/// The closure record a `Codec` hands out — thin delegates to the trait
-	/// methods below (direct `decode_json` skips it).
-	fun deserializer(self): Deserializer {
-		Deserializer {
-			begin_struct = || self.begin_struct(),
-			field = |name| self.field(name),
-			end_struct = || self.end_struct(),
-			begin_list = || self.begin_list(),
-			end_list = || self.end_list(),
-			variant_tag = || self.variant_tag(),
-			begin_variant = |name, arity| self.begin_variant(name, arity),
-			end_variant = || self.end_variant(),
-			is_null = || self.is_null(),
-			null_value = || self.null_value(),
-			str_value = || self.str_value(),
-			i32_value = || self.i32_value(),
-			u32_value = || self.u32_value(),
-			i53_value = || self.i53_value(),
-			f64_value = || self.f64_value(),
-			bool_value = || self.bool_value(),
-			fail = |reason| self.fail(reason),
-			failed = || self.failed(),
+	/// THE TYPE GATE (FIND papers-39): the value a read just took has to be of the
+	/// kind that read asked for, or the read is a decode FAILURE rather than a host
+	/// coercion. `false` means "poisoned — hand back the zero value", which is the
+	/// shape the sticky-error model already had for a structural mismatch.
+	///
+	/// Without it every typed read was `Number(x)` / `String(x)` / `Boolean(x)`
+	/// over whatever happened to be on the stack, and the answers were the
+	/// coercions': a JSON string read as an `i32` answered `NaN`, `null`
+	/// answered `0`, `true` answered `1`, and a list SHORTER than what the
+	/// caller read answered the ENCLOSING OBJECT as a number. Every one of them
+	/// silently, with `failed()` still answering `None` — so the gates written
+	/// on it (the `[rpc]` route's `decode_failed`, which does consult it) all
+	/// passed and a malformed frame routed as a well-formed call.
+	fun expect(&mut self, value: JsonValue, wanted: JsonKind, name: str): bool {
+		if !self.ok() {
+			ret false;
+		}
+		if value.kind() == wanted {
+			ret true;
+		}
+		self.report(i"expected {name}, found {found_kind(value)}");
+		false
+	}
+
+	/// The integer lanes want a WHOLE number, and the unsigned ones a non-negative
+	/// one: `1.5` read as an `i32` used to answer `1.5` TYPED `i32`, and `-1` read
+	/// as a `u32` answered `-1` typed `u32` — values outside their own types, which
+	/// is the same defect as the wrong kind wearing the right one.
+	///
+	/// The MAGNITUDE is deliberately not checked here: `i32`/`u32` are the JS
+	/// numeric lanes rather than hardware widths, and refusing a large value would
+	/// be a behaviour change to documents that already cross. That is its own
+	/// question, with its own estate sweep.
+	fun expect_integer(&mut self, value: JsonValue, signed: bool): bool {
+		if !self.expect(value, JsonKind::Number, "a number") {
+			ret false;
+		}
+		match integer_lane_failure(value, signed) {
+			Some(let reason) => {
+				self.report(reason);
+				false
+			},
+			None => true,
 		}
 	}
 }
 
-// The visitor's read half, natively.
-impl JsonReader with Deserialize {
-	fun begin_struct(self) {}
+/// The integer lanes' VALUE check, shared by the typed reader above and by the
+/// scalar `FromJson` impls (tracker B373): `None` when `value` is a number this
+/// lane can hold, `Some(reason)` naming why it is not.
+///
+/// It is a free function and not a method because the two callers report
+/// differently — the reader poisons, `from_json_value` answers `Err` — and the
+/// defect it closes was exactly that they did not share a predicate: the reader
+/// grew these two rules with 2321790e and `i32::from_json("1.5")` went on answering
+/// `Ok(1.5)`, an `i32`-typed value that is not an integer. One lane read two ways
+/// is the shape of every hole in this file's history.
+///
+/// The MAGNITUDE is deliberately not checked, for the reason `expect_integer`
+/// already gave: `i32`/`u32` are the JS numeric lanes rather than hardware widths,
+/// and refusing a large value is its own question with its own estate sweep
+/// (recorded on B373, waiting on I5's `usize`).
+fun integer_lane_failure(value: JsonValue, signed: bool): Option<str> {
+	let number = coerce_f64(value);
+	if number != number.floor() {
+		ret Some(i"expected a whole number, found {number}");
+	}
+	if !signed && number < 0.0 {
+		ret Some(i"expected a non-negative number, found {number}");
+	}
+	None
+}
 
-	fun field(self, name: str) {
+/// How a decode failure NAMES the kind it found, with its article, so the two
+/// halves of "expected a number, found a string" read as one sentence.
+fun found_kind(value: JsonValue): str {
+	match value.kind() {
+		JsonKind::Null => "null",
+		JsonKind::Bool => "a boolean",
+		JsonKind::Number => "a number",
+		JsonKind::String => "a string",
+		JsonKind::Array => "an array",
+		// `__json_kind` answers exactly these six, so the last one is the FALLBACK
+		// rather than a sixth named arm: an exhaustive match over a BACKED enum
+		// emits the `__enum_trap` helper, and that would put a guard against a host
+		// value outside the set into every bundle that decodes JSON, for a value
+		// this intrinsic cannot produce.
+		_ => "an object",
+	}
+}
+
+// The visitor's read half, natively. EXPORTED deliberately, and B354 is the reason:
+// a `[derive(Wire)]` visitor is generated code, and its admitting file is the file
+// the ATTRIBUTE was written in - a USER's file, which cannot reach a private std
+// block and cannot be asked to write `#(impl JsonReader)` for one. The Order 36
+// sweep exported these under the sentinel rule; they stay exported under the right
+// one. The plain blocks above/below need no export: a derived body only ever calls
+// the VISITOR methods.
+export impl JsonReader with Deserialize {
+	fun begin_struct(&mut self) {}
+
+	fun field(&mut self, name: str) {
 		let subject = self.top();
-		if self.ok() {
+		// The kind check comes FIRST and is not only a type gate: `has_json_field`
+		// is `Object.hasOwn`, which THROWS on `null` — so a `null` document
+		// reaching a struct decode took the process rather than reporting.
+		if self.expect(subject, JsonKind::Object, "an object") {
 			if has_json_field(subject, name) {
-				self.stack.write().push(subject.field(name));
+				self.stack.push(subject.field(name));
 			} else {
 				self.report(i"missing field '{name}'");
 			}
 		}
 	}
 
-	fun end_struct(self) {
+	fun end_struct(&mut self) {
 		let _ = self.take();
 	}
 
-	fun begin_list(self): i32 {
+	fun begin_list(&mut self): i32 {
 		let subject = self.take();
-		if self.ok() {
+		if self.expect(subject, JsonKind::Array, "an array") {
 			let elements = subject.elements();
-			mut index = elements.len() - 1;
-			for index >= 0 {
-				self.stack.write().push(elements[index]);
+			// Where the stack stands once every element has been read: what
+			// `end_list` holds the caller to.
+			self.list_marks.push(self.stack.len());
+			mut index = elements.len();
+			for index > 0 {
 				index -= 1;
+				self.stack.push(elements[index]);
 			}
-			elements.len()
+			// WIRE: `begin_list` answers the codec's `i32` length (§2.2).
+			elements.len().as_i32()
 		} else {
 			0
 		}
 	}
 
-	fun end_list(self) {}
+	/// The arity check (FIND papers-39). A list LONGER than what the caller read
+	/// used to leave its tail on the stack, where the next read took an element of
+	/// it instead of the value it asked for; a shorter one is caught by the type
+	/// gate above, since the read runs into the enclosing value. Either way the
+	/// answer is a decode failure and not a number.
+	///
+	/// A reader whose caller never closes its list — `std::rpc`'s `open_request`
+	/// opens the argument list and leaves it open for the route to pull from —
+	/// simply never reaches this, and its mark is never read.
+	fun end_list(&mut self) {
+		match self.list_marks.pop() {
+			Some(let mark) => {
+				if self.ok() && self.stack.len() > mark {
+					let unread = self.stack.len() - mark;
+					self.report(i"a list had {unread} element(s) left unread");
+				}
+			},
+			None => {},
+		}
+	}
 
-	fun variant_tag(self): str {
+	fun variant_tag(&mut self): str {
 		if self.ok() {
 			self.top().tag()
 		} else {
@@ -604,19 +704,19 @@ impl JsonReader with Deserialize {
 		}
 	}
 
-	fun begin_variant(self, name: str, arity: i32) {
+	fun begin_variant(&mut self, name: str, arity: i32) {
 		let subject = self.take();
-		if self.ok() && arity > 0 {
+		if arity > 0 && self.expect(subject, JsonKind::Object, "an object") {
 			if has_json_field(subject, name) {
 				let payload = subject.field(name);
 				if arity == 1 {
-					self.stack.write().push(payload);
+					self.stack.push(payload);
 				} else {
 					let elements = payload.elements();
-					mut index = elements.len() - 1;
-					for index >= 0 {
-						self.stack.write().push(elements[index]);
+					mut index = elements.len();
+					for index > 0 {
 						index -= 1;
+						self.stack.push(elements[index]);
 					}
 				}
 			} else {
@@ -625,13 +725,13 @@ impl JsonReader with Deserialize {
 		}
 	}
 
-	fun end_variant(self) {}
+	fun end_variant(&mut self) {}
 
-	fun is_null(self): bool {
+	fun is_null(&mut self): bool {
 		self.ok() && self.top().is_null()
 	}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		let _ = self.take();
 	}
 
@@ -639,119 +739,165 @@ impl JsonReader with Deserialize {
 	/// scalar through the raw coercion rather than the validating `from_json_value`
 	/// (which now returns a `Result`) — the leaf is already inside the reader's
 	/// error discipline.
-	fun str_value(self): str {
+	fun str_value(&mut self): str {
 		let value = self.take();
-		if self.ok() {
+		if self.expect(value, JsonKind::String, "a string") {
 			coerce_str(value)
 		} else {
 			""
 		}
 	}
 
-	fun i32_value(self): i32 {
+	fun i32_value(&mut self): i32 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect_integer(value, true) {
 			coerce_i32(value)
 		} else {
 			0
 		}
 	}
 
-	fun u32_value(self): u32 {
+	fun u32_value(&mut self): u32 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect_integer(value, false) {
 			coerce_u32(value)
 		} else {
 			0
 		}
 	}
 
-	fun i53_value(self): i53 {
+	fun i53_value(&mut self): i53 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect_integer(value, true) {
 			coerce_i53(value)
 		} else {
 			0
 		}
 	}
 
-	fun f64_value(self): f64 {
+	fun f64_value(&mut self): f64 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect(value, JsonKind::Number, "a number") {
 			coerce_f64(value)
 		} else {
 			0.0
 		}
 	}
 
-	fun bool_value(self): bool {
+	fun bool_value(&mut self): bool {
 		let value = self.take();
-		if self.ok() {
+		if self.expect(value, JsonKind::Bool, "a boolean") {
 			coerce_bool(value)
 		} else {
 			false
 		}
 	}
 
-	fun fail(self, reason: str) {
+	fun fail(&mut self, reason: str) {
 		self.report(reason);
 	}
 
-	fun failed(self): Option<str> {
-		self.error.read()
+	fun failed(&mut self): Option<str> {
+		self.error
 	}
 }
 
-/// Encode a `Wire` value as JSON text — the direct path: `describe`
-/// monomorphizes straight onto `JsonWriter`, no record in between.
-fun encode_json<T: Wire>(value: T): str {
-	let writer = JsonWriter::new();
-	value.describe(writer);
+/// Encode a `Wire` value as JSON text — the direct path: `describe` monomorphizes
+/// straight onto `JsonWriter`, no record in between.
+export fun encode_json<T: Wire>(value: T): str {
+	mut writer = JsonWriter::new();
+	value.describe(&mut writer);
 	writer.result()
 }
 
 /// Decode JSON text as a `Wire` value: `Err(reason)` names the first structural
 /// failure (missing field, missing variant payload) instead of half-decoding.
-/// (Malformed JSON *syntax* still throws at `parse_json_value` — the guarded
-/// parse is Q10/`?` territory.)
-fun decode_json<T: Wire>(text: str): Result<T, str> {
-	let reader = opened_reader(text);
-	let value: T = T::rebuild(reader);
-	match reader.error.read() {
+/// (Malformed JSON *syntax* still throws at `parse_json_value` — the guarded parse
+/// is Q10/`?` territory.)
+export fun decode_json<T: Wire>(text: str): Result<T, str> {
+	mut reader = opened_reader(text);
+	let value: T = T::rebuild(&mut reader);
+	match reader.error {
 		None => Ok(value),
 		Some(let reason) => Err(reason),
 	}
 }
 
-/// A reader over `text` — pre-poisoned when the text is not JSON at all: the
-/// codec contract is a sticky decode error, NEVER a crash (a wire frame is
-/// untrusted input; a throwing parse here would let one malformed request kill
-/// a server).
+/// A reader over `text` — pre-poisoned when the text is not JSON at all: the codec
+/// contract is a sticky decode error, NEVER a crash (a wire frame is untrusted
+/// input; a throwing parse here would let one malformed request kill a server).
 fun opened_reader(text: str): JsonReader {
 	match text.try_parse_json() {
 		Some(let root) => JsonReader::new(root),
 		None => {
-			let reader = JsonReader::new(parse_json_value("null"));
+			mut reader = JsonReader::new(parse_json_value("null"));
 			reader.report("malformed JSON");
 			reader
 		},
 	}
 }
 
-/// The JSON codec (§6.2): text frames over the writer/reader pair. A binary
-/// frame poisons the reader — a sticky decode error, never a crash.
-fun json_codec(): Codec {
+/// The JSON codec (§6.2): text frames over the writer/reader pair. A binary frame
+/// poisons the reader — a sticky decode error, never a crash.
+///
+/// The closure records are built HERE rather than by a `serializer()` method on
+/// the writer, and A108 is why: the visitor's state lives in plain fields now,
+/// so a record whose closures captured a by-value copy of the writer would
+/// narrate into a copy and finish an empty document, and a record whose
+/// closures captured a `&mut self` view is refused outright (a view may not
+/// escape its scope). What both closures may capture is the `mut` LOCAL of the
+/// frame that mints them — a closure captures the BINDING (spec §6.9) — so the
+/// writer and the finisher share one writer, which is exactly the relation the
+/// `Shared` cells used to buy.
+export fun json_codec(): Codec {
 	Codec {
 		writer = || {
-			let writer = JsonWriter::new();
-			(writer.serializer(), || Frame::Text(writer.result()))
+			mut writer = JsonWriter::new();
+			let record = Serializer {
+				begin_struct = |fields| writer.begin_struct(fields),
+				field = |name| writer.field(name),
+				end_struct = || writer.end_struct(),
+				begin_list = |length| writer.begin_list(length),
+				end_list = || writer.end_list(),
+				begin_variant = |name, arity| writer.begin_variant(name, arity),
+				end_variant = || writer.end_variant(),
+				null_value = || writer.null_value(),
+				some_value = || writer.some_value(),
+				str_value = |value| writer.str_value(value),
+				i32_value = |value| writer.i32_value(value),
+				u32_value = |value| writer.u32_value(value),
+				i53_value = |value| writer.i53_value(value),
+				f64_value = |value| writer.f64_value(value),
+				bool_value = |value| writer.bool_value(value),
+			};
+			(record, || Frame::Text(writer.result()))
 		},
 		reader = |frame| {
 			// Liberal in what it accepts: a binary frame is read as UTF-8 JSON
 			// (server mounts read request bodies as bytes without sniffing).
-			match frame {
-				Frame::Text(let text) => opened_reader(text).deserializer(),
-				Frame::Binary(let bytes) => opened_reader(decode_utf8(bytes)).deserializer(),
+			mut reader = match frame {
+				Frame::Text(let text) => opened_reader(text),
+				Frame::Binary(let bytes) => opened_reader(decode_utf8(bytes)),
+			};
+			Deserializer {
+				begin_struct = || reader.begin_struct(),
+				field = |name| reader.field(name),
+				end_struct = || reader.end_struct(),
+				begin_list = || reader.begin_list(),
+				end_list = || reader.end_list(),
+				variant_tag = || reader.variant_tag(),
+				begin_variant = |name, arity| reader.begin_variant(name, arity),
+				end_variant = || reader.end_variant(),
+				is_null = || reader.is_null(),
+				null_value = || reader.null_value(),
+				str_value = || reader.str_value(),
+				i32_value = || reader.i32_value(),
+				u32_value = || reader.u32_value(),
+				i53_value = || reader.i53_value(),
+				f64_value = || reader.f64_value(),
+				bool_value = || reader.bool_value(),
+				fail = |reason| reader.fail(reason),
+				failed = || reader.failed(),
 			}
 		},
 	}
@@ -763,7 +909,7 @@ fun json_codec(): Codec {
 // helpers are file-scoped (each file compiles as its own hermetic world);
 // the `Wire` TRAIT stays in `wire.vl`. Outputs carry their own imports.
 
-macro fun struct_json_impls(target: StructItem): str {
+export macro fun struct_json_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of, init_of, quote, join };
 
 	// `"{" + "\"a\":" + self.a.to_json() + "," + … + "}"`.
@@ -784,7 +930,13 @@ macro fun struct_json_impls(target: StructItem): str {
 	// Decoding is fallible (I3): `from_json` parses the text without crashing,
 	// `from_json_value` checks each field is present (naming a missing one) and
 	// threads a leaf failure with `!`.
-	let result_type = i"Result<{target.name}, str>";
+	//
+	// The subject is spelled as an APPLICATION of its own parameters (`Handle<T>`)
+	// in every type role, and the impl binds them with the derived trait (B194's
+	// rule). A path head (`Handle::from_json_value(..)`) and a struct literal head
+	// name a namespace, not an application, so they keep the bare name.
+	let subject = target.subject();
+	let result_type = i"Result<{subject}, str>";
 	let from_json = fun_of("from_json")
 		.parameter("text: str")
 		.returns(result_type)
@@ -806,23 +958,25 @@ macro fun struct_json_impls(target: StructItem): str {
 	}
 	from_json_value = from_json_value.expr(i"Result::Ok({literal.render()})");
 	impl_of(target.name)
+		.generics(target.binders("Json"))
 		.implements("Json")
 		.method(to_json)
 		.render()
 		+ impl_of(target.name)
+			.generics(target.binders("FromJson"))
 			.implements("FromJson")
 			.method(from_json)
 			.method(from_json_value)
 			.render()
 }
 
-macro fun struct_wire_impls(target: StructItem): str {
+export macro fun struct_wire_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of, init_of, quote };
 
 	mut describe = fun_of("describe")
 		.generics("<S: Serialize>")
 		.parameter("self")
-		.parameter("serializer: S")
+		.parameter("serializer: &mut S")
 		.line(i"serializer.begin_struct({target.fields.len()});");
 	for field in target.fields {
 		let label = quote(field.name);
@@ -832,8 +986,8 @@ macro fun struct_wire_impls(target: StructItem): str {
 	describe = describe.line("serializer.end_struct();");
 	mut rebuild = fun_of("rebuild")
 		.generics("<D: Deserialize>")
-		.parameter("deserializer: D")
-		.returns(target.name)
+		.parameter("deserializer: &mut D")
+		.returns(target.subject())
 		.line("deserializer.begin_struct();");
 	mut literal = init_of(target.name);
 	for field in target.fields {
@@ -843,18 +997,29 @@ macro fun struct_wire_impls(target: StructItem): str {
 		literal = literal.field(field.name, field.name);
 	}
 	rebuild = rebuild.line("deserializer.end_struct();").expr(literal.render());
-	impl_of(target.name).implements("Wire").method(describe).method(rebuild).render()
+	impl_of(target.name)
+		.generics(target.binders("Wire"))
+		.implements("Wire")
+		.method(describe)
+		.method(rebuild)
+		.render()
 }
 
-macro fun enum_json_impls(target: EnumItem): str {
+export macro fun enum_json_impls(target: EnumItem): str {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, quote, join };
 
-	// A BACKED enum encodes AS ITS BACKING VALUE (proposal/backed-enums.md
-	// §3.9): `Align::Start` is `"start"` on the wire, not `"Start"`, and it
-	// round-trips through the synthesized `parse`. Both directions delegate —
-	// `value()` folds to the identity and the backing type's own `to_json`
-	// already escapes correctly — so neither re-implements JSON quoting.
+	// The subject spelled as an APPLICATION of its own parameters (`Either<L, R>`)
+	// in every type role, with the impl binding them under the derived trait
+	// (B194's rule). Variant paths (`Either::Left`) and the static
+	// `from_json_value` head name a namespace, not an application, and keep the
+	// bare name.
+	let subject = target.subject();
+	// A BACKED enum encodes AS ITS BACKING VALUE (proposal/backed-enums.md §3.9):
+	// `Align::Start` is `"start"` on the wire, not `"Start"`, and it round-trips
+	// through the synthesized `parse`. Both directions delegate — `value()` folds
+	// to the identity and the backing type's own `to_json` already escapes
+	// correctly — so neither re-implements JSON quoting.
 	if target.backing_type != "" {
 		mut coerce = "coerce_i32";
 		if target.backing_type == "str" {
@@ -862,8 +1027,11 @@ macro fun enum_json_impls(target: EnumItem): str {
 		} else if target.backing_type == "i53" {
 			coerce = "coerce_i53";
 		}
-		let backed_result = i"Result<{target.name}, str>";
-		let backed_to_json = fun_of("to_json").parameter("self").returns("str").expr("self.value().to_json()");
+		let backed_result = i"Result<{subject}, str>";
+		let backed_to_json = fun_of("to_json")
+			.parameter("self")
+			.returns("str")
+			.expr("self.value().to_json()");
 		let backed_from_json = fun_of("from_json")
 			.parameter("text: str")
 			.returns(backed_result)
@@ -873,10 +1041,12 @@ macro fun enum_json_impls(target: EnumItem): str {
 			.returns(backed_result)
 			.expr(i"{target.name}::parse({coerce}(value)).ok_or(\"unknown value in JSON for enum {target.name}\")");
 		ret impl_of(target.name)
+			.generics(target.binders("Json"))
 			.implements("Json")
 			.method(backed_to_json)
 			.render()
 			+ impl_of(target.name)
+				.generics(target.binders("FromJson"))
 				.implements("FromJson")
 				.method(backed_from_json)
 				.method(backed_from_json_value)
@@ -891,7 +1061,9 @@ macro fun enum_json_impls(target: EnumItem): str {
 			to_arms = to_arms.arm(i"{target.name}::{variant.name}", quote(i"\"{variant.name}\""));
 		} else if arity == 1 {
 			let opener = quote(i"\{\"{variant.name}\":");
-			to_arms = to_arms.arm(i"{target.name}::{variant.name}(let p0)", opener + " + p0.to_json() + " + quote("}"));
+			to_arms = to_arms.arm(i"{target.name}::{variant.name}(let p0)", opener
+				+ " + p0.to_json() + "
+				+ quote("}"));
 		} else {
 			mut binds: List<str> = [];
 			mut parts: List<str> = [];
@@ -904,7 +1076,11 @@ macro fun enum_json_impls(target: EnumItem): str {
 			let bind_pattern = join(binds, ", ");
 			let separator = " + " + quote(",") + " + ";
 			let opener = quote(i"\{\"{variant.name}\":[");
-			to_arms = to_arms.arm(i"{target.name}::{variant.name}({bind_pattern})", opener + " + " + join(parts, separator) + " + " + quote("]}"));
+			to_arms = to_arms.arm(i"{target.name}::{variant.name}({bind_pattern})", opener
+				+ " + "
+				+ join(parts, separator)
+				+ " + "
+				+ quote("]}"));
 		}
 	}
 	// Decoding validates the tag (an unknown one is a decode error, not a panic)
@@ -934,7 +1110,7 @@ macro fun enum_json_impls(target: EnumItem): str {
 		}
 	}
 	from_arms = from_arms.arm("_", i"Result::Err(\"unknown variant in JSON for enum {target.name}\")");
-	let result_type = i"Result<{target.name}, str>";
+	let result_type = i"Result<{subject}, str>";
 	let to_json = fun_of("to_json").parameter("self").returns("str").expr(to_arms.render());
 	let from_json = fun_of("from_json")
 		.parameter("text: str")
@@ -945,17 +1121,19 @@ macro fun enum_json_impls(target: EnumItem): str {
 		.returns(result_type)
 		.expr(from_arms.render());
 	impl_of(target.name)
+		.generics(target.binders("Json"))
 		.implements("Json")
 		.method(to_json)
 		.render()
 		+ impl_of(target.name)
+			.generics(target.binders("FromJson"))
 			.implements("FromJson")
 			.method(from_json)
 			.method(from_json_value)
 			.render()
 }
 
-macro fun enum_wire_impls(target: EnumItem): str {
+export macro fun enum_wire_impls(target: EnumItem): str {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, quote, join };
 
@@ -963,11 +1141,14 @@ macro fun enum_wire_impls(target: EnumItem): str {
 	if target.variants.len() == 0 {
 		ret "";
 	}
+	// The subject as an application of its own parameters (B194), the impl binding
+	// them under `Wire`.
+	let subject = target.subject();
 	// §3.9's backed form: the backing value is what crosses, so both directions
 	// delegate to the backing type's own `Wire` impl and to `parse`. The
-	// unknown-value path is the tagged form's, kept: a host sending a value
-	// outside the set decodes to a reported failure plus a poisoned
-	// zero-construction of the first variant, never to garbage.
+	// unknown-value path is the tagged form's, kept: a host sending a value outside
+	// the set decodes to a reported failure plus a poisoned zero-construction of
+	// the first variant, never to garbage.
 	if target.backing_type != "" {
 		mut first_variant = "";
 		for variant in target.variants {
@@ -987,16 +1168,21 @@ macro fun enum_wire_impls(target: EnumItem): str {
 		let backed_describe = fun_of("describe")
 			.generics("<S: Serialize>")
 			.parameter("self")
-			.parameter("serializer: S")
+			.parameter("serializer: &mut S")
 			.expr("self.value().describe(serializer)");
 		mut backed_rebuild = fun_of("rebuild")
 			.generics("<D: Deserialize>")
-			.parameter("deserializer: D")
-			.returns(target.name);
+			.parameter("deserializer: &mut D")
+			.returns(subject);
 		for line in rebuild_body {
 			backed_rebuild = backed_rebuild.line(line);
 		}
-		ret impl_of(target.name).implements("Wire").method(backed_describe).method(backed_rebuild).render();
+		ret impl_of(target.name)
+			.generics(target.binders("Wire"))
+			.implements("Wire")
+			.method(backed_describe)
+			.method(backed_rebuild)
+			.render();
 	}
 	mut describe_arms = match_of("self");
 	for variant in target.variants {
@@ -1041,8 +1227,8 @@ macro fun enum_wire_impls(target: EnumItem): str {
 		statements.push(construct);
 		rebuild_arms = rebuild_arms.arm_block(tag, statements);
 	}
-	// The unknown-tag arm reports a sticky decode failure and zero-constructs
-	// the FIRST variant through the (now poisoned) deserializer.
+	// The unknown-tag arm reports a sticky decode failure and zero-constructs the
+	// FIRST variant through the (now poisoned) deserializer.
 	mut fallback: List<str> = [];
 	fallback.push(i"deserializer.fail(i\"unknown variant '\{tag\}'\");");
 	mut first = true;
@@ -1069,37 +1255,62 @@ macro fun enum_wire_impls(target: EnumItem): str {
 	let describe = fun_of("describe")
 		.generics("<S: Serialize>")
 		.parameter("self")
-		.parameter("serializer: S")
+		.parameter("serializer: &mut S")
 		.expr(describe_arms.render());
 	let rebuild = fun_of("rebuild")
 		.generics("<D: Deserialize>")
-		.parameter("deserializer: D")
-		.returns(target.name)
+		.parameter("deserializer: &mut D")
+		.returns(subject)
 		.line("let tag = deserializer.variant_tag();")
 		.expr(rebuild_arms.render());
-	impl_of(target.name).implements("Wire").method(describe).method(rebuild).render()
+	impl_of(target.name)
+		.generics(target.binders("Wire"))
+		.implements("Wire")
+		.method(describe)
+		.method(rebuild)
+		.render()
 }
 
-macro fun Json(item: Item): Source {
+export macro fun Json(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	if item.as_struct() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + struct_json_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue };\n"
+			+ "import std::result::Result;\n"
+			+ struct_json_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + enum_json_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n"
+			+ "import std::result::Result;\n"
+			+ "import std::option::Option;\n"
+			+ enum_json_impls(target));
 	}
 	source("")
 }
 
-macro fun Wire(item: Item): Source {
+// `[derive(Wire)]` emits the §6.1 VISITOR impls and nothing else (B301).
+//
+// It used to emit the JSON pair beside them — "additive until the codec
+// re-plumb consumes it" — and the residue was not additive at all: it made
+// every field of a Wire type have to be JSON as well, at a time when `Map` had
+// been Wire since A39 and `Result` since A82 and neither is Json. `[derive(Wire)]
+// struct Row { tags: Map<str, i32> }` failed with "`Map<str, i32>` has no method
+// 'to_json'" and "cannot find 'from_json_value' in Map<str, i32>" — two
+// diagnostics about a codec the author did not ask for, naming a trait the
+// attribute does not mention. A hand-written `impl .. with Wire` type and a
+// `Result` field met the identical wall.
+//
+// A type that wants both codecs asks for both: `[derive(Json, Wire)]`.
+export macro fun Wire(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 
 	if item.as_struct() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + struct_json_impls(target) + struct_wire_impls(target));
+		ret source("import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + struct_wire_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + enum_json_impls(target) + enum_wire_impls(target));
+		ret source("import std::option::Option;\n"
+			+ "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n"
+			+ enum_wire_impls(target));
 	}
 	source("")
 }
@@ -1110,12 +1321,12 @@ macro fun Wire(item: Item): Source {
 // Scalar Json/FromJson over the host JSON functions, exactly the i32 shape:
 // every sized value is a plain JS number, so it serializes as one.
 
-impl i8 with Json {
+export impl i8 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl i8 with FromJson {
+export impl i8 with FromJson {
 	fun from_json(text: str): Result<i8, str> {
 		match text.try_parse_json() {
 			Some(let value) => i8::from_json_value(value),
@@ -1131,12 +1342,12 @@ impl i8 with FromJson {
 	}
 }
 
-impl u8 with Json {
+export impl u8 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl u8 with FromJson {
+export impl u8 with FromJson {
 	fun from_json(text: str): Result<u8, str> {
 		match text.try_parse_json() {
 			Some(let value) => u8::from_json_value(value),
@@ -1152,12 +1363,12 @@ impl u8 with FromJson {
 	}
 }
 
-impl i16 with Json {
+export impl i16 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl i16 with FromJson {
+export impl i16 with FromJson {
 	fun from_json(text: str): Result<i16, str> {
 		match text.try_parse_json() {
 			Some(let value) => i16::from_json_value(value),
@@ -1173,12 +1384,12 @@ impl i16 with FromJson {
 	}
 }
 
-impl u16 with Json {
+export impl u16 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl u16 with FromJson {
+export impl u16 with FromJson {
 	fun from_json(text: str): Result<u16, str> {
 		match text.try_parse_json() {
 			Some(let value) => u16::from_json_value(value),
@@ -1194,12 +1405,12 @@ impl u16 with FromJson {
 	}
 }
 
-impl i53 with Json {
+export impl i53 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl i53 with FromJson {
+export impl i53 with FromJson {
 	fun from_json(text: str): Result<i53, str> {
 		match text.try_parse_json() {
 			Some(let value) => i53::from_json_value(value),
@@ -1215,12 +1426,12 @@ impl i53 with FromJson {
 	}
 }
 
-impl u53 with Json {
+export impl u53 with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl u53 with FromJson {
+export impl u53 with FromJson {
 	fun from_json(text: str): Result<u53, str> {
 		match text.try_parse_json() {
 			Some(let value) => u53::from_json_value(value),
@@ -1236,12 +1447,33 @@ impl u53 with FromJson {
 	}
 }
 
-impl f32 with Json {
+export impl usize with Json {
 	[extern("JSON.stringify")]
 	external fun to_json(self): str;
 }
 
-impl f32 with FromJson {
+export impl usize with FromJson {
+	fun from_json(text: str): Result<usize, str> {
+		match text.try_parse_json() {
+			Some(let value) => usize::from_json_value(value),
+			None => Err("not valid JSON"),
+		}
+	}
+	fun from_json_value(value: JsonValue): Result<usize, str> {
+		if value.kind() == JsonKind::Number {
+			Ok(coerce_usize(value))
+		} else {
+			Err("expected a number")
+		}
+	}
+}
+
+export impl f32 with Json {
+	[extern("JSON.stringify")]
+	external fun to_json(self): str;
+}
+
+export impl f32 with FromJson {
 	fun from_json(text: str): Result<f32, str> {
 		match text.try_parse_json() {
 			Some(let value) => f32::from_json_value(value),
@@ -1253,6 +1485,52 @@ impl f32 with FromJson {
 			Ok(coerce_f32(value))
 		} else {
 			Err("expected a number")
+		}
+	}
+}
+
+// --- `Result` (A104) ----------------------------------------------------------
+//
+// `Option` has carried both directions since this module existed (`:23` and
+// `:264`); `Result` carried neither, so every app wanting a fallible value in JSON
+// wrote the pair itself and chose its own encoding (kolt's `shared.vl:65/80` is a
+// `[kind, value]` array with 0 = Ok and 1 = Err).
+//
+// The spelling here is not a third one. It is EXTERNALLY TAGGED BY VARIANT NAME —
+// `Ok(7)` is `{"Ok":7}`, `Err("nope")` is `{"Err":"nope"}` — which is at once what
+// `[derive(Json)]` gives a one-payload variant and what the wire codec's `Result`
+// impl writes through `begin_variant` (wire.vl's A82 block). One value therefore
+// crosses both codecs under one spelling, and the tags are names rather than
+// discriminants, so neither side depends on declaration order.
+export impl Result<type T: Json, type E: Json> with Json {
+	fun to_json(self): str {
+		match self {
+			Ok(let value) => "{\"Ok\":" + value.to_json() + "}",
+			Err(let error) => "{\"Err\":" + error.to_json() + "}",
+		}
+	}
+}
+
+// Decoding is fallible and never crashes (the rule this module's `FromJson` doc
+// states): the SHAPE is checked before the tag is read, because a tag read is
+// `Object.keys` over the value and a JSON `null` or number has no keys. A wrong
+// shape and an unrecognized tag are both decode errors, and each payload leaf
+// threads its own failure with `!`.
+export impl Result<type T: FromJson, type E: FromJson> with FromJson {
+	fun from_json(text: str): Result<Result<T, E>, str> {
+		match text.try_parse_json() {
+			Some(let value) => Result::from_json_value(value),
+			None => Err("not valid JSON"),
+		}
+	}
+	fun from_json_value(value: JsonValue): Result<Result<T, E>, str> {
+		if value.kind() != JsonKind::Object {
+			ret Err("expected an object");
+		}
+		match value.tag() {
+			"Ok" => Ok(Ok(T::from_json_value(value.field("Ok"))!)),
+			"Err" => Ok(Err(E::from_json_value(value.field("Err"))!)),
+			_ => Err("unknown variant in JSON for enum Result"),
 		}
 	}
 }

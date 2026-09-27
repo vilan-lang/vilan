@@ -148,7 +148,7 @@ mutates the storage **in place** — assigning through a **view**, writing a
 a `&mut self` method that does either. None of it is visible through a capture:
 
 ```vilan
-enum Feed { Ready(List<str>, i32), Done }
+enum Feed { Ready(List<str>, usize), Done }
 
 impl Feed {
 	fun step(&mut self): str {
@@ -394,7 +394,7 @@ a copied refcount miscounts. Destruction is therefore not bolted onto the
 data world: the world is partitioned. **Data** is everything above: copied
 on binding, elided at last use, reclaimed by the host. A **resource** is a
 small, explicitly-rooted class with *affine* discipline (one owner at a
-time, no copies) whose owner's scope end runs its destructor. This section
+time, no copies) whose owner's last use runs its destructor. This section
 is the static **death** cell of §6.0: a resource's move ends the source
 binding's epoch, and `drop` is its final event.
 
@@ -406,22 +406,25 @@ references above.
 
 ### The resource class
 
-- **`resource` is a declaration modifier**, written in `external`'s
-  position: `resource struct S`, `resource external struct D`, `resource
-  enum E`.
+- **`[resource]` is a declaration attribute**, written ahead of
+  `external`: `[resource] struct S`, `[resource] external struct D`,
+  `[resource] enum E`. It labels a struct or an enum and nothing else.
+  (`resource` was a keyword until B413; it is an ordinary name now, and
+  the old `resource struct` spelling is refused with a steer to the
+  attribute.)
 - **Containment infers.** An aggregate (struct, enum, tuple, or fixed
   array `[R; n]`) with a resource field, payload, element, or member type
   *is* a resource, recursively (the `Wire`/`Hashable` all-fields machinery
   with the polarity flipped: any resource member marks the whole). Declaring
-  `resource` on such a type is allowed and checked; omitting it never hides
+  `[resource]` on such a type is allowed and checked; omitting it never hides
   resource-ness.
-- **The modifier is required at leaves.** An `external struct` is opaque, so
+- **The attribute is required at leaves.** An `external struct` is opaque, so
   a host-object resource (`Database`) must declare itself one.
 - **Per-instantiation for generics.** `Option<Database>` is a resource
   instantiation; `Option<i32>` stays data. Resource-ness of a generic type
   is decided at each instantiation, like the platform and asyncness bits.
 - **`Drop` may be implemented only for a resource type** (see below); an
-  impl on a data type is an error steering to add `resource`.
+  impl on a data type is an error steering to add `[resource]`.
 
 ### The affine rules
 
@@ -452,7 +455,7 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  resource struct Guard { label: str }
+  [resource] struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }
@@ -481,7 +484,7 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   right-hand side's own evaluation: the assignment evaluates its new value,
   then destroys what the place holds, then stores. So a right-hand side that
   panics leaves the place holding its original value — still live, still
-  owned, and dropped exactly once at the scope end — rather than a value the
+  owned, and dropped exactly once at its last use — rather than a value the
   overwrite had already destroyed. Where the right-hand side has effects of
   its own, they are observable before the outgoing value's `drop` body runs.
 
@@ -493,7 +496,7 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  resource struct Guard { label: str }
+  [resource] struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }
@@ -523,13 +526,14 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ownership, a body may not move a loaned resource parameter **out** — no
   returning it, no `own`-passing it on, no consuming `match` of it. Doing so
   would hand the caller a second owner while the caller's binding stays live
-  and still drops at its scope end, destroying one value twice. `own` is the
+  and still drops at its own last use, destroying one value twice. `own` is the
   only convention a body may consume, and a **consuming method** therefore
   declares `own self`: `o.unwrap()` is a move of `o`, so a later use of `o` is
-  use-after-move and `o` is not torn down at scope end. A bare `self`
+  use-after-move and `o` owes no teardown at all. A bare `self`
   receiver stays a loan (`db.exec(..)` never consumes `db`).
 - **R4: returns move out**, including through `if` / `match` tails (a
-  diverging leg is exempt). A tail move-out is still a move on *that* path
+  diverging leg — one that `ret`s, `jump`s, `panic`s or loops forever,
+  types §5.1 — is exempt). A tail move-out is still a move on *that* path
   only — R7 reads the arms against each other, so producing a different
   binding from each arm is a conditional move, not two independent returns.
 - **R5: fields.** A struct literal moves resources in. A resource field is
@@ -539,22 +543,23 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   permitted, and is R2's overwrite: the outgoing value is destroyed first.
 - **R6: match consumes.** Matching a resource *by value* consumes the
   subject; pattern captures move the payloads into the arm, and each capture
-  **owns** what it took — it is destroyed at the end of the arm that bound
-  it, in reverse capture order, unless it is moved onward first. The same
-  holds for a `let` pattern (`let (handle, count) = pair`), whose captures
-  drop at the declaring scope's end. Matching a loan (`match &self.state`,
+  **owns** what it took — it is destroyed at its last use inside the arm that
+  bound it, simultaneous captures in reverse capture order, unless it is moved
+  onward first. The same holds for a `let` pattern (`let (handle, count) =
+  pair`), whose captures drop at their last use like any other local. Matching
+  a loan (`match &self.state`,
   and the `x is Some(let v)` test) inspects without consuming: the subject
   keeps ownership and destroys the payload itself, so its captures own
   nothing — and, owning nothing, they may not be **consumed**. This is R3's
   "a loan changes no ownership" read in the capture position: `own`-passing
   a loaned capture, returning it, or matching it by value would hand a
-  second owner the payload the subject still destroys at its own scope end.
+  second owner the payload the subject still destroys at its own last use.
   The fix is to consume the *subject* (`match x` without the `&`), not to
   redeclare the capture — a capture carries no convention to change.
 - **R7: no conditional moves.** A binding must be moved on every path
   through a scope or on none; moving it on one path only is an error. This
-  keeps end-of-scope ownership static: there are no runtime drop flags in
-  v1. **Branch tails are paths too.** R4 makes each arm's tail a move-out,
+  keeps ownership static at the drop point: there are no runtime drop flags
+  in v1. **Branch tails are paths too.** R4 makes each arm's tail a move-out,
   and the arms are alternatives, not a rejoin — so `if flag { x } else { x }`
   is moved on every path and fine, while `if flag { first } else { second }`
   moves each binding on one path and abandons it on the other, and is the
@@ -731,10 +736,12 @@ leg, a loop body or a nested block, exactly as at a body's top level.
 
 - **A loan takes no teardown.** Only an owner destroys. A view *binding* of a
   resource (`let v = &mut holder`) names storage another binding still owns,
-  so its scope end drops nothing — its referent is destroyed once, where the
-  owner's scope ends. This is the same sentence R2's view-write half reads in
-  the other direction: a loan owns nothing, so it neither destroys at its own
-  scope end nor is excused from destroying what it overwrites.
+  so the view's own teardown point drops nothing — its referent is destroyed
+  once, at the owner's last use, which the loan-extension clause above has
+  already stretched to cover the view's. This is the same sentence R2's
+  view-write half reads in the other direction: a loan owns nothing, so it
+  neither destroys at its own last use nor is excused from destroying what it
+  overwrites.
 - **Module-level resources never drop.** A top-level `let` resource has
   process lifetime (the serve-forever server's `Database`). It is
   consequently **loan-only**: moving it into a local, an `own` argument, or
@@ -839,8 +846,10 @@ useful for data too.
 fun drop<T>(own value: T) {}
 ```
 
-Moving a value into `drop` destroys it at that (immediate) scope end instead
-of waiting for the owner's scope to close. The call is rewritten at each
+Moving a value into `drop` destroys it at that statement: the move *is* a
+use, so `drop(x)` is `x`'s last use and the inferred teardown point is the
+one the call was written at (a later mention is use-after-move). The call
+is rewritten at each
 site by the concrete argument type: for a resource it lowers to that type's
 destructor; for plain data it is a no-op that consumes the argument for its
 effects. There is no public `close()` to keep in sync with a destructor;
@@ -850,11 +859,12 @@ emitted once, erased), so R11 rejects it **under a resource instantiation**
 ("whose erased body has no concrete destructor; destroy at a concrete type, or move the value out to the caller"); a data
 instantiation keeps the legitimate no-op consume.
 
-`drop(x)` moves the teardown earlier; it does not remove the scope's safety
-net. The owner's scope end still covers the window between the acquisition
-and the `drop(x)`, so a panic that never reaches the explicit call releases
-the resource on the way out exactly as an implicit scope-end drop would — and
-the two never both fire, so a fall-through path destroys exactly once.
+`drop(x)` names the teardown point; it does not remove the safety net. The
+teardown `finally` opened at the acquisition closes at the `drop(x)`
+statement rather than at the scope end, so it still covers the whole window
+between them: a panic that never reaches the explicit call releases the
+resource on the way out exactly as an inferred drop would — and the two
+never both fire, so a fall-through path destroys exactly once.
 
 ### `OwnedNursery`
 
@@ -866,8 +876,10 @@ R10-rejected, so ownership lives only in the wrapper). `enter(body)` runs
 in the body's dynamic extent registers with the owner) but, unlike
 `nursery`, does *not* join: it returns the body's value as soon as the body
 settles, leaving the spawned tasks running under the owner. Its `Drop`
-cancels the owned nursery, so dropping the owner (at scope end or via
-`drop(owner)`) aborts in-flight bridged IO.
+cancels the owned nursery, so dropping the owner (at its last use or via
+`drop(owner)`) aborts in-flight bridged IO. The owner's last use is
+therefore what bounds the work: if nothing reads the owner after `enter`,
+the tasks are cancelled as soon as `enter` returns.
 
 Its nursery runs in **detached mode**: because nothing ever joins the owned
 children, a child failure that is not a cancellation echo takes the
@@ -980,3 +992,56 @@ closure over a `&mut` parameter, handed to a function that stores it,
 leaves the frame whose place the view names. Nothing in std does this,
 and the shape needs the closure-escape analysis §6.4's dynamic remainder
 is future work for.
+
+## 6.10 `lazy` — a binding initialized at first use
+
+*(Design: [`lazy`](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lazy.md) §2.)*
+
+A **module-level** `let` may be written `lazy`, and then its initializer
+runs at the binding's **first use** instead of at module load, and
+memoizes:
+
+```vilan
+import std::db::Database;
+
+lazy let database: Database = Database::open("kolt.db");
+
+fun main() {
+	database.exec("CREATE TABLE IF NOT EXISTS notes (body TEXT)");
+}
+```
+
+*Everything else about the binding is unchanged.* The module owns the
+value, it has process lifetime and never drops, a resource is loan-only
+and write-frozen (§6.8), a closure may reference it under R9's
+module-level exemption, and the platform coloring of the initializer
+colors the binding exactly as an eager one's does. `lazy` moves one
+event's **time**, and nothing else.
+
+Four rules follow from where the initializer runs:
+
+- **The initializer is sync and context-free.** First touch can happen
+  anywhere, so the deferred code must be self-contained — the same law a
+  `drop` body obeys (§6.8), and for the same reason: neither call site
+  threads a context.
+- **Reentrancy traps.** An initializer that (transitively) reads its own
+  binding panics with `` lazy initialization cycle: `database` ``, via an
+  in-progress flag. It is not a compile error: two lazy bindings that
+  reach each other are legal as long as neither is forced into its own
+  initialization.
+- **A failed initializer poisons the binding.** The panic propagates at
+  the touching site, and every later touch re-panics naming the poison.
+  Retrying would re-run the initializer's side effects and turn "at most
+  once" into "at least once per attempt".
+- **Initialization is atomic within a turn**, by construction: the
+  initializer is synchronous, so nothing interleaves mid-initialization.
+
+A **local** `let` may not be `lazy`: destroying one at the end of its
+scope would need a runtime was-it-initialized flag, and drop flags are
+ratified out (§6.8). Neither may a struct field — a field's forcing point
+is any read anywhere, which is interior mutability through a copyable
+value, and `Shared` (§6.7) is the feature for that.
+
+The same word on a **parameter** defers an argument rather than an
+initializer; the two share one lowering and one semantic — evaluate at
+first demand, at most once, memoize.

@@ -5,6 +5,14 @@
 #
 #   vilan run .     build + run `main.vl`
 #   vilan test .    run every `*_test.vl` in the package
+#
+# `prelude` names the ambient scope every file here resolves under — the names
+# in scope with no import (`proposal/prelude.md` §5). `std::prelude` is the base
+# set (`print`, `Option` with `Some`/`None`, `Result` with `Ok`/`Err`), and it is
+# also what omitting the key means; it is written out so you can see the knob.
+# `main.vl` calls `print` on the strength of it. An app that lives in the browser
+# wants `"std::web"` instead (see `../reactive-ui`); `false` turns it off.
 [package]
 name = "math"
 root = "."
+prelude = "std::prelude"

@@ -32,6 +32,14 @@
 //   * `constructor` / `prototype` / `__proto__` property edges — the host's
 //     class plumbing, which is cyclic by construction in every JS program.
 //
+// THE ONE EXCLUSION BY NAME (A130): `options.designedLoops` lists closure names
+// whose loop is the DESIGN, not a leak — `std::reactive`'s `.cell_global()`
+// names its refresh closure `cell_global_refresh`, and a cell that lives for the
+// program holds root → record → that closure → the chain → root for as long as
+// the program runs. A component containing a closure of such a name is reported
+// under `designed`, never under `components`, and the gate asserts that it SAW
+// one, so the exclusion cannot quietly swallow the walk.
+//
 // WHAT COUNTS AS A CYCLE. An SCC of more than one node containing at least one
 // closure or one scope. Every reactive back edge runs through a capture — a
 // subscriber's notify, an element's listener — so a component with neither is
@@ -42,8 +50,10 @@ const fs = require("fs");
 
 /**
  * @param {string} snapshotPath a file written by `v8.writeHeapSnapshot`
- * @param {{rootEdgeName: string}} options `rootEdgeName` is the global the
- *   harness parked the app's roots under; the walk is scoped to what it reaches.
+ * @param {{rootEdgeName: string, designedLoops?: string[]}} options
+ *   `rootEdgeName` is the global the harness parked the app's roots under; the
+ *   walk is scoped to what it reaches. `designedLoops` names the closures whose
+ *   loop is by design (see the header).
  */
 function analyze(snapshotPath, options) {
     const snapshot = JSON.parse(fs.readFileSync(snapshotPath, "utf8"));
@@ -155,6 +165,8 @@ function analyze(snapshotPath, options) {
     const onStack = new Set();
     const componentStack = [];
     const components = [];
+    const designed = [];
+    const designedNames = new Set(options.designedLoops || []);
     let counter = 0;
     for (const entry of reachable) {
         if (index.has(entry)) continue;
@@ -191,7 +203,12 @@ function analyze(snapshotPath, options) {
                 const isReactive = component.length > 1 && component.some(
                     member => typeOf(member) === "closure" || nameOf(member) === "system / Context",
                 );
-                if (isReactive) components.push(component);
+                if (isReactive) {
+                    const isDesigned = component.some(
+                        member => typeOf(member) === "closure" && designedNames.has(nameOf(member)),
+                    );
+                    (isDesigned ? designed : components).push(component);
+                }
             }
             work.pop();
             if (work.length > 0) {
@@ -204,6 +221,7 @@ function analyze(snapshotPath, options) {
     const describe = node => `${typeOf(node)}/${nameOf(node) || "(anonymous)"}`;
     return {
         components,
+        designed,
         reachable: reachable.size,
         describe,
         report: components

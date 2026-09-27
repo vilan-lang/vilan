@@ -30,6 +30,13 @@
 //!    referenced from some other production, or is the start symbol. A
 //!    production that names a rule nobody wrote, and a rule nothing reaches,
 //!    are both drift.
+//! 5. **The exemptions expire** (N42, N50). Every table at the top of this file
+//!    widens one of the checks above, and a widening is only worth its ink
+//!    while what it covers is still uncovered: a `TOKEN_CLASSES_NOT_IN_LEXICAL`
+//!    class §2 has since declared, a `NON_KEYWORD_TERMINALS` word the compiler
+//!    now has a table for, a `PROSE_DEFINED` name §3 now writes a production
+//!    for, a `PROSE_RIGHT_HAND_SIDES` side that reads as grammar after all, a
+//!    `UNREACHED_PRODUCTIONS` root something reaches — each reds, by name.
 //!
 //! # What this file does NOT verify
 //!
@@ -63,6 +70,16 @@ const LEXICAL: &str = "vilan/docs/spec/lexical.md";
 /// Identifier-shaped terminals the EBNF quotes that are not keywords, not
 /// attribute markers and not extern form words, with what each is. Every one
 /// is a CONTEXTUAL word or a fixed argument the parser matches by text.
+/// Attribute markers the parser RECOGNIZES but no longer ACCEPTS — a retired
+/// attribute whose name is still matched so the refusal can name what replaced
+/// it, rather than reporting "found `[` expected `fun`" at a form the book used
+/// to recommend. Spec §3 must NOT spell these: the grammar says what parses.
+const REFUSED_ATTRIBUTE_MARKERS: &[(&str, &str)] = &[(
+    "doc",
+    "`[doc(hidden)]` is retired (B318 §7.5) — recognized so the refusal can \
+     steer to `export`, never accepted",
+)];
+
 const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
     ("context", "the contextual clause on a closure type (§2.2)"),
     (
@@ -70,12 +87,66 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
         "the contextual marker opening a closure type (§7.4)",
     ),
     ("on", "the element head's event form: `on:click(..)`"),
-    ("hidden", "the sole argument of `[doc(hidden)]`"),
+    (
+        "keyed",
+        "the sole argument of `[expose(keyed)]` / `[expose(keyed = K)]` (A39, A51)",
+    ),
+    (
+        "client",
+        "the named argument of `[service(.., client = H)]` (transport-rpc.md §9.3, R1)",
+    ),
+    (
+        "http",
+        "the opt-in marker `[service(.., http)]` — the service is meant to be reached over the \
+         connectionless POST leg, so a handle- or `[expose]`-bearing member is refused at its \
+         declaration (transport-rpc.md §9.7.5, A120 S5)",
+    ),
+    (
+        "as",
+        "the contextual alias on an import/use path leaf (§3.2, E142)",
+    ),
+    (
+        "only",
+        "the contextual trailing modifier on an import statement (§3.2, B318)",
+    ),
     ("_", "the wildcard pattern"),
+    (
+        "self",
+        "the file's own module in `mod self;` (§3.1, B415) — an identifier the parser \
+         matches by text and reserves as a module name, never a keyword",
+    ),
+    (
+        "void",
+        "the unit VALUE, the sixth literal (§2.2 lists it contextual; N113 — \
+         the atom production read every `void` as the unit from the day it \
+         shipped, and §3's literal production did not say so)",
+    ),
 ];
 
 /// Nonterminals the document defines in PROSE rather than with a production,
 /// with where. Each is a token run the grammar deliberately does not shape.
+/// N113: `void` is a LITERAL, and §3's literal production must say so.
+///
+/// The atom production has read every `void` as the unit value since the day
+/// it shipped, and §2.2 lists the word; §3's `literal` rule offered five
+/// alternatives and not this one, so the normative grammar described a
+/// language in which the unit value cannot be written. Held by name rather
+/// than by the coverage check above, which only asks that the word appear
+/// SOMEWHERE — it appeared in two prose sentences, which is how this stayed
+/// invisible.
+#[test]
+fn n113_the_literal_production_offers_the_unit_value() {
+    let grammar = read("vilan/docs/spec/grammar.md");
+    let production = grammar
+        .lines()
+        .find(|line| line.starts_with("literal "))
+        .expect("§3 writes a `literal` production");
+    assert!(
+        production.contains("\"void\""),
+        "the literal production must offer `void`, the unit value: {production}"
+    );
+}
+
 const PROSE_DEFINED: &[(&str, &str)] = &[(
     "expr-span",
     "a raw balanced token run handed to a macro as source text — §3.3's \
@@ -102,26 +173,25 @@ const UNREACHED_PRODUCTIONS: &[(&str, &str)] = &[("module", "the start symbol (�
 const TOKEN_CLASSES_NOT_IN_LEXICAL: &[(&str, &str)] = &[
     (
         "NAME",
-        "`an identifier or any keyword` — §3.6's element-name rule defines it          in its own fence comment, because it is a §3 concept",
-    ),
-    (
-        "ISTRING",
-        "`i\"...\"`, the single-line interpolated string. §2 describes it in          prose (§2.4) and declares only its multiline twin          (INTERPOLATED_MULTILINE); a production there would be better",
+        "`an identifier or any keyword` — §3.6's element-name rule defines it \
+         in its own fence comment, because it is a §3 concept",
     ),
     (
         "TOKEN",
-        "`any token but \";\", \"{\", \"}\"` — the css-block value scanner's          meta-class, defined in §3.6's own fence comment",
+        "`any token but \";\", \"{\", \"}\"` — the css-block value scanner's \
+         meta-class, defined in §3.6's own fence comment",
     ),
     (
         "INTEGER",
-        "`NUMBER without a fractional part and without a SUFFIX` — declared in          §3.3's fixed-array fence, over §2's NUMBER",
+        "`NUMBER without a fractional part and without a SUFFIX` — declared in \
+         §3.3's fixed-array fence, over §2's NUMBER",
     ),
 ];
 
-/// Every capitalized token class §3 may use: the productions `spec/lexical.md`
-/// writes, plus the recorded few above. Read from §2 rather than copied, so a
-/// class that leaves §2 stops being available to §3.
-fn token_classes() -> BTreeSet<String> {
+/// The token classes `spec/lexical.md` DECLARES — §2's own productions, and
+/// nothing else. Read from the document rather than copied, so a class that
+/// leaves §2 stops being available to §3.
+fn lexical_token_classes() -> BTreeSet<String> {
     let lexical = read(LEXICAL);
     let mut classes: BTreeSet<String> = BTreeSet::new();
     for line in lexical.lines() {
@@ -137,8 +207,16 @@ fn token_classes() -> BTreeSet<String> {
     }
     assert!(
         classes.len() >= 4,
-        "spec/lexical.md reads as {classes:?} token classes — the §2 scan has          stopped matching"
+        "spec/lexical.md reads as {classes:?} token classes — the §2 scan has \
+         stopped matching"
     );
+    classes
+}
+
+/// Every capitalized token class §3 may use: the productions `spec/lexical.md`
+/// writes, plus the recorded few above.
+fn token_classes() -> BTreeSet<String> {
+    let mut classes = lexical_token_classes();
     classes.extend(
         TOKEN_CLASSES_NOT_IN_LEXICAL
             .iter()
@@ -343,6 +421,11 @@ fn every_attribute_marker_is_spelled_in_the_normative_grammar() {
         .iter()
         .copied()
         .filter(|marker| !terminals.contains(*marker))
+        .filter(|marker| {
+            !REFUSED_ATTRIBUTE_MARKERS
+                .iter()
+                .any(|(refused, _)| refused == marker)
+        })
         .collect();
     assert!(
         missing.is_empty(),
@@ -480,5 +563,254 @@ fn every_production_the_grammar_writes_is_one_the_grammar_reaches() {
         "spec §3 writes production(s) nothing reaches: {unreached:?}. Either a \
          rule that references them was dropped (the grammar is behind the \
          parser), or they are dead and should go."
+    );
+}
+
+#[test]
+fn every_recorded_token_class_still_needs_recording() {
+    // The inverse of the exemption (tracker N42). `TOKEN_CLASSES_NOT_IN_LEXICAL`
+    // widens what §3 may name, and a widening only earns its ink while the thing
+    // it covers is still uncovered: the moment `spec/lexical.md` grows a
+    // production for one of these, the entry stops exempting anything and
+    // becomes a claim about the document that is no longer true.
+    //
+    // This is not hypothetical. N39 removed `ISTRING` from this list BY HAND,
+    // having noticed it in a read-through, and nothing would have noticed it
+    // otherwise: the gate stays green either way, because a name that is BOTH
+    // recorded here and declared in §2 is simply inserted twice into a set.
+    let declared = lexical_token_classes();
+    let stale: Vec<&str> = TOKEN_CLASSES_NOT_IN_LEXICAL
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| declared.contains(*name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "token class(es) {stale:?} are recorded in TOKEN_CLASSES_NOT_IN_LEXICAL as \
+         classes `{LEXICAL}` does not declare — and it declares them. The exemption \
+         covers nothing now: delete the entry, and §2's production carries the class \
+         on its own."
+    );
+}
+
+// --- The exemptions' inverses (tracker N50) ---------------------------------
+//
+// Four of the five tables at the top of this file WIDEN a gate, and the fifth
+// (`TOKEN_CLASSES_NOT_IN_LEXICAL`) already has the check that keeps a widening
+// honest: `every_recorded_token_class_still_needs_recording`, N42's shape. The
+// other four rot in the same silent direction and for the same reason — being
+// listed only ever SUBTRACTS work, so an entry whose reason has stopped holding
+// goes on subtracting it forever, and the gate stays green either way. N39
+// removed a rotted entry from the fifth list BY HAND, having noticed it in a
+// read-through, which is how long the silence lasts otherwise.
+//
+// Each check below asks its table's own question — "is this still exempting
+// anything?" — with the predicate the gate it widens uses, so an entry these
+// tests call dead is an entry the gate would hold on its own.
+
+#[test]
+fn every_refused_attribute_marker_still_needs_recording() {
+    // `REFUSED_ATTRIBUTE_MARKERS` widens check 2: a marker listed here is
+    // allowed to be a name the parser matches that §3 never spells. It stops
+    // exempting anything two ways — the parser drops the name (there is nothing
+    // left to recognize), or §3 spells it again (the form is back, and the
+    // entry now hides a real grammar).
+    let quoted = terminals(&ebnf());
+    let stale: Vec<String> = REFUSED_ATTRIBUTE_MARKERS
+        .iter()
+        .filter_map(|(marker, _)| {
+            if !KNOWN_ATTRIBUTE_MARKERS.contains(marker) {
+                Some(format!(
+                    "  {marker:?}: the parser no longer matches the name at all"
+                ))
+            } else if quoted.contains(*marker) {
+                Some(format!(
+                    "  {marker:?}: spec §3 spells it again, so the form parses \
+                     and check 2 covers it"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in REFUSED_ATTRIBUTE_MARKERS record a marker as refused-but-\
+         recognized that is no longer one:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_recorded_non_keyword_terminal_still_needs_recording() {
+    // `NON_KEYWORD_TERMINALS` widens check 1: a quoted terminal listed here is
+    // allowed to be a word no compiler table knows. Two ways that stops being
+    // true — the word becomes a keyword, a marker or an extern form word (the
+    // table now covers it, and the entry claims otherwise), or the grammar
+    // stops quoting it at all (there is nothing left to exempt).
+    let quoted = terminals(&ebnf());
+    let known: BTreeSet<String> = KEYWORDS
+        .iter()
+        .map(|(word, _)| (*word).to_string())
+        .chain(
+            KNOWN_ATTRIBUTE_MARKERS
+                .iter()
+                .map(|word| (*word).to_string()),
+        )
+        .chain(extern_form_words())
+        .collect();
+    let stale: Vec<String> = NON_KEYWORD_TERMINALS
+        .iter()
+        .filter_map(|(word, _)| {
+            if !quoted.contains(*word) {
+                Some(format!(
+                    "  {word:?}: spec §3's EBNF no longer quotes it, so the entry \
+                     exempts nothing"
+                ))
+            } else if known.contains(*word) {
+                Some(format!(
+                    "  {word:?}: the compiler has a table for it now, so check 1 \
+                     accepts it on its own"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in NON_KEYWORD_TERMINALS record a word as contextual that is \
+         no longer one. Delete the entry — the word's own table carries it:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_prose_defined_name_still_needs_recording() {
+    // `PROSE_DEFINED` widens check 4's first half: a name listed here may be
+    // referenced without any production writing it, because the prose beneath
+    // its fence defines it. The claim dies when §3 grows a production for the
+    // name — the fence is no longer the definition — and the entry stops
+    // exempting anything when no production references the name at all.
+    let productions = productions(&ebnf());
+    let referenced: BTreeSet<String> = productions
+        .iter()
+        .flat_map(|(name, body)| {
+            references(body)
+                .into_iter()
+                .filter(move |reference| reference != name)
+        })
+        .collect();
+    let stale: Vec<String> = PROSE_DEFINED
+        .iter()
+        .filter_map(|(name, _)| {
+            if productions.contains_key(*name) {
+                Some(format!(
+                    "  `{name}`: spec §3 writes a production for it now, so check 4 \
+                     resolves it on its own"
+                ))
+            } else if !referenced.contains(*name) {
+                Some(format!(
+                    "  `{name}`: no production names it any more, so there is \
+                     nothing left to resolve"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in PROSE_DEFINED record a name as defined in prose that no \
+         longer needs it. Delete the entry:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_prose_right_hand_side_still_needs_recording() {
+    // `PROSE_RIGHT_HAND_SIDES` widens check 4 the hard way: it drops a whole
+    // production's right-hand side out of the scan, because that side is
+    // English rather than shape. So the question is the one check 4 would ask —
+    // read as grammar, does this side name anything undefined? A production
+    // rewritten into real shape names nothing undefined, and then the exemption
+    // is blinding the check over a side it would pass.
+    let productions = productions(&ebnf());
+    let classes = token_classes();
+    let stale: Vec<String> = PROSE_RIGHT_HAND_SIDES
+        .iter()
+        .filter_map(|(name, _)| {
+            let Some(body) = productions.get(*name) else {
+                return Some(format!(
+                    "  `{name}`: spec §3 no longer writes this production, so the \
+                     entry exempts nothing"
+                ));
+            };
+            let undefined: Vec<String> = references(body)
+                .into_iter()
+                .filter(|reference| {
+                    !productions.contains_key(reference)
+                        && !classes.contains(reference)
+                        && !PROSE_DEFINED
+                            .iter()
+                            .any(|(word, _)| *word == reference.as_str())
+                })
+                .collect();
+            undefined.is_empty().then(|| {
+                format!(
+                    "  `{name}`: read as grammar its right-hand side names nothing \
+                     undefined, so check 4 holds it as written"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in PROSE_RIGHT_HAND_SIDES take a production out of check 4 \
+         that check 4 would pass. Delete the entry — the production is shape now, \
+         and hiding it from the check hides its future drift too:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn every_unreached_production_is_still_written_and_still_unreached() {
+    // `UNREACHED_PRODUCTIONS` widens check 4's second half for the start symbol
+    // and nothing else. A production some other production reaches now needs no
+    // exemption, and one the grammar no longer writes cannot be reached or
+    // unreached — either way the entry is a claim about a document that has
+    // moved on.
+    let productions = productions(&ebnf());
+    let referenced: BTreeSet<String> = productions
+        .iter()
+        .flat_map(|(name, body)| {
+            references(body)
+                .into_iter()
+                .filter(move |reference| reference != name)
+        })
+        .collect();
+    let stale: Vec<String> = UNREACHED_PRODUCTIONS
+        .iter()
+        .filter_map(|(name, _)| {
+            if !productions.contains_key(*name) {
+                Some(format!(
+                    "  `{name}`: spec §3 no longer writes this production"
+                ))
+            } else if referenced.contains(*name) {
+                Some(format!(
+                    "  `{name}`: some production reaches it now, so check 4 holds \
+                     it on its own"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "entry(ies) in UNREACHED_PRODUCTIONS record a production as unreachable \
+         that is not. Delete the entry — the start symbol is the only one there \
+         should ever be:\n{}",
+        stale.join("\n")
     );
 }

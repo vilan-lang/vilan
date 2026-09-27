@@ -3,7 +3,9 @@
 // already a JS reference), so these behave like the bare forms.
 import std::io::print;
 
-struct Counter { value: i32 }
+struct Counter {
+	value: i32,
+}
 
 impl Counter {
 	fun increment(&mut self) {
@@ -17,7 +19,7 @@ fun bump(&mut c: Counter) {
 
 fun main() {
 	mut c = Counter { value = 10 };
-	c.increment();  // &mut self method:  10 -> 11
-	bump(&mut c);   // &mut param + &mut arg: 11 -> 21
+	c.increment(); // &mut self method:  10 -> 11
+	bump(&mut c); // &mut param + &mut arg: 11 -> 21
 	print(c.value); // 21
 }

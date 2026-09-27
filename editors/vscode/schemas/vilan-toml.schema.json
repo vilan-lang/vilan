@@ -255,6 +255,35 @@
         }
       }
     },
+    "fmt": {
+      "type": "object",
+      "description": "`vilan fmt`'s knobs for this package.",
+      "additionalProperties": false,
+      "properties": {
+        "wrap_comments": {
+          "type": "boolean",
+          "description": "Re-fill a paragraph of `//` / `///` comment lines to the comment width, the way code is already laid out (default false)."
+        },
+        "comment_width": {
+          "type": "integer",
+          "description": "The column budget a re-filled comment paragraph is laid out to, at that comment's own indentation. Prose is not code: a package whose comments are written narrower than its code says so here. Read only when `wrap_comments` is on.",
+          "default": 100
+        }
+      }
+    },
+    "lints": {
+      "type": "object",
+      "description": "The warnings this package asks for that the compiler does not raise by default.",
+      "additionalProperties": false,
+      "properties": {
+        "internal_use": {
+          "type": "string",
+          "enum": ["allow", "warn"],
+          "description": "`warn`: a warning at every use of an `[internal(\"reason\")]` item outside the module that declares it. Default `allow` — the label on its own only changes what the editor shows.",
+          "default": "allow"
+        }
+      }
+    },
     "macro": {
       "type": "object",
       "description": "The compile-time interpreter's budget.",

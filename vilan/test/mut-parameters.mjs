@@ -4,6 +4,31 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function fold_unsigned(value, modulus) {
+	const truncated = Math.trunc(value);
+	const wrapped = truncated % modulus;
+	let $a = null;
+	if (wrapped < 0) {
+		$a = wrapped + modulus;
+	} else {
+		$a = wrapped;
+	}
+	return $a;
+}
+function fold_signed(value, modulus, half) {
+	const wrapped = fold_unsigned(value, modulus);
+	let $b = null;
+	if (wrapped >= half) {
+		$b = wrapped - modulus;
+	} else {
+		$b = wrapped;
+	}
+	return $b;
+}
+function as_i32(self) {
+	const widened = Number(self);
+	return Number(fold_signed(widened, 4294967296, 2147483648));
+}
 function bump(x) {
 	x = x + 1;
 	return x;
@@ -11,7 +36,7 @@ function bump(x) {
 function grow(xs) {
 	xs = __clone(xs);
 	xs.push(9);
-	return xs.length;
+	return as_i32(xs.length);
 }
 function poke(x) {
 	x = [ x ];

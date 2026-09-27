@@ -15,8 +15,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_conditional_get_{tag}_{}",
         std::process::id()
     ));

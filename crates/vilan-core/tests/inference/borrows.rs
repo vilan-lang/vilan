@@ -47,25 +47,36 @@ fn reactive_map_sub_and_set_with() {
 
 #[test]
 fn owner_disposes_subscriptions_across_re_renders() {
-    // A2: the leak fix. Mimics `bind_each` — `source` drives re-renders; each
-    // render disposes the previous rows' subscriptions (`rows.dispose()`) and
-    // creates fresh ones. After several renders only the *current* rows fire, so
-    // the count stays bounded (a leak would give 6, not 2).
+    // A2: the leak fix. Mimics `each` — `source` drives re-renders; each
+    // render disposes the previous rows' subscriptions and creates fresh ones
+    // under a FRESH owner. After several renders only the *current* rows fire,
+    // so the count stays bounded (a leak would give 6, not 2).
+    //
+    // The fresh owner per render is `std::ui`'s own discipline — every
+    // boundary in `browser/ui.vl` (`each`'s rows, `when`, `swap`) disposes
+    // the old owner and mints a new one, never refilling the disposed one — and
+    // since B291 it is the only shape that works: an `Owner` has a disposed
+    // state, and a `take` on a disposed owner releases the item on the spot
+    // rather than parking a cleanup nothing would ever run. This pin drove the
+    // dead owner before B291 and read 2 by accident, because the cleanups it
+    // parked were never run by anything either.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::shared::Shared;
-        import std::reactive::{ Signal, SignalCell, Owner };
+        import std::reactive::{ Disposable, Signal, SignalCell, Owner };
         fun main() {
             let source = Signal::new(0);
             let data = Signal::new(0);
-            let rows = Owner::new();
+            let rows: Shared<Owner> = Shared::new(Owner::new());
             let fires = Shared::new(0);
             let outer = Owner::new();
             outer.take(source.sub(|_| {
-                rows.dispose();
-                rows.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
-                rows.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
+                rows.read().dispose();
+                let fresh = Owner::new();
+                fresh.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
+                fresh.take(data.sub(|_| { fires.write() = fires.read() + 1; }));
+                rows.write() = fresh;
             }));
             source.set(1);
             source.set(2);
@@ -293,7 +304,7 @@ fn method_closure_param_inferred_from_argument_generic() {
     // A method's own generic bound from a (nested) argument must reach its closure
     // parameters: `pick<T, K>(rows: List<List<T>>, key: |T| K, get: |T| i32)` typed
     // `|p| p.id`'s `p` as the abstract `T` until the own-generic binding ran first.
-    // This is the `bind_each(source: SignalCell<List<T>>, |todo| todo.id, ..)` shape.
+    // This is the `each(source: SignalCell<List<T>>, |todo| todo.id, ..)` shape.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -339,9 +350,10 @@ fn logical_or_operator() {
 #[test]
 fn reactive_combine_variadic() {
     // The driving example: `combine` is variadic over its inputs' distinct types
-    // via a mapped-tuple parameter, yielding a `Signal` of the tuple that
-    // recomputes when any input changes. The consumer destructures the tuple with
-    // a closure tuple binder.
+    // via a mapped-tuple parameter, yielding a source of the tuple that changes
+    // when any input changes. The consumer destructures the tuple with a closure
+    // tuple binder. Since A124 S2c `combine` answers a `Combine` node, so the
+    // `SignalCell` this annotation names is its `.cell()`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -351,7 +363,7 @@ fn reactive_combine_variadic() {
             let a = Signal::new(1);
             let b = Signal::new("x");
             let c = Signal::new(true);
-            let combined: SignalCell<(i32, str, bool)> = combine((a, b, c));
+            let combined: SignalCell<(i32, str, bool)> = combine((a, b, c)).cell();
             combined.sub(|(n, s, flag)| print(i"{n.to_string()} {s} {flag}"));
             a.set(2);
             b.set("y");
@@ -365,9 +377,39 @@ fn reactive_combine_variadic() {
 fn tuple_comprehension_over_mapped_source() {
     // A tuple comprehension `(x in xs => e)` maps each element of a mapped-tuple
     // source through the body, typing as `(U in T: <body>)`. Here `source.len()`
-    // collapses `(List<i32>, List<str>)` to `(i32, str) = T`. Lowers to a runtime
-    // `.map`, so it's arity-independent.
+    // sends every element to a `usize`, so the result is `(U in T: usize)` — the
+    // arity of `T` with `usize` in every slot. Lowers to a runtime `.map`, so it's
+    // arity-independent.
+    //
+    // B211 changed the RETURN this is declared with. It used to read `: T`, and
+    // that was never true: with `T = (i32, str)` the body produces `(usize, usize)`.
+    // It compiled because `reconcile_type`'s generic arm bound the body's OWN
+    // `T` to the mapped type — the leak B211 closed — and the run only looked
+    // right because `to_string` on a number reads the same either way. The
+    // declared return is now the type the body has, and the old spelling is
+    // refused (pinned below).
     assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        fun lengths<T: (2..)>(sources: (U in T: List<U>)): (U in T: usize) {
+            (source in sources => source.len())
+        }
+        fun main() {
+            let (a, b) = lengths(([1, 2, 3], ["a", "b"]));
+            print(i"{a.to_string()} {b.to_string()}");
+        }
+        "#,
+        "3 2\n",
+    );
+}
+
+#[test]
+fn b211_a_comprehension_may_not_re_bind_its_own_source_parameter() {
+    // The verdict change above, held as its own pin: declaring the return `T`
+    // when the body maps every element to a `usize` is a mismatch, not a binding.
+    // Before B211 this compiled and ran.
+    assert_fails_with(
         r#"
         import std::io::print;
         import std::display::Display;
@@ -379,7 +421,7 @@ fn tuple_comprehension_over_mapped_source() {
             print(i"{a.to_string()} {b.to_string()}");
         }
         "#,
-        "3 2\n",
+        "Expected T, but got (U in T: usize) instead.",
     );
 }
 
@@ -1044,6 +1086,12 @@ fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
     // generic argument is deliberately unconstrained, which is sound only
     // because a derived type's parameters are necessarily phantom
     // (`a_wire_type_with_a_parameter_typed_field_is_rejected` is the other half).
+    //
+    // B194 is why this still holds now that derived impls carry bounds: the
+    // trait binds only the parameters the generated body REACHES, and a phantom
+    // one takes a bare binder. Rust's rule (bind every parameter) would refuse
+    // this program. `generics::b194_a_phantom_parameter_takes_a_bare_binder`
+    // runs the round trip this compiles.
     assert_compiles(
         r#"
         import std::arena::{ Arena, Handle };
@@ -1063,9 +1111,11 @@ fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
 fn a_wire_type_with_a_parameter_typed_field_is_rejected() {
     // The guard behind C7's unconstrained generic arguments: a `[derive(Wire)]`
     // type whose field is typed by a PARAMETER is rejected at its own
-    // declaration (the derive emits no generic impls), so no derived type can
-    // put a generic argument on the wire. If generic Wire derives ever land,
-    // `is_wire_type` must start checking the arguments.
+    // declaration, so no derived type can put a generic argument on the wire.
+    // B194 made the generators generic-aware, and this guard is what keeps
+    // `Wire`'s parameters phantom-only, so a `Wire` impl never binds one. If
+    // this rule is ever relaxed, `is_wire_type` must start checking the
+    // arguments on the same day.
     assert_fails_with(
         r#"
         [derive(Wire)]
@@ -1334,7 +1384,7 @@ fn own_parameter_is_a_mutable_copy() {
         r#"
         import std::io::print;
         fun bump(own x: i32): i32 { x += 1; x }
-        fun grow(own xs: List<i32>): i32 { xs = [7, 8, 9, 10]; xs.len() }
+        fun grow(own xs: List<i32>): usize { xs = [7, 8, 9, 10]; xs.len() }
         fun main() {
             mut a = 10;
             print(bump(a)); // 11
@@ -1370,7 +1420,7 @@ fn a_mut_parameter_is_invisible_to_the_caller() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun grow(mut xs: List<i32>): i32 { xs.push(9); xs.len() }
+        fun grow(mut xs: List<i32>): usize { xs.push(9); xs.len() }
         fun main() {
             mut list = [1, 2];
             print(grow(list));  // 3 — the callee's copy grew
@@ -1435,7 +1485,7 @@ fn a_closure_mut_parameter_types_from_a_declared_closure_argument() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun apply(xs: List<i32>, grow: |List<i32>| i32): i32 { grow(xs) }
+        fun apply(xs: List<i32>, grow: |List<i32>| usize): usize { grow(xs) }
         fun main() {
             mut list = [1, 2];
             print(apply(list, |mut xs| {
@@ -1563,7 +1613,7 @@ fn a_mut_parameter_never_takes_a_resource() {
     // rejection steers to `own` (transfer), the sanctioned resource intake.
     assert_fails_with(
         r#"
-        resource struct Conn { id: i32 }
+        [resource] struct Conn { id: i32 }
         impl Conn { fun close(own self) {} }
         fun misuse(mut c: Conn) {}
         fun main() {}
@@ -1897,7 +1947,7 @@ fn an_own_parameter_capture_shares_when_nothing_writes_it() {
     // same elision seen in bytes — it regained its pre-B60 form here.)
     let source = r#"
         import std::io::print;
-        fun peek(own pair: (List<i32>, i32)): i32 {
+        fun peek(own pair: (List<i32>, i32)): usize {
             let (first, second) = pair;
             first.len()
         }
@@ -1923,7 +1973,7 @@ fn an_own_parameter_capture_copies_when_a_method_writes_it() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun observe(own pair: (List<i32>, i32)): i32 {
+        fun observe(own pair: (List<i32>, i32)): usize {
             let (first, second) = pair;
             pair.0.push(7);
             first.len()
@@ -1943,7 +1993,7 @@ fn an_own_parameter_capture_copies_when_an_assignment_writes_it() {
         r#"
         import std::io::print;
         struct Holder { xs: List<i32> }
-        fun observe(own pair: (Holder, i32)): i32 {
+        fun observe(own pair: (Holder, i32)): usize {
             let (first, second) = pair;
             pair.0.xs = [ 9, 9 ];
             first.xs.len()
@@ -1972,7 +2022,7 @@ fn a_generic_capture_moves_a_resource_instantiation() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res {
+        [resource] struct Res {
             n: i32,
         }
         fun main() {
@@ -2002,7 +2052,7 @@ fn a_moved_resource_instantiation_destroys_one_value() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::{ Drop, drop };
-        resource struct Res {
+        [resource] struct Res {
             tag: str,
             n: i32,
         }
@@ -2042,7 +2092,7 @@ fn a_generic_aggregate_capture_moves_a_resource_instantiation() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res {
+        [resource] struct Res {
             n: i32,
         }
         impl Res with Drop {
@@ -2140,6 +2190,99 @@ fn a_mut_array_binder_in_an_is_test_stamps_its_elements() {
     );
 }
 
+// --- A80: a mutable binder in a VARIANT payload ------------------------------
+//
+// B53 finding 5 carried `mut` through the tuple and array binders of a match;
+// the variant payload is the same keyword in the same grammar, and the pins
+// below are the ones the item was filed for. A binder is a BINDING, so `mut`
+// buys a mutable binding of a COPY — exactly what `mut x = value` buys one
+// statement away — and the value the arm matched is untouched. Writing the
+// mutated copy back through a `&mut` subject is what reaches the original.
+
+#[test]
+fn a80_a_mut_binder_in_a_variant_payload_is_mutable_in_the_arm() {
+    // The item's own exhibit. `Some(let list) => list.push(9)` is refused with
+    // "cannot mutate immutable 'list'" (the pin below), and the workaround was
+    // `Option::take`/`replace`, which is not obvious. The arm's own push lands,
+    // and the assignment through `held` — the `&mut` subject the closure was
+    // handed — is what carries it into the cell.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::SignalCell;
+        fun main() {
+            let cell = SignalCell::new(Some([1]));
+            cell.update(|&mut held| {
+                match held {
+                    Some(mut list) => {
+                        list.push(9);
+                        print(list.len());
+                        held = Some(list);
+                    }
+                    None => void,
+                }
+            });
+            match cell.get() {
+                Some(let list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn a80_a_mut_binder_in_a_variant_payload_binds_a_copy() {
+    // The half that is not the sugar: rule 1 copies at a binding, and a pattern
+    // binder is a binding — `mut [a, b]`'s pin two screens up says the same
+    // thing for the array form. So the arm's push does NOT reach the matched
+    // value, and a reader who wants it to has to write it back.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut slot = Some([1]);
+            match slot {
+                Some(mut list) => {
+                    list.push(9);
+                    print(list.len());
+                }
+                None => void,
+            }
+            match slot {
+                Some(let list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "2\n1\n",
+    );
+}
+
+#[test]
+fn a80_a_let_binder_in_a_variant_payload_is_still_immutable() {
+    // The control that says `mut` is what changed: `let` binds immutably in a
+    // pattern exactly as it does in a declaration, and the refusal an author
+    // meets when they reach for the mutation is the one that sent them here.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let list) => {
+                    list.push(9);
+                    print(list.len());
+                }
+                None => void,
+            }
+        }
+        "#,
+        "cannot mutate immutable 'list'",
+    );
+}
+
 #[test]
 fn a_guard_that_needs_a_temporary_emits_it() {
     // B59: a guard whose expression needs hoisted statements (an `is` test, a
@@ -2180,7 +2323,7 @@ fn a_guard_that_needs_a_temporary_emits_it() {
 
 #[test]
 fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
-    // B81's filed repro. `at` is an `i32`, so it owes no copy and kept its
+    // B81's filed repro. `at` is a `usize`, so it owes no copy and kept its
     // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to a write in place
     // (`__replace(self, ..)`), mutating the very array `$a` aliases, so
     // `items[at]` indexed with the INCREMENTED `at`. Printed "b\nc" for two
@@ -2190,7 +2333,7 @@ fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         impl Feed {
@@ -2225,7 +2368,7 @@ fn an_is_capture_from_a_mut_parameter_subject_is_unchanged() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         fun step(mut feed: Feed): Option<str> {
@@ -2255,7 +2398,7 @@ fn an_is_capture_from_a_mut_view_parameter_reads_the_prematch_value() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         fun step(feed: &mut Feed): str {
@@ -2289,7 +2432,7 @@ fn an_is_capture_from_a_dereferenced_view_local_copies_and_reads_early() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         fun main() {
@@ -2341,7 +2484,7 @@ fn a_guarded_leg_capture_from_a_viewed_subject_reads_the_prematch_value() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         impl Feed {
@@ -2376,7 +2519,7 @@ fn an_unguarded_match_leg_on_a_viewed_subject_was_already_right() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         impl Feed {
@@ -2418,7 +2561,7 @@ fn both_capture_shapes_survive_an_in_place_write_through_the_view() {
             if pair is (let items, let at) {
                 pair.0.push("d");
                 pair.1 = 9;
-                items.len() + at
+                items.len().as_i32() + at
             } else {
                 -1
             }
@@ -2449,7 +2592,7 @@ fn a_nested_capture_from_a_viewed_subject_reads_the_prematch_value() {
             fun step(&mut self): i32 {
                 if self is Pair::Two((let xs, let k), let at) {
                     self = Pair::Two(([9, 9, 9, 9], 7), 5);
-                    xs.len() + k + at
+                    xs.len().as_i32() + k + at
                 } else {
                     -1
                 }
@@ -2509,7 +2652,7 @@ fn a_resource_capture_from_a_viewed_subject_loans_the_prematch_payload() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Conn {
+        [resource] struct Conn {
             id: i32,
         }
         enum Slot {
@@ -2545,7 +2688,7 @@ fn a_resource_capture_from_a_place_subject_loans_the_prematch_payload() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Conn {
+        [resource] struct Conn {
             id: i32,
         }
         enum Slot {
@@ -2582,7 +2725,7 @@ fn a_readonly_view_subject_keeps_its_shared_accessors() {
         impl Feed {
             fun peek(&self): i32 {
                 if self is Feed::Ready(let items, let at) {
-                    items.len() + at
+                    items.len().as_i32() + at
                 } else {
                     -1
                 }
@@ -2724,7 +2867,7 @@ fn a_shortening_write_through_a_view_truncates_under_const_eval() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun replace(v: &mut List<i32>): i32 {
+        fun replace(v: &mut List<i32>): usize {
             v = [9];
             v.len()
         }
@@ -2756,7 +2899,7 @@ fn a_view_write_drops_the_overwritten_variants_resource() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop {
             fun drop(&mut self) {
                 print(i"dropped {self.label}");
@@ -2801,7 +2944,7 @@ fn a_view_write_of_the_same_variant_width_drops_the_old_payload() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Full(Guard), Empty }}
         impl Holder {{ fun swap(&mut self) {{ self = Holder::Full(Guard {{ label = "second" }}); }} }}
@@ -2835,7 +2978,7 @@ fn a_view_write_that_grows_the_variant_drops_the_old_payload() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Small(Guard), Big(Guard, i32, i32), Empty }
         impl Holder {
@@ -2861,7 +3004,7 @@ fn a_view_write_to_a_struct_pointee_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         fun reset(g: &mut Guard) { g = Guard { label = "new" }; }
         fun main() {
@@ -2885,7 +3028,7 @@ fn a_view_write_drops_before_the_truncating_replace_clobbers_the_payload() {
     let source = r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(List<i32>, Guard), Empty }
         impl Holder { fun clear(&mut self) { self = Holder::Empty; } }
@@ -2923,7 +3066,7 @@ fn a_view_write_drops_the_payload_in_the_owned_paths_order() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Pair(Guard, Guard), Empty }}
         impl Holder {{ fun clear(&mut self) {{ self = Holder::Empty; }} }}
@@ -2954,7 +3097,7 @@ fn a_view_write_through_a_mut_parameter_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun clear(v: &mut Holder) { v = Holder::Empty; }
@@ -2978,7 +3121,7 @@ fn a_view_write_through_a_mut_local_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun main() {
@@ -3002,7 +3145,7 @@ fn a_view_write_through_a_nested_reborrow_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun inner(v: &mut Holder) { v = Holder::Empty; }
@@ -3028,7 +3171,7 @@ fn repeated_view_writes_drop_each_outgoing_value_exactly_once() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         impl Holder {
@@ -3060,7 +3203,7 @@ fn a_view_write_after_the_owner_moved_out_is_rejected() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         impl Holder { fun clear(&mut self) { self = Holder::Empty; } }
@@ -3087,7 +3230,7 @@ fn a_moved_out_binding_is_not_overwrite_dropped() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun main() {
@@ -3124,7 +3267,7 @@ fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Full(Guard), Empty }}
         fun main() {{
@@ -3193,7 +3336,7 @@ fn b99_program(body: &str) -> String {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Full(Guard), Empty }}
         struct Slot {{ held: Holder }}
@@ -3779,7 +3922,7 @@ fn both_capture_shapes_survive_a_component_write_to_the_place() {
             if pair is (let items, let at) {
                 pair.0.push("d");
                 pair.1 = 9;
-                print(items.len() + at);
+                print(items.len().as_i32() + at);
             }
             print(pair.0.len());
         }
@@ -3798,7 +3941,7 @@ fn a_resource_capture_from_a_component_written_place_loans_the_prematch_payload(
     // does, and what the whole-assignment place twin already did. 1, not 6.
     let source = r#"
         import std::io::print;
-        resource struct Conn { id: i32 }
+        [resource] struct Conn { id: i32 }
         fun main() {
             mut slot = (Conn { id = 1 }, 0);
             if slot is (let c, let at) {
@@ -3918,7 +4061,7 @@ fn a_resource_capture_from_a_borrows_call_subject_loans_the_prematch_payload() {
     // twice. Both halves asserted: the value (1, not 6) and the absent copy.
     let source = r#"
         import std::io::print;
-        resource struct Conn { id: i32 }
+        [resource] struct Conn { id: i32 }
         struct Holder { slot: (Conn, i32) }
         impl Holder {
             fun view(&mut self): &mut (Conn, i32) borrows self { &mut self.slot }
@@ -3961,7 +4104,7 @@ fn both_capture_shapes_survive_a_write_through_a_borrows_call_subject() {
             if holder.view() is (let items, let at) {
                 holder.pair.0.push("d");
                 holder.pair.1 = 9;
-                print(items.len() + at);
+                print(items.len().as_i32() + at);
             }
             print(holder.pair.0.len());
         }
@@ -4211,7 +4354,7 @@ fn an_owned_call_subject_still_binds_without_copying() {
         fun make(): (List<i32>, i32) { ([1, 2], 3) }
         fun main() {
             if make() is (let xs, let n) {
-                print(xs.len() + n);
+                print(xs.len().as_i32() + n);
             }
         }
         "#;
@@ -4240,7 +4383,7 @@ fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
         fun main() {
             mut g = Holder { cells = ([1, 2], 3) };
             if g.slot() is (let xs, let n) {
-                print(xs.len() + n);
+                print(xs.len().as_i32() + n);
             }
         }
         "#,
@@ -4851,7 +4994,7 @@ fn a_resource_forwarded_out_of_a_loan_is_still_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard {
             fun drop(own self) { print("drop " + self.tag); }
             fun take(&self): Guard { self }
@@ -5249,7 +5392,7 @@ fn a_reference_leaf_handing_back_a_resource_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5272,7 +5415,7 @@ fn a_borrows_call_leaf_handing_back_a_resource_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         fun peek(h: &Holder): &Guard borrows h { &h.g }
@@ -5295,7 +5438,7 @@ fn a_reference_leaf_loaning_a_resource_out_of_a_view_return_is_still_allowed() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5443,7 +5586,7 @@ fn b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5468,7 +5611,7 @@ fn b116_the_ret_spelling_of_a_resource_borrows_call_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         fun peek(h: &Holder): &Guard borrows h { &h.g }
@@ -5548,7 +5691,7 @@ fn b116_a_ret_only_resource_crossing_is_named_by_the_move_scan() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5909,7 +6052,7 @@ fn b134_the_unannotated_ret_spelling_of_a_resource_reference_leaf_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5935,7 +6078,7 @@ fn b134_an_unannotated_ret_only_resource_crossing_is_named_by_the_move_scan() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -6616,7 +6759,7 @@ fn a_closures_own_is_capture_is_not_a_resource_capture() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let read = |o: Option<Db>| {
                 if o is Some(let d) { d.handle } else { 0 }
@@ -7025,15 +7168,22 @@ fn reading_the_value_out_before_the_closure_is_the_fix_the_message_names() {
     );
 }
 
+// --- C16: the escape rule's remainder — a STORING callee (R7, Order 37) ------
+//
+// C13's shape, un-ignored. It printed 3 on this tree until C16: `make` captures
+// its `&mut` parameter, hands the closure to an ordinary function, and `keep`
+// stores it in a struct it returns — so `outer` hands back a closure reading a
+// view of its own dead local. Memory-safe only because JS boxes the place and
+// traces it; under the emit-Rust backend (F1) it is a freed slot, which is why
+// the refusal is that backend's precondition rather than a later tidy-up.
+//
+// The lever is a per-parameter summary of what a callee KEEPS past the call
+// (`compute_retaining_positions`), asked only of arguments that are
+// view-capturing closures — so `twice(|| *v)`, whose callee only calls what it
+// is handed, still compiles, and that control is pinned below.
+
 #[test]
-#[ignore = "C13: the escape rule does not follow a closure through an ordinary call (spec §6.9's honesty limit). Not C12's hole — the capture here is a view PARAMETER — and closing it needs the closure-escape analysis rule 4's dynamic remainder is future work for."]
 fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
-    // Measured on this tree: prints 3. `make` captures its `&mut` parameter,
-    // hands the closure to an ordinary function, and `keep` stores it in a
-    // struct it returns — so `outer` hands back a closure reading a view of
-    // its own dead local. `check_view_escape` sees a closure in an ARGUMENT
-    // position, which it skips on purpose (an ordinary callee only borrows
-    // for the call), and never learns that this one is stored.
     assert_fails_with(
         r#"
         import std::io::print;
@@ -7047,5 +7197,2908 @@ fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
         fun main() { let h = outer(); print((h.f)()); }
         "#,
         "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn the_storing_callee_refusal_names_the_callee_that_keeps_the_closure() {
+    // The whole diagnosis is WHICH callee keeps it: the closure at the argument
+    // position is none of the four things the older sentence enumerates, so the
+    // storing shape gets its own sentence and names the body to look at.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun make(v: &mut i32): Holder { keep(|| *v) }
+        fun outer(): Holder {
+            mut n = 3;
+            make(&mut n)
+        }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+        "`keep` keeps what it is handed past the call",
+    );
+}
+
+#[test]
+fn a_callee_that_only_calls_its_closure_argument_still_compiles() {
+    // The boundary the refusal must not cross, and the reason argument
+    // positions were skipped in the first place: an ordinary callee borrows the
+    // closure for the call, and the view it captured outlives the call by
+    // construction.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun twice(g: || i32): i32 { g() + g() }
+        fun read(v: &mut i32): i32 { twice(|| *v) }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn the_storing_callee_refusal_follows_a_chain_of_callees() {
+    // The summary is a fixpoint, so a parameter handed on to a callee that
+    // keeps it is itself kept: `pass` names `keep`, and the refusal arrives at
+    // the call `make` actually wrote.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun pass(g: || i32): Holder { keep(g) }
+        fun make(v: &mut i32): Holder { pass(|| *v) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+        "`pass` keeps what it is handed past the call",
+    );
+}
+
+#[test]
+fn a_callee_that_puts_the_closure_in_a_collection_keeps_it() {
+    // A collection is a store like a field is: the list outlives the call.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun collect(g: || i32): List<|| i32> {
+            mut out: List<|| i32> = [];
+            out.push(g);
+            out
+        }
+        fun make(v: &mut i32): List<|| i32> { collect(|| *v) }
+        fun main() { mut n = 3; let fs = make(&mut n); print(fs.len()); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn a_closure_capturing_no_view_may_still_be_stored_by_a_callee() {
+    // The other boundary: §6.9 captures BINDINGS, and a binding holding a VALUE
+    // travels with the closure. Only a captured VIEW dangles, so only a
+    // captured view is refused.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun outer(): Holder {
+            mut n = 3;
+            keep(|| n)
+        }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+        "3\n",
+    );
+}
+
+// --- B171: what an `is` binding's scope IS ------------------------------------
+//
+// The spec used to say "bindings inside an `is` pattern are scoped to nothing
+// (use `match` to bind)", which was false three ways. RULED 2026-09-01, and the
+// four pins below are the whole sentence:
+//
+//   then-branch          YES — the test passed, so the payload is there
+//   `&&`-right operand   YES — the same, and short-circuit guarantees it ran
+//   `||` arms            NO  — `||` short-circuits, so the other arm proves
+//                              nothing about this arm's test (and neither does
+//                              anything after the condition, then-branch
+//                              included)
+//   else-branch          NO  — the test FAILED there
+//
+// The two refusals are the ordinary unresolved-name error: nothing bound the
+// name, so nothing special needs saying. `if !(x is Some(let y)) { return }`
+// binding the continuation is a separate design item (B187) and is NOT this.
+
+#[test]
+fn b171_an_is_binding_is_visible_in_the_then_branch() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b171_an_is_binding_is_visible_in_the_and_right_operand() {
+    // The condition's own right-hand side, which the tracker item verified by
+    // probe and the spec sentence denied. `&&` short-circuits, so the right
+    // operand is evaluated only where the `is` test already passed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) && n > 1 { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b171_an_is_binding_is_not_visible_in_an_or_arm() {
+    // The other arm of a `||` runs precisely when the `is` test FAILED, so the
+    // payload is not there. Before the ruling this compiled and emitted
+    // `$a[0] === 0 || $a[1] > 1` — a read of a payload slot the subject does
+    // not have, which JavaScript answers `undefined` and compares `false`: a
+    // silent wrong answer rather than a crash.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) || n > 1 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b171_an_is_binding_is_not_visible_in_the_else_branch() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) { print(n); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+/// The consequence of the `||` rule that the four boundaries do not state on
+/// their own, and the reason the cap is the OPERAND rather than the `||` node:
+/// reaching the then-branch of a condition whose `is` sits under a `||` proves
+/// only that *some* arm was true, so the binding is not there either.
+#[test]
+fn b171_an_or_arm_capture_does_not_reach_the_then_branch() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let flag = false;
+            if maybe is Some(let n) || flag { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+/// The control that keeps the `||` cap from swallowing the `&&` rule: an `is`
+/// and its use inside ONE operand of a `||` are both inside that operand, so
+/// the capture is visible exactly where it was before.
+#[test]
+fn b171_an_and_inside_an_or_arm_still_sees_its_own_capture() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let flag = false;
+            if (maybe is Some(let n) && n > 1) || flag { print("hit"); }
+        }
+        "#,
+        "hit\n",
+    );
+}
+
+/// And the binding dies with the `if`: after it, the name is unresolved in the
+/// enclosing scope, which never had it. (The `is` capture lives in the `if`'s
+/// own scope — shared with the condition and the then-branch, and a sibling of
+/// the `else`'s.)
+#[test]
+fn b171_an_is_binding_does_not_outlive_its_if() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) { print(n); }
+            print(n);
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+// --- B195: an `is` capture under a NEGATION ----------------------------------
+//
+// B171 ruled the scope of an unnegated capture. A negated one is the case that
+// sentence did not reach, and it was LIVE UNSOUND: `if !(maybe is Some(let n))
+// { print(n); }` compiled to `if (!($a[0] === 0)) { console.log($a[1]); }` and
+// printed `undefined` — the payload slot read exactly when the pattern did not
+// match.
+//
+// The rule, which is B171's then-branch rule MIRRORED: `!(x is P)` is true
+// where `P` failed, so the capture is not in the then-branch; it is true's
+// opposite in the ELSE branch, which runs precisely when `P` matched, so the
+// capture IS bound there (and on down an `else if` chain). Two negations cancel.
+// A capture under a `||` stays unbound in both branches (B171's cap, untouched).
+// The guard-clause shape — `if !(x is P) { ret; }` then reading the capture
+// after the `if` — stays refused in both places; B187 decides it.
+
+#[test]
+fn b195_a_negated_is_capture_is_not_visible_in_the_then_branch() {
+    // The bug itself. Before the fix this compiled and printed `undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_is_capture_is_visible_in_the_else_branch() {
+    // And the branch it IS bound in — run, not merely compiled, because the
+    // whole family is a miscompile: the emitted `else` reads the payload slot
+    // exactly where the subject has one, and the `if` side never reads it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun pick(flag: bool): Option<i32> { if flag { Some(2) } else { None } }
+        fun main() {
+            let hit = pick(true);
+            let miss = pick(false);
+            if !(hit is Some(let n)) { print("miss"); } else { print(n); }
+            if !(miss is Some(let m)) { print("miss"); } else { print(m); }
+        }
+        "#,
+        "2\nmiss\n",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_reaches_an_else_if_branch() {
+    // The else of an `else if` chain is still the previous condition's false
+    // path, so the capture is bound through the chain — condition and body.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print("miss"); }
+            else if n > 1 { print(n); }
+            else { print(0); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b195_a_later_let_in_the_else_branch_still_shadows_the_capture() {
+    // The inherited declaration covers the else branch from its start, so an
+    // ordinary `let` of the same name inside it shadows from its own point on —
+    // the positional rule, unchanged by where the declaration came from.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print("miss"); } else { print(n); let n = 9; print(n); }
+        }
+        "#,
+        "2\n9\n",
+    );
+}
+
+#[test]
+fn b195_a_double_negation_cancels() {
+    // `!` is a swap of the two branches, so applying it twice is the identity:
+    // `!(!(x is P))` is the plain test, with B171's plain answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(!(maybe is Some(let n))) { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b195_a_double_negation_does_not_reach_the_else_branch() {
+    // The other half of the cancellation, and the one that would catch a fix
+    // that only ever ADDED the else branch: two negations put the capture back
+    // in the then-branch and take it out of the else.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(!(maybe is Some(let n))) { print("y"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_capture_under_a_negated_and_is_not_visible_in_the_then_branch() {
+    // `!(a is X && b)` is true when the `&&` was false, which the failed test
+    // is one way of causing — so the then-branch proves nothing.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n) && n > 1) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_and_still_binds_its_own_right_operand() {
+    // Inside the negation the `&&` short-circuit is untouched: reaching `n > 1`
+    // still means the test passed, negation or no negation. (The condition is
+    // therefore false here and the `else` runs.)
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n) && n > 1) { print("no"); } else { print("yes"); }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+#[test]
+fn b195_a_negated_and_binds_the_else_branch() {
+    // `!(a is X && b)` FALSE means the `&&` was true, and a true `&&` ran and
+    // passed its left operand — so the else branch has the payload.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n) && n > 1) { print("no"); } else { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_does_not_reach_the_and_right_operand() {
+    // The mirror of B171's `&&` rule: `&&` carries its left operand's TRUE
+    // side, and a negated capture is bound on the FALSE side, so it dies with
+    // the operand rather than crossing into the right one.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) && n > 1 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negation_inside_an_and_does_not_bind_the_rest_of_the_and() {
+    // The nesting that a plain parity counter gets wrong: the capture sits
+    // under two `!`s, but the inner one is the left operand of an `&&`, whose
+    // right operand runs when that operand was TRUE — that is, when the test
+    // FAILED. Before the fix this compiled and read the missing payload.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(!(maybe is Some(let n)) && n > 1) { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_under_an_or_stays_capped() {
+    // B171's `||` cap swallows the negation: an operand of a `||` proves
+    // nothing outside itself either way, so neither branch gets the capture.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) || n > 1 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_under_an_or_does_not_reach_the_else_branch() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let flag = false;
+            if !(maybe is Some(let n)) || flag { print("hit"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_the_guard_clauses_then_branch_stays_refused() {
+    // `if !(x is P) { print(n); ret; }` — the then-branch runs when the test
+    // FAILED, so the payload is not there whatever the branch goes on to do.
+    // B187 opened the CONTINUATION after this `if`; the branch itself is still
+    // the bug B195 fixed.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print(n); ret; }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+// --- B187: the guard clause — negate, diverge, continue -----------------------
+//
+// The owner's ruling (Order 24, off B171's scope ruling): "`if !(x is
+// Some(let y)) { return }` — would the binding be accessible after?" Yes.
+//
+// The reasoning is B195's else rule read one step further. `!(x is P)` is true
+// exactly where `P` failed, so the capture is bound on the condition's FALSE
+// path; B195 gives that path a home when the `if` has an `else`. With no
+// `else` and a then-branch that provably DIVERGES, the false path has a
+// different home — the rest of the enclosing block — and it is the only way to
+// get there. So the captures the condition binds on its false path are declared
+// into the ENCLOSING scope, visible from the end of the `if` onward.
+//
+// The three conditions, each pinned below:
+//   * NEGATED (or otherwise bound on the false path) — an unnegated `is` whose
+//     then-branch diverges proves the test FAILED on the continuation;
+//   * DIVERGING then-branch, decided by the checker's own divergence analysis
+//     (`Divergence::checker`: `ret` and `jump` are its leaves), so the editor
+//     and the checker cannot disagree about what "dead" means;
+//   * NO `else` — the guard clause is the one-armed shape. A two-armed `if`
+//     reaches its continuation through the arm that did NOT diverge, which is a
+//     wider rule (it would have to cover `if x is P(let n) { … } else { ret; }`
+//     too) and nobody has ruled it.
+// A `||`-composed condition does not qualify: B171 caps its captures at the
+// operand, so there is nothing on the false path to publish.
+
+#[test]
+fn b187_a_diverging_guard_binds_the_continuation() {
+    // The exhibit. `ret` is the shape the owner asked about.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { ret; }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_the_guard_really_returns_when_the_pattern_missed() {
+    // The other half of the exhibit: the continuation is not merely typeable,
+    // it is unreachable on a miss.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { print("missed"); ret; }
+            print(n);
+        }
+        fun main() { guard(None); }
+        "#,
+        "missed\n",
+    );
+}
+
+#[test]
+fn b187_a_jump_break_diverges_for_the_guard() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            for {
+                if !(maybe is Some(let n)) { jump break; }
+                print(n);
+                jump break;
+            }
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_a_jump_continue_diverges_for_the_guard() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            mut seen = false;
+            for !seen {
+                seen = true;
+                if !(maybe is Some(let n)) { jump continue; }
+                print(n);
+            }
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_a_nested_block_that_diverges_counts() {
+    // Divergence is the checker's recursive answer, not a syntactic look at the
+    // last statement: a block whose every path leaves is a diverging block.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>, flag: bool) {
+            if !(maybe is Some(let n)) {
+                if flag { ret; } else { ret; }
+            }
+            print(n);
+        }
+        fun main() { guard(Some(2), true); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b187_a_non_diverging_then_branch_binds_nothing() {
+    // The control that makes the whole rule sound: if the then-branch can fall
+    // through, the continuation is reachable on a MISS, and the payload is not
+    // there.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { print("missed"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_an_else_branch_keeps_the_continuation_unbound() {
+    // A two-armed `if` is not the guard clause. Its continuation is reached
+    // through whichever arm did not diverge — here the `else`, where B195
+    // already declares the capture — and extending the binding past the `if`
+    // from there is a wider rule than the one that was ruled: it would have to
+    // answer for `if x is P(let n) { … } else { ret; }` in the same breath.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { ret; } else { print(n); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_an_unnegated_guard_binds_nothing_after_the_if() {
+    // The polarity matters, and it is the reason the rule reads off B195's
+    // false-path set rather than off "there was an `is` in the condition":
+    // reaching the continuation of THIS `if` proves the pattern did not match.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if maybe is Some(let n) { ret; }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_an_or_composed_guard_binds_nothing() {
+    // `!(x is P) || flag` being false proves only that BOTH operands were
+    // false, and the `||` cap (B171) already keeps the capture inside its
+    // operand, so there is nothing on the false path to publish.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>, flag: bool) {
+            if !(maybe is Some(let n)) || flag { ret; }
+            print(n);
+        }
+        fun main() { guard(Some(2), false); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_a_negated_and_publishes_both_of_its_captures() {
+    // `!(A && B)` is false exactly when both matched, so both captures are on
+    // the false path — the two-capture case, one per operand.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(left: Option<i32>, right: Option<i32>) {
+            if !(left is Some(let a) && right is Some(let b)) { ret; }
+            print(a + b);
+        }
+        fun main() { guard(Some(2), Some(3)); }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b187_one_pattern_can_publish_two_captures() {
+    // The two captures of one variant payload, both published together.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        enum Pair { Both(i32, i32), Neither }
+        fun guard(pair: Pair) {
+            if !(pair is Pair::Both(let a, let b)) { ret; }
+            print(a + b);
+        }
+        fun main() { guard(Pair::Both(2, 3)); }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b187_the_continuation_binding_can_be_shadowed() {
+    // The capture is an ordinary declaration in the enclosing scope from the
+    // end of the `if` onward, so a later `let` of the same name shadows it the
+    // way it shadows any other (local-shadowing.md §2).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { ret; }
+            print(n);
+            let n = 9;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n9\n",
+    );
+}
+
+#[test]
+fn b187_the_continuation_binding_shadows_an_earlier_local() {
+    // And it shadows in the other direction: from the end of the `if`, the
+    // name is the capture, not the `let` that came before it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            let n = 9;
+            print(n);
+            if !(maybe is Some(let n)) { ret; }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "9\n2\n",
+    );
+}
+
+#[test]
+fn b187_the_continuation_binding_stops_at_the_enclosing_block() {
+    // The scope is the rest of the ENCLOSING block, which is where the guard
+    // was written — not the function, and not the block's parent.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>, flag: bool) {
+            if flag {
+                if !(maybe is Some(let n)) { ret; }
+                print(n);
+            }
+            print(n);
+        }
+        fun main() { guard(Some(2), true); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b187_a_panicking_guard_binds_the_continuation() {
+    // The guard clause's other idiomatic ending. B204 made a `panic(…)` call a
+    // leaf of the ONE `Divergence` walk, and B222 moved the verdict to where
+    // that leaf exists: the walk records the candidate, `resolve_world` decides
+    // it once the leaves have settled and before any name resolves against the
+    // scope it publishes into.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+// --- B199: an `is` capture reached OFF the condition's boolean spine ---------
+//
+// B195 made the negation bookkeeping travel the spine — `!`, `&&`/`||` and the
+// `is` test — and drop for anything else. What "drop" meant was B171's default,
+// which left the capture visible in the THEN branch: `if always(maybe is
+// Some(let n)) { print(n); }` compiled and printed `undefined`, a read of a
+// payload slot the subject does not have.
+//
+// The rule: off the spine, the condition's truth proves NOTHING about the test
+// — `always(…)` is true whatever the `is` answered — so the capture reaches
+// neither branch. It keeps exactly one thing, the short-circuit rule INSIDE the
+// off-spine subtree: `maybe is Some(let n) && n > 0` still binds its own right
+// operand wherever it is written, because `&&` really does only evaluate its
+// right operand where the left one passed. So the capture's visibility is
+// capped at the end of the subtree analysis stepped off the spine into.
+
+#[test]
+fn b199_a_capture_in_a_call_argument_is_unbound_in_the_then_branch() {
+    // The exhibit. Before the fix this compiled and printed `undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe: Option<i32> = None;
+            if always(maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_capture_in_a_call_argument_is_unbound_in_the_else_branch() {
+    // The half B195 already refused, kept: the else runs when the CALL was
+    // false, which says nothing about the test either.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun negate(flag: bool): bool { !flag }
+        fun main() {
+            let maybe = Some(2);
+            if negate(maybe is Some(let n)) { print("hit"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_call_argument_capture_does_not_reach_the_and_right_operand() {
+    // The cap is the argument's end, so the `&&` written AROUND the call does
+    // not see the capture either. Before the fix this printed `undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe: Option<i32> = None;
+            if always(maybe is Some(let n)) && n > 0 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_an_and_inside_a_call_argument_still_binds_its_own_right_operand() {
+    // The control that keeps the drop from swallowing B171's `&&` rule: the
+    // capture and its use are both inside the argument, and `&&` short-circuits
+    // there exactly as it does on the spine.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe = Some(2);
+            if always(maybe is Some(let n) && n > 1) { print("hit"); }
+        }
+        "#,
+        "hit\n",
+    );
+}
+
+#[test]
+fn b199_a_capture_nested_two_calls_deep_is_unbound_in_the_then_branch() {
+    // The cap takes the TIGHTER of the two off-spine subtrees, so nesting can
+    // only shrink the capture's reach — never widen it back out.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe: Option<i32> = None;
+            if always(always(maybe is Some(let n))) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_negated_call_argument_capture_reaches_neither_branch() {
+    // A `!` on the spine above an off-spine drop still swaps nothing into
+    // existence: the drop clears BOTH else flags, so the negation has no
+    // else-branch declaration left to make.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe = Some(2);
+            if !always(maybe is Some(let n)) { print("hit"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b199_a_capture_inside_a_closure_argument_stays_in_the_closure() {
+    // The closure body is its own scope, so the capture never escaped it even
+    // before B199 — the control that says the fix did not have to reach here.
+    // B223 kept the answer and changed the VOICE: a closure body is not part of
+    // the condition it is written in, so the test in it is in expression
+    // position and the read is refused in B215's terms rather than as a name
+    // typo. One rule, one voice, wherever the test is written.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun apply(f: || bool): bool { f() }
+        fun main() {
+            let maybe = Some(2);
+            if apply(|| maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+#[test]
+fn b199_a_capture_on_the_spine_is_untouched() {
+    // The control for the whole item: nothing about the drop reaches a capture
+    // that stayed on the spine.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun always(flag: bool): bool { true }
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) && always(n > 1) { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// --- B215: an `is` capture bound in EXPRESSION position ----------------------
+//
+// Every rule above is about a CONDITION, because a condition is the only thing
+// that selects on a test's answer. `condition_polarity` could not say so: `None`
+// meant both "outside every condition" and "in a condition that installed no
+// frame" — the `while`-shaped `for` and the `match` guard, which never did — so
+// an `is` written as a plain expression fell back to B171's answer and its
+// capture ran to the end of the scope. `let b = x is Some(let n); print(n);`
+// compiled and read the payload slot of a value that may have no payload:
+// `print(n)` on a `None` printed `undefined`, and `print(n + 1)` printed `NaN`
+// where the program's own type said `i32`.
+//
+// The rule: a capture bound in expression position reaches the rest of THAT
+// expression and nothing after it. There is no narrowing that could make the
+// later read work — vilan has no flow typing, so "`n` where `b` is true" is not
+// something it can say.
+
+const B215_STEER: &str = "is bound only inside the `is` test that captured it";
+
+// The exhibit. Refused, and the refusal quotes the author's own test back.
+#[test]
+fn b215_a_bare_let_bound_is_binds_nothing_afterwards() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let present = maybe is Some(let n);
+            print(present);
+            print(n);
+        }
+        "#,
+        "'n' is bound only inside the `is` test that captured it: outside a condition \
+         that test is an ordinary `bool`, and nothing after it proves the payload is \
+         there. Put the test where a branch depends on it — `if maybe is Some(let n) \
+         { … }` — and read 'n' inside",
+    );
+}
+
+// The same read, one diagnostic and not two: the refusal replaces the generic
+// "cannot find", it does not stand beside it.
+#[test]
+fn b215_the_refusal_replaces_the_name_miss_rather_than_joining_it() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let present = maybe is Some(let n);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let present = maybe is Some(let n);
+            print(n);
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+// The `&&` rule holds wherever the operator is written — B195's answer, and the
+// half of the expression-position frame that is deliberately NOT cut. The right
+// operand is reached only when the left matched, whether the `&&` sits in a
+// condition or in a `let`'s initializer.
+#[test]
+fn b215_an_and_initializer_still_binds_its_own_right_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let big = maybe is Some(let n) && n > 1;
+            print(big);
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// ...and the read AFTER that statement is still refused, which is the line the
+// rule draws: the `&&` carries the capture through its own right operand and no
+// further.
+#[test]
+fn b215_an_and_initializer_binds_nothing_past_the_statement() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let big = maybe is Some(let n) && n > 1;
+            print(big);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+// The control the rule steers to: the same test as an `if` condition binds, and
+// the branch is entered only where it matched.
+#[test]
+fn b215_the_same_test_as_an_if_condition_still_binds() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) {
+                print(n);
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// A `while`-shaped `for`'s condition is a condition for the same reason —
+// reaching the body IS the test having passed. It installs no polarity frame, so
+// it is exactly the state B215 had to tell apart from expression position.
+#[test]
+fn b215_a_while_shaped_for_condition_still_binds_in_the_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = Some(4);
+            for slot is Some(let n) {
+                print(n);
+                slot = None;
+            }
+        }
+        "#,
+        "4\n",
+    );
+}
+
+// A `match` guard is the third such condition: the leg body runs only where the
+// guard held, so the guard's capture reaches it.
+#[test]
+fn b215_a_match_guard_still_binds_in_its_leg() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(3);
+            let scale = 5;
+            match scale {
+                let s if maybe is Some(let n) => print(n + s),
+                _ => print(0),
+            }
+        }
+        "#,
+        "8\n",
+    );
+}
+
+// A `match` LEG pattern's captures are untouched — the leg body is the branch
+// the pattern selected, which is the whole of the question.
+#[test]
+fn b215_a_match_leg_capture_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = Some(6);
+            match maybe {
+                Some(let n) => print(n),
+                None => print(0),
+            }
+        }
+        "#,
+        "6\n",
+    );
+}
+
+// B199's shape in expression position: a test buried in a call ARGUMENT, with no
+// condition anywhere. It was accepted (B199 only reaches a capture under a
+// condition) and is now refused by the expression-position rule instead.
+#[test]
+fn b215_a_call_argument_test_outside_a_condition_binds_nothing_afterwards() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun report(flag: bool) { print(flag); }
+        fun main() {
+            let maybe: Option<i32> = None;
+            report(maybe is Some(let n));
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+// A MODULE-scope initializer is the same test and the same answer. It took the
+// rule's other half to reach: a module scope keeps no positional record (B33 —
+// its bindings are order-independent), so the capture was declared as an
+// ordinary module binding and `main` could read it. A declaration with a real
+// END is the exception, because an end is meaningless without positions.
+#[test]
+fn b215_a_module_level_test_binds_nothing_for_the_program() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        let slot: Option<i32> = None;
+        let present = slot is Some(let n);
+
+        fun main() {
+            print(present);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+// ...and the `&&` half survives at module scope too, so the positional record is
+// a narrowing and not a ban.
+#[test]
+fn b215_a_module_level_and_initializer_still_binds_its_right_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        let slot: Option<i32> = Some(9);
+        let big = slot is Some(let n) && n > 1;
+
+        fun main() {
+            print(big);
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// A `||` in expression position was already refused — B171 caps each operand at
+// its own end — but with the generic "cannot find". It now gets the refusal that
+// says why, which is the same reason.
+#[test]
+fn b215_an_or_initializer_is_refused_in_the_rules_own_terms() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let either = true || maybe is Some(let n);
+            print(either);
+            print(n);
+        }
+        "#,
+        B215_STEER,
+    );
+}
+
+// --- B224: a short-circuit condition keeps its right operand's statements ----
+//
+// The emitter had no statement slot for a condition, so ANY right operand that
+// lowered to statements (an `is` subject temp and its materialized captures, an
+// if-expression, a `?` lift) was walked into the ENCLOSING block and ran
+// unconditionally — before the `if`, and regardless of what the left operand
+// decided. Every program below compiled clean and ran wrong, so each pin RUNS
+// rather than merely compiling. `match` guards were the one correct form (B59
+// gave each leg its own prelude); the last pin is that control.
+
+#[test]
+fn b224_an_and_right_operand_test_does_not_run_when_the_left_missed() {
+    // The owner's find. `x.on_drag_end` was read out of a `None`'s payload
+    // before the `if`, so the program threw `TypeError: cannot read properties
+    // of undefined` instead of taking the `else`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let initiated: Option<Handler> = None;
+            if initiated is Some(let x) && x.on_drag_end is Some(let end) {
+                print("both");
+                print(end);
+            } else {
+                print("neither");
+            }
+        }
+        "#,
+        "neither\n",
+    );
+}
+
+#[test]
+fn b224_an_and_right_operand_test_runs_when_the_left_matched() {
+    // The succeeding path of the same program: both captures are readable in
+    // the body, which is what kept the miscompile invisible to the old pins.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let initiated: Option<Handler> = Some(Handler { on_drag_end = Some(7) });
+            if initiated is Some(let x) && x.on_drag_end is Some(let end) {
+                print("both");
+                print(end);
+            } else {
+                print("neither");
+            }
+        }
+        "#,
+        "both\n7\n",
+    );
+}
+
+#[test]
+fn b224_a_false_left_operand_does_not_call_the_right_operands_probe() {
+    // The side-effect form: the right operand's subject is a CALL, so a lost
+    // short-circuit is observable as an extra line of output.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let flag = false;
+            if flag && probe() is Some(let n) { print(n); } else { print("no"); }
+        }
+        "#,
+        "no\n",
+    );
+}
+
+#[test]
+fn b224_a_true_left_operand_does_not_call_an_or_right_operands_probe() {
+    // `||`'s mirror: a true left operand settles the test, so the right
+    // operand's statements must not run either.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let flag = true;
+            if flag || probe() is Some(let n) { print("hit"); }
+        }
+        "#,
+        "hit\n",
+    );
+}
+
+#[test]
+fn b224_a_negated_left_operand_still_short_circuits() {
+    // The left operand is itself an `is` under a negation (B195's shape): it
+    // matches, so the negation is false and the right operand never runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let a: Option<i32> = Some(5);
+            if !(a is Some(let n)) && probe() is Some(let m) {
+                print("hit");
+            } else {
+                print("miss");
+            }
+        }
+        "#,
+        "miss\n",
+    );
+}
+
+#[test]
+fn b224_an_if_expression_right_operand_does_not_run() {
+    // An if-expression has no expression form, so this is the statement
+    // fallback rather than the comma sequence — the same law, the other shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun boom(): i32 {
+            print("boom ran");
+            1
+        }
+        fun main() {
+            let flag = false;
+            let c = true;
+            if flag && (if c { boom() } else { 0 }) > 0 { print("yes"); } else { print("no"); }
+        }
+        "#,
+        "no\n",
+    );
+}
+
+#[test]
+fn b224_an_and_in_expression_position_short_circuits() {
+    // B215's position: the same `&&` as a `let` initializer rather than an `if`
+    // head. It must stay ONE expression, and still not read the missed payload.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let a: Option<Handler> = None;
+            let ok = a is Some(let x) && x.on_drag_end is Some(let y) && y > 1;
+            print(ok);
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b224_a_while_shaped_for_condition_short_circuits() {
+    // B136 already re-runs a `for` condition's prelude per iteration; the
+    // right operand's statements have to sit inside the short-circuit too, or
+    // the loop throws on its first test instead of never entering.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let a: Option<Handler> = None;
+            for a is Some(let x) && x.on_drag_end is Some(let y) { print(y); }
+            print("done");
+        }
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b224_a_negated_and_still_publishes_its_captures_after_the_if() {
+    // B187's continuation, run rather than merely compiled: `y` is named AFTER
+    // the `if`, so the right operand's declaration must be hoisted to the
+    // enclosing block even though its VALUE is computed inside the condition.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun guard(a: Option<Handler>) {
+            if !(a is Some(let x) && x.on_drag_end is Some(let y)) {
+                print("bail");
+                ret;
+            }
+            print(y);
+        }
+        fun main() {
+            guard(None);
+            guard(Some(Handler { on_drag_end = Some(4) }));
+        }
+        "#,
+        "bail\n4\n",
+    );
+}
+
+#[test]
+fn b224_an_else_if_condition_does_not_run_when_an_earlier_branch_matched() {
+    // `walk_branch` hoisted EVERY `else if` condition into the outer block, so
+    // the chain's later tests ran before the chain did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let a: Option<i32> = Some(5);
+            if a is Some(let n) {
+                print(n);
+            } else if probe() is Some(let m) {
+                print(m);
+            }
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b224_an_else_if_condition_runs_when_the_earlier_branch_missed() {
+    // The other half: the hoisted-out condition still has to be REACHED, and
+    // its captures still have to be readable in its own branch.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(): Option<i32> {
+            print("probe ran");
+            Some(1)
+        }
+        fun main() {
+            let a: Option<i32> = None;
+            if a is Some(let n) {
+                print(n);
+            } else if probe() is Some(let m) {
+                print(m);
+            }
+        }
+        "#,
+        "probe ran\n1\n",
+    );
+}
+
+#[test]
+fn b224_a_match_guard_is_the_control() {
+    // The one form that was already right (B59): each leg has its own prelude,
+    // so the guard's `is` subject is read only once the pattern has matched.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        struct Handler { on_drag_end: Option<i32> }
+        fun main() {
+            let a: Option<Handler> = None;
+            match a {
+                Some(let h) if h.on_drag_end is Some(let y) => print(y),
+                _ => print("other"),
+            }
+        }
+        "#,
+        "other\n",
+    );
+}
+
+#[test]
+fn b224_an_else_if_condition_acquires_its_resource_only_when_reached() {
+    // The reshape has to carry destruction.md §7 with it: the `else if`'s
+    // condition lifts a resource temporary, so the `try`/`finally` moves into
+    // the `else` block WITH it — acquired only once the chain reached this leg,
+    // destroyed after the branch that reads it. The earlier branch is taken,
+    // so `probe` is never called and nothing is opened or dropped.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+        [resource] struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        impl Guard { fun ok(&self): bool { true } }
+        fun probe(label: str): Guard {
+            print(i"opened {label}");
+            Guard { label = label }
+        }
+        fun main() {
+            let taken = true;
+            if taken { print("first"); } else if probe("chain").ok() { print("second"); }
+            print("end");
+        }
+        "#,
+        "first\nend\n",
+    );
+}
+
+#[test]
+fn b224_a_root_if_condition_still_lifts_its_resource_into_the_enclosing_block() {
+    // The control for the reshape, and the shape it must NOT touch: an `if`
+    // that IS the statement already has a statement slot — the block it sits
+    // in — so its condition's temporary is closed there, exactly as before.
+    // (Reshaping this one produced a bare `else { … }` at statement level, a
+    // module that would not parse.) The `else if` leg is reached rather than
+    // skipped, and the chain's OWN temporary is destroyed inside the `else`
+    // while the root condition's outlives the whole statement (§7.1's
+    // end-of-statement extent) — which is why "no" drops last.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+        [resource] struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        impl Guard { fun ok(&self): bool { self.label == "yes" } }
+        fun probe(label: str): Guard {
+            print(i"opened {label}");
+            Guard { label = label }
+        }
+        fun main() {
+            if probe("root").ok() { print("root branch"); }
+            if probe("no").ok() { print("first"); } else if probe("chain").ok() { print("second"); }
+            print("end");
+        }
+        "#,
+        "opened root\ndropped root\nopened no\nopened chain\ndropped chain\ndropped no\nend\n",
+    );
+}
+
+#[test]
+fn b222_an_endless_loop_guard_binds_the_continuation() {
+    // The other leaf the walk cannot read: `for { … }` with nothing that breaks
+    // out of it never falls through, so the only way past the `if` is the
+    // condition's false path — the guard clause exactly.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { for { print("stuck"); } }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b222_a_loop_with_a_break_is_not_an_ending() {
+    // The control for that leaf, and the reason the leaf is a resolved fact
+    // rather than a shape: the same `for`, with a `jump break` bound to it,
+    // falls through — so the continuation is reached with the pattern still
+    // unproven and binds nothing.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { for { jump break; } }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b222_a_module_qualified_panic_is_still_an_ending() {
+    // The `panic` leaf is the callee's IDENTITY, not the spelling at the call:
+    // `io::panic(…)` is a member path whose subject resolves later than a bare
+    // name, and the verdict waits for it too.
+    assert_compiles_and_runs(
+        r#"
+        import std::io;
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { io::panic("missing"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b222_the_continuation_binding_is_still_immutable() {
+    // The continuation binding is a capture, not a `let`: it is published into
+    // the enclosing scope as an ordinary immutable declaration, and the
+    // deferred resolution above does not cost it that.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            n = 5;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot mutate immutable 'n'",
+    );
+}
+
+#[test]
+fn b223_a_negated_for_condition_binds_nothing_in_the_body() {
+    // The exhibit. The loop body runs where the pattern did NOT match, so the
+    // payload is not there — before the frame this compiled and read it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = None;
+            for !(slot is Some(let n)) {
+                print(n);
+                slot = Some(1);
+            }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b223_a_negated_match_guard_binds_nothing_in_the_leg() {
+    // The guard's twin: the leg runs where the guard held, and the guard held
+    // where the pattern missed.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe: Option<i32> = None;
+            let scale = 5;
+            match scale {
+                let s if !(maybe is Some(let n)) => print(n + s),
+                _ => print(0),
+            }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b223_an_unnegated_for_condition_still_binds_its_body() {
+    // The control on the other side: reaching the body IS the test having
+    // passed, so the plain shape keeps binding exactly as it did.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut slot: Option<i32> = Some(4);
+            for slot is Some(let n) {
+                print(n);
+                slot = None;
+            }
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b223_a_capture_in_a_closure_written_in_a_condition_speaks_b215s_rule() {
+    // A closure body is not part of the condition it is written in — the
+    // condition's truth says nothing about a test that runs inside a function
+    // value. So an `is` there is in EXPRESSION position, and the read past it
+    // is refused in B215's terms rather than as a name typo, which is what
+    // B199's per-node narrowing left it as.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun holds(check: || bool): bool { check() }
+        fun main() {
+            let maybe = Some(2);
+            if holds(|| maybe is Some(let n)) {
+                print(n);
+            }
+        }
+        "#,
+        "Put the test where a branch depends on it — `if maybe is Some(let n) { … }`",
+    );
+}
+
+#[test]
+fn b223_the_if_control_is_unchanged() {
+    // B195's own exhibit, re-pinned beside the two conditions that now share
+    // its frame: one rule, three conditions, one voice.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+// --- B237: the assignment wiring and the guard pass's seam -------------------
+
+#[test]
+fn b237_an_assignment_to_a_late_resolving_target_reaches_the_wirings_refusal() {
+    // B222 moved a guard clause's continuation binding out of the walk: a
+    // bare-name use a guard MIGHT publish is held back and resolved after the
+    // guard verdict. The assignment wiring runs between those two halves and
+    // reads its target's resolution, so a held-back target was not an
+    // `Expr::Local` when it looked — it fell to the loop's `_ => continue` and
+    // the wiring never saw the assignment at all.
+    //
+    // Nothing else catches this shape. `n = 5` targets the top-level FUNCTION
+    // `n` (the capture is visible only from the end of the `if`), which is not
+    // a binding, so `check_readonly_mutation` has nothing to refuse — and the
+    // program below compiled CLEAN, emitting an assignment to a function.
+    // Held back only because a guard in an enclosing scope captures the same
+    // NAME.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun n(): i32 { 3 }
+        fun guard(maybe: Option<i32>) {
+            n = 5;
+            if !(maybe is Some(let n)) { panic("missing"); }
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot assign to this expression",
+    );
+}
+
+#[test]
+fn b237_the_same_assignment_without_the_name_collision_is_the_control() {
+    // The identical program with the capture spelled `m`: nothing is held back,
+    // the wiring resolves the target in its first part, and the refusal was
+    // always reported. The ONE difference between this and the pin above is
+    // whether the target's name collides with a guard capture's — which is
+    // exactly the seam, and nothing about the assignment itself.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun n(): i32 { 3 }
+        fun guard(maybe: Option<i32>) {
+            n = 5;
+            if !(maybe is Some(let m)) { panic("missing"); }
+            print(m);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot assign to this expression",
+    );
+}
+
+#[test]
+fn b237_assigning_to_the_continuation_binding_itself_still_reports_once() {
+    // The other half of the seam, and the shape the re-run must not double.
+    // The continuation binding IS a variable, so the wiring's job for it is to
+    // feed the variable's constraint — not to refuse. The refusal is
+    // `check_readonly_mutation`'s (the capture is an immutable declaration),
+    // and it must stay the only one now that the wiring runs on this target
+    // too.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            n = 5;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot mutate immutable 'n'",
+    );
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::option::Option::{ self, Some, None };
+        fun guard(maybe: Option<i32>) {
+            if !(maybe is Some(let n)) { panic("missing"); }
+            n = 5;
+            print(n);
+        }
+        fun main() { guard(Some(2)); }
+        "#,
+        "cannot assign to this expression",
+    );
+}
+
+#[test]
+fn b231_a_match_is_an_and_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            let flag = true;
+            if flag && match probe(3) { Some(let n) => n > 0, None => false } {
+                print("yes");
+            } else {
+                print("no");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+#[test]
+fn b231_a_match_is_an_or_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            let flag = false;
+            if flag || match probe(0) { Some(let n) => n > 0, None => true } {
+                print("yes");
+            } else {
+                print("no");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+#[test]
+fn b231_a_match_operand_keeps_the_short_circuit() {
+    // The half only a RUN can say: the operand lowers to statements, and B224's
+    // slot is what keeps them on the operator's own side of the test. A left
+    // operand that settles the answer must leave `probe` uncalled.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        mut hits = 0;
+        fun probe(): Option<i32> { hits = hits + 1; Some(1) }
+        fun main() {
+            let no = false;
+            if no && match probe() { Some(_) => true, None => false } { print("and"); }
+            let yes = true;
+            if yes || match probe() { Some(_) => true, None => false } { print("or"); }
+            print(hits);
+        }
+        "#,
+        "or\n0\n",
+    );
+}
+
+#[test]
+fn b231_a_match_is_an_arithmetic_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            print(1 + match probe(4) { Some(let n) => n, None => 0 });
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b231_an_if_expression_is_an_and_operand() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let flag = true;
+            print(true && if flag { true } else { false });
+        }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b231_a_block_is_an_operand_in_expression_position() {
+    // A bare block is admitted where an operand is unambiguous. In CONDITION
+    // position it stays refused — a `{` after an operator there is the
+    // enclosing construct's body, the ambiguity `no_struct` already resolves
+    // for struct literals and `css` blocks — and parentheses are the spelling.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print(2 + { let a = 3; a });
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b231_the_parenthesized_control_is_unchanged() {
+    // The spelling that already worked, and the one the old refusal steered to:
+    // it must go on producing the same answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun probe(n: i32): Option<i32> { if n > 0 { Some(n) } else { None } }
+        fun main() {
+            let flag = true;
+            if flag && (match probe(1) { Some(_) => true, None => false }) {
+                print("yes");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+// --- B248: a block-like STATEMENT is complete ----------------------------------
+//
+// B231 admitted a block-like form as an OPERAND, where an operator has already
+// committed the position to an expression. As the HEAD of a statement it is a
+// different question, and vilan answers it the way Rust does: `match x { .. }` in
+// leading statement position is COMPLETE at its closing brace, so `+ 1` after it
+// begins a new statement. Admitting the tower there would re-read `* 3` on the
+// next line as a multiplication, which is exactly what the rule exists to settle.
+// The refusal replaces the bare `found '+' expected an expression` — true, and
+// about a statement the author did not know they had written.
+
+#[test]
+fn b248_a_match_head_followed_by_an_operator_steers_to_parentheses() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 } + 1;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "found '+' expected an expression");
+}
+
+#[test]
+fn b248_the_parenthesized_spelling_is_accepted() {
+    // The spelling the refusal steers to, running: the steer has to be a fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let x = 1;
+            print((match x { 1 => 10, _ => 20 }) + 1);
+        }
+        "#,
+        "11\n",
+    );
+}
+
+#[test]
+fn b248_an_if_head_is_refused_the_same_way() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            let c = true;
+            if c { 1 } else { 2 } + 1;
+        }
+        "#,
+        "is COMPLETE at its closing brace",
+    );
+}
+
+#[test]
+fn b248_a_bare_block_head_is_refused_the_same_way() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            { 1 } + 1;
+        }
+        "#,
+        "is COMPLETE at its closing brace",
+    );
+}
+
+#[test]
+fn b248_a_prefix_operator_still_begins_its_own_statement() {
+    // The control the rule EXISTS for, and the reason the shape above is refused
+    // rather than admitted: `*` and `-` can begin an expression, so a line
+    // starting with one is a statement of its own — as it is today, and as it
+    // would silently stop being if the tower ran on after a block-like head.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let c = true;
+            if c { print("branch"); } else { }
+            -1;
+            print("done");
+        }
+        "#,
+        "branch\ndone\n",
+    );
+}
+
+#[test]
+fn b248_a_block_like_operand_is_untouched() {
+    // B231's own shape, one line below the refusal: an operator BEFORE the
+    // block-like form still admits it, because nothing there is ambiguous.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let flag = true;
+            if flag && match 3 { 3 => true, _ => false } {
+                print("yes");
+            }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+// --- B259: the same rule, everywhere the form can head an expression -----------
+//
+// B248 put the refusal at the STATEMENT fork, which is where the shape was found.
+// The rule is about the FORM, though, not about the statement: `let y = match x
+// { .. } + 1;` is the same mistake with the same fix, and it reported "expected
+// `;` to end this statement" and nothing about why; an argument position reported
+// `found '+' expected ',' or ')'`. A `.` chain on a block-like head
+// (`match x { .. }.to_string()`) was outside B248's set entirely and kept the bare
+// `found '.' expected an expression`. All four now take one refusal with the one
+// steer, and the recovery consumes what it refused — a `.` chain WHOLE, since
+// skipping only the `.` would leave `to_string()` as a bare name and cascade.
+
+#[test]
+fn b259_a_let_initializer_with_a_block_like_head_takes_the_refusal() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            let y = match x { 1 => 1, _ => 2 } + 1;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    // The bare terminator demand was the whole of what the author used to get.
+    assert_fails_without(source, "expected `;` to end this statement");
+}
+
+#[test]
+fn b259_an_argument_position_takes_the_refusal() {
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            let x = 1;
+            print(match x { 1 => 1, _ => 2 } + 1);
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "found '+' expected");
+}
+
+#[test]
+fn b259_a_postfix_chain_on_a_block_like_head_is_refused_without_a_cascade() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }.to_string();
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "found '.' expected an expression");
+    // The chain is consumed WHOLE: skipping the `.` alone would leave
+    // `to_string()` standing as a statement of its own.
+    assert_fails_without(source, "to_string");
+}
+
+#[test]
+fn b259_a_postfix_chain_outside_statement_position_is_refused_once() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            let s = match x { 1 => 1, _ => 2 }.to_string();
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "expected `;` to end this statement");
+}
+
+#[test]
+fn b259_the_parenthesized_postfix_spelling_is_accepted() {
+    // The steer has to be a fix for the `.` form too, not only for the operator.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            print((match x { 1 => 10, _ => 20 }).to_string());
+        }
+        "#,
+        "10\n",
+    );
+}
+
+#[test]
+fn b259_a_match_guard_ends_at_the_arms_arrow() {
+    // The boundary the statement fork could not see, and the reason `=>` is
+    // outside the refused set: a guard is an expression that ENDS where the arm's
+    // arrow begins, so an arrow after a block-like guard belongs to the arm and
+    // taking it would eat the leg. `b59`'s own nested-`match` guard is this shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held: Option<i32> = Some(3);
+            match held {
+                Some(let n) if match n { 0 => false, _ => true } => print("kept"),
+                _ => print("dropped"),
+            }
+        }
+        "#,
+        "kept\n",
+    );
+}
+
+#[test]
+fn b259_a_block_like_head_before_a_prefix_operator_still_parses_as_two_statements() {
+    // B248's control, restated OUTSIDE the statement fork: the refusal moved to
+    // where the form is parsed, so the four prefixes have to stay outside its set
+    // there too, or `-1;` on the next line would stop being its own statement.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let c = true;
+            if c { print("branch"); } else { }
+            -1;
+            print("done");
+        }
+        "#,
+        "branch\ndone\n",
+    );
+}
+
+#[test]
+fn b257_assigning_a_live_list_copies_it() {
+    // P1. §6.1 names assignment first — `b = a` installs a second owner of
+    // `a`'s storage exactly as `mut b = a` does. `a` is READ after the
+    // assignment, so this is not rule 2's last-use elision declining to fire:
+    // the site was never a candidate at all. `compute_clone_sites`' Assignment
+    // arm asked `type_id_of_expr`, which answers `None` for a bare
+    // `Expr::Local` (a variable READ interns no type of its own), so the
+    // `let Some(type_id)` guard dropped every plain local on the right of `=`.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut a = [1, 2, 3];
+            mut b = [0];
+            b = a;
+            print(a.len());
+            a.push(4);
+            print(b.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("b = __clone(a);"),
+            "an assignment from a live list aliased its source:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n3\n");
+}
+
+#[test]
+fn b257_assigning_a_live_struct_copies_it() {
+    // P2. The same miss at the other aggregate shape, and it is §6.1's own
+    // example rewritten as an assignment: `r = q; q.x = 10` left `r.x` at 10.
+    let source = r#"
+        import std::io::print;
+        struct Point { x: i32, y: i32 }
+        fun main() {
+            mut q = Point { x = 1, y = 2 };
+            mut r = Point { x = 0, y = 0 };
+            r = q;
+            print(q.x);
+            q.x = 10;
+            print(r.x);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__clone(q)"),
+            "an assignment from a live struct aliased its source:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "1\n1\n");
+}
+
+#[test]
+fn b257_assigning_a_dead_list_still_elides() {
+    // P3. Rule 2 must keep firing: `c` is never read again, so the assignment
+    // moves rather than copies and the program has no `__clone` at all. This is
+    // the half a "always copy at an assignment" patch would have eaten.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut c = [1, 2, 3];
+            mut d = [0];
+            d = c;
+            d.push(9);
+            print(d.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a dead source's donation copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "4\n");
+}
+
+#[test]
+fn b257_the_binding_form_is_the_control() {
+    // P4. `mut f = e` always copied — the `let` arm passes the variable's own
+    // declared type, which is never `None`. It must go on doing so.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut e = [1, 2, 3];
+            mut f = e;
+            e.push(4);
+            print(f.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("let f = __clone(e);"),
+            "the binding control stopped copying:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn b257_a_write_through_a_shared_view_copies_its_source() {
+    // P5. The form B255 came in through: `h.write() = c` is an assignment whose
+    // target `rewrite_view_assignment_targets` has already turned into a
+    // `Dereference`, and whose value is a live local. It lowered to `h.v = c`,
+    // so a later `c.push(4)` grew the cell — which is how `each`'s
+    // `row_items.write() = list` came to hold the reconciler's own input.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            mut c = [1, 2, 3];
+            let h = Shared::new([0]);
+            h.write() = c;
+            c.push(4);
+            print(h.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("h.v = __clone(c);"),
+            "a write through a Shared view aliased its source:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn b257_a_bare_parameter_stored_by_an_assignment_copies() {
+    // The std shape the corpus diff is made of, and a miscompile of its own:
+    // `List::insert`'s `self[index] = value` wrote the CALLER's aggregate into
+    // the receiver's slot. A bare parameter is a loan the callee may not hand
+    // on (§6.3), and `is_elidable_copy` never elides one, so the store copies.
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            mut rows = [[0]];
+            mut row = [1, 2];
+            rows.insert(0, row);
+            row.push(3);
+            print(rows[0].len());
+        }
+        "#;
+    assert_compiles_and_runs(source, "2\n");
+}
+
+#[test]
+fn b256_a_binding_fed_by_a_shared_read_copies() {
+    // `Shared.read(self): T` is declared a value return, and §6.1 says a
+    // signature that hands back a value hands back a value. The intrinsic
+    // lowers to the bare slot `self.v`, so `let b = h.read()` binds the cell's
+    // own storage and a later write through the cell shows in `b`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3, 4, 5]);
+            let b = h.read();
+            h.write().push(9);
+            print(b.len());
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b256_a_mutable_binding_fed_by_a_shared_read_does_not_grow_the_cell() {
+    // The other direction of the same alias: `mut c = h.read(); c.push(10)`
+    // pushed into the CELL, so the cell read 6.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3, 4, 5]);
+            mut c = h.read();
+            c.push(10);
+            print(h.read().len());
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn b256_a_value_returning_body_copies_the_shared_read_it_hands_back() {
+    // `SignalCell::get`'s shape: a by-value signature whose tail is a shared
+    // read. The frame does not own the cell — it reached it through a bare
+    // parameter — so the return owes rule 1's copy, and without it every
+    // `signal.get()` in the estate hands out the signal's own storage.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Cell<T> { value: Shared<T> }
+        impl Cell<type T> {
+            fun get(self): T { self.value.read() }
+        }
+        fun main() {
+            let cell = Cell { value = Shared::new([1, 2, 3]) };
+            mut got = cell.get();
+            got.push(4);
+            print(cell.get().len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b256_a_shared_read_in_temporary_position_stays_free() {
+    // The half of the ruling that is NOT a cost: a read that feeds no store is
+    // no position at all, so `for x in cell.read()` and `cell.read().len()`
+    // copy nothing — and must go on copying nothing when B256 lands. Green
+    // today, and the control that says which half the ignored pins above are
+    // about.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3]);
+            print(h.read().len());
+            mut total = 0;
+            for x in h.read() {
+                total += x;
+            }
+            print(total);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a shared read in temporary position copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n6\n");
+}
+
+// --- B267: the cell-aware last-use elision ----------------------------------
+
+#[test]
+fn b267_a_read_of_a_cell_only_rebound_keeps_the_cells_storage() {
+    // `each`'s per-notify shape, reduced: a cell whose only writes REPLACE
+    // the slot, read into a binding that is walked and nothing more. A rebind
+    // installs a fresh value and leaves the old one exactly as it was, so
+    // nothing can ever reach back into what the read handed out and the copy
+    // rule 1 would ask for cannot be observed by any program.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let rows: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let previous = rows.read();
+            mut total = 0;
+            for row in previous {
+                total += row;
+            }
+            rows.write() = [9];
+            print(total);
+            print(rows.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a read of a cell nothing mutates in place copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "6\n1\n");
+}
+
+#[test]
+fn b267_a_rebind_on_the_next_line_orphans_the_read_before_any_mutation() {
+    // `drain`'s shape, and the ordering B267 had to decide. The cell IS mutated
+    // in place elsewhere in the program, so the elision cannot rest on the
+    // cell's writes alone — but the clear one line down REBINDS the slot before
+    // anything runs, and from there the wave is the binding's alone. The push
+    // that follows lands on the fresh list, never on the wave.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let pending: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let wave = pending.read();
+            pending.write() = [];
+            pending.write().push(7);
+            mut total = 0;
+            for item in wave {
+                total += item;
+            }
+            print(total);
+            print(pending.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a read the very next line orphans copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "6\n1\n");
+}
+
+#[test]
+fn b267_a_read_of_one_cell_survives_a_write_to_a_different_cell() {
+    // Cell identity is the whole of the rule: a write mutates the cell it is
+    // written through and no other, so a second cell's `push` is not a hazard
+    // for the first cell's read. Two `Shared::new` bindings are two cells, and
+    // the slot walk says so without an alias analysis.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let left: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let right: Shared<List<i32>> = Shared::new([4, 5]);
+            let snapshot = left.read();
+            right.write().push(9);
+            mut total = 0;
+            for item in snapshot {
+                total += item;
+            }
+            print(total);
+            print(right.read().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a write to a different cell refused the elision:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "6\n3\n");
+}
+
+#[test]
+fn b267_an_in_place_write_before_the_rebind_refuses_the_elision() {
+    // The hazard the ordering test exists to catch: the in-place write reaches
+    // the read's storage FIRST, and the rebind that follows is too late to
+    // orphan anything. So this read copies, and the binding keeps the three
+    // elements it was handed.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let before = cell.read();
+            cell.write().push(9);
+            cell.write() = [];
+            print(before.len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__clone"),
+            "a read a later in-place write reaches did not copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn b267_a_read_whose_binding_a_closure_captures_copies() {
+    // A closure captures BINDINGS (§6.9), so a captured binding is read from a
+    // region the last-use walk cannot survey — it says so by refusing to answer
+    // at all, and the elision refuses with it. Conservative on purpose: the
+    // cell here is only ever rebound, so the alias would in fact be harmless,
+    // and the pin is that B267 does not go looking.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let snapshot = cell.read();
+            let show = || snapshot.len();
+            cell.write() = [9];
+            print(show());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__clone"),
+            "a read a closure captures elided its copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+// --- B274: the copy at a `&mut self` receiver on a temporary read ------------
+//
+// B256 left the temporary free, and one temporary is not free: the RECEIVER of
+// a `&mut self` method. A read hands back the cell's own storage, so the
+// callee's `&mut` binding IS the cell and `shared.read().push(x)` grows it —
+// through a signature that says it hands back a value. It is the only position
+// a value reaches a `&mut` binding through: a `&mut` PARAMETER refuses one
+// outright ("a `&mut` parameter takes a view; pass `&mut <place>`"), so there is
+// no second hole of this shape to close.
+
+#[test]
+fn b274_a_temporary_read_at_a_mutable_receiver_does_not_grow_the_cell() {
+    // The item's own probe, and what four doc pages have always promised:
+    // `tour/memory-model.md:172`, `:240`, `std/cells.md:36` and
+    // `appendix/gotchas.md:44` all say this push is lost. It was not.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let log = Shared::new([1]);
+            log.read().push(9);
+            print(log.read().len());
+            log.write().push(9);
+            print(log.read().len());
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b274_a_mutable_receiver_on_an_ordinary_place_still_mutates_in_place() {
+    // The control that says how narrow the rule is: only a READ is admitted at
+    // the receiver, never a place. A local, a field and an element are the
+    // in-place mutation the `&mut self` convention exists for, and a rule
+    // keyed on `Convention::RefMut` alone would have copied all three.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Box { items: List<i32> }
+        fun main() {
+            mut local = [1];
+            local.push(9);
+            print(local.len());
+            mut box = Box { items = [1] };
+            box.items.push(9);
+            print(box.items.len());
+            mut nested = [[1]];
+            nested[0].push(9);
+            print(nested[0].len());
+        }
+        "#,
+        "2\n2\n2\n",
+    );
+}
+
+#[test]
+fn b274_a_temporary_read_at_a_reading_receiver_still_copies_nothing() {
+    // B256's other half, held against the widening: a receiver that does not
+    // take `&mut self` cannot grow the cell, so it goes on paying nothing.
+    // `len()` takes a bare `self`, and so does std's own `Bytes::set` — which
+    // is why `binary.vl`'s `self.buffer.read().set(..)` writes through to the
+    // host buffer and must go on doing so.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let h = Shared::new([1, 2, 3]);
+            print(h.read().len());
+            for x in h.read() {
+                print(x);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a reading receiver on a temporary read copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n1\n2\n3\n");
+}
+
+#[test]
+fn b274_a_temporary_read_at_a_mutable_receiver_copies_through_a_field_too() {
+    // The shape the trap is actually written in: a cell reached through a
+    // struct, mutated by a method whose receiver is the read. The position is
+    // the receiver rather than the read's own subject, so how the cell was
+    // reached makes no difference.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Log { lines: Shared<List<str>> }
+        fun main() {
+            let log = Log { lines = Shared::new(["a"]) };
+            log.lines.read().push("b");
+            print(log.lines.read().len());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// --- E157: `::` after a block-like form is its own refusal ---------------------
+//
+// B248/B259's message earns its keep with its STEER, and a steer has to be a
+// fix. `(match x { .. }) + 1` and `(match x { .. }).to_str()` parse — B231
+// admits the form inside parentheses — and `(match x { .. })::foo` does not,
+// because `::` reaches into a NAMESPACE and what stands to its left is a name,
+// not a value. So the one continuation with no parenthesized spelling was the
+// one being sent to parentheses, and the author's next keystroke bought them a
+// second parse error.
+
+#[test]
+fn e157_a_path_after_a_match_head_says_a_path_cannot_start_at_a_value() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    // The steer that is not a fix here is gone from this shape specifically.
+    assert_fails_without(source, "is COMPLETE at its closing brace");
+}
+
+#[test]
+fn e157_the_same_refusal_after_an_if_head() {
+    let source = r#"
+        fun main() {
+            let c = true;
+            if c { 1 } else { 2 }::Bar::baz();
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    assert_fails_without(source, "is COMPLETE at its closing brace");
+}
+
+#[test]
+fn e157_the_same_refusal_after_a_bare_block_head() {
+    let source = r#"
+        fun main() {
+            { 1 }::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    assert_fails_without(source, "is COMPLETE at its closing brace");
+}
+
+// B259's other three positions take the `::` rule too — the rule is about the
+// FORM, not about the statement, which is the whole of what B259 established.
+#[test]
+fn e157_a_let_initializer_takes_the_path_refusal() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            let y = match x { 1 => 1, _ => 2 }::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+    assert_fails_without(source, "expected `;` to end this statement");
+}
+
+#[test]
+fn e157_an_argument_position_takes_the_path_refusal() {
+    let source = r#"
+        import std::io::print;
+        fun main() {
+            let x = 1;
+            print(match x { 1 => 1, _ => 2 }::foo);
+        }
+        "#;
+    assert_fails_once_with(source, "`::` reaches into a NAMESPACE");
+}
+
+// The counterweight, and the reason this is a SECOND rule rather than a reworded
+// first: every other continuation still gets the parenthesize steer, which is
+// still a fix for it.
+#[test]
+fn e157_an_operator_after_a_block_like_head_keeps_the_parenthesize_steer() {
+    let source = r#"
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 } + 1;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "`::` reaches into a NAMESPACE");
+}
+
+#[test]
+fn e157_a_dot_chain_after_a_block_like_head_keeps_the_parenthesize_steer() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }.to_string();
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "`::` reaches into a NAMESPACE");
+}
+
+// One diagnostic, not two: a `.` chain followed by a `::` is refused once, by
+// the rule the FIRST continuation earned.
+#[test]
+fn e157_a_chain_then_a_path_is_refused_exactly_once() {
+    let source = r#"
+        import std::display::Display;
+        fun main() {
+            let x = 1;
+            match x { 1 => 1, _ => 2 }.to_string()::foo;
+        }
+        "#;
+    assert_fails_once_with(source, "is COMPLETE at its closing brace");
+    assert_fails_without(source, "`::` reaches into a NAMESPACE");
+}
+
+// The path spelling the refusal points at, running: a `match` that ENDED the
+// statement before, and an ordinary path on the line after it.
+#[test]
+fn e157_the_separated_spelling_is_accepted() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        enum Colour { Red, Green }
+        fun main() {
+            let x = 1;
+            match x { 1 => print("one"), _ => print("other") }
+            let c = Colour::Green;
+            match c { Colour::Red => print("red"), Colour::Green => print("green") }
+        }
+        "#,
+        "one\ngreen\n",
+    );
+}
+
+/// B345: rule 3's capture scan walks a call's SUBJECT, not only its arguments.
+/// A plain call's subject is the callee's own name and walking it finds
+/// nothing, which is why the omission survived — but a call whose callee is
+/// COMPUTED carries the whole inner expression there, and a view named inside
+/// it was missed by the scan that exists to find exactly that.
+#[test]
+fn a_view_inside_a_nested_call_subject_is_a_closure_capture() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Holder { label: str }
+
+        fun build(text: str): || str {
+            || text
+        }
+
+        fun main() {
+            let holder = Holder { label = "a" };
+            let seen = &holder;
+            let show = || (build(seen.label))();
+            print(show());
+        }
+        "#,
+        "a closure cannot capture the view 'seen'",
     );
 }

@@ -3,6 +3,8 @@
 // boundary forces it, but because anything an entry reaches must run where
 // that entry runs, and these types travel to both.
 
+export *;
+
 // A note. Wire so it can travel, PartialEq so mirrors and the UI can
 // compare values, Debug for error paths.
 [derive(Wire, PartialEq, Debug)]

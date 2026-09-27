@@ -16,7 +16,7 @@ macro fun derive_label(item: Item): Source {
 
 	let target = match item.as_struct() {
 		Some(let found) => found,
-		None => StructItem { name = "?", fields = [] },
+		None => StructItem { name = "?", fields = [], generics = [] },
 	};
 	// The whole impl as a template: braces of the GENERATED code are escaped,
 	// braces of the holes are not, and the indentation is the closing

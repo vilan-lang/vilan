@@ -192,18 +192,72 @@ fn normalize_components(path: &Path) -> PathBuf {
 /// the longest-path-safe spelling, and it is never shown to the user (the
 /// original path is what diagnostics print).
 pub fn canonical_path(path: impl AsRef<Path>) -> PathBuf {
-    let path = path.as_ref();
-    let Ok(canonical) = std::fs::canonicalize(path) else {
-        return normalize_components(path);
-    };
+    canonicalized(path.as_ref()).unwrap_or_else(|| normalize_components(path.as_ref()))
+}
+
+/// [`canonical_path`]'s on-disk arm alone: `None` where the path is not there.
+fn canonicalized(path: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
     // A path Windows cannot spell in UTF-8 (an unpaired surrogate) keeps its
     // verbatim form: it is still a consistent key, just a longer one.
-    match canonical.to_str() {
+    Some(match canonical.to_str() {
         Some(text) => match strip_verbatim_prefix(text) {
             Cow::Borrowed(stripped) if stripped.len() == text.len() => canonical,
             stripped => PathBuf::from(stripped.into_owned()),
         },
         None => canonical,
+    })
+}
+
+/// [`canonical_path`] for a path that **is not on disk yet** — a build product
+/// before its generator has written it: the deepest ancestor that IS on disk is
+/// canonicalized, and the components below it are re-attached exactly as they
+/// were spelled.
+///
+/// The comparison key `canonical_path` yields is only like-with-like when both
+/// sides resolved. When one did not, the two are a resolved spelling and a
+/// spelled one, and every way a filesystem can give a path two spellings makes
+/// them differ: a symlink anywhere in the ancestry (unix and Windows alike), and
+/// on a case-insensitive filesystem the case of every component. Containment
+/// then answers NO for a path that is plainly inside its root — B198's fail-open,
+/// found on Windows against `gen` / `GEN` and reachable on unix through a link.
+///
+/// So this is the resolution a containment test uses when the subject may not
+/// exist: **canonical-or-fail, never folded-against-lexical**. What cannot be
+/// resolved is the tail, which is by definition the part no filesystem has an
+/// opinion about yet — so the two sides of the comparison are again like with
+/// like, and the answer for a tree where nothing at all is on disk degrades to
+/// G17's spelled ladder (both sides lexical) rather than to a mixed comparison.
+///
+/// Not a replacement for [`canonical_path`], whose promise to every other caller
+/// — "the path as the disk spells it, or the path as you spelled it" — is
+/// unchanged. This one costs one `canonicalize` per missing ancestor, and for a
+/// path that IS on disk it costs exactly what `canonical_path` costs: the first
+/// attempt succeeds.
+pub fn canonical_path_of_unwritten(path: impl AsRef<Path>) -> PathBuf {
+    // The tail is folded lexically FIRST: a `.` or `..` component has no file
+    // name, so climbing the spelled path would give up at it and answer the
+    // whole thing lexically — while the plain spelling of the same file
+    // resolved through its ancestor. Two spellings of one unsaved buffer
+    // disagreed exactly there (B207's pin, red on Windows, whose temp root is
+    // an 8.3 short name that resolution rewrites).
+    let normalized = normalize_components(path.as_ref());
+    let mut unwritten: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut ancestor: &Path = &normalized;
+    loop {
+        if let Some(mut resolved) = canonicalized(ancestor) {
+            for name in unwritten.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        // Nothing on this path exists: there is no anchor, so the whole thing
+        // stays lexical, exactly as `canonical_path` would answer.
+        let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+            return normalized;
+        };
+        unwritten.push(name);
+        ancestor = parent;
     }
 }
 
@@ -310,6 +364,7 @@ impl RecursionGuard {
     /// Enters one level of recursion; `None` once the depth limit is reached, so
     /// the caller can return a graceful fallback instead of recursing.
     pub fn enter() -> Option<RecursionGuard> {
+        crate::stack_guard::ensure_sufficient_stack("a type walk");
         RECURSION_DEPTH.with(|depth| {
             let current = depth.get();
             if current >= 2048 {
@@ -451,8 +506,8 @@ pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Ran
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_path, join_with, normalize_components, normalize_newlines, strip_bom,
-        strip_verbatim_prefix, trim_multiline_string,
+        canonical_path, canonical_path_of_unwritten, join_with, normalize_components,
+        normalize_newlines, strip_bom, strip_verbatim_prefix, trim_multiline_string,
     };
     use std::path::{Path, PathBuf};
 
@@ -499,6 +554,67 @@ mod tests {
         );
         // `\\?\pipe\name` is not a drive letter either.
         assert_eq!(strip_verbatim_prefix(r"\\?\pipe\vilan"), r"\\?\pipe\vilan");
+    }
+
+    /// [`strip_verbatim_prefix`]'s doc justifies stripping UNCONDITIONALLY on
+    /// the grounds that "the result is a comparison key, never a path we
+    /// reopen". Audit run 7 checked, and three callers reopen it:
+    /// `TreeWalk::rooted_at` stats the canonical root (`is_dir()`,
+    /// `main.rs` ~2039), `find_project_root` probes `vilan.toml` beside every
+    /// ancestor of one (`main.rs` ~4069), and `generated_root_in` reads that
+    /// file's bytes (`manifest.rs` ~807). So the caveat `dunce` exists to
+    /// respect — that an ordinary spelling cannot always address what a verbatim
+    /// one can — is live here rather than excluded by construction.
+    ///
+    /// It holds, and this pin is why it is allowed to: `std` re-applies the
+    /// verbatim form itself on the way back in (`maybe_verbatim`), so a path
+    /// past `MAX_PATH` survives the round trip through the stripped spelling.
+    /// That is a property of the standard library, not of this module, which is
+    /// exactly the kind of thing that changes underneath a comment. The pin
+    /// turns the caveat into a gate, on the longest path the callers can hand
+    /// back — `cfg(windows)` because `MAX_PATH` and the prefix are only there.
+    #[cfg(windows)]
+    #[test]
+    fn a_stripped_canonical_path_is_still_openable() {
+        let base = std::env::temp_dir().join(format!("vilan-longpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Comfortably past `MAX_PATH` (260): the verbatim prefix is the only
+        // thing that lets Win32 address a path this long, so removing it is
+        // precisely the risk under test.
+        let mut deep = base.clone();
+        for _ in 0..12 {
+            deep.push("directory_with_a_name_long_enough_to_pass_max_path");
+        }
+        assert!(
+            deep.as_os_str().len() > 260,
+            "the probe must actually be a long path: {}",
+            deep.display()
+        );
+        std::fs::create_dir_all(&deep).expect("create a path past MAX_PATH");
+        std::fs::write(deep.join("vilan.toml"), "[package]\nname = \"app\"\n").unwrap();
+
+        let key = canonical_path(&deep);
+        assert!(
+            !key.to_string_lossy().starts_with(r"\\?\"),
+            "the prefix is gone — that is the behavior whose caveat this pins: {}",
+            key.display()
+        );
+        // The three reopens, in the shapes their callers use.
+        assert!(
+            key.is_dir(),
+            "a canonical root is stat'd by the walk that starts there: {}",
+            key.display()
+        );
+        assert!(
+            key.join("vilan.toml").is_file(),
+            "and probed for a manifest at every level of the climb above it"
+        );
+        assert!(
+            std::fs::read_to_string(key.join("vilan.toml")).is_ok(),
+            "and that manifest is then READ, which is the reopen that decides \
+             whether a generated root is found at all"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -562,6 +678,97 @@ mod tests {
             canonical.display()
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unwritten_path_resolves_through_the_deepest_ancestor_that_exists() {
+        // B198. `canonical_path` answers a path not on disk with the caller's
+        // own spelling, which is the right key and the wrong SIDE of a
+        // containment test: the other side resolved. Here the directory is real
+        // and reached through a link, so `canonical_path` and this one give
+        // measurably different answers for the same missing file.
+        let base = std::env::temp_dir().join(format!(
+            "vilan-canonical-unwritten-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).expect("create the probe directory");
+        let root = canonical_path(&base);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("real"), root.join("link"))
+            .expect("link the probe directory");
+
+        let unwritten = root.join("real/not_written_yet.vl");
+        assert!(!unwritten.exists(), "the probe file must not be on disk");
+        assert_eq!(
+            canonical_path_of_unwritten(&unwritten),
+            root.join("real/not_written_yet.vl"),
+            "the tail is re-attached to its resolved ancestor"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            canonical_path_of_unwritten(root.join("link/not_written_yet.vl")),
+            root.join("real/not_written_yet.vl"),
+            "and the ancestor is RESOLVED, which is the whole difference from \
+             `canonical_path` — it answers the link's own spelling here"
+        );
+
+        // Nothing BELOW the probe directory exists, so the whole tail is
+        // re-attached to the deepest ancestor that does — resolved, and with the
+        // tail's `.` folded. Windows spells its temp directory with an 8.3 short
+        // name (`RUNNER~1`) that resolves to the long one, which is exactly the
+        // difference this function exists for: `base` is the caller's spelling,
+        // `root` is what is really there.
+        let nowhere = base.join("absent/pkg/./src/main.vl");
+        assert_eq!(
+            canonical_path_of_unwritten(&nowhere),
+            root.join("absent/pkg/src/main.vl"),
+            "the unwritten tail rides the RESOLVED ancestor"
+        );
+        // From an ancestor that is already canonical there is nothing left to
+        // resolve, so the two functions agree — on every platform.
+        let nowhere_canonical = root.join("absent/pkg/./src/main.vl");
+        assert_eq!(
+            canonical_path_of_unwritten(&nowhere_canonical),
+            canonical_path(&nowhere_canonical),
+            "with a canonical anchor there is nothing to resolve, so the two agree"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn two_spellings_of_an_unwritten_path_agree_through_a_resolved_ancestor() {
+        // B207's Windows red at Order 26's seal, made runnable here: an
+        // ancestor whose canonical form differs from its spelling — a symlink
+        // on unix, an 8.3 short name on Windows. A `..` in the unwritten tail
+        // used to send the spelled path down the lexical arm while the plain
+        // spelling resolved through the link, and `same_file` disagreed.
+        let base = std::env::temp_dir().join(format!(
+            "vilan-unwritten-spellings-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).expect("create the probe directory");
+        let root = canonical_path(&base);
+        std::os::unix::fs::symlink(root.join("real"), root.join("link"))
+            .expect("link the probe directory");
+        let spelled = root.join("link/src/./pkg/../pkg/main.vl");
+        let plain = root.join("link/src/pkg/main.vl");
+        assert!(!plain.exists(), "the probe file must not be on disk");
+        assert_eq!(
+            canonical_path_of_unwritten(&spelled),
+            canonical_path_of_unwritten(&plain),
+            "one file, two spellings, one answer"
+        );
+        assert_eq!(
+            canonical_path_of_unwritten(&plain),
+            root.join("real/src/pkg/main.vl"),
+            "and the answer rides the RESOLVED ancestor"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

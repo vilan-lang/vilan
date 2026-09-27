@@ -19,10 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod support;
+
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
+    let directory = support::scratch_root().join(format!(
         "vilan_build_manifest_{tag}_{}_{unique}",
         std::process::id()
     ));

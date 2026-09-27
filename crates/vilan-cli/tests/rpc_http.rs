@@ -19,7 +19,7 @@ mod support;
 
 /// A fresh temp directory for the test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("vilan_rpc_http_{tag}_{}", std::process::id()));
+    let dir = support::scratch_root().join(format!("vilan_rpc_http_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -255,6 +255,87 @@ fun run_client(url: str) {
     assert!(
         stdout.contains("add -> 2") && stdout.contains("add -> 5"),
         "round-trips (with server-side state) failed:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B374: `HttpTransport` against a host nothing answers on. The host `fetch`
+/// REJECTS, and a rejection is not a throw on the calling stack — so the
+/// transport's own contract ("a transport can FAIL … `Err(reason)` is the
+/// infrastructure path") used to be broken by the rejection leaving as an
+/// unhandled one and taking the whole process with it. A login form on a
+/// dropped network must say "offline", not take the page down.
+///
+/// The pin asserts BOTH halves, because either alone is passable by accident:
+/// the typed `Transport(..)` arm is reached (so the caller's `match` ran), and
+/// the line printed AFTER it is on stdout (so the program kept going). A
+/// process that dies here also writes `TypeError: fetch failed` to stderr,
+/// which `vilan_run_with_liveness_bound` fails on in its own right.
+#[test]
+fn an_unreachable_host_answers_a_typed_transport_error_and_the_process_survives() {
+    // A port bound and immediately released: nothing listens on it, and it is
+    // the OS's own answer to "which port is free", so no literal can collide
+    // with a service a developer happens to be running.
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
+        let port = listener.local_addr().expect("read the probe port").port();
+        drop(listener);
+        port
+    };
+    let dir = temp_project("unreachable");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{{ self, Ok, Err }};
+import std::json::json_codec;
+import std::rpc::{{ HttpTransport, RpcError }};
+
+[service(Client)]
+struct Counter {{
+	seed: i32,
+}}
+
+impl Counter {{
+	[rpc]
+	fun add(self, by: i32): i32 {{
+		self.seed + by
+	}}
+}}
+
+async fun main() {{
+	let client = Client {{
+		transport = HttpTransport {{ url = "http://127.0.0.1:{closed_port}/rpc" }},
+		codec = json_codec(),
+	}};
+	match client.add(2) {{
+		Ok(let n) => print(i"add -> {{n}}"),
+		Err(let error) => match error {{
+			RpcError::Transport(let reason) => print(i"transport failure: {{reason}}"),
+			_ => print(i"wrong arm: {{error.to_json()}}"),
+		}},
+	}}
+	print("still running");
+	exit(0);
+}}
+"#
+        ),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("transport failure: "),
+        "an unreachable host did not answer `RpcError::Transport`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("still running"),
+        "the process did not survive an unreachable host:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -503,7 +584,7 @@ fun main() {{
 	let reactive = ReactiveClient::new(bridge(split), json_codec());
 	let transport = HttpTransport {{ url = i"{{base}}/rpc" }};
 	let connection = split.connection;
-	let attached: Result<i32, RpcError> = call(transport, json_codec(), "attach", [|s: Serializer| connection.describe(s)]);
+	let attached: Result<i32, RpcError> = call(transport, json_codec(), "attach", [|mut s: Serializer| connection.describe(&mut s)]);
 	match attached {{
 		Ok(let channel) => {{
 			let mirror: RemoteSource<i32> = reactive.source(channel);
@@ -540,7 +621,7 @@ fun main() {{
         "src/main.vl",
         &watcher(
             "survivor",
-            "\tlet by = 5;\n\tlet added: Result<i32, RpcError> = call(transport, json_codec(), \"add\", [|s: Serializer| by.describe(s)]);\n\tmatch added {\n\t\tOk(let n) => print(i\"add -> {n}\"),\n\t\tErr(let error) => print(i\"add err {error.to_json()}\"),\n\t}\n\tsleep(300);\n",
+            "\tlet by = 5;\n\tlet added: Result<i32, RpcError> = call(transport, json_codec(), \"add\", [|mut s: Serializer| by.describe(&mut s)]);\n\tmatch added {\n\t\tOk(let n) => print(i\"add -> {n}\"),\n\t\tErr(let error) => print(i\"add err {error.to_json()}\"),\n\t}\n\tsleep(300);\n",
         ),
     );
 
@@ -979,5 +1060,253 @@ fun run_clients(port: i32) {
             "missing `{expected}` in binary-socket output:\n{stdout}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A78: a handle-returning method reached over the CONNECTIONLESS `{mount}rpc`
+/// POST leg fails naming the method, and the service's plain methods keep
+/// answering beside it.
+///
+/// Since A92 the stub is SYNC and makes no call, so the failure arrives one
+/// step later and in the mirror's own vocabulary: the first LEASE is what asks,
+/// and what it was told is `status()` — `Failed(Remote("`note` returns a signal
+/// handle, …"))`. The message is unchanged; where a caller reads it is not.
+///
+/// A handle's reply is a channel id minted in the connection's capability
+/// table, and the POST leg holds no connection — so the call cannot be served
+/// there. The message used to say only that "a source-returning method" needed
+/// a session this request had none of, which reads as a server fault at a call
+/// the author cannot see; it names the method and the transport that does work
+/// now.
+///
+/// This is the leg that CANNOT be refused at the mount, which is the half of
+/// A78 worth pinning explicitly: `ServerBuilder::build` folds an upgrade
+/// handler for every service, so the same mount that answers this POST also
+/// answers the WebSocket the method is fine over. Nothing about the mount is
+/// wrong — only the route the client dialled — and refusing at mount would
+/// refuse every working handle service. `local_rpc`, which really can be wired
+/// with no connection at all, refuses at wiring time instead (pinned in
+/// vilan-core's `inference`).
+#[test]
+fn a_handle_method_over_the_connectionless_post_leg_fails_naming_the_method() {
+    let dir = temp_project("handle_over_post");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::time::sleep;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::rpc::{ HttpTransport, ReactiveClient, RemoteSource, duplex_pair };
+import std::http::Server;
+import std::rpc_server::Service;
+
+[service(NotesClient)]
+struct Notes {
+	body: SignalCell<str>,
+}
+
+impl Notes {
+	[rpc]
+	fun note(self, id: str): SignalCell<str> {
+		self.body
+	}
+
+	[rpc]
+	fun touch(self): i32 {
+		7
+	}
+}
+
+fun main() {
+	let notes = Notes { body = Signal::new("hello") };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec())))
+		.on_start(|server| run_client(i"{server.url()}rpc"))
+		.build()
+		.start();
+}
+
+fun run_client(url: str) {
+	// The reactive half a handle service's client carries, wired to a duplex
+	// that goes nowhere: the POST leg is the point, and the mirror this call
+	// would mint is never reached.
+	let (client_end, _server_end) = duplex_pair();
+	let client = NotesClient {
+		transport = HttpTransport { url = url },
+		codec = json_codec(),
+		reactive = ReactiveClient::new(client_end, json_codec()),
+	};
+	match client.touch() {
+		Ok(let n) => print(i"touch -> {n}"),
+		Err(let error) => print(i"touch err {error.to_json()}"),
+	}
+	// The stub is sync and makes no call (A92), so the failure arrives where a
+	// mirror's facts live: the first LEASE issues the call, it fails, and
+	// `status()` reads `Failed(error)`.
+	let note: RemoteSource<str> = client.note("welcome");
+	let watching = note.sub(|_text| print("note -> seeded"));
+	// N84: the SETTLE WAIT. The lease is issued on the subscription above and
+	// answered on the transport's own turn, not on this one, so what makes the
+	// failure readable here is a round-trip — and one round-trip was enough on
+	// a quiet box and not enough under lane load, where this printed
+	// `note err Waiting` and nothing in the pin could tell that from a real
+	// regression. Round-trip until the status leaves `Waiting`, bounded: a
+	// genuine hang still fails the assertions below, with the state it is
+	// stuck in printed rather than with a timeout nobody can read.
+	mut settled = note.status().get().debug();
+	mut rounds = 0;
+	for settled.contains("Waiting") && rounds < 100 {
+		match client.touch() {
+			Ok(let _settle) => {},
+			Err(let _error) => {},
+		}
+		sleep(20);
+		settled = note.status().get().debug();
+		rounds = rounds + 1;
+	}
+	print(i"note err {settled}");
+	watching.dispose();
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("touch -> 7"),
+        "a plain method must keep answering over the POST leg — the refusal is \
+         the handle's, not the mount's:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("note err Failed("),
+        "a handle method over the POST leg must fail at its first lease, not \
+         answer a channel id that names nothing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("note -> seeded"),
+        "a mirror whose mint failed must deliver nothing:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("`note` returns a signal handle"),
+        "the failure must name the METHOD — the half the reader can act on:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Client::connect"),
+        "the failure must name the transport that does work:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A107's other leg: an awaited `void` `[rpc]` method over the CONNECTIONLESS
+/// `{mount}rpc` POST route, where a handle-returning method cannot be served
+/// at all.
+///
+/// This is the pair worth having beside `a_handle_method_over_the_connectionless
+/// _post_leg_fails_naming_the_method`. A handle's reply is a channel id minted
+/// in a connection's capability table and the POST leg holds no connection, so
+/// that method fails by construction. A void method needs NOTHING from the
+/// connection: its reply is the ack envelope, so it is served over the POST leg
+/// exactly as a plain method is, and the client waits for the ack over one
+/// request/response pair with no socket anywhere.
+///
+/// Which also says what the ack IS: not a socket-level acknowledgement, but the
+/// reply frame the protocol always writes (`RpcProtocol::respond`). Whatever
+/// carries a reply carries this one.
+#[test]
+fn an_awaited_void_rpc_is_served_over_the_connectionless_post_leg() {
+    let dir = temp_project("void_over_post");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::option::Option::{ self, None, Some };
+import std::json::json_codec;
+import std::rpc::HttpTransport;
+import std::http::Server;
+import std::rpc_server::Service;
+
+[service(LedgerClient)]
+struct Ledger {
+	rows: SignalCell<List<i53>>,
+}
+
+impl Ledger {
+	[rpc]
+	fun drop_row(self, id: i53) {
+		self.rows.update(|&mut rows| {
+			if rows.index_of(id) is Some(let index) {
+				rows.remove(index);
+			}
+		});
+	}
+
+	[rpc]
+	fun count(self): i32 {
+		self.rows.get().len().as_i32()
+	}
+}
+
+fun main() {
+	let ledger = Ledger { rows = Signal::new([1i53, 2i53, 3i53]) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(ledger.dispatcher().into_protocol(json_codec())))
+		.on_start(|server| run_client(i"{server.url()}rpc"))
+		.build()
+		.start();
+}
+
+fun run_client(url: str) {
+	// No `reactive` field: this service exposes nothing and returns no handle,
+	// so its generated client is the transport and the codec — which is the
+	// whole surface an awaited void needs.
+	let client = LedgerClient {
+		transport = HttpTransport { url = url },
+		codec = json_codec(),
+	};
+	print(i"before {client.count().unwrap_or(0)}");
+	match client.drop_row(2i53) {
+		Ok(_) => print("acked"),
+		Err(let error) => print(i"failed {error.to_json()}"),
+	}
+	print(i"after {client.count().unwrap_or(0)}");
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("before 3"),
+        "the POST leg must answer the plain method first:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("acked"),
+        "an awaited void must be served over the connectionless POST leg — its \
+         reply is the ack envelope and needs no connection:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("after 2"),
+        "the void handler must have run before the ack the client waited for:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("failed "),
+        "the void call over the POST leg reported a failure:\n{stdout}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, six crates, plus the language's own tree:
+Rust workspace, ten crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -36,7 +36,10 @@ Rust workspace, six crates, plus the language's own tree:
   including `wasm32-unknown-unknown`, where the language server's tower-lsp/tokio
   stack cannot follow. A completion behavior belongs here, not in `vilan-lsp`, whose
   `line_index.rs` is only a newtype speaking `lsp_types` at the protocol edge.
-- `crates/vilan-embedded-std` — embeds the std source into the binary.
+- `crates/vilan-embedded` — embeds the std source into the binary, and since
+  F19 the `vilan-rt` source beside it; it also owns the `~/.vilan` cache layout
+  (`std-cache`, `check-cache`, `git-deps`, `rt-cache`), so nothing else names a
+  cache root.
 - `crates/vilan-wasm` — the compiler as a WebAssembly module; the web
   playground's engine (`proposals/projects/vilan/proposal/web-playground.md`). The compile logic is
   plain Rust tested natively on the host; the `wasm_bindgen` layer at the
@@ -49,6 +52,23 @@ Rust workspace, six crates, plus the language's own tree:
   N15 moved the design memory out of this tree) — design documents. Semantics
   are settled there **before** code; the proposal named in your work order is
   the spec for your change.
+- `crates/vilan-rust` — the emit-Rust backend (F1 S1a, Order 37): the same `Program` the JS
+  emitter reads, one `main.rs` out, a cargo project under `dist/native/<entry>/`; scoped to
+  what the platform-free corpus and `std::http`/`std::json`/`std::db` need — no UI or rpc
+  server yet.
+- `crates/vilan-rt` — the runtime that emitted Rust links against: `Rc<str>`, `Vec`, the
+  ordered `Map`/`Set`, `Shared`/`Captured` cells, `guarded` panics and node's `console.log`
+  rendering, so a native binary prints byte-for-byte what the JS build prints. No
+  dependencies beyond Rust's std, by rule.
+- `crates/vilan-rt-sqlite` — `std::db` for emitted Rust (F18 slice 2; Order 39's R1): the
+  first runtime surface to take a crates.io dependency (`rusqlite`, `bundled`), kept OUT of
+  `vilan-rt` so that rule holds; a generated cargo project names it only when the program
+  reaches `std::db`.
+- `crates/vilan-rt-crypto` — OS randomness, SHA-384/512, HMAC and PBKDF2 for emitted Rust
+  (F40, RULED (a)): `getrandom` is the one dependency, because OS randomness is a syscall
+  `vilan-rt` could reach only through a crate or `unsafe`; the digests are hand-written, the
+  crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
+  when the program reaches one of its bindings (optimized even in the dev profile).
 
 ## Definition of done (the gates)
 
@@ -92,6 +112,26 @@ Rust workspace, six crates, plus the language's own tree:
    `cargo fmt` run under `rust-toolchain.toml`'s pin, which is what makes your
    answer and CI's the same answer. A dependency change also owes
    `cargo audit --deny unsound` (its own CI leg) alongside the notices gate.
+7. **The suite runs on 8 MiB test threads, and that is a MARGIN, not a
+   licence** (N97). libtest gives every `#[test]` a 2 MiB thread, and the
+   analyzer's expression walk spends one frame per level of source nesting —
+   ~46.3 KiB of it unoptimized, ~2.1 KiB optimized, measured with
+   `VILAN_DEPTH_STATS=1` over chains of known depth (N128's re-measurement,
+   2026-09-25; the 11.3 KiB this said was an older optimized frame). Order 36's arms grew that
+   frame while the recursion stayed put, and a nine-level module-cycle pin
+   aborted the Windows shard with `0xc00000fd`; the fix was
+   `.cargo/config.toml`'s `[env] RUST_MIN_STACK = "8388608"`, which cargo and
+   nextest both hand to the test processes (a value written by the shell still
+   wins — there is no `force`). **Do not raise it further, and do not lean on
+   it**: a deeper frame is a finding, not a number to tune.
+   `deep_nesting.rs`'s `a_thirty_level_chain_still_fits_libtests_own_two_mib_thread`
+   pins a thread at the original 2 MiB so growth reds here rather than on
+   Windows — and reds as an ABORT, since a stack overflow takes the process and
+   prints no `FAIL` line to grep for. A test that genuinely needs more spawns
+   its own worker with an explicit `stack_size` and says in a comment why that
+   size (`deep_nesting.rs`'s 64 MiB is the model: it is sized so that the
+   UNBOUNDED walk would still overflow it, which is what keeps the pin
+   non-vacuous).
 
 ## Invariants and scar tissue (each of these has bitten before)
 
@@ -191,7 +231,13 @@ Rust workspace, six crates, plus the language's own tree:
   server, a watcher, an editor surface) fences at its own boundary —
   catch, degrade to an honest internal-error answer, details left to
   stderr; a new one-shot entry takes the CLI's stance. Either way,
-  write which and why at the site.
+  write which and why at the site. A fence catches PANICS, and a stack
+  overflow is not one — it aborts the process from any thread (N121) — so a
+  long-lived thread that runs the analysis also DECLARES its stack
+  (`vilan_core::stack_guard::with_declared_stack`, first thing in the thread,
+  with the size it was spawned with): the analyzer's recursion funnels probe
+  that declaration and panic short of the guard page, which the fence then
+  catches. An undeclared thread's probe is inert.
 - **Every lock RECOVERS from poisoning — no exceptions, and a test
   holds the line** (E97, ruled 2026-08-28: "do the safe thing, prevent
   a poisoned cache"). `.lock()`, `.read()` and `.write()` are followed
@@ -222,6 +268,23 @@ Rust workspace, six crates, plus the language's own tree:
   unless the work order says so. Run git from the worktree root, or via
   `git -C <worktree>`; never share a compound command with `cd` that could
   land in another checkout.
+- **Four traps Order 40's lanes met, each now a rule** (N123). `cargo fmt` JOINS a
+  `\`-continued string literal and leaves the next line's indentation inside the
+  string, which `diagnostics_ledger.rs`'s
+  `no_prose_literal_swallows_a_line_continuation` then reds on, so a multi-line `.vl`
+  fixture in a Rust test is a `concat!` of one-line literals or a one-line program
+  (a rowed diagnostic MESSAGE is still ONE `\`-continued literal, because the ledger
+  reads it that way — re-read it after `cargo fmt`). `Document::semantic_tokens`
+  (vilan-lsp) answers `(Span, TokenKind, u32)` — a BYTE span and a modifier bitset,
+  not a line/character pair — so a modifier pin converts through the document's line
+  index (`analyzed_index().range(span)`, as
+  `a_window_answers_byte_for_byte_what_filtering_the_full_stream_answers` does)
+  rather than trusting a helper that assumes positions. Any change to
+  `vilan/docs/spec/grammar.md` gates `cargo test -p vilan-cli --test grammar_ebnf`
+  and `--test grammar_sync` beside the docs pair (`markdown_golden`, `book_sync`).
+  And every change to `vilan/std` gates `cargo test -p vilan-cli --test
+  shared_census` — a committed per-file count of std's `Shared::new` sites, so two
+  lanes that each add one merge textually clean and red together.
 
 ## How to work
 

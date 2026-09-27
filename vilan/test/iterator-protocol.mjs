@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function default2() {
 	return 0;
 }
@@ -18,7 +24,7 @@ function $d(self) {
 		if (seeded) {
 			total = total + item;
 		} else {
-			total = item;
+			total = __clone(item);
 			seeded = true;
 		}
 	}
@@ -31,7 +37,7 @@ function $e(self) {
 		if (seeded) {
 			total = total * item;
 		} else {
-			total = item;
+			total = __clone(item);
 			seeded = true;
 		}
 	}

@@ -23,6 +23,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// The exhibit: a user type that is a `Source` and is not a `Signal`. `set`
 /// lives outside the trait, so nothing a binding does could reach it — a
 /// binding that needed the write side would not compile against this at all.
@@ -37,8 +39,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription {
-		self.inner.sub(observer)
+	fun on_change(self, observer: |T| void): Subscription {
+		self.inner.on_change(observer)
 	}
 }
 
@@ -57,63 +59,13 @@ impl Stored<type T> {
 /// properties, the hidden flag, text — and can serialize the tree, which is
 /// what makes "the binding fired again" an observable fact rather than an
 /// inference from the absence of a crash.
-const DOM_STUB: &str = r#"class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.value = "";
-        this.hidden = false;
-        this.attributes = {};
-        this.properties = {};
-        this.style = { setProperty: (name, value) => { this.properties[name] = value; } };
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-}
-
-function serialize(node) {
-    let out = "<" + node.tagName;
-    for (const [name, value] of Object.entries(node.attributes)) out += ` ${name}="${value}"`;
-    for (const [name, value] of Object.entries(node.properties)) out += ` ${name}="${value}"`;
-    if (node.hidden) out += " hidden";
-    out += ">" + node.textContent;
-    for (const child of node.children) out += serialize(child);
-    return out + "</" + node.tagName + ">";
-}
-
-const documentRoot = new StubElement("body");
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    createElementNS: (namespace, tag) => new StubElement(tag),
-    getElementById: () => documentRoot,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = { pushState(state, title, path) { global.location.pathname = path; } };
-global.window = { addEventListener: () => {} };
-global.__dump = (tag) => console.log(tag + " " + serialize(documentRoot));
-"#;
+const DOM_STUB: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/source_bindings.js"),
+);
 
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_source_bindings_{tag}_{}",
         std::process::id()
     ));
@@ -176,7 +128,7 @@ fn build_and_run(tag: &str, app: &str) -> String {
 fn app_source() -> String {
     format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-import std::ui::{{ View, mount_root, view }};
+import std::ui::{{ View, each, mount_root, view, when }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -197,8 +149,8 @@ fun main() {{
 		.child(view("a").bind_attr("href", href))
 		.child(view("div").style_var("--w", width))
 		.child(view("i").show(visible))
-		.child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
-		.child(view("aside").when(present, || view("b").text("here"))));
+		.child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
+		.child(view("aside").child(when(present, || view("b").text("here")))));
 	dump("mounted");
 
 	label.set("beta");
@@ -267,13 +219,16 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
              got:\n{updated}"
         );
     }
+    // A60: `show(false)` makes two writes — the `hidden` attribute and the
+    // inline `display:none` that actually hides a styled element. This stub
+    // serializes an inline style property as an attribute of its own name.
     assert!(
-        updated.contains("<i hidden>"),
+        updated.contains(r#"<i display="none" hidden>"#),
         "`show(false)` must hide the element after the write; got:\n{updated}"
     );
     assert!(
         !updated.contains("<li>x</li>"),
-        "`bind_each` must reconcile the removed row away; got:\n{updated}"
+        "`each` must reconcile the removed row away; got:\n{updated}"
     );
 }
 
@@ -295,7 +250,7 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
 fn a_user_source_drives_swap_and_keeps_driving_it() {
     let app = format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-import std::ui::{{ View, mount_root, view }};
+import std::ui::{{ View, mount_root, swap, view }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -305,7 +260,7 @@ fun main() {{
 	let route: Stored<str> = Stored::new("home");
 
 	let _root = mount_root("app", || view("main")
-		.swap(route, |current| view("section").text(i"page {{current}}")));
+		.child(swap(route, |current| view("section").text(i"page {{current}}"))));
 	dump("mounted");
 
 	route.set("docs");

@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 
 use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
 
+mod scratch;
+
 fn std_spec() -> PackageSpec {
     vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
@@ -170,8 +172,7 @@ fn compile(source: &str) -> Result<String, Vec<String>> {
 }
 
 fn run_node(js: &str) -> String {
-    let path =
-        std::env::temp_dir().join(format!("vilan_markdown_golden_{}.mjs", std::process::id()));
+    let path = scratch::root().join(format!("vilan_markdown_golden_{}.mjs", std::process::id()));
     std::fs::write(&path, js).expect("write walker script");
     let output = std::process::Command::new("node")
         .arg(&path)

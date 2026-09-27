@@ -1,0 +1,14 @@
+# A one-file `node` package whose program NEVER RETURNS, deliberately: it is a
+# filesystem watch, and a watch ends when the process does.
+#
+#   vilan run .     build + run `main.vl`, then edit a file here to see it
+#                   report the change; Ctrl-C to stop
+#
+# It lives here rather than in `vilan/test/` because a corpus program's OUTPUT
+# is its claim, and a program that does not exit has no output to be one
+# (tracker N51). The corpus keeps the `Watcher` tier under a program that makes
+# its own change and leaves; this is the shape a reader actually writes.
+[package]
+name = "watch"
+root = "."
+prelude = "std::prelude"

@@ -17,3 +17,141 @@ fail-fast = false
 [[profile.default.overrides]]
 filter = 'test(leak_measurement)'
 priority = 100
+
+# The stragglers start FIRST, for the same reason the leak plateaus do
+# (tracker N46, from two sibling lanes' unions).
+#
+# Neither of these asserts anything about TIME — `dependent_edit_measurement`
+# prints its per-analysis wall clocks and asserts on leak-tally BYTES, and
+# `style_chain_order` has no clock in it at all — so there is nothing here for a
+# liveness bound or a CPU clock to fix. They are simply long, and a long test
+# scheduled late is the critical path: `dependent_edit_measurement` was the sole
+# straggler of a 5455-test union at 246.6 s, holding the run open about four
+# minutes after everything else had finished.
+#
+# `release_differential` was the third member and is not one any more (tracker
+# N49). It was 607.3 s of a 698.7 s union, and priority was the only lever there
+# was while the leg was ONE test; split into one test per corpus program, 600 of
+# those seconds turned out to be `watch.vl` waiting out two 300 s node deadlines
+# for a filesystem change that never came. That program now makes its own change
+# and exits (tracker N51), so it is run like any other, and the binary's longest
+# member is about 20 s under the suite's own parallelism — no straggler left to
+# schedule around, and a priority that named it would be a claim about a shape
+# that is gone. `infer_differential` took the same split (tracker N52) and is
+# not a member here either, for the same reason.
+[[profile.default.overrides]]
+filter = '''
+    test(dependent_edit_measurement) + binary(style_chain_order)
+'''
+priority = 100
+
+# M19 T1's replay differential is the run's single longest member, and it is a
+# member of its own binary for that reason (tracker N57). It re-hosts all ~124
+# corpus programs as package modules, then analyzes every one of them warm
+# TWICE — once replaying its modules' remembered checks, once re-deriving them —
+# so 60-170 s is not a bound anyone tuned, it is the sweep. Started last it IS
+# the critical path, exactly as `dependent_edit_measurement` was above; started
+# first it overlaps the wide middle of the run.
+#
+# It is deliberately NOT in `wall-clock-waits` below, for the reason the two
+# other differentials are not: that group is one thread because its members WAIT
+# on work happening elsewhere and pile onto each other doing nothing. This one
+# waits on nothing — it is compute, on a 16-way `thread::scope` of its own — and
+# one thread for it would turn the run's longest test into a longer one.
+#
+# `slow-timeout` is raised from the 60 s default so a leg whose honest cost is
+# two and a half minutes is not reported as a runaway on every run; the kill is
+# at 15 minutes, which nothing but a hang can reach.
+[[profile.default.overrides]]
+filter = 'binary(replay_differential)'
+priority = 100
+slow-timeout = { period = "180s", terminate-after = 5 }
+
+# The wall-clock waits run ONE AT A TIME (tracker N46).
+#
+# Every member waits, on the wall clock, for work happening on ANOTHER thread or
+# in another process to land: a `vilan build --watch` / `run --watch` round (a
+# compile plus the build commands, observed through a file the round writes), or
+# the language server's debounced re-analysis and the package sweep behind it.
+# The bound is a liveness bound in each case, and it has now been paid four
+# times over: Order 20's close, Order 24's hygiene lane, Order 24's pre-seal
+# union — the same 301 s red each time, on a pin that costs 0.6 s alone — and
+# two sibling lanes' unions, where `package_recolor_tests`' 10 s settle window
+# was eaten under ten-lane load by a recolor that takes 13.8 s alone.
+#
+# The suite is the only load this repository controls, and until now it piled
+# the family onto itself: 31 tests, most with a compile behind them, all
+# eligible to run at once inside an interleave already 16 wide. One thread for
+# the group ends that. It does not (and cannot) fix a box loaded by something
+# else — that is the honest limit of this lever, and the reason each pin's own
+# bound was ALSO fixed where it was too small to be a liveness bound at all
+# (`settled`'s 10 s, `release_differential`'s 30 s) rather than left to the
+# group to rescue.
+#
+# The other direction the item names — making the wait CPU-time-aware, the way
+# M15 fixed the const-pass gate — was MEASURED and rejected, because the shape
+# does not transfer. M15's subject is a computation, and preemption does not
+# accrue to a computation's own CPU clock. This subject is an EVENT delivered
+# by a 300 ms poll loop that sleeps between polls, and the numbers say so: at
+# loadavg 79, a watcher waiting with nothing to do burns 0.030 s of CPU per
+# 30 s of wall — 1.0 ms/s, set by the poll rate and not by the load — while the
+# round it is waiting for costs 0.33 s (round 1) and 0.02 s (round 2). A
+# deadline denominated in the watcher's own CPU is therefore a wall deadline
+# wearing different units, and it makes the two states the bound has to tell
+# apart — starved and stuck — indistinguishable rather than distinguishable.
+[test-groups]
+wall-clock-waits = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# `hmr`, `hmr_swap`, `hmr_css_matrix`, `watch_lifecycle` and `watch_leg_reuse` are
+# watch sessions end to end, so they join whole. The next six binaries are mostly one-shot
+# `build` pins with a watch family inside them, and the family is named the way
+# it is spelled: every one of these tests carries `watch` or `round` in its
+# name. A name filter can rot in silence, so it does not stand alone —
+# `build_hooks`'s `every_test_that_drives_a_watch_session_is_in_the_group`
+# reads all ten files and reds if a test spawns a watcher from outside the set
+# this line selects. It is what found `split` and `serve_build`, whose one
+# watch round each was invisible to a filter written off the HMR suites.
+#
+# The two `package_recolor_tests` pins are the other shape the group is for and
+# the reason it is not named after watch rounds: no watcher, no child process —
+# a `did_change` on one open buffer, and then a poll waiting for the language
+# server's debounced analysis and its package sweep to recolor a DIFFERENT open
+# buffer. Same bound, same failure, same cure.
+#
+# `watched_files_tests` (E127) is the same shape once more: a
+# `didChangeWatchedFiles` notification on one open buffer's package, and then a
+# poll waiting for the sweep it starts to re-analyze that buffer so its
+# completion sees a module that has just appeared on (or vanished from) disk.
+# No watcher and no child process — the wait is on the language server's own
+# analysis thread, which is exactly what this group stops the suite from piling
+# onto itself.
+#
+# `dead_item_clock_tests` (E124) is the recolor shape once more, with one more
+# clock on top: after the debounced analysis it waits for the PACKAGE clock's
+# idle timer and the union behind it — one full analysis per declared entry —
+# to land before the top-level gray it asserts can exist at all.
+#
+# `cancellation_tests` (M26) is that same shape again, and one of them adds a
+# reason of its own: `a_burst_of_edits_...` types eight keystrokes a debounce
+# window apart and counts how many of the analyses they started ran to the end.
+# Its assertion is a COUNT and load can only push it the safe way — a slower box
+# cancels MORE — but the burst itself is eight debounce windows of wall clock
+# with real analyses behind them, which is precisely the work this group exists
+# to stop the suite from piling onto itself.
+filter = '''
+    binary(hmr) + binary(hmr_swap) + binary(hmr_css_matrix) + binary(watch_lifecycle)
+    + binary(watch_leg_reuse)
+    + ((binary(build_hooks) + binary(assets) + binary(asset_bundle) + binary(split)
+        + binary(serve_build) + binary(parallel_build)) & test(/watch|round/))
+    + (binary(vilan-lsp) & test(/package_recolor_tests|cancellation_tests|watched_files_tests|dead_item_clock_tests/))
+'''
+test-group = 'wall-clock-waits'
+# Advisory at 120 s, killed at 8 minutes. The pins' own `WATCH_LIVENESS` (300 s)
+# is well inside that on purpose: a hung round should be reported by the pin,
+# which panics with the round counts and the watcher's whole log, not by a
+# runner that can only say "terminated". What `terminate-after` buys is the
+# case the pin's own bound cannot reach — a watcher child that never exits, a
+# wait somebody writes without a bound — where the alternative is a CI runner
+# held until the job timeout.
+slow-timeout = { period = "120s", terminate-after = 4 }

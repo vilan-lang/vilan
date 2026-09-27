@@ -166,7 +166,7 @@ fn within_prefixes_the_ancestor_guard() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data-theme", "dark", style().background(Color::gray(900)))
+            style().within("data-theme", Some("dark"), style().background(Color::gray(900)))
         }
         let _s = const s();
         fun main() {}
@@ -190,7 +190,7 @@ fn within_stacks_over_a_pseudo_class() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data-theme", "dark", style().hover(style().background(Color::gray(700))))
+            style().within("data-theme", Some("dark"), style().hover(style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -214,7 +214,7 @@ fn a_breakpoint_wraps_within_over_a_pseudo_class() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().md(style().within("data-theme", "dark", style().hover(style().padding(space(6)))))
+            style().md(style().within("data-theme", Some("dark"), style().hover(style().padding(space(6)))))
         }
         let _s = const s();
         fun main() {}
@@ -239,7 +239,7 @@ fn a_pseudo_class_cannot_wrap_within() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().hover(style().within("data-theme", "dark", style().background(Color::gray(700))))
+            style().hover(style().within("data-theme", Some("dark"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -260,7 +260,7 @@ fn within_cannot_wrap_within() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data-theme", "dark", style().within("data-theme", "dim", style().background(Color::gray(700))))
+            style().within("data-theme", Some("dark"), style().within("data-theme", Some("dim"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -281,7 +281,7 @@ fn within_cannot_wrap_a_breakpoint() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().within("data-theme", "dark", style().md(style().padding(space(6))))
+            style().within("data-theme", Some("dark"), style().md(style().padding(space(6))))
         }
         let _s = const s();
         fun main() {}
@@ -291,7 +291,7 @@ fn within_cannot_wrap_a_breakpoint() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("nest conditions as md(within(..))")),
+            .any(|(message, _)| message.contains("nest it as md(within(..))")),
         "{diagnostics:#?}"
     );
 }
@@ -304,7 +304,7 @@ fn within_validates_its_name_and_value() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().within("data theme", "dark", style().background(Color::gray(700)))
+            style().within("data theme", Some("dark"), style().background(Color::gray(700)))
         }
         let _s = const s();
         fun main() {}
@@ -920,7 +920,7 @@ fn the_display_enum_covers_every_variant() {
                 .disabled(style().display(Display::InlineBlock))
                 .first(style().display(Display::InlineFlex))
                 .last(style().display(Display::InlineGrid))
-                .within("data-theme", "dark", style().display(Display::Hidden))
+                .within("data-theme", Some("dark"), style().display(Display::Hidden))
         }
         let _s = const s();
         fun main() {}
@@ -1240,7 +1240,7 @@ fn a_condition_never_clears_the_base_family() {
         r#"
         import std::style::{ style, space, Style };
         fun shorthand_under_within(): Style {
-            style().padding_top(space(0)).within("data-theme", "dark", style().padding(space(4)))
+            style().padding_top(space(0)).within("data-theme", Some("dark"), style().padding(space(4)))
         }
         fun longhand_under_hover(): Style {
             style().padding(space(6)).hover(style().padding_top(space(2)))
@@ -1285,7 +1285,7 @@ fn a_condition_never_clears_the_base_family() {
         import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
-            let themed = const style().padding_top(space(0)).within("data-theme", "dark", style().padding(space(4)));
+            let themed = const style().padding_top(space(0)).within("data-theme", Some("dark"), style().padding(space(4)));
             print(themed.class_list().split(" ").len());
         }
         main();
@@ -1966,6 +1966,113 @@ fn color_var_references_without_declaring() {
     );
 }
 
+/// A90: a custom property is spelled with its two leading dashes, and a name
+/// without them is refused at const time on both `var`s. `var(button-color)` is
+/// the failure that has no other detector — `button-color` parses as a keyword,
+/// the browser drops the declaration, and the page is simply wrong.
+#[test]
+fn a_custom_property_reference_without_its_dashes_fails_the_build() {
+    for program in [
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::var("button-color"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+        r#"
+        import std::style::{ style, Style, Length };
+        fun s(): Style {
+            style().width(Length::var("w"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    ] {
+        let diagnostics = failure_diagnostics(program);
+        assert!(
+            diagnostics.iter().any(
+                |(message, _)| message.contains("a custom property is written with its dashes")
+            ),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+/// A bare `--` names nothing, and the same message says so.
+#[test]
+fn a_custom_property_named_only_dashes_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::var("--"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("a custom property is written with its dashes")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The name's fence is the attribute name's: a space, a quote or a `:` would
+/// run past the `var()` call it is written into.
+#[test]
+fn a_custom_property_name_with_a_delimiter_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::var("--button color"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("a custom property name cannot contain ' '")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The control: a name WITH its dashes renders exactly as it always did, on
+/// both types, so the check costs the shipped spelling nothing.
+#[test]
+fn a_dashed_custom_property_reference_still_renders() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style()
+                .background(Color::var("--button-color"))
+                .width(Length::var("--w"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in ["{background-color:var(--button-color)}", "{width:var(--w)}"] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
 /// `Color::oklch` (item 013): the perceptual literal, emitted in the CSS
 /// number form — space-joined components, the hue a bare degree count — with
 /// `.alpha()` composing through the relative form like over any colour.
@@ -2077,7 +2184,7 @@ fn an_attribute_condition_selects_on_the_element_itself() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data-open", "true", style().opacity(0.5))
+            style().attribute("data-open", Some("true"), style().opacity(0.5))
         }
         let _s = const s();
         fun main() {}
@@ -2101,7 +2208,7 @@ fn an_attribute_condition_wraps_a_pseudo_class() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data-open", "true", style().hover(style().opacity(0.8)))
+            style().attribute("data-open", Some("true"), style().hover(style().opacity(0.8)))
         }
         let _s = const s();
         fun main() {}
@@ -2124,7 +2231,7 @@ fn within_wraps_an_attribute_condition() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().within("data-theme", "dark", style().attribute("data-open", "true", style().opacity(0.8)))
+            style().within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().opacity(0.8)))
         }
         let _s = const s();
         fun main() {}
@@ -2148,9 +2255,9 @@ fn all_four_condition_axes_compose_outside_in() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().md(style().within("data-theme", "dark", style().attribute(
+            style().md(style().within("data-theme", Some("dark"), style().attribute(
                 "data-open",
-                "true",
+                Some("true"),
                 style().hover(style().opacity(0.8)),
             )))
         }
@@ -2176,7 +2283,7 @@ fn an_attribute_cannot_wrap_a_media_conditioned_style() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().attribute("data-open", "true", style().md(style().padding(space(6))))
+            style().attribute("data-open", Some("true"), style().md(style().padding(space(6))))
         }
         let _s = const s();
         fun main() {}
@@ -2186,7 +2293,7 @@ fn an_attribute_cannot_wrap_a_media_conditioned_style() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("nest conditions as md(attribute(..))")),
+            .any(|(message, _)| message.contains("nest it as md(attribute(..))")),
         "{diagnostics:#?}"
     );
 }
@@ -2197,7 +2304,7 @@ fn an_attribute_cannot_wrap_within() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().attribute("data-open", "true", style().within("data-theme", "dark", style().background(Color::gray(700))))
+            style().attribute("data-open", Some("true"), style().within("data-theme", Some("dark"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -2219,7 +2326,7 @@ fn a_pseudo_class_cannot_wrap_an_attribute_condition() {
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().hover(style().attribute("data-open", "true", style().background(Color::gray(700))))
+            style().hover(style().attribute("data-open", Some("true"), style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -2243,8 +2350,8 @@ fn an_attribute_cannot_wrap_an_attribute_condition() {
         fun s(): Style {
             style().attribute(
                 "data-open",
-                "true",
-                style().attribute("data-side", "left", style().background(Color::gray(700))),
+                Some("true"),
+                style().attribute("data-side", Some("left"), style().background(Color::gray(700))),
             )
         }
         let _s = const s();
@@ -2269,7 +2376,7 @@ fn an_attribute_name_with_a_delimiter_fails_the_build() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data open", "true", style().opacity(0.5))
+            style().attribute("data open", Some("true"), style().opacity(0.5))
         }
         let _s = const s();
         fun main() {}
@@ -2290,7 +2397,7 @@ fn an_attribute_value_with_a_quote_fails_the_build() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().attribute("data-open", "tr\"ue", style().opacity(0.5))
+            style().attribute("data-open", Some("tr\"ue"), style().opacity(0.5))
         }
         let _s = const s();
         fun main() {}
@@ -2316,12 +2423,12 @@ fn attribute_slots_merge_per_condition_and_property() {
         import std::style::{ style, Style };
         fun main() {
             let togged = const style()
-                .attribute("data-open", "true", style().opacity(0.5))
-                .attribute("data-open", "true", style().opacity(1.0));
+                .attribute("data-open", Some("true"), style().opacity(0.5))
+                .attribute("data-open", Some("true"), style().opacity(1.0));
             print(togged.class_list().split(" ").len());
             let sided = const style()
-                .attribute("data-side", "left", style().opacity(0.5))
-                .attribute("data-side", "right", style().opacity(1.0));
+                .attribute("data-side", Some("left"), style().opacity(0.5))
+                .attribute("data-side", Some("right"), style().opacity(1.0));
             print(sided.class_list().split(" ").len());
         }
         main();
@@ -2343,12 +2450,331 @@ fn ssr_renders_attribute_conditioned_classes() {
         fun main() {
             let disclosure = const style()
                 .color(Color::gray(700))
-                .attribute("data-open", "true", style().color(Color::gray(900)));
+                .attribute("data-open", Some("true"), style().color(Color::gray(900)));
             print(render(view("div").styled(disclosure)));
         }
         main();
         "#,
         "<div class=\"s1hbtfg8 sjt5x3g\"></div>\n",
+    );
+}
+
+// --- A89's presence form, A95's NEGATION as a value (style-conditions.md §5.2) --
+// `attribute(name)` is the PRESENCE condition `[name]` — the shape a boolean
+// attribute actually has in markup — and `attribute(name).eq(v)` the exact
+// match `[name="v"]`; the `Option<str>` the sugar still takes is A89's and is
+// deprecated for it.
+//
+// Negation was a MARKER (A89): `not(inner)` emitted nothing and marked the
+// inner's slots, and the condition immediately enclosing it negated its own
+// selector — the only reading a WRAPPER can have, since which selector is
+// negated is a fact about the condition outside it. A95 S2 retires it. A
+// condition is a value, so `.not()` is written on the value it negates and the
+// question never arises; the marker's three refusals (an unwrapped `not`, a
+// double `not`, a negated media condition) go with it, replaced by the two
+// `Condition::not` refuses at the value.
+
+#[test]
+fn an_attribute_condition_with_no_value_selects_on_presence() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-selected", None, style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            // No `=`: presence, not an exact match — and still the base band.
+            line.starts_with('.') && line.contains("[data-selected]{opacity:0.5}")
+        }),
+        "{assets:?}"
+    );
+    // The control: `Some` renders exactly what it always did, so the presence
+    // form is a second condition rather than a reinterpretation of the first.
+    let exact = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-selected", Some("true"), style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        exact
+            .iter()
+            .any(|(_, line)| line.contains("[data-selected=\"true\"]{opacity:0.5}")),
+        "{exact:?}"
+    );
+}
+
+/// `within`'s value is the same `Option` for the same reason: an ancestor that
+/// merely CARRIES the attribute (`[data-print] .sX`) rather than one whose value
+/// matches.
+#[test]
+fn an_ancestor_guard_with_no_value_selects_on_presence() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().within("data-print", None, style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.starts_with("[data-print] .") && line.ends_with("{opacity:0.5}")),
+        "{assets:?}"
+    );
+}
+
+/// The owner's form, verbatim: `attribute("disabled", None, not(hover(s)))` is
+/// `.sX:not([disabled]):hover` — the hover is KEPT and the attribute negated,
+/// because `not` negates the next condition OUT.
+#[test]
+fn a_negated_attribute_condition_composes_with_a_pseudo_class() {
+    // The pair that had no spelling before A89 and no honest one before A95:
+    // hovered AND not disabled, with the negation on the condition it negates.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, attribute, hover };
+        fun s(): Style {
+            style().on(attribute("disabled").not() + hover(), style().opacity(0.8))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with('.') && line.contains(":not([disabled]):hover{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_negated_pseudo_class_renders_as_not() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, hover };
+        fun s(): Style {
+            style().on(hover().not(), style().opacity(0.8))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.starts_with('.') && line.contains(":not(:hover){opacity:0.8}")),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_negated_ancestor_guard_opens_the_line_with_a_colon() {
+    // The one negation that moves a rule's cascade BAND: `:not([..]) .sX` opens
+    // with ':' where `[..] .sX` opened with '[', so it sorts among the pseudo
+    // rules instead of after them (A89's one recorded band move, unchanged).
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, attribute, within };
+        fun s(): Style {
+            style().on(within(attribute("data-theme").eq("dark")).not(), style().opacity(0.8))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with(":not([data-theme=\"dark\"]) .") && line.ends_with("{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// Specificity, stated and pinned: `:not(x)` counts as its ARGUMENT, so the
+/// composed `.sX:not([disabled]):hover` is (0,3,0) — class + attribute +
+/// pseudo-class — and beats the plain `.sX:hover`'s (0,2,0) on the cascade
+/// rather than on the sheet's line order.
+#[test]
+fn a_negated_attribute_rule_outranks_the_plain_pseudo_rule() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, attribute, hover };
+        fun s(): Style {
+            style()
+                .on(hover(), style().opacity(0.9))
+                .on(attribute("disabled").not() + hover(), style().opacity(0.8))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let composed = assets
+        .iter()
+        .find(|(_, line)| line.contains(":not([disabled]):hover"))
+        .map(|(_, line)| line.clone())
+        .unwrap_or_else(|| panic!("{assets:?}"));
+    let plain = assets
+        .iter()
+        .find(|(_, line)| line.ends_with(":hover{opacity:0.9}"))
+        .map(|(_, line)| line.clone())
+        .unwrap_or_else(|| panic!("{assets:?}"));
+    assert!(
+        composed.matches(':').count() > plain.matches(':').count(),
+        "the composed rule must carry one more condition than the plain one: \
+         {composed} vs {plain}"
+    );
+    assert!(!plain.contains(":not("), "{plain}");
+}
+
+/// The `css` block reaches the same rule through the name-blind dotted head
+/// (css-block.md §5.3, §4 of style-conditions.md): `.on(<set>) { … }` lowers to
+/// `.on(<set>, style() … )` with no new lowering rule, and the constructors are
+/// ambient inside a block, so the head needs no import. Both spellings must
+/// resolve to ONE class, which is the strongest available statement that they
+/// are one rule.
+#[test]
+fn a_css_block_head_takes_a_condition_set() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::{ style, Style, attribute, hover };
+        fun main() {
+            let chain = const style()
+                .on(attribute("disabled").not() + hover(), style().raw("color", "red"));
+            let block = const css {
+                .on(attribute("disabled").not() + hover()) {
+                    color("red");
+                }
+            };
+            print(chain.class_list() == block.class_list());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+/// The marker is GONE, and a program written against it stops compiling rather
+/// than meaning something else. `Style::not` was the only method that emitted
+/// nothing, and its whole estate is the codemod this slice carries.
+#[test]
+fn the_not_marker_is_retired() {
+    assert_fails(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().not(style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+}
+
+/// A double negation is said, not cancelled — the marker's refusal, restated on
+/// the value.
+#[test]
+fn a_double_negation_on_a_condition_fails_the_build() {
+    assert_fails_with(
+        &conditioned(r#"style().on(hover().not().not(), style().color(Color::gray(50)))"#),
+        "a double negation is a spelling mistake",
+    );
+}
+
+/// The marker's grammar fence, still live: a leading `!` on a condition token IS
+/// the negation, so `pseudo`'s free-form name may not forge one.
+#[test]
+fn a_pseudo_class_name_cannot_forge_the_negation_marker() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().pseudo("!hover", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("a pseudo-class name cannot start with '!'")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// A negated condition is its OWN slot: `[disabled]` and `:not([disabled])` are
+/// two conditions on one property, so they coexist rather than overwrite — the
+/// same rule two values of one attribute already follow.
+#[test]
+fn a_negated_condition_is_its_own_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::{ style, Style, attribute };
+        fun main() {
+            let both = const style()
+                .on(attribute("disabled"), style().opacity(0.5))
+                .on(attribute("disabled").not(), style().opacity(1.0));
+            print(both.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// The child relation's refusal steers twice: to `attribute(..)` for a state on
+/// the element ITSELF (the want that drove kolt onto the deleted
+/// `child_relation` raw-selector hatch), and to the SET for a condition that
+/// belongs BESIDE the relation rather than under it.
+#[test]
+fn a_child_relation_steers_a_conditioned_inner_to_attribute_and_to_the_set() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().children(style().hover(style().opacity(0.5)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("for a state on the element ITSELF")),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains(".on(attribute(name) + children(), ..)")),
+        "{diagnostics:#?}"
     );
 }
 
@@ -2517,7 +2943,7 @@ fn a_within_rule_sorts_after_the_pseudo_band() {
         fun s(): Style {
             style()
                 .hover(style().background(Color::gray(100)))
-                .within("data-theme", "dark", style().background(Color::gray(900)))
+                .within("data-theme", Some("dark"), style().background(Color::gray(900)))
         }
         let _s = const s();
         fun main() {}
@@ -2552,6 +2978,11 @@ fn a_within_rule_sorts_after_the_pseudo_band() {
 /// UNCONDITIONED inner (a pseudo or attribute under it would bind to the
 /// child's compound — unruled semantics), cannot wrap a breakpoint, and no
 /// relation wraps a relation.
+///
+/// They are the SUGAR's fences and A95 S2 KEEPS them (R1): deleting a refusal
+/// makes a formerly refused program compile with nothing to steer to, and the
+/// sugar is still a documented surface. What changed is the steer — every one
+/// of them now also names the SET, which has no nesting order to get wrong.
 #[test]
 fn a_child_relation_takes_an_unconditioned_style() {
     let diagnostics = failure_diagnostics(
@@ -2579,7 +3010,7 @@ fn divide_takes_an_unconditioned_style() {
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().divide(style().attribute("data-open", "true", style().opacity(0.5)))
+            style().divide(style().attribute("data-open", Some("true"), style().opacity(0.5)))
         }
         let _s = const s();
         fun main() {}
@@ -2610,7 +3041,7 @@ fn a_child_relation_cannot_wrap_a_breakpoint() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("nest conditions as md(children(..))")),
+            .any(|(message, _)| message.contains("nest it as md(children(..))")),
         "{diagnostics:#?}"
     );
 }
@@ -2621,7 +3052,7 @@ fn within_cannot_wrap_a_child_relation() {
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().within("data-theme", "dark", style().children(style().margin_top(space(2))))
+            style().within("data-theme", Some("dark"), style().children(style().margin_top(space(2))))
         }
         let _s = const s();
         fun main() {}
@@ -4373,9 +4804,9 @@ fn calling_a_method_call_result_binds_first() {
         r#"
         import std::io::print;
         import std::shared::Shared;
-        struct Holder { hook: Shared<|str| i32> }
+        struct Holder { hook: Shared<|str| usize> }
         impl Holder {
-            fun call_it(self, a: str): i32 {
+            fun call_it(self, a: str): usize {
                 let hook = self.hook.read();
                 hook(a)
             }
@@ -4397,9 +4828,9 @@ fn calling_a_method_call_result_directly_parses() {
     assert_compiles(
         r#"
         import std::shared::Shared;
-        struct Holder { hook: Shared<|str| i32> }
+        struct Holder { hook: Shared<|str| usize> }
         impl Holder {
-            fun call_it(self, a: str): i32 {
+            fun call_it(self, a: str): usize {
                 self.hook.read()(a)
             }
         }
@@ -4424,7 +4855,7 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
     // whose render closure matches the (unannotated) route value.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
         import std::router::{ current_path, navigate, segments, link, Routable };
 
@@ -4474,10 +4905,10 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
             let _root = mount_root("app", || view("main")
                 .child(link("Home", Route::Home))
                 .child(view("button").on("click", || navigate(href(Route::Home))))
-                .swap(route, |current| match current {
+                .child(swap(route, |current| match current {
                     Route::Home => view("section").text("home"),
                     Route::Workspace(let org, let inner) => workspace_layout(org, inner),
-                }));
+                })));
         }
         "#,
     );
@@ -4638,7 +5069,7 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
     // the retry instead of freezing abstract.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
         import std::router::{ current_path, segments };
 
@@ -4655,10 +5086,10 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
         fun main() {
             let route = current_path().map(|path| parse(path));
             let _root = mount_root("app", || view("main")
-                .swap(route, |current| match current {
+                .child(swap(route, |current| match current {
                     Route::Home => view("section").text("home"),
                     Route::Other => view("section").text("other"),
-                }));
+                })));
         }
         "#,
     );
@@ -4670,7 +5101,7 @@ fn swap_requires_a_comparable_value() {
     // without the impl is rejected at the call.
     assert_fails_browser_with(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         struct Opaque {
@@ -4680,7 +5111,7 @@ fn swap_requires_a_comparable_value() {
         fun main() {
             let source: SignalCell<Opaque> = Signal::new(Opaque { tag = "a" });
             let _root = mount_root("app", || view("main")
-                .swap(source, |current| view("p").text(current.tag)));
+                .child(swap(source, |current| view("p").text(current.tag))));
         }
         "#,
         "does not implement trait 'PartialEq'",
@@ -4694,16 +5125,16 @@ fn swap_boundaries_nest() {
     // resolve under the outer's injected extent.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         fun main() {
             let outer: SignalCell<i32> = Signal::new(0);
             let inner: SignalCell<str> = Signal::new("a");
             let _root = mount_root("app", || view("main")
-                .swap(outer, |level| view("section")
+                .child(swap(outer, |level| view("section")
                     .child(view("h1").text(i"level {level}"))
-                    .swap(inner, |name| view("p").text(name))));
+                    .child(swap(inner, |name| view("p").text(name))))));
         }
         "#,
     );
@@ -4711,11 +5142,11 @@ fn swap_boundaries_nest() {
 
 #[test]
 fn swap_composes_with_sibling_bindings() {
-    // `swap` alongside `bind_each` and `show` on one element tree — the mixed
+    // `swap` alongside `each` and `show` on one element tree — the mixed
     // form: three boundary kinds registering into the same enclosing owner.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, each, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         fun main() {
@@ -4723,9 +5154,9 @@ fn swap_composes_with_sibling_bindings() {
             let items: SignalCell<List<str>> = Signal::new(["a", "b"]);
             let visible: SignalCell<bool> = Signal::new(true);
             let _root = mount_root("app", || view("main")
-                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
+                .child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
                 .child(view("aside").show(visible))
-                .swap(page, |current| view("section").text(i"page {current}")));
+                .child(swap(page, |current| view("section").text(i"page {current}"))));
         }
         "#,
     );
@@ -5076,23 +5507,23 @@ const TWIN_PROGRAM: &str = r#"
 "#;
 
 const TWIN_BLOCK: &str = r#"css {
-            display: flex;
-            gap: {space(4)};
-            padding: {space(4)};
-            background-color: {Color::gray(50)};
-            border-radius: {Length::px(8)};
-            grid-template-columns: repeat(3, 1fr);
+            display("flex");
+            gap(space(4));
+            padding(space(4));
+            background-color(Color::gray(50));
+            border-radius(Length::px(8));
+            grid-template-columns("repeat(3, 1fr)");
             .md {
-                padding: {space(6)};
+                padding(space(6));
             }
             .hover {
-                background-color: {Color::gray(100)};
+                background-color(Color::gray(100));
             }
-            .within("data-theme", "dark") {
-                color: {Color::gray(50)};
+            .within("data-theme", Some("dark")) {
+                color(Color::gray(50));
             }
             .children {
-                margin-top: {space(2)};
+                margin-top(space(2));
             }
         }"#;
 
@@ -5105,7 +5536,7 @@ const TWIN_CHAIN: &str = r#"style()
             .raw("grid-template-columns", "repeat(3, 1fr)")
             .md(style().raw("padding", space(6)))
             .hover(style().raw("background-color", Color::gray(100)))
-            .within("data-theme", "dark", style().raw("color", Color::gray(50)))
+            .within("data-theme", Some("dark"), style().raw("color", Color::gray(50)))
             .children(style().raw("margin-top", space(2)))"#;
 
 fn twin(spelling: &str) -> String {
@@ -5150,6 +5581,78 @@ fn a_css_block_emits_byte_identical_js_against_the_chain() {
 }
 
 #[test]
+fn a101_several_arguments_join_with_one_space() {
+    // R10: N arguments are ONE value, joined by a single space — CSS's own list
+    // separator — and `raw`'s arity does not change. The chain twin is the join
+    // written out, each part through `piece` so a token mid-value still puts its
+    // `:root` line on the sheet, and the two spellings emit the same bytes.
+    let block = style_css(
+        r#"
+        import std::style::{ style, space, Color };
+        let _s = const css { margin(space(4), space(8)); border("1px solid", Color::gray(500)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        block.contains("{margin:var(--space-4) var(--space-8)}"),
+        "{block}"
+    );
+    assert!(
+        block.contains("{border:1px solid var(--gray-500)}"),
+        "{block}"
+    );
+    assert!(block.contains(":root{--gray-500:"), "{block}");
+    assert!(block.contains(":root{--space-8:"), "{block}");
+}
+
+#[test]
+fn a101_a_custom_property_is_a_call_head_and_var_reads_one() {
+    // R12, both sides. `--brand-ink(..)` is admitted on the PROPERTY side by the
+    // production that already read leading hyphens (element attributes do the
+    // same); on the VALUE side `--x` is not an expression at all, so CSS's
+    // `var(--x)` is spelled `var("--x")` — a `std::style` value function,
+    // ambient inside a block through the style prelude.
+    let block = style_css(
+        r#"
+        import std::style::{ style, Color };
+        let _s = const css { --brand-ink(Color::gray(900)); color(var("--brand-ink")); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(block.contains("{--brand-ink:var(--gray-900)}"), "{block}");
+    assert!(block.contains("{color:var(--brand-ink)}"), "{block}");
+    // The dashes are the whole of what makes a name a custom property (A90),
+    // and the check reaches the free function too.
+    assert_run_panics(
+        r#"
+        import std::style::style;
+        let _s = const css { color(var("brand-ink")); };
+        fun main() {}
+        main();
+        "#,
+        "a custom property is written with its dashes",
+    );
+}
+
+#[test]
+fn a101_a_declaration_argument_is_typed_at_the_argument() {
+    // The value grammar is gone, so a value whose type is not a raw value is
+    // the ORDINARY type error at the argument — the same one the chain gives,
+    // named at the same trait, in the same words.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let _s = const css { padding(4); };
+        fun main() {}
+        main();
+        "#,
+        "CssValue",
+    );
+}
+
+#[test]
 fn a_css_block_is_an_ordinary_expression() {
     // It evaluates to a `Style`, so `+` still combines and last wins — the
     // §1.2 requirement, that the form compose natively, met by lowering to the
@@ -5159,8 +5662,8 @@ fn a_css_block_is_an_ordinary_expression() {
         import std::io::print;
         import std::style::{ style, space };
         fun main() {
-            let base = const css { padding: {space(4)}; };
-            let wider = const css { padding: {space(6)}; };
+            let base = const css { padding(space(4)); };
+            let wider = const css { padding(space(6)); };
             print((base + wider).class_list());
         }
         main();
@@ -5177,7 +5680,7 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
     let css = style_css(
         r#"
         import std::style::{ style, space };
-        let _s = const css { gap: {space(4)}; };
+        let _s = const css { gap(space(4)); };
         fun main() {}
         main();
         "#,
@@ -5186,29 +5689,111 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
     assert!(css.contains(":root{--space-4:1rem}"), "{css}");
 }
 
+// --- A34: a typed style token MID-VALUE --------------------------------------
+//
+// A value that MIXES text and holes used to be built to the i-string's shape —
+// `("" + "calc(" + space(4) + " + 2px)")` — so it inherited the
+// concatenation's rules: a `Length` is a two-field struct, and B148 refused it
+// outright, which was the honest state because no correct spelling existed.
+// `.text` reaches the var reference and DROPS the `:root` line the one-hole
+// path carries, which is the exact hazard the block was built to close.
+//
+// Each hole of a mixed value now goes through `std::style::piece`, which
+// returns the text and puts the `:root` line on the sheet. This replaces
+// `a_mixed_css_value_refuses_a_struct_hole`, which pinned the gap.
+
 #[test]
-fn a_mixed_css_value_refuses_a_struct_hole() {
-    // B148's css end. A value that MIXES text and holes is built to the
-    // i-string's shape — `("" + "calc(" + space(4) + " + 2px)")`
-    // (`css::build_value`) — so it inherited the concatenation's hole: a
-    // `Length` is a two-field struct, and the host rendered the tuple straight
-    // into the declaration, sheet fragment and all
-    // (`calc(var(--space-4),:root{--space-4:1rem} + 2px)`). The concatenation
-    // rule refuses it here for the same reason it refuses `"x" + point`.
-    //
-    // A `str` or a number hole in a mixed value is unaffected — those render —
-    // so what this closes is the typed style values (`Length`, `Color`) used
-    // MID-value. There is no correct spelling for that today: `.text` reaches
-    // the var reference but drops the `:root` line the one-hole row above
-    // carries, which is the hazard S1 closed. Refusing is the honest state.
-    assert_fails_with(
+fn a_mid_value_token_carries_its_root_line() {
+    // The item's own exhibit: `border: 1px solid {Color::gray(500)}` emits the
+    // var reference AND the token that declares it.
+    let css = style_css(
         r#"
-        import std::style::{ style, space };
-        let _s = const css { padding: calc({space(4)} + 2px); };
+        import std::style::{ style, Color };
+        let _s = const css { border("1px solid", Color::gray(500)); };
         fun main() {}
         main();
         "#,
-        "`+` on `str` concatenates, and `Length` has no string form",
+    );
+    assert!(css.contains("{border:1px solid var(--gray-500)}"), "{css}");
+    assert!(css.contains(":root{--gray-500:"), "{css}");
+}
+
+#[test]
+fn a_mid_value_length_carries_its_root_line_too() {
+    // `space` is the token with a `:root` line to lose; `calc` is the value
+    // shape that forced the mixed path in the first place.
+    let css = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const css { padding(i"calc({piece(space(4))} + 2px)"); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        css.contains("{padding:calc(var(--space-4) + 2px)}"),
+        "{css}"
+    );
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+}
+
+#[test]
+fn the_single_hole_path_is_unchanged_by_the_mid_value_one() {
+    // The control. A value that is EXACTLY one hole still passes its
+    // expression through untouched — it keeps its TYPE and reaches
+    // `Style::raw`, which is what makes `gap: {space(4)};` a `Length` rather
+    // than a rendered string, and what the emitted-bytes gate compares.
+    let block = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const css { gap(space(4)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    let chain = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const style().raw("gap", space(4));
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(block, chain);
+}
+
+#[test]
+fn a_piece_of_a_type_with_no_piece_is_still_refused() {
+    // The refusal survives, one trait over: a value assembled from several
+    // arguments still cannot render an arbitrary struct, and says which trait
+    // would let it.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        struct Point { x: i32, y: i32 }
+        let _s = const css { border("1px solid", Point { x = 1, y = 2 }); };
+        fun main() {}
+        main();
+        "#,
+        "CssPiece",
+    );
+}
+
+#[test]
+fn a_whole_value_still_demands_a_css_value_and_its_unit() {
+    // Why `CssPiece` is a SECOND trait rather than the same one: a whole value
+    // must carry its own unit, so a bare number is still refused there and the
+    // author is still steered to `space(4)` / `px(4)`. A piece sits inside
+    // text that supplies the unit, which is why a bare number is legal there.
+    assert_fails_with(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style { style().raw("padding", 4) }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+        "CssValue",
     );
 }
 
@@ -5222,7 +5807,7 @@ fn a_mixed_css_value_still_admits_a_string_hole() {
         fun main() {}
         let width = "100%";
         let inset = 2;
-        let _s = const css { width: calc({width} - {inset}rem); };
+        let _s = const css { width(i"calc({piece(width)} - {piece(inset)}rem)"); };
         main();
         "#,
     );
@@ -5238,10 +5823,10 @@ fn a_hole_free_value_is_its_own_source_slice() {
         r#"
         import std::style::style;
         let _s = const css {
-            grid-template-columns: repeat(3, 1fr);
-            background-image: url("tile.png");
-            width: 50%;
-            line-height: 1.5;
+            grid-template-columns("repeat(3, 1fr)");
+            background-image("url(\"tile.png\")");
+            width(pct(50));
+            line-height("1.5");
         };
         fun main() {}
         main();
@@ -5264,7 +5849,7 @@ fn a_custom_property_is_span_adjacency_and_nothing_new() {
     let css = style_css(
         r#"
         import std::style::{ style, Color };
-        let _s = const css { --brand-ink: {Color::gray(900)}; };
+        let _s = const css { --brand-ink(Color::gray(900)); };
         fun main() {}
         main();
         "#,
@@ -5282,14 +5867,14 @@ fn nested_rules_lower_to_the_shipped_relation_combinators() {
         r#"
         import std::style::{ style, space, Color };
         let _s = const css {
-            .within("data-theme", "dark") {
-                color: {Color::gray(50)};
+            .within("data-theme", Some("dark")) {
+                color(Color::gray(50));
             }
             .children {
-                margin-top: {space(2)};
+                margin-top(space(2));
             }
             .divide {
-                margin-top: {space(4)};
+                margin-top(space(4));
             }
         };
         fun main() {}
@@ -5314,10 +5899,10 @@ fn nesting_order_is_combinator_order() {
         import std::style::{ style, Color };
         let _s = const css {
             .md {
-                .within("data-theme", "dark") {
-                    .attribute("data-open", "true") {
+                .within("data-theme", Some("dark")) {
+                    .attribute("data-open", Some("true")) {
                         .hover {
-                            color: {Color::gray(50)};
+                            color(Color::gray(50));
                         }
                     }
                 }
@@ -5344,7 +5929,7 @@ fn a_misnested_condition_still_refuses_by_name() {
         let _s = const css {
             .hover {
                 .md {
-                    color: {Color::gray(50)};
+                    color(Color::gray(50));
                 }
             }
         };
@@ -5367,7 +5952,7 @@ fn a_macro_generated_css_block_desugars() {
         fun main() {
             let made = macro {
                 import macro_std::source;
-                source("const css { padding: {space(4)}; .hover { color: red; } }")
+                source("const css { padding(space(4)); .hover { color(\"red\"); } }")
             };
             print(made.class_list());
         }
@@ -5387,7 +5972,7 @@ fn a_css_block_inside_markup_desugars() {
         import std::ui::{ View, view };
         import std::style::{ style, space };
         fun main() {
-            let _card = <div .styled(const css { padding: {space(4)}; }) />;
+            let _card = <div .styled(const css { padding(space(4)); }) />;
         }
         "#,
     );
@@ -5396,19 +5981,30 @@ fn a_css_block_inside_markup_desugars() {
 // The refusals, each with its fix named (§4.1, §7.3, §10).
 
 #[test]
-fn a_bare_hex_colour_refuses_naming_the_hole() {
-    // `#` is in no charset, so this is a LEX error and cannot be anything
-    // else: lexing is context-free by spec and finishes before the parser
-    // exists. The mitigation is the `UNESCAPED_BRACE` precedent — a rule code
-    // on the `LexError` naming the vilan spelling.
-    assert_fails_with(
-        r#"
+fn a101_a_hex_colour_is_a_typed_value_and_the_colour_rule_is_retired() {
+    // The `#`-is-not-a-colour refusal RETIRES with the value grammar it
+    // guarded (A101): no CSS token reaches a declaration any more, so `#333`
+    // is refused as the ordinary expression it is not — `#` begins none —
+    // rather than by a rule of the block's own. What the rule steered TO is
+    // what the block now writes directly.
+    // (`r##"…"##`: the spelling contains `"#`, which closes an `r#"`.)
+    assert_compiles(
+        r##"
         import std::style::style;
-        let _s = const css { color: #333; };
+        import std::style::Color;
+        let _s = const css { color(Color::hex("#333")); };
         fun main() {}
         main();
-        "#,
-        "Color::hex",
+        "##,
+    );
+    // The prelude's own spelling, ambient inside a block.
+    assert_compiles(
+        r##"
+        import std::style::style;
+        let _s = const css { color(hex("#333")); };
+        fun main() {}
+        main();
+        "##,
     );
 }
 
@@ -5427,10 +6023,14 @@ fn an_at_rule_refuses_naming_the_breakpoint_combinator() {
 
 #[test]
 fn important_refuses_permanently_and_says_why() {
+    // Read off the declaration's argument TOKENS since A101 — `red !important`
+    // is not an expression, so the argument list would otherwise report a `,`
+    // the author never wanted and the sentence that answers would never be
+    // seen.
     assert_fails_with(
         r#"
         import std::style::style;
-        let _s = const css { color: red !important; };
+        let _s = const css { color(red !important); };
         fun main() {}
         main();
         "#,
@@ -5441,16 +6041,32 @@ fn important_refuses_permanently_and_says_why() {
 #[test]
 fn a_missing_terminator_asks_for_the_semicolon() {
     // The `;` is required after every declaration, including the last: the
-    // formatter may never invent a token, and a required terminator makes
-    // value scanning decidable in one pass.
+    // formatter may never invent a token, and a required terminator keeps an
+    // item decidable in one pass.
     assert_fails_with(
         r#"
         import std::style::style;
-        let _s = const css { color: red };
+        let _s = const css { color("red") };
         fun main() {}
         main();
         "#,
         "expected `;` to end this statement",
+    );
+}
+
+#[test]
+fn a101_the_css_spelling_of_a_declaration_names_the_call_form() {
+    // The breaking change's own diagnostic: every program written before A101
+    // lands here, at the `:`, and the rule names what to write instead.
+    // Written as two pieces on purpose: this is the one fixture that must KEEP
+    // the spelling A101 retired, and a whole `css { … }` block in one literal is
+    // exactly what the codemod migrates.
+    assert_fails_with(
+        concat!(
+            "\n        import std::style::style;\n        let _s = const css { padding",
+            ": 1rem; };\n        fun main() {}\n        main();\n        "
+        ),
+        "a `css` declaration is a CALL",
     );
 }
 
@@ -5463,7 +6079,7 @@ fn a_block_in_condition_position_asks_for_parentheses() {
         r#"
         import std::io::print;
         fun main() {
-            if css { color: red; } { print("x"); }
+            if css { color("red"); } { print("x"); }
         }
         main();
         "#,
@@ -5479,7 +6095,7 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
         import std::io::print;
         import std::style::style;
         fun main() {
-            if (const css { color: red; }).class_list() != "" {
+            if (const css { color("red"); }).class_list() != "" {
                 print("styled");
             }
         }
@@ -5487,42 +6103,699 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
     );
 }
 
+// --- A69: a CHAIN LINK inside a block ----------------------------------------
+//
+// A dotted item ending in `;` is a verbatim `Style` method call at its written
+// position — the element syntax's own rule (dotted = chain link) read on the
+// style side, and the way an app's helpers and std's combinators reach the
+// block. The exhibit is kolt's own three (`flex_row`, `ghost`, `select_off`),
+// restated here at the same shape: `impl Style` methods over `raw` and
+// `within`, called from a block.
+
 #[test]
-fn a_block_without_style_in_scope_fails_at_the_css_keyword() {
-    // The one generated accessor S2 gave a REAL span, and this is what the
-    // span was kept for (§7.3): the block lowers to `style()`, so a missing
-    // `import std::style::style` fails on the generated accessor — and the
-    // squiggle lands on the word that asked for a `Style`, not on a
-    // zero-width anchor somewhere inside the block.
-    assert_fails_spanning(
+fn a_chain_link_calls_an_apps_own_style_helper() {
+    let css = style_css(
         r#"
-        fun main() {
-            let _s = const css { display: flex; };
+        import std::style::{ style, Style, Display, FlexDirection, UserSelect };
+        impl Style {
+            fun flex_row(self): Style {
+                self.display(Display::Flex).flex_direction(FlexDirection::Row)
+            }
+            fun select_off(self): Style {
+                self.within("data-user-select", Some("false"), style().user_select(UserSelect::Off))
+            }
+            fun ghost(self): Style {
+                self.raw("pointer-events", "none").select_off()
+            }
         }
+        let card = css {
+            .flex_row();
+            gap(rem(1));
+            .ghost();
+        };
+        fun main() {}
+        main();
         "#,
-        "css",
-        "cannot find 'style' in this scope",
     );
-    // S4's tailored note. The generic report is honest but disjointed — `css`
-    // underlined, `style` in the message, nothing drawing the line — so the
-    // note says which is which, on the element-syntax precedent.
-    assert_fails_noting(
+    assert!(css.contains("{display:flex}"), "{css}");
+    assert!(css.contains("{flex-direction:row}"), "{css}");
+    assert!(css.contains("{gap:1rem}"), "{css}");
+    assert!(css.contains("{pointer-events:none}"), "{css}");
+    assert!(css.contains("user-select"), "{css}");
+}
+
+#[test]
+fn a_chain_link_takes_arguments_and_a_block_still_equals_its_chain() {
+    // The headline claim, extended to the new item: block and chain emit the
+    // same sheet, link arguments included.
+    let block = style_css(
         r#"
-        fun main() {
-            let _s = const css { display: flex; };
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
         }
+        let a = css { color("red"); .nudge(Length::px(4)); padding(rem(1)); };
+        fun main() {}
+        main();
         "#,
-        "cannot find 'style' in this scope",
-        "css",
-        "a `css { … }` block lowers to a std::style::style chain",
+    );
+    let chain = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let a = const style().raw("color", "red").nudge(Length::px(4)).raw("padding", "1rem");
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(block, chain);
+}
+
+#[test]
+fn a_dotted_item_with_no_body_and_no_terminator_is_refused() {
+    // The `;` is required of a link exactly as it is of a declaration — the
+    // formatter may never invent a token.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let a = css { .ghost() };
+        fun main() {}
+        main();
+        "#,
+        "expected `;` to end this statement",
+    );
+}
+
+// --- A70: `std::style::prelude`, ambient inside a block ----------------------
+
+#[test]
+fn a_hole_reaches_the_style_prelude_with_no_import() {
+    // `{rem(4)}` and `{gray(500)}` are the hole spellings. Nothing is
+    // imported: the module is ambient inside a block, and the loader seeds it
+    // off the block itself.
+    let css = style_css(
+        r#"
+        let card = css {
+            gap(space(4));
+            padding(rem(1));
+            color(gray(500));
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{gap:var(--space-4)}"), "{css}");
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+    assert!(css.contains("{padding:1rem}"), "{css}");
+    assert!(css.contains("{color:var(--gray-500)}"), "{css}");
+    assert!(css.contains(":root{--gray-500:"), "{css}");
+}
+
+#[test]
+fn a_local_binding_beats_the_ambient_style_prelude() {
+    // The rule that makes the module safe to grow: the site's own scope is
+    // asked first, always, so no file can be broken by a name added to it.
+    let css = style_css(
+        r#"
+        import std::style::Length;
+        fun main() {}
+        fun rem(value: f64): Length { Length::px(value) }
+        let card = css { padding(rem(4)); };
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:4px}"), "{css}");
+}
+
+#[test]
+fn a_chain_links_arguments_see_the_prelude_too() {
+    // Every expression written inside a block is a block expression: a hole,
+    // a condition head's argument, and a link's argument alike.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Length };
+        impl Style {
+            fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
+        }
+        let card = css { .nudge(rem(1)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{margin-top:1rem}"), "{css}");
+}
+
+#[test]
+fn the_style_prelude_is_importable_in_any_block() {
+    // Outside a `css` block it is an ordinary module: a brace list binds the
+    // members bare, and the module name qualifies them. Both spellings are
+    // block-scoped, so a `const { … }` can carry its own.
+    assert_compiles(
+        r#"
+        import std::style::Style;
+        fun palette(): Style {
+            const {
+                import std::style::prelude::{ rem, s };
+                s().raw("padding", rem(1))
+            }
+        }
+        fun main() { let _s = palette(); }
+        main();
+        "#,
+    );
+    assert_compiles(
+        r#"
+        import std::style::Style;
+        fun palette(): Style {
+            const {
+                import std::style::prelude;
+                prelude::s().raw("padding", prelude::rem(1))
+            }
+        }
+        fun main() { let _s = palette(); }
+        main();
+        "#,
     );
 }
 
 #[test]
-fn a_hand_written_style_accessor_gets_no_css_note() {
-    // The note's gate is the SPAN reading `css`, so it cannot fire on an
-    // ordinary unresolved `style` — which would be a note about a construct
-    // the author never wrote.
+fn the_style_prelude_is_not_ambient_outside_a_block() {
+    // The other half of "ambient inside a block": the names are not in scope
+    // anywhere else, so the module costs the bare namespace nothing.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let a = const style().raw("padding", rem(1));
+        fun main() {}
+        main();
+        "#,
+        "cannot find 'rem' in this scope",
+    );
+}
+
+// --- A106: the vocabulary reaches a chain written OUTSIDE a hole -------------
+//
+// A70 made the prelude ambient inside a css HOLE, which is one syntactic
+// position. A `fun` body that builds a chain is not that position, so before
+// A106 such a file imported one name per token it used — and from `std::style`
+// rather than the prelude, because the prelude carried the free functions and
+// the conditions but NOT the keyword-property types, and because the builder
+// there is named `style` and wants aliasing. kolt's `styles.vl:54/103` is the
+// exhibit: nine names, imported twice, once inside each of two functions,
+// under a `// FIXME: Add a prelude to std.`.
+//
+// Door 1 (R7 at Order 38's GO): the four TYPES the vocabulary needs join the
+// module, and one file-level import list is the idiom. Door 2 — the `std::web`
+// prelude re-exporting this module, ambient in every web file — is gated on a
+// zero-collision census, and the census this lane ran is NOT zero, so it is
+// not taken.
+
+/// The four keyword-property types resolve through `std::style::prelude`, so
+/// ONE import list answers both halves of a chain — the tokens and the
+/// keywords. This is kolt's `button_style` shape, with the nine-name block
+/// replaced by one statement at the top.
+#[test]
+fn a106_one_prelude_import_answers_a_whole_chain_outside_a_hole() {
+    let css = style_css(
+        r#"
+        import std::style::prelude::{
+            AlignItems,
+            Cursor,
+            Length,
+            TextAlign,
+            active,
+            attribute,
+            gray,
+            hover,
+            pseudo,
+            px,
+            s,
+            space,
+        };
+        import std::style::Style;
+        fun button(): Style {
+            s()
+                .padding(space(2))
+                .color(gray(700))
+                .cursor(Cursor::Pointer)
+                .text_align(TextAlign::Center)
+                .align_items(AlignItems::Center)
+                .width(px(120))
+                .raw("outline-offset", Length::zero())
+                .on(hover() + active().not(), s().color(gray(900)))
+                .on(attribute("data-open"), s().color(gray(500)))
+                .on(pseudo("focus-visible"), s().color(gray(100)))
+        }
+        fun main() { let _built = const button(); }
+        main();
+        "#,
+    );
+    assert!(css.contains("{cursor:pointer"), "{css}");
+    assert!(css.contains("text-align:center"), "{css}");
+    assert!(css.contains("align-items:center"), "{css}");
+    assert!(css.contains("width:120px"), "{css}");
+    assert!(css.contains(":hover"), "{css}");
+    assert!(css.contains("[data-open]"), "{css}");
+    assert!(css.contains(":focus-visible"), "{css}");
+}
+
+/// The module name qualifies them too, which is the form for a file that would
+/// rather not bind a dozen bare names.
+#[test]
+fn a106_the_four_types_qualify_through_the_module_name() {
+    assert_compiles(
+        r#"
+        import std::style::prelude as tokens;
+        import std::style::Style;
+        fun button(): Style {
+            tokens::s()
+                .cursor(tokens::Cursor::Pointer)
+                .text_align(tokens::TextAlign::Left)
+                .align_items(tokens::AlignItems::Stretch)
+                .raw("outline-offset", tokens::Length::zero())
+        }
+        fun main() { let _built = const button(); }
+        main();
+        "#,
+    );
+}
+
+/// The set is the FOUR the vocabulary needs, not every keyword enum in
+/// `std::style`. A prelude is a vocabulary rather than a second spelling of a
+/// module, so the rest stay where they are and the refusal says so.
+#[test]
+fn a106_the_other_keyword_enums_stay_out_of_the_prelude() {
+    for absent in ["Display", "Position", "FlexDirection", "JustifyContent"] {
+        let source = format!(
+            r#"
+            import std::style::prelude::{{ {absent} }};
+            fun main() {{}}
+            main();
+            "#
+        );
+        assert_fails_with(&source, "in the imported path");
+    }
+}
+
+/// The widening cannot break a file, and this is the rule that guarantees it:
+/// the site's own scope is asked FIRST, always. A file declaring its own
+/// `Cursor` keeps it, and a hole in the same file still reaches the prelude for
+/// everything else. Neither case is hypothetical — the book's own iteration
+/// example declares `struct Cursor`, and kolt's icon library declares
+/// `fun space()`, `fun focus()` and `fun divide()`; they are three of the six
+/// file-level shadows door 2's census found.
+#[test]
+fn a106_a_local_declaration_still_beats_a_newly_added_prelude_name() {
+    let css = style_css(
+        r#"
+        struct Cursor { index: i32 }
+        fun space(): i32 { 7 }
+        let card = css { padding(rem(1)); };
+        fun main() {
+            let walked = Cursor { index = space() };
+            print(walked.index);
+        }
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:1rem}"), "{css}");
+}
+
+// --- A117: the prelude's SURFACE is the 46 names it was designed with -------
+//
+// `export *;` re-exports what a module BINDS, an aliased import included, so
+// the twenty-one aliases this module needs on the way in — `open_style`,
+// `scale_step`, `value_piece`, `custom_property` and seventeen `*_condition`
+// spellings — resolved from outside as 21 more exports nobody designed: 21 of
+// the module's 67, a vocabulary with two spellings for everything, and A106
+// door 2's largest objection. Each alias now lives INSIDE the one body it is
+// for, where a function-scoped import binds in the function's scope and no
+// other module can reach it.
+//
+// The aliases are not droppable: the free name and the local one collide by
+// construction (`hover()` here IS the condition and calls `style::hover`), so
+// "hide the alias" and "delete the alias" are different changes and only the
+// first one is available.
+
+/// The designed surface, written down. 8 types and 38 one-line functions —
+/// every name a css hole or a chain reaches for, and nothing else.
+const A117_PRELUDE_SURFACE: &[&str] = &[
+    // The keyword-property types and the currencies (A106's door 1).
+    "AlignItems",
+    "Color",
+    "Condition",
+    "CssPiece",
+    "Cursor",
+    "Length",
+    "Style",
+    "TextAlign",
+    // Lengths.
+    "auto",
+    "em",
+    "pct",
+    "px",
+    "rem",
+    "space",
+    "vh",
+    "vw",
+    // Colors and the two value builders.
+    "black",
+    "blue",
+    "gray",
+    "green",
+    "hex",
+    "oklch",
+    "piece",
+    "red",
+    "rgba",
+    "transparent",
+    "var",
+    "white",
+    // The builder.
+    "s",
+    // The conditions (A95).
+    "active",
+    "attribute",
+    "children",
+    "disabled",
+    "divide",
+    "element",
+    "first",
+    "focus",
+    "hover",
+    "last",
+    "lg",
+    "md",
+    "media",
+    "pseudo",
+    "sm",
+    "within",
+    "xl",
+];
+
+/// The twenty-one spellings that used to ride out on `export *;`.
+const A117_RETIRED_ALIAS_SPELLINGS: &[&str] = &[
+    "active_condition",
+    "attribute_condition",
+    "children_condition",
+    "custom_property",
+    "disabled_condition",
+    "divide_condition",
+    "element_condition",
+    "first_condition",
+    "focus_condition",
+    "hover_condition",
+    "last_condition",
+    "lg_condition",
+    "md_condition",
+    "media_condition",
+    "open_style",
+    "pseudo_condition",
+    "scale_step",
+    "sm_condition",
+    "value_piece",
+    "within_condition",
+    "xl_condition",
+];
+
+/// The count is the claim, so it is asserted rather than left to be read off a
+/// list: 46 exports, 8 + 38.
+#[test]
+fn a117_the_designed_surface_is_forty_six_names() {
+    assert_eq!(A117_PRELUDE_SURFACE.len(), 46);
+    let mut sorted = A117_PRELUDE_SURFACE.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 46, "the written surface repeats a name");
+    assert_eq!(A117_RETIRED_ALIAS_SPELLINGS.len(), 21);
+}
+
+/// Every designed name still resolves through the module, in ONE import list —
+/// which is what keeps the hiding from having taken surface with it.
+#[test]
+fn a117_every_designed_name_still_imports_from_the_prelude() {
+    let names = A117_PRELUDE_SURFACE.join(", ");
+    assert_compiles(&format!(
+        "import std::style::prelude::{{ {names} }};\nfun main() {{}}\nmain();\n"
+    ));
+}
+
+/// And every alias spelling is gone. One case per name: the set is the
+/// surface's complement and a single representative would let twenty of them
+/// creep back.
+#[test]
+fn a117_no_alias_spelling_resolves_from_outside_the_prelude() {
+    for alias in A117_RETIRED_ALIAS_SPELLINGS {
+        let source =
+            format!("import std::style::prelude::{{ {alias} }};\nfun main() {{}}\nmain();\n");
+        let diagnostics = failure_diagnostics(&source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains("in the imported path")),
+            "`{alias}` still resolves out of std::style::prelude: {diagnostics:#?}"
+        );
+    }
+}
+
+/// The module's own source is the other half of the claim: a name added to the
+/// file-level import, or a new top-level `fun`, is a change to the SURFACE and
+/// reddens here rather than shipping. Read off the text, because that is where
+/// `export *;` reads it too.
+#[test]
+fn a117_the_preludes_source_binds_exactly_the_designed_surface() {
+    let source = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vilan/std/src/style/prelude.vl"),
+    )
+    .expect("read std::style::prelude");
+    let mut bound: Vec<String> = Vec::new();
+    let mut inside_file_level_import = false;
+    for line in source.lines() {
+        // A function-scoped import is indented; the file-level one is not, and
+        // it is the only import whose names `export *;` publishes.
+        if let Some(rest) = line.strip_prefix("import pkg::style::{") {
+            inside_file_level_import = !rest.contains('}');
+            for name in rest.trim_end_matches(&['}', ';'][..]).split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    bound.push(name.to_string());
+                }
+            }
+            continue;
+        }
+        if inside_file_level_import {
+            if line.starts_with('}') {
+                inside_file_level_import = false;
+                continue;
+            }
+            let name = line.trim().trim_end_matches(',').trim();
+            if !name.is_empty() {
+                bound.push(name.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("fun ") {
+            let name: String = rest
+                .chars()
+                .take_while(|character| character.is_alphanumeric() || *character == '_')
+                .collect();
+            bound.push(name);
+        }
+    }
+    bound.sort();
+    let mut designed: Vec<String> = A117_PRELUDE_SURFACE
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    designed.sort();
+    assert_eq!(
+        bound, designed,
+        "std::style::prelude binds a different set than the designed surface"
+    );
+    for alias in A117_RETIRED_ALIAS_SPELLINGS {
+        assert!(
+            !bound.iter().any(|name| name == alias),
+            "`{alias}` is bound at the module's top level again"
+        );
+    }
+}
+
+// --- A68: a block is `const` BY CONSTRUCTION ---------------------------------
+//
+// `Style::raw` calls `emit`, the compile-time channel, so a chain only means
+// anything inside a `const` — and every block had to be written
+// `const css { … }`, with `let b = css { padding: 1rem; };` refused as
+// "`raw` … is compile-time-only; evaluate this call inside a `const`
+// expression". A block IS a compile-time asset by definition, so the desugar
+// writes the word. A hole that reads a runtime binding still gets const-eval's
+// refusal, now at the hole rather than at a `const` nobody wrote.
+
+#[test]
+fn a_block_needs_no_const_written_in_front_of_it() {
+    let css = style_css(
+        r#"
+        let plain = css { padding(rem(1)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:1rem}"), "{css}");
+}
+
+#[test]
+fn a_written_const_block_still_compiles_and_means_the_same() {
+    // Idempotence, which is what lets every block already written with `const`
+    // stay exactly as it is: the desugar's marker and the author's nest, and
+    // `const` forwards to its inner expression, so the two spellings are one
+    // tree and one rule on the sheet.
+    let written = style_css(
+        r#"
+        let a = const css { padding(rem(1)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    let bare = style_css(
+        r#"
+        let a = css { padding(rem(1)); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(written, bare);
+}
+
+#[test]
+fn a_block_in_an_element_head_needs_no_const_either() {
+    // The other everyday position: `.styled(css { … })` on markup, where the
+    // written `const` reads worst of all.
+    assert!(
+        compile_browser(
+            r#"
+        import std::ui::mount_root;
+        fun main() {
+            mount_root("app", || <div .styled(css { display("flex"); })>"hi"</div>);
+        }
+        main();
+        "#
+        )
+        .is_ok(),
+        "a bare block inside markup must compile"
+    );
+}
+
+#[test]
+fn a_runtime_hole_is_refused_at_the_hole() {
+    // The half A68 does NOT change: a block is compile-time, so a hole reading
+    // a runtime value cannot be evaluated — and const-eval says so at the hole,
+    // which is the expression that cannot be read.
+    // Occurrence 2 of `width` is the HOLE's read — occurrence 0 is the
+    // parameter and 1 is the CSS property name — so this pins the anchor as
+    // well as the message.
+    assert_fails_spanning_nth(
+        r#"
+        fun styled(width: str) {
+            let _s = css { width(width); };
+        }
+        fun main() { styled("10px"); }
+        main();
+        "#,
+        "width",
+        2,
+        "`width` is a runtime value; a `const` expression reads only compile-time-known bindings",
+    );
+}
+
+// --- B270: the seed is a scope-independent reference to std ------------------
+//
+// The block's seed used to be a bare `style` accessor resolved at the SITE,
+// which made the whole form unusable in the packages it was built for: under
+// `prelude = "std::web"` the ambient `style` is a MODULE, so every block failed
+// with "`style` is a module, not a value" (kolt channel.vl:71). It also let any
+// local `style` capture a call nobody had written. The seed is now
+// `std::style::style` whatever the site says, and the loader pulls `std::style`
+// in off the reference, so a block needs no import at all.
+//
+// This replaces `a_block_without_style_in_scope_fails_at_the_css_keyword`,
+// which pinned the behaviour B270 reverses. The note it also pinned
+// (`css_style_import_note`) is deleted rather than narrowed — N74, below.
+
+#[test]
+fn a_block_needs_no_style_import_at_all() {
+    // The pin the old test inverts. No import, no prelude: the block still
+    // means std's `style()`, and the sheet still gets the declaration.
+    let css = style_css(
+        r#"
+        let _s = const css { display("flex"); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{display:flex}"), "{css}");
+}
+
+#[test]
+fn a_local_style_binding_does_not_capture_the_blocks_seed() {
+    // Hygiene's whole point: a `let style = 1;` in scope is not what `css {}`
+    // reaches. Before B270 this reported "1 is not callable" against the `css`
+    // keyword.
+    let css = style_css(
+        r#"
+        fun main() {
+            let style = 1;
+            let _s = const css { display("flex"); };
+            let _n = style + 1;
+        }
+        main();
+        "#,
+    );
+    assert!(css.contains("{display:flex}"), "{css}");
+}
+
+#[test]
+fn an_aliased_style_import_leaves_the_blocks_seed_alone() {
+    // `import std::style::style as s;` binds `s` and nothing called `style`.
+    // The block is unaffected either way — the alias is for the CHAIN, and the
+    // two spellings sit side by side.
+    let css = style_css(
+        r#"
+        import std::style::style as s;
+        let _a = const s().raw("color", "red");
+        let _b = const css { display("flex"); };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{display:flex}"), "{css}");
+    assert!(css.contains("{color:red}"), "{css}");
+}
+
+#[test]
+fn n74_an_unresolved_style_is_reported_without_an_import_steer() {
+    // N74, N69's twin. `css_style_import_note` attached "a `css { … }` block
+    // lowers to a std::style::style chain; add `import std::style::style;`" to
+    // an unresolved `style` whose span read `css`, and after B270 the block's
+    // seed is a scope-independent reference to `std::style::style` — so the
+    // note could only fire for a std with no `style` item at all, where the
+    // import it steers at would miss exactly the same way. A note that can
+    // only fire where its own advice is false is worse than no note; the
+    // reachability half is held by `a_block_needs_no_style_import_at_all`
+    // above, which goes red the moment a block needs the import again.
+    //
+    // What is left is the ordinary miss, for the author who wrote the lowered
+    // chain by hand: the plain message, and nothing about a `css` block they
+    // did not write.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _s = const style().raw("display", "flex");
+        }
+        "#,
+        "cannot find 'style' in this scope",
+    );
     assert_fails_without(
         r#"
         fun main() {
@@ -5530,5 +6803,955 @@ fn a_hand_written_style_accessor_gets_no_css_note() {
         }
         "#,
         "a `css { … }` block lowers to",
+    );
+}
+
+// --- B227: an event handler's parameter is its `Event`, not `any` ------------
+//
+// The owner's second report — "`event` in `on:keydown(|event| ..)` is `any`
+// instead of `Event`" — is the same defect seen through the element head. The
+// `on:` desugar is sound (it lowers to `.on_event`, whose handler is declared
+// `|Event| void`); what re-typed the parameter was a `print(event)` written
+// above the read, through B13's adopt rule and `any`. The `|event: Event|`
+// annotations a real application carries are the workaround, not the spelling.
+
+#[test]
+fn b227_a_printed_event_parameter_is_still_an_event() {
+    // Red before the fix with "cannot call method 'bogus' on any" — the
+    // handler's own declared type reported as `any`, so no member check on
+    // `event` said anything for the rest of the body.
+    assert_fails_browser_with(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, view, mount_root };
+
+        fun main() {
+            let _root = mount_root("app", || <div on:keydown(|event| {
+                print(event);
+                event.bogus();
+            }) />);
+        }
+        "#,
+        "Event has no method 'bogus'",
+    );
+}
+
+#[test]
+fn b227_a_printed_event_parameter_still_reads_its_key() {
+    // The positive half: `Event::key` is a method, and reading it through a
+    // handler that also prints the event must compile. This is the shape the
+    // application was written in.
+    assert_compiles_browser(
+        r#"
+        import std::io::print;
+        import std::ui::{ View, view, mount_root };
+
+        fun main() {
+            let _root = mount_root("app", || <div on:keydown(|event| {
+                print(event);
+                print(event.key());
+            }) />);
+        }
+        "#,
+    );
+}
+
+// --- B311/B322: no condition carries the slot key's own delimiter, and no
+// --- reader splits a key by hand ------------------------------------------------
+// `Style::rule` keys a slot `media:condition:property`, and every reader used to
+// split that string for itself and index the pieces positionally. `pseudo`'s
+// free-form name was the one surface that could put the separator INSIDE a
+// condition: the split mis-aligned, the condition field stopped at the first
+// `:`, the rest of the compound was read as the PROPERTY, and the wrapping
+// combinator re-minted the slot from those pieces — a strictly WEAKER selector,
+// emitted in silence. Measured on the item's own exhibit before the interim
+// fence: `.s2jb016[data-open="true"]:hover{opacity:0.5}`, the `:not(:active)`
+// gone.
+//
+// A95 S2 closes the class from both ends. `pseudo(name)` refuses a `:` outright
+// — a compound is two condition VALUES (`hover() + active().not()`) and a
+// leading colon meant a pseudo-ELEMENT (`element("selection")`) — so no
+// condition token can hold the byte. And every reader goes through `slot_of`,
+// one total reader whose assertion fires loudly if a key ever stops naming
+// exactly one triple, which is what B322's latent halves were: `Style::add`
+// split a key too, and `media`'s width and `raw`'s property were unfenced.
+
+#[test]
+fn b311_a_pseudo_name_carrying_the_key_separator_is_refused_at_the_name() {
+    // The fence moved from the WRAP to the NAME, which is what makes the class
+    // closable rather than fenceable: the string form cannot be constructed, so
+    // there is no program shape left for a reader to mis-split. Both spellings
+    // the free-form name was reached for are refused here, wrapped or not.
+    for written in [
+        r#"style().pseudo("hover:not(:active)", style().opacity(0.5))"#,
+        r#"style().attribute("data-open", Some("true"), style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+        r#"style().pseudo(":selection", style().opacity(0.5))"#,
+    ] {
+        let program = format!(
+            r#"
+            import std::style::{{ style, Style }};
+            fun s(): Style {{
+                {written}
+            }}
+            let _s = const s();
+            fun main() {{}}
+            main();
+            "#
+        );
+        let diagnostics = failure_diagnostics(&program);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains("a pseudo-class name cannot contain ':'")),
+            "{written}\n{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn b311_the_refusal_names_both_values_the_string_form_was_reached_for() {
+    // The two things the message owes an author whose program just stopped
+    // compiling, and they are different fixes for the two different strings the
+    // free-form name was carrying.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().pseudo("hover:not(:active)", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let refusal = diagnostics
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .find(|message| message.contains("a pseudo-class name cannot contain ':'"))
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    assert!(refusal.contains("hover:not(:active)"), "{refusal}");
+    assert!(
+        refusal.contains(".on(hover() + active().not(), ..)"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("element(name)"), "{refusal}");
+}
+
+#[test]
+fn b311_the_miscompiles_own_exhibit_is_spelled_as_two_condition_values() {
+    // The item's program, rewritten the way the refusal steers — and this is
+    // the whole claim: the selector the mis-aligned split silently dropped is
+    // now the one that reaches the sheet, with the `:not(:active)` in it.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, hover, active, attribute };
+        fun s(): Style {
+            style().on(
+                attribute("data-open").eq("true") + hover() + active().not(),
+                style().opacity(0.5),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(kind, line)| {
+            kind == "css"
+                && line.starts_with(".s")
+                && line.ends_with("[data-open=\"true\"]:not(:active):hover{opacity:0.5}")
+        }),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn b322_add_merges_a_conditioned_style_through_the_slot_reader() {
+    // B322's first half: `Style::add` split a slot key too, and ran
+    // `without_covered` against the mis-split property. It reads `slot_of` now
+    // like every other reader, and the control that matters is that `+` still
+    // MERGES — kolt merges conditioned styles at its use sites.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::style::{ style, Style, hover, active, pseudo, element };
+        fun main() {
+            let base = const style()
+                .on(hover() + active().not(), style().opacity(0.5))
+                .on(pseudo("focus-visible") + active().not(), style().opacity(0.7));
+            let extra = const style().on(element("selection"), style().opacity(1.0));
+            print(base.class_list().split(" ").len());
+            print((base + extra).class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn b322_a_breakpoint_width_and_a_written_property_are_fenced_against_the_separator() {
+    // B322's other two halves: `media`'s min-width is field 0 of the key and
+    // `raw`'s property is field 2, and neither was fenced — unreachable through
+    // `sm`/`md`/`lg`/`xl` and the typed property methods, reachable by hand.
+    for (written, needle) in [
+        (
+            r#"style().media("768px:1024px", style().opacity(0.5))"#,
+            "a breakpoint's min-width cannot contain ':'",
+        ),
+        (
+            r#"style().raw("color:red", "blue")"#,
+            "a declaration's property cannot contain ':'",
+        ),
+    ] {
+        let program = format!(
+            r#"
+            import std::style::{{ style, Style }};
+            fun s(): Style {{
+                {written}
+            }}
+            let _s = const s();
+            fun main() {{}}
+            main();
+            "#
+        );
+        let diagnostics = failure_diagnostics(&program);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains(needle)),
+            "{written}\n{diagnostics:#?}"
+        );
+    }
+}
+
+// --- A95 S5: the `Option<str>` sugar deprecated for one release -----------------
+// `Style::attribute` and `Style::within` take A89's `value: Option<str>`, which
+// is exactly what a condition VALUE spells without an argument:
+// `attribute(name)` is presence and `attribute(name).eq(value)` the exact match.
+// Ruled (style-conditions.md §12 (iv)) as one release of `[deprecated]` and then
+// removal — not a break now, so both still compile and both still emit what they
+// always emitted.
+
+#[test]
+fn a95_the_option_taking_sugar_warns_with_the_condition_value_as_the_steer() {
+    for (call, steer) in [
+        (
+            r#"style().attribute("data-open", Some("true"), style().opacity(0.5))"#,
+            "`attribute` is deprecated; use .on(attribute(name), inner)",
+        ),
+        (
+            r#"style().within("data-theme", Some("dark"), style().opacity(0.5))"#,
+            "`within` is deprecated; use .on(within(attribute(name)), inner)",
+        ),
+    ] {
+        let program = format!(
+            r#"
+            import std::style::{{ style, Style }};
+            fun s(): Style {{
+                {call}
+            }}
+            let _s = const s();
+            fun main() {{}}
+            main();
+            "#
+        );
+        let messages = warnings(&program);
+        assert!(
+            messages.iter().any(|message| message.contains(steer)),
+            "{call}\n{messages:#?}"
+        );
+        // The other half of the steer: `.eq(value)` is where the `Option`'s
+        // `Some` went, and the message says so rather than leaving the exact
+        // form to be guessed.
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("with .eq(value) for the exact form")),
+            "{call}\n{messages:#?}"
+        );
+    }
+}
+
+#[test]
+fn a95_the_deprecated_sugar_still_emits_exactly_what_it_always_did() {
+    // Deprecated is not removed: the window is a release long, and a program
+    // that has not migrated yet must keep producing the same stylesheet.
+    let sugar = style_rules(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute("data-open", Some("true"), style().color(Color::gray(50)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let value = style_rules(&conditioned(
+        r#"style().on(attribute("data-open").eq("true"), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(sugar, value, "{sugar:?}");
+}
+
+#[test]
+fn a95_the_value_form_does_not_warn() {
+    // The control: the spelling the steer names is the one that is clean.
+    let messages = warnings(&conditioned(
+        r#"style().on(within(attribute("data-theme").eq("dark")) + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("deprecated")),
+        "{messages:#?}"
+    );
+}
+
+// --- A93: `child_relation` is DELETED -------------------------------------------
+// The method was `children`'s and `divide`'s shared chokepoint, and it was
+// reachable from outside std only because the language had no visibility yet.
+// Its token went into the slot key unexamined, so a token that was neither `>*`
+// nor `>*+*` landed in the PSEUDO slot, skipped the `@layer vilan` wrap and the
+// `> *` suffix, and rendered a rule about the ELEMENT from a method whose whole
+// subject is that element's children — a raw-selector hatch, not a relation.
+// Order 33 fenced the token to the two shipped relations; A95 S2 deletes the
+// method, because `children()` and `divide()` are condition VALUES now and the
+// two callers pass no token at all.
+
+#[test]
+fn a93_the_child_relation_hatch_is_gone() {
+    // kolt's own token, the exhibit the fence was built on. It no longer names
+    // a method, so the hatch cannot be reached to be fenced.
+    assert_fails(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().child_relation("not([hidden])", "display", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a93_the_two_shipped_relations_are_the_controls() {
+    // Non-vacuity, beside the deletion: both relations still reach the sheet
+    // with their own rendering — `children` the bare `> *`, `divide` the
+    // `:not(:first-child)` refinement — through the condition values that
+    // replaced the token.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style()
+                .children(style().margin_top(space(2)))
+                .divide(style().margin_top(space(4)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.") && line.ends_with(" > *{margin-top:var(--space-2)}}")
+        }),
+        "{assets:?}"
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.")
+                && line.ends_with(" > :not(:first-child){margin-top:var(--space-4)}}")
+        }),
+        "{assets:?}"
+    );
+}
+
+// --- G23: the const-eval END-OF-EVALUATION HOOK -------------------------------
+// `asset::schedule_at_end(f)` records `f` by identity and the const pass runs
+// the list once, in registration order, after the LAST const evaluation of the
+// compile — the hook B308's late emission rides (const-eval.md §3, G23).
+
+#[test]
+fn three_requests_for_one_finaliser_run_it_once() {
+    // The idempotence pin, and it is read off the RAW collection on purpose:
+    // the flush deduplicates by `(key, line)`, so a finaliser that ran three
+    // times would still write one line into the sidecar and the mistake would
+    // be invisible in the file. `collected_assets` is the pass's own vector,
+    // in contribution order, where a second run IS a second entry.
+    let assets = collected_assets(
+        r#"
+        import std::asset::{ emit, schedule_at_end };
+        fun flush() {
+            emit("probe", "flushed");
+        }
+        fun contribute(): i32 {
+            schedule_at_end(flush);
+            schedule_at_end(flush);
+            schedule_at_end(flush);
+            7
+        }
+        let _contributed = const contribute();
+        fun main() {}
+        main();
+        "#,
+    );
+    let runs = assets
+        .iter()
+        .filter(|(kind, line)| kind == "probe" && line == "flushed")
+        .count();
+    assert_eq!(runs, 1, "{assets:?}");
+}
+
+#[test]
+fn a_finaliser_runs_after_every_const_expression_including_later_ones() {
+    // The run-once-AT-END pin: the finaliser is scheduled by the FIRST const
+    // site and must still land after a contribution made by a site evaluated
+    // later, which is what lets a registry be complete when it is read. Order
+    // is the observable — the raw vector is in contribution order.
+    let assets = collected_assets(
+        r#"
+        import std::asset::{ emit, schedule_at_end };
+        fun flush() {
+            emit("probe", "zzz-the-end");
+        }
+        fun first(): i32 {
+            schedule_at_end(flush);
+            emit("probe", "aaa-first");
+            1
+        }
+        fun second(): i32 {
+            emit("probe", "mmm-second");
+            2
+        }
+        let _first = const first();
+        let _second = const second();
+        fun main() {}
+        main();
+        "#,
+    );
+    let probe: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, _)| kind == "probe")
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        probe,
+        vec!["aaa-first", "mmm-second", "zzz-the-end"],
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_panicking_finaliser_fails_the_build_naming_the_function() {
+    assert_fails_with(
+        r#"
+        import std::asset::{ emit, schedule_at_end };
+        import std::io::panic;
+        fun flush() {
+            emit("probe", "never");
+            panic("the registry is inconsistent");
+        }
+        fun contribute(): i32 {
+            schedule_at_end(flush);
+            1
+        }
+        let _contributed = const contribute();
+        fun main() {}
+        main();
+        "#,
+        "the end-of-evaluation finaliser `flush` failed",
+    );
+}
+
+#[test]
+fn scheduling_a_finaliser_outside_a_const_expression_is_refused() {
+    // `schedule_at_end` joins the const-only channel for the reason every
+    // other verb does: a runtime call path reaching it compiles clean and
+    // carries a live `__schedule_at_end` with no runtime binding.
+    assert_fails_with(
+        r#"
+        import std::asset::schedule_at_end;
+        fun flush() {}
+        fun main() {
+            schedule_at_end(flush);
+        }
+        main();
+        "#,
+        "asset::schedule_at_end",
+    );
+}
+
+// --- B308: the sheet holds the rules the program KEPT ------------------------
+// `Style::rule` stages its rule against its class and the scheduled finaliser
+// emits the ones whose class the build still names, so an intermediate style a
+// condition combinator wrapped and dropped never reaches the stylesheet.
+
+#[test]
+fn a_nested_condition_emits_the_composed_rule_and_not_its_scaffolding() {
+    // B308's own exhibit. `attribute(.., hover(inner))` mints THREE classes —
+    // `inner`'s base rule, `hover(inner)`'s, and the composed one — and drops
+    // the first two as it goes, so only the third can ever be on an element.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Color, Style };
+        import std::option::Option::Some;
+        fun s(): Style {
+            style().attribute(
+                "data-open",
+                Some("true"),
+                style().hover(style().color(Color::gray(50))),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let rules: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        rules,
+        vec![".sq42fek[data-open=\"true\"]:hover{color:var(--gray-50)}"],
+        "{assets:?}"
+    );
+    // The token line the composed rule needs is unconditional and still there:
+    // it names no class, so nothing can stop naming it.
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--gray-50:#f9fafb}".to_string())),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_standalone_condition_style_still_emits_when_it_is_itself_applied() {
+    // The control that keeps the drop honest: the same `hover(..)` rule that
+    // is scaffolding above is the WHOLE style here, its class is on the
+    // element, and it ships.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Color, Style };
+        fun s(): Style {
+            style().hover(style().color(Color::gray(50)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let rules: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        rules,
+        vec![".s1civwyy:hover{color:var(--gray-50)}"],
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_slot_a_shorthand_covered_never_reaches_the_sheet() {
+    // styles-33's F4, closed by the same mechanism: `without_covered` drops
+    // the longhand's slot from the style, so its class is named by nothing and
+    // its rule is dropped with it. The shorthand's rule is what ships.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().padding_top(space(2)).padding(space(4))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let rules: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(
+        rules,
+        vec!["*.s1ufvr2{padding:var(--space-4)}"],
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn the_registry_cannot_be_read_before_evaluation_has_finished() {
+    // `asset::staged` answers "which of these tokens does the build still
+    // name?", and until the last `const` expression has run the answer is not
+    // yet a fact. Refused, naming the hook that IS the right place to ask.
+    assert_fails_with(
+        r#"
+        import std::asset::{ stage, staged };
+        fun contribute(): usize {
+            stage("probe", "token", "line");
+            staged("probe").len()
+        }
+        let _contributed = const contribute();
+        fun main() {}
+        main();
+        "#,
+        "reads the registry AFTER evaluation has finished",
+    );
+}
+
+#[test]
+fn a_staged_contribution_survives_when_the_build_still_names_its_token() {
+    // The registry's own rule, away from styling: the token decides. One
+    // contribution's token is the value the program keeps, the other's is a
+    // string nothing names.
+    let assets = collected_assets(
+        r#"
+        import std::asset::{ emit, schedule_at_end, stage, staged };
+        fun flush() {
+            for line in staged("probe") {
+                emit("probe", line);
+            }
+        }
+        fun contribute(): str {
+            schedule_at_end(flush);
+            stage("probe", "kept", "the kept line");
+            stage("probe", "dropped", "the dropped line");
+            "kept"
+        }
+        let _kept = const contribute();
+        fun main() {}
+        main();
+        "#,
+    );
+    let probe: Vec<&str> = assets
+        .iter()
+        .filter(|(kind, _)| kind == "probe")
+        .map(|(_, line)| line.as_str())
+        .collect();
+    assert_eq!(probe, vec!["the kept line"], "{assets:?}");
+}
+
+// --- A95 S1: conditions as values, behind the existing surface ---------------
+// A condition is a VALUE and a set of them is the same value; `Style::on` is
+// the one combinator and every named one is sugar over it. The slice's whole
+// acceptance is that nothing a program can see moves — so these pins are about
+// the MODEL: the canonical order, the merge, the refusals, and the two shapes
+// a nest could never spell.
+
+/// The rules a program's styles put on the sheet, `:root` token lines aside.
+fn style_rules(source: &str) -> Vec<String> {
+    collected_assets(source)
+        .into_iter()
+        .filter(|(kind, line)| kind == "css" && !line.starts_with(":root"))
+        .map(|(_, line)| line)
+        .collect()
+}
+
+const CONDITION_PROGRAM: &str = r#"
+    import std::style::{ style, Color, Style, hover, active, attribute, md, within, element, pseudo, children, divide, sm };
+    fun s(): Style {
+        {SET}
+    }
+    let _s = const s();
+    fun main() {}
+    main();
+"#;
+
+fn conditioned(set: &str) -> String {
+    CONDITION_PROGRAM.replace("{SET}", set)
+}
+
+#[test]
+fn a_condition_set_canonicalises_whatever_order_it_was_written_in() {
+    // The content hash is over the slot key, and the key carries the condition
+    // string — so two authors who mean one rule must get one class or the hash
+    // stops being a function of the meaning (§2.1). Written in three orders,
+    // one rule.
+    let written = style_rules(&conditioned(
+        r#"style().on(md() + attribute("data-open") + hover(), style().color(Color::gray(50)))"#,
+    ));
+    let reversed = style_rules(&conditioned(
+        r#"style().on(hover() + attribute("data-open") + md(), style().color(Color::gray(50)))"#,
+    ));
+    let mixed = style_rules(&conditioned(
+        r#"style().on(attribute("data-open") + md() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(written, reversed, "{written:?}");
+    assert_eq!(written, mixed, "{written:?}");
+    assert_eq!(
+        written,
+        vec![
+            "@media (min-width: 768px){.s1uwvpl4[data-open]:hover{color:var(--gray-50)}}"
+                .to_string()
+        ],
+        "{written:?}"
+    );
+}
+
+#[test]
+fn equal_conditions_in_one_set_merge() {
+    // Set semantics: `hover() + hover()` is `hover()`, and the class says so —
+    // it is the class the plain `hover()` rule mints.
+    let doubled = style_rules(&conditioned(
+        r#"style().on(hover() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    let once = style_rules(&conditioned(
+        r#"style().on(hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(doubled, once, "{doubled:?}");
+}
+
+#[test]
+fn nested_on_calls_intersect_their_condition_sets() {
+    // What makes nesting mean anything: `a.on(X, b.on(Y, s))` gives `s` the
+    // set `X ∪ Y`, so the nested spelling and the summed one are one rule.
+    let nested = style_rules(&conditioned(
+        r#"style().on(md(), style().on(hover(), style().color(Color::gray(50))))"#,
+    ));
+    let summed = style_rules(&conditioned(
+        r#"style().on(md() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(nested, summed, "{nested:?}");
+}
+
+#[test]
+fn two_pseudo_classes_on_one_rule_render_as_one_compound() {
+    // B311's whole class, spelled: two pseudo-classes are two VALUES, never a
+    // string carrying the slot key's own `:`. The negation sits on the value it
+    // negates, which is A95's argument in one line.
+    //
+    // The compound comes out `:not(:active):hover` and not the written order,
+    // which is §2.1 working: tokens sort lexically by their BARE token, so
+    // `active` precedes `hover` whichever way round they were written and two
+    // authors meaning one rule get one class. Compound-selector order is
+    // semantically free in CSS — same match set, same (0,3,0) specificity —
+    // so the canonical order costs nothing and buys the hash its determinism.
+    let rules = style_rules(&conditioned(
+        r#"style().on(hover() + active().not(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        rules,
+        vec![".sddio2v:not(:active):hover{color:var(--gray-50)}".to_string()],
+        "{rules:?}"
+    );
+    // …and the reverse spelling is the same rule, which is the claim.
+    let reversed = style_rules(&conditioned(
+        r#"style().on(active().not() + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(reversed, rules, "{reversed:?}");
+}
+
+#[test]
+fn a_guard_and_a_child_relation_compose_in_one_set() {
+    // The relation axis could never spell `[data-theme="dark"] .sX > *` — a
+    // guard is a PREFIX and a child relation a SUFFIX, and a nest holds one
+    // relation. A rule carrying a child relation reaches IN, so it is layered
+    // whatever else conditions it (§2.5).
+    let rules = style_rules(&conditioned(
+        r#"style().on(within(attribute("data-theme").eq("dark")) + children(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        rules,
+        vec!["@layer vilan{[data-theme=\"dark\"] .stn8rgh > *{color:var(--gray-50)}}".to_string()],
+        "{rules:?}"
+    );
+}
+
+#[test]
+fn a_pseudo_element_renders_last_in_the_compound() {
+    // kolt smuggled `::selection` through `pseudo(":selection", ..)`'s
+    // free-form name. It is its own kind here, and the token carries `%`
+    // rather than the `::` it renders as, because a `:` inside a condition
+    // mis-aligns every split of the slot key (B311).
+    let rules = style_rules(&conditioned(
+        r#"style().on(element("selection"), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        rules,
+        vec![".svl47w1::selection{color:var(--gray-50)}".to_string()],
+        "{rules:?}"
+    );
+}
+
+#[test]
+fn a_condition_and_its_negation_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(r#"style().on(hover() + hover().not(), style().color(Color::gray(50)))"#),
+        "cannot hold hover and its negation",
+    );
+}
+
+#[test]
+fn two_breakpoints_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(r#"style().on(sm() + md(), style().color(Color::gray(50)))"#),
+        "holds ONE breakpoint",
+    );
+}
+
+#[test]
+fn two_ancestor_guards_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(
+            r#"style().on(
+                within(attribute("data-theme").eq("dark")) + within(attribute("data-dense")),
+                style().color(Color::gray(50)),
+            )"#,
+        ),
+        "holds ONE ancestor guard",
+    );
+}
+
+#[test]
+fn two_child_relations_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(r#"style().on(children() + divide(), style().color(Color::gray(50)))"#),
+        "holds ONE child relation",
+    );
+}
+
+#[test]
+fn two_pseudo_elements_in_one_set_are_refused() {
+    assert_fails_with(
+        &conditioned(
+            r#"style().on(element("selection") + element("before"), style().color(Color::gray(50)))"#,
+        ),
+        "holds ONE pseudo-element",
+    );
+}
+
+#[test]
+fn a_pseudo_element_cannot_be_negated() {
+    assert_fails_with(
+        &conditioned(r#"style().on(element("selection").not(), style().color(Color::gray(50)))"#),
+        "a pseudo-element cannot be negated",
+    );
+}
+
+#[test]
+fn a_breakpoint_cannot_be_negated_as_a_value_either() {
+    assert_fails_with(
+        &conditioned(r#"style().on(md().not(), style().color(Color::gray(50)))"#),
+        "a breakpoint cannot be negated in this version",
+    );
+}
+
+#[test]
+fn not_and_eq_refuse_a_set_rather_than_guessing_which_condition_they_mean() {
+    assert_fails_with(
+        &conditioned(r#"style().on((hover() + active()).not(), style().color(Color::gray(50)))"#),
+        "negates ONE condition and this set holds 2",
+    );
+    assert_fails_with(
+        &conditioned(r#"style().on(hover().eq("true"), style().color(Color::gray(50)))"#),
+        "gives an ATTRIBUTE condition its exact value",
+    );
+}
+
+#[test]
+fn an_ancestor_guard_takes_any_condition_that_selects_an_element() {
+    // S1 refused every non-attribute guard: the guard travelled inside the slot
+    // key as its RENDERED selector, so `^:hover` carried the key's own
+    // separator. A95 S2 stores the inner TOKEN instead (`^hover`) and renders
+    // it at `render_rule` through the same per-axis rendering every other token
+    // gets, so the ruling's own example lands.
+    let hovered = style_rules(&conditioned(
+        r#"style().on(within(hover()), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        hovered,
+        vec![":hover .s1a8ssfc{color:var(--gray-50)}".to_string()],
+        "{hovered:?}"
+    );
+    // The presence form of the ruling's other example, and the negated guard
+    // beside it — the negation still wraps the ancestor's whole selector.
+    let present = style_rules(&conditioned(
+        r#"style().on(within(attribute("open")), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        present,
+        vec!["[open] .s14u69pq{color:var(--gray-50)}".to_string()],
+        "{present:?}"
+    );
+    let negated = style_rules(&conditioned(
+        r#"style().on(within(hover()).not(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        negated,
+        vec![":not(:hover) .sef5r0p{color:var(--gray-50)}".to_string()],
+        "{negated:?}"
+    );
+}
+
+#[test]
+fn a_negated_condition_inside_a_guard_renders_as_a_negated_ancestor() {
+    // A95 S1 shipped this as a latent MISCOMPILE, and the token form closes it
+    // with the same change that widens the guard. S1 stored the guard as its
+    // ancestor's RENDERED selector prefixed with `^`, and read the negation off
+    // the token's OWN first byte — so `within(attribute("x").not())` became
+    // `^![x]`, whose first byte is `^`, and `render_rule` emitted the `!` into
+    // the selector verbatim: `![x] .sX{opacity:0.5}`, which is not a selector
+    // CSS admits and which nothing said a word about. (Measured at 9b22ec36.)
+    // Nothing in std, the corpus, the examples or kolt wrote one.
+    //
+    // The guard carries its inner TOKEN now and renders it through the same
+    // per-axis rendering every other token gets, negation included.
+    let attribute_guard = style_rules(&conditioned(
+        r#"style().on(within(attribute("x").not()), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        attribute_guard,
+        vec![":not([x]) .sm0ah11{color:var(--gray-50)}".to_string()],
+        "{attribute_guard:?}"
+    );
+    let pseudo_guard = style_rules(&conditioned(
+        r#"style().on(within(hover().not()), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        pseudo_guard,
+        vec![":not(:hover) .syqgpex{color:var(--gray-50)}".to_string()],
+        "{pseudo_guard:?}"
+    );
+}
+
+#[test]
+fn an_ancestor_guard_refuses_a_condition_that_selects_no_element() {
+    // A guard holds a condition an ANCESTOR can match. The other four axes are
+    // not element selectors at all, and each refusal names where its condition
+    // belongs instead — beside the guard in the set, or nowhere.
+    for (written, needle) in [
+        (
+            r#"style().on(within(md()), style().color(Color::gray(50)))"#,
+            "was given a breakpoint",
+        ),
+        (
+            r#"style().on(within(within(attribute("open"))), style().color(Color::gray(50)))"#,
+            "was given another guard",
+        ),
+        (
+            r#"style().on(within(children()), style().color(Color::gray(50)))"#,
+            "was given a child relation",
+        ),
+        (
+            r#"style().on(within(element("selection")), style().color(Color::gray(50)))"#,
+            "was given a pseudo-element",
+        ),
+    ] {
+        assert_fails_with(&conditioned(written), needle);
+    }
+}
+
+#[test]
+fn a_pseudo_class_name_cannot_claim_the_pseudo_element_marker() {
+    assert_fails_with(
+        &conditioned(r#"style().on(pseudo("%selection"), style().color(Color::gray(50)))"#),
+        "a pseudo-class name cannot start with '%'",
     );
 }

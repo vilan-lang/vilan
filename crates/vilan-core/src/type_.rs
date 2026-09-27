@@ -11,7 +11,17 @@ use crate::id::Id;
 /// carried its own copy of the names and never grew the `bool` case), which
 /// miscompiled a generic `&mut T` resolving to `bool`.
 pub const SCALAR_PRIMITIVE_NAMES: &[&str] = &[
-    "str", "i32", "u32", "f64", "BigInt", "null", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
+    "str", "i32", "u32", "f64", "BigInt", "null", "i8", "u8", "i16", "u16", "i53", "u53", "usize",
+    "f32",
+];
+
+/// The numeric PRIMITIVE type names — the scalar primitives minus the three
+/// that are not numbers. The emission verdicts an arithmetic expression carries
+/// (truncating division, unsigned bitwise) are a property of one of these and
+/// of nothing else, so B370's context record is filtered by this list; beside
+/// `SCALAR_PRIMITIVE_NAMES` so the two cannot drift apart unnoticed.
+pub const NUMERIC_PRIMITIVE_NAMES: &[&str] = &[
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64", "BigInt",
 ];
 
 /// The numeric-literal type suffixes the analyzer accepts (`42u32`, `1.5f`,
@@ -22,10 +32,15 @@ pub const SCALAR_PRIMITIVE_NAMES: &[&str] = &[
 /// found the theme current and the TextMate grammar a release behind on the
 /// sibling primitive-type list, which is the drift that gate closes.
 pub const NUMERIC_SUFFIXES: &[&str] = &[
-    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f", "f32", "f64", "n",
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f", "f32", "f64", "n",
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Hash` because the resolved type is a memo KEY: impl selection over a
+// `TypeId` is a pure function of the `Type` that id resolves to (the id's
+// identity never enters the walk — see `dispatch_refine::refined_edges`), and
+// a program mints one id per expression, so keying a selection memo on the id
+// would memoize nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Any,
     // The type of expressions that never produce a value: `panic(..)`,
@@ -33,7 +48,27 @@ pub enum Type {
     // other side (a diverging match leg doesn't constrain the match's
     // type), unlike `Any`, which absorbs. Internal — not written in source.
     Never,
-    Closure(Vec<TypeId>, TypeId),
+    // A closure type: the parameter types, the return type, and the `context`
+    // clause it carries (B309) — the context bindings an INJECTED closure is
+    // threaded with, in written order, empty for an ordinary closure.
+    //
+    // The clause is part of the TYPE, not a side-band keyed by the parameter
+    // that happened to declare it (`ambient-owner.md` §5 v1 recorded it by
+    // parameter id, which is why it flowed through no field, generic argument
+    // or return). Carrying it here is what lets `body: (|| View) context
+    // owner_scope` be a struct FIELD, a generic ARGUMENT and a RETURN type, and
+    // what lets the coverage check follow the value wherever it flows.
+    //
+    // UNIFICATION IGNORES IT. Compatibility is the parameters and the return:
+    // a closure LITERAL is born clause-less and takes the clause of the
+    // position it lands in (that is the whole point — the literal defers its
+    // context binding to its call sites instead of capturing at creation), so
+    // demanding equal clauses here would refuse every legal program. The
+    // discipline that keeps a clause-carrying value honest is
+    // `context::thread_contexts`' value-flow rule — a call, a forward to a
+    // same-clause position, or `run` — and it is closed by default: a use the
+    // rule does not name is refused, not threaded.
+    Closure(Vec<TypeId>, TypeId, Vec<Id>),
     // A nominal enum/struct and its type arguments (`Option<i32>` ->
     // `Enum(option_id, [i32])`, `List<str>` -> `Struct(list_id, [str])`). The
     // arguments are empty for a non-generic type, or where they are not (yet)
@@ -41,6 +76,20 @@ pub enum Type {
     // parameters with them.
     Enum(Id, Vec<TypeId>),
     Function(Id),
+    // A mention of a generic parameter, by the CONSTRAINT's type id — the id
+    // whose own `Type` is the parameter's bound (`Trait(Greet, [])` for
+    // `<type T: Greet>`, `Any` for an unbounded one).
+    //
+    // **`Generic(constraint)` is the ONE spelling of a parameter in a nominal
+    // declaration's body** (B366): a struct field, an enum variant's payload,
+    // a nested nominal's or tuple's argument, and an impl SUBJECT's argument
+    // all carry it, for user, std, `external`, bounded, multi-parameter,
+    // recursive and `[derive]`-generated declarations alike. The bare
+    // constraint id is never a body type. That is what lets one walk bind a
+    // declaration's parameters —
+    // [`crate::impl_select::bind_subject`](crate::impl_select::bind_subject)
+    // is that walk, and it matches this node and nothing else — and the
+    // emitters may rely on it. `tests/nominal_generic_spelling.rs` is the gate.
     Generic(TypeId),
     Module(Id),
     Struct(Id, Vec<TypeId>),
@@ -49,6 +98,14 @@ pub enum Type {
     // `Trait(readable_id, [U])`). The arguments drive parameterized-trait impl
     // selection and a mapped trait template's inversion.
     Trait(Id, Vec<TypeId>),
+    // B4/A124 R3: a TRAIT OBJECT — the erased pair `(value, vtable)` over a
+    // trait whose members are all dispatchable. `dyn Source<i32>` ->
+    // `Dyn(source_id, [i32])`, carrying exactly the arguments `Trait` carries.
+    //
+    // It is a VALUE type and `Trait` is not: that is the whole distinction
+    // §0 of trait-objects.md says the one representation was missing. Every
+    // reader that asks "is this a value" answers yes here and no there.
+    Dyn(Id, Vec<TypeId>),
     Tuple(Vec<TypeId>),
     // A fixed-length array `[T; n]` — the element type and a compile-time-known
     // length (`[i32; 4]` -> `Array(i32, 4)`). Unlike `List<T>` (a growable

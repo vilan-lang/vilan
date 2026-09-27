@@ -24,18 +24,35 @@ quoted here.
 The name isn't visible here. Usually a missing `import` — though the
 basics (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) are in the
 prelude and need none. If you did import it, check for a typo or a
-shadowing local.
-→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md)
+shadowing local. One case that reads as a compiler mistake and isn't: an
+`is` capture is in scope only where its test is known to have **passed** —
+the then-branch and the rest of the condition after an `&&` — so naming
+it in the `else`, after the `if`, or in the other arm of a `||` is this
+error. Move the read inside the branch, or use `match`. A NEGATED test
+swaps which branch that is: `if !(x is Some(let n))` runs its then-branch
+when the pattern *didn't* match, so `n` is this error there and is in
+scope in the `else` — read it there, or drop the `!` and swap the two
+branches. A negated test whose branch **leaves** (`{ ret; }`, no `else`)
+is the guard clause, and there the capture *is* in scope after the `if`;
+this error after one usually means the branch can fall through. An `is`
+written OUTSIDE a condition — `let ok = x is Some(let n);` — reads
+differently and gets a message of its own ("is bound only inside the `is`
+test that captured it"): a plain `bool` does not carry the payload, so
+the capture reaches the rest of that expression and nothing after it.
+→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md), [spec §5.7](../spec/types.md)
 
 **"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
-The name (`Signal`, `view`, `View`) is one std's **web**
+The name (`Signal`, `SignalCell`, `view`, `View`) is one std's **web**
 prelude makes ambient, and this package is on the base one. Either set
 `prelude = "std::web"` in `vilan.toml`, or import the name explicitly —
-both work — the steer fires only for names the web set carries as bare
-members, never for its module-carried names (`style`, `ui`), where
-switching preludes would leave a value-position miss unfixed — and it
-only means the manifest line is usually what
-you wanted.
+both work; the steer only means the manifest line is usually what you
+wanted. It fires only for names the web set carries as bare members,
+never for its module-carried names (`style`, `ui`): switching preludes
+would leave a `style::Display` miss exactly where it was. In the **web
+playground** the same miss reads "switch the playground's prelude to the
+web set, or import it (`import std::reactive::Signal;`)" — a pasted
+buffer is not a package and has no `vilan.toml` to edit, so the repair
+there is the page's prelude toggle.
 → [Projects](../tour/projects.md), [spec §4.7](../spec/names.md)
 
 **"`std` is a namespace, not a value; import the module first …"**
@@ -92,19 +109,77 @@ byte (§4.2), so this would fail to build on a case-sensitive
 filesystem. Rename the file or the import so the two agree.
 → [Names, modules, and packages](../spec/names.md)
 
+**"`main` takes no parameters: the shell owns what is passed to a program …"**
+A parameter list declares what values a function accepts, and the entry
+accepts none — nothing in the language can call `main`, so a parameter
+there is a guess about what the shell will send rather than a promise
+about it. Delete the list and read the arguments in two lines: `import
+std::process;` at the top of the file, then `process::args()` in the
+body, a `List<str>` of everything after the script path, whose type is
+always right. Both lines are needed — `std::process::args()` written
+inline is a namespace path, not an expression (`std` is a namespace, not
+a value), and a bare `process::args()` with no import above it has no
+`process` to qualify through. (This shape used to compile: the entry's
+body becomes the program's top-level statements, so the parameter was a
+free name and the program died at its first use.)
+→ [Process modules](../std/process.md)
+
+**"`pkg::a::hidden` is not exported by `pkg::a` …"** — a WARNING
+A plain import of an item the declaring module keeps to itself. It still
+compiles — visibility never blocks access — and the message names the
+spelling that says you meant it: `import pkg::a::{ #hidden };`, the
+**reach** marker. Two ways out, and neither is "work around it": mark the
+reach, or export the item if it is yours to export. The same warning
+fires at a *qualified* reach — `a::hidden()` after `import pkg::a;` —
+where there is no leaf to mark, and there the fix is to import the item
+with the marker and call it bare. Reaching a **dependency's** unexported
+item says nothing at all: whether an item should be exported is its
+author's judgement, and your need is evidence against it. The mirror
+image is a warning too — a `#` on an item that IS exported says something
+untrue, and deleting the character is the whole fix.
+→ [spec §4.8](../spec/names.md)
+
+**"`my_fun` is exported, but `S` is not …"** — a WARNING
+An exported item whose signature names a type the module keeps private: a
+consumer can call `my_fun` and cannot name what it hands back. The
+sentence ahead of that one names the position — "`S` is returned here",
+"`S` is a field's type here", "`S` is a parameter type here", "`S` is a
+declared bound here" — and the one after it says what the consumer loses.
+It is
+reported once at the declaration, whatever the number of positions, and
+only for signature positions — a `let`'s type, a parameter, a return
+type, an exported struct's field types, an enum variant's payloads, a
+declared bound, a generic argument in any of those. A private type used
+inside an exported function's **body** is exactly the encapsulation the
+marker exists to permit and is never reported. The fix is to export the
+type; when `S` belongs to a dependency there is no fix and the message
+says so — the shape has to change, or the dependency has to export it.
+→ [spec §4.8](../spec/names.md)
+
 ## Types and generics
 
 **"Expected …, but got … instead."**
 The general type mismatch. One special case surprises people: an `i53`
 mixed with a bare integer literal: the literal is `i32`, and there are
-no implicit conversions. Suffix it (`stamp + 1000i53`).
+no implicit conversions. Suffix it (`stamp + 1000i53`). When both sides
+are numeric widths the message goes on to name the conversion —
+``There are no implicit numeric conversions; convert with `.as_u53()` `` —
+and the editor offers it as a quick fix. When one side is `usize` the
+message says what that is, ``Expected usize (an index: a position, a
+length or a count), but got i32 instead``, so a program migrating its
+indexes to `usize` learns which of its values are indexes — and
+`vilan check --fix` converts every one of them in a package.
 → [Values and types](../tour/values-and-types.md)
 
 **"generic parameter '…' is missing the bound ': …' required by this call"**
 You called something that needs a capability (say `PartialEq`) with a
 generic parameter that doesn't declare it. Add the bound to *your*
-signature: `fun caller<U: PartialEq>(…)`.
-→ [Data and traits](../tour/data-and-traits.md)
+signature: `fun caller<U: PartialEq>(…)`. A **blanket impl** covering the
+trait does not spare you this: a generic parameter's bounds are answered
+from what it *declares*, never from an impl, so the same call that
+compiles for a concrete `i32` is refused for a `T` — declare it and it
+holds.
+→ [Data and traits](../tour/data-and-traits.md), [spec §5.4](../spec/types.md)
 
 **"cannot call method '…' on …"**
 The value's type doesn't have that method. If the type is a generic
@@ -118,18 +193,48 @@ An `impl … with Trait` doesn't provide every required method, or a bound
 demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
-**"'…' is a trait, not a type: a trait is not a value type (vilan has no trait objects)"**
-A trait's name was written where a type belongs — a parameter, a return
-type, a struct field, or a generic argument like `List<Display>`. Traits
-are **bounds**, not types, so no value can ever have that type: the impl
-is fine, the signature is not. Write the generic the message spells out —
-`fun show<T: A>(v: T)` — or, inside the trait's own declaration, write
-`Self`, which is what a trait naming itself in a return position always
-meant. The note points at the trait, which may live in another module.
-For "one of several things at runtime", use an enum. A `let` binding's
-own annotation is not this error: there a trait is a *constraint* on the
-inferred type, see the next entry.
+**"'…' is a trait, not a type: a trait names a bound, and a value needs a type"**
+A trait's name was written where a type belongs — a return type, a struct
+field, or a generic argument like `List<Display>`. Traits are **bounds**,
+not types, so no value can have that type: the impl is fine, the
+signature is not. Three spellings do what was meant, and the message names
+each. `dyn A` is the **trait object** — a value whose concrete type is
+erased, carrying the trait's members in a table — and it is what a field,
+an element type or any other value position takes when what it holds is
+decided at runtime. A **parameter** needs nothing: `fun f(x: A)` already
+IS `fun f<T: A>(x: T)`. A **return** takes the generic the message spells
+out, `<T: A>` with `T` written in the return position; inside the trait's
+own declaration it takes `Self`, which is what a trait naming itself in a
+return position always meant. A `let` binding's own annotation is not this
+error at all — there a trait is a *constraint* on the inferred type; see
+the next entry. The note points at the trait, which may live in another
+module. For a CLOSED set of alternatives, an enum is still better than an
+object: it is exhaustive, checked, and costs nothing at runtime.
 → [Data and traits](../tour/data-and-traits.md)
+
+**"`…` cannot be a `dyn` object: … An object dispatches through a table of its trait's members, so every member it requires must take a receiver, name no `Self` in its signature, and be non-generic"**
+The first sentence names the member and why: **"`…` is a static — it takes
+no `self`"**, **"… is generic — one vtable slot cannot hold an unbounded
+family of specializations"**, or **"… returns `Self` — the caller would have
+to know the type the object erased"**. An object dispatches through a table of its
+trait's members, so each member the trait *requires* has to fit a slot: it
+takes a receiver, it names no `Self`, and it is not generic. The message
+names the **member** that disqualified the trait and the note points at
+its declaration, because naming the trait would send you to read every
+signature it has. A trait's *default* members never disqualify it — they
+are the trait's own code over the requirements. Where the trait cannot be
+an object, the generic is the answer: `<T: Trait>` keeps the type, needs
+no table, and is what the language does everywhere else.
+→ [Data and traits](../tour/data-and-traits.md)
+
+**"'…' is a resource, so it cannot become a `dyn …`"**
+A `resource` has exactly one owner and a destructor that runs at a known
+point. Erasing it into a trait object would make that destructor dynamic —
+dispatched through the table like everything else — where the rest of the
+language keeps teardown static. Hold the resource in a struct field of
+your own and put *that* behind the object, or take it through a generic
+bound, where its type is still known.
+→ [Memory model](../tour/memory-model.md)
 
 **"'…' does not implement trait '…', required by the annotation on '…'"**
 A `let` binding's annotation named a trait, which reads as a constraint
@@ -206,7 +311,9 @@ every trait-provided one.
 **"'…' is not an inherent member of '…': … provide… it; call … instead"**
 `Type::method(receiver)` means the type's *own* method. This one comes
 from a trait, so name the trait at the path head instead:
-`Trait::method(receiver)`.
+`Trait::method(receiver)`. It reads the same whether the impl block
+declares the method or takes the trait's default body — a default body
+is provision, and `Trait::method` is what reaches it either way.
 → [Names, modules, and packages](../spec/names.md)
 
 **"'…' does not implement '…', so '…::…' cannot be called on it"**
@@ -264,6 +371,23 @@ turns it into a "Change to `entries`" quickfix that rewrites the name.
 Close enough is a real threshold: `"entires"` suggests `"entries"`, and
 `"x"` suggests nothing at all.
 → [Control flow](../tour/control-flow.md)
+
+**"`…` here is std's … twin — this file is analyzed under …"** *(a note)*
+This rides under a field or method miss on a **std** type, and it is
+usually the whole story. A build's platform selects `std`'s layer
+overlay, so it decides what a name like `View` *is*: `{ element }` in
+the browser layer, `{ tag, attributes, children, text }` in the process
+one. If your file is being analyzed under the platform you did not have
+in mind, correct code reports a field that does not exist. The note
+names which twin you got and **why that platform** — one of four: the
+entry that reaches this file, the `default-entry` that answers when no
+entry reaches it, an explicit `--platform`, or a single-entry package's
+own `target`. Fix the situation the reason names rather than the line:
+if a module should be browser code, have the browser entry reach it
+(import it from that entry, directly or transitively); if it is shared
+between legs, it must type-check under *every* leg that loads it, and
+the note tells you which one is complaining.
+→ [Platforms](../tour/platforms.md), [Building UI](../guide/ui.md)
 
 **"`…` expects N arguments, but got M instead: `…` is missing."** ·
 **"`…` expects N fields, but got M instead: `…` is not a field of `…`."**
@@ -325,8 +449,13 @@ printed `1,2` for a `Point { x = 1, y = 2 }`. Render it first —
 `point.to_string()`, adding an `impl Point with Display` if the type has
 none. **An interpolated string is this same concatenation** (`i"a{x}b"`
 *is* `("" + "a" + x + "b")`), so a hole gets the identical error and the
-identical fix; the same goes for a `css` block value that mixes text
-with holes. A backed enum is included in the refusal on purpose: its
+identical fix. A `css` block's hole is the one that is NOT this
+concatenation any more (A34): a mixed value passes each hole through
+`std::style::piece`, so `border: 1px solid {Color::gray(500)};` keeps
+the value typed and puts its `:root` line on the sheet — which is why
+the message steers a style token into a block rather than into
+`.to_string()`, whose text would name a custom property nothing
+declares. A backed enum is included in the refusal on purpose: its
 backing is a lowering detail, not a rendering the program chose.
 A **generic parameter** gets the same error worded for its bounds — an
 unbounded one promises nothing, and one bounded to something other than
@@ -357,6 +486,25 @@ so `T: Add` promises `T + T` and says nothing about `i32`. Convert where
 the type is known and declare the operand `i32`.
 → [Values and types](../tour/values-and-types.md)
 
+**"`…`'s `add` accepts `…`, but the right operand is `…`"**
+The same membership rule where the left operand **dispatches**: your impl
+says what its operator accepts, and this operand is not it. Three shapes
+reach the message. A `Self` operator (`impl Counter with Add`) accepts
+the subject and nothing else — a foreign struct there used to be read
+through the declared type's fields, so `Counter { n = 1 } + Point { x =
+1, y = 2 }` computed off the `Point`'s first slot. A **declared** `B`
+(`impl Meters with Add<Feet>`) accepts *that* type, which means it does
+not accept `Meters`. And an impl over its own parameter
+(`impl Bag<type T> with Add<T>`) accepts whatever the left operand bound
+`T` to. The routes out: convert the operand, give the left type a second
+impl whose `B` is this operand's type, or — for a **generic** operand,
+where no bound can prove membership — write the left operand's type over
+that same parameter, so its `B` *is* the parameter. Every dispatched
+operator reads this way, `eq` for `==`/`!=` and `lt`/`le`/`gt`/`ge` for
+the orderings included.
+→ [Data and traits](../tour/data-and-traits.md),
+[Values and types](../tour/values-and-types.md)
+
 **"`+` adds numbers and concatenates `str`, and `…` is neither: it has no
 `Add` …"**
 `bool` and backed enums are native for `==` and `<` without being
@@ -373,8 +521,12 @@ through it, and `lt`/`le`/`gt`/`ge` come free as defaults).
 → [Data and traits](../tour/data-and-traits.md)
 
 **"the literal `…` is out of range for `…` (…)"**
-The number doesn't fit the type. For `i53`/`u53` the range is ±2^53,
-JavaScript's exact-integer window. Bigger integers take `BigInt` (`7n`).
+The number doesn't fit the type. For `i53`/`u53`/`usize` the range is
+±2^53 (non-negative for the unsigned two), JavaScript's exact-integer
+window. Bigger integers take `BigInt` (`7n`). A negative literal at an
+unsigned type (`let n: usize = -1`) is refused with its own message, which
+names the type's range: an unsigned value is never below zero, and a
+"nothing here" sentinel is `None` in an `Option<usize>`.
 → [Values and types](../tour/values-and-types.md)
 
 **"unknown numeric suffix `…`"**
@@ -518,7 +670,7 @@ an `Option<…>` and `take()` it out.
 
 **"`…` is moved on one path through this branch but not another: …"**
 An `if`/`match` moves the binding on some paths and not others, so its
-end-of-scope ownership isn't static (there are no runtime drop flags). Move it
+ownership at the drop point isn't static (there are no runtime drop flags). Move it
 on *every* path, on none, or hold it in an `Option` and `take()` on the
 path that consumes it. A diverging leg (one that `ret`s or `jump`s out) is
 exempt: it never reaches the merge.
@@ -605,10 +757,10 @@ The other derives are unaffected: `PartialEq` and `Debug` read a resource's
 fields through the loan and stay available.
 → [Resources](../tour/resources.md), [Services](../guide/services.md)
 
-**"`…` implements `Drop` but is not a resource: … declare it a `resource` …"**
-`Drop` (the destruction hook) may be implemented only for a `resource`
+**"`…` implements `Drop` but is not a resource: … mark it `[resource]` …"**
+`Drop` (the destruction hook) may be implemented only for a resource
 type. A destructor without move discipline is the double-close bug:
-copy the value and each copy would run `drop`. Declare the type `resource`
+copy the value and each copy would run `drop`. Mark the type `[resource]`
 so it moves instead of being copied. (Plain-data, framework-driven teardown
 uses the cooperative `Disposable` protocol, not `Drop`.)
 → [Resources](../tour/resources.md)
@@ -750,7 +902,8 @@ severed. Wrap it in a closure literal at the use site instead.
 **"an injected (`context`-typed) closure can only be called, forwarded …, or passed to `run`"**
 Injected closures (the ones with `context` clauses in their type) are
 deliberately restricted so the ambient value can always be threaded to
-them. Don't store them; call or forward them.
+them. Call one, forward it to a position carrying the same clause — a
+parameter, a struct field, a return — or pass it as `run`'s body.
 → [Functions & closures](../tour/functions-and-closures.md)
 
 **"unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard."**
@@ -773,7 +926,8 @@ migration notes.
 **"field `…` of `[derive(Wire)]` type `…` is `…`, which is not Wire: …"**
 Something unserializable (a closure, a `Signal`) is inside a payload
 type. Wire types carry data only: scalars, `str`, `bool`,
-`List`/`Option` of Wire, and other Wire types.
+`List`/`Option`/`Result`/`Map` of Wire, other Wire types, and anything
+you write an `impl … with Wire` for.
 → [Services & RPC](../guide/services.md)
 
 **`RpcError::Contract` at connect time**
@@ -896,25 +1050,41 @@ condition's operand, which reports **"`Point` is a type, not a value"**.
 Parenthesize the literal: `if p == (Point { x = 1 }) { … }`.
 → [spec §3.8](../spec/grammar.md)
 
-**"`#` is not a vilan token …"** · **"`@` is not a vilan token …"**
-Both turn up almost only inside a `css` block. A colour is written as a
-hole that routes through the `Color` type — `color: {Color::hex("#333")};`
-— which is what lets the type carry its own `:root` line. And a `css`
-block has no at-rules of any kind: a media query is spelled as a
-breakpoint combinator (`.md { … }`), and a declaration block under a
-selector of your own is `std::style::declare`.
+**"a `css` declaration is a CALL …"** · **"`@` is not a vilan token …"**
+Both turn up only inside a `css` block. A declaration is a CALL —
+`color(Color::hex("#333"));`, `width(pct(100));` — so the property is the
+name and the value is ordinary vilan expressions; the CSS-shaped
+`property: value;` is what the block used to take, and the `:` is where
+it reports. There are no `{ }` holes any more, because there is no token
+span for one to interrupt: a typed value is simply an argument, and a
+colour routes through the `Color` type as it always did, which is what
+lets the type carry its own `:root` line. Several arguments join with one
+space, the way CSS's own value lists do — `margin(px(4), px(8))`,
+`border("1px solid", gray(300))`. And a `css` block has no at-rules of
+any kind: a media query is spelled as a breakpoint combinator
+(`.md { … }`), and a declaration block under a selector of your own is
+`std::style::declare`. `@` lexes as nothing at all, anywhere, which is
+why that one is the lexer's refusal and not the block's.
 → [Styling](../guide/styling.md)
 
 **"`pub` is not a vilan keyword …"**
 `pub` (and `public`) is an ordinary identifier here, so `pub fun helper()`
 reads as the expression statement `pub` followed by an item — which used
 to report a missing `;` three columns in, a true statement about a
-program nobody wrote. Vilan has no visibility marker to reach for: a
-module's items are importable as written, so the fix is to delete the
-word. `export` is a different thing — it *re-exports* something this
-module imported (`export import pkg::io::panic;`), so importers of this
-module see the name as if it were declared here.
-→ [spec §4.3](../spec/names.md)
+program nobody wrote. The marker vilan does have is **`export`**: write
+`export fun helper()`. An item a module does not export is the module's
+own — completion does not offer it, the add-import fix does not propose
+it, and a plain import of it from another file of the same package warns
+— but it is never *blocked*: an importer who needs it anyway writes the
+reach, `import pkg::util::{ #helper };`. There is no second marker to
+learn: the default IS private, `export *;` marks a whole module at once,
+and `export(in mod)` / `export(in pkg)` narrow one item. `export` also
+*re-exports* something this module imported
+(`export import pkg::io::panic;`), so importers of this module see that
+name as if it were declared here. Unlike `pub`, it goes ahead of the
+attributes as well as the keyword — `export [derive(Wire)] struct Handle`
+— because it wraps the whole declaration.
+→ [spec §4.8](../spec/names.md)
 
 **"a mutable binding is spelled `mut x = …` …"**
 `let mut x = 1` is the Rust spelling. `let` and `mut` are vilan's two

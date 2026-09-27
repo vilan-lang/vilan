@@ -98,7 +98,7 @@ yours.
 | `vilan init [name]` | scaffold a project; `--template` picks `node`, `browser`, or `fullstack` |
 | `vilan build [path]` | compile to `<file>.mjs` — `.js` for a browser entry (no path: use the nearest `vilan.toml`) |
 | `vilan check [path]` | type-check and report problems, write nothing |
-| `vilan run [path] [args…]` | build and run; extra args reach `process::args()` |
+| `vilan run [path] [args…]` | build and run; extra args reach `process::args()`, under `import std::process;` |
 | `vilan fmt [paths…]` | format source files in place (`--check` to verify only) |
 | `vilan test [path]` | run `*_test.vl` files (a failed `assert` panics = test fails) |
 
@@ -152,6 +152,7 @@ import std::json::json_codec;               // one item
 import std::reactive::{ Signal, combine };  // several at once
 import std::option::Option::{ self, Some, None };  // a type plus its variants
 import pkg::routes::{ Route, parse };       // another file in YOUR package
+import pkg::lib::input_system::InputLayer;  // a file in a SUBDIRECTORY
 import common::{ Note, NotesClient };       // a dependency, by its name
 ```
 
@@ -163,6 +164,28 @@ There are three places an import can come from:
   module declaration.
 - Anything else is a dependency, under the name you gave it in
   `vilan.toml`.
+
+### Directories
+
+Your modules can live in directories, and the path follows the layout:
+
+```
+src/
+  main.vl              the entry
+  routes.vl            pkg::routes
+  lib/
+    input_system.vl    pkg::lib::input_system
+    ui/
+      widget.vl        pkg::lib::ui::widget
+```
+
+Two rules cover the whole of it. A directory may have a **body** —
+`lib.vl` inside it (`src/lib/lib.vl` is `pkg::lib`) — or a file beside it
+(`src/lib.vl`, same thing); having both is an error, and having neither
+is fine, which makes the directory a pure grouping you reach only through
+the files inside it. And a module is imported by its **own** path:
+`import pkg::lib;` brings in what `lib.vl` declares, not what the
+directory holds, so `pkg::lib::input_system` is an import of its own.
 
 The `{ self, Some, None }` form imports the `Option` type *and* its
 variants, so you can write `Some(x)` without qualifying it. (That
@@ -183,9 +206,10 @@ prelude = "std::web"    # omit the key for the default set
 ```
 
 The default set is `print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`.
-The **web** set adds `Signal`, `view`, `View`, and the modules `style`
-and `ui` — so a UI file writes `view("div")` and `style::Display::Flex`
-with no import at all. `prelude = false` turns it off entirely.
+The **web** set adds `Signal`, `SignalCell`, `view`, `View`, and the
+modules `style` and `ui` — so a UI file writes `view("div")` and
+`style::Display::Flex` with no import at all. `prelude = false` turns it
+off entirely.
 
 Two rules worth knowing:
 

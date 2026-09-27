@@ -62,8 +62,8 @@ fn list_contains_and_index_of_compare_by_value() {
             let xs = [10, 20, 30, 20];
             print(xs.contains(20));                 // true
             print(xs.contains(25));                 // false
-            print(xs.index_of(20).unwrap_or(-1));   // 1 — the first
-            print(xs.index_of(30).unwrap_or(-1));   // 2
+            print(xs.index_of(20).unwrap_or(99));   // 1 — the first
+            print(xs.index_of(30).unwrap_or(99));   // 2
             print(xs.index_of(99).is_none());       // true
             let words = ["a", "b"];
             print(words.contains("b"));             // true
@@ -240,8 +240,10 @@ fn list_remove_out_of_bounds_panics_like_the_subscript() {
 }
 
 #[test]
-fn list_remove_at_a_negative_index_panics() {
-    assert_run_panics(
+fn list_remove_at_a_negative_index_is_refused() {
+    // An index is a `usize` since I5 S2: the negative `remove` that used to
+    // reach the runtime bounds check is refused where it is written (B407).
+    assert_fails_with(
         r#"
         fun main() {
             mut xs = [1, 2, 3];
@@ -249,7 +251,7 @@ fn list_remove_at_a_negative_index_panics() {
         }
         main();
         "#,
-        "index out of bounds: the length is 3 but the index is -1",
+        "`usize` is unsigned (0 ..= 2^53 on the JS backend), so the negative literal `-1` is out of range",
     );
 }
 
@@ -344,7 +346,7 @@ fn the_std_surface_batch_needs_no_import() {
             print(xs.sort()[0]);
             print(xs.sort_by(|a, b| a.compare(b))[2]);
             print(xs.contains(2));
-            print(xs.index_of(2).unwrap_or(-1));
+            print(xs.index_of(2).unwrap_or(99));
             print(xs.find(|n| n > 2).unwrap_or(0));
             xs.insert(0, 9);
             print(xs.remove(0));
@@ -961,6 +963,10 @@ fn the_to_string_steer_covers_every_display_impl_subject() {
         ("true", "bool"),
         ("1.5f", "f64"),
         ("7n", "BigInt"),
+        // A126: the sized family implements `Display` too.
+        ("200u8", "u8"),
+        ("3u53", "u53"),
+        ("1.5f32", "f32"),
     ] {
         let source = format!(
             r#"
@@ -1897,12 +1903,12 @@ fn a_generic_impl_grounds_the_traits_parameter_through_its_own_binder() {
 // --- B62: a pattern capture that takes ownership of a resource payload is
 // destroyed at its scope end (`proposal/affine-moves.md` §7) ------------------
 
-/// The `resource struct Res` + `Drop` preamble every B62 pin below shares.
+/// The `[resource] struct Res` + `Drop` preamble every B62 pin below shares.
 const B62_PRELUDE: &str = r#"
     import std::io::print;
     import std::option::Option::{ self, Some, None };
     import std::drop::{ Drop, drop };
-    resource struct Res {
+    [resource] struct Res {
         tag: str,
     }
     impl Res with Drop {
@@ -1997,7 +2003,7 @@ fn b62_two_captures_in_one_leg_destroy_in_reverse_order() {
     assert_compiles_and_runs(
         &b62_program(
             r#"
-            resource enum Both {
+            [resource] enum Both {
                 Pair(Res, Res),
                 Nothing,
             }
@@ -2426,7 +2432,7 @@ fn b62_a_capture_consumed_by_a_nested_match_is_destroyed_once() {
     assert_compiles_and_runs(
         &b62_program(
             r#"
-            resource enum Wrap {
+            [resource] enum Wrap {
                 Inner(Res),
                 Nothing,
             }
@@ -3016,7 +3022,7 @@ fn b66_a_generic_overwrite_that_would_drop_the_old_value_is_rejected() {
     let source = r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun swap<T>(own a: T, own b: T): T {
             mut held = a;
@@ -3058,7 +3064,7 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut held = Db { tag = "first" };
@@ -3086,7 +3092,7 @@ fn b101_program(body: &str) -> String {
         import std::io::print;
         import std::drop::{{ Drop, drop }};
         import std::option::Option::{{ self, Some, None }};
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         {body}
         "#
@@ -3289,7 +3295,7 @@ fn b101_a_concrete_resource_written_inside_a_generic_body_is_not_r11s() {
     assert_compiles_and_runs(
         &b101_program(
             r#"
-        resource struct Slot { held: Guard }
+        [resource] struct Slot { held: Guard }
         fun bump<T>(own value: T, slot: &mut Slot): T {
             slot.held = Guard { label = "fresh" };
             value
@@ -3361,7 +3367,7 @@ fn b66_a_body_that_already_failed_the_move_scan_reports_once() {
     // CONSEQUENCE of that failure, not a second problem. `keep` still owns only
     // because `x` was used twice, which is already the error.
     let source = r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun use_twice<T>(own x: T): T {
             let keep = x;
             x
@@ -3890,6 +3896,88 @@ fn b57_a_type_qualified_call_does_not_fall_through_to_a_trait() {
         "'pick' is not an inherent member of 'Bag': 'A' provides it; \
          call 'A::pick(..)' instead",
     );
+    // The steered spelling, compiled and run: the claim the message makes is
+    // the program that follows it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun pick(self): str; }
+        impl Bag with A { fun pick(self): str { "A" } }
+        fun main() { print(A::pick(Bag { x = 1 })); }
+        "#,
+        "A\n",
+    );
+}
+
+/// Audit run 7 (F5): the same refusal on an impl that takes the trait's DEFAULT
+/// BODY. `method_member_candidates` scans what an impl DECLARES, so an impl
+/// whose body is empty contributed no candidate and the steer fell silent —
+/// the author got a bare "cannot find 'pick' in Bag" on the one shape where the
+/// fix the steer names is exactly the same one. A default body is provision.
+#[test]
+fn b57_a_type_qualified_call_steers_when_the_provision_is_a_default_body() {
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "A" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        fun main() { print(Bag::pick(Bag { x = 1 })); }
+        "#,
+        "Bag::pick",
+        "'pick' is not an inherent member of 'Bag': 'A' provides it; \
+         call 'A::pick(..)' instead",
+    );
+    // And the spelling it blesses compiles and runs — B162's ruling that
+    // `Trait::func` IS the default body, reached through the steer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "A" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        fun main() { print(A::pick(Bag { x = 1 })); }
+        "#,
+        "A\n",
+    );
+}
+
+#[test]
+fn b57_a_default_bodied_provision_names_every_providing_trait() {
+    // Two traits, both providing by default body, neither declared in its impl:
+    // the steer names both, the way it always did for declared provision.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "from-A" } }
+        trait B { fun mark(self): str; fun pick(self): str { "from-B" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        impl Bag with B { fun mark(self): str { "m" } }
+        fun main() { print(Bag::pick(Bag { x = 1 })); }
+        "#,
+        "'pick' is not an inherent member of 'Bag': 'A' and 'B' provide it; \
+         call 'A::pick(..)' or 'B::pick(..)' instead",
+    );
+}
+
+#[test]
+fn b57_a_trait_only_default_body_keeps_its_own_steer() {
+    // The exclusion the new provision has to respect: a `[trait_only]` member
+    // is not reached by `Trait::member(receiver)` either, so pointing at that
+    // spelling would be the very defect F5 is about. Its own steer — reach it
+    // through a bound — still stands.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait A { fun tag(self): str; [trait_only] fun pick(self): str { "from-A" } }
+        struct Bag { x: i32 }
+        impl Bag with A { fun tag(self): str { "t" } }
+        fun main() { print(Bag::pick(Bag { x = 1 })); }
+        "#,
+        "it is `[trait_only]` on trait `A`",
+    );
 }
 
 /// The disambiguator against an INHERITED DEFAULT: the impl declares nothing,
@@ -3997,41 +4085,74 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
 // which is the arc closing rather than a regression, and the steer's own pins
 // now read at the declaration. What survives verbatim is the register: name the
 // rule, then name the declaration that works.
+//
+// SUPERSEDED IN PART BY B186. The PARAMETER position, which is the position
+// B72 was filed on, now takes the trait name and means `<T: A>` — the steer's
+// own recommendation, made the spelling. What B72 established survives whole
+// where it still applies: the rule is a DECLARATION-site one (it fires with no
+// call in sight), it is one rule rather than a per-position message, and the
+// steer has to name a program that compiles. The pins below carry that to the
+// positions that still refuse, and the parameter's own acceptance is pinned in
+// `traits.rs`'s B186 section.
 
 #[test]
-fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
-    // The filed shape. Now refused where it is written, not where it is called.
-    assert_fails_with(
+fn b186_a_bare_trait_parameter_is_the_generic_the_steer_asked_for() {
+    // SUPERSEDED BY B186 (was `b72_a_bare_trait_parameter_steers_to_a_bound_generic`).
+    // The filed shape, and now a running program: the declaration B72 refused
+    // and steered to is what the declaration MEANS.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
-        fun main() { let s = show(Bag { n = 1 }); }
+        fun show(v: A): str { v.name() }
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
         "#,
-        "'A' is a trait, not a type: a trait is not a value type",
+        "bag\n",
     );
 }
 
 #[test]
-fn b72_the_bare_trait_steer_names_the_generic_to_write() {
+fn b72_the_bare_trait_steer_names_the_position_that_works() {
     // The actionable half — without it the message diagnoses without directing.
+    // Read at a RETURN, and the steer names all three spellings: the parameter
+    // (B186), `dyn A` for a field or any other value position (A124 R3), and
+    // the written generic, which is what a RETURN actually needs.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
-        fun main() { let s = show(Bag { n = 1 }); }
+        fun make(): A { Bag { n = 1 } }
+        fun main() { }
         "#,
-        "`<T: A>` — and write 'T' here",
+        "Write `fun f(x: A)` for a parameter, `dyn A` for a field or any other position \
+         that holds a value",
     );
+    // An ATTRIBUTED declaration takes the SAME steer. It used to lose the field
+    // clause and gain a sentence, because B184's hidden parameter could not be
+    // spelled by a generator; `dyn A` is a written type, so the carve-out is
+    // gone and the ordinary steer is the whole answer (A124 R3).
+    let attributed = r#"
+        import std::io::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        [derive(Wire)]
+        struct Holder { v: A }
+        fun main() { print(1); }
+        main();
+        "#;
+    assert_fails_with(attributed, "`dyn A` for a field");
+    assert_fails_without(attributed, "not on a declaration carrying an attribute");
 }
 
 #[test]
 fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
     // B72 anchored at the call and needed a note to reach the parameter that
-    // had to change. The refusal anchors at that parameter, so the note points
+    // had to change. The refusal anchors at the annotation, so the note points
     // at the other thing the reader may not be able to see — the trait — and
     // carries its own source, so it renders when the trait lives in another
     // module (the B72 mechanism, pointed one hop further out).
@@ -4040,8 +4161,8 @@ fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(subject: A): str { "x" }
-        fun main() { let s = show(Bag { n = 1 }); }
+        fun subject(): A { Bag { n = 1 } }
+        fun main() { }
         "#,
         "'A' is a trait, not a type",
         "A",
@@ -4050,20 +4171,24 @@ fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
 }
 
 #[test]
-fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
+fn b186_a_bare_trait_parameter_on_a_static_is_the_generic_too() {
+    // SUPERSEDED BY B186 (was `b72_a_bare_trait_parameter_on_a_static_steers_too`).
     // The second surface B72 had to reach separately — an associated function
-    // called as `Type::member(..)` — needs no separate reach now: both are the
-    // same written parameter, refused once at the declaration.
-    assert_fails_with(
+    // called as `Type::member(..)` — needs no separate reach now, in the other
+    // direction: both are the same written parameter, and both are the implicit
+    // generic.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         struct Holder { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        impl Holder { fun make(v: A): i32 { 1 } }
-        fun main() { let n = Holder::make(Bag { n = 1 }); }
+        impl Holder { fun make(v: A): str { v.name() } }
+        fun main() { print(Holder::make(Bag { n = 1 })); }
+        main();
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4072,33 +4197,34 @@ fn b72_the_refusal_does_not_wait_for_an_argument() {
     // B72's steer was conditional on the argument implementing the trait: at a
     // call, a non-implementing value made the missing impl the likelier
     // mistake, so the plain mismatch stayed the better report. A definition-site
-    // rule has no such branch and needs none — `fun show(v: A)` is wrong on its
-    // own terms, before any argument exists, and reports identically whether
-    // the value passed implements `A` or not. That is what makes it one rule
-    // rather than a message.
+    // rule has no such branch and needs none — a trait in a value position is
+    // wrong on its own terms, before any value exists. That is what makes it
+    // one rule rather than a message.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         struct Other { m: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
-        fun main() { let s = show(Other { m = 1 }); }
+        fun show(): A { Other { m = 1 } }
+        fun main() { let s = show(); }
         "#,
         "'A' is a trait, not a type",
     );
 }
 
 #[test]
-fn b72_an_uncalled_bare_trait_parameter_is_still_refused() {
+fn b72_an_unused_bare_trait_declaration_is_still_refused() {
     // The half a use-site steer structurally could not reach: a declaration
-    // nobody calls. B72 was silent here; the rule is not.
+    // nobody uses. B72 was silent here; the rule is not. Read at a RETURN since
+    // B184 — the field this was written on is the hidden parameter now, and the
+    // return is the value position with no binding source to ground one from.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
+        fun make(): A { Bag { n = 1 } }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4202,20 +4328,24 @@ fn b161_a_trait_annotated_binding_dispatches_on_its_own_type() {
 }
 
 #[test]
-fn b72_a_bare_trait_method_parameter_is_refused() {
+fn b186_a_bare_trait_method_parameter_is_the_generic_too() {
+    // SUPERSEDED BY B186 (was `b72_a_bare_trait_method_parameter_is_refused`).
     // A METHOD's bare-trait parameter reconciled value-first, so it accepted
-    // where the free function refused. The asymmetry is gone: both are written
-    // parameters, and the rule is on the writing.
-    assert_fails_with(
+    // where the free function refused — an asymmetry B72 closed by refusing
+    // both. Both are written parameters and the rule is still on the writing;
+    // what the writing MEANS is now the implicit generic, on both.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         struct Holder { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        impl Holder { fun take(self, v: A): i32 { 1 } }
-        fun main() { let h = Holder { n = 0 }; let n = h.take(Bag { n = 1 }); }
+        impl Holder { fun take(self, v: A): str { v.name() } }
+        fun main() { let h = Holder { n = 0 }; print(h.take(Bag { n = 1 })); }
+        main();
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4236,15 +4366,46 @@ fn b72_a_bare_trait_return_is_refused() {
 }
 
 #[test]
-fn b72_a_bare_trait_field_is_refused() {
-    // The fifth position — the one §2.2's resource leak rode in on.
+fn b184_a_bare_trait_field_is_refused_and_the_dyn_it_steers_to_runs() {
+    // WITHDRAWN AT THIS POSITION by A124 R3 (2026-09-22), **breaking**: the
+    // fifth position — the one §2.2's resource leak rode in on — read as B184's
+    // hidden type parameter for two orders and now takes the OBJECT. The steer
+    // names it, and the steered program is the second half of the pin, because
+    // advice that does not compile is not advice. The leak stays shut either
+    // way (`b184_a_trait_typed_field_cannot_swallow_a_resources_destructor_either`).
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; print(h.item.name()); }
+        main();
+        "#,
+        "`dyn A` for a field",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: dyn A }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; print(h.item.name()); }
+        main();
+        "#,
+        "bag\n",
+    );
+    // The NESTED spelling at a field is not the sugar and stays refused: the
+    // inner type id was never an annotation id (B161's rule, B186's rule).
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { item: A }
-        fun main() { let h = Holder { item = Bag { n = 1 } }; }
+        struct Holder { item: List<A> }
+        fun main() { let h = Holder { item = [] }; }
         "#,
         "'A' is a trait, not a type",
     );
@@ -4300,17 +4461,26 @@ fn b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program() 
 }
 
 #[test]
-fn b4_the_internal_error_route_through_a_field_is_a_clean_refusal() {
-    assert_fails_with(
+fn b184_the_internal_error_route_through_a_field_is_now_an_ordinary_program() {
+    // B55's internal error came from a value CARRYING a trait type into a
+    // bounded generic, where monomorphization had no concrete type to reach.
+    // B184 removed the carrier by making the field a hidden parameter; A124 R3
+    // withdrew that and the OBJECT removes it the other way — `h.item` is a
+    // `dyn A`, which satisfies `T: A` and dispatches through its own table, so
+    // `use_it` has something to emit at every instantiation. Either way the
+    // guard is unreachable, which is what this pins.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { item: A }
+        struct Holder { item: dyn A }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; print(use_it(h.item)); }
+        main();
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4337,18 +4507,20 @@ fn b4_no_route_to_the_internal_error_survives() {
     // appear, because it is the one that asks the user to file a bug for their
     // own mistake.
     //
-    // The BINDING route left this list with B161 — it is a clean, running
-    // program now, not a diagnostic (see
-    // `b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program`),
-    // and a program that compiles reaches no guard at all.
+    // The BINDING route left this list with B161 and the FIELD route with B184 —
+    // both are clean, running programs now, not diagnostics (see
+    // `b161_the_internal_error_route_through_a_binding_is_now_an_ordinary_program`
+    // and `b184_the_internal_error_route_through_a_field_is_now_an_ordinary_program`),
+    // and a program that compiles reaches no guard at all. The RETURN is the
+    // route that is left, plus the nested spelling that never was a reading.
     for source in [
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        struct Holder { item: A }
+        struct Holder { item: List<A> }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        fun main() { let h = Holder { item = [] }; let s = use_it(h.item); }
         "#,
         r#"
         trait A { fun name(self): str; }
@@ -4777,7 +4949,7 @@ fn a_resource_binding_runs_its_destructor() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -4806,7 +4978,7 @@ fn a_trait_annotated_binding_cannot_swallow_a_resources_destructor() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -4828,7 +5000,7 @@ fn a_resource_field_runs_its_destructor() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -4844,25 +5016,36 @@ fn a_resource_field_runs_its_destructor() {
 }
 
 #[test]
-fn a_bare_trait_field_cannot_swallow_a_resources_destructor() {
-    // P8 row 4 — the field route, which is the dangerous one: the resource is
-    // reachable, owned, and invisible to containment inference.
-    assert_fails_with(
-        r#"
+fn b184_a_trait_typed_field_cannot_swallow_a_resources_destructor_either() {
+    // P8 row 4 was the field route, and the leak it named — a resource
+    // reachable, owned, and invisible to containment inference — stays shut
+    // under A124 R3's withdrawal, by the REFUSAL this time: the bare trait at
+    // the field is refused, so no value is carried anywhere.
+    const LEAK: &str = r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
-        struct Holder { item: Named }
+        struct Holder { item: __FIELD__ }
         fun main() {
             let holder = Holder { item = Handle { id = 1 } };
             print("ok");
         }
         main();
-        "#,
-        "a trait is not a value type (vilan has no trait objects)",
+        "#;
+    assert_fails_with(
+        &LEAK.replace("__FIELD__", "Named"),
+        "is a trait, not a type",
+    );
+    // And the steered spelling does not reopen it: Q5 refuses a resource AT
+    // the coercion, which is the last point the destructor is still known.
+    // Without that refusal this program would print `ok` alone — the original
+    // P8 row 4, wearing a keyword.
+    assert_fails_with(
+        &LEAK.replace("__FIELD__", "dyn Named"),
+        "is a resource, so it cannot become a `dyn Named`",
     );
 }
 
@@ -4874,7 +5057,7 @@ fn a_resource_field_keeps_its_single_owner() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -4899,7 +5082,7 @@ fn a_bare_trait_field_cannot_launder_the_single_owner_rule() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -5121,4 +5304,1570 @@ fn b74_a_static_still_resolves_when_it_is_the_only_one() {
         "#,
         "4\nbag\n",
     );
+}
+
+// --- B178: the entry takes no parameters, and `process::args()` is the door --
+//
+// RULED 2026-09-01. A parameter list declares what values a function accepts,
+// and the entry accepts none — the shell owns what is passed to a program, so
+// nothing in the language can call `main` with arguments. Before the ruling
+// `fun main(condition: bool)` COMPILED and the emitted program read a free
+// `condition` (the transformer inlines `main`'s body as the top-level
+// statements), dying with `ReferenceError: condition is not defined`.
+//
+// The refusal steers to `std::process::args()`, whose result type is always
+// right where a hand-written parameter list is a guess.
+
+#[test]
+fn b178_a_parameterized_main_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main(condition: bool) {
+            if condition { print("yes"); } else { print("no"); }
+        }
+        "#,
+        "`main` takes no parameters",
+    );
+}
+
+#[test]
+fn b178_the_refusal_steers_to_process_args() {
+    // The message is the whole point of the ruling: refusing without naming the
+    // argument door leaves the author with no way forward at all.
+    //
+    // Audit run 7 (F2/F3): naming `std::process::args()` was not naming the
+    // door. That spelling is a NAMESPACE path, refused in an expression, and
+    // the bare `process::args()` under it is refused too until the module is
+    // imported — so the steer led into a second refusal whichever way the
+    // author read it. The working spelling is two lines, and the message names
+    // both; the two pins below hold the refusals it used to walk into.
+    //
+    // A steer is a claim, so the claim is checked and then COMPILED: the
+    // program the refusal draws, with the message's own spelling applied.
+    assert_fails_with(
+        r#"
+        fun main(first: str, second: str) { }
+        "#,
+        "read them with `import std::process;` at the top and `process::args()` in the body",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() {
+            let arguments = process::args();
+            print(arguments.len());
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b178_the_inline_namespace_path_is_not_the_steer() {
+    // F3's first refusal, and the reason the message no longer spells the call
+    // `std::process::args()`: a namespace root is not a binding, so a
+    // fully-qualified path is not an expression the language has. That is B52's
+    // rule holding (`path::name` addresses what a NAMESPACE declares, and `std`
+    // declares modules, not values) and it is unchanged here — only the steer
+    // moved. The resolution rule's own diagnostic is what an author who writes
+    // it meets.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() { print(std::process::args().len()); }
+        "#,
+        "`std` is a namespace, not a value",
+    );
+}
+
+#[test]
+fn b178_process_args_without_the_import_is_refused() {
+    // F3's second refusal: dropping to the bare `process::args()` — the form
+    // the errors appendix and `vilan help run` used to show with the import
+    // left unnamed — refuses too, because `process` is a module name only once
+    // something imports it. Which is why the steer names BOTH lines.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() { print(process::args().len()); }
+        "#,
+        "cannot find type 'process'",
+    );
+}
+
+#[test]
+fn b178_a_parameterless_main_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() { print("entry"); }
+        "#,
+        "entry\n",
+    );
+}
+
+#[test]
+fn b178_a_function_named_main_that_is_not_the_entry_may_take_parameters() {
+    // The check keys on the GLOBAL scope's `main`, which is the same lookup the
+    // transformer's entry discovery makes. A method named `main` is nobody's
+    // entry and keeps its parameters.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct App { }
+        impl App {
+            fun main(self, label: str): str { label }
+        }
+        fun main() { print(App { }.main("run")); }
+        "#,
+        "run\n",
+    );
+}
+
+#[test]
+fn b178_process_args_runs_and_yields_the_argument_tail() {
+    // The argument door itself: `process::args()` is a `List<str>` of the tail
+    // past the runtime and the script path, so a program invoked with none
+    // reads an empty list rather than a `null` or a panic.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() {
+            let tail = process::args();
+            print(tail.len());
+            for argument in tail { print(argument); }
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b178_a_local_named_arguments_survives_strict_mode() {
+    // `arguments` (and `eval`) cannot be BOUND in strict mode, and an ES module
+    // is always strict — so emitting `const arguments = …` is a `SyntaxError`
+    // at load, before a line runs. They are not reserved WORDS, which is how
+    // they escaped the emitter's list; `let arguments = args()` is the obvious
+    // spelling of the very call B178 steers to, which is where this surfaced.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() {
+            let arguments = process::args();
+            let eval = arguments.len();
+            print(eval);
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b178_process_args_is_refused_on_the_browser_leg() {
+    // Platform coloring holds it like every other process-only name — the
+    // browser has no argv, and `args()` is declared in std's `process` layer.
+    assert_fails_browser_with(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() { print(process::args().len()); }
+        "#,
+        "requires the `process` layer of `std` and cannot run on `browser`",
+    );
+}
+
+// --- A82: `std::wire`'s `Result` and the sized numeric family ---------------
+
+/// `Result<T, E>` crosses, and it crosses in `Option`'s vocabulary: an
+/// externally-tagged `Ok`/`Err` object over JSON, a `begin_variant` tag over
+/// the binary codec. The tags are the variant NAMES, so the encoding is
+/// hash-stable — no declaration order, no discriminant a later edit could
+/// renumber — which is what lets a client and a server built from different
+/// checkouts agree.
+///
+/// Before A82 `std::wire` had no `Result` impl at all and every app that
+/// wanted a fallible reply wrote forty lines of this itself (kolt's
+/// `store.vl:27` is the exhibit these impls were taken from).
+#[test]
+fn a_result_round_trips_through_both_codecs_in_options_vocabulary() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::binary::{ decode_binary, encode_binary };
+        import std::json::{ decode_json, encode_json };
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let inner) => match inner {
+                    Ok(let value) => i"ok:{value}",
+                    Err(let reason) => i"err:{reason}",
+                },
+                Err(let reason) => i"failed:{reason}",
+            }
+        }
+        fun main() {
+            let good: Result<i53, str> = Ok(7i53);
+            let bad: Result<i53, str> = Err("nope");
+            print(encode_json(good));
+            print(encode_json(bad));
+            print(show(decode_json<Result<i53, str>>(encode_json(good))));
+            print(show(decode_json<Result<i53, str>>(encode_json(bad))));
+            print(show(decode_binary<Result<i53, str>>(encode_binary(good))));
+            print(show(decode_binary<Result<i53, str>>(encode_binary(bad))));
+        }
+        "#,
+        "{\"Ok\":7}\n{\"Err\":\"nope\"}\nok:7\nerr:nope\nok:7\nerr:nope\n",
+    );
+}
+
+/// An unrecognized tag is a STRUCTURAL failure and not a panic: `rebuild` fails
+/// the deserializer, which poisons every later read, so the `Err` payload it
+/// then hands back is a zero value nothing looks at and `decode` reports the
+/// reason instead. A decode is fallible by design — a malformed frame off a
+/// socket must not be able to abort the process.
+#[test]
+fn an_unknown_result_tag_is_a_sticky_decode_failure_not_a_panic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::decode_json;
+        import std::result::Result::{ self, Err, Ok };
+        fun main() {
+            match decode_json<Result<i53, str>>("{\"Nope\":1}") {
+                Ok(let _decoded) => print("decoded-garbage"),
+                Err(let reason) => print(i"sticky:{reason}"),
+            }
+        }
+        "#,
+        "sticky:unknown result variant 'Nope'\n",
+    );
+}
+
+/// A104 — the DIRECT `Json`/`FromJson` pair for `Result<T, E>`, which the
+/// module carried for `Option` from the start and for `Result` not at all. It
+/// is deliberately not a third encoding: the text is externally tagged by
+/// VARIANT NAME, which is both what `[derive(Json)]` gives a one-payload
+/// variant and what the wire codec's `Result` impl writes, so `to_json` and
+/// `encode_json` are byte-identical and either side reads the other's document.
+/// (kolt's `shared.vl:65/80` hand-wrote the pair as a `[kind, value]` array
+/// with integer kinds — the exhibit, and an encoding nothing else spoke.)
+#[test]
+fn a104_result_carries_the_direct_json_pair_in_the_codecs_own_spelling() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ decode_json, encode_json, FromJson, Json };
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let inner) => match inner {
+                    Ok(let value) => i"ok:{value}",
+                    Err(let reason) => i"err:{reason}",
+                },
+                Err(let reason) => i"failed:{reason}",
+            }
+        }
+        fun main() {
+            let good: Result<i53, str> = Ok(7i53);
+            let bad: Result<i53, str> = Err("nope");
+            print(good.to_json());                 // {"Ok":7}
+            print(bad.to_json());                  // {"Err":"nope"}
+            // The visitor writes the same bytes the direct impl does.
+            print(i"same:{encode_json(good) == good.to_json()}");
+            print(i"same:{encode_json(bad) == bad.to_json()}");
+            // Both directions of the direct pair.
+            print(show(Result::from_json(good.to_json())));
+            print(show(Result::from_json(bad.to_json())));
+            // And across the two: the visitor reads what the direct impl wrote.
+            print(show(decode_json<Result<i53, str>>(good.to_json())));
+            print(show(Result::from_json(encode_json(bad))));
+        }
+        "#,
+        "{\"Ok\":7}\n{\"Err\":\"nope\"}\nsame:true\nsame:true\nok:7\nerr:nope\nok:7\nerr:nope\n",
+    );
+}
+
+/// A104 — the pair nests, because each side delegates to its payload's own
+/// impl: a container, an `Option` (whose `None` is a bare `null` inside the
+/// tag) and a `[derive(Json)]` struct all cross on either leg.
+#[test]
+fn a104_the_result_json_pair_nests_through_containers_and_a_derive() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        import std::result::Result::{ self, Err, Ok };
+        [derive(Json)]
+        struct Row {
+            id: i32,
+            name: str,
+        }
+        fun main() {
+            let list: Result<List<i32>, str> = Ok([1, 2]);
+            print(list.to_json());
+            let absent: Result<Option<i32>, str> = Ok(None);
+            print(absent.to_json());
+            let row: Result<Row, str> = Ok(Row { id = 1, name = "Ada" });
+            print(row.to_json());
+            let read: Result<Result<Row, str>, str> = Result::from_json(row.to_json());
+            match read {
+                Ok(let inner) => match inner {
+                    Ok(let value) => print(i"row {value.id} {value.name}"),
+                    Err(let reason) => print(i"inner-err {reason}"),
+                },
+                Err(let reason) => print(i"failed {reason}"),
+            }
+            // The Err leg carries its own payload type just as well.
+            let failed: Result<i32, Row> = Err(Row { id = 9, name = "boom" });
+            print(failed.to_json());
+        }
+        "#,
+        "{\"Ok\":[1,2]}\n{\"Ok\":null}\n{\"Ok\":{\"id\":1,\"name\":\"Ada\"}}\nrow 1 Ada\n\
+         {\"Err\":{\"id\":9,\"name\":\"boom\"}}\n",
+    );
+}
+
+/// A104 — decoding is fallible and NEVER crashes (the rule `FromJson`'s own
+/// doc states). The SHAPE is checked before the tag is read, deliberately: a
+/// tag read is `Object.keys` over the value, and a JSON `null` has no keys, so
+/// reading the tag first would throw rather than report. A wrong shape, an
+/// unknown tag, and text that is not JSON at all are three decode errors.
+#[test]
+fn a104_a_malformed_result_document_is_a_decode_error_and_never_a_crash() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let _decoded) => "decoded-garbage",
+                Err(let reason) => i"refused:{reason}",
+            }
+        }
+        fun main() {
+            print(show(Result::from_json("null")));          // no keys to read
+            print(show(Result::from_json("7")));             // a number is not a variant
+            print(show(Result::from_json("[0,7]")));         // kolt's old array shape
+            print(show(Result::from_json("{\"Nope\":1}")));  // a tag nothing declares
+            print(show(Result::from_json("not json")));      // not a document at all
+        }
+        "#,
+        "refused:expected an object\nrefused:expected an object\nrefused:expected an object\n\
+         refused:unknown variant in JSON for enum Result\nrefused:not valid JSON\n",
+    );
+}
+
+// --- A116: `[derive(Json)]` on an ENUM never crashes on a non-object ---------
+//
+// A104 gave `std::result::Result` a hand-written shape guard AHEAD of the tag
+// read; a DERIVED enum has no such guard and read the tag first, so
+// `__json_tag` reached `Object.keys(null)` and threw a `TypeError` out of a
+// decode that `FromJson`'s own doc promises can only return `Err` (json.vl,
+// "Decoding is fallible and NEVER crashes"). The fix is in the helper rather
+// than in the derive: `__json_tag` answers `""` for everything that is not a
+// tagged enum, which no variant can be spelled with, so the generated `_` arm
+// reports the decode error it was always there to report.
+//
+// One pin per document shape, because each reaches the helper differently:
+// `null` threw, a number reached `Object.keys(3)` (empty) and answered
+// `undefined`, an array answered its first INDEX (`"0"`, a tag by accident),
+// and `{}` answered `undefined` too. The control below proves the two real
+// spellings still decode, so a helper that answered `""` unconditionally would
+// not pass this set.
+
+/// The shared fixture: a plain two-variant derived enum and a reporter that
+/// prints the decode outcome. `Shape` carries a payload on one variant so the
+/// object form is a real `{"Square":…}` document and not only a bare tag.
+const A116_DERIVED_ENUM: &str = r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        [derive(Json)]
+        enum Shape {
+            Circle,
+            Square(i32),
+        }
+        fun show(text: str): str {
+            match Shape::from_json(text) {
+                Ok(let shape) => i"decoded:{shape.to_json()}",
+                Err(let reason) => i"refused:{reason}",
+            }
+        }
+    "#;
+
+/// A116 — JSON `null` is the crashing case the item was filed for.
+#[test]
+fn a116_a_derived_enum_refuses_a_null_document_instead_of_throwing() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"null\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — a NUMBER has no keys at all, so the tag read answered `undefined`.
+#[test]
+fn a116_a_derived_enum_refuses_a_number_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"7\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — an ARRAY answered its first INDEX as the tag, which is a tag by
+/// accident: `["Circle"]` would have decoded through a key that is not a name.
+#[test]
+fn a116_a_derived_enum_refuses_an_array_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"[\\\"Circle\\\"]\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — an EMPTY object is an object with no tag in it.
+#[test]
+fn a116_a_derived_enum_refuses_an_empty_object_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"{{}}\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116's control — both tagged spellings still decode, so the four refusals
+/// above are about the shapes and not about the helper having stopped working.
+#[test]
+fn a116_a_derived_enum_still_decodes_a_bare_tag_and_a_single_key_object() {
+    assert_compiles_and_runs(
+        &format!(
+            "{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"\\\"Circle\\\"\")); \
+             print(show(\"{{\\\"Square\\\":3}}\")); }}\n"
+        ),
+        "decoded:\"Circle\"\ndecoded:{\"Square\":3}\n",
+    );
+}
+
+/// The sized numeric family (numeric-types.md §5) is Wire, each width riding
+/// the visitor lane that holds it exactly — `i8`/`i16` on `i32`, `u8`/`u16` on
+/// `u32`, `u53` on `i53`, `f32` on `f64` — so the round trip is exact at both
+/// ends of every range. `std::json` has carried the same family for as long as
+/// the types existed; `std::wire`'s row stopped at `i53`/`f64`, which is why an
+/// unsigned id could not cross (kolt's `store.vl:143` is the report).
+#[test]
+fn the_sized_numeric_family_round_trips_at_both_ends_of_every_range() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::binary::{ decode_binary, encode_binary };
+        import std::json::{ decode_json, encode_json };
+        import std::result::Result::{ self, Err, Ok };
+        fun main() {
+            print(i"i8:{decode_binary<i8>(encode_binary(-128i8)).unwrap_or(0i8)}");
+            print(i"u8:{decode_json<u8>(encode_json(255u8)).unwrap_or(0u8)}");
+            print(i"i16:{decode_binary<i16>(encode_binary(-32768i16)).unwrap_or(0i16)}");
+            print(i"u16:{decode_json<u16>(encode_json(65535u16)).unwrap_or(0u16)}");
+            print(i"i53:{decode_json<i53>(encode_json(-9007199254740992i53)).unwrap_or(0i53)}");
+            print(i"u53:{decode_binary<u53>(encode_binary(9007199254740992u53)).unwrap_or(0u53)}");
+            print(i"f32:{decode_binary<f32>(encode_binary(2.5f32)).unwrap_or(0.0f32)}");
+            print(i"f64:{decode_json<f64>(encode_json(0.5)).unwrap_or(0.0)}");
+        }
+        "#,
+        "i8:-128\nu8:255\ni16:-32768\nu16:65535\ni53:-9007199254740992\nu53:9007199254740992\nf32:2.5\nf64:0.5\n",
+    );
+}
+
+/// And the analyzer's half of the same change: the Wire boundary admits every
+/// member of the family, which is what makes the impls above reachable from an
+/// `[rpc]` signature. The two lists move together or a payload is admitted with
+/// no `describe` to call (or refused with one sitting right there).
+#[test]
+fn the_wire_boundary_admits_every_sized_scalar_in_an_rpc_signature() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Err, Ok };
+        [service(SizedClient)]
+        struct Sized { name: str }
+        impl Sized {
+            [rpc]
+            fun tiny(self, value: i8): u8 { 1u8 }
+
+            [rpc]
+            fun narrow(self, value: i16): u16 { 1u16 }
+
+            [rpc]
+            fun wide(self, value: i53): u53 { 1u53 }
+
+            [rpc]
+            fun real(self, value: f32): f64 { 1.0 }
+
+            [rpc]
+            fun fallible(self, id: u53): Result<i53, str> { Err("missing") }
+        }
+        fun main() { print("sized"); }
+        main();
+        "#,
+    );
+}
+
+/// A92: std's `Memo<K: Hashable, V>` — a per-key cache of values made on first
+/// ask, and the app's composition tool for "one handle per id".
+///
+/// Three claims in one run, because they are one behaviour seen from three
+/// sides. The MAKER runs once per key and never again while the entry is held
+/// (`makes` moves on the first ask and not the second), which is the whole
+/// point — memoizing a remote handle is what keeps two views of one row from
+/// leasing two mirrors. `forget` puts a key back to unmade, so a value that
+/// turned out wrong can be retried without a second mechanism. And the maker
+/// is a CLOSURE evaluated at the call site rather than a value passed in, so a
+/// maker that reads its caller's ambient scope — the rpc client, an owner —
+/// reads the right one; `held_after_forget:false` is the passive `get`
+/// agreeing with `len`.
+#[test]
+fn a_memo_makes_a_value_once_per_key_and_forgets_one_on_request() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::memo::Memo;
+        import std::shared::Shared;
+
+        let makes: Shared<i32> = Shared::new(0);
+        let widths: Memo<str, usize> = Memo::new();
+
+        fun width_of(word: str): usize {
+            makes.write() = makes.read() + 1;
+            word.len()
+        }
+
+        fun main() {
+            print(i"first:{widths.get_or("alpha", || width_of("alpha"))}");
+            print(i"again:{widths.get_or("alpha", || width_of("alpha"))}");
+            print(i"other:{widths.get_or("be", || width_of("be"))}");
+            print(i"makes:{makes.read()} len:{widths.len()}");
+            print(i"held:{widths.get("alpha").is_some()}");
+            widths.forget("alpha");
+            print(i"held_after_forget:{widths.get("alpha").is_some()} len:{widths.len()}");
+            print(i"remade:{widths.get_or("alpha", || width_of("alpha"))} makes:{makes.read()}");
+            widths.clear();
+            print(i"cleared:{widths.len()}");
+        }
+        main();
+        "#,
+        "first:5\nagain:5\nother:2\nmakes:2 len:2\nheld:true\nheld_after_forget:false len:1\nremade:5 makes:3\ncleared:0\n",
+    );
+}
+
+/// B296's own exhibit, in the vocabulary it was found in: a `[service]` struct
+/// with TWO exposed `KeyedCell<str, Task>` fields, both `KeyedCell::new([])`.
+/// It stopped the build with
+/// `internal: a call resolved to 'Keyed's requirement 'key', which has no body`
+/// — a `please report this program` over a program that is simply two fields.
+/// Neither `[service]` nor `KeyedCell` was load-bearing (a plain struct with
+/// two such fields did the same), but this is the spelling the item carries and
+/// the one an app writes.
+#[test]
+fn b296_two_exposed_keyed_cells_seeded_empty_both_compile() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str, label: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] active: KeyedCell<str, Task>,
+            [expose(keyed)] done: KeyedCell<str, Task>,
+        }
+        fun main() {
+            let store = Store {
+                active = KeyedCell::new([]),
+                done = KeyedCell::new([]),
+            };
+            print("store");
+        }
+        main();
+        "#,
+    );
+}
+
+/// B296's mixed face, named in the item: `[expose(keyed)]` beside a plain
+/// `[expose]`, both cells built empty.
+#[test]
+fn b296_a_keyed_and_a_plain_exposed_cell_seeded_empty_both_compile() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::rpc::KeyedCell;
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str, label: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(StoreClient)]
+        struct Store {
+            [expose(keyed)] active: KeyedCell<str, Task>,
+            [expose] labels: SignalCell<List<str>>,
+        }
+        fun main() {
+            let store = Store {
+                active = KeyedCell::new([]),
+                labels = Signal::new([]),
+            };
+            print("store");
+        }
+        main();
+        "#,
+    );
+}
+
+/// M66: `Shared::identity` is the language's one answer to "are these two
+/// bindings the same cell", and it is LAZY — the number is stamped on the cell
+/// the first time anything asks.
+///
+/// Four claims in one run, because they are one sentence: a second handle to
+/// one cell answers the same number (a copied `Shared` is a copied HANDLE, and
+/// `identity` is what lets a program say so); two cells built from equal values
+/// answer different numbers (it is not derived from the contents); asking twice
+/// answers the same number (the stamp is kept, not re-minted); and a cell that
+/// is never asked about is never stamped, which is the whole point — every
+/// `SignalCell` in the program used to mint one at construction for the rpc
+/// runtime's dedup, whether or not anything exposed it.
+///
+/// The last claim is the one this program cannot see and the CORPUS can: the
+/// eleven goldens A92 moved are back at their pre-A92 shape, with no
+/// `fresh_id()` in a `SignalCell` constructor and no `__shared_identity` in any
+/// program that asks for none.
+#[test]
+fn shared_identity_is_the_cell_and_is_stamped_on_the_first_ask() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        fun main() {
+            let cell: Shared<i32> = Shared::new(7);
+            let same = cell;
+            let handle = cell.clone();
+            let other: Shared<i32> = Shared::new(7);
+            print(i"same:{cell.identity() == same.identity()}");
+            print(i"clone:{cell.identity() == handle.identity()}");
+            print(i"other:{cell.identity() == other.identity()}");
+            print(i"stable:{cell.identity() == cell.identity()}");
+        }
+        main();
+        "#,
+        "same:true\nclone:true\nother:false\nstable:true\n",
+    );
+}
+
+/// M66: the identity of a `SignalCell` is its VALUE cell's, and copying the
+/// struct copies neither of the two `Shared`s it is made of — so the rpc
+/// runtime's dedup (A92) reads the same number for two bindings of one signal
+/// and a different one for a second signal holding the same value.
+///
+/// This is the shape `expose_dynamic` dedups on: a getter two views call
+/// answers one cell, and minting a second channel for it would cost a second
+/// capability, a second forward and a second copy of every update.
+#[test]
+fn a_signal_cells_identity_is_its_value_cells_and_survives_a_copy() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        struct Holder { source: SignalCell<i32> }
+
+        fun main() {
+            let signal: SignalCell<i32> = Signal::new(1);
+            let held = Holder { source = signal };
+            let twin: SignalCell<i32> = Signal::new(1);
+            print(i"held:{signal.value.identity() == held.source.value.identity()}");
+            print(i"twin:{signal.value.identity() == twin.value.identity()}");
+        }
+        main();
+        "#,
+        "held:true\ntwin:false\n",
+    );
+}
+
+// --- I4: `Default` reaches the containers -----------------------------------
+//
+// `Default`'s implementors were the numeric family (`number.vl`), `str` and
+// `bool` (`default.vl`) and `Option<T>` (`option.vl`) — no container at all, so
+// a `T: Default` bound could not be met by a `List`, a `Map` or a `Set` and a
+// `[derive(Default)]` over a struct holding one had nothing to call. kolt wrote
+// `impl Map<type K, type V> with Default` itself (`prefs.vl:100`, under a
+// `// FIXME: Implement with std.`). Each impl lives in its own type's module,
+// which is the rule `default.vl`'s own comment states and the placement
+// `Option`'s follows.
+
+/// The three empty containers answer `default()`, and the value is a real fresh
+/// container rather than a shared one: inserting into the map does not change
+/// what the next `default()` hands back.
+#[test]
+fn i4_the_containers_have_a_default_and_it_is_the_empty_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        import std::map::Map;
+        import std::set::Set;
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let list: List<i32> = make();
+            mut map: Map<str, i32> = make();
+            mut set: Set<i32> = make();
+            print(i"{list.len()} {map.len()} {set.len()}");
+            map.insert("a", 1);
+            set.insert(3);
+            print(i"{map.len()} {set.len()}");
+            let fresh_map: Map<str, i32> = make();
+            let fresh_set: Set<i32> = make();
+            print(i"{fresh_map.len()} {fresh_set.len()}");
+        }
+        "#,
+        "0 0 0\n1 1\n0 0\n",
+    );
+}
+
+/// The other three the item asked to verify were already there, and the pin
+/// says so rather than leaving it to a reader: `str` is `""`, `bool` is
+/// `false`, `Option<T>` is `None`, and the numeric family is zero.
+#[test]
+fn i4_the_scalars_and_option_already_had_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let text: str = make();
+            let flag: bool = make();
+            let slot: Option<i32> = make();
+            let whole: i32 = make();
+            let real: f64 = make();
+            print(i"'{text}' {flag} {slot.is_none()} {whole} {real}");
+        }
+        "#,
+        "'' false true 0 0\n",
+    );
+}
+
+/// The point of the batch: `[derive(Default)]` builds its literal out of
+/// `Field::default()` per field, so a struct holding a container was refused at
+/// the DERIVE before this — the shape kolt's `prefs.vl` is.
+#[test]
+fn i4_a_derived_default_admits_a_struct_holding_containers() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::set::Set;
+        [derive(Default)]
+        struct Prefs {
+            names: List<str>,
+            seen: Set<i32>,
+            widths: Map<str, i32>,
+            label: str,
+            collapsed: bool,
+            width: i32,
+            last: Option<i32>,
+        }
+        fun main() {
+            let prefs = Prefs::default();
+            print(i"{prefs.names.len()} {prefs.seen.len()} {prefs.widths.len()}");
+            print(i"'{prefs.label}' {prefs.collapsed} {prefs.width} {prefs.last.is_none()}");
+        }
+        "#,
+        "0 0 0\n'' false 0 true\n",
+    );
+}
+
+/// A `Map`'s and a `Set`'s binder carries the `Hashable` its TYPE declares, so
+/// the impls do not widen what either container admits: a key that is not
+/// hashable is refused exactly where it was before, at the type.
+#[test]
+fn i4_the_container_defaults_do_not_widen_what_a_map_key_may_be() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        import std::map::Map;
+        struct Key { id: i32 }
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let map: Map<Key, i32> = make();
+            print(map.len());
+        }
+        "#,
+        "Hashable",
+    );
+}
+
+// --- A118: `std::random::range` is HALF-OPEN ---------------------------------
+//
+// `docs/std/numbers.md` has said `[low, high)` since the module landed and the
+// integer helper implemented `[low, high]` — `Math.floor(rand * (high - low +
+// 1)) + low` — so `random::range(1, 7)` answered 7 about one run in eight. R7
+// at Order 39's GO: the DOC is the contract, fix the implementation.
+//
+// The draws below are the pin's instrument. A distribution cannot be asserted
+// from one sample, so each case draws over a range small enough that the claim
+// is decided by ~2^-N rather than by luck: 400 draws of a two-value range that
+// must never answer its bound is red at probability 1 - 2^-400 under the old
+// helper, which is a certainty in every sense that matters to a suite. Output
+// is a verdict rather than the draws, so the pins are deterministic even
+// though the program is not.
+
+/// A118 — the bound itself is NOT in the range. The case the item was filed
+/// for, at the tightest range where "inclusive" and "half-open" differ:
+/// `[0, 1)` holds exactly one value.
+#[test]
+fn a118_an_integer_range_never_answers_its_upper_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut outside = 0;
+            for draws < 400 {
+                if random::range(0, 1) != 0 {
+                    outside += 1;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside}");
+        }
+        "#,
+        "outside:0\n",
+    );
+}
+
+/// A118 — and every value BELOW the bound still is, so the fix is not "answer
+/// `low`". `[0, 3)` is three values; 400 draws miss one at 3 * (2/3)^400.
+#[test]
+fn a118_an_integer_range_still_answers_every_value_below_its_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut seen = [false, false, false];
+            mut outside = 0;
+            mut draws = 0;
+            for draws < 400 {
+                let value = random::range(0, 3);
+                if value < 0 || value > 2 {
+                    outside += 1;
+                } else {
+                    seen[value] = true;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside} zero:{seen[0]} one:{seen[1]} two:{seen[2]}");
+        }
+        "#,
+        "outside:0 zero:true one:true two:true\n",
+    );
+}
+
+/// A118 — a DEGENERATE range answers `low`. `[4, 4)` holds nothing, and `low`
+/// is the only value there is to answer; the doc says so rather than leaving a
+/// reader to find out.
+#[test]
+fn a118_a_degenerate_integer_range_answers_its_low_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut other = 0;
+            for draws < 100 {
+                if random::range(4, 4) != 4 {
+                    other += 1;
+                }
+                draws += 1;
+            }
+            print(i"other:{other}");
+        }
+        "#,
+        "other:0\n",
+    );
+}
+
+/// A118 — the FLOAT arm was already half-open (`Math.random()` is `[0, 1)`), so
+/// this is the guard that the two arms now say the same thing about their
+/// bounds and keep saying it.
+#[test]
+fn a118_a_float_range_is_half_open_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut outside = 0;
+            for draws < 400 {
+                let value = random::range(0.0, 1.0);
+                if value < 0.0 || value >= 1.0 {
+                    outside += 1;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside}");
+        }
+        "#,
+        "outside:0\n",
+    );
+}
+
+// --- FIND (papers-39): the JSON reader enforces the type it is asked to read -
+//
+// `JsonReader`'s typed reads went straight through the host coercion
+// (`Number(x)`, `String(x)`, `Boolean(x)`) over whatever happened to be on the
+// value stack, and NEVER poisoned: a JSON string read as an `i32` answered
+// `NaN`, `null` answered `0`, `true` answered `1`, `1.5` answered `1.5` typed
+// `i32`, and a list SHORTER than what the caller read answered the enclosing
+// OBJECT as a number. `failed()` kept answering `None` through all of it, so
+// every gate written on it — the `[rpc]` route's `decode_failed`, which does
+// consult it — passed, and a malformed frame routed as a well-formed call.
+//
+// One pin per row of the find's own table, because each reaches the gate
+// differently, plus the arity check and a control. The wire does not move:
+// only malformed input changes behaviour, which is what the frame-level
+// suites (`service_layer`, `reactive_channels`, `rpc_http`) hold.
+
+/// Two `i32`s read out of one JSON list — the find's own shape, with `rpc`
+/// taken out of it. Answers either what it read or the first decode failure.
+const JSON_READER_TWO: &str = r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun read_two(text: str): str {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text(text));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let left: i32 = i32::rebuild(&mut deserializer);
+            let right: i32 = i32::rebuild(&mut deserializer);
+            match (deserializer.failed)() {
+                Some(let reason) => i"refused:{reason}",
+                None => i"read:{left},{right}",
+            }
+        }
+    "#;
+
+/// The control, and it comes first: a well-formed document still reads.
+#[test]
+fn the_json_reader_still_reads_a_well_formed_list() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1,2]}}\")); }}\n"
+        ),
+        "read:1,2\n",
+    );
+}
+
+/// A SHORT list: the second read runs past the list into the request object,
+/// which used to answer `NaN` unpoisoned. This is the row the find opened on.
+#[test]
+fn the_json_reader_refuses_a_list_shorter_than_the_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1]}}\")); }}\n"
+        ),
+        "refused:expected a number, found an object\n",
+    );
+}
+
+/// An EMPTY list — the `args: []` an arbitrary HTTP caller sends.
+#[test]
+fn the_json_reader_refuses_an_empty_list_where_a_value_is_read() {
+    assert_compiles_and_runs(
+        &format!("{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[]}}\")); }}\n"),
+        "refused:expected a number, found an object\n",
+    );
+}
+
+/// A STRING where a number is read: `Number("x")` is `NaN`.
+#[test]
+fn the_json_reader_refuses_a_string_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[\\\"x\\\",2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found a string\n",
+    );
+}
+
+/// `null` where a number is read: `Number(null)` is `0`, which is a value the
+/// caller never sent.
+#[test]
+fn the_json_reader_refuses_a_null_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[null,2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found null\n",
+    );
+}
+
+/// `true` where a number is read: `Number(true)` is `1`.
+#[test]
+fn the_json_reader_refuses_a_boolean_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[true,2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found a boolean\n",
+    );
+}
+
+/// A FRACTION where an integer is read — the wrong kind wearing the right one:
+/// `1.5` is a JSON number, and `1.5` typed `i32` is a value outside its type.
+#[test]
+fn the_json_reader_refuses_a_fraction_where_an_integer_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1.5,2]}}\")); }}\n"
+        ),
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// And the same rule on the unsigned lane, where the value out of its type is
+/// a negative one.
+#[test]
+fn the_json_reader_refuses_a_negative_number_where_an_unsigned_is_read() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun main() {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("{\"args\":[-1]}"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let only: u32 = u32::rebuild(&mut deserializer);
+            match (deserializer.failed)() {
+                Some(let reason) => print(i"refused:{reason}"),
+                None => print(i"read:{only}"),
+            }
+        }
+        "#,
+        "refused:expected a non-negative number, found -1\n",
+    );
+}
+
+/// The OPENERS take the same gate. A document whose `args` is not a list at
+/// all used to walk into `elements()` on a non-array and read indices off it.
+#[test]
+fn the_json_reader_refuses_a_non_list_where_a_list_is_opened() {
+    assert_compiles_and_runs(
+        &format!("{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":7}}\")); }}\n"),
+        "refused:expected an array, found a number\n",
+    );
+}
+
+/// And a struct read of a document that is not an object at all. This one was
+/// not merely wrong: `has_json_field` is `Object.hasOwn`, which THROWS on
+/// `null`, so a `null` frame took the process rather than reporting — against
+/// the same never-crash contract A116 closed on the derive side.
+#[test]
+fn the_json_reader_refuses_a_null_document_where_a_field_is_read() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun main() {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("null"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            match (deserializer.failed)() {
+                Some(let reason) => print(i"refused:{reason}"),
+                None => print("read"),
+            }
+        }
+        "#,
+        "refused:expected an object, found null\n",
+    );
+}
+
+/// The ARITY check: a list LONGER than what the caller reads used to leave its
+/// tail on the value stack, where whatever read next took an element of it
+/// instead of the value it asked for. `end_list` is where that is caught — a
+/// caller that never closes its list (`std::rpc::open_request` leaves the
+/// argument list open for the route to pull from) simply never reaches it.
+#[test]
+fn the_json_reader_refuses_a_list_longer_than_the_reads_at_its_close() {
+    let program = |document: &str| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{{ Frame, Wire }};
+        fun main() {{
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("{document}"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let only: i32 = i32::rebuild(&mut deserializer);
+            (deserializer.end_list)();
+            match (deserializer.failed)() {{
+                Some(let reason) => print(i"refused:{{reason}}"),
+                None => print(i"read:{{only}}"),
+            }}
+        }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(&program("{\\\"args\\\":[1]}"), "read:1\n");
+    assert_compiles_and_runs(
+        &program("{\\\"args\\\":[1,2]}"),
+        "refused:a list had 1 element(s) left unread\n",
+    );
+}
+
+// --- B373: the scalar `FromJson` impls take the integer lanes' value check ---
+//
+// 2321790e gave the typed READER a whole-number rule and a non-negative rule
+// (`JsonReader::expect_integer`), and the scalar `from_json`/`from_json_value`
+// entry points went on parsing the document and handing the number through:
+// `i32::from_json("1.5")` answered `Ok(1.5)` — a value typed `i32` that is not
+// an integer — and `u32::from_json("-1")` answered `Ok(-1)`. One lane read two
+// ways, which is the shape of every hole in this file's history; the two now
+// share one predicate (`integer_lane_failure`).
+//
+// The derives ride on this: a `[derive(Json)]` field of type `i32` decodes
+// through `i32::from_json_value`, so a struct field is gated by the same rule.
+
+/// A fraction where an `i32` is asked for.
+#[test]
+fn b373_the_scalar_i32_from_json_refuses_a_fraction() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match i32::from_json("1.5") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// A negative where a `u32` is asked for.
+#[test]
+fn b373_the_scalar_u32_from_json_refuses_a_negative() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match u32::from_json("-1") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a non-negative number, found -1\n",
+    );
+}
+
+/// The kind gate that was already there still fires, and still says what it
+/// said: the lane check is an addition, not a replacement.
+#[test]
+fn b373_the_scalar_i32_from_json_still_refuses_a_string_by_kind() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match i32::from_json("\"x\"") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a number\n",
+    );
+}
+
+/// A DERIVED type's field takes the same rule, because the derive decodes each
+/// field through its type's `from_json_value` — which is the reason this is
+/// worth closing rather than a curiosity about a scalar entry point.
+#[test]
+fn b373_a_derived_json_field_refuses_a_fraction_in_an_integer_lane() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        [derive(Json)]
+        struct Row {
+            count: i32,
+        }
+        fun main() {
+            match Row::from_json("{\"count\":1.5}") {
+                Ok(let row) => print(i"read:{row.count}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// The controls, and they come last so a passing run proves the lanes still
+/// READ rather than that they stopped: a whole number, a negative one in the
+/// signed lane, and a fraction in the float lane, which has no such rule.
+#[test]
+fn b373_the_scalar_lanes_still_read_what_they_are_for() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            print(i"i32:{i32::from_json(\"42\").unwrap_or(0)}");
+            print(i"i32:{i32::from_json(\"-7\").unwrap_or(0)}");
+            print(i"u32:{u32::from_json(\"9\").unwrap_or(0u32)}");
+            print(i"f64:{f64::from_json(\"1.5\").unwrap_or(0.0)}");
+        }
+        "#,
+        "i32:42\ni32:-7\nu32:9\nf64:1.5\n",
+    );
+}
+
+// --- N117: the BINARY reader's kind-mismatch audit ---------------------------
+//
+// 2321790e closed the class on the JSON reader — a typed read that never
+// poisoned on the wrong kind or a short list. The binary codec is the other
+// codec, and the audit is the same one. Most of its shapes were already held:
+// the format is schema-ORDERED, so there is no kind on the wire to mismatch,
+// `expect(count)` refuses a read past the buffer, `read_length` refuses a
+// prefix longer than the frame (which is what bounds a hostile list COUNT — a
+// list cannot be read past its declared count, because the count is what the
+// generated rebuild loops on), and an unknown variant tag is poisoned by the
+// derive's own fallback arm, shared with JSON.
+//
+// Three were not, and each is a byte the writer never emits being read as
+// something the schema says is there: an `Option` marker that is neither 0 nor
+// 1 (any non-zero read as "present", so the value was taken one byte on — a
+// shifted read of whatever followed), a `bool` byte that is neither (read as
+// `true`), and a frame LONGER than the value it declares (a prefix read as the
+// whole, so a caller got a value that was never sent). Each answers a reason
+// naming both sides, as the JSON reader's do.
+
+/// The fixture: a two-field Wire type whose bytes are `[marker][i32][bool]`,
+/// with one byte of the encoding replaced. `at` is an index into the frame.
+fn binary_reader_program(mutation: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::binary::{{ decode_binary, encode_binary }};
+        import std::bytes::Bytes;
+        [derive(Wire)]
+        struct Flagged {{
+            tag: Option<i32>,
+            on: bool,
+        }}
+        fun show(bytes: Bytes): str {{
+            let back: Result<Flagged, str> = decode_binary(bytes);
+            match back {{
+                Ok(let value) => i"read:{{value.tag.is_some()}},{{value.on}}",
+                Err(let reason) => i"refused:{{reason}}",
+            }}
+        }}
+        fun with_byte(bytes: Bytes, at: usize, value: i32): Bytes {{
+            let copy = Bytes::alloc(bytes.len());
+            copy.copy_into(bytes, 0);
+            copy.set(at, value);
+            copy
+        }}
+        fun main() {{
+            let good = encode_binary(Flagged {{ tag = Some(7), on = true }});
+            {mutation}
+        }}
+        "#
+    )
+}
+
+/// The control, first: a well-formed frame still round-trips.
+#[test]
+fn n117_the_binary_reader_still_reads_a_well_formed_frame() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(good));"),
+        "read:true,true\n",
+    );
+}
+
+/// An `Option` marker byte that is neither 0 nor 1.
+#[test]
+fn n117_the_binary_reader_refuses_an_option_marker_that_is_neither_zero_nor_one() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(with_byte(good, 0, 7)));"),
+        "refused:expected an Option marker (0 or 1), found 7\n",
+    );
+}
+
+/// A `bool` byte that is neither 0 nor 1 — the last byte of this encoding.
+#[test]
+fn n117_the_binary_reader_refuses_a_boolean_byte_that_is_neither_zero_nor_one() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(with_byte(good, good.len() - 1, 5)));"),
+        "refused:expected a boolean (0 or 1), found 5\n",
+    );
+}
+
+/// A frame LONGER than the value it declares: the binary twin of the JSON
+/// reader's unread-element check.
+#[test]
+fn n117_the_binary_reader_refuses_a_frame_with_bytes_left_unread() {
+    assert_compiles_and_runs(
+        &binary_reader_program(
+            "let longer = Bytes::alloc(good.len() + 2);\n\
+             longer.copy_into(good, 0);\n\
+             print(show(longer));",
+        ),
+        "refused:frame has 2 byte(s) left unread\n",
+    );
+}
+
+/// And the shape that was already held, pinned so the audit's own claim is
+/// checked rather than asserted: a truncated frame is a decode failure.
+#[test]
+fn n117_the_binary_reader_refuses_a_truncated_frame() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(good.slice(0, good.len() - 1)));"),
+        "refused:unexpected end of frame\n",
+    );
+}
+
+/// A string whose length prefix claims more than the frame holds — the other
+/// shape the audit names, over a type whose encoding is a length-prefixed
+/// string. The prefix is the first four bytes, little-endian.
+#[test]
+fn n117_the_binary_reader_refuses_a_string_length_past_the_frame() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::binary::{ decode_binary, encode_binary };
+        import std::bytes::Bytes;
+        fun main() {
+            let good = encode_binary("ada");
+            let copy = Bytes::alloc(good.len());
+            copy.copy_into(good, 0);
+            copy.set(0, 200);
+            let back: Result<str, str> = decode_binary(copy);
+            match back {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:length prefix exceeds frame\n",
+    );
+}
+
+#[test]
+fn a_fractional_list_index_is_refused_at_the_subscript() {
+    // The reported program, whole: it checked clean and died at
+    // `found.len()` with `Cannot read properties of undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: List<str> = ["a", "b"];
+            let at: f64 = 1.5;
+            let found: str = xs[at];
+            print(i"{found.len()}");
+        }
+        "#,
+        "an index must be a `usize`, and this one is `f64`",
+    );
+}
+
+#[test]
+fn a_str_list_index_is_refused_at_the_subscript() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: List<str> = ["a", "b"];
+            print(xs["a"]);
+        }
+        "#,
+        "an index must be a `usize`, and this one is `str`",
+    );
+}
+
+#[test]
+fn a_bool_list_index_is_refused_at_the_subscript() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: List<str> = ["a", "b"];
+            print(xs[true]);
+        }
+        "#,
+        "an index must be a `usize`, and this one is `bool`",
+    );
+}
+
+#[test]
+fn the_subscript_write_form_checks_its_index_too() {
+    // `xs[k] = v` is the same `Expr::Index`, and it was accepted as readily.
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut xs: List<str> = ["a", "b"];
+            xs["k"] = "v";
+        }
+        "#,
+        "an index must be a `usize`, and this one is `str`",
+    );
+}
+
+#[test]
+fn a_fixed_array_index_is_checked_at_the_same_position() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: [i32; 3] = [1, 2, 3];
+            let at: f64 = 0.5;
+            print(xs[at]);
+        }
+        "#,
+        "an index must be a `usize`, and this one is `f64`",
+    );
+}
+
+#[test]
+fn an_i32_index_still_reads_a_list_an_array_and_a_write() {
+    // The control, and the reason the check is exactly `usize`: every spelling
+    // that worked goes on working — a literal, a `usize` binding, a loop
+    // counter, a fixed array, and the write form.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs: List<str> = ["a", "b", "c"];
+            let at: usize = 1;
+            print(xs[0]);
+            print(xs[at]);
+            xs[2] = "z";
+            print(xs[2]);
+            let fixed: [i32; 3] = [4, 5, 6];
+            print(fixed[at]);
+            mut total = 0;
+            mut index = 0;
+            for _slot in fixed {
+                total += fixed[index];
+                index += 1;
+            }
+            print(total);
+        }
+        "#,
+        "a\nb\nz\n5\n15\n",
+    );
+}
+
+// --- A126: `Display` on the sized numeric family ------------------------------
+//
+// `display.vl` implemented `Display` for `str`, `i32`, `f64`, `bool`, `u32` and
+// `BigInt` only, so a `T: Display` bound refused every sized width while
+// interpolation of the same value worked (index-type.md §12 F-f). One pin per
+// width, each THROUGH the bound — interpolation alone never asked the trait.
+// The item named `i64`/`u64`, which are not types (renamed to `i53`/`u53`,
+// numeric-types.md §3); the width it missed is `f32`.
+
+#[track_caller]
+fn assert_displays_through_a_bound(type_name: &str, literal: &str, expected: &str) {
+    let source = format!(
+        r#"
+        import std::{{ io::print, display::{{ Display, format }} }};
+
+        fun show<T: Display>(value: T): str {{
+            value.to_string()
+        }}
+
+        fun main() {{
+            let value: {type_name} = {literal};
+            print(show(value));
+            print(format(value));
+            let values: List<{type_name}> = [value, value];
+            print(values.join("|"));
+        }}
+        "#
+    );
+    assert_compiles_and_runs(
+        &source,
+        &format!("{expected}\n{expected}\n{expected}|{expected}\n"),
+    );
+}
+
+#[test]
+fn a126_i8_displays_through_a_bound() {
+    assert_displays_through_a_bound("i8", "-5i8", "-5");
+}
+
+#[test]
+fn a126_u8_displays_through_a_bound() {
+    assert_displays_through_a_bound("u8", "200u8", "200");
+}
+
+#[test]
+fn a126_i16_displays_through_a_bound() {
+    assert_displays_through_a_bound("i16", "-300i16", "-300");
+}
+
+#[test]
+fn a126_u16_displays_through_a_bound() {
+    assert_displays_through_a_bound("u16", "65535u16", "65535");
+}
+
+#[test]
+fn a126_i53_displays_through_a_bound() {
+    assert_displays_through_a_bound("i53", "-9007199254740992i53", "-9007199254740992");
+}
+
+#[test]
+fn a126_u53_displays_through_a_bound() {
+    assert_displays_through_a_bound("u53", "9007199254740992u53", "9007199254740992");
+}
+
+#[test]
+fn a126_f32_displays_through_a_bound() {
+    assert_displays_through_a_bound("f32", "1.5f32", "1.5");
 }

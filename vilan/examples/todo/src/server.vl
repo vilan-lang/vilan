@@ -6,6 +6,10 @@
 // carries the list's changes out to every subscribed tab. One chain, three
 // claims on the port: the service's routes, the build's artifacts, and the
 // page for everything else.
+//
+// This file shares the package's `prelude = "std::web"` — that is what gives
+// `print` below with no import. Everything a server reaches beyond it is
+// one-layer and in no prelude by rule, so the process modules are named.
 
 import std::build::require_build;
 import std::document::Document;
@@ -39,7 +43,10 @@ async fun main() {
 		.port(59386)
 		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
 		.serve_build(build)
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_request(|request| Response::builder()
+			.set_header("Content-Type", "text/html")
+			.body(page)
+			.build())
 		.on_start(|server| print(i"todo server: {server.url()} — open it in two tabs"))
 		.build()
 		.start();

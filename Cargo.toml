@@ -5,8 +5,25 @@ members = [
     "crates/vilan-cli",
     "crates/vilan-lsp",
     "crates/vilan-ide",
-    "crates/vilan-embedded-std",
+    "crates/vilan-embedded",
     "crates/vilan-wasm",
+    # The emit-Rust backend (tracker F1, slice S1a): the emitter, and the
+    # runtime the programs it emits link against. `vilan-rt` is a member so the
+    # workspace's own gates (fmt, clippy, its unit tests) reach it — it is NOT a
+    # dependency of any other member, because the compiler never links it. What
+    # links it is the cargo project `vilan build --backend rust` writes, through
+    # a path dependency on this directory.
+    "crates/vilan-rust",
+    "crates/vilan-rt",
+    # F18 slice 2, Order 39's R1: the ONE runtime surface that needs a crates.io
+    # dependency (SQLite) lives apart from the dependency-free `vilan-rt`, and a
+    # program that does not reach `std::db` never links it.
+    "crates/vilan-rt-sqlite",
+    # F40 (RULED (a), Order 42): OS randomness needs a dependency or `unsafe`,
+    # and `vilan-rt` takes neither — so `getrandom`, with the SHA-512 family,
+    # HMAC and PBKDF2 beside it, is a second optional crate, linked only by a
+    # program that reaches one of them.
+    "crates/vilan-rt-crypto",
 ]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace
@@ -43,10 +60,16 @@ type_complexity = "allow"
 # one walk across two namespaces.
 only_used_in_recursion = "allow"
 # `Node`, the parser's type forms and the formatter's layout enum are hot AST
-# enums matched in the innermost loops of every phase. Boxing the large variant
-# to even the sizes trades a memcpy the profiler never showed for a pointer chase
-# on every match — a performance decision, made in the other direction, that the
-# lint is not in a position to make.
+# enums matched in the innermost loops of every phase, so whether to box a wide
+# variant is a performance decision the lint is not in a position to make: it
+# fires on a size RATIO between variants and knows nothing about which of them
+# the parser RETURNS. It is still allowed — but the reason recorded here used to
+# be "a memcpy the profiler never showed", and the profiler showed it. M32
+# measured `Node::Func`'s inlined `Func` at 312 of the enum's 320 bytes, paid on
+# every expression the precedence tower moves up its recursion; boxing that one
+# variant took the enum to 144 and a cold kolt client check down 3.2% of its
+# instructions. The judgement lives where a profile can reach it —
+# `crates/vilan-core/tests/node_size.rs` pins the width as a measured ceiling.
 large_enum_variant = "allow"
 
 # Distributed binaries carry no symbol tables (smaller, and fewer places for

@@ -1,6 +1,6 @@
 //! Route-chunk planning — bundle splitting's S1, analysis only
 //! (proposal/bundle-splitting.md). Finds the splittable route matches (a
-//! `match` on a `View.swap` render closure's parameter), attributes each
+//! `match` on a `swap` render closure's parameter), attributes each
 //! arm's calls by SPAN NESTING (a call belongs to the arm whose body span
 //! contains it — no expression walker needed), and partitions the call
 //! graph: reachable from the eager root (`main` + module bindings, with
@@ -40,24 +40,31 @@ pub struct ChunkPlan {
     pub shared_functions: usize,
     pub chunks: Vec<Chunk>,
     /// Where a split build wires the route gate: the recognized `swap` calls
-    /// and the two methods involved. `None` when nothing splits — and then the
-    /// emitter changes no call, which is what makes the flag's absence
-    /// byte-identical (`bundle-splitting.md` §4).
+    /// and the pair of free functions involved. `None` when nothing splits —
+    /// and then the emitter changes no call, which is what makes the flag's
+    /// absence byte-identical (`bundle-splitting.md` §4).
     pub gate: Option<Gate>,
 }
 
-/// The gate wiring for one entry (`bundle-splitting.md` §2). `View.swap`'s
-/// render closure is `sync` and cannot await a chunk, so the wait moves
-/// upstream: the recognized calls are emitted against `View.swap_split`, which
-/// holds a gated signal and advances it only once the arm's chunk has landed.
+/// The gate wiring for one entry (`bundle-splitting.md` §2). `swap`'s render
+/// closure is `sync` and cannot await a chunk, so the wait moves upstream: the
+/// recognized calls are emitted against `std::ui::swap_split`, which holds a
+/// gated signal and advances it only once the arm's chunk has landed.
 pub struct Gate {
     /// The `swap` call ids the emitter retargets.
     pub calls: Vec<Id>,
-    /// `View.swap` — what those calls resolve to today.
-    pub swap: Id,
-    /// `View.swap_split` — what they resolve to in a split build. Same shape,
-    /// so the call's own type binding carries over by position.
-    pub swap_split: Id,
+    /// The retarget table: what a recognized call resolves to today, what it
+    /// resolves to in a split build, and WHICH ARGUMENT of the emitted call is
+    /// the route source (the boot preload reads it by position).
+    ///
+    /// ONE entry since A99: `swap` is the free VALUE form
+    /// (`{swap(route, render)}` in a child hole) and nothing else — the
+    /// `View.swap` METHOD, whose emitted call carried its receiver first and so
+    /// read its route source at argument 1, is retired. The free form's source
+    /// is argument 0, and it retargets to the free `swap_split`, which declares
+    /// the same generics in the same order — so the call's own type binding
+    /// carries over by position.
+    pub retarget: Vec<(Id, Id, usize)>,
     /// `std::ui::chunk_preload` — the boot preload the emitter plants ahead of
     /// the statement that mounts the swap (`bundle-splitting.md` §S3). Declares
     /// the same generics as `swap_split` in the same order, so the gate call's
@@ -87,10 +94,19 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
         chunks: Vec::new(),
         gate: None,
     };
-    let Some(swap_fn) = view_method(program, "swap") else {
+    // The ONE shape a route swap is written in since A99: the free `swap`
+    // VALUE placed in a child hole. The `View.swap` method it used to share the
+    // name with was retired, so name alone is an answer again — but the lookup
+    // still excludes impl members, because a user type is free to declare a
+    // `swap` method of its own and it is not this one.
+    let mut recognized: Vec<Id> = Vec::new();
+    if let Some(value) = std_free_function(program, "swap") {
+        recognized.push(value);
+    }
+    if recognized.is_empty() {
         return empty;
-    };
-    let sites = splittable_sites(program, swap_fn);
+    }
+    let sites = splittable_sites(program, &recognized);
     if sites.is_empty() {
         return empty;
     }
@@ -175,7 +191,9 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
             .is_none_or(|source| program.std_sources.contains(&source))
         {
             // Std is never chunked — it is the shared runtime, eager by
-            // residence (and mostly tree-shaken anyway). App code is
+            // residence (and mostly tree-shaken anyway; `std_sources` is the
+            // residence set, E198, so an overlaid std copy is still std here).
+            // App code is
             // chunkable wherever it lives: entry-only would plan ZERO chunks
             // for the common real shape (pages in a `views` module — the
             // walkthrough example), which S1's sweep caught.
@@ -217,12 +235,22 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
     chunks.retain(|chunk| !chunk.functions.is_empty());
 
-    let gate = view_method(program, "swap_split")
-        .zip(std_function(program, "chunk_preload"))
-        .map(|(swap_split, preload)| Gate {
+    // The retarget table for the one shape recognized above: the value form's
+    // emitted call carries no receiver, so its route source is argument 0. A
+    // shape whose gated twin is missing simply degrades away rather than
+    // breaking a build.
+    let mut retarget: Vec<(Id, Id, usize)> = Vec::new();
+    if let Some((from, to)) =
+        std_free_function(program, "swap").zip(std_free_function(program, "swap_split"))
+    {
+        retarget.push((from, to, 0));
+    }
+    let gate = (!retarget.is_empty())
+        .then(|| std_function(program, "chunk_preload"))
+        .flatten()
+        .map(|preload| Gate {
             calls: sites.iter().map(|site| site.call).collect(),
-            swap: swap_fn,
-            swap_split,
+            retarget,
             preload,
         });
     ChunkPlan {
@@ -285,23 +313,27 @@ impl SplitCost {
     }
 }
 
-/// A std `View` method by name, when the browser layer is loaded.
-fn view_method(program: &Program<'_>, name: &str) -> Option<Id> {
-    let view_struct = program.structs.iter().find_map(|(id, struct_)| {
-        (struct_.name == "View"
-            && program
-                .source_of(*id)
-                .is_some_and(|source| program.std_sources.contains(&source)))
-        .then_some(*id)
-    })?;
-    program.implementations.iter().find_map(|implementation| {
-        matches!(
-            program.type_id_to_type_map.get(&implementation.subject),
-            Some(crate::type_::Type::Struct(id, _)) if *id == view_struct
-        )
-        .then(|| implementation.declarations.get(name).copied())
-        .flatten()
-    })
+/// A free std function by name that is NOT an impl member — `std::ui::swap`,
+/// A85's value form. A99 retired the `View.swap` METHOD it used to share the
+/// name with, but the member exclusion stays: a USER type may declare a `swap`
+/// method of its own, and an impl member is never the function this gate wires.
+fn std_free_function(program: &Program<'_>, name: &str) -> Option<Id> {
+    let members: HashSet<Id> = program
+        .implementations
+        .iter()
+        .flat_map(|implementation| implementation.declarations.values().copied())
+        .collect();
+    program
+        .functions
+        .iter()
+        .find(|(id, function)| {
+            function.name == name
+                && !members.contains(id)
+                && program
+                    .source_of(**id)
+                    .is_some_and(|source| program.std_sources.contains(&source))
+        })
+        .map(|(id, _)| *id)
 }
 
 /// A free std function by name — restricted to std sources, so an app function
@@ -391,15 +423,15 @@ impl Arm {
     }
 }
 
-/// The recognized splittable sites: calls to `swap` whose last closure
-/// argument's body is a `match` on that closure's parameter.
-fn splittable_sites(program: &Program<'_>, swap_fn: Id) -> Vec<Site> {
+/// The recognized splittable sites: calls to any of the `swap` shapes whose
+/// last closure argument's body is a `match` on that closure's parameter.
+fn splittable_sites(program: &Program<'_>, swap_fns: &[Id]) -> Vec<Site> {
     let mut sites = Vec::new();
     for (call_id, call) in &program.function_calls {
         let Some(Expr::Local(target)) = program.entity_map.get(&call.subject_id) else {
             continue;
         };
-        if *target != swap_fn {
+        if !swap_fns.contains(target) {
             continue;
         }
         let Some(closure_id) = call.argument_ids.iter().rev().find_map(|argument| {

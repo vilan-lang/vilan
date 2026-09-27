@@ -1,0 +1,25 @@
+// A `usize` subtracted past zero (tracker I5, ruling 2; proposal/index-type.md
+// §5): the result is UNSPECIFIED, never memory-unsafe. On JS the value leaves
+// the type's range and goes negative — nothing traps, and every subscript's
+// bounds check still stands between it and a list. Natively Rust's own rule
+// applies: a debug build panics (`attempt to subtract with overflow`). The two
+// backends legitimately print different things, so this program is named OUT
+// of the native differential (`native_differential.rs`'s
+// `OUTSIDE_THE_DIFFERENTIAL`), and its golden is the JS behaviour.
+
+// A function boundary keeps the subtraction a RUNTIME one: rustc refuses a
+// constant underflow at compile time (`arithmetic_overflow`).
+fun step_back(at: usize): usize {
+	at - 1
+}
+
+fun main() {
+	let first: usize = 0;
+	let under = step_back(first);
+	print(i"{under}");
+	print(under < first);
+	// What a program that wants a defined answer writes instead.
+	print(first.checked_sub(1).is_none());
+	let floor = first.saturating_sub(1);
+	print(i"{floor}");
+}

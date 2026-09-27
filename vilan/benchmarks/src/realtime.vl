@@ -4,11 +4,11 @@
 // first mutation to every session having observed the final value.
 
 import std::http::{ Response, Server };
-import std::json::{ FromJson, Json, json_codec };
-import std::option::Option::{ None, Some, self };
 import std::io::print;
+import std::json::{ FromJson, Json, json_codec };
+import std::option::Option::{ self, None, Some };
 import std::reactive::{ Signal, SignalCell, Subscription };
-import std::result::Result::{ Err, Ok, self };
+import std::result::Result::{ self, Err, Ok };
 import std::rpc::{
 	DuplexEnd,
 	DuplexTransport,
@@ -25,6 +25,8 @@ import std::shared::Shared;
 import std::time::{ now_millis, sleep };
 import std::wire::Frame;
 import pkg::report::{ round, section };
+
+export *;
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
@@ -98,7 +100,7 @@ fun watch(base: str): Session {
 		},
 		Err(let error) => print("attach failed"),
 	}
-	Session { frames = frames, last_seen = last_seen, watching = watching }
+	Session { frames, last_seen, watching }
 }
 
 fun run(finished: || void) {
@@ -145,7 +147,10 @@ fun drive(port: i32, finished: || void) {
 	}
 	// Poll until every session has observed the final value (or 5s).
 	mut waited = 0;
-	for (alice.last_seen.read() != mutations || bob.last_seen.read() != mutations || carol.last_seen.read() != mutations) && waited < 5000 {
+	for (alice.last_seen.read() != mutations
+		|| bob.last_seen.read() != mutations
+		|| carol.last_seen.read() != mutations)
+		&& waited < 5000 {
 		sleep(20);
 		waited += 20;
 	}

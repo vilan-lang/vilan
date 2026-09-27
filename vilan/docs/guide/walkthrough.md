@@ -32,6 +32,7 @@ follows keystroke by keystroke.
 ```toml
 [package]
 name = "notes"
+prelude = "std::web"
 
 [entry.client]
 target = "browser"
@@ -53,9 +54,16 @@ walkthrough/
 ```
 
 One package, two entries ([Platforms](../tour/platforms.md) introduced
-this layout). There is no client/server directory split and no shared
-`common` package. Every file is visible to both entries, and the
-compiler sorts out what may run where by what each entry reaches.
+this layout). `prelude = "std::web"` is the other line worth reading: it
+puts `Signal`, `SignalCell`, `view`, `View` and the modules `style` and
+`ui` in scope in every file below with no `import`, which is why the
+snippets that follow have such short import blocks (see [the prelude
+key](../tour/projects.md#the-prelude-key)). It is a *package* key, so
+both entries share it — every name in the set exists on node too, so the
+server leg loses nothing by it. There is no client/server directory
+split and no shared `common` package. Every file is visible to both
+entries, and the compiler sorts out what may run where by what each
+entry reaches.
 `store.vl` uses SQLite freely because only the server entry calls into
 it; if client code ever reached that far, the build would fail with the
 call chain.
@@ -106,7 +114,7 @@ struct NotesStore {
 
 Why module-level, and not a field on `NotesStore`? A `Database` is a
 `resource`: it has a single owner, it *moves* rather than copies, and it closes
-itself when its owner's scope ends. A struct that owns a resource is itself a
+itself at its owner's last use. A struct that owns a resource is itself a
 resource. `[service]` generates a dispatcher that captures the store into
 one closure per `[rpc]` method, which a resource can't be (a closure capturing a
 resource is the double-owner bug the class exists to prevent). So the long-lived
@@ -288,15 +296,15 @@ routed app `show`s once it isn't. Signing in stores the token; signing
 out removes it and navigates home.
 
 **The list page.** An add form bound to a local signal, and the list
-itself, one keyed `bind_each` over the mirror:
+itself, one keyed `each` over the mirror:
 
 ```vilan,fragment
-.child(view("ul").bind_each(notes, |note| note.id, |note| note_row(client, note, token)))
+.child(view("ul").child(each(notes, |note| note.id, |note| note_row(client, note, token))))
 ```
 
 That single line is the live sync. When any client adds or deletes a
 note, the mirror updates and the keyed rows reconcile
-([Building UI](ui.md#lists-bind_each)).
+([Building UI](ui.md#lists-each)).
 
 **The editor.** The note page finds its note in the mirror, waits for it
 under `when(present)` (so a deep link shows "loading…" until the first
@@ -353,7 +361,7 @@ there is nothing left for one to do.
 | the package, its two entries | [Hello Vilan](../tour/hello-vilan.md), [Platforms](../tour/platforms.md) |
 | `Note`, derives, the enums | [Data & traits](../tour/data-and-traits.md) |
 | signals, effects, drafts | [Reactive state](reactive.md) |
-| views, `bind_each`, `when`, `show` | [Building UI](ui.md) |
+| views, `each`, `when`, `show` | [Building UI](ui.md) |
 | the `const` styles | [Styling](styling.md) |
 | the route enum, `swap`, `link` | [Routing](routing.md) |
 | `[service]`, mirrors, reconnect | [Services & RPC](services.md) |

@@ -20,7 +20,9 @@
 //! prefilter (riding `for_each_child`, like lift's mark detection) leaves
 //! untouched nodes unrebuilt.
 
-use crate::node::{Closure, ElementBody, ElementHeadItem, If, Node, NodeIfBranch, NodeList};
+use crate::node::{
+    Closure, ElementBody, ElementChild, ElementHeadItem, If, Node, NodeIfBranch, NodeList,
+};
 use crate::span::{Span, Spanned};
 
 /// Rewrite every element in a parsed tree, in place. Called at each
@@ -59,7 +61,7 @@ fn desugar<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Element(body) => {
             // Interior first: head links, handlers, attribute values, and
             // children may themselves contain elements.
-            let body = desugar_interior(body, source);
+            let body = desugar_interior(*body, source);
             build_chain(body, span, source)
         }
         other => descend((other, span), source),
@@ -97,15 +99,34 @@ fn build_chain<'src>(
         children,
         self_closing: _,
         close_tag: _,
+        // The desugar retires the element before analysis; the angle brackets
+        // it recorded are read from the RAW tree by the editor (E115).
+        punctuation: _,
     } = body;
+    // A46: the nameless head is a FRAGMENT, and its lowering is not a chain at
+    // all — `<>a b</>` IS the list `[a, b]`, a `List<View>` LITERAL, which the
+    // child contract's static `List<View>` arm already places and whose
+    // reactive twin keeps its position through A71's region. No runtime type
+    // is introduced: the fragment's TYPE is `List<View>`, legal in child
+    // position and wherever a list is.
+    let Some(tag) = tag else {
+        let items: NodeList<'src> = children.into_iter().map(ElementChild::into_node).collect();
+        return (Node::List(items), span);
+    };
     let tag_text = &source[tag.into_range()];
-    // The generated `view` accessor spans `<tag` — an unresolved `view` (the
-    // import is missing) then underlines the element head itself, which is
-    // what the user wrote. The tailored import note rides S4 with the docs.
+    // The generated `view` reference spans `<tag`, so a diagnostic about the
+    // view underlines the element head itself, which is what the user wrote.
+    //
+    // It is a `StdItem` (B270), not a bare accessor: `<div />` means
+    // `std::ui::view` whatever `view` names at the site, so a local `view`
+    // binding — a `let`, a `fun`, an icon set's generated `view` (A35's find)
+    // — no longer captures the desugar's callee, and the loader seeds
+    // `std::ui` off the reference rather than off an import the author must
+    // remember.
     let head_span: Span = (span.start..tag.end).into();
     let mut chain: Spanned<Node<'src>> = (
         Node::Call(
-            Box::new((Node::Accessor("view"), head_span)),
+            Box::new((Node::StdItem("ui", "view"), head_span)),
             None,
             (vec![(Node::String(tag_text), tag)], tag),
         ),
@@ -240,9 +261,14 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             return_type,
             return_value: desugar_boxed(return_value, source),
         }),
-        Node::Let(name, annotation, value, mutable) => {
-            Node::Let(name, annotation, desugar_opt(value, source), mutable)
-        }
+        Node::Let(name, annotation, value, mutable, lazy, labels) => Node::Let(
+            name,
+            annotation,
+            desugar_opt(value, source),
+            mutable,
+            lazy,
+            labels,
+        ),
         Node::LetDestructure(pattern, annotation, value, mutable) => {
             Node::LetDestructure(pattern, annotation, desugar_opt(value, source), mutable)
         }
@@ -274,13 +300,13 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Repeat(value, length) => {
             Node::Repeat(desugar_boxed(value, source), desugar_boxed(length, source))
         }
-        Node::StructInitializer(name, generics, mut fields) => {
+        Node::StructInitializer(namespace, name, generics, mut fields) => {
             for field in fields.0.iter_mut() {
                 if let Some(value) = field.0.1.as_mut() {
                     take_and_desugar(value, source);
                 }
             }
-            Node::StructInitializer(name, generics, fields)
+            Node::StructInitializer(namespace, name, generics, fields)
         }
         Node::Binary(op, left, right) => Node::Binary(
             op,
@@ -295,10 +321,12 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Await(inner) => Node::Await(desugar_boxed(inner, source)),
         Node::Async(inner) => Node::Async(desugar_boxed(inner, source)),
         Node::FuncReturn(value) => Node::FuncReturn(desugar_opt(value, source)),
-        Node::Export(inner) => Node::Export(desugar_boxed(inner, source)),
+        Node::Export(scope, inner, labels) => {
+            Node::Export(scope, desugar_boxed(inner, source), labels)
+        }
         Node::Const(inner) => Node::Const(desugar_boxed(inner, source)),
         Node::Derive(names, inner) => Node::Derive(names, desugar_boxed(inner, source)),
-        Node::Service(name, inner) => Node::Service(name, desugar_boxed(inner, source)),
+        Node::Service(attribute, inner) => Node::Service(attribute, desugar_boxed(inner, source)),
         Node::MacroAttribute(name, name_span, arguments, inner) => {
             Node::MacroAttribute(name, name_span, arguments, desugar_boxed(inner, source))
         }
@@ -306,13 +334,13 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             desugar_list(&mut items.0, source);
             Node::Module(name, items)
         }
-        Node::Impl(subject, traits, mut members) => {
+        Node::Impl(subject, traits, mut members, labels) => {
             desugar_list(&mut members.0, source);
-            Node::Impl(subject, traits, members)
+            Node::Impl(subject, traits, members, labels)
         }
-        Node::Trait(name, generics, supertraits, mut members) => {
+        Node::Trait(name, generics, supertraits, mut members, labels) => {
             desugar_list(&mut members.0, source);
-            Node::Trait(name, generics, supertraits, members)
+            Node::Trait(name, generics, supertraits, members, labels)
         }
         Node::Lift(subject, continuation) => Node::Lift(
             desugar_boxed(subject, source),
@@ -361,11 +389,13 @@ fn descend_if<'src>(branch: NodeIfBranch<'src>, source: &'src str) -> NodeIfBran
     }
 }
 
+// In place, in the box the tree already owns — see `css::desugar_boxed`.
 fn desugar_boxed<'src>(
-    node: Box<Spanned<Node<'src>>>,
+    mut node: Box<Spanned<Node<'src>>>,
     source: &'src str,
 ) -> Box<Spanned<Node<'src>>> {
-    Box::new(desugar(*node, source))
+    take_and_desugar(&mut node, source);
+    node
 }
 
 fn desugar_opt<'src>(

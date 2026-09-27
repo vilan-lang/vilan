@@ -2,8 +2,18 @@
 # `browser`-target package, so a plain `vilan build .` emits `client.js` next to
 # `index.html` — no `--target` flag needed. Sources sit at the package root, so
 # `root` is `.`.
+#
+# `prelude` names the ambient scope every file here resolves under — the names in
+# scope with no import (`proposal/prelude.md` §5). `std::web` is the set for
+# applications: the base seven (`print`, `Option`/`Some`/`None`,
+# `Result`/`Ok`/`Err`) plus `Signal`, `SignalCell`, `view` and `View`, plus the
+# MODULES `style` and `ui`. This example deliberately reaches for none of the
+# framework names — it is the raw-DOM floor — so the key deletes no import from
+# `client.vl`; it is here because a browser app's ambient scope is the web set,
+# and `../reactive-ui` is where you can watch it do work.
 [package]
 name = "browser_demo"
 root = "."
 entry = "client.vl"
 target = "browser"
+prelude = "std::web"

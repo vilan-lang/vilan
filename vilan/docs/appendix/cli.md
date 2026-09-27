@@ -86,8 +86,17 @@ its own, with the default prelude and no dependencies.
   ([the dev loop](../guide/dev-loop.md#shipping-routes-separately)).
 - `--explain`: after the build, print where every output came from — see
   below.
-- `--backend js`: the only backend today; the flag exists so a future
-  one has somewhere to live.
+- `--backend <js|rust>`: which emitter runs. `js` is the default. `rust`
+  emits the program as Rust, writes a cargo project under `dist/native/`
+  and builds it with the host's `cargo` — **in debug**, because rustc is
+  the inner loop from there on (`--release` is yours to run over the
+  generated project). It is a first cut whose scope is structs, enums,
+  `Option`/`Result`, `str`, `List`, `Map`/`Set`, closures, `impl`s,
+  `print` and `panic`; anything outside that — a generic function, a
+  module-level binding, `async`, any host binding — is refused by name
+  rather than mis-compiled. [Native binaries](../guide/native.md) has the
+  whole list. `vilan run --backend rust` runs the binary it built; it
+  takes no `--watch`.
 
 Every build of a `browser` entry writes `<name>.chunks.json`, the leg's
 build manifest — what it emitted, for `std::build::build_of` to read. A
@@ -185,6 +194,30 @@ nothing, and runs no `[build] run` hooks. Same path forms and flags
 every entry, each under its own platform. Exit is non-zero when
 diagnostics were reported.
 
+**Writes nothing means nothing.** A check remembers its macro expansions
+across processes — that is what makes a second check of an unchanged package
+compile no macro world at all — and that memory lives under
+`~/.vilan/check-cache/`, keyed by the package's path, *not* in the package.
+`dist/.cache` belongs to `vilan build`, which has a `dist/` because it has
+artifacts; a check has neither, and creating one would make a read-only
+command mutate the tree it was pointed at. `vilan cache prune` sweeps the
+check tables beside the std trees.
+
+**`--fix`** is the one exception to "writes nothing", and it is asked for
+by name. Before checking, it applies the fix every **numeric mismatch**
+carries — the `.as_*()` conversion the message names, or `: usize` on a
+counter bound by a bare literal — to the package's own files (never to
+std or a dependency), analyzes again, and repeats until a round finds
+nothing more to fix; then it checks as usual and reports what is left.
+It prints one line first, `fixed 12 numeric mismatches in 3 files`. The
+edits are the editor's quick fixes (**Convert with `.as_usize()`**,
+**Declare `at` a `usize`**), computed by the same function, so the two
+never disagree. It is the migration tool for the release that moved
+std's positions, lengths and counts to [`usize`](../std/numbers.md): what
+it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
+arithmetic that should convert once at its end — stays a diagnostic, for
+a person. It cannot be combined with `--watch`.
+
 One thing it does that `build` does not: when the file has a **syntax
 error**, `check` reports it and then type-checks the rest of the file
 anyway. The parser recovers at the next statement or item boundary, so a
@@ -196,10 +229,30 @@ skipped statement — a function body that lost its result, a name whose
 declaration did not parse — are reported too, beside the syntax error
 that explains them.
 
+**Opt-in warnings: `[lints]`.** A few warnings are off unless a package asks
+for them, in its own `vilan.toml`:
+
+```toml
+[lints]
+internal_use = "warn"
+```
+
+`internal_use` warns at every import and use of an `[internal("reason")]`
+item outside the module that declares it — `` `anchor` is internal: place
+against it, never through it ``. The label on its own only changes what the
+editor shows (the name is hidden from completion, dimmed, and its hover leads
+with the reason); a package that wants the terminal to say so too sets the
+key. Each lint is `"allow"` (the default) or `"warn"`, and a lint name or a
+level the section does not have is a manifest error rather than a silent
+no-op. The section is read from the entry package's manifest; std's own uses,
+and a dependency's, are their authors' and never warn.
+
 ## `vilan run [file] [args…]`
 
 Builds and runs. Anything after the file is forwarded to the program.
-Reach it with `process::args()`. Under `--watch` it rebuilds and
+Reach it with `import std::process;` and `process::args()` — both lines:
+the qualified `std::process::args()` is a namespace path, not an
+expression. Under `--watch` it rebuilds and
 restarts on every save; in a project with a browser leg, hot module
 replacement is on by default: the page swaps changed code in place
 instead of reloading (see [the dev loop](../guide/dev-loop.md)).
@@ -228,6 +281,10 @@ is the current directory. Formatting is conservative and a fixed point:
   — the last included, so adding an entry is a one-line diff. One that
   fits stays inline *without* a trailing comma, so the comma marks a
   split and nothing else.
+- A struct literal's field written long where the shorthand says the same
+  thing — `A { x = x }` — is printed as the shorthand `A { x }`. The two are
+  one construct with two spellings, and the formatter picks one; a field whose
+  value is any other expression, `A { x = y }` included, is left as written.
 - Width is measured on a line, not on a statement: a construct that opens
   a line and continues below it — a block-bodied closure, a `match`, a
   block — is judged by the line it opens, and its body lines are measured
@@ -255,6 +312,13 @@ is the current directory. Formatting is conservative and a fixed point:
   and the body's `{` (or a bodyless `;`) riding the closing `)`. An empty
   parameter list never breaks, so a signature pushed over by its *name*
   stays long. A closure's parameters are never broken.
+- A block-bearing HEAD over the budget breaks at its own layout site: an
+  `if` or `for` condition, a `for … in` iterable, a `match` subject. Each of
+  those lines — `if <cond> {`, `for <name> in <iterable> {` — carries one
+  thing with a layout of its own, so that is where the break goes, at the
+  lowest-precedence operator and operator-leading. The permission stops at the
+  head: a loop body is a fresh statement list and a `match`'s legs earn their
+  own breaks from their own lines.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
 - A call's *argument* list is never wrapped, but the split reaches the
@@ -265,8 +329,29 @@ is the current directory. Formatting is conservative and a fixed point:
   above — an argument list sits inside an expression, where the builder
   convention decides layout, while a parameter list is a declaration's own
   contract and has no shape but one-per-line.
-- A `style()` builder chain's links are put in a canonical ORDER — the only
-  place `vilan fmt` reorders your code rather than re-laying it out. The order
+- An element HEAD's items are put in a canonical ORDER: `id`, `name`, `type`,
+  `for`, `href`, `src` lead, every other undotted attribute follows
+  alphabetically, then every `on:` handler alphabetically among themselves. A
+  DOTTED link (`.class(…)`, `.styled(…)`, `.child(…)`, one of your own) is a
+  **barrier** — it holds its position absolutely and items sort only within the
+  runs between barriers — because a link may write any slot it likes and the
+  formatter knows nothing about what yours writes. Two items naming the same
+  slot keep their written order, so a last-wins pair still wins the same way,
+  and a head with a comment anywhere inside it is left exactly as written. What
+  the reorder cannot change is what the element BUILDS: every moved item fills
+  a slot named by its own first argument, and an HTML start tag reads its
+  attributes as a set.
+- **The order the attribute VALUES run in is not preserved**, and that is the
+  one thing to know about the rule above. An attribute's value is an arbitrary
+  expression, so moving `title(a())` past `id(b())` moves when `a()` and `b()`
+  are called. In practice a value is a literal or a signal read and this cannot
+  be observed — it is the same bargain the `style()` order below ships with,
+  and the same one an argument list has always had. Where it can be observed,
+  the side effect is the smell rather than the sorter: lift it into a `let`
+  above the element, where its order is written down and a reader can see it.
+- A `style()` builder chain's links are put in a canonical ORDER — the element
+  head's sibling, reordering your code rather than re-laying it out, and taking
+  the same bargain about when its arguments run. The order
   is Tailwind CSS's category sequence (layout, flexbox/grid, spacing, sizing,
   typography, backgrounds, borders, effects, filters, tables,
   transitions/animation, transforms, interactivity, svg, accessibility), with
@@ -286,10 +371,77 @@ is the current directory. Formatting is conservative and a fixed point:
   before and after. `Style + Style` operands are never reordered: that merge's
   order is yours.
 - A file the formatter cannot yet print faithfully is left byte-for-byte
-  untouched, never half-formatted.
+  untouched, never half-formatted — and **said out loud**, not silently. One
+  `declined <file>:<line>` line names it and what the formatter met: a
+  construct the printer has no rule for yet, a reprint its own safety net
+  threw away, a reprint that is not a Vilan file, or a file that does not lex
+  or parse. The safety net is two checks, not one: the reprint must carry the
+  source's tokens, **and** it must read back as a Vilan file — the formatter
+  parses its own output before it writes anything. The second check is not
+  implied by the first, because the token comparison deliberately ignores an
+  insignificant trailing comma, so a printer that wrote one in the wrong place
+  would satisfy it with output nothing can parse. When the token check is the
+  one that fails, the line it names is where the reprint and your file stop
+  agreeing — found by bisecting the two token streams, not by naming the file's
+  first declaration.
 
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.
+
+**Comments are left exactly as you typed them, unless you ask.** The formatter
+lays code out to a width and leaves prose alone, so a `//` line runs as far as
+its author took it and a paragraph edited in the middle keeps its ragged
+lines. A package can opt into re-filling them:
+
+```toml
+[fmt]
+wrap_comments = true
+comment_width = 84
+```
+
+It re-fills a *paragraph* — a run of `//` (or `///`) lines with nothing but a
+newline between them — to `comment_width` columns, at that comment's own
+indentation. A blank `//` line is a paragraph break and stays one. Both keys
+are read from the nearest `vilan.toml` above the file, each on its own, so a
+workspace can set the width once and a member turn the wrapping off; unset
+means off, and with it off `vilan fmt` is byte-for-byte what it was.
+
+**`comment_width` is prose's own width, and it defaults to the code width**
+(100). Code has one canonical layout and no knob; comments are yours, and a
+tree whose prose is written narrower than its code — std's is written to 84 —
+would otherwise be re-filled to a width nobody chose the day it opted in. The
+key is read only when `wrap_comments` is on: with the knob off nothing is
+re-laid-out at any width.
+
+**Ten classes are never re-filled**, because re-wrapping them destroys
+something: fenced code blocks; list items (an item is a line, and joining two
+makes one); tables; headings; block quotes; a line with an interior run of two
+or more spaces (aligned columns, an ASCII drawing); section banners and
+horizontal rules (`// --- Placement ---`); toolchain directives such as
+`// witness:`; commented-out code; and license headers. A trailing comment
+after code is not re-filled either — it is not a paragraph, it is a note on a
+line. A URL or a `` `code span` `` longer than the width is never *broken* —
+it takes a line of its own and runs over, the way any unbreakable word does.
+No character is ever substituted: the fill moves whitespace between words and
+does nothing else, and it checks that afterwards. If a re-fill ever came out
+with different words, `vilan fmt` declines the file (exit 2) and names the
+comment rather than writing it.
+
+**So `wrap_comments = true` does not mean "no comment over the budget."** A
+paragraph in any of those ten classes keeps every column its author gave it, a
+hanging-indent list stays as deep and as long as it was written, and an
+unbreakable word runs past the width on a line of its own. The key says the
+formatter *may* re-fill ordinary prose, not that a grep for long lines will
+come back empty.
+
+**Three outcomes, three exit codes.** `0` is clean. `1` is "this tree is not
+formatted" — `--check` found files that would change, or a write failed. `2` is
+"the formatter could not format a file", the `declined` lines above it saying
+which and why, and it holds in both modes because a run that skipped a file
+wrote nothing for it either. `2` outranks `1`: a run that met a file it could
+not format has established nothing about the rest of the tree. Before this,
+every one of those ways out answered the file's own bytes, so `--check`
+reported a file the printer had bailed on as already-formatted.
 
 **Generated sources are skipped.** A package that declares
 `[package] generated = "…"` is saying that directory holds *products* — files
@@ -616,8 +768,8 @@ with a string that is none of the variants — but nothing has to: an
 exhaustive `match` on a backed enum traps and names the value rather than
 returning a confident wrong variant. Where an unrecognized value is an
 answer you expect rather than a bug, hand-edit the binding to the guarded
-shape: bind the raw `str` under a `[doc(hidden)]` name and forward through
-`Align::parse`, which returns `Option<Align>`. The generated file is
+shape: bind the raw `str` under a name the module does not `export` and
+forward through `Align::parse`, which returns `Option<Align>`. The generated file is
 ordinary source, and that edit is one of the reasons it is yours to keep.
 
 An *inline* `"left" | "right"` is widened to `str` instead — safe and
@@ -639,3 +791,42 @@ release, downloading for your platform and swapping the pair atomically
 (`vilan-lsp` first, so the two are never newer-cli/older-lsp). The
 licenses and third-party notices travel along. `--check` reports whether
 a newer release exists and changes nothing.
+
+`vilan upgrade` also prunes the std cache described below while it has
+`~/.vilan` open.
+
+## `vilan cache prune`
+
+Deletes materialized std trees no binary can use any more, and the macro
+expansion tables `vilan check` keeps beside them.
+
+An installed `vilan` carries its standard library inside the binary and
+writes it out once, to `~/.vilan/std-cache/<content hash>/`, so the
+compiler and your editor read ordinary files. The directory is keyed by
+the std's content, so each *build* of the toolchain gets its own — which
+is invisible if you install releases, and adds up quickly if you build
+vilan from source.
+
+Two things prune it for you: writing a new tree sweeps the root it just
+grew, and `vilan upgrade` sweeps while it is there. Both keep anything
+created in the last seven days, because a compile reads std files lazily
+and a young tree may belong to one that is still running. This command
+is the same sweep, on demand:
+
+```sh
+vilan cache prune            # entries older than seven days
+vilan cache prune --dry-run  # print what would go, with sizes; delete nothing
+vilan cache prune --all      # every entry, guard and all
+```
+
+The tree this binary itself uses is never deleted, `--all` included: the
+next command would write it straight back.
+
+Two roots are swept, and each reports its own line. `~/.vilan/std-cache/`
+is the one above. `~/.vilan/check-cache/` holds one macro expansion table
+per package a `vilan check` has warmed — the same content-keyed, stamped
+file `vilan build` keeps in `dist/.cache`, put where a command that emits
+nothing can keep memory without writing into your tree. Deleting a table
+costs a recompile of that package's macro worlds and nothing else; the
+same seven-day guard applies, because a check running right now is holding
+its own table open.

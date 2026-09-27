@@ -1,9 +1,0 @@
-[package]
-name = "vilan-embedded-std"
-version = "0.40.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-
-# The workspace clippy exception list (root Cargo.toml, backlog N21).
-[lints]
-workspace = true

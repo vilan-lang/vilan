@@ -156,7 +156,7 @@ fn recovers_garbled_struct_initializer_fields() {
                 "[{name}] garbled struct-init fields must report (c): {tree}"
             );
             assert!(
-                tree.contains("StructInitializer(\"Point\", None, ([]"),
+                tree.contains("StructInitializer([], (\"Point\", 21..26), None, ([]"),
                 "[{name}] recovered to empty struct-initializer fields (b); got: {tree}"
             );
         },
@@ -353,22 +353,23 @@ fn recovers_trailing_question_dot_member_keeping_receiver() {
 
 #[test]
 fn recovers_misplaced_resource_and_continues() {
-    // parser.rs ~1501: `resource` before anything but `struct`/`enum` steers — it
+    // parser.rs ~1501: `[resource]` (B413; the keyword before it) before anything
+    // but `struct`/`enum` steers — it
     // emits a diagnostic and a `Node::Error` placeholder, leaving the offending
     // token unconsumed so `fun`/`impl`/`let`/`trait` parse as themselves. The
     // MESSAGE is already pinned in the `inference` suite
     // (`resource_on_a_*_is_rejected`); this pins the RECOVERY half — the steer placeholder plus the fact that the
     // steered item AND every subsequent item still parse.
     for_each_frontend(
-        "resource fun foo() {}\nfun after() {}\n",
+        "[resource] fun foo() {}\nfun after() {}\n",
         |name, tree, errors| {
             assert!(
                 errors > 0,
                 "[{name}] the misplaced `resource` must report (c): {tree}"
             );
             assert!(
-                tree.contains("(Error, 0..8)"),
-                "[{name}] `resource` steered to a Node::Error placeholder (b); got: {tree}"
+                tree.contains("(Error, 0..10)"),
+                "[{name}] `[resource]` steered to a Node::Error placeholder (b); got: {tree}"
             );
             assert!(
                 tree.contains("(\"foo\"") && tree.contains("(\"after\""),
@@ -472,11 +473,12 @@ mod analyze {
 
     #[test]
     fn misplaced_resource_analyzes_the_rest_of_the_file() {
-        // The recovery half at the analyze level: after the steered `resource fun`,
-        // the following struct + function still analyze (the sole diagnostic is the
-        // steer message, and `Point` is usable downstream).
+        // The recovery half at the analyze level: after the steered `[resource]
+        // fun` (B413's attribute), the following struct + function still analyze
+        // (the sole diagnostic is the steer message, and `Point` is usable
+        // downstream).
         let (program, messages) = analyze(
-            "resource fun foo() {}\n\
+            "[resource] fun foo() {}\n\
              struct Point { x: i32 }\n\
              fun after() { let q = Point { x = 5 }; }\n",
         );
@@ -484,7 +486,7 @@ mod analyze {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("type-declaration modifier")),
+                .any(|m| m.contains("may label only a `struct`")),
             "the steer diagnostic must be present; got: {messages:#?}"
         );
         assert!(
@@ -942,5 +944,28 @@ fn a_committed_separator_failure_still_reports_where_it_broke() {
     assert_eq!(
         reported[0],
         ("found ';' expected ',' or ')'".to_string(), ";".to_string())
+    );
+}
+
+#[test]
+fn a_function_whose_body_is_missing_reports_at_the_gap_not_at_the_keyword() {
+    // B172's second facet. `fun` + name + `(params)` commits: nothing else in
+    // the grammar starts that way, so every demand past it is located. The body
+    // was the one that was not — an OPENING delimiter is a silent head-check —
+    // so a function that parsed to its return type and then met something that
+    // was not a body backtracked whole, and the STATEMENT alternative tried
+    // before it (`expression ;`, which declines on the `fun` keyword at column
+    // 1) was left holding the farthest failure. The reader was told the item's
+    // own first token was where an expression should be.
+    let source = "fun f(): i32 Bar {\n\t1\n}\n\nfun main() {\n\tprint(1);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert_eq!(
+        reported[0],
+        (
+            "found 'Bar' expected '{' or ';' for a bodyless declaration".to_string(),
+            "Bar".to_string()
+        ),
+        "the anchor is where the body should have started"
     );
 }

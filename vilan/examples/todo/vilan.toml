@@ -12,8 +12,19 @@
 #
 #   vilan build .   compiles both entries into `dist/` (`client.js` / `server.mjs`)
 #   vilan run .     builds both and starts the Node server → http://localhost:59386
+#
+# `prelude` names the ambient scope every file in the package resolves under —
+# the names in scope with no import (`proposal/prelude.md` §5). It is a PACKAGE
+# key, so both entries share it: `std::web` is the application set — the base
+# seven (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) plus `Signal`,
+# `SignalCell`, `view` and `View`, plus the MODULES `style` and `ui` — and every
+# one of those names exists on node too, so the server leg loses nothing by
+# sharing the client's prelude. `src/store.vl`, which both entries reach, is the
+# proof: it is server-colored and still wants `SignalCell` and `Result` bare.
+# Omit the key for the base set; `false` turns it off.
 [package]
 name = "todo"
+prelude = "std::web"
 
 [entry.client]
 target = "browser"

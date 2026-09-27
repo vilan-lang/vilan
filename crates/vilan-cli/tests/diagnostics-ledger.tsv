@@ -8,7 +8,12 @@
 # message, or the suite is red.
 #
 # Columns, tab-separated:
-#   row       the ledger row number
+#   row       the ledger row number, or `NEW` for a row whose number
+#             integration assigns. A lane owes its message a row in the
+#             change that ships it, but every lane of an order appends to
+#             this same tail, so a minted number is a merge collision and a
+#             renumbering after it. `NEW` rows sit at the END of the file and
+#             are checked exactly like numbered ones.
 #   flagship  `flagship` when the errors appendix documents this message,
 #             `-` otherwise. The appendix is a CURATED SUBSET, by three
 #             criteria (stated in `vilan/docs/appendix/errors.md` itself):
@@ -23,8 +28,12 @@
 #             literal fragments.
 #
 # Two rows are deliberately keyless and absent here: 154 (a forwarding push
-# with no head of its own) and 229 (the nine `ParseErrorReason::Rule`
-# statements, which the parse-rule tests hold instead).
+# with no head of its own) and 229 (the `ParseErrorReason::Rule` statements,
+# which the parse-rule tests hold instead — their population by the gate's
+# RULE_STATEMENT_SITES count, and the CURATED ones, stated through a named
+# constant, by its CURATED_RULE_STATEMENTS enumeration. The count that used
+# to stand here said `nine` for seven orders; N60 and N65 are why it is not
+# written in prose any more).
 row	flagship	key
 1	flagship	'{type}' does not implement trait '{trait}', required by a declared bound of '{owner}'
 2	flagship	{label} of `[derive(Wire)]` type `{type_name}` is `{rendered
@@ -82,7 +91,6 @@ row	flagship	key
 54	-	cannot destructure {rendered} as a fixed array: 
 55	-	literal pattern of type {} cannot match type {}
 56	-	an `async` closure type is only supported on parameters, `let` annotations, struct fields, and function return types
-57	-	a `context` clause is only supported on a parameter's closur
 58	-	this array literal has {} element{}, but its type is `[_; {l
 59	flagship	Expected {expected} (this literal's element type), but got {
 60	flagship	Expected {expected} (this literal's element type), but got {
@@ -143,7 +151,7 @@ row	flagship	key
 115	flagship	index {literal_index} is out of range for an array of length
 116	-	cannot index {} (only a `List` or `[T; n]` array is indexabl
 117	flagship	cannot find '{}' in this scope
-118	-	`use` requires a namespace (a module or an enum)
+118	-	`use` requires a namespace (a module, an enum or a struct)
 119	-	cannot find '{}' in the `use` path
 120	flagship	`{name}` is a type, not a value; construct it (`{name} { .`
 121	flagship	cannot find '{}' in this scope
@@ -157,7 +165,7 @@ row	flagship	key
 129	-	no bound of this type parameter ({}) has a member '{}'
 130	-	cannot find trait '{}'
 131	-	'{}' is not a trait
-132	flagship	'{}' does not implement trait '{}': missing '{}'
+132	flagship	'{type_label}' does not implement trait '{trait_label}': missing '{member_name}'
 133	-	this {construct} is `{label}`, but a condition must be `bool
 134	flagship	`{symbol}` takes `bool` operands; the {side} operand is `{la
 135	flagship	`bool` has no ordering: `{symbol}` models `PartialOrd`, whic
@@ -187,7 +195,7 @@ row	flagship	key
 160	-	a macro body may import only from `macro_std`: the macro wor
 161	-	`[service]` expanded before std::rpc's `service` macro was 
 162	-	this `macro { .. }` block was not registered; see the file'
-163	-	the built-in derive generators produced invalid Vilan ({mess
+163	-	the built-in enum member generators produced invalid Vilan ({message})
 164	-	no macro named `{name}` is in scope
 165	-	`{name}` is a macro HELPER (its signature is not a macro sha
 166	-	macro `{name}` is invocation-shaped (it takes no `Item`); ca
@@ -230,22 +238,22 @@ row	flagship	key
 203	flagship	an async closure cannot adapt a trait/generic-dispatched call
 204	flagship	found {found} expected {expected} in {context}; {hint}
 205	flagship	unclosed `{delimiter}` in {production}: expected a matching `{close}`
-206	-	`resource` is a type-declaration modifier: it may appear only before a `struct` or `enum` declaration
+206	-	`[resource]` marks a type as a resource: it may label only a `struct` or an `enum` declaration
 207	-	found '{character}' expected a token
 208	-	if this was postfix `!` before a comparison, the space is required: `a! == b`
 209	flagship	{members} form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order
 210	flagship	a string cannot span lines unless it is triple-quoted: close it before the line break; multi-line text goes in `"""…"""` (`i"""…"""` when interpolating), and a single line break is written `\n`
 211	-	a literal `}` inside an interpolated string is written `\}`: an unescaped brace belongs to a `{expr}` hole
-212	-	{} has no method '{}'{trait_only}{field}{import}
+212	-	{} has no method '{}'{trait_only}{field}{import}{slot}
 213	-	'{member}' is ambiguous on '{type}': {both }{homes} provide it, and '{Trait}::{member}' names only the trait, not which of its instantiations; annotate the type this call must produce to pick one
 214	flagship	'{member}' is ambiguous on '{type}': {both }{subjects} provide it and neither impl subject is more specific than the other; vilan picks the more specific of two overlapping impls, so narrow one subject until it is
 215	-	`{method}` must be called on a context bound to a name
 216	-	`run` must be called on a named context with a closure literal body
 217	-	`run` must be called on a named context with a closure literal body, or a closure value whose type is `context`-annotated with exactly this context
 218	-	this parameter's `context` clause names a value that is not a context
-219	-	a `context`-typed binding takes a closure literal, or a value with the same `context` clause
+219	-	a `context`-typed {position} takes a closure literal, or a value with the same `context` clause
 220	-	a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)
-221	flagship	an injected (`context`-typed) closure can only be called, forwarded to a parameter with the same `context` clause, or passed to `run`
+221	flagship	an injected (`context`-typed) closure can only be called, forwarded to a position with the same `context` clause, or passed to `run`
 222	flagship	context `{}` is read here, but this code can be reached without an enclosing `run`
 223	-	an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`
 224	flagship	`{}` reads context `{}`, so it can't be used as a value
@@ -271,7 +279,7 @@ row	flagship	key
 245	-	a bare `ret` returns nothing, but the function's return type is inferred as {inferred} from {origin}; return a value, or declare the return type
 246	-	`{name}` is deprecated; {steer}
 247	flagship	`{old-spelling}` is deprecated; use `{new-spelling}`
-248	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, `macro_std`, and `vilan` are all reserved); rename the {package|dependency}
+248	flagship	`{name}` is a reserved package name: {reason} ({reserved}); rename the {package|dependency}
 249	-	`{name}` is never given a type: this closure is never called and its parameter is unannotated; annotate it (e.g. `|{name}: List<i32>|`)
 250	-	cannot iterate `{rendered}`: no bound on it provides `{next_method}(&mut self): Option<T>`, and a generic is not natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) or iterate a concrete container
 251	-	cannot iterate `{rendered}`: it has no `{next_method}(&mut self): Option<T>`, and {kind} is not natively iterable — the loop would walk its representation. Implement the iterator protocol on it, or iterate a `List` / `Set` / `Range` (a `Map` iterates through `entries()`, `keys()` or `values()`)
@@ -307,15 +315,15 @@ row	flagship	key
 281	flagship	'{member_name}' is ambiguous on '{type_str}': {}{} provide it; call {} to pick one
 282	-	a bare `?` needs a container with an element type; this is {rendered}
 283	flagship	'{member_name}' is not an inherent member of '{subject_str}': {} provide{} it; call {} instead
-284	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, and `macro_std` are all reserved); this workspace staged a dependency edge named `{name}` — the edge is ignored and `{name}::` keeps meaning the root it always names; rename the dependency
+284	flagship	`{name}` is a reserved package name: {reason} ({reserved}); this workspace staged a dependency edge named `{name}` — the edge is ignored and `{name}::` keeps meaning the root it always names; rename the dependency
 285	flagship	module `{name}` resolved to `{on_disk}` on disk, but it is imported as `{requested}`: Vilan matches module files by exact case, so this builds only where the filesystem ignores case; rename one to match the other
 286	flagship	`const` expressions form a dependency cycle
 287	flagship	`{name}` is a runtime value; a `const` expression reads only compile-time-known bindings
 288	flagship	this `const` expression reaches `{name}`, whose value is not compile-time-known
 289	flagship	{name} is compile-time-only; evaluate this call inside a `const` expression
 290	flagship	{subject} is compile-time-only; call it directly inside a `const` expression — a compile-time-only function has no runtime value form
-291	-	{headline}{subject}: {}
-292	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
+291	-	{headline}{subject}: {}{}
+292	-	internal error: the compiler panicked analyzing `{}` (this is a bug; the details are on stderr)
 293	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
 294	-	the `macro_std` package was not found beside `std`
 295	-	the macro `{}` did not compile to a callable function
@@ -353,12 +361,11 @@ row	flagship	key
 327	-	`[[build.hook]]` `{name}` declares an empty `{key}` entry: each one is a file or directory path relative to the manifest
 328	-	`[[build.hook]]` `{name}` declares `{key}` entry `{path}`, which contains `{metacharacter}`: freshness digests the paths you declare, and there is no glob matching — name the directory (`src/static`) or the files themselves
 329	-	Cannot execute program without a main function
-330	flagship	internal: a call resolved to {source}, which has no body — emitting it would produce an empty function and a runtime `TypeError`. The receiver's type could not be resolved to a concrete implementation at this call; please report this program
+330	flagship	internal: a call resolved to {source}, which has no body — emitting it would produce an empty function and a runtime `TypeError`. The receiver's type could not be resolved to a concrete implementation at this call{asked}; please report this program
 331	flagship	internal: the type of this `drop` argument could not be resolved, so the sink cannot tell a resource from data and would tear nothing down; please report this program
 332	flagship	`std::{name}` was removed: `{name}` is a primitive and is always in scope — delete the import (its module path, if you need it, is `std::{home}::{name}`)
 333	flagship	`std::{name}` was removed: `{name}` is in the default prelude (no import needed), and its module path is `std::{home}::{name}`
 334	flagship	`std::{name}` was removed: its module path is `std::{home}::{name}`
-335	flagship	`#` is not a vilan token; in a `css` block a colour is a hole — `color: {Color::hex("#333")};` — which routes it through the `Color` type that carries its own `:root` line
 336	flagship	`@` is not a vilan token; a `css` block has no at-rules — a media query is a breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is `std::style::declare`
 337	-	std::db migrate: could not begin a transaction for migration '{step.name}': {message}
 338	-	std::db migrate: migration '{step.name}' failed and was not applied: {message}
@@ -369,3 +376,225 @@ row	flagship	key
 343	-	std::db migrate: the database has migration '{recorded_name}' applied, but it is not among the {count} migrations given — this database was migrated by a newer build
 344	-	std::db migrate: migration '{pending}' is not applied, but '{applied}' after it in the list is — a migration was inserted before the applied history
 345	flagship	`{symbol}` takes two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: `{rhs_label}` is wider than what `{lhs_label}` admits
+346	flagship	`{subject_label}`'s `{method_name}` accepts `{declared_label}`, but the right operand is `{rhs_label}`
+347	-	'{member_name}' in module '{module_name}' is not a type
+348	flagship	'{type_label}' does not implement trait '{trait_label}', required by the annotation on '{name}': a trait annotation on a binding is a CONSTRAINT on the value's own type, which stays '{type_label}'
+349	-	{label} is `[expose]`d, but its type `{rendered_field}` does not implement `std::Source`: only observable state can be exposed, because the client mirrors it by subscribing. Write a `SignalCell<T>` with a Wire `T`, or implement `std::Source<T>` for this type
+350	flagship	'{trait_name}::{member_name}' has no default body, so '{trait_name}::{member_name}(..)' has nothing to call: an associated function without one is a per-impl requirement. Call it through an implementing type — '<Type>::{member_name}(..)' — or give '{member_name}' a default body on '{trait_name}'
+351	-	internal: this concatenation was admitted on a generic parameter's `{RENDER_MEMBER}` bound, but no implementation could be resolved for it here — concatenating the operand directly would print the value's runtime shape; please report this program
+352	-	`+` on `str` concatenates, and `{rhs_label}` has no string form: a parameter promises only what its bounds promise, and this one is unbounded, so every instantiation would concatenate the value's runtime shape — a struct as a tuple, an enum as a tagged array. Bound it with `Display` and concatenate `value.to_string()`; an i-string hole is this same concatenation, so it needs the same pair
+353	flagship	`+` adds two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: `{rhs_label}` is wider than what `{lhs_label}`'s `add` accepts. That set is `{lhs_label}` itself, and no trait names it, so no bound on `{rhs_label}` can prove membership — a bound promises a trait's methods, never that the parameter IS `{lhs_label}`. Convert the value explicitly and declare the operand `{lhs_label}`, or put a left operand there whose `Add` declares a `B` that admits `{rhs_label}`
+354	-	`+` on `str` concatenates, and `{rhs_label}` has no string form: a parameter promises only what its bounds promise, and no bound on `{rhs_label}` provides `to_string`, so every instantiation would concatenate the value's runtime shape — a struct as a tuple, an enum a tagged array. Add a `Display` bound (`<{rhs_label}: Display>`); an i-string hole is this same concatenation, so it needs the same bound
+355	flagship	`+` on `str` concatenates, and `{rhs_label}` has no string form: concatenating it renders the value's runtime shape — a struct is a tuple, an enum a tagged array — not the value. Call `.to_string()` on it, implementing `Display` for its type if it has none; an i-string hole is this same concatenation, so it needs the same call — but a `css` block's hole is not, and a typed style value belongs in one: `border: 1px solid {Color::gray(500)};` keeps the value typed and carries its `:root` line onto the sheet
+356	flagship	`+` on `{lhs_label}` adds, and `str` is not a number: only a `str` LEFT operand concatenates, because the expression takes its type from the left. Put the string first (`"…" + value`), or convert this operand with `.to_string()`
+357	flagship	`+` adds two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: there are no implicit conversions; suffix the literal or convert with `as_*`
+358	-	`{name}` takes {count} type argument{plural}, {given} given — write `{spelling}` with `{params}` supplied here: {example}, or {a parameter} this signature declares (add `<{params}>` to its generics)
+359	flagship	`main` takes no parameters: the shell owns what is passed to a program, so nothing can call the entry with arguments — read them with `import std::process;` at the top and `process::args()` in the body, which hands back the argument tail as a `List<str>`
+361	-	`{symbol}` takes `bool` operands, and `{label}` is a type parameter: `bool`'s set is `bool` itself, no trait names it, and `{symbol}` models no operator trait to consult, so no bound on `{label}` can prove membership
+362	-	`{symbol}` on `{lhs_label}` has no meaning: `{lhs_label}`'s admitted operators are {admitted}. A binary takes its type from the LEFT operand and the host operator returns a number, so this expression is a number wearing `{lhs_label}` — {exhibit}. {steer}
+363	flagship	; `{name}` is in the prelude of the web set — set `prelude = "{}"` in vilan.toml
+364	-	; `{name}` is in the prelude of the web set — switch the playground's prelude to the web set{import}
+365	-	`{name}` takes no type arguments, {written_count} given — it declares no generics, so there is nothing here for this list to bind; write `{name}(…)`
+366	-	`{name}` takes at most {declared_count} type {argument(s)}, {written_count} given — a SHORTER list is fine (the parameters it does not reach are inferred from the arguments), but there is no parameter left for the extra {one(s)} to bind
+367	-	`{symbol}` on `{label}` needs `{label}: {trait_name}` — a parameter promises only what its bounds promise, and {promise}, so there is no `{method_name}` to dispatch to. `{symbol}` dispatches through its LEFT operand, which is exactly where a bound decides the implementation: add it where `{label}` is declared{site}, or write a concrete type here
+368	-	`!` negates a `bool`, and `{label}` is a type parameter: `bool`'s set is `bool` itself, no trait names it, and `!` models no operator trait to consult, so no bound on `{label}` can prove membership
+369	-	`!` negates a `bool`, and this operand is `void`: the expression it comes from produces no value
+370	-	`!` negates a `bool`, and this operand is `{label}`: the host's `!` is a truthiness test that admits every value, so this compiles to a question nobody asked
+371	-	`-` negates a number, and `{label}` is a type parameter: the set `-` admits is the numeric primitives, no trait names it, and `-` models no operator trait to consult, so no bound on `{label}` can prove membership
+372	-	`-` on `bool` has no meaning: `bool`'s admitted unary operator is `!`. A unary takes its type from its OPERAND and the host operator returns a number
+373	-	`-` on `str` has no meaning: `str`'s admitted operators are `+ == != < <= > >=`, none of them unary
+374	-	`-` on `{label}` has no meaning: `{label}`'s admitted operators are {admitted}, none of them unary
+375	-	`-` negates a number, and this operand is `void`: the expression it comes from produces no value
+376	-	`-` negates a number, and `{label}` is not one: vilan has no `Neg` trait, so there is no impl that could give `-` a meaning here
+377	-	`{symbol}` models `{trait_name}`, and `{trait_label}` does not require it: inside a default body `self` is the trait itself, so the operator resolves through what `{trait_label}` promises
+378	-	`impl {subject_name} with {trait}`{inherited} provides no `{member_name}`: an operator trait's method is required at impl time
+379	-	`!` negates a `bool`, and `{label}` is a trait: no trait names `bool` — vilan has no `Not` for one to require
+380	-	`-` negates a number, and `{label}` is a trait: no trait names the numeric set — vilan has no `Neg` for one to require
+381	-	{label} is `[expose]`d, and its type `{rendered_field}` does implement `std::Source`, but its element is not written as a type argument: the `[service]` expansion builds the client's mirror before any type resolves, so it reads the element off the annotation's sole type argument and has nothing to name here. Spell the source with its element as that argument (`SignalCell<Note>`), or expose a field whose type is written that way
+382	-	'{name}' is already declared in this module; remove or rename this one
+383	-	'{name}' is {sort}, not a trait: a bound names a trait.
+384	-	cannot iterate `{rendered}`: a tuple is a fixed sequence of independently typed elements, not a container of one element type, so a `for` binder has no single type to take and one body cannot be checked for every element. {steer}
+385	-	'{name}' is bound only inside the `is` test that captured it: outside a condition that test is an ordinary `bool`, and nothing after it proves the payload is there{steer}
+386	-	`pkg::{name}` is this program's own entry file, so this import…
+387	-	`pkg::{name}` is this program's entry file, which is the…
+388	-	a name after `::`
+389	-	this {construct} is `{label}`, and a condition must be `bool`: `bool`'s set is `bool` itself and no trait names it, so no bound on `{label}` can prove membership
+390	-	a name after `::` on the same line: a `::` path does not cross a line break, because `a::` at the end of a line joins whatever the next line starts with — join the line, or import the path under a shorter name (`import a::b::c as d;`) and write `d`
+391	-	`{name}` {reason}carries a hidden type parameter — and nothing here can supply one
+392	-	Expected {struct}, but got {rendered} instead. '{struct}' has a trait-typed field, so the annotation on
+393	-	this call could not be resolved: the type of {operand} is never determined
+394	-	a `context` clause on a trait or `impl` method is not supported yet: a dispatched call selects its callee at the call site, so the requirement cannot be checked against one declaration. Declare it on a free `fun` and call that from the method
+395	-	this `context` clause names a value that is not a context
+396	-	context `{context}` is required by `{name}`'s `context` clause, but this code can be reached without an enclosing `run` — call it under `{context}.run(..)`, or declare `context {context}` here too
+397	-	`{name}`'s body reads {contexts}, which this `context` clause does not declare — write `{spelling}`
+398	-	this `context` clause declares `{context}`, which `{name}`'s body never reads; callers must supply it anyway
+399	-	{label} is `[expose(keyed)]`d, but nothing names its KEY type: a keyed mirror is a `KeyedSource<K, T>`, and the `[service]` expansion reads both types off the annotation (there are no associated types to read the key from). A `Map<K, V>` element names both and takes the bare form; anything else names the key in the attribute — write `[expose(keyed = K)]`, or drop `keyed` for a channel that resends the whole value on every change
+400	-	this file is being checked as a module of `{package}` — it lives inside that package, so its siblings are `pkg::` here, not `{package}::`. Write `import pkg::…` for a module of `{package}` itself
+401	-	'{type}' does not implement trait '{trait}', required by the bound on parameter
+402	-	a bound promises a trait's METHODS, never that `{name}` ADMITS an
+403	-	{label} names a key with `[expose(keyed = …)]`, but its collection is not written as a `List<T>` or a `Map<K, V>`: those are the two the keyed exposure can read, and the `[service]` expansion picks between them off the annotation before any type resolves. Write the field as `SignalCell<List<T>>`
+404	-	`[expose(keyed = …)]`'s argument is a TYPE — the key type the mirror is keyed by, as in `[expose(keyed = str)]`. It is written here because a keyed mirror is a `KeyedSource<K, T>` and a `List<T>` names only the element; a `Map<K, V>` element names both, and takes the bare `[expose(keyed)]`
+405	-	`{spelled}` is a directory with no `{leaf}.vl`, so it is a namespace rather than a module: it has no items to import. Import one of its modules instead: {listed}
+406	-	`[service]` cannot take a generic subject: `{subject}` declares `<{parameters}>`
+407	-	{label} names its key twice and the two disagree: `[expose(keyed = {written})]` says `{written}`, and its `Map` element says `{map_key}`. A keyed mirror is a `KeyedSource<K, T>` and the `[service]` expansion reads `K` off the annotation before any type resolves, so it cannot pick between them. Drop the argument — a `Map<K, V>` names both types and takes the bare `[expose(keyed)]` — or write the map with `{written}` as its key
+408	-	`[rpc]` method `{method_name}` takes `mut self`, and an `[rpc]` method's `mut self` copy is discarded after the call
+409	-	return type of `[rpc]` method `{method_name}` is `{rendered}`, but a `[client_service]` method is a
+410	-	`[service(.., client = {handler_name})]` names `{handler_name}` as the struct this
+411	-	`[rpc]` method `{method_name}` returns a signal handle whose element `{rendered}` is not Wire: the source itself stays on the server and the client mirrors it over a channel, so it is the ELEMENT that crosses the wire and it must be Wire (a scalar, `str`, `bool`, `List`/`Option`/`Map` of Wire, a `[derive(Wire)]` type, or a type with an `impl .. with Wire`)
+412	-	{label} is `[expose]`d, but that struct carries only `[client_service]`: an exposed field is mirrored out of the SERVER's reactive session through the generated `__attach` route, and a client-side struct has neither — so the attribute moves the contract hash and mints no channel at all. Drop `[expose]`, or write `[service(..)]` beside `[client_service]` if this struct is a peer that serves as well as handles
+413	-	{label} names its key twice and the two disagree: `[expose(keyed = {written})]` says `{written}`, and its `KeyedCell` says `{cell_key}`. A `KeyedCell<K, T>` names both of its types itself and is keyed by the one it names: `expose_keyed_cell` and the `KeyedSource<K, T>` mirror are typed at `{cell_key}`, so the argument cannot be honoured and is not read. Drop it — a `KeyedCell` takes the bare `[expose(keyed)]` — or write the cell with `{written}` as its key
+414	-	`_` is the anonymous type binder: it introduces a generic parameter, and only an `impl` subject introduces one
+415	-	`{derive}` cannot be derived for the resource {kind} `{name}`: a resource is an owned handle, not plain data — {what_it_would_do}; {steer}
+416	-	parameter `{parameter_name}` of `[rpc]` method `{method_name}` starts with `__`, which the `[service]` expansion reserves for its own bindings
+417	-	`[rpc]` method `{method_name}` is declared `async` and takes `&mut self`, and the two cannot both hold
+418	-	`[service]` needs std's `rpc.vl`, and the std this package resolves to does not carry one
+422	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's negation marker; write `.not()` on the condition you want negated (pseudo("focus-visible").not())
+423	-	a custom property is written with its dashes — var("--button-color"), not var("{name}")
+424	-	a custom property name cannot contain {...} — the name is one token, like --button-color
+425	-	cannot find type '{name}'; this `impl`'s subject is the trait `{trait_name}` itself, so it is written for EVERY type that implements it — and that type has no name here. Say `Self`, or name it in the head: `impl type {name}: {trait_name}<..>`
+428	-	`[rpc]` method `{method_name}` takes a name the `[service]` expansion generates on `{owner}`
+429	-	`[rpc]` method `{method_name}` returns a keyed handle whose key `{rendered}` is {missing}: the client names the key in every keyed `Subscribe`, each `Delta` the channel forwards carries it, and the mirror indexes by it
+430	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait
+431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{child}` that is the module `{module_name}::{name}` — the declaration wins, so the module cannot be reached by any import; rename one of them
+432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
+433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
+434	-	`[derive({derive})]` needs std's `{module}`, and the std this package resolves to does not carry one
+435	-	`{parent}::lib` is module `{leaf}`'s own BODY FILE, not a module below it: `{directory}/lib.vl` is what `{parent}` resolves to. Import `{parent}` instead — the items that file declares are `{parent}`'s own
+436	-	`{part}` is not a member of the type `{subject_name}`: it is an item of `{module_path}`, and a type segment REPLACES the path's namespace rather than adding to it. Write `{module_path}::{part}`
+437	-	the end-of-evaluation finaliser `{...}` failed: {...}
+438	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's pseudo-ELEMENT marker; write element(name) for `::name`, which is its own axis because a pseudo-element comes last in a compound selector and only one may appear
+439	-	a condition set cannot hold {...} and its negation — a rule conditioned on a value AND on its absence matches nothing, so one of the two is a mistake rather than an intent; drop it, or negate the condition you meant
+440	-	a condition set holds ONE breakpoint, and this one holds {...} and {...} — two min-widths in one query is the narrower of them written twice; keep the narrower and drop the other
+441	-	a condition set holds ONE ancestor guard, and this one holds {...} and {...} — one ancestor carrying both conditions is a selector this version does not spell; condition the element ITSELF with attribute(..) for the second
+442	-	a condition set holds ONE child relation, and this one holds {...} and {...} — divide() is children() minus the first child, so the two can never agree about that child; pick the one you mean
+443	-	a condition set holds ONE pseudo-element, and this one holds {...} and {...} — a compound selector admits one, always last, with nothing after it
+444	-	within(..) guards on ONE condition and was given a set — an ancestor carrying several conditions is a selector this version does not spell; guard on the one that identifies the ancestor
+446	-	`.not()` negates ONE condition and this set holds {...} — negate each one where it is written (hover().not() + active()), which is the whole point of a condition being a value
+447	-	a breakpoint cannot be negated in this version — `@media not (..)` is a grammar of its own and no ruling has reached it; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead
+448	-	a pseudo-element cannot be negated — `:not(::selection)` is not a selector CSS admits; negate a condition that selects the ELEMENT instead
+449	-	a double negation is a spelling mistake rather than a cancellation — drop both `.not()`s, or negate the condition you meant
+450	-	`.eq(..)` gives ONE attribute condition its value and this set holds {...} — write it on the attribute (attribute(name).eq(value) + hover()), not on the set
+451	-	`.eq(..)` gives an ATTRIBUTE condition its exact value and this condition is {...} — a pseudo-class, a relation or a breakpoint has no value to match; attribute(name).eq(value) is the form
+452	-	this attribute condition already carries a value ({...}) — `.eq(..)` narrows PRESENCE to one value, so write attribute(name).eq(value) once
+454	-	an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
+455	-	`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an expression is none of those, and publishes nothing, checks nothing and emits nothing
+456	-	`{type}` {position}. `{item}` is exported, but `{type}` is not. A consumer can {verb} `{item}` but cannot name {noun}.
+458	-	`{path}` is not exported by `{module}`. Importing it anyway is allowed — mark the reach: `import {module}::{ #{leaf} };`
+459	-	`{module}` exports `{leaf}`, so the reach marker is redundant — delete the `#`
+460	-	`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already reachable and absent from completion, which is the whole of what this marker meant — delete it, and write `export` on the names consumers are meant to find
+461	-	`{path}` is not exported by `{module}`, and this path reaches it through the module. The spelling that says so is a marked import: `import {module}::{ #{leaf} };`, and then `{leaf}` on its own
+462	-	a closure written at this {position} would be born under `{clause}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array
+463	-	'{member}' is provided by an `impl` in module `{module}`, and {claim}: {fix}
+464	-	`{spelling}` outside a `const` expression
+465	-	`asset::stage` outside a `const` expression
+466	-	`asset::staged` outside a `const` expression
+467	-	`asset::read` outside a `const` expression
+468	-	`asset::digest` outside a `const` expression
+469	-	`asset::schedule_at_end` outside a `const` expression
+470	-	`{function}` kinds name one file beside the build output; `{kind}` is not one path segment — pass a bare kind like `css`
+471	-	`{function}` kinds name one file beside the build output, and `{kind}` collides with {collision} — pass a kind of the program's own, like `routes`
+472	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::style` own the sheet
+473	-	parameter {position} of `{subject}`'s `{member}` is {form}, but `{trait}` declares {declared}; match the declared laziness
+474	-	`{name}` is a `lazy` parameter of the resource type `{type}`: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids
+475	-	this argument is the resource `{type}`, and it stands in the `lazy` parameter `{name}`: the thunk that carries it would own the resource
+476	-	this argument suspends, and it stands in the `lazy` parameter `{name}`: the thunk forces on the parameter's first read
+477	-	this argument requires an ambient context, and it stands in the `lazy` parameter `{name}`: the thunk forces inside the callee
+478	-	`{name}` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's
+479	-	this initializer requires an ambient context, and it initializes the `lazy` binding `{name}`: a lazy initializer runs at the binding's first use
+480	-	a pseudo-class name cannot contain ':' (got {...}) — one value is one pseudo-class, and ':' is the slot key's own field separator. Two pseudo-classes on one rule are two CONDITIONS — .on(hover() + active().not(), ..) — and a leading colon meant a pseudo-ELEMENT, which is element(name) for `::name`
+481	-	this style's slot key is not one media:condition:property triple (got {...}) — every field that reaches a key is fenced against ':' where it is written, so a key holding another one means a condition token was minted carrying the key's own separator; that is the bug, not this read
+482	-	a breakpoint's min-width cannot contain ':' (got {...}) — it is the slot key's own field separator, and a width is a CSS length (media("768px"), or the named sm/md/lg/xl)
+483	-	a declaration's property cannot contain '{...}' (got {...}) — it separates the property from its value and from the next declaration; pass the value as the second argument
+484	-	within(..) guards on an ANCESTOR and was given a breakpoint — a media query conditions the viewport, not an element, so it belongs beside the guard in the set rather than inside it: .on(md() + within(attribute(name)), ..)
+485	-	within(..) guards on ONE ancestor and was given another guard — a grandparent chain is a selector this version does not spell; guard on the ancestor that identifies the state
+486	-	within(..) guards on an ancestor's own condition and was given a child relation — children() and divide() say where a rule REACHES, not what an ancestor matches, so they belong beside the guard in the set: .on(within(attribute(name)) + children(), ..)
+487	-	within(..) guards on an ancestor and was given a pseudo-element — `::selection` is a piece of a box CSS paints, never an element something can be inside of; guard on an attribute or a pseudo-class
+488	-	implementing `Callable` requires a `call` method: `{rendered}` declares none, so `value(..)` has nothing to resolve to. The marker carries no signature of its own — write the arity and the types you mean (`fun call(self, ..): ..`), here or in an `impl {rendered}` of its own
+489	-	{base}; it declares a `call` method but does not implement `Callable` — write `impl {rendered} with Callable` to call it as a function
+490	-	`{name}` is declared `const fun`, but its body reaches {capability}, which has no compile-time answer: a `const fun` promises its body is const-evaluable, and that promise is checked here rather than at a call site. Drop the `const` to keep an ordinary function, or move the capability out of the body
+491	-	'{member}' is provided by an `impl` in module `{declaring}`, and module `{here}` does not admit it: a generic body resolves under the file it was DECLARED in, not the file that instantiated it, so widening the import at the CALLER does not reach it. Widen `{here}`'s own import of `{declaring}` — `(impl _)` admits every implementation it declares
+492	-	'{member}' is already defined for '{subject}' by module '{other}', which this file also imports; a file may take only one. Select one — {fix} — or drop an import
+493	-	'{member}' is declared for '{subject}' by two blanket impls whose bounds OVERLAP, one of them module '{other}''s, and this file imports both: a type satisfying both clauses matches both impls, and an inherent member is taken from the first without ranking. Select one — {fix} — or drop an import
+494	-	'{member}' is provided by an `impl` in module `{module}` that `{module}` does not export, so it contributes no methods here. Reach it — `import {module}::{{ #(impl {subject}) }};` — or write `export` on the block
+495	-	this receiver satisfies the bounds of TWO blanket `impl` blocks that both declare '{member}', and an inherent member is taken from the first declared without ranking — swapping the two blocks would change which body runs: {fix}
+496	-	no `impl` this statement carries has a subject `{subject}` admits, so the selector admits nothing. The modules it walks are {modules}; `(impl _)` admits every block they declare
+497	-	no `impl {subject}` this statement carries declares {named}: the selector admits nothing
+498	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
+499	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own
+500	-	a view cannot escape its scope: this closure captures one, and `{callee}` keeps what it is handed past the call
+501	-	the `rust` backend does not emit {what} yet
+502	-	`--backend rust` does not split: route chunks are a browser artifact
+503	-	`--backend rust` builds ONE entry, not a workspace: a workspace's legs are a
+504	-	`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a
+505	-	`--backend rust` has no `--watch` yet: the native round is a full
+506	-	a `context` clause after an UN-PARENTHESIZED closure return type binds to the closure's own return type, which cannot carry one. Parenthesize the closure type to say which clause you mean: {...}
+507	-	{} is not available at expansion time
+508	-	output during evaluation (an inferred fold must be observably silent)
+509	-	a process exit during evaluation (an inferred fold must be observably silent)
+510	-	host bindings ([extern])
+511	-	`{helper}`
+512	-	`{name}`
+513	-	`{base}.{method}`
+514	-	`with_finally_async`
+515	-	async (macro bodies are synchronous)
+516	-	await (macro bodies are synchronous)
+517	-	the array method `{other}`
+518	-	the Set method `{other}`
+519	-	the Map method `{other}`
+520	-	the string method `{other}`
+521	-	the method `{method}` on {}
+522	-	replaceAll with an empty pattern
+523	-	stringifying a function
+524	-	a BigInt beyond 128 bits (the expansion engine's v1 bound)
+525	-	`Shared::identity` over {}
+526	-	the build's staging registry (`asset::stage`)
+527	-	the build's staging registry (`asset::staged`)
+528	-	the project's files (`asset::read`)
+529	-	the project's files (`asset::digest`)
+530	-	the project's files (`{spelling}`)
+531	-	`asset::schedule_at_end` on an anonymous closure (it takes a named function: the name is the identity that makes a repeat request a no-op, and a closure's captured scope does not outlive the evaluation that made it)
+532	-	a `const` result must be plain data; this evaluates to {what}
+533	-	the macro did not return a `Source` (build one with `macro_std::source(..)`)
+534	-	the fuel budget was exhausted
+535	-	the call-depth cap was exceeded
+536	-	lazy initialization cycle: `{name}`
+537	-	lazy `{name}` is poisoned: its initializer panicked: {poison}
+538	-	{name}: {value} is not one of its values
+539	-	index out of bounds: the length is {length} but the index is {index}
+540	-	substring out of range: the length is {length} but the range is {start}..{end} — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end
+541	-	every `impl {subject}` in {modules} is exported, so the reach marker is redundant — delete the `#`
+542	-	`[derive({name})]` could not expand: this toolchain has no `macro_std` beside its `std`, so std's own `{module}` never registered its `{name}` macro — `std` is at `{}`, and `macro_std` was looked for at `{}`
+543	-	`[service]` could not expand: this toolchain has no `macro_std` beside its `std`, so std::rpc's `service` macro never registered — `std` is at `{}`, and `macro_std` was looked for at `{}`
+544	-	this instantiates `{callee}`'s `lazy` parameter `{name}` at {at}: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids
+545	flagship	a `css` declaration is a CALL: write `padding(space(4));`, not `padding: space(4);`. The property is the name and its value is ordinary vilan expressions, so a typed value needs no `{ }` hole — and several arguments join with one space, as CSS's own value lists do (`margin(px(4), px(8))`)
+546	-	`asset::staged` reads the registry AFTER evaluation has finished, and this build is still evaluating — until the last `const` expression has run, a token it stages may still be about to be named. Read it from a function passed to `asset::schedule_at_end`, which is where the build runs it.
+547	-	`[derive({name})]` expanded before std's `{module}` declared its `{name}` macro: a compiler load-ordering bug (B21's class); please report how this module is reached
+548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again
+549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
+550	-	`{symbol}` is a host PROPERTY, not a function: the function form of `[extern]` emits a CALL, so this binding reaches the host as `{symbol}()` and fails there. Read it through a runtime helper (`std::dom`'s `__dom_active_element` and `__dom_window` are that shape), or, if the property hangs off a value the program holds rather than off a global, bind it with `[extern(get, "..")]` on a receiver
+551	-	`{}` is not a derivable trait: nothing declares a `{}` macro — not std, not this file, and nothing it imports. std derives {}; a derive of your own is a `macro fun {}` in this file or imported by name
+552	-	`guarded_async`
+553	-	`[service]` on `{name}` has an empty contract surface: it declares no `[rpc]` method, no `[expose]`d field and no `client = ..` handler, so the client it generates can call nothing and every call answers `unknown method` at runtime
+554	-	`response_header`
+555	-	an `http` service cannot name `client = {handler}`: the server calls a client back over the CONNECTION that client holds open, and the connectionless POST leg holds none
+556	-	an `http` service's field `{field}` is `[expose]`d, and a mirror is attached over a CONNECTION
+557	-	an `http` service's method `{method}` returns a signal handle (`{spelling}<..>`), and a handle's reply is a channel id minted in a CONNECTION's capability table
+558	-	an index must be a `usize`, and this one is `{index_str}`: a list and an array are POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — anything else names no element, and the emitted subscript read `undefined` back instead of failing{conversion}
+559	-	the `BigInt` literal `{digits}n` is outside the native backend's range: a `BigInt` is an `i128` there (±1.7e38), which is the documented limit
+560	-	`dyn` erases a TRAIT, and `{rendered}` is {sort}: there is no member surface here to dispatch through. Write `{rendered}` on its own for the type itself, or name the trait the value implements
+561	-	Expected {expected}, but got {object} instead: an object does not narrow back to the type it erased. `dyn` is where the concrete type went — the program cannot ask for it again — so a value that must stay a {expected} is held as one, or taken through a generic bound
+562	-	`dyn Trait` is a type, not a value (expected an expression here)
+563	flagship	`{rendered}` is a resource, so it cannot become a `{object}`: a trait object's teardown would have to be dispatched through its table, and vilan keeps teardown static (memory.md R7/R10). Holding the resource in a struct field of your own is the sanctioned alternative
+564	flagship	`{root_name}` cannot be a `dyn` object: {reason}.{through} An object dispatches through a table of its trait's members, so every member it requires must take a receiver, name no `Self` in its signature, and be non-generic. Use a generic parameter (`<T: {root_name}>`) for a value whose type is known where it is written
+565	-	{subject_name} `{member}` is async, but `{trait_name}::{member}` is declared sync, so this value cannot become a `dyn {trait_name}`: a call through an object is compiled once, against the declaration, and would hand back an unawaited promise. Declare `{trait_name}::{member}` `async` (an implementation may then be either), or keep the value behind a generic bound, where each implementation is awaited as it is written
+566	-	`{name}` is internal: {reason}
+567	-	`{name}` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+568	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
+569	-	Expected {expected}, but got {got} instead. There are no implicit numeric conversions; convert with `.as_{target}()`
+570	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
+571	-	`resource` is an attribute, not a keyword: write `[resource]` before the declaration (`[resource] struct`, `[resource] external struct`, `[resource] enum`)
+572	-	Expected usize (an index: a position, a length or a count), but got {got} instead. There are no implicit numeric conversions; convert with `.as_usize()`
+573	-	Expected {expected}, but got usize (an index: a position, a length or a count) instead. There are no implicit numeric conversions; convert with `.as_{target}()`
+NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
+574	-	the literal `{literal}` is fractional, and the other operand of `{symbol}` is `{integer}`: an integer has no fractional part, so the literal would be typed `{integer}` and the arithmetic done in integers. Convert the integer first — `{peer}.as_f64()` — or write an integer literal
+575	-	`.cell()` in the initializer of the module binding `{name}` ties the cell to an owner, and a module binding has none: its subscription would stay on the upstream for the life of the program. Build it under the owner that reads it (inside the view, or an `owner_scope.run`), or write `.cell_global()`, which says that lifetime

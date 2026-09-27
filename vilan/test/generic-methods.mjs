@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function __shared_new(value) {
 	return { v: value };
 }
@@ -5,10 +11,10 @@ function $a(value) {
 	return [ __shared_new(value) ];
 }
 function $c(self) {
-	return self[0].v;
+	return __clone(self[0].v);
 }
 function $d(self, value) {
-	self[0].v = value;
+	self[0].v = __clone(value);
 }
 function $b(self, transform) {
 	$d(self, transform($c(self)));

@@ -28,7 +28,11 @@
 //! agrees — this exemplar mounted holds V4 plus two live-session loops (a
 //! `ReactiveServer`/`ReactiveClient` and its transport handler, a
 //! `RemoteSource` lease and its cache), all of which are exactly as long-lived
-//! as the thing they belong to. What must be ZERO is what survives the
+//! as the thing they belong to. The walk reports them as TWO strongly connected
+//! components, not three cycles — loops that share a node are one component —
+//! so the mounted line reads `cycles=2` (measured at Order 38: a component of
+//! 64 around the element tree, V4's, and one of 30 around the session's
+//! closures), and that figure is this paragraph, not a disagreement with it. What must be ZERO is what survives the
 //! teardown, and that is what this asserts.
 //!
 //! Every one of V1, V3 and V5 was proven to redden it by planting the bug back:
@@ -39,9 +43,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// A fresh temp directory for one test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_reactive_lifetimes_{tag}_{}",
         std::process::id()
     ));
@@ -57,53 +63,10 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 
 /// The DOM/history stub every harness here builds on: enough of a document to
 /// mount into, with `parent`/`children` links so the walk sees a real tree.
-const DOM_STUB: &str = r#"class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.value = "";
-        this.attributes = {};
-        this.style = { setProperty: () => {} };
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    fire(event, payload = {}) { for (const h of (this.listeners[event] || [])) h(payload); }
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-}
-
-const documentRoot = new StubElement("div");
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    createElementNS: (namespace, tag) => new StubElement(tag),
-    getElementById: () => documentRoot,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = { pushState(state, title, path) { global.location.pathname = path; } };
-global.window = { addEventListener: () => {} };
-"#;
+const DOM_STUB: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/reactive_lifetimes.js"),
+);
 
 /// Builds `app.vl` for the browser with the real CLI and runs `harness.js`
 /// under node, returning its stdout. Fails loudly with both streams.
@@ -254,31 +217,36 @@ require("./app.js");
 // --- The standing no-cycle gate ----------------------------------------------
 
 /// The exemplar: everything §5 named, in one mounted app. A derivation made
-/// OUTSIDE every boundary (the module-level `route`, which nothing disposes and
-/// which therefore is what the post-disposal walk still sees), a bound text, a
-/// two-way input, a handler that writes signals the view reads (V4), a keyed
-/// list, and a live reactive RPC session on an in-process duplex.
+/// OUTSIDE every boundary — the module-level `depth`, which nothing disposes and
+/// which therefore is what the post-disposal walk still sees; since A130 it is
+/// spelled `.cell_global()`, the one loop the gate excludes by name — a cached
+/// derivation made INSIDE the mounted view (`route`, whose `.cell()` meets the
+/// view's owner and goes with it: A124 S2c's ruling), a bound text, a two-way
+/// input, a handler that writes signals the view reads (V4), a keyed list, and a
+/// live reactive RPC session on an in-process duplex.
 const CYCLE_EXEMPLAR: &str = r#"import std::json::json_codec;
 import std::reactive::{ Disposable, Signal, SignalCell };
 import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 let path: SignalCell<str> = Signal::new("/");
-let route: SignalCell<str> = path.map(|value| "route" + value);
+let depth: SignalCell<usize> = path.map(|value| value.len()).cell_global();
 
 fun row(item: str): View {
 	view("li").text(item)
 }
 
 fun app(items: SignalCell<List<str>>, draft: SignalCell<str>): View {
+	let route: SignalCell<str> = path.map(|value| "route" + value).cell();
 	view("main")
 		.child(view("h1").bind_text(route))
+		.child(view("p").bind_text(depth.map(|n| i"{n}")))
 		.child(view("input").bind_value(draft))
 		.child(view("button").text("add").on("click", || {
 			items.update(|&mut list| { list.push(draft.get()); });
 			draft.set("");
 		}))
-		.child(view("ul").bind_each(items, |item| item, |item| row(item)))
+		.child(view("ul").child(each(items, |item| item, |item| row(item))))
 }
 
 fun main() {
@@ -298,7 +266,7 @@ fun main() {
 	// Everything stays reachable from the harness, so nothing is "acyclic"
 	// merely by having been collected.
 	keep(path);
-	keep(route);
+	keep(depth);
 	keep(items);
 	keep(draft);
 	keep(server);
@@ -350,8 +318,11 @@ global.__scc_unmounted = () => {{
 require("./app.js");
 
 for (const phase of ["mounted", "unmounted"]) {{
-    const result = analyze(`./${{phase}}.heapsnapshot`, {{ rootEdgeName: "__vilan_scc_roots" }});
-    console.log(`${{phase}} reachable=${{result.reachable}} cycles=${{result.components.length}}`);
+    const result = analyze(`./${{phase}}.heapsnapshot`, {{
+        rootEdgeName: "__vilan_scc_roots",
+        designedLoops: ["cell_global_refresh"],
+    }});
+    console.log(`${{phase}} reachable=${{result.reachable}} cycles=${{result.components.length}} designed=${{result.designed.length}}`);
     if (result.components.length > 0) console.log(result.report);
 }}
 "#
@@ -365,13 +336,1243 @@ for (const phase of ["mounted", "unmounted"]) {{
 
     // The mounted line is RECORDED, not asserted: V4 and the live session loops
     // are there by design, and pinning their count would pin an implementation
-    // detail of the exemplar rather than a law.
+    // detail of the exemplar rather than a law. Recording it means PRINTING it
+    // — `cargo nextest run -p vilan-cli --test reactive_lifetimes -E
+    // 'test(a_disposed_exemplar_holds_no_reactive_cycle)' --no-capture` — so
+    // the number a change to the graph moves can be read off the gate that
+    // measures it instead of re-derived by hand (C14 S3 read it this way).
+    println!("{stdout}");
     assert!(
         stdout.contains("mounted reachable="),
         "the walk must reach the mounted app; got:\n{stdout}"
     );
+    let unmounted = stdout
+        .lines()
+        .find(|line| line.starts_with("unmounted reachable="))
+        .unwrap_or_else(|| panic!("the walk must reach the unmounted app; got:\n{stdout}"));
     assert!(
-        stdout.contains("unmounted reachable=") && stdout.contains("cycles=0"),
+        unmounted.contains("cycles=0"),
         "a disposed app must hold no reactive cycle; got:\n{stdout}"
     );
+    // The exclusion is by NAME, so it is held to having matched: the
+    // module-level `.cell_global()` keeps its loop for the life of the program
+    // (A130, by design), and a walk that stopped seeing it — the closure
+    // renamed, the global inlined away — would pass `cycles=0` vacuously.
+    assert!(
+        unmounted.contains("designed=1"),
+        "the module-level `.cell_global()` loop must be seen and excluded by name; \
+         got:\n{stdout}"
+    );
 }
+
+// --- B291: an owner has a DISPOSED state ------------------------------------
+
+/// The async shape the item names: a scope torn down while a continuation that
+/// registers into it is still in flight — a route switched away before a
+/// handle's reply, a `each` row rebuilt while its first fetch is out.
+const LATE_REGISTRATION: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, owner_scope };
+
+async fun main() {
+	let count: SignalCell<i32> = Signal::new(0);
+	let fired: SignalCell<i32> = Signal::new(0);
+	let owner = Owner::new();
+
+	// The continuation's owner is captured at CREATION and disposed before the
+	// continuation ever runs.
+	owner_scope.run(owner, || {
+		async {
+			let _tick: i32 = await async 1;
+			count.effect(|_value: i32| {
+				fired.set_with(|n| n + 1);
+			});
+		};
+	});
+	owner.dispose();
+	let _first: i32 = await async 1;
+	let _second: i32 = await async 1;
+
+	// `effect` is `effect_on_change` plus one immediate call, and the immediate
+	// call is the observer's contract, not a subscription — it still happens.
+	print(i"at-registration={fired.get()}");
+	count.set(1);
+	count.set(2);
+	print(i"after-disposal={fired.get() - 1}");
+	print(i"subscribers={count.subscribers.read().len()}");
+	owner.dispose();
+	count.set(3);
+	print(i"after-second-dispose={fired.get() - 1}");
+}
+"#;
+
+#[test]
+fn b291_an_effect_registered_after_its_owner_was_disposed_never_fires_again() {
+    // Before the flag, `Owner::dispose` emptied the cleanup list and kept no
+    // record, so this `take` parked a cleanup on a list nothing runs again:
+    // `after-disposal=2` (the observer fired on every later `set` for the rest
+    // of the session) and only a SECOND `dispose` released it. The immediate
+    // call at registration is deliberately NOT what changed — `effect`'s
+    // contract is one call with the current value, and it is made before the
+    // subscription is handed anywhere.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("late_registration", LATE_REGISTRATION, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "at-registration=1",
+            "after-disposal=0",
+            "subscribers=0",
+            "after-second-dispose=0",
+        ],
+        "a late registration must be disposed on the spot; got:\n{stdout}"
+    );
+}
+
+/// The three faces of the flag, synchronously: `dispose` is idempotent, a late
+/// `defer` runs now, a late `take` disposes on the spot — and a LIVE owner
+/// still parks everything it is given, which is the control.
+const DISPOSED_OWNER_STATE: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell };
+
+fun main() {
+	let ran: SignalCell<i32> = Signal::new(0);
+	let owner = Owner::new();
+	owner.defer(|| {
+		ran.set_with(|n| n + 1);
+	});
+	owner.dispose();
+	print(i"first-dispose={ran.get()}");
+	owner.dispose();
+	print(i"second-dispose={ran.get()}");
+
+	// A cleanup deferred to an owner that is already gone runs NOW — the
+	// promise to release is kept the only way it still can be.
+	owner.defer(|| {
+		ran.set_with(|n| n + 1);
+	});
+	print(i"late-defer={ran.get()}");
+
+	// And a disposable TAKEN by a dead owner is disposed on the spot: the
+	// observer is off the signal before the next write.
+	let count: SignalCell<i32> = Signal::new(0);
+	let seen: SignalCell<i32> = Signal::new(0);
+	let late = owner.take(count.on_change(|_value: i32| {
+		seen.set_with(|n| n + 1);
+	}));
+	count.set(1);
+	print(i"late-take={seen.get()} subscribers={count.subscribers.read().len()}");
+	late.dispose();
+	print(i"disposing-it-again={count.subscribers.read().len()}");
+
+	// The control: a live owner parks its cleanups and releases them as a
+	// group, exactly as before.
+	let live = Owner::new();
+	let parked: SignalCell<i32> = Signal::new(0);
+	live.defer(|| {
+		parked.set_with(|n| n + 1);
+	});
+	print(i"parked={parked.get()}");
+	live.dispose();
+	print(i"released={parked.get()}");
+}
+"#;
+
+#[test]
+fn b291_a_disposed_owner_is_idempotent_and_releases_what_it_is_given_at_once() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("disposed_owner", DISPOSED_OWNER_STATE, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "first-dispose=1",
+            // Idempotent: the second `dispose` runs nothing. Before the flag
+            // this was true only because the list had been emptied, which is
+            // exactly what made a LATE registration immortal.
+            "second-dispose=1",
+            "late-defer=2",
+            "late-take=0 subscribers=0",
+            "disposing-it-again=0",
+            "parked=0",
+            "released=1",
+        ],
+        "the disposed owner's state went differently:\n{stdout}"
+    );
+}
+
+// --- B292: the drain is exception-safe, and so is a disposal group ----------
+
+/// A throwing observer, and a throwing cleanup, with a harness that can see the
+/// throw — vilan has no exception syntax, so `__step` is the only way a program
+/// can report that the error really left the reactive core rather than being
+/// swallowed there.
+const THROWING_OBSERVER: &str = r#"import std::io::{ panic, print };
+import std::reactive::{ Disposable, FlushPolicy, Owner, Signal, SignalCell, turn };
+
+/// The harness runs each step inside a JS `try`/`catch` and prints what it
+/// caught.
+[extern("__step")]
+external fun step(body: || void): void;
+
+fun main() {
+	let a: SignalCell<i32> = Signal::new(0);
+	let b: SignalCell<i32> = Signal::new(0);
+	let seen_a: SignalCell<i32> = Signal::new(0);
+	let seen_b: SignalCell<i32> = Signal::new(0);
+	let armed: SignalCell<bool> = Signal::new(true);
+
+	let _watch_a = a.on_change(|value: i32| {
+		seen_a.set(value);
+		if armed.get() {
+			armed.set(false);
+			panic("observer exploded");
+		}
+	});
+	let _watch_b = b.on_change(|value: i32| {
+		seen_b.set(value);
+	});
+
+	// Both writes land in ONE turn, so both observers are in one wave.
+	step(|| {
+		turn(FlushPolicy::AtEnd, || {
+			a.set(1);
+			b.set(1);
+		});
+	});
+	print(i"after-throw:a={seen_a.get()} b={seen_b.get()}");
+
+	// The scheduler survived. These two have NO ambient turn, so they resolve
+	// through `draining_turns.last()` — which is exactly where the stuck turn
+	// used to be, swallowing every write in the program from here on.
+	a.set(2);
+	b.set(2);
+	print(i"after-recovery:a={seen_a.get()} b={seen_b.get()}");
+
+	// A disposal group is a list of promises, so it FINISHES past a throwing
+	// cleanup and raises the failure afterwards.
+	let owner = Owner::new();
+	let released: SignalCell<i32> = Signal::new(0);
+	owner.defer(|| {
+		released.set_with(|n| n + 1);
+	});
+	owner.defer(|| {
+		panic("cleanup exploded");
+	});
+	owner.defer(|| {
+		released.set_with(|n| n + 1);
+	});
+	step(|| {
+		owner.dispose();
+	});
+	print(i"released={released.get()}");
+}
+"#;
+
+#[test]
+fn b292_a_throwing_observer_leaves_the_turn_drainable_and_the_error_visible() {
+    // B292. `drain` set `draining = true`, pushed the turn onto
+    // `draining_turns`, and restored neither on the way out of a throw, so one
+    // observer that panicked — or one host API that refused its argument, the
+    // Chrome `insertRule` shape the item names — left the turn DRAINING
+    // forever and on the stack. Every later write then resolved to it
+    // (`Signal::notify`'s no-ambient-turn arm joins `draining_turns.last()`)
+    // and enqueued into a queue nothing would ever flush: the reactive graph
+    // was off for the rest of the session, with no second error to show for
+    // it. `after-recovery` is that line.
+    //
+    // The drain restores under a FINALLY and lets the throw keep unwinding
+    // untouched, rather than catching and continuing the wave: a throwing
+    // observer means the graph is mid-update, and the write that started the
+    // drain is the honest place for the failure to surface. `b=0` on the
+    // `after-throw` line is the price, and it is deliberate. A disposal group
+    // is the opposite case and gets the opposite guard — see `released`.
+    let harness = format!(
+        r#"{DOM_STUB}
+global.__step = (body) => {{
+    try {{
+        body();
+    }} catch (error) {{
+        console.log(`caught:${{error && error.message ? error.message : String(error)}}`);
+    }}
+}};
+require("./app.js");
+"#
+    );
+    let stdout = build_and_run("throwing_observer", THROWING_OBSERVER, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The throw left the core with its own message.
+            "caught:observer exploded",
+            // The wave was abandoned at the thrower, deliberately.
+            "after-throw:a=1 b=0",
+            // And the scheduler is usable again — this is the line that was
+            // `a=1 b=0` for the rest of the session.
+            "after-recovery:a=2 b=2",
+            "caught:cleanup exploded",
+            // Both surviving cleanups ran: a disposal group finishes. Before
+            // B292 this was 1, and B291's idempotence made it permanent — a
+            // second `dispose` no longer picks up what the throw skipped.
+            "released=2",
+        ],
+        "the reactive core's exception safety went differently:\n{stdout}"
+    );
+}
+
+// --- A110 door 1: a disposed observer never fires ---------------------------
+
+/// The item's probe, inline: a `route` cell, a `shell` derived from it, an outer
+/// observer of `shell` that disposes a boundary, and an inner observer of
+/// `route` owned by that boundary. One `route.set`, no ambient turn.
+///
+/// `SignalCell::notify`'s inline arm walks a SNAPSHOT of the subscriber list.
+/// The derivation's subscriber runs first and cascades depth-first — derived
+/// `set` → the outer observer → the boundary disposed and the inner
+/// subscription detached from the LIST — but the snapshot the loop is walking
+/// still holds it, so it was called next. For a `swap` that is the leak the
+/// item names: `live_owner` (already disposed) no-ops, `render` runs under a
+/// fresh `Owner` the boundary's `defer` has already passed, and `open_row`
+/// inserts before an anchor `region.close()` removed.
+const A110_DISPOSED_OBSERVER_INLINE: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, owner_scope };
+
+fun main() {
+	let route: SignalCell<i32> = Signal::new(0);
+	let shell: SignalCell<i32> = route.map(|value| value / 10).cell();
+	let boundary = Owner::new();
+	let fired: SignalCell<i32> = Signal::new(0);
+
+	owner_scope.run(boundary, || {
+		route.effect_on_change(|value: i32| {
+			print(i"INNER fired with {value} (boundary disposed: {boundary.is_disposed()})");
+			fired.set_with(|count| count + 1);
+		});
+	});
+	let _outer = shell.on_change(|_projected: i32| {
+		print("outer disposes the inner boundary");
+		boundary.dispose();
+	});
+
+	// No ambient turn: `notify` takes the inline arm.
+	route.set(10);
+	print(i"inline-fired={fired.get()}");
+	print(i"inline-subscribers={route.subscribers.read().len()}");
+}
+"#;
+
+#[test]
+fn a110_a_disposed_observer_does_not_fire_from_an_inline_notifys_snapshot() {
+    // Before door 1 this printed `INNER fired with 10 (boundary disposed:
+    // true)` and `inline-fired=1` — the scrub's own comment promises "a
+    // disposed observer never fires", and that held only under an ambient
+    // turn. The flag is `Subscriber.live`, lowered by `Subscription::dispose`
+    // and read by both notification loops.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a110_inline", A110_DISPOSED_OBSERVER_INLINE, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "outer disposes the inner boundary",
+            // No `INNER fired` line at all: the inner observer is off.
+            "inline-fired=0",
+            // …and detached, which is what it always was.
+            "inline-subscribers=1",
+        ],
+        "a disposed observer must not fire from an inline notify's snapshot; got:\n{stdout}"
+    );
+}
+
+/// The same law inside a turn, at the two places the pending-queue scrub cannot
+/// reach.
+///
+/// **One wave.** `drain` takes a whole wave OUT of `pending` before running it,
+/// so a dispose from inside that wave scrubs a queue the remaining subscribers
+/// are no longer in. Both observers here stand directly on `route`, the
+/// disposing one registered first, so they land in one wave in subscription
+/// order.
+///
+/// **Through a derivation.** The inner subscriber is reached one derivation
+/// later than the disposer, so it is enqueued while the wave is already
+/// running. Since A110 door 2 the derivation runs in the wave's FIRST phase, so
+/// the inner effect joins the same effect wave; before door 2 it waited for
+/// wave 2. Either way the disposer runs first and the wave the inner is in has
+/// already been taken out of `pending`, which is the face no removal can reach.
+///
+/// **Both halves register the DISPOSER first**, and that is load-bearing since
+/// door 2: the effect queue runs in ascending subscriber id, so the creation
+/// order is what puts the disposer ahead of its victim. A hand-written pair in
+/// the other order is two INDEPENDENT observers of one source, whose relative
+/// order is explicitly not part of the contract (reactive-turns.md §7.10) — and
+/// with the victim first the victim simply fires, live, which measures nothing
+/// about door 1. A genuinely nested form has this order by construction: the
+/// parent's effect is created when the parent is placed, the child's when the
+/// parent's render runs.
+const A110_DISPOSED_OBSERVER_IN_A_TURN: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, FlushPolicy, Owner, Signal, SignalCell, Source, owner_scope, turn,
+};
+
+fun main() {
+	// One wave: the outer is registered FIRST, so it runs before the inner.
+	let route: SignalCell<i32> = Signal::new(0);
+	let boundary = Owner::new();
+	let fired: SignalCell<i32> = Signal::new(0);
+	let _outer = route.on_change(|_value: i32| {
+		print("one-wave: outer disposes the inner boundary");
+		boundary.dispose();
+	});
+	owner_scope.run(boundary, || {
+		route.effect_on_change(|value: i32| {
+			print(i"one-wave: INNER fired with {value}");
+			fired.set_with(|count| count + 1);
+		});
+	});
+	turn(FlushPolicy::AtEnd, || {
+		route.set(10);
+	});
+	print(i"one-wave-fired={fired.get()}");
+
+	// Through a derivation: the inner observes a DERIVATION of the source, so
+	// it is enqueued while the wave is already running and the outer disposes
+	// it from inside that wave. The outer is created FIRST, so ascending
+	// subscriber id runs it first (A110 door 2).
+	let path: SignalCell<i32> = Signal::new(0);
+	let gate: SignalCell<i32> = path.map(|value| value / 10).cell();
+	let later_boundary = Owner::new();
+	let later_fired: SignalCell<i32> = Signal::new(0);
+	let _later_outer = path.on_change(|_value: i32| {
+		print("later-wave: outer disposes the inner boundary");
+		later_boundary.dispose();
+	});
+	owner_scope.run(later_boundary, || {
+		gate.effect_on_change(|value: i32| {
+			print(i"later-wave: INNER fired with {value}");
+			later_fired.set_with(|count| count + 1);
+		});
+	});
+	turn(FlushPolicy::AtEnd, || {
+		path.set(10);
+	});
+	print(i"later-wave-fired={later_fired.get()}");
+}
+"#;
+
+#[test]
+fn a110_a_disposed_observer_does_not_fire_from_a_wave_the_drain_already_took_out() {
+    // Both halves printed an `INNER fired` line and a `-fired=1` before door 1.
+    // The `later-wave` half is the one the item's "pending-queue scrub cannot
+    // help" sentence undercounts: the scrub is not merely too late there, it
+    // does not run — the disposer is an owner's cleanup closure whose captured
+    // turn is `None`, so `dispose` scrubs nothing while the subscriber sits in
+    // the draining turn's own queue.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run(
+        "a110_in_a_turn",
+        A110_DISPOSED_OBSERVER_IN_A_TURN,
+        &harness,
+        &[],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "one-wave: outer disposes the inner boundary",
+            "one-wave-fired=0",
+            "later-wave: outer disposes the inner boundary",
+            "later-wave-fired=0",
+        ],
+        "a disposed observer must not fire from a wave already taken out of the \
+         queue, nor from a queue the disposer's own turn cannot reach; got:\n{stdout}"
+    );
+}
+
+// --- FIND-2 (papers-38): the scrub resolves its turn the way `notify` does ---
+
+/// `Subscription::dispose` read its turn with `turn_scope.get_safe()` alone,
+/// while `SignalCell::notify` and `defer_to_turn` both read "the ambient turn,
+/// ELSE the currently DRAINING one". `turn` calls `drain(fresh)` AFTER
+/// `turn_scope.run(fresh, body)` has returned, so a drain runs OUTSIDE its own
+/// turn's context extent — and a dispose reached from inside a notify is every
+/// form's teardown, since a form's own effect is what disposes the previous
+/// instantiation. Those disposals read `None` and scrubbed nothing at all.
+///
+/// The shape, one cell and two positions in one wave: an effect that PARKS the
+/// victim (it writes a second cell the victim observes, and the wave it lands
+/// in has already been taken out of `pending`), then — at a higher subscriber
+/// id, so it runs second since A110 door 2 ordered the effect queue — the
+/// disposer. That is the only arrangement in which the scrub has anything to
+/// do, and it is the arrangement a nested form has: the enclosing form's
+/// teardown runs while the subtree's own effects are parked.
+///
+/// Before door 2 this was written as a DERIVATION parking the victim for wave 2
+/// with the disposer second in wave 1. Door 2 runs derivations in the wave's
+/// first phase, so the victim joined the same effect wave and the queue the
+/// scrub reads was empty by the time the disposer ran — the assertion would
+/// still have read 0, vacuously. An effect doing the parking puts the entry
+/// back where the scrub can be measured.
+///
+/// The program drives its OWN `Turn` rather than using `turn(..)`, because the
+/// queue length has to be read from INSIDE the drain — which is the only place
+/// the scrub's effect is visible now that the liveness flag stops the delivery
+/// either way. `pending-after-dispose` is that reading, and it is the
+/// assertion that belongs to this fix rather than to door 1.
+const FIND2_A_DISPOSE_FROM_INSIDE_A_DRAIN: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, Owner, Signal, SignalCell, Source, Turn, drain, owner_scope, turn_scope,
+};
+import std::shared::Shared;
+
+/// BOTH of a turn's queues, since A110 door 2 split them: a parked effect sits
+/// in `pending` and a derivation in `pending_derived`, and the scrub's claim is
+/// about whichever one holds the entry.
+fun parked(turn: Turn): usize {
+	turn.pending.read().len() + turn.pending_derived.read().len()
+}
+
+fun main() {
+	let own_turn = Turn::new();
+	let trigger: SignalCell<i32> = Signal::new(0);
+	let relay: SignalCell<i32> = Signal::new(0);
+	let boundary = Owner::new();
+	let fired: Shared<i32> = Shared::new(0);
+
+	// The VICTIM stands on `relay`, not on `trigger`, so it is not in the wave
+	// — it is PARKED into the queue by an effect that is.
+	owner_scope.run(boundary, || {
+		relay.effect_on_change(|value: i32| {
+			fired.write() = fired.read() + 1;
+			print(i"VICTIM fired with {value} (boundary disposed: {boundary.is_disposed()})");
+		});
+	});
+	// First in the wave (the lower id): park the victim.
+	let _parker = trigger.on_change(|value: i32| {
+		relay.set(value * 10);
+	});
+	// Second in the wave: the dispose every form's teardown is, reached from
+	// inside the drain with no ambient turn of its own.
+	let _disposer = trigger.on_change(|_value: i32| {
+		boundary.dispose();
+		print(i"pending-after-dispose={parked(own_turn)}");
+	});
+
+	// `run` enqueues; `drain` settles, from OUTSIDE the context extent.
+	turn_scope.run(own_turn, || {
+		trigger.set(1);
+	});
+	drain(own_turn);
+	print(i"victim-fired={fired.read()}");
+
+	// The control: the same dispose made from the turn's BODY, where
+	// `turn_scope` IS established and the scrub always worked.
+	let second_turn = Turn::new();
+	let second_trigger: SignalCell<i32> = Signal::new(0);
+	let second_derived: SignalCell<i32> = second_trigger.map(|value| value * 10).cell();
+	let second_boundary = Owner::new();
+	let second_fired: Shared<i32> = Shared::new(0);
+	owner_scope.run(second_boundary, || {
+		second_derived.effect_on_change(|value: i32| {
+			second_fired.write() = second_fired.read() + 1;
+			print(i"CONTROL fired with {value}");
+		});
+	});
+	turn_scope.run(second_turn, || {
+		second_trigger.set(1);
+		second_boundary.dispose();
+		print(i"control-pending-after-dispose={parked(second_turn)}");
+	});
+	drain(second_turn);
+	print(i"control-fired={second_fired.read()}");
+}
+"#;
+
+#[test]
+fn find2_a_dispose_reached_from_inside_a_drain_scrubs_the_draining_turns_queue() {
+    // TWO claims, red against two different plants.
+    //
+    // `victim-fired=0` is A110 door 1's (the liveness flag): on `0fa109eb` the
+    // victim fired once with its boundary already disposed.
+    //
+    // `pending-after-dispose=0` is THIS fix's: on the door-1 commit it still
+    // read 1, because `dispose` asked `turn_scope.get_safe()` and nothing
+    // else. A disposed subscriber left in the queue is a disposed subtree's
+    // notify closure — and everything it captured — held reachable until the
+    // drain ends, which for a `swap` tearing down a thousand rows inside one
+    // wave is a thousand of them.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run(
+        "find2_scrub",
+        FIND2_A_DISPOSE_FROM_INSIDE_A_DRAIN,
+        &harness,
+        &[],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "pending-after-dispose=0",
+            "victim-fired=0",
+            // 1, and correctly: the dispose happens BEFORE the drain, so the
+            // only thing queued is the DERIVATION's own entry — in
+            // `pending_derived` since door 2, which is why the program counts
+            // both queues — and the victim has not been enqueued yet. The
+            // control's claim is the line below it.
+            "control-pending-after-dispose=1",
+            "control-fired=0",
+        ],
+        "a dispose from inside a drain must scrub the draining turn's queue, and \
+         the victim must not fire either way; got:\n{stdout}"
+    );
+}
+
+// --- A110 door 2: derivations to a fixpoint, then effects in ascending id ----
+
+/// The ordering contract (`reactive-turns.md` §7, RULED 2026-09-21), on the
+/// shape it is a contract ABOUT: **nested forms**.
+///
+/// Two halves, and the first is why the second is possible. Both stand on one
+/// cell with the outer observer reaching it one derivation further away — the
+/// idiom the guide teaches, because projecting the outer key is what stops the
+/// outer form rebuilding on every change — and in both the INNER effect is
+/// created by the OUTER's own first run, which is what makes the pair nested
+/// rather than two independent observers of one source (`fresh_id` is
+/// monotonic, so "created by my render" is "has a higher id than me").
+///
+/// **`order:`** — nothing is disposed, so both fire and the order is readable:
+/// the outer's line comes first. Before door 2 the inner's came first, and by a
+/// whole wave — `drain` ran the wave in SUBSCRIPTION order, where the outer is
+/// not on the cell's list at all (it rides the derived cell), so no order read
+/// off one cell's list could ever put it first.
+///
+/// **`nested:`** — the outer's run DISPOSES the previous instantiation, which
+/// is what every form's teardown does. The inner observer of the instantiation
+/// being replaced fires ZERO times, where under door 1 alone it fired once,
+/// live, for a value the outer was about to exclude — a wasted subtree build,
+/// and a panic if that arm is `unreachable`. `built`/`torn` stay a balanced
+/// pair, which is door 1's claim and is unaffected.
+///
+/// Order among INDEPENDENT observers of one source is explicitly NOT part of
+/// the contract (§7.10), so neither half is written on a hand-made sibling
+/// pair — and A110's own probe, which is one, is not this item's pin.
+const A110_DOOR2_NESTED_FORMS: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, FlushPolicy, Owner, Signal, SignalCell, Source, get_owner, owner_scope,
+	run_with_owner, turn,
+};
+
+fun main() {
+	// --- order: the outer runs first, and both run.
+	let source: SignalCell<i32> = Signal::new(0);
+	let coarse: SignalCell<i32> = source.map(|value| value / 10).cell();
+	let host = Owner::new();
+	mut wired = false;
+	run_with_owner(host, || {
+		coarse.effect(|value: i32| {
+			print(i"order: OUTER with {value}");
+			if !wired {
+				wired = true;
+				source.effect_on_change(|inner: i32| {
+					print(i"order: inner with {inner}");
+				});
+			}
+		});
+	});
+	turn(FlushPolicy::AtEnd, || {
+		source.set(10);
+	});
+
+	// --- nested: the outer's run replaces the instantiation the inner belongs
+	// to, so the inner never runs at all.
+	let route: SignalCell<i32> = Signal::new(0);
+	let shell: SignalCell<i32> = route.map(|value| value / 10).cell();
+	let boundary = Owner::new();
+	let built: SignalCell<i32> = Signal::new(0);
+	let torn: SignalCell<i32> = Signal::new(0);
+	let inner_fired: SignalCell<i32> = Signal::new(0);
+	mut instance: Option<Owner> = None;
+	run_with_owner(boundary, || {
+		shell.effect(|value: i32| {
+			print(i"nested: OUTER renders for shell={value}");
+			match instance {
+				Some(let previous) => previous.dispose(),
+				None => {},
+			}
+			let fresh = Owner::new();
+			instance = Some(fresh);
+			owner_scope.run(fresh, || {
+				built.set_with(|count| count + 1);
+				get_owner().defer(|| {
+					torn.set_with(|count| count + 1);
+				});
+				route.effect_on_change(|inner: i32| {
+					print(i"nested: inner fired with {inner}");
+					inner_fired.set_with(|count| count + 1);
+				});
+			});
+		});
+	});
+	turn(FlushPolicy::AtEnd, || {
+		route.set(10);
+	});
+	print(i"nested: built={built.get()} torn={torn.get()} inner-fired={inner_fired.get()}");
+}
+"#;
+
+#[test]
+fn a110_door2_a_parent_forms_effect_runs_before_anything_its_render_created() {
+    // Red on the door-1 commit, in both halves and for the same reason. The
+    // `order:` half printed `inner` before the second `OUTER` line (the outer
+    // was a whole wave behind, since it reaches the source through the
+    // derivation). The `nested:` half printed a `nested: inner fired with 10`
+    // line and `built=3 torn=2 inner-fired=1` — the wasted build A110 was
+    // filed for.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a110_door2_nested", A110_DOOR2_NESTED_FORMS, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The eager first call, before anything has changed.
+            "order: OUTER with 0",
+            // One `set`, one wave: the derivation settles in phase 1, then the
+            // effects run in ascending id — the parent's first.
+            "order: OUTER with 1",
+            "order: inner with 10",
+            "nested: OUTER renders for shell=0",
+            "nested: OUTER renders for shell=1",
+            // No `nested: inner fired` line at all, and the pair balances: two
+            // instantiations built, the first one torn down.
+            "nested: built=2 torn=1 inner-fired=0",
+        ],
+        "a parent form's effect must run before anything its render created, and \
+         an instantiation the parent has replaced must not run at all; got:\n{stdout}"
+    );
+}
+
+/// The other half of the rule: **derivations run to a FIXPOINT** before any
+/// effect, so an effect never reads a half-updated graph.
+///
+/// The shape is a diamond with a two-deep chain on one arm — an effect standing
+/// on the root that READS a derivation two hops away. Under door 2 the chain is
+/// pulled all the way through in phase 1 and the effect reads 11. Before it, the
+/// effect was in the same wave as the first link of the chain and ran after it
+/// in subscription order, so it read the SECOND link's stale value: `5/3`, where
+/// 3 is what `twice` held before the write and 11 is what it holds one wave
+/// later. That is a glitch in the sense `enqueue`'s dedup already promised not
+/// to have — "each subscriber fires once" extended to "each subscriber fires
+/// once, on final values".
+///
+/// It fires ONCE, which is the second claim: the chain's two intermediate
+/// writes do not each wake the effect.
+const A110_DOOR2_DERIVATION_FIXPOINT: &str = r#"import std::io::print;
+import std::reactive::{
+	FlushPolicy, Owner, Signal, SignalCell, Source, run_with_owner, turn,
+};
+
+fun main() {
+	let root: SignalCell<i32> = Signal::new(1);
+	let once: SignalCell<i32> = root.map(|value| value * 2).cell();
+	let twice: SignalCell<i32> = once.map(|value| value + 1).cell();
+	let seen: SignalCell<str> = Signal::new("");
+	let watcher = Owner::new();
+	run_with_owner(watcher, || {
+		root.effect_on_change(|value: i32| {
+			seen.set_with(|log| i"{log}{value}/{twice.get()},");
+		});
+	});
+	print(i"before root={root.get()} twice={twice.get()}");
+	turn(FlushPolicy::AtEnd, || {
+		root.set(5);
+	});
+	print(i"fixpoint={seen.get()}");
+}
+"#;
+
+#[test]
+fn a110_door2_an_effect_reads_a_derivation_chains_final_value_once() {
+    // Red on the door-1 commit: `fixpoint=5/3,` — the effect ran between the
+    // chain's first and second link and read the value `twice` held BEFORE the
+    // write. The count is the same either way (the dedup was never the defect),
+    // so the claim is the VALUE.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run(
+        "a110_door2_fixpoint",
+        A110_DOOR2_DERIVATION_FIXPOINT,
+        &harness,
+        &[],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec!["before root=1 twice=3", "fixpoint=5/11,"],
+        "an effect must see a derivation chain settled, and see it once; got:\n{stdout}"
+    );
+}
+
+/// The same claim with COLD arms (A124 S2a, `proposal/reactive-pipeline.md`
+/// §2.3), and with the count made the claim. The derivation chain is two
+/// `map_node`s — nodes, which store nothing and are READ by pulling — and the
+/// effect stands on a diamond: the root joined with that chain. Under pull the
+/// VALUE half holds by construction (every read is of settled state, so `5/3`
+/// cannot happen). The COUNT half is what the threaded id buys: both arms
+/// forward the effect's ONE subscriber record to the root, so the root's list
+/// holds it twice, and the turn's dedup — keyed on that id — calls it once.
+///
+/// Red when `SignalCell::on_settle` mints a fresh id per registration instead
+/// of pushing the leaf's record: `fixpoint=5/11,5/11,`.
+const A124_S2A_COLD_DIAMOND: &str = r#"import std::io::print;
+import std::reactive::{
+	FlushPolicy, Owner, Signal, SignalCell, Source, combine, run_with_owner, turn,
+};
+
+fun main() {
+	let root: SignalCell<i32> = Signal::new(1);
+	let twice = root.map(|value| value * 2).map(|value| value + 1);
+	let arms: (dyn Source<i32>, dyn Source<i32>) = (root, twice);
+	let pair = combine(arms);
+	let seen: SignalCell<str> = Signal::new("");
+	let watcher = Owner::new();
+	run_with_owner(watcher, || {
+		pair.effect_on_change(|both: (i32, i32)| {
+			let (left, right) = both;
+			seen.set_with(|log| i"{log}{left}/{right},");
+		});
+	});
+	print(i"before root={root.get()} twice={twice.get()}");
+	turn(FlushPolicy::AtEnd, || {
+		root.set(5);
+	});
+	print(i"fixpoint={seen.get()}");
+	watcher.dispose();
+	turn(FlushPolicy::AtEnd, || {
+		root.set(6);
+	});
+	print(i"disposed={seen.get()}");
+}
+"#;
+
+#[test]
+fn a124_s2a_door2_a_cold_diamond_fires_its_effect_once_with_the_settled_pair() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run(
+        "a124_s2a_cold_diamond",
+        A124_S2A_COLD_DIAMOND,
+        &harness,
+        &[],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec!["before root=1 twice=3", "fixpoint=5/11,", "disposed=5/11,"],
+        "an effect standing on a cold diamond must fire once per settle, on the \
+         settled pair, and not at all once its owner is gone; got:\n{stdout}"
+    );
+}
+
+// --- A114: an effect with an OWNER PER RUN ----------------------------------
+
+/// `Source::scoped_effect` and the free `on_cleanup` (tracker A114, R2 at Order
+/// 39's GO), on the sequence A113 row 4 named as missing: a per-run cleanup.
+///
+/// Four sections, and the first is the item's own user-code probe
+/// (`sweeps/order38/probes/scoped_effect.vl`) run through the std form. Its
+/// output here is byte-identical to the probe's on the same tree, which is the
+/// claim that the mechanism moved into std unchanged.
+///
+/// **`inline:`** — one owner per run. Each run registers an `on_cleanup` and a
+/// nested `effect` on a SECOND source; the cleanup runs before the next run, the
+/// nested subscription dies with the run (so `other`'s changes reach exactly the
+/// current run), and the LAST run is released by the enclosing boundary —
+/// `other-subscribers=0` after it, which is the leak a form-less per-run owner
+/// has no other way to close.
+///
+/// **`turn:`** — the same inside a turn, counted: runs and cleanups differ by
+/// exactly one while the effect is live (the current run has not been cleaned
+/// up yet) and are EQUAL once the boundary goes. Disposal count = creation
+/// count is the item's own acceptance line.
+///
+/// **`plain:`** — `on_cleanup` under an ordinary boundary, which is the other
+/// half of "one name, the ambient owner decides": it runs ONCE, at teardown,
+/// and not per change.
+///
+/// **`lazy:`** — `scoped_effect_on_change` makes no immediate run, exactly as
+/// `effect_on_change` makes no immediate call.
+const A114_SCOPED_EFFECT: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, FlushPolicy, Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner,
+	turn,
+};
+
+fun main() {
+	let id: SignalCell<i32> = Signal::new(1);
+	let other: SignalCell<str> = Signal::new("a");
+	let boundary = Owner::new();
+	run_with_owner(boundary, || {
+		id.scoped_effect(|value: i32| {
+			print(i"inline: run {value}");
+			on_cleanup(|| print(i"inline: cleanup {value}"));
+			other.effect(|text: str| print(i"inline: inner {value} sees {text}"));
+		});
+	});
+	id.set(2);
+	other.set("b");
+	id.set(3);
+	print("inline: dispose boundary");
+	boundary.dispose();
+	id.set(4);
+	other.set("c");
+	print(i"inline: other-subscribers={other.subscribers.read().len()}");
+
+	let key: SignalCell<i32> = Signal::new(0);
+	let runs: SignalCell<i32> = Signal::new(0);
+	let cleanups: SignalCell<i32> = Signal::new(0);
+	let scope = Owner::new();
+	run_with_owner(scope, || {
+		key.scoped_effect(|_value: i32| {
+			runs.set_with(|count| count + 1);
+			on_cleanup(|| cleanups.set_with(|count| count + 1));
+		});
+	});
+	turn(FlushPolicy::AtEnd, || {
+		key.set(1);
+	});
+	turn(FlushPolicy::AtEnd, || {
+		key.set(2);
+	});
+	print(i"turn: runs={runs.get()} cleanups={cleanups.get()}");
+	scope.dispose();
+	print(i"turn: after-dispose runs={runs.get()} cleanups={cleanups.get()}");
+
+	let ticks: SignalCell<i32> = Signal::new(0);
+	let plain = Owner::new();
+	run_with_owner(plain, || {
+		on_cleanup(|| print("plain: cleanup"));
+		ticks.effect(|value: i32| print(i"plain: tick {value}"));
+	});
+	ticks.set(1);
+	ticks.set(2);
+	plain.dispose();
+	print("plain: disposed");
+
+	let lazy_key: SignalCell<i32> = Signal::new(0);
+	let lazy_runs: SignalCell<i32> = Signal::new(0);
+	let lazy_scope = Owner::new();
+	run_with_owner(lazy_scope, || {
+		lazy_key.scoped_effect_on_change(|_value: i32| {
+			lazy_runs.set_with(|count| count + 1);
+		});
+	});
+	print(i"lazy: after-attach runs={lazy_runs.get()}");
+	lazy_key.set(1);
+	print(i"lazy: after-change runs={lazy_runs.get()}");
+	lazy_scope.dispose();
+}
+"#;
+
+#[test]
+fn a114_a_scoped_effect_releases_each_runs_registrations_before_the_next_run() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a114_scoped", A114_SCOPED_EFFECT, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // Run 1, and its nested subscription sees the other source's
+            // current value through the eager `effect`.
+            "inline: run 1",
+            "inline: inner 1 sees a",
+            // The cleanup runs BEFORE the next run, not after it.
+            "inline: cleanup 1",
+            "inline: run 2",
+            "inline: inner 2 sees a",
+            // `other` changed: exactly the CURRENT run's nested subscription
+            // hears it. Under a plain `effect` there would be two by now.
+            "inline: inner 2 sees b",
+            "inline: cleanup 2",
+            "inline: run 3",
+            "inline: inner 3 sees b",
+            "inline: dispose boundary",
+            // The last run is the BOUNDARY's to release, which is what the
+            // `on_cleanup` inside `scoped_runner` is for.
+            "inline: cleanup 3",
+            "inline: other-subscribers=0",
+            // Three runs, two cleanups: the live run has not been cleaned up.
+            "turn: runs=3 cleanups=2",
+            // …and then it has. Disposal count = creation count.
+            "turn: after-dispose runs=3 cleanups=3",
+            // `on_cleanup` under an ordinary boundary: once, at teardown.
+            "plain: tick 0",
+            "plain: tick 1",
+            "plain: tick 2",
+            "plain: cleanup",
+            "plain: disposed",
+            // The lazy twin makes no immediate run.
+            "lazy: after-attach runs=0",
+            "lazy: after-change runs=1",
+        ],
+        "a scoped effect must give every run its own owner and release it before \
+         the next run; got:\n{stdout}"
+    );
+}
+
+/// A run whose body THROWS still had its owner installed as the current one, so
+/// whatever it registered before the throw is released by the next run — and by
+/// the boundary if there is no next run.
+///
+/// The order inside the observer is what makes this true and is written that
+/// way deliberately: release the previous run, install the fresh owner, THEN
+/// call the body. A body that throws with the fresh owner already installed
+/// leaks nothing; a body called before the install would leak everything it had
+/// registered.
+const A114_THROWING_BODY: &str = r#"import std::io::{ panic, print };
+import std::reactive::{
+	Disposable, Owner, Signal, SignalCell, Source, guarded, on_cleanup, run_with_owner,
+};
+
+fun main() {
+	let id: SignalCell<i32> = Signal::new(0);
+	let released: SignalCell<i32> = Signal::new(0);
+	let scope = Owner::new();
+	run_with_owner(scope, || {
+		id.scoped_effect(|value: i32| {
+			on_cleanup(|| released.set_with(|count| count + 1));
+			if value == 1 {
+				panic("the body refused");
+			}
+		});
+	});
+	let failure = guarded(|| {
+		id.set(1);
+	});
+	print(i"caught={failure.is_some()} released={released.get()}");
+	id.set(2);
+	print(i"after-next released={released.get()}");
+	scope.dispose();
+	print(i"after-dispose released={released.get()}");
+}
+"#;
+
+#[test]
+fn a114_a_throwing_scoped_effect_body_does_not_leak_the_run_it_started() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a114_throwing", A114_THROWING_BODY, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The throw is caught by the program; run 0's cleanup ran on the
+            // way in, which is the one release that had to happen.
+            "caught=true released=1",
+            // The FAILED run's own cleanup is released by the next run.
+            "after-next released=2",
+            // And the last run by the boundary: three runs, three releases.
+            "after-dispose released=3",
+        ],
+        "a throwing run must not leak what it registered before it threw; \
+         got:\n{stdout}"
+    );
+}
+
+// --- A113: who cleans up what, one pin per row ------------------------------
+
+/// A113's question (the owner, 2026-09-21) — **do signal effects clean up their
+/// observers?** — answered by COUNTING subscribers on the source rather than by
+/// reading doc comments, which is where the answer lived until now. The rows are
+/// the item's own table and the guide's "Who cleans up what" carries the same
+/// five.
+///
+/// **Row 1 — `effect` / `effect_on_change`.** The ambient owner's, and the
+/// requirement is static (no owner, no compile). One subscriber each while the
+/// boundary lives, none after it goes.
+///
+/// **Row 3 — the derivations.** Re-derived at A124 S2c: the combinators (`map`,
+/// `combine`, `flatten`) are COLD NODES that register nothing at all, inside a
+/// boundary or out (`cold: map=0 combine=0+0 flatten=0+0`) — there is nothing for
+/// a boundary to release. What registers is the materialising end: a `.cell()`
+/// of each, and `selector`, route their subscription through
+/// `register_with_owner`, so inside a boundary every one detaches with it —
+/// A28's measured leak, closed, now at the node that holds state. OUTSIDE every
+/// boundary a `.cell()` lives as long as its source, which is **deliberate and
+/// RULED (R3 at Order 39's GO: KEEP)** — in a function body; in a module
+/// binding's initializer the direct spelling is refused and `.cell_global()`
+/// says the lifetime (A130). The pre-flip pin read `map=1` inside and
+/// `ownerless map=1` for the bare `map`; those `1`s are the `.cell()`'s now.
+const A113_OWNED_FORMS: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, Owner, Signal, SignalCell, Source, combine, run_with_owner, selector,
+};
+
+fun counts(label: str, mapped: SignalCell<i32>, left: SignalCell<i32>, right: SignalCell<i32>,
+	picked: SignalCell<i32>, outer: SignalCell<SignalCell<i32>>, inner: SignalCell<i32>) {
+	print(i"row3: {label} map={mapped.subscribers.read().len()} combine={left.subscribers.read().len()}+{right.subscribers.read().len()} selector={picked.subscribers.read().len()} flatten={outer.subscribers.read().len()}+{inner.subscribers.read().len()}");
+}
+
+fun main() {
+	let eager: SignalCell<i32> = Signal::new(0);
+	let quiet: SignalCell<i32> = Signal::new(0);
+	let boundary = Owner::new();
+	run_with_owner(boundary, || {
+		eager.effect(|_value: i32| {});
+		quiet.effect_on_change(|_value: i32| {});
+	});
+	print(i"row1: live eager={eager.subscribers.read().len()} quiet={quiet.subscribers.read().len()}");
+	boundary.dispose();
+	print(i"row1: disposed eager={eager.subscribers.read().len()} quiet={quiet.subscribers.read().len()}");
+
+	let mapped: SignalCell<i32> = Signal::new(0);
+	let left: SignalCell<i32> = Signal::new(0);
+	let right: SignalCell<i32> = Signal::new(0);
+	let picked: SignalCell<i32> = Signal::new(0);
+	let inner: SignalCell<i32> = Signal::new(0);
+	let outer: SignalCell<SignalCell<i32>> = Signal::new(inner);
+	let cold = Owner::new();
+	run_with_owner(cold, || {
+		let _m = mapped.map(|value| value + 1);
+		let _c = combine((left, right));
+		let _f = outer.flatten();
+	});
+	print(i"row3: cold map={mapped.subscribers.read().len()} combine={left.subscribers.read().len()}+{right.subscribers.read().len()} flatten={outer.subscribers.read().len()}+{inner.subscribers.read().len()}");
+	cold.dispose();
+
+	let derivations = Owner::new();
+	run_with_owner(derivations, || {
+		let _m = mapped.map(|value| value + 1).cell();
+		let _c = combine((left, right)).cell();
+		let _s = selector(picked);
+		let _f = outer.flatten().cell();
+	});
+	counts("inside-live", mapped, left, right, picked, outer, inner);
+	derivations.dispose();
+	counts("inside-disposed", mapped, left, right, picked, outer, inner);
+
+	let module_level: SignalCell<i32> = Signal::new(0);
+	let _cold = module_level.map(|value| value + 1);
+	let _ownerless = module_level.map(|value| value + 1).cell();
+	print(i"row3: ownerless cell={module_level.subscribers.read().len()}");
+}
+"#;
+
+#[test]
+fn a113_the_owned_forms_and_every_derivation_detach_with_their_boundary() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a113_owned", A113_OWNED_FORMS, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "row1: live eager=1 quiet=1",
+            "row1: disposed eager=0 quiet=0",
+            // A cold node registers nothing, owner or not.
+            "row3: cold map=0 combine=0+0 flatten=0+0",
+            // Each `.cell()` (and `selector`), one subscription into each input
+            // — `combine` one per input, `flatten` one outer and one inner.
+            "row3: inside-live map=1 combine=1+1 selector=1 flatten=1+1",
+            "row3: inside-disposed map=0 combine=0+0 selector=0 flatten=0+0",
+            // The ownerless `.cell()` KEEPS its subscription (R3) and the cold
+            // `map` beside it adds none. Reading 0 would mean the idiom stopped
+            // working; reading 1 is the documented answer.
+            "row3: ownerless cell=1",
+        ],
+        "the owned forms and the derivation combinators must release their \
+         observers with their boundary, and an ownerless derivation must keep \
+         its own; got:\n{stdout}"
+    );
+}
+
+/// The other two rows, and both are pins over what does NOT happen.
+///
+/// **Row 2 — `sub` / `on_change` / `observe`.** They hand back a `Subscription`
+/// and nothing cleans it up. DROPPING the value does not unsubscribe: there are
+/// no destructors on this backend, and C14 S3's weak edges help collect a dead
+/// CELL, not a live cell's forgotten observer. So `after-drop=1` is the
+/// contract, not a bug — the caller holds the handle and disposes it, or hands
+/// it to an owner.
+///
+/// **Row 4 — a plain effect's body has no per-run cleanup.** Two `set`s later
+/// the body's nested subscription has been made three times and all three are
+/// live, because `Owner::defer` runs at DISPOSAL only. That is the row A114
+/// answers: `scoped_effect` in the same shape holds exactly one.
+const A113_MANUAL_FORMS: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, run_with_owner };
+
+fun subscribe_and_drop(source: SignalCell<i32>) {
+	let _dropped = source.on_change(|_value: i32| {});
+}
+
+fun main() {
+	let source: SignalCell<i32> = Signal::new(0);
+	subscribe_and_drop(source);
+	print(i"row2: after-drop={source.subscribers.read().len()}");
+	let held = source.on_change(|_value: i32| {});
+	print(i"row2: held={source.subscribers.read().len()}");
+	held.dispose();
+	print(i"row2: after-dispose={source.subscribers.read().len()}");
+	let bag = Owner::new();
+	let _taken = bag.take(source.on_change(|_value: i32| {}));
+	print(i"row2: taken={source.subscribers.read().len()}");
+	bag.dispose();
+	print(i"row2: bag-disposed={source.subscribers.read().len()}");
+
+	let key: SignalCell<i32> = Signal::new(0);
+	let watched: SignalCell<i32> = Signal::new(0);
+	let page = Owner::new();
+	run_with_owner(page, || {
+		key.effect(|_value: i32| {
+			watched.effect(|_seen: i32| {});
+		});
+	});
+	key.set(1);
+	key.set(2);
+	print(i"row4: plain watchers={watched.subscribers.read().len()}");
+	page.dispose();
+	print(i"row4: plain-disposed watchers={watched.subscribers.read().len()}");
+	let scoped_page = Owner::new();
+	run_with_owner(scoped_page, || {
+		key.scoped_effect(|_value: i32| {
+			watched.effect(|_seen: i32| {});
+		});
+	});
+	key.set(3);
+	key.set(4);
+	print(i"row4: scoped watchers={watched.subscribers.read().len()}");
+	scoped_page.dispose();
+	print(i"row4: scoped-disposed watchers={watched.subscribers.read().len()}");
+}
+"#;
+
+#[test]
+fn a113_the_manual_forms_release_nothing_and_a_plain_effects_body_accumulates() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a113_manual", A113_MANUAL_FORMS, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The dropped handle is still subscribed, and stays so for the rest
+            // of the program — every later count includes it.
+            "row2: after-drop=1",
+            "row2: held=2",
+            "row2: after-dispose=1",
+            "row2: taken=2",
+            "row2: bag-disposed=1",
+            // Three runs of a plain effect body, three live nested
+            // subscriptions.
+            "row4: plain watchers=3",
+            "row4: plain-disposed watchers=0",
+            // The same body under `scoped_effect`: one.
+            "row4: scoped watchers=1",
+            "row4: scoped-disposed watchers=0",
+        ],
+        "a dropped subscription must stay subscribed and a plain effect's body \
+         must accumulate, both as documented; got:\n{stdout}"
+    );
+}
+
+// Row 5 of A113's table — a disposed `Owner` is single-use, so a late `take` or
+// `defer` releases ON THE SPOT rather than parking a cleanup nothing will run —
+// is B291's and is already pinned above, by
+// `b291_an_effect_registered_after_its_owner_was_disposed_never_fires_again`
+// and `b291_a_disposed_owner_is_idempotent_and_releases_what_it_is_given_at_once`.
+// It gets no third pin here.

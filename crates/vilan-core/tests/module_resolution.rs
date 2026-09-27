@@ -3,13 +3,37 @@
 //! both existing is an ambiguity error, and the `none` platform gates out the
 //! platform `std` layers. These need real files on disk (the loader reads them),
 //! so each writes a throwaway package directory and analyzes against it.
+//!
+//! # No assertion in this suite reads a clock (N116)
+//!
+//! The suite runs eleven ways at once, under `nextest -j 32` with other lanes
+//! building beside it, and a duration measured there is a measurement of the
+//! machine. That is true of a WALL reading and it is true of the two CPU
+//! clocks as well: `/proc/self/stat` is the whole PROCESS's CPU, so every
+//! other test thread's work lands in it, and a thread clock at eight
+//! microseconds is a handful of scheduler slices on caches somebody else owns.
+//! M75's own bound went NEGATIVE under a parallel lane (`-10 ms` for the
+//! delta a collision was supposed to cost), which is not a regression and not
+//! a pass — it is noise wearing a millisecond label.
+//!
+//! So a performance claim in this suite is asserted over a COUNT the pass
+//! itself produces — rows banked, bodies walked, candidates visited — which is
+//! the property an index has and a scan does not, and which does not move when
+//! the box is busy. The durations are still MEASURED and still PRINTED, tagged
+//! with the load average, because a number to look at is worth having; what
+//! they are not is a thing that can fail. A budget that genuinely must read a
+//! clock lives behind `#[ignore]` and is asserted in release only
+//! (`vilan-lsp`'s `keystroke::gate` is the worked example).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use vilan_core::manifest::PreludeSpec;
+
+mod scratch;
 use vilan_core::{
-    Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, Workspace, analyze_source,
+    EntryMode, Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, PreludeRepair,
+    Workspace, analyze_source,
 };
 
 fn std_spec() -> PackageSpec {
@@ -24,7 +48,7 @@ fn std_spec() -> PackageSpec {
 fn analyze_package_raw(files: &[(&str, &str)], entry: &str, platform: Platform) -> Vec<Error> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_modres_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_modres_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -150,7 +174,7 @@ fn an_absent_overlay_module_still_fails_to_resolve() {
 fn the_overlay_outranks_the_file_on_disk() {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = scratch::root().join(format!(
         "vilan_overlay_disk_{}_{unique}",
         std::process::id()
     ));
@@ -182,8 +206,7 @@ fn the_overlay_outranks_the_file_on_disk() {
 fn a_buffer_keeps_its_byte_order_mark_while_a_disk_read_drops_one() {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("vilan_overlay_bom_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_overlay_bom_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("bom.vl");
@@ -309,7 +332,7 @@ fn analyze_workspace_files(
 ) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_ws_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_ws_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
     let app_dir = root.join("app");
@@ -345,6 +368,7 @@ fn analyze_workspace_files(
         entry_dependencies,
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
 
     let source = std::fs::read_to_string(&entry_path).unwrap();
@@ -358,7 +382,19 @@ fn analyze_workspace_files(
         &workspace,
     );
     let _ = std::fs::remove_dir_all(&root);
-    errors.into_iter().map(|error| error.msg).collect()
+    errors
+        .into_iter()
+        .map(|error| {
+            format!(
+                "{}{}",
+                error.msg,
+                error
+                    .note
+                    .map(|note| format!(" || NOTE: {}", note.msg))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -420,7 +456,7 @@ fn dependency_pkg_self_reference_is_isolated() {
     // The entry's own `pkg::helper` sibling lives next to the entry.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_wsiso_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_wsiso_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -444,6 +480,7 @@ fn dependency_pkg_self_reference_is_isolated() {
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let entry_path = app_dir.join("main.vl");
     let source = std::fs::read_to_string(&entry_path).unwrap();
@@ -634,7 +671,7 @@ fn platform_modules_load_for_typing_under_opposite_platform() {
 fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_layer_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_layer_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app = root.join("app");
     std::fs::create_dir_all(&app).unwrap();
@@ -677,6 +714,7 @@ fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let source = std::fs::read_to_string(&entry_path).unwrap();
     let leaked: &'static str = Box::leak(source.into_boxed_str());
@@ -689,7 +727,19 @@ fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
         &workspace,
     );
     let _ = std::fs::remove_dir_all(&root);
-    errors.into_iter().map(|error| error.msg).collect()
+    errors
+        .into_iter()
+        .map(|error| {
+            format!(
+                "{}{}",
+                error.msg,
+                error
+                    .note
+                    .map(|note| format!(" || NOTE: {}", note.msg))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -746,7 +796,7 @@ fn base_lib_reexporting_a_layer_module_errors() {
     // the public surface must be platform-agnostic, so this is a Q4 violation.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_q4_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_q4_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app = root.join("app");
     std::fs::create_dir_all(&app).unwrap();
@@ -781,6 +831,7 @@ fn base_lib_reexporting_a_layer_module_errors() {
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let source = std::fs::read_to_string(&entry_path).unwrap();
     let leaked: &'static str = Box::leak(source.into_boxed_str());
@@ -873,7 +924,7 @@ fn contract_violations(
 ) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_contract_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_contract_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let put = |dir: &std::path::Path, files: &[(&str, &str)]| {
         std::fs::create_dir_all(dir).unwrap();
@@ -1090,7 +1141,7 @@ fn analyze_package_attributed(
 ) -> Vec<(String, String, Option<String>)> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_attr_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_attr_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -1144,7 +1195,7 @@ fn analyze_package_spanned(
 ) -> Vec<(String, String, std::ops::Range<usize>)> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_span_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_span_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -1308,7 +1359,11 @@ fn several_parse_errors_in_one_module_keep_distinct_spans() {
     // The 798-error shape in miniature: a generated module holds many, and each
     // needs its own place. They arrive in source order, which is what
     // `normalize_diagnostic_order` sorts by once a span exists to sort on.
-    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 @ }\nfun c(): i32 { 3 }\n                  fun d(): i32 { 4 # }\nfun e(): i32 { 5 }\n";
+    // B318 §2.3 took `#` as the import reach marker, so it LEXES: the second
+    // un-lexable byte is a second `@`, which is the one the `css` block still
+    // refuses. The pin is about two errors keeping distinct spans, and it is
+    // unchanged.
+    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 @ }\nfun c(): i32 { 3 }\nfun d(): i32 { 4 @ }\nfun e(): i32 { 5 }\n";
     let spanned = analyze_package_spanned(
         &[
             (
@@ -1792,24 +1847,32 @@ fn dependency_display_names_intern_across_analyses() {
     );
 }
 
-/// The Rust-fallback derive path — a derive with NO macro in scope, the case
-/// fixture stds and macro-world compiles hit — must parse its generated impls
-/// through the content cache: an unchanged program's re-analysis reuses the
-/// tree instead of re-leaking one. Pinned here rather than in the LSP leak
-/// harness because it needs a std WITHOUT the std macros, and this file
-/// already owns the hand-built-spec fixtures (the E23 sweep's coverage gap).
+/// The SYNTHESIZED-MEMBER path — a backed enum's `value()`/`parse()` and a
+/// bare-lowered enum's `Hashable` impl, the members the language gives an enum
+/// with no macro anywhere in it — must parse its generated text through the
+/// content cache: an unchanged program's re-analysis reuses the tree instead of
+/// re-leaking one. Pinned here rather than in the LSP leak harness because it
+/// needs a hand-built std spec, and this file already owns those fixtures (the
+/// E23 sweep's coverage gap).
+///
+/// The subject was `[derive(PartialEq)]` with no macro in scope until N79,
+/// which deleted the Rust derive generators that path ran on. The MECHANISM is
+/// unchanged — the same per-scope bucket, the same `flush_synthesized_members`,
+/// the same `parse_cached` — so the pin moves to the one generator still
+/// filling that bucket rather than going with the generators.
 #[test]
-fn rust_fallback_derives_parse_through_the_content_cache() {
+fn synthesized_enum_members_parse_through_the_content_cache() {
     use vilan_core::leak_tally::{self, LeakSite};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_fallback_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_synthesized_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    // A std whose loader-forced modules are empty stubs and which defines no
-    // `macro fun` anywhere: `[derive(PartialEq)]` finds no macro in scope and
-    // falls back to the Rust generators. (The generated prelude's imports then
-    // fail to resolve against the stubs — irrelevant here: the leak this pins
+    // A std whose loader-forced modules are empty stubs: a backed enum's
+    // `value()`/`parse()` and its `Hashable` impl are synthesized regardless —
+    // no macro is consulted for them, which is what makes this path the one
+    // that still fills the bucket. (The generated prelude's imports then fail
+    // to resolve against the stubs — irrelevant here: the leak this pins
     // happens at the parse, before resolution.)
     let std_src = root.join("std").join("src");
     std::fs::create_dir_all(&std_src).unwrap();
@@ -1829,7 +1892,7 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let entry_path = app_dir.join("main.vl");
-    let source = "[derive(PartialEq)]\nstruct FallbackPin { x: i32 }\n";
+    let source = "enum SynthesizedPin { Low = 0, Mid, High }\n";
     std::fs::write(&entry_path, source).unwrap();
     let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
 
@@ -1847,8 +1910,8 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
     analyze();
     assert!(
         leak_tally::bytes(LeakSite::MacroParseText) > 0,
-        "the fixture never took the Rust-fallback path — no generated text was \
-         parsed, and this pin is vacuous"
+        "the fixture never synthesized anything — no generated text was parsed, \
+         and this pin is vacuous"
     );
     leak_tally::reset();
     analyze();
@@ -1856,8 +1919,8 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
         leak_tally::bytes(LeakSite::MacroParseText) + leak_tally::bytes(LeakSite::MacroParseAst);
     assert_eq!(
         releaked, 0,
-        "the Rust-fallback derive re-leaked {releaked} B on an unchanged \
-         re-analysis — `flush_rust_fallback` is not parsing through the \
+        "the synthesized enum members re-leaked {releaked} B on an unchanged \
+         re-analysis — `flush_synthesized_members` is not parsing through the \
          content cache"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -2020,21 +2083,23 @@ fn a_macro_worlds_tree_records_at_its_own_site_not_the_entrys() {
         .expect("worker panicked");
 }
 
-/// M9 (`leak-soak.md` §7.9.4): the opted-in entry point
+/// M9 (`leak-soak.md` §7.9.4) with M23's claim: the opted-in entry point
 /// (`analyze_source_owning_overlay_modules`) parses an overlay-served module
 /// into ANALYSIS-OWNED allocations — no growth at either process-global cache
-/// site, one owned copy per analysis (no cross-analysis sharing), reclaimed
-/// to a zero balance once the program is dropped. The non-opted entry points
+/// site — and the base world built over them CLAIMS them, so a second
+/// analysis of the same content is served that world and parses nothing.
+/// Every claim released, the balance nets to zero. The non-opted entry points
 /// keep today's behavior byte for byte: the same overlaid load goes through
 /// `parse_clean_cached` exactly as before (§7.9.4c — the CLI, the wasm front
-/// end, and every transient reader must not switch).
+/// end, and every transient reader must not switch), and they are never
+/// served a CLAIMED world, having nowhere to keep its claims.
 #[test]
 fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
     use vilan_core::leak_tally::{self, LeakSite};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_m9_core_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_m9_core_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let entry_path = dir.join("main.vl");
@@ -2070,8 +2135,11 @@ fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
             };
             // Warmup: fill the process-global caches with std's parses (and
             // the disk helper), so the measured window below reads only what
-            // the OVERLAY loads do.
+            // the OVERLAY loads do. Its base world is cleared before the
+            // window opens (M23 stores one now), so `first` below is a MISS
+            // and really does parse the overlay.
             let _ = analyze_owning();
+            vilan_core::analyzer::base_cache_clear();
             leak_tally::reset();
             let first = analyze_owning();
             assert!(
@@ -2097,15 +2165,30 @@ fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
                 "the owned copy records the overlaid text to the byte"
             );
 
-            // A second opted-in analysis of the SAME content parses and owns
-            // its own copy — nothing is shared across analyses, which is the
-            // whole soundness story.
+            // M23: the world the first analysis built was STORED and claims
+            // that copy, so a second opted-in analysis of the same content
+            // hits it — it holds a claim on the same allocation and parses
+            // nothing. (Before M23 the store was refused and this analysis
+            // paid the whole pre-entry world again.)
             let second = analyze_owning();
-            assert_eq!(second.owned_modules.len(), 1);
+            assert_eq!(
+                second.owned_modules.len(),
+                1,
+                "the hitting analysis must hold its own claim on the copy the \
+                 stored world served it"
+            );
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                2 * overlaid_bytes,
-                "a second analysis must own its own copy, not share the first's"
+                overlaid_bytes,
+                "M23: the second analysis is served the stored world's copy \
+                 and parses nothing — a claim, not a second copy"
+            );
+            let (claims, claim_bytes) = vilan_core::analyzer::base_cache_overlay_claims();
+            assert_eq!(
+                (claims, claim_bytes),
+                (1, overlaid_bytes),
+                "the stored world holds exactly one claim, on the overlaid \
+                 module's text"
             );
 
             // Reclaim in the owner's order: program first, then the handles.
@@ -2116,23 +2199,31 @@ fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
                     // dropped on the line above.
                     unsafe { ast.reclaim() };
                 }
-                // SAFETY: as above — the owned copies' only borrower (the
-                // program; the store gate and macro carve-out keep every
-                // global out of them) is gone.
+                // SAFETY: as above. Only this analysis's claims are given
+                // back; the stored world's keeps the allocation alive.
                 unsafe { analyzed.owned_modules.reclaim() };
             }
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                overlaid_bytes as isize,
+                "the stored world's claim is the one still outstanding — M23's \
+                 retention, and what M24's budget bounds"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                2 * overlaid_bytes,
+                overlaid_bytes,
                 "the gross record stands after the reclaim"
             );
 
             // The NON-opted path, same overlay: the process-global cache is
             // used exactly as before — the §7.5 leak is the recorded,
             // deliberate behavior for every caller that does not opt in.
+            // (M23: it is also never served a CLAIMED base world, having no
+            // scope to keep the claims in — so it really does load.)
             leak_tally::reset();
             let (program, errors) = analyze_source(
                 source,
@@ -2178,13 +2269,20 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_m9_memo_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m9_memo_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
     std::fs::write(
         app_dir.join("main.vl"),
         "import common::greeting;\n\nfun main() {\n\tlet _x = greeting();\n}\n",
+    )
+    .unwrap();
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
     )
     .unwrap();
     let dep_root = root.join("common");
@@ -2208,6 +2306,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let overlaid = "fun dep_value(): i32 { 424242 }\n".to_string();
     let overlaid_bytes = overlaid.len();
@@ -2233,6 +2332,10 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
                 )
             };
             let _warmup = analyze_owning();
+            // M23: the warmup's base world is stored and claims its copy, so
+            // clear it — the measured analysis below must MISS and really
+            // parse the overlay for the byte assertion to mean anything.
+            vilan_core::analyzer::base_cache_clear();
             leak_tally::reset();
             let analyzed = analyze_owning();
             assert!(
@@ -2255,8 +2358,15 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
                 // SAFETY: the program was dropped on the line above.
                 unsafe { ast.reclaim() };
             }
-            // SAFETY: as above — the program was the owned copy's only borrower.
+            // SAFETY: as above. This releases only this analysis's claim.
             unsafe { analyzed.owned_modules.reclaim() };
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                overlaid_bytes as isize,
+                "M23: the base world stored for this analysis claims the copy, \
+                 so the analysis's own release does not free it"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
 
             vilan_core::analyzer::set_document_overlay(&dep_helper, None);
@@ -2285,7 +2395,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
 /// The `resource Guard` preamble the resource-rule cases share, since a `Guard`
 /// declaration is most of each of them.
 const GUARD_PREAMBLE: &str = "import std::io::print;\nimport std::drop::Drop;\n\
-    resource struct Guard { label: str }\n\
+    [resource] struct Guard { label: str }\n\
     impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n";
 
 fn guarded(body: &str) -> String {
@@ -2472,16 +2582,21 @@ fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
 fn b112_the_entrys_own_violations_still_attribute_to_the_entry() {
     let attributed = analyze_package_attributed(
         &[
+            // `Guard` is declared in a third module both files import. It used
+            // to live in the entry, with `store.vl` reaching it through
+            // `pkg::main::Guard` — which only ever resolved because the loader
+            // then loaded the entry AS a module and quietly dropped the entry
+            // walk with it (B226). Nothing here turns on WHERE the resource is
+            // declared; the claim is that each file's own violation goes home.
+            ("guard.vl", &guarded("")),
             (
                 "main.vl",
-                &guarded(
-                    "import pkg::store::keep;\nfun main() {\n\tkeep();\n\
-                     \tmut mine: List<Guard> = [];\n}\n",
-                ),
+                "import pkg::guard::Guard;\nimport pkg::store::keep;\n\
+                 fun main() {\n\tkeep();\n\tmut mine: List<Guard> = [];\n}\n",
             ),
             (
                 "store.vl",
-                "import pkg::main::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n",
+                "import pkg::guard::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n",
             ),
         ],
         "main.vl",
@@ -2748,8 +2863,28 @@ fn the_web_preludes_surface_is_its_members_and_its_ambient_modules() {
     let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("web.vl"));
     let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
     for expected in [
-        "print", "Option", "Some", "None", "Result", "Ok", "Err", "Signal", "view", "View",
-        "style", "ui",
+        "print",
+        "Option",
+        "Some",
+        "None",
+        "Result",
+        "Ok",
+        "Err",
+        "Signal",
+        "view",
+        "View",
+        "style",
+        "ui",
+        // A99's slot values, bare, and A119's `when_some` with them: the
+        // owner's spelling in a hole is `{when_some(selected, ..)}`, so a
+        // conditional form left behind `ui::` would put back the import this
+        // set exists to delete.
+        "when",
+        "when_some",
+        "swap",
+        "each",
+        "each_values",
+        "each_by",
     ] {
         assert!(
             names.contains(&expected),
@@ -2784,9 +2919,21 @@ fn analyze_under_prelude(
     entry: &str,
     platform: Platform,
 ) -> Vec<String> {
+    analyze_under_prelude_repaired(prelude, PreludeRepair::default(), files, entry, platform)
+}
+
+/// [`analyze_under_prelude`] with the front end's declared prelude REPAIR
+/// (E120) — which control the web-set steer sends the reader to.
+fn analyze_under_prelude_repaired(
+    prelude: PreludeSpec,
+    repair: PreludeRepair,
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_prelude_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_prelude_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -2798,6 +2945,7 @@ fn analyze_under_prelude(
     let leaked: &'static str = Box::leak(source.into_boxed_str());
     let workspace = Workspace {
         entry_prelude: prelude,
+        prelude_repair: repair,
         ..Workspace::default()
     };
     let (_program, errors) = analyze_source(
@@ -3038,6 +3186,61 @@ fn the_web_prelude_binds_signal_view_and_the_ambient_modules() {
     );
 }
 
+// --- B270: a desugar's std reference is scope-independent ------------------
+//
+// The `css` block's seed and element syntax's callee used to be BARE names
+// resolved at the site, and the web prelude is exactly where that broke: it
+// makes `style` an ambient MODULE, so every `css { … }` in an application
+// package reported "`style` is a module, not a value; qualify through it" —
+// the form was unusable in the packages it was designed for. The seed is a
+// `Node::StdItem`, resolved through `std`'s own namespace, and the loader
+// seeds `std::style` off the reference itself.
+
+#[test]
+fn b270_a_css_block_compiles_under_the_web_preludes_ambient_style_module() {
+    // The owner's repro (kolt channel.vl:71), reduced. `style::Length::rem` in
+    // the same file is the control: the ambient MODULE is untouched and still
+    // qualifies, which the interim workaround (a per-file
+    // `import std::style::{ Length, style };`) cost the file.
+    let entry = "let card = const css { display(\"flex\"); };\n\
+        fun main() {\n\
+        \tlet gap = style::Length::rem(1);\n\
+        \tprint(card.class_list());\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn b270_a_local_style_binding_does_not_capture_a_block_under_a_prelude() {
+    // Hygiene under the prelude too: a local binding wins for the NAME, and
+    // wins nothing at all for the desugar's seed.
+    let entry = "fun main() {\n\
+        \tlet style = 1;\n\
+        \tlet card = const css { display(\"flex\"); };\n\
+        \tprint(card.class_list());\n\
+        \tprint(i\"{style}\");\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
 #[test]
 fn an_ambient_module_is_beaten_by_an_explicit_member_import() {
     // §4.1/§13.11, and the reason the `style` module costs the estate nothing:
@@ -3136,13 +3339,20 @@ fn a_dependency_resolves_under_its_own_prelude_not_the_consumers() {
     // base one — `Some` resolves inside it and `Signal` must not.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_preliso_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_preliso_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
     std::fs::write(
         app_dir.join("main.vl"),
         "import common::greeting;\nfun main() { let s = Signal::new(0); print(\"app\"); }\n",
+    )
+    .unwrap();
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
     )
     .unwrap();
     let dep_root = root.join("common");
@@ -3166,6 +3376,7 @@ fn a_dependency_resolves_under_its_own_prelude_not_the_consumers() {
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: web_prelude(),
+        ..Workspace::default()
     };
     let entry_path = app_dir.join("main.vl");
     let source = std::fs::read_to_string(&entry_path).unwrap();
@@ -3212,6 +3423,40 @@ fn a_web_set_name_steers_to_the_manifest_key_not_to_an_import() {
             e.contains("in the prelude of the web set") && e.contains("prelude = \"std::web\"")
         }),
         "{errors:#?}"
+    );
+}
+
+/// The playground arm of the same steer (E120). WHICH repair the message names
+/// is a fact about the front end, not about the program — a `vilan.toml` line
+/// is advice a pasted buffer cannot take — so the front end declares it and the
+/// analyzer owns both wordings. The manifest arm above is this one's control:
+/// same program, same prelude, default repair, unchanged sentence.
+#[test]
+fn a_toggle_front_end_steers_at_the_prelude_toggle_not_the_manifest() {
+    let errors = analyze_under_prelude_repaired(
+        base_prelude(),
+        PreludeRepair::Toggle,
+        &[(
+            "main.vl",
+            "fun main() { let s = Signal::new(0); print(\"x\"); }\n",
+        )],
+        "main.vl",
+        Platform::Browser,
+    );
+    let steer = errors
+        .iter()
+        .find(|error| error.contains("in the prelude of the web set"))
+        .unwrap_or_else(|| panic!("{errors:#?}"));
+    assert!(
+        steer.contains("switch the playground's prelude to the web set"),
+        "{steer}"
+    );
+    // The one-name import beside it, so the reader who wants exactly this name
+    // has a repair that does not change what the rest of the buffer means.
+    assert!(steer.contains("import std::reactive::Signal;"), "{steer}");
+    assert!(
+        !steer.contains("vilan.toml"),
+        "there is no manifest to edit: {steer}"
     );
 }
 
@@ -3280,6 +3525,31 @@ fn a_module_carried_web_name_gets_no_web_steer() {
         !errors.iter().any(|e| e.contains("web set")),
         "no web-set steer for a module-carried name: {errors:?}",
     );
+}
+
+#[test]
+fn a_module_carried_web_name_reaches_its_types_by_qualifying() {
+    // B172, and the reason it was load-bearing rather than cosmetic. The web
+    // set carries `style` as a MODULE, so a web-set user reached every VALUE in
+    // `std::style` (`style::style()`, `style::Display::Flex`) and no TYPE in
+    // it: `style::Style` was a PARSE error in every type position, and both web
+    // templates carried a forced `import std::style::Style;` to get around it.
+    // A qualified path is a type now, so the prelude's module name is enough.
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[(
+            "main.vl",
+            "fun card(): style::Style {\n\
+             \tstyle::style().padding(style::space(4))\n\
+             }\n\
+             fun main() {\n\
+             \tlet _card = const card();\n\
+             }\n",
+        )],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
 }
 
 #[test]
@@ -3423,5 +3693,4299 @@ fn a_deeper_std_path_is_not_mistaken_for_a_removed_alias() {
             .iter()
             .any(|e| e.contains("cannot find 'prnt' in the imported path")),
         "{errors:#?}"
+    );
+}
+
+#[test]
+fn b212_the_same_type_name_in_two_modules_is_allowed() {
+    // The control B212's duplicate rule is scoped by: a module IS a namespace,
+    // and it owns its own scope, so `shapes::N` and `colors::N` are two types
+    // the program can name apart. The rule counts what ONE module declares —
+    // which is why it needs a real second FILE to check, a module being one
+    // source file (`spec/names.md`).
+    let errors = analyze_package(
+        &[
+            ("shapes.vl", "struct N { a: i32 }\n"),
+            ("colors.vl", "struct N { b: str }\n"),
+            (
+                "main.vl",
+                "import std::io::print;\n\
+                 import pkg::shapes;\n\
+                 import pkg::colors;\n\
+                 fun main() {\n\
+                 \tprint((shapes::N { a = 1 }).a);\n\
+                 \tprint((colors::N { b = \"two\" }).b);\n\
+                 }\n\
+                 main();\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "two modules may each declare `N`; got: {errors:#?}"
+    );
+}
+
+#[test]
+fn b212_one_module_declaring_a_name_twice_is_refused_on_disk_too() {
+    // The same rule through the real loader, so the check is not an artifact of
+    // the single-source harness: the module scope a file walks into is the one
+    // the duplicate rule reads.
+    let errors = analyze_package(
+        &[
+            ("shapes.vl", "struct N { a: i32 }\nstruct N { b: str }\n"),
+            (
+                "main.vl",
+                "import pkg::shapes::N;\nfun main() { }\nmain();\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("'N' is already declared in this module")),
+        "{errors:#?}"
+    );
+}
+
+/// As [`analyze_package_raw`], but keeps the analyzed program's WARNINGS beside
+/// its diagnostics. A self-import (B226) compiles clean and warns, and the
+/// warning lives on the program the other helpers drop.
+fn analyze_package_with_warnings(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> (Vec<String>, Vec<String>) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_selfimport_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let warnings = program
+        .map(|program| {
+            program
+                .warnings
+                .into_iter()
+                .map(|warning| warning.msg)
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        errors.into_iter().map(|error| error.msg).collect(),
+        warnings,
+    )
+}
+
+#[test]
+fn an_entry_self_import_keeps_the_entrys_derive_expansion() {
+    // B226: `import pkg::main::..` inside the ENTRY resolved back to the entry
+    // file, which the loader then loaded as a MODULE — and an entry that is a
+    // module skips both the entry-as-program walk and the entry's own macro /
+    // derive expansion. The `[derive(PartialEq)]` below was expanded nowhere,
+    // and the program failed with "does not implement the `PartialEq`
+    // operator" over a type that plainly derives it.
+    let (errors, warnings) = analyze_package_with_warnings(
+        &[(
+            "main.vl",
+            "import pkg::main::Tab;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+             fun main() {\n\tlet same = Tab::Messages == Tab::Other;\n}\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "the entry's derive must survive its own self-import, got: {errors:#?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("`pkg::main` is this program's own entry file")),
+        "and the no-op import must be told about: {warnings:#?}"
+    );
+}
+
+#[test]
+fn an_entry_self_import_of_a_function_keeps_the_entry_walk() {
+    // The same defect seen through the item table rather than the derive: a
+    // self-imported FUNCTION lost the whole entry walk, so `main` itself
+    // vanished. Here the program must still analyze clean.
+    let (errors, warnings) = analyze_package_with_warnings(
+        &[(
+            "main.vl",
+            "import pkg::main::helper;\n\nfun helper(): i32 { 1 }\n\n\
+             fun main() {\n\tlet value = helper();\n}\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
+    assert_eq!(warnings.len(), 1, "exactly one telling: {warnings:#?}");
+}
+
+#[test]
+fn an_import_cycle_back_into_the_entry_is_refused_at_the_import() {
+    // The cycle form of B226 (`main` -> `views` -> `main`). The entry is the
+    // PROGRAM, not a module of its package, so a sibling cannot import from
+    // it — and before the fix the loader answered by loading the entry as a
+    // module, which silently cost the entry its walk and its derives. The
+    // refusal must name the real problem, at the sibling's import, and the
+    // entry's own derive must no longer be the thing that fails.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::Tab;\n\nfun render(): bool { Tab::Messages == Tab::Other }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pkg::main` is this program's entry file")),
+        "the cycle must be refused where it is written: {errors:#?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("does not implement the `PartialEq` operator")),
+        "and never as a lost derive on the entry's own type: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_non_entry_self_import_stays_clean() {
+    // The control, and the latent form a real package carries: a MODULE that
+    // imports its own name. It always worked — the module is loaded once and
+    // the import is a no-op — and it must keep working silently, with no
+    // refusal and no telling. Only the entry's self-import is a telling,
+    // because only the entry is not a module.
+    let (errors, warnings) = analyze_package_with_warnings(
+        &[
+            (
+                "main.vl",
+                "import pkg::sidebar::Tab;\n\nfun main() {\n\tlet same = Tab::Messages == Tab::Other;\n}\n",
+            ),
+            (
+                // B318: `main.vl` imports `Tab`, so the module marks it — the
+                // one-line codemod, beside the self-import the pin is about.
+                "sidebar.vl",
+                "export *;\n\nimport pkg::sidebar::Tab;\n\n\
+                 [derive(PartialEq)]\nenum Tab { Messages, Other }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
+    assert!(
+        warnings.is_empty(),
+        "a non-entry self-import says nothing: {warnings:#?}"
+    );
+}
+
+// ── B239: an OPEN MODULE FILE analyzed as the entry ─────────────────────────
+//
+// The editor, and `vilan check src/views.vl`, analyze the file in front of them
+// AS the entry, because a file is all they were given. That file is usually one
+// of the package's MODULES, and its siblings import it — the owner's kolt shape:
+// `views.vl` imports `channel.vl`, `channel.vl` imports `pkg::views::{
+// button_style, icon }`, a legitimate module cycle under the real entries.
+//
+// B226 refused that cycle, because for a DECLARED entry it is one: the entry is
+// the program, not a module, and a sibling resolves its imports before the entry
+// walks. In file mode neither half holds, and the refusal cost the owner seven
+// errors in the editor over code `vilan check .` compiled clean. The front end
+// now says which situation it is ([`EntryMode`]), and file mode takes the
+// monolithic order — everything resolves once, after the entry walk, so
+// `pkg::<open file>` names the scope the entry walked into.
+
+/// [`EntryMode::OpenFile`] carrying the package's declared-entry module names
+/// (B240). `&[]` is the answer for a caller with no manifest to read, and is
+/// what every B239 pin below wants: nothing in those packages is declared.
+fn open_file(declared_entries: &[&str]) -> EntryMode {
+    EntryMode::OpenFile {
+        declared_entries: declared_entries
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+    }
+}
+
+/// [`EntryMode::Declared`] carrying the same set (B250): the package's declared
+/// programs are refused on this leg too, so both surfaces read one fact.
+fn declared(declared_entries: &[&str]) -> EntryMode {
+    EntryMode::Declared {
+        declared_entries: declared_entries
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+    }
+}
+
+/// As [`analyze_package_raw`], but the analysis is told what KIND of entry it
+/// was handed (B239) and keeps the program's warnings beside its diagnostics.
+fn analyze_package_as(
+    files: &[(&str, &str)],
+    entry: &str,
+    entry_mode: EntryMode,
+) -> (Vec<String>, Vec<String>) {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_openfile_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let workspace = Workspace {
+        entry_mode,
+        ..Workspace::default()
+    };
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &workspace,
+    );
+    let warnings = program
+        .map(|program| {
+            program
+                .warnings
+                .into_iter()
+                .map(|warning| warning.msg)
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        errors.into_iter().map(|error| error.msg).collect(),
+        warnings,
+    )
+}
+
+/// The kolt shape, as three files: the open module `views.vl` and the sibling
+/// `channel.vl` that imports it back, plus the declared entry `client.vl` that
+/// reaches them both. `views.vl` carries a `[derive]` (so the entry's own
+/// expansion is on the line) and an inherent `impl` the sibling reaches through
+/// the cycle (so method resolution across it is too).
+/// The kolt shape, as three files: the open module `views.vl` and the sibling
+/// `channel.vl` that imports it back, plus the declared entry `client.vl` that
+/// reaches them both. `views.vl` carries a `[derive]` (so the entry's own
+/// expansion is on the line) and an inherent `impl` the sibling reaches through
+/// the cycle (so method resolution across it is too).
+// B318: `views` and `channel` are imported by their siblings, so each carries
+// the one-line `export *;` the estate's codemod writes — without it every
+// cross-file name here is a plain reach of a private item and the pins that
+// assert silence would be asserting the absence of a warning that is correct.
+const B239_FILES: &[(&str, &str)] = &[
+    (
+        "views.vl",
+        "export *;\n\nimport pkg::channel::render;\n\n\
+         [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+         struct Style { padding: i32 }\n\n\
+         impl Style {\n\tfun flex_row(self): Style {\n\t\t\
+         Style { padding = self.padding + 1 }\n\t}\n}\n\n\
+         fun button_style(): Style { Style { padding = 1 } }\n\n\
+         fun icon(name: str): str { name }\n\n\
+         fun shown(): bool { Tab::Messages == Tab::Other }\n\n\
+         fun total(): i32 { render() }\n",
+    ),
+    (
+        "channel.vl",
+        "export *;\n\nimport pkg::views::{ Style, button_style, icon };\n\n\
+         fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
+         let label = icon(\"x\");\n\tbase.padding\n}\n",
+    ),
+    (
+        "client.vl",
+        "import pkg::views::{ shown, total };\n\n\
+         fun main() {\n\tlet reported = shown();\n\tlet count = total();\n}\n",
+    ),
+];
+
+#[test]
+fn b239_an_open_module_file_stays_importable_by_its_siblings() {
+    // The regression, in one analysis: `views.vl` opened as the entry while its
+    // sibling `channel.vl` imports `pkg::views`. Before, that import hit B226's
+    // "is this program's entry file … it cannot be imported", `channel` lost
+    // every name it took from `views`, and the misses cascaded — seven of them
+    // in the owner's app, over a package `vilan check .` compiled clean.
+    //
+    // It must be an ordinary module cycle: the imports resolve, the inherent
+    // method declared in the open file is reachable through the cycle, and the
+    // open file's own `[derive]` still expands (it is walked as the program,
+    // which is what B226 bought and what this must not give back).
+    let (errors, warnings) = analyze_package_as(B239_FILES, "views.vl", open_file(&[]));
+    assert!(
+        errors.is_empty(),
+        "an open module file is still the module its siblings import: {errors:#?}"
+    );
+    assert!(
+        warnings.is_empty(),
+        "and nothing about the situation is worth a telling: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b239_the_same_package_from_its_declared_entry_is_clean_too() {
+    // The control that the shape itself is legal: analyzed from `client.vl`,
+    // the entry a manifest would declare, `views` and `channel` are two modules
+    // in a cycle and nothing is special about either. If this ever reddens, the
+    // pin above is measuring the wrong thing.
+    let (errors, warnings) = analyze_package_as(B239_FILES, "client.vl", EntryMode::default());
+    assert!(
+        errors.is_empty(),
+        "the declared entry compiles the same package: {errors:#?}"
+    );
+    assert!(warnings.is_empty(), "silently: {warnings:#?}");
+}
+
+#[test]
+fn b239_a_cycle_back_into_a_declared_entry_is_still_refused() {
+    // B226 stands where it was written. A DECLARED entry is the program, not a
+    // module: a sibling resolves its imports before the entry walks, so there is
+    // nothing there to import, and the refusal must still say so at the import.
+    let (errors, _warnings) = analyze_package_as(
+        &[
+            (
+                "client.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::client::helper;\n\nfun render(): i32 { helper() }\n",
+            ),
+        ],
+        "client.vl",
+        EntryMode::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pkg::client` is this program's entry file")),
+        "the declared-entry cycle keeps B226's refusal: {errors:#?}"
+    );
+}
+
+#[test]
+fn b239_an_open_module_files_self_import_says_nothing() {
+    // The self-import telling is the entry's, and only the entry's. B226 warns
+    // that `import pkg::main::..` inside the ENTRY brings the file into itself;
+    // a MODULE that imports its own name has always been a silent no-op
+    // (`a_non_entry_self_import_stays_clean`), and an open module file is one —
+    // the editor must not invent a warning `vilan check .` never prints.
+    let (errors, warnings) = analyze_package_as(
+        &[(
+            "views.vl",
+            "import pkg::views::Tab;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+             fun shown(): bool { Tab::Messages == Tab::Other }\n",
+        )],
+        "views.vl",
+        open_file(&[]),
+    );
+    assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
+    assert!(
+        warnings.is_empty(),
+        "a module that imports its own name says nothing: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b239_an_open_module_file_needs_no_main() {
+    // A module has no `main` and nothing may ask it for one (E113's rule, which
+    // file mode already keeps). Stated here because the fix walks the open file
+    // as the PROGRAM, and a program walk is exactly what used to demand one.
+    let (errors, _warnings) = analyze_package_as(
+        &[
+            (
+                "views.vl",
+                "import pkg::channel::render;\n\nfun label(): i32 { render() }\n",
+            ),
+            (
+                "channel.vl",
+                "import pkg::views::label;\n\nfun render(): i32 { 7 }\n\n\
+                 fun twice(): i32 { label() + label() }\n",
+            ),
+        ],
+        "views.vl",
+        open_file(&[]),
+    );
+    assert!(
+        errors.is_empty(),
+        "no `main`, and none demanded: {errors:#?}"
+    );
+}
+
+// ── B236: the entry-cycle refusal reports ONCE ───────────────────────────────
+
+#[test]
+fn b236_the_entry_cycle_refusal_reports_exactly_once() {
+    // B226 refuses the sibling's `import pkg::main::Tab` at the import, and
+    // that is the whole mistake. What followed it was the same mistake read
+    // three more ways: the import's own walk into the entry's (empty) scope
+    // ("cannot find 'Tab' in the imported path"), and then every use of the
+    // name the import never bound ("cannot find type 'Tab'", twice). Four
+    // reports over one edit, three of them naming a type the author can see
+    // declared in the file the refusal already pointed at.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\n[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::Tab;\n\nfun render(): bool { Tab::Messages == Tab::Other }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "one cycle, one report — no cascade over the names it did not bind: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "and the one report is the refusal at the import: {errors:#?}"
+    );
+}
+
+#[test]
+fn b236_a_value_use_of_a_refused_entry_import_stands_down_too() {
+    // The value-position twin of the same cascade: the sibling imports a
+    // FUNCTION from the entry, so the follow-on is "cannot find 'helper' in
+    // this scope" at the call rather than "cannot find type". One mistake,
+    // one report, whichever position the name is read in.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\n\nfun render(): i32 { helper() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(errors.len(), 1, "one cycle, one report: {errors:#?}");
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b236_the_stand_down_covers_only_what_the_refusal_accounts_for() {
+    // The control. The stand-down is keyed on the FILE that wrote the refused
+    // import and the NAMES that import would have brought in — nothing wider.
+    // A real miss in the same file, of a name no refused import mentions, is
+    // still the author's own mistake and is still reported.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\n\nfun render(): i32 { helper() + missing() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`pkg::main` is this program's entry file")),
+        "the refusal stands: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot find 'missing' in this scope")),
+        "and an unrelated miss in the same file is still reported: {errors:#?}"
+    );
+}
+
+// ── B240: file mode's residues after B239 ────────────────────────────────────
+
+#[test]
+fn b240_the_entry_refusal_is_pushed_once_per_import_statement() {
+    // (a) The refusal is the IMPORT's, and `import pkg::client::{ helper,
+    // other }` is one import. Every leaf of it carries the module segment's own
+    // span, so the loop pushed one error PER NAME, all at the same span — the
+    // CLI folds identical spans and showed one, the editor's raw diagnostics do
+    // not and showed two squiggles on one word.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\nfun other(): i32 { 4 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::{ helper, other };\n\n\
+                 fun render(): i32 { helper() + other() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "one import statement, one refusal (B236 covers the names it did not bind): {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`pkg::main` is this program's entry file"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b240_two_separate_imports_of_the_entry_are_two_refusals() {
+    // The control for that dedup, and the reason it is keyed on the SPAN rather
+    // than on the module name: two `import` statements are two mistakes, each
+    // written somewhere the reader has to look.
+    let errors = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\nfun other(): i32 { 4 }\n\n\
+                 fun main() {\n\tlet shown = render();\n}\n",
+            ),
+            (
+                "views.vl",
+                "import pkg::main::helper;\nimport pkg::main::other;\n\n\
+                 fun render(): i32 { helper() + other() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert_eq!(errors.len(), 2, "one per import statement: {errors:#?}");
+}
+
+#[test]
+fn b240_file_mode_refuses_an_import_of_a_sibling_that_is_a_declared_entry() {
+    // (b) The open file is a MODULE and its own siblings may import it (B239) —
+    // but the package's OTHER declared programs are still programs, and file
+    // mode could not see which files those were. `views.vl` importing
+    // `pkg::client::helper` was clean in the editor while `vilan check .` —
+    // whose `client` leg compiles that same file as the entry — refused it.
+    // The manifest's declared-entry set rides on `EntryMode` now, so the two
+    // surfaces agree.
+    let files: &[(&str, &str)] = &[
+        (
+            "client.vl",
+            "import pkg::views::render;\n\nfun helper(): i32 { 3 }\n\n\
+             fun main() {\n\tlet shown = render();\n}\n",
+        ),
+        (
+            "views.vl",
+            "import pkg::client::helper;\n\nfun render(): i32 { helper() }\n",
+        ),
+    ];
+    let (file_mode, _) = analyze_package_as(files, "views.vl", open_file(&["client"]));
+    assert!(
+        file_mode
+            .iter()
+            .any(|error| error.contains("`pkg::client` is this program's entry file")),
+        "file mode refuses the import of a declared entry: {file_mode:#?}"
+    );
+    let (declared, _) = analyze_package_as(files, "client.vl", declared(&["client"]));
+    assert!(
+        declared
+            .iter()
+            .any(|error| error.contains("`pkg::client` is this program's entry file")),
+        "exactly as the declared-entry analysis does: {declared:#?}"
+    );
+}
+
+#[test]
+fn b240_file_mode_still_lets_a_sibling_import_the_open_module() {
+    // The control B239 bought, unmoved: the OPEN file is not a declared entry,
+    // so `pkg::views` is an ordinary module import and the cycle through it is
+    // an ordinary module cycle. Only a file the manifest declares is refused.
+    let (errors, warnings) =
+        analyze_package_as(B239_FILES, "views.vl", open_file(&["client", "server"]));
+    assert!(
+        errors.is_empty(),
+        "an open module file is still the module its siblings import: {errors:#?}"
+    );
+    assert!(warnings.is_empty(), "silently: {warnings:#?}");
+}
+
+#[test]
+fn b240_a_dependency_file_opened_as_the_entry_keeps_its_own_derives() {
+    // (c) The latent third residue, and the only one nothing was pinning. A std
+    // or dependency file opened DIRECTLY (the editor, `vilan check <path>`) is
+    // analyzed as its own module from the buffer rather than loaded a second
+    // time from disk — `entry_is_module`. The derive/macro hoist (§6.13) marks
+    // `SourceId(0)` expanded up front so the load loop's ENTRY arm skips it and
+    // `expand_entry_over_world` can run the expansion after the world is built;
+    // that hoist runs only under `!entry_is_module`, and the mark was never
+    // taken back. So the file expanded NOWHERE and lost every `[derive]` it
+    // declares — B226's original complaint, one package over. (A std file
+    // escaped it only because `entry_is_inside_std` makes that analysis
+    // uncacheable, so there was no mark to undo.)
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = scratch::root().join(format!("vilan_depentry_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
+    )
+    .unwrap();
+    let dep_root = root.join("common");
+    std::fs::create_dir_all(&dep_root).unwrap();
+    // The dependency's public surface, which every dependent loads — and which
+    // reaches the module below through the dependency's own `pkg::`. That load
+    // is what hands the open buffer back as a `Dep` module at `SourceId(0)`.
+    std::fs::write(
+        dep_root.join("lib.vl"),
+        "import pkg::helper::shown;\n\nfun greeting(): bool { shown() }\n",
+    )
+    .unwrap();
+    // The dependency's own module, opened as the entry. Its `[derive]` is the
+    // whole subject: the file is walked as the program AND registered as the
+    // dependency's `helper` module, and the expansion must still happen.
+    let helper = dep_root.join("helper.vl");
+    std::fs::write(
+        &helper,
+        "[derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+         fun shown(): bool { Tab::Messages == Tab::Other }\n",
+    )
+    .unwrap();
+    let workspace = Workspace {
+        packages: vec![PackageSpec {
+            base_root: dep_root.clone(),
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        }],
+        entry_dependencies: vec![("common".to_string(), 0)],
+        ..Workspace::default()
+    };
+    let source = std::fs::read_to_string(&helper).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (_program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &app_dir,
+        &helper,
+        Some(Platform::default()),
+        &workspace,
+    );
+    let errors: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("does not implement the `PartialEq` operator")),
+        "the opened dependency file's own `[derive]` must expand: {errors:#?}"
+    );
+    assert!(errors.is_empty(), "and nothing else is wrong: {errors:#?}");
+}
+
+fn analyze_dependency_file_as_entry(helper_src: &str) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = scratch::root().join(format!("vilan_b250_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() { let _ = greeting(); }\n",
+    )
+    .unwrap();
+    let dep_root = root.join("common");
+    std::fs::create_dir_all(&dep_root).unwrap();
+    std::fs::write(
+        dep_root.join("lib.vl"),
+        "import pkg::helper::shown;\n\nfun greeting(): bool { shown() }\n",
+    )
+    .unwrap();
+    std::fs::write(dep_root.join("util.vl"), "fun thing(): i32 { 4 }\n").unwrap();
+    let helper = dep_root.join("helper.vl");
+    std::fs::write(&helper, helper_src).unwrap();
+    let workspace = Workspace {
+        packages: vec![PackageSpec {
+            base_root: dep_root.clone(),
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        }],
+        entry_dependencies: vec![("common".to_string(), 0)],
+        ..Workspace::default()
+    };
+    let source = std::fs::read_to_string(&helper).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (_program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &app_dir,
+        &helper,
+        Some(Platform::default()),
+        &workspace,
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    errors
+        .into_iter()
+        .map(|error| {
+            format!(
+                "{}{}",
+                error.msg,
+                error
+                    .note
+                    .map(|note| format!(" || NOTE: {}", note.msg))
+                    .unwrap_or_default()
+            )
+        })
+        .collect()
+}
+#[test]
+fn b250_a_dependency_entrys_own_name_says_which_package_it_is_in() {
+    // Leg 1. B240's fix made a dependency file opened as the entry keep its
+    // derives, and moved `package_of_source[SourceId(0)]` onto the dependency to
+    // do it. That remap is right — inside `common`, its siblings are `pkg::` —
+    // and it was SILENT: the one root it takes away is `common` itself, which is
+    // how every file outside the package addresses it, so an import that
+    // resolved before the file was opened this way stops after.
+    //
+    // The refusal stands; the note says why, and names the spelling that works.
+    let errors = analyze_dependency_file_as_entry(
+        "import common::util::thing;\n\nfun shown(): bool { thing() > 1 }\n",
+    );
+    let root_miss = errors
+        .iter()
+        .find(|error| error.starts_with("cannot find module 'common' to import"))
+        .unwrap_or_else(|| panic!("the remapped root is still refused: {errors:#?}"));
+    assert!(
+        root_miss.contains("being checked as a module of `common`"),
+        "and says which package it is being checked as part of: {root_miss}"
+    );
+    assert!(
+        root_miss.contains("`pkg::"),
+        "and names the spelling that works here: {root_miss}"
+    );
+}
+
+#[test]
+fn b250_the_pkg_spelling_inside_the_dependency_entry_is_clean() {
+    // The control the note steers to: the same file, the same analysis, the
+    // sanctioned spelling — and nothing to report. A note that named a fix which
+    // does not work would be worse than the silence it replaces.
+    let errors = analyze_dependency_file_as_entry(
+        "import pkg::util::thing;\n\nfun shown(): bool { thing() > 1 }\n",
+    );
+    assert!(
+        errors.is_empty(),
+        "`pkg::` is the spelling here: {errors:#?}"
+    );
+}
+
+#[test]
+fn b250_an_unrelated_missing_root_gets_no_note() {
+    // The scope. Only the dependency's OWN name is the one the remap took away;
+    // any other unresolved root in the same file is an ordinary miss.
+    let errors =
+        analyze_dependency_file_as_entry("import nowhere::thing;\n\nfun shown(): bool { true }\n");
+    let root_miss = errors
+        .iter()
+        .find(|error| error.starts_with("cannot find module 'nowhere' to import"))
+        .unwrap_or_else(|| panic!("an unknown root is still refused: {errors:#?}"));
+    assert!(
+        !root_miss.contains("being checked as a module of"),
+        "and reads as the ordinary miss it is: {root_miss}"
+    );
+}
+
+/// Leg 2's package: two DECLARED programs and a module that imports one of them.
+/// `views.vl` is the module both legs look at the same shape through.
+const B250_FILES: &[(&str, &str)] = &[
+    (
+        "client.vl",
+        "import pkg::views::render;\n\nfun main() {\n\tlet shown = render();\n}\n",
+    ),
+    (
+        "server.vl",
+        "fun helper(): i32 { 3 }\n\nfun main() {\n\tlet _ = helper();\n}\n",
+    ),
+    (
+        "views.vl",
+        "import pkg::server::helper;\n\nfun render(): i32 { helper() }\n",
+    ),
+];
+
+#[test]
+fn b250_the_declared_leg_refuses_a_siblings_import_of_another_declared_entry() {
+    // Leg 2, and the whole of B250's ruling in one assertion: the two legs are
+    // the same package, so they answer the same question the same way.
+    //
+    // Before, the DECLARED leg read only the entry's own alias (B226), so with
+    // `client.vl` as the entry a sibling's `import pkg::server::helper` loaded
+    // `server.vl` as an ordinary module and the analysis was clean — while file
+    // mode, holding the same manifest, refused it (B240). Agreement is per
+    // PACKAGE, not per leg: a file the manifest declares is a program on every
+    // surface that looks at it.
+    let (declared_errors, _) =
+        analyze_package_as(B250_FILES, "client.vl", declared(&["client", "server"]));
+    let refusal = "`pkg::server` is this program's entry file";
+    assert!(
+        declared_errors.iter().any(|error| error.contains(refusal)),
+        "the declared leg refuses it too: {declared_errors:#?}"
+    );
+    let (file_mode, _) =
+        analyze_package_as(B250_FILES, "views.vl", open_file(&["client", "server"]));
+    assert!(
+        file_mode.iter().any(|error| error.contains(refusal)),
+        "with B226's own message, exactly as file mode already did: {file_mode:#?}"
+    );
+}
+
+#[test]
+fn b250_a_declared_leg_with_no_manifest_is_unchanged() {
+    // The control for every caller that has no manifest to read — a test
+    // harness, a macro world, `vilan check <a bare file>`. The declared set is
+    // empty there, so B226's own alias is still the whole rule and its refusal
+    // is unmoved.
+    let (errors, _) = analyze_package_as(B239_FILES, "client.vl", EntryMode::default());
+    assert!(
+        errors.is_empty(),
+        "an ordinary module cycle under a declared entry: {errors:#?}"
+    );
+}
+
+// --- A65: module DIRECTORIES ---
+//
+// Rust's rule, arrived at in A65: `a.vl` OR `a/lib.vl` is module `a`'s body
+// (both present stays the ambiguity error), and `a/b.vl` is the module `a::b`
+// whether or not `a` has a body. A directory with no `lib.vl` is a PURE
+// NAMESPACE — importable only through its children. Nesting is unbounded, and
+// every component keeps the byte-exact case rule.
+//
+// The resolution rule the walk implements: the LONGEST module prefix of an
+// import path is resolved against the disk (and the open-document overlay),
+// then the remaining segments are item segments walked in that module's scope.
+
+/// A package whose library files live under `lib/`, with one more level below
+/// it — the shape A65's exhibit (kolt's `src/lib/`) has.
+const A65_NESTED: &[(&str, &str)] = &[
+    ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+    (
+        "lib/ui/widget.vl",
+        "fun a(): i32 { 1 }\nfun b(): i32 { 2 }\n",
+    ),
+];
+
+#[test]
+fn a65_a_nested_module_is_imported_by_its_own_path() {
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::util;\n\nfun main() { let _ = util::hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "`lib/util.vl` is the module `lib::util`: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_member_of_a_nested_module_is_imported_by_its_full_path() {
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "the longest module prefix is `lib::util`, then the item `hello`: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_brace_set_reaches_a_deeper_directorys_members() {
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::ui::widget::{ a, b };\n\nfun main() { let _ = a() + b(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "nesting is unbounded and a set member is an item segment: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_an_alias_renames_a_nested_modules_leaf() {
+    // E142's `as` over a directory path: the path resolves exactly as it would
+    // without one, and the alias is the only thing that changes.
+    let mut files = A65_NESTED.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::lib::util as u;\n\nfun main() { let _ = u::hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(errors.is_empty(), "`as` over a nested path: {errors:#?}");
+}
+
+#[test]
+fn a65_a_directory_with_a_body_keeps_its_own_items_and_gains_its_children() {
+    // `lib/lib.vl` is `lib`'s body. Its items stay reachable as `pkg::lib::…`,
+    // and its directory's children are reachable as `pkg::lib::<child>` — the
+    // two live in one namespace, which is what "a directory holds a module AND
+    // its submodules" means.
+    let mut files = A65_NESTED.to_vec();
+    files.push(("lib/lib.vl", "fun surface(): i32 { 3 }\n"));
+    files.push((
+        "main.vl",
+        "import pkg::lib::surface;\nimport pkg::lib::util::hello;\n\nfun main() { let _ = surface() + \
+         hello(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a body and a namespace at once: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_pure_namespace_import_is_refused_and_names_its_children() {
+    // `lib/` has no `lib.vl`, so `pkg::lib` names no module body. Importing it
+    // binds nothing anyone can use, so it is refused — and the refusal says
+    // what the directory DOES hold, which is the whole of the fix.
+    let mut files = A65_NESTED.to_vec();
+    files.push(("main.vl", "import pkg::lib;\n\nfun main() {}\n"));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("`pkg::lib`"))
+        .unwrap_or_else(|| panic!("a bodiless directory is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("no `lib.vl`") || refusal.contains("namespace"),
+        "and says why: {refusal}"
+    );
+    assert!(
+        refusal.contains("util") && refusal.contains("ui"),
+        "and names the children it found: {refusal}"
+    );
+}
+
+#[test]
+fn a65_the_ambiguity_error_is_unchanged_inside_a_directory() {
+    // Both forms of ONE module's body, one level down: `lib/util.vl` and
+    // `lib/util/lib.vl`. The rule does not weaken because the module is nested.
+    let files = &[
+        ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        ("lib/util/lib.vl", "fun hello(): i32 { 8 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.iter().any(|error| error.contains("is ambiguous")
+            && error.contains("util.vl")
+            && error.contains("util/lib.vl")),
+        "both forms of a nested module's body is still the ambiguity error: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_parent_import_does_not_bring_the_children_into_scope() {
+    // The scope decision, pinned. `import pkg::lib;` binds `lib`'s OWN items —
+    // a child module is imported by its own path, exactly as in Rust. Writing
+    // `lib::util::hello()` after importing only `pkg::lib` must not resolve.
+    let files = &[
+        ("lib/lib.vl", "fun surface(): i32 { 3 }\n"),
+        ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib;\n\nfun main() { let _ = lib::util::hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        !errors.is_empty(),
+        "a parent import is not a child import: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_wrong_case_directory_component_does_not_resolve() {
+    // Every component carries the byte-exact rule (`windows-support.md` §5), so
+    // a directory spelled `Lib` is not reached by `import pkg::lib::util`. On a
+    // case-sensitive filesystem the resolution simply never happens, which is
+    // the refusal below; the Windows leg is where the mismatch ARM fires, and
+    // this pin declines there rather than asserting the other platform's answer.
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        return;
+    }
+    let files = &[
+        ("Lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        !errors.is_empty(),
+        "`Lib` is not `lib`, in a directory component too: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_a_nested_file_opened_as_the_entry_resolves_its_siblings_by_pkg() {
+    // File mode (B239's `OpenFile` leg): the editor hands the analysis
+    // `lib/ui/widget.vl`, which is a MODULE of the package. Its siblings are
+    // `pkg::…` from anywhere in the tree — the package root is the root,
+    // not the file's own directory.
+    let files = &[
+        ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+        (
+            "lib/ui/widget.vl",
+            "import pkg::lib::util::hello;\n\nfun a(): i32 { hello() }\n",
+        ),
+        ("main.vl", "fun main() {}\n"),
+    ];
+    let (errors, _) = analyze_package_as(files, "lib/ui/widget.vl", open_file(&["main"]));
+    assert!(
+        errors.is_empty(),
+        "a nested module's own `pkg::` imports resolve in file mode: {errors:#?}"
+    );
+}
+
+#[test]
+fn a65_an_overlay_only_nested_module_resolves() {
+    // The unsaved-buffer world: `resolve_module_file` asks the open-document
+    // overlay beside the disk, and a directory component changes nothing about
+    // that — a nested module the user has just created and not yet saved must
+    // resolve exactly as a flat one does.
+    let errors = analyze_overlay_package(
+        &[
+            ("lib/util.vl", "fun hello(): i32 { 7 }\n"),
+            (
+                "main.vl",
+                "import pkg::lib::util::hello;\n\nfun main() { let _ = hello(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "an overlay-only nested module resolves: {errors:#?}"
+    );
+}
+
+// --- A67: a declaration and a same-named file in the module's directory -------
+//
+// A65 gave `member_or_submodule` its order — a module's own items win over a
+// same-named file in its directory — so that ADDING a file could not re-point
+// an existing import. That is still the right winner, and it was still a silent
+// one: while `a.vl` declares `b`, `a/b.vl` cannot be reached by any import at
+// all, and a rename on either side changes what every `pkg::a::b` in the estate
+// means with nothing said. The collision is an ambiguity error now, which is
+// what the file-level twin (`a.vl` beside `a/lib.vl`) has been since A65 — one
+// rule for both collisions.
+//
+// THE BOUND, stated because it used to be missed (tracker B342). The rule reads
+// each loaded module's CHILDREN SCOPE, and a child has one only because
+// something loaded it, so the collision is reported for a path something walks
+// THROUGH — whatever that path's spelling, and however many spell it — and not
+// for one nothing has ever named. `a67_a_collision_nothing_walks_into_is_not_
+// reported` pins that end of it and carries the measurement that chose it over
+// listing every loaded module's directory on every keystroke.
+
+#[test]
+fn a67_a_declaration_shadowing_a_directory_child_is_ambiguous() {
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b;\n\nfun main() { let _ = b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`b`") && refusal.contains("`a`") && refusal.contains("`b.vl`"),
+        "and names both halves: {refusal}"
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.contains("is ambiguous"))
+            .count(),
+        1,
+        "once, however many imports walk it: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_an_aliased_import_walks_the_same_collision() {
+    // The refusal does not depend on the SPELLING of the import that reached
+    // the child: `as taken` binds a different name and walks the same path, so
+    // the pair is named the same way.
+    //
+    // This test used to be called `a67_the_collision_is_reported_with_no_import_
+    // of_the_path`, and its comment said "`pkg::a` alone loads both halves".
+    // Neither was true of its own fixture, which imports `pkg::a::b` — a path
+    // that walks THROUGH the child (tracker B342). The rule as it is, and why
+    // it is that, is the test below.
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b as taken;\n\nfun main() { let _ = taken(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("is ambiguous in module")),
+        "an aliased import walks the same collision: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_a_collision_nothing_walks_into_is_not_reported() {
+    // B342, and the rule AS IT IS rather than as the heading above once claimed
+    // it. A67 reads each loaded module's CHILDREN SCOPE, and a child has a
+    // scope only because something loaded it — so `import pkg::a;` on its own,
+    // with `a.vl` declaring `b` beside an `a/b.vl` nobody has ever named,
+    // reports nothing. The ambiguity is real and latent; it is announced the
+    // moment any path walks through `a::b`, which is the test above.
+    //
+    // Closing it means LISTING each loaded module's directory instead of
+    // reading its children scope — a `read_dir` per loaded module per analysis,
+    // and the analysis is every keystroke, because the rule runs in
+    // `post_analysis_passes`. Measured on a copy of the owner's application
+    // (kolt, 24 modules plus the generated `lucide` root the manifest excludes,
+    // `submodules_in_directory` over the directory each loaded module names,
+    // 200 passes, thread CPU, loadavg 104-106, and again on a quiet box at
+    // 13 for the same answer — the cost is syscalls, not contention): kolt's
+    // own 28 module directories cost 0.68-0.70 ms median / 0.82-1.40 ms p95,
+    // and the kolt + std
+    // set an analysis actually loads — 93 directories, of which 7 exist — costs
+    // 2.90 ms median / 3.9-4.6 ms p95. The bar was 1 ms per analysis. It is
+    // over it, on a pass whose whole yield is announcing an ambiguity earlier
+    // than the first import that would announce it anyway, so the heading was
+    // corrected instead and this pin holds the rule honest.
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a;\n\nfun main() { let _ = a::b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("is ambiguous in module")),
+        "a child nothing loaded has no scope for the rule to read, so the \
+         collision is latent rather than reported: {errors:#?}"
+    );
+    assert!(
+        errors.is_empty(),
+        "and the declaration wins in silence, which is the fact B342 names — \
+         not an error, a latency: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_the_lib_control_stays_the_file_level_ambiguity_alone() {
+    // `a/lib.vl` is module `a`'s own BODY, never a child `a::lib`, so a
+    // declaration named `lib` collides with nothing. The tree is still
+    // degenerate and still refused — by the file-level rule, once
+    // (diagnostics-standard B5: one diagnostic per root cause).
+    let files = &[
+        ("a.vl", "fun lib(): i32 { 1 }\n"),
+        ("a/lib.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::lib;\n\nfun main() { let _ = lib(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("is ambiguous: both") && error.contains("a/lib.vl")),
+        "the file-level ambiguity still fires: {errors:#?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("is ambiguous in module")),
+        "and A67's rule does not fire on top of it: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_a_directory_child_with_no_colliding_declaration_still_resolves() {
+    // The control that says how narrow the rule is: the same two files with the
+    // declaration renamed resolve exactly as A65 left them.
+    let files = &[
+        ("a.vl", "fun surface(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an uncontested directory child resolves: {errors:#?}"
+    );
+}
+
+// --- B317: a type's statics across files -------------------------------------
+//
+// The two shapes a single-file pin cannot hold: the app prelude that RE-EXPORTS
+// a static under a bare name, and an EXTENSION impl, whose statics are reached
+// through the module that writes the block rather than through the module that
+// declares the type. Both fall out of one question — does this block's subject
+// name resolve, in this block's own scope, to the type the path walked to — and
+// the last pin is what that question buys: a module that writes no such block
+// offers nothing, however visible the type is inside it.
+
+#[test]
+fn b317_a_reexported_static_is_consumed_by_a_second_file() {
+    // The app-prelude shape the item was filed from: one module gathers the
+    // spellings an app wants bare, and every other file imports them from it.
+    let files = &[
+        (
+            "sugar.vl",
+            "import pkg::shapes::Point;\n\nexport import pkg::shapes::Point::origin as origin;\n",
+        ),
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::sugar::origin;\n\nfun main() { let _ = origin().x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a re-exported static is importable from the relay: {errors:#?}"
+    );
+}
+
+#[test]
+fn b317_an_extension_impls_static_imports_from_the_extending_module() {
+    // The block is written in `extra.vl`, whose own import is what makes
+    // `Point` resolve there — so `pkg::extra::Point::doubled` is the path, and
+    // the fixpoint over the import queue is what lets the second import wait
+    // for the first.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "extra.vl",
+            "import pkg::shapes::Point;\n\nimpl Point {\n\tfun doubled(x: i32): Point {\n\t\tPoint { x = x * 2 }\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::extra::Point::doubled;\n\nfun main() { let _ = doubled(2).x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an extension impl's static imports from the extending module: {errors:#?}"
+    );
+}
+
+#[test]
+fn b317_a_static_is_not_importable_through_a_module_that_writes_no_block() {
+    // The keying, stated as a refusal. `bare.vl` imports `Point` and writes no
+    // impl, so `pkg::bare::Point::doubled` names nothing — the statics belong
+    // to the modules whose files declare them, not to every module the type is
+    // visible in.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+        ),
+        (
+            "bare.vl",
+            "import pkg::shapes::Point;\n\nfun anchor(): i32 { 1 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::bare::Point::origin;\n\nfun main() { let _ = origin().x; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot find 'origin' in the imported path")),
+        "a module that writes no block offers no statics: {errors:#?}"
+    );
+}
+
+// --- B331: `lib` is a body file, never a segment below its own directory -----
+//
+// `a/lib.vl` IS module `a`. The loader used to answer `a::lib` with it as well,
+// so one file was parsed, analyzed and entity-numbered twice under two names,
+// `lib` landed in `a`'s submodule scope (which `submodules_in_directory` has
+// never listed), and A67's collision rule had to skip the name by hand to avoid
+// saying one root cause twice. `resolve_module_file` refuses the name now and
+// the walk's miss says what the segment is, with the parent path to write
+// instead.
+
+/// The package the pins share: `a`'s body is its directory's `lib.vl`.
+const B331_NESTED_BODY: &[(&str, &str)] = &[("a/lib.vl", "fun greet(): i32 { 7 }\n")];
+
+#[test]
+fn b331_a_body_file_is_not_a_module_under_its_own_directory() {
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::a::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("own BODY FILE"))
+        .unwrap_or_else(|| panic!("`lib` under `a` is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`pkg::a::lib`") && refusal.contains("`a/lib.vl`"),
+        "and names the segment and the file it is: {refusal}"
+    );
+    assert!(
+        refusal.contains("Import `pkg::a` instead"),
+        "and steers to the parent path: {refusal}"
+    );
+}
+
+#[test]
+fn b331_the_segment_alone_is_refused_the_same_way() {
+    // `import pkg::a::lib;` has no leaf to blame, and it resolved to the body
+    // file under a second name exactly as the deeper path did.
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push(("main.vl", "import pkg::a::lib;\n\nfun main() {}\n"));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("own BODY FILE")
+                && error.contains("Import `pkg::a` instead")),
+        "the bare segment is refused with the same steer: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_the_steers_own_spelling_resolves() {
+    // The other half of the pin the item asked for: what the refusal tells the
+    // author to write compiles. `a/lib.vl`'s items are `pkg::a`'s items.
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::a::greet;\n\nfun main() { let _ = greet(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "`pkg::a::greet` reaches what `pkg::a::lib::greet` was aiming at: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_a_deeper_body_file_names_its_own_parent() {
+    // The steer is built from the segments WALKED, not from the root: two
+    // levels down it says `pkg::x::a` and `x/a/lib.vl`.
+    let files = &[
+        ("x/a/lib.vl", "fun greet(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::x::a::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("own BODY FILE"))
+        .unwrap_or_else(|| panic!("the nested body is refused too: {errors:#?}"));
+    assert!(
+        refusal.contains("`pkg::x::a::lib`")
+            && refusal.contains("`x/a/lib.vl`")
+            && refusal.contains("Import `pkg::x::a` instead"),
+        "and spells the path it walked: {refusal}"
+    );
+}
+
+#[test]
+fn b331_a_root_level_lib_module_is_untouched() {
+    // The narrowness control the refusal must not swallow: the SOURCE ROOT is
+    // nobody's body, so `lib.vl` beside `main.vl` is the ordinary module `lib`
+    // (and is std's own package surface). Only a `lib` with a directory prefix
+    // names a body file.
+    let files = &[
+        ("lib.vl", "fun greet(): i32 { 7 }\n"),
+        (
+            "main.vl",
+            "import pkg::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a root-level `lib.vl` is a module like any other: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_a_directory_named_lib_below_a_module_still_resolves() {
+    // The second control: `a/lib/` is a DIRECTORY whose own body would be
+    // `a/lib/lib.vl` — `lib` there names that directory, not `a`'s body, and
+    // nothing about it is degenerate. Only the flat candidate is refused.
+    let files = &[
+        ("a.vl", "fun surface(): i32 { 1 }\n"),
+        ("a/lib/x.vl", "fun hello(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::lib::x::hello;\n\nfun main() { let _ = hello(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a real `lib` directory is still a path segment: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_the_body_file_is_loaded_once_under_one_name() {
+    // The root cause, stated as behaviour rather than as a message: `a/lib.vl`
+    // declares `greet` once. While the loader answered `a::lib` with it too, the
+    // file was analyzed a second time as a second module — and the duplicate
+    // declaration rule is what notices a name declared twice in one module.
+    // Neither name is reported, because there is only one module now.
+    let mut files = B331_NESTED_BODY.to_vec();
+    files.push((
+        "main.vl",
+        "import pkg::a::greet;\nimport pkg::a;\n\nfun main() { let _ = greet(); }\n",
+    ));
+    let errors = analyze_package(&files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "one file, one module, however many paths reach it: {errors:#?}"
+    );
+}
+
+#[test]
+fn b331_a_declaration_shadowing_a_real_lib_directory_is_ambiguous() {
+    // What the refusal bought A67. `refuse_shadowed_submodules` used to skip
+    // the name `lib` outright, because the loader's second resolution of a body
+    // file put one in every such module's submodule scope and the collision
+    // would have been said twice. With that resolution gone, a `lib` in a
+    // submodule scope is a real directory — here `a/lib/` with a body of its own
+    // — and a declaration named `lib` beside it is the ordinary A67 collision,
+    // which the hand-skip was hiding.
+    let files = &[
+        ("a.vl", "fun lib(): i32 { 1 }\n"),
+        ("a/lib/lib.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::lib::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`lib` is ambiguous in module `a`")
+                && error.contains("the declaration wins")),
+        "the collision the hand-skip hid is reported: {errors:#?}"
+    );
+}
+
+// --- B337: what shape the child is, and the namespace child the rule missed --
+//
+// A67's message said "its directory holds a `{name}.vl`" whatever the child
+// was. A child bodied by `b/lib.vl` is a DIRECTORY on disk, and so is a pure
+// NAMESPACE child (`a/c/` holding `x.vl` and no body of its own) — a reader
+// told to look for `a/b.vl` is being sent to a file that does not exist, in a
+// diagnostic whose whole job is to name the two halves of a rename.
+//
+// The namespace child was worse than mis-named: it was invisible. The loader
+// maps each pending request to "the longest prefix that names a module, or
+// failing that the module directory it addresses", and for `a::c` the module
+// walk ANSWERED — with `a`, one segment short — so the directory fallback
+// never ran. `a::c` was never registered as `a`'s child, the children scope
+// this rule reads never held `c`, and `a.vl` declaring `c` beside `a/c/x.vl`
+// bound the declaration in silence. The loader takes the deeper of the two
+// answers now; the shorter is a prefix of it and loads anyway.
+
+#[test]
+fn b337_a_directory_bodied_child_is_named_as_a_directory() {
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b/lib.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b;\n\nfun main() { let _ = b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("holds a `b/`") && !refusal.contains("`b.vl`"),
+        "a `b/lib.vl` child is a DIRECTORY, and the message must send the \
+         reader there: {refusal}"
+    );
+}
+
+#[test]
+fn b337_a_flat_child_is_still_named_as_a_file() {
+    // The control that keeps the two spellings apart: `a/b.vl` is a file, and
+    // it still says so.
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b;\n\nfun main() { let _ = b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("holds a `b.vl`"),
+        "the flat child keeps the file spelling: {refusal}"
+    );
+}
+
+#[test]
+fn b337_a_declaration_shadowing_a_pure_namespace_child_is_ambiguous() {
+    // The silent winner: `a/c/` holds `x.vl` and no body of its own, so `c` is
+    // a namespace the path walks THROUGH. `import pkg::a::c;` used to bind the
+    // declaration with nothing said, which is exactly what A67 closed for a
+    // file child.
+    let files = &[
+        ("a.vl", "fun c(): i32 { 1 }\n"),
+        ("a/c/x.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::c;\n\nfun main() { let _ = c(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the namespace collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`c` is ambiguous in module `a`") && refusal.contains("holds a `c/`"),
+        "and names the directory, not a `c.vl` that does not exist: {refusal}"
+    );
+}
+
+#[test]
+fn b337_a_namespace_child_with_no_colliding_declaration_still_resolves() {
+    // The narrowness control: the same tree with the declaration renamed walks
+    // through the namespace exactly as it always did, and the deeper
+    // resolution the loader now takes adds no diagnostic of its own.
+    let files = &[
+        ("a.vl", "fun surface(): i32 { 1 }\n"),
+        ("a/c/x.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::c::x::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a namespace child nothing shadows is reached as before: {errors:#?}"
+    );
+}
+
+// --- B332: a type segment REPLACES the walk's namespace ----------------------
+//
+// B317 shipped the struct half the safe way round — a type's namespace asked
+// SECOND, after the scope the walk was standing in, so no path that resolved
+// changed meaning. That left the two kinds of type segment inconsistent: an
+// ENUM segment had always replaced the scope with its variants, while a STRUCT
+// segment kept the module scope, so a module-level `rem` beside `Length` beat
+// `Length::rem` in the file that declares both, silently. One rule now: a type
+// segment replaces the namespace, enum and struct alike. The estate was
+// censused before the change — no import in std, the corpus, `examples/`, the
+// templates, the benchmarks, the docs' fences or kolt reaches a module item
+// through a type-named prefix — and the miss the change makes is curated, so a
+// path outside the tree that did is handed the spelling that replaces it.
+
+/// The shadowing pair the item is filed on, in miniature: one module declaring
+/// both a type with a `rem` static and a module-level `rem` of its own.
+const B332_SHADOWING_PAIR: &str = "struct Length {\n\tvalue: i32,\n}\n\nimpl Length {\n\tfun \
+                                   rem(value: i32): Length {\n\t\tLength { value = value }\n\t}\n}\
+                                   \n\nfun rem(value: i32): i32 { value * 16 }\n";
+
+#[test]
+fn b332_a_struct_segment_replaces_the_module_scope() {
+    // `Length::rem` is the static, in the one file where the old order made it
+    // the module's function. The RESULT TYPE is the assertion: the static
+    // answers a `Length` (which has `.value`), the module-level `rem` an `i32`
+    // (which does not), so a pin on the meaning rather than on a message.
+    let files = &[
+        ("style.vl", B332_SHADOWING_PAIR),
+        (
+            "main.vl",
+            "import pkg::style::Length::rem;\n\nfun main() { let _ = rem(1).value; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "the type's namespace is the path's namespace: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_the_module_item_keeps_its_own_path() {
+    // The other half of the same pair, and the reason the change costs nothing:
+    // the module-level `rem` is reached by the module's path, which is what it
+    // always meant. `i32 * 16` has no `.value`, so this pins the opposite
+    // meaning as sharply as the pin above.
+    let files = &[
+        ("style.vl", B332_SHADOWING_PAIR),
+        (
+            "main.vl",
+            "import pkg::style::rem;\n\nfun main() { let _ = rem(1) + 1; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a module item is reached through its module: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_a_module_item_is_not_reachable_through_a_type_segment() {
+    // The BREAKING half, and its curated steer. `px` is an item of the module,
+    // not a member of `Length`; the old order let the module scope answer under
+    // the type prefix, and the miss that replaces it names the spelling that
+    // works rather than reporting a name the author can see declared as
+    // missing.
+    let files = &[
+        (
+            "style.vl",
+            "struct Length {\n\tvalue: i32,\n}\n\nimpl Length {\n\tfun rem(value: i32): Length \
+             {\n\t\tLength { value = value }\n\t}\n}\n\nfun px(value: i32): i32 { value }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::style::Length::px;\n\nfun main() { let _ = px(1); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is not a member of the type"))
+        .unwrap_or_else(|| panic!("a module item under a type prefix is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`px`") && refusal.contains("`Length`"),
+        "and names both: {refusal}"
+    );
+    assert!(
+        refusal.contains("Write `pkg::style::px`"),
+        "and hands over the spelling that replaces it: {refusal}"
+    );
+}
+
+#[test]
+fn b332_an_enum_segment_is_the_control_it_always_was() {
+    // The kind the rule is copied FROM: an enum segment has always replaced the
+    // scope with its variants, so a module-level `fallback` never shadowed
+    // `Colour::fallback`. Unchanged by B332, and here to say so — the struct
+    // arm agrees with this one now instead of contradicting it.
+    let files = &[
+        (
+            "colour.vl",
+            "enum Colour {\n\tRed,\n\tGreen,\n}\n\nimpl Colour {\n\tfun fallback(): Colour \
+             {\n\t\tColour::Red\n\t}\n}\n\nfun fallback(): i32 { 1 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::colour::Colour;\nimport pkg::colour::Colour::fallback;\n\nfun main() { \
+             let _ = match fallback() { Colour::Red => 1, Colour::Green => 2 }; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "the enum's static outranks a module-level twin, as it always has: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_an_enums_variants_still_travel_their_path() {
+    // The control that says how much of the enum walk is untouched: the
+    // variants scope is still what the segment hands over, and `self` still
+    // binds the type beside them.
+    let files = &[
+        (
+            "colour.vl",
+            "enum Colour {\n\tRed,\n\tGreen,\n}\n\nfun Red(): i32 { 9 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::colour::Colour::{ self, Red, Green };\n\nfun main() { let colour: \
+             Colour = Red; let _ = match colour { Red => 1, Green => 2 }; }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a brace set of variants is unmoved: {errors:#?}"
+    );
+}
+
+#[test]
+fn b332_a_self_method_is_still_refused_by_name_under_the_new_order() {
+    // B317's refusal reads the same subject the walk now stands in, so it must
+    // still fire: a `self` method is in the type's namespace and is not
+    // importable out of it.
+    let files = &[
+        (
+            "shapes.vl",
+            "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun doubled(self): i32 {\n\t\tself.x \
+             * 2\n\t}\n}\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::shapes::Point::doubled;\n\nfun main() {}\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`Point::doubled` takes `self`")),
+        "the `self` refusal outranks the miss: {errors:#?}"
+    );
+}
+
+/// As [`analyze_package_raw`], but the program's WARNINGS — B318's two are
+/// non-fatal, so they never appear in the error list.
+fn analyze_package_warnings(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_warn_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        errors.is_empty(),
+        "the exhibit must analyze cleanly: {errors:#?}"
+    );
+    program
+        .map(|program| {
+            program
+                .warnings
+                .iter()
+                .map(|warning| warning.msg.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+#[test]
+fn b318_export_all_is_a_module_level_item_like_every_other_export() {
+    // `export *;` carries no inner statement — the marker IS the statement —
+    // so it takes the same refusal `export <item>` takes inside a body, for
+    // the same reason: an export shapes a MODULE's surface and a body has no
+    // surface to shape.
+    let files = &[("main.vl", "fun main() {\n\texport *;\n}\n")];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`export` is a module-level item")),
+        "`export *;` inside a body is refused: {errors:#?}"
+    );
+    // At a module's top level it is clean.
+    let files = &[("main.vl", "export *;\n\nfun main() {}\n")];
+    assert!(
+        analyze_package(files, "main.vl", Platform::default()).is_empty(),
+        "`export *;` at the top level is an item"
+    );
+}
+
+/// Writes `files` into a fresh temp directory and hands back the path of
+/// `module` inside it, for the parse-only importable queries. The caller
+/// removes the directory.
+fn write_module_tree(files: &[(&str, &str)]) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_vis_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn b318_the_export_bit_round_trips_through_module_importables() {
+    use vilan_core::analyzer::{Visibility, module_importables, module_is_curated};
+
+    // The marker used to be DISCARDED: `unwrap_item` stripped `Node::Export`
+    // along with derive/service/macro-attribute, so `export fun f` and `fun f`
+    // produced byte-identical rows. The bit is the whole of what S1 adds.
+    let dir = write_module_tree(&[(
+        "curated.vl",
+        "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n\nexport(in mod) fun narrowed(): i32 { 3 }\n",
+    )]);
+    let rows = module_importables(&dir.join("curated.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("shown"), Visibility::Exported);
+    assert_eq!(named("hidden"), Visibility::Private);
+    assert_eq!(named("narrowed"), Visibility::Scoped(vec!["mod"]));
+    assert!(
+        module_is_curated(&rows),
+        "a marker anywhere curates the module"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `export *;` sets the bit on every item — and an item carrying its OWN
+    // narrowing keeps it, which is exactly what `export(in mod)` is for.
+    let dir = write_module_tree(&[(
+        "wide.vl",
+        "export *;\n\nfun a(): i32 { 1 }\n\nexport(in mod) fun b(): i32 { 2 }\n",
+    )]);
+    let rows = module_importables(&dir.join("wide.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("a"), Visibility::Exported);
+    assert_eq!(named("b"), Visibility::Scoped(vec!["mod"]));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // An UNCURATED module is not curated, and the three tooling consumers read
+    // that as "offers everything" (§8, the rollout's tooling half).
+    let dir = write_module_tree(&[("plain.vl", "fun a(): i32 { 1 }\n")]);
+    let rows = module_importables(&dir.join("plain.vl"));
+    assert_eq!(rows[0].exported, Visibility::Private);
+    assert!(!module_is_curated(&rows));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `export import` publishes: a re-export is an act of publication by a
+    // module that can see the item (§10 n).
+    let dir = write_module_tree(&[("surface.vl", "export import pkg::a::helper;\n")]);
+    let rows = module_importables(&dir.join("surface.vl"));
+    assert_eq!(rows[0].name, "helper");
+    assert_eq!(rows[0].exported, Visibility::Exported);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn n89_export_const_publishes_the_declaration_under_the_marker() {
+    use vilan_core::analyzer::{Visibility, module_importables, module_is_curated};
+
+    // G24 gave `const` a DECLARATION form, and `export` is a wrapper over a
+    // declaration — so `export const fun` and `export const let` are two
+    // wrappers over one item, and every consumer of the export marker has to
+    // see through both. `export_takes` saw through neither: the form was
+    // refused outright, with a message about expressions ("an expression is
+    // none of those") that a `const fun` is not.
+    let dir = write_module_tree(&[(
+        "marked.vl",
+        concat!(
+            "export const fun answer(): i32 { 42 }\n",
+            "\n",
+            "export const let value: i32 = answer();\n",
+            "\n",
+            "const fun kept(): i32 { 7 }\n",
+        ),
+    )]);
+    let rows = module_importables(&dir.join("marked.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("answer"), Visibility::Exported);
+    assert_eq!(named("value"), Visibility::Exported);
+    // And the marker is not INVENTED: an unmarked `const fun` in the same
+    // curated module stays the module's own.
+    assert_eq!(named("kept"), Visibility::Private);
+    assert!(module_is_curated(&rows));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The whole way through: another module imports both and the program is
+    // clean. A `const let` initialized by an imported `const fun` is the
+    // shape `const.md` §9.6 documents, one module over.
+    let errors = analyze_package(
+        &[
+            (
+                "a.vl",
+                concat!(
+                    "export const fun answer(): i32 { 42 }\n",
+                    "\n",
+                    "export const let value: i32 = answer();\n",
+                ),
+            ),
+            (
+                "main.vl",
+                concat!(
+                    "import pkg::a::{ answer, value };\n",
+                    "\n",
+                    "fun main() { let _ = answer() + value; }\n",
+                ),
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(errors.is_empty(), "`export const` imports: {errors:#?}");
+}
+
+#[test]
+fn b318_an_unexported_item_still_imports() {
+    // Visibility NEVER gates ACCESS (§1): `resolve_import` binds what the path
+    // names, exported or not. The release-N posture is a WARNING, and the
+    // program compiles.
+    let files = &[
+        (
+            "a.vl",
+            "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "an unexported item still imports: {errors:#?}"
+    );
+}
+
+#[test]
+fn b318_the_import_steer_skips_a_private_item_of_a_curated_module() {
+    // §1: the bit gates the B4 "import it first" steer. A module's private
+    // machinery is not something to point at — the author said it is theirs,
+    // and an author who needs it anyway writes the reach deliberately rather
+    // than being talked into it by a compiler note.
+    //
+    // The module has to be LOADED for the steer to see it at all, so every leg
+    // imports one name from it and then reaches for a second.
+    const CURATED: &str = "export fun shown(): i32 { 1 }\n\nexport fun other(): i32 { 3 }\n\nfun hidden(): i32 { 2 }\n";
+    let steers = |module: &'static str, reached: &str| -> Vec<String> {
+        let entry =
+            format!("import pkg::a::shown;\n\nfun main() {{ let _ = shown() + {reached}(); }}\n");
+        let entry: &'static str = Box::leak(entry.into_boxed_str());
+        analyze_package(
+            &[("a.vl", module), ("main.vl", entry)],
+            "main.vl",
+            Platform::default(),
+        )
+    };
+
+    let private = steers(CURATED, "hidden");
+    assert!(
+        private
+            .iter()
+            .any(|error| error.contains("cannot find 'hidden'")),
+        "the name still does not resolve: {private:#?}"
+    );
+    assert!(
+        !private
+            .iter()
+            .any(|error| error.contains("import it first")),
+        "a private item is not steered toward: {private:#?}"
+    );
+    // The exported sibling still steers, which is what says the filter is the
+    // BIT and not a deleted steer.
+    let exported = steers(CURATED, "other");
+    assert!(
+        exported
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::a::other;`)")),
+        "an exported item still steers: {exported:#?}"
+    );
+    // And an UNCURATED module steers for everything, exactly as before the bit
+    // existed (§8, the rollout's tooling half).
+    let uncurated = steers(
+        "fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        "hidden",
+    );
+    assert!(
+        uncurated
+            .iter()
+            .any(|error| error.contains("import it first (`import pkg::a::hidden;`)")),
+        "an uncurated module offers everything: {uncurated:#?}"
+    );
+}
+
+/// The exposure exhibit: one curated module whose exported items name a private
+/// struct in every signature position B318 §4 lists, plus the body control.
+const EXPOSURE_MODULE: &str = "\
+struct Hidden {\n\
+\tx: i32,\n\
+}\n\
+\n\
+trait Secret {\n\
+\tfun mark(self): i32;\n\
+}\n\
+\n\
+export let registry: Hidden = Hidden { x = 0 };\n\
+\n\
+export fun takes(item: Hidden): i32 { item.x }\n\
+\n\
+export fun returns(): Hidden { Hidden { x = 1 } }\n\
+\n\
+export fun generic_return(): List<Hidden> { [] }\n\
+\n\
+export fun bounded<T: Secret>(item: T): i32 { item.mark() }\n\
+\n\
+export struct Boxed {\n\
+\titem: Hidden,\n\
+}\n\
+\n\
+export enum Holder {\n\
+\tOne(Hidden),\n\
+}\n\
+\n\
+export fun body_only(): i32 {\n\
+\tlet local = Hidden { x = 2 };\n\
+\tlocal.x\n\
+}\n\
+\n\
+export fun reachable(): i32 { 3 }\n";
+
+#[test]
+fn b318_the_exposure_warning_covers_every_signature_position() {
+    // §4, with the RULED wording on the return row. Seven positions, each with
+    // the private type named and the item named, and the BODY control: a
+    // private type used inside an exported function's body is exactly the
+    // encapsulation the feature exists to permit, and never warns.
+    let files = &[
+        ("a.vl", EXPOSURE_MODULE),
+        (
+            "main.vl",
+            "import pkg::a::reachable;\n\nfun main() { let _ = reachable(); }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "main.vl", Platform::default());
+    let says = |needle: &str| {
+        assert!(
+            warnings.iter().any(|warning| warning.contains(needle)),
+            "missing {needle:?} in {warnings:#?}"
+        );
+    };
+    // The RULED sentence, verbatim.
+    says(
+        "`Hidden` is returned here. `returns` is exported, but `Hidden` is not. \
+         A consumer can call `returns` but cannot name the return type.",
+    );
+    says("`Hidden` is this value's type. `registry` is exported");
+    says("`Hidden` is a parameter type here. `takes` is exported");
+    says("`Hidden` is a field's type here. `Boxed` is exported");
+    says("`Hidden` is a variant's payload here. `Holder` is exported");
+    says("`Secret` is a declared bound here. `bounded` is exported");
+    // A generic ARGUMENT is reached: `List<Hidden>` names `Hidden`.
+    says("`generic_return` is exported");
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("`body_only`")),
+        "a private type inside a BODY never warns: {warnings:#?}"
+    );
+    // One warning per declaration, not one per position.
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.contains("is exported, but"))
+            .count(),
+        7,
+        "one per exposing declaration: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b318_an_uncurated_module_exposes_nothing() {
+    // §8, the rollout's tooling half: a module that has written no marker has
+    // made no claim about its surface, so nothing it declares reads as private
+    // to the exposure check. Same exhibit with the markers removed from the
+    // TYPES' module — here, the whole module uncurated — is silent.
+    let files = &[
+        (
+            "a.vl",
+            "struct Hidden {\n\tx: i32,\n}\n\nfun returns(): Hidden { Hidden { x = 1 } }\n\nfun reachable(): i32 { 3 }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::a::reachable;\n\nfun main() { let _ = reachable(); }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "main.vl", Platform::default());
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("is exported, but")),
+        "an uncurated module exposes nothing: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b318_an_exported_type_in_an_exported_signature_is_silent() {
+    // The control that says the check is about the BIT: mark `Hidden` and the
+    // warning goes, with nothing else changed.
+    let files = &[
+        (
+            "a.vl",
+            "export struct Hidden {\n\tx: i32,\n}\n\nexport fun returns(): Hidden { Hidden { x = 1 } }\n",
+        ),
+        (
+            "main.vl",
+            "import pkg::a::returns;\n\nfun main() { let _ = returns().x; }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "main.vl", Platform::default());
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("is exported, but")),
+        "an exported type in an exported signature is silent: {warnings:#?}"
+    );
+}
+
+#[test]
+fn b318_a_plain_reach_of_a_private_item_warns_and_the_marker_silences_it() {
+    // §5 / R1: the warning that makes the default flip non-breaking. The
+    // program COMPILES — visibility never gates access — and the message names
+    // the marked spelling, which is the one-character edit the quickfix makes.
+    const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+    let plain = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        plain.iter().any(|warning| warning
+            == "`pkg::a::hidden` is not exported by `pkg::a`. Importing it anyway is allowed \
+                — mark the reach: `import pkg::a::{ #hidden };`"),
+        "the plain reach warns: {plain:#?}"
+    );
+    // Marked: silent. This is the whole point of paying for `#`.
+    let marked = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::{ #hidden };\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(marked.is_empty(), "a marked reach is silent: {marked:#?}");
+    // Exported: silent, marked or not — except that a marker on an exported
+    // item says something that is not true, and gets its own warning.
+    let exported = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::shown;\n\nfun main() { let _ = shown(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        exported.is_empty(),
+        "an exported item is silent: {exported:#?}"
+    );
+    let redundant = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a::{ #shown };\n\nfun main() { let _ = shown(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        redundant.iter().any(|warning| warning
+            == "`pkg::a` exports `shown`, so the reach marker is redundant — delete the `#`"),
+        "a redundant marker warns: {redundant:#?}"
+    );
+    // `export *;` silences a module wholesale, which is what the codemod writes.
+    let wide = analyze_package_warnings(
+        &[
+            ("a.vl", "export *;\n\nfun hidden(): i32 { 2 }\n"),
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(wide.is_empty(), "`export *;` silences a module: {wide:#?}");
+    // `export(in mod)` holds ONE item back under it.
+    let narrowed = analyze_package_warnings(
+        &[
+            (
+                "a.vl",
+                "export *;\n\nexport(in mod) fun hidden(): i32 { 2 }\n",
+            ),
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() { let _ = hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        narrowed
+            .iter()
+            .any(|warning| warning.contains("is not exported by")),
+        "`export(in mod)` hides one item under `export *;`: {narrowed:#?}"
+    );
+    // An ENTRY's own items are imported by nothing, so nothing warns (§10 m):
+    // the flip must not make an application's entry noisy.
+    let entry = analyze_package_warnings(
+        &[(
+            "main.vl",
+            "fun helper(): i32 { 1 }\n\nfun main() { let _ = helper(); }\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(entry.is_empty(), "an entry is never noisy: {entry:#?}");
+    // And a DEPENDENCY's private item is no diagnostic at all (RULED): std's
+    // items are unmarked, and reaching one is silent at any release.
+    let dependency = analyze_package_warnings(
+        &[(
+            "main.vl",
+            "import std::json::JsonValue;\n\nfun main() { let _: Option<JsonValue> = None; }\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        dependency.is_empty(),
+        "a dependency's private item is never a diagnostic: {dependency:#?}"
+    );
+}
+
+#[test]
+fn b318_a_qualified_reach_of_a_private_item_warns_too() {
+    // §5's other door: `import pkg::a;` then `a::hidden()` reaches a private
+    // item with no LEAF to mark, so the message steers to the marked import
+    // instead of to a one-character insertion. Measured at 19 sites in the whole
+    // estate, so it is narrow — and it is the half a leaf-only warning would
+    // leave silently open.
+    const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+    let qualified = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a;\n\nfun main() { let _ = a::hidden(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        qualified.iter().any(|warning| warning
+            == "`pkg::a::hidden` is not exported by `pkg::a`, and this path reaches it through \
+                the module. The spelling that says so is a marked import: \
+                `import pkg::a::{ #hidden };`, and then `hidden` on its own"),
+        "a qualified reach warns: {qualified:#?}"
+    );
+    // The exported sibling, reached the same way, is silent.
+    let exported = analyze_package_warnings(
+        &[
+            ("a.vl", MODULE),
+            (
+                "main.vl",
+                "import pkg::a;\n\nfun main() { let _ = a::shown(); }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        exported.is_empty(),
+        "an exported item is silent: {exported:#?}"
+    );
+}
+/// The P7 module set, with `app.vl`'s body supplied per case.
+fn p7_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a.vl",
+            "struct Thing { x: i32 }\n\nimpl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "x.vl",
+            "import pkg::a::Thing;\n\nimpl Thing {\n\tfun bump(self): i32 { self.x + 1 }\n}\n"
+                .to_string(),
+        ),
+        ("x/y.vl", "fun y_helper(): i32 { 8 }\n".to_string()),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_p7(app: &str) -> Vec<String> {
+    let owned = p7_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// P7, unchanged: an intermediate module's `impl` arrives with an import that
+/// reaches something under it, and the call compiles. The control the paper
+/// records (P7b — drop the `y_helper` import) is the "has no method" arm.
+#[test]
+fn b318_p7s_exhibit_is_admitted_by_a_plain_import() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x::y::y_helper;\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "P7's exhibit should compile unchanged: {diagnostics:?}"
+    );
+}
+
+/// The same program with `only` on the statement that loaded `x.vl`: the names
+/// still arrive (`y_helper` resolves), and the implementation does not. The
+/// refusal names the module and the fix.
+#[test]
+fn b318_only_declines_the_impls_along_the_path() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x::y::y_helper only;\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "expected exactly the admission refusal: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics[0].contains("'bump' is provided by an `impl` in module `x`")
+            && diagnostics[0].contains("imports that module `only`"),
+        "unexpected message: {}",
+        diagnostics[0]
+    );
+}
+
+/// `only` subtracts implementations, not NAMES: the same file's own leaf still
+/// binds, which is the half that makes the modifier usable at all.
+#[test]
+fn b318_only_still_binds_the_statements_names() {
+    let diagnostics =
+        analyze_p7("import pkg::x::y::y_helper only;\n\nfun main() {\n\tlet _ = y_helper();\n}\n");
+    assert!(
+        diagnostics.is_empty(),
+        "`only` dropped a name it should have bound: {diagnostics:?}"
+    );
+}
+
+/// A selector on the statement that carries the block admits it again — the
+/// exhibit `only` refused, spelled back in.
+#[test]
+fn b318_a_selector_readmits_what_only_declined() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x::{ y::y_helper, (impl Thing) };\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "the selector should admit `x.vl`'s block: {diagnostics:?}"
+    );
+}
+
+/// The generic exhibit: one module with a block per element type. A file that
+/// selects `(impl Boxed<i32>)` gets the `i32` block and NOT the `str` one —
+/// B318's open (b), answered at the receiver's type through
+/// `impl_select::subject_applies`.
+fn boxed_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "item.vl",
+            "struct Boxed<T> { value: T }\n\n\
+             impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Boxed;\n\n\
+             impl Boxed<i32> {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+             impl Boxed<str> {\n\tfun tag(self): i32 { 2 }\n\tfun other(self): i32 { 3 }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_boxed(app: &str) -> Vec<String> {
+    let owned = boxed_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// `(impl Boxed<i32>)` serves a `Boxed<i32>` receiver and refuses a
+/// `Boxed<str>` one in the SAME file.
+#[test]
+fn b318_a_concrete_selector_serves_its_own_type_only() {
+    let served = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+    );
+    assert!(served.is_empty(), "the i32 block should serve: {served:?}");
+    let refused = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(\"a\").tag();\n}\n",
+    );
+    assert!(
+        refused.iter().any(|message| message
+            .contains("'tag' is provided by an `impl` in module `ext`")
+            && message.contains("`(impl Boxed<i32>)` does not admit it")),
+        "the str block should not be admitted: {refused:?}"
+    );
+}
+
+/// `_` is the placeholder: `(impl Boxed<_>)` admits every block whatever its
+/// argument, so both receivers are served in one file. Against a CONCRETE block
+/// it is the backward unification that reaches — a constructor-headed subject
+/// does not match a hole the other way round.
+#[test]
+fn b318_the_placeholder_selector_serves_every_argument() {
+    let diagnostics = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<_>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag() + Boxed::make(\"a\").tag();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`(impl Boxed<_>)` should admit both blocks: {diagnostics:?}"
+    );
+}
+
+/// `(impl _)` is the whole-module impls-only form: every block the module
+/// declares, and no name — the file still has to import `Boxed` itself.
+#[test]
+fn b318_the_whole_module_selector_admits_every_block() {
+    let diagnostics = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag() + Boxed::make(\"a\").other();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`(impl _)` should admit every block: {diagnostics:?}"
+    );
+}
+
+/// A METHOD selector takes one member into the type's namespace for this file
+/// and leaves the block's others out.
+#[test]
+fn b318_a_method_selector_takes_only_the_member_it_names() {
+    let taken = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<str>)::tag };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(\"a\").tag();\n}\n",
+    );
+    assert!(taken.is_empty(), "`tag` was selected: {taken:?}");
+    let left = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<str>)::tag };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(\"a\").other();\n}\n",
+    );
+    assert!(
+        left.iter()
+            .any(|message| message.contains("'other' is provided by an `impl`")),
+        "`other` was not selected and should be refused: {left:?}"
+    );
+}
+
+/// RULED: `impl PATH` resolves in the IMPORTER's scope. An alias the file bound
+/// itself is a legal subject, and so is the qualified spelling — which is what
+/// makes selector resolution a SECOND pass over the file's import list
+/// (`visibility.md` §3.6).
+#[test]
+fn b318_a_selector_resolves_in_the_importers_scope() {
+    let aliased = analyze_boxed(
+        "import pkg::item::Boxed as B;\nimport pkg::ext::{ (impl B<i32>) };\n\n\
+         fun main() {\n\tlet _ = B::make(1).tag();\n}\n",
+    );
+    assert!(
+        aliased.is_empty(),
+        "`impl B<i32>` should reach the alias this file bound: {aliased:?}"
+    );
+    let qualified = analyze_boxed(
+        "import pkg::item;\nimport pkg::item::Boxed;\nimport pkg::ext::{ (impl item::Boxed<i32>) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+    );
+    assert!(
+        qualified.is_empty(),
+        "the qualified subject should resolve: {qualified:?}"
+    );
+}
+
+/// The union rule: a module a file ALSO reaches through a statement that
+/// claimed nothing keeps today's meaning. `only` on a deeper path does not
+/// silently strip the blocks of a module the file imported plainly.
+#[test]
+fn b318_a_plain_import_of_the_same_module_lifts_the_restriction() {
+    let diagnostics = analyze_p7(
+        "import pkg::a::Thing;\nimport pkg::x;\nimport pkg::x::y::y_helper only;\n\n\
+         fun main() {\n\tlet _ = Thing::make().bump() + y_helper();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "the plain `import pkg::x;` should keep `x.vl`'s block: {diagnostics:?}"
+    );
+}
+
+/// B318 S4 — a statement whose whole payload is a selector WALKS its path.
+///
+/// `resolve_import` gained a `bind` flag for this: the walk resolves the
+/// module, records each segment's reference and stops one line short of
+/// binding a name. Before it, such a statement was never walked at all and the
+/// admission pass matched the selector's segments against `canonical_sources`
+/// as a file path — a host-dependent string comparison (the Order 35 seal fix
+/// 9b22ec36 is the exhibit) that also guessed between two packages of the same
+/// shape. The nested path is what the guess could not see: the module is
+/// `deep/ext.vl`, and only a walk knows the statement reached it through
+/// `deep`.
+#[test]
+fn b318_a_selector_only_statement_walks_a_nested_path() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "item.vl",
+                "export struct Boxed<T> { value: T }\n\n\
+                 export impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+            ),
+            (
+                "deep/ext.vl",
+                "import pkg::item::Boxed;\n\n\
+                 export impl Boxed<i32> {\n\tfun tag(self): i32 { 1 }\n}\n",
+            ),
+            (
+                "app.vl",
+                "import pkg::item::Boxed;\nimport pkg::deep::ext::{ (impl Boxed<i32>) };\n\n\
+                 fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "a selector under a nested path should admit its block: {diagnostics:?}"
+    );
+}
+
+/// The same walk's other half: a selector naming a module that does not exist
+/// is REFUSED, by the ordinary import miss. The file-name lookup it replaces
+/// was silent — it answered `None` and the statement claimed nothing.
+#[test]
+fn b318_a_selector_only_statement_refuses_a_module_that_is_not_there() {
+    let diagnostics = analyze_package(
+        &[
+            ("item.vl", "export struct Boxed<T> { value: T }\n"),
+            (
+                "app.vl",
+                "import pkg::item::Boxed;\nimport pkg::nowhere::{ (impl Boxed<i32>) };\n\n\
+                 fun main() {}\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|message| message.contains("cannot find 'nowhere' in the imported path")),
+        "the selector's own path should be walked and reported: {diagnostics:?}"
+    );
+}
+
+/// Writes `files` into a fresh temp package, analyzes `entry` against it and
+/// then TRANSFORMS the program — the only way to observe a decision
+/// `impl_select::select_member` makes at MONOMORPHIZATION, which is emission's
+/// and not analysis's (B318 §3.5). Returns the emitted JavaScript, or the first
+/// failure's message.
+fn transform_package(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Result<String, String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_tx_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let program = match program {
+        Some(program) if errors.is_empty() => program,
+        _ => {
+            return Err(errors
+                .into_iter()
+                .map(|error| error.msg)
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
+    };
+    vilan_core::transform(&program, &vilan_core::options::BuildOptions::default())
+        .map_err(|error| error.msg)
+}
+
+/// N124's package: an exported `Box`, two traits each carrying a DEFAULT
+/// `describe` (`One` answers "one", `Two` answers "two"), one exported
+/// `impl Box with ..` per trait in modules of their own, and an entry whose
+/// import of `p1` is written per case. Every module is one line so `cargo fmt`
+/// cannot leave an indent inside it (AGENTS.md, N123).
+fn inherited_default_files(p1_import: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("b.vl", "export struct Box { n: i32 }\n".to_string()),
+        (
+            "t.vl",
+            "export trait One {\n\tfun describe(self): str { \"one\" }\n}\n\nexport trait Two {\n\tfun describe(self): str { \"two\" }\n}\n".to_string(),
+        ),
+        (
+            "p1.vl",
+            "import pkg::b::Box;\nimport pkg::t::One;\n\nexport impl Box with One {}\n".to_string(),
+        ),
+        (
+            "p2.vl",
+            "import pkg::b::Box;\nimport pkg::t::Two;\n\nexport impl Box with Two {}\n".to_string(),
+        ),
+        (
+            "c.vl",
+            format!("import pkg::b::Box;\n{p1_import}\n\nfun main() {{\n\tlet _ = Box {{ n = 1 }};\n}}\n"),
+        ),
+    ]
+}
+
+/// What N124's pins read off one analyzed package: the entry file, the `Box`
+/// type, and each trait's `describe` default, found by name.
+struct InheritedDefaultProgram {
+    program: vilan_core::analyzer::Program<'static>,
+    entry_file: vilan_core::analyzer::SourceId,
+    box_type: vilan_core::type_::TypeId,
+    one_default: vilan_core::id::Id,
+    two_default: vilan_core::id::Id,
+}
+
+fn analyze_inherited_default_package(p1_import: &str) -> InheritedDefaultProgram {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_n124_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in inherited_default_files(p1_import) {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("c.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+    let program = program.unwrap_or_else(|| panic!("no program: {messages:#?}"));
+    assert!(messages.is_empty(), "{messages:#?}");
+    let main = program
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("the entry's `main`")
+        .id;
+    let entry_file = program.source_of(main).expect("`main` has a file");
+    let box_id = program
+        .structs
+        .values()
+        .find(|declared| declared.name == "Box")
+        .expect("`Box`")
+        .id;
+    let box_type = *program
+        .type_id_to_type_map
+        .iter()
+        .find(|(_, type_)| {
+            matches!(type_, vilan_core::type_::Type::Struct(id, arguments) if *id == box_id && arguments.is_empty())
+        })
+        .expect("`Box` is interned")
+        .0;
+    let default_of = |trait_name: &str| {
+        let trait_id = program
+            .traits
+            .values()
+            .find(|declared| declared.name == trait_name)
+            .unwrap_or_else(|| panic!("trait `{trait_name}`"))
+            .id;
+        vilan_core::mono::trait_default_member(&program, trait_id, "describe")
+            .unwrap_or_else(|| panic!("`{trait_name}::describe` has a default"))
+    };
+    let one_default = default_of("One");
+    let two_default = default_of("Two");
+    InheritedDefaultProgram {
+        program,
+        entry_file,
+        box_type,
+        one_default,
+        two_default,
+    }
+}
+
+/// N124 — F26's impl-ADMISSION parameter on the SHARED inherited-default
+/// lookup (`mono::resolve_inherited_default`, which both emitters call): asked
+/// on behalf of a file whose `only` import DECLINES `p1`'s blocks, `Box`
+/// inherits no `describe` — while the same question asked with no file (the
+/// native emitter's `None`, "every impl in the program") answers `One`'s
+/// default. The control beside it: a plain import of `p1` admits the block and
+/// the file-scoped answer is `One`'s default too.
+///
+/// Red with the parameter planted out of the shared lookup (`resolve_inherited_default`
+/// passing `None` to `applying_trait_ids`): the declined file answers `One`'s
+/// default. NOT red with `None` planted at the JavaScript emitter's call site,
+/// and the pin cannot be made to: the entry that calls `box.describe()` under
+/// the declining import compiles today (the analyzer's default lookup does not
+/// read admission), and when the file-scoped lookup declines, the emitter falls
+/// back to the analyzer's own resolution — the same default — so the emitted
+/// program differs only in the name it gives the function. The two-trait form
+/// the tracker asked for is refused before emission: with `p2` loaded at all,
+/// `box.describe()` is "ambiguous on 'Box'" whatever `c.vl`'s imports admit.
+#[test]
+fn n124_the_shared_inherited_default_lookup_answers_under_the_asking_files_imports() {
+    let declined = analyze_inherited_default_package("import pkg::p1 only;\nimport pkg::p2 only;");
+    assert_eq!(
+        vilan_core::mono::resolve_inherited_default(
+            &declined.program,
+            Some(declined.entry_file),
+            declined.box_type,
+            "describe",
+        ),
+        None,
+        "a file that declines every block inherits no default through them"
+    );
+    let unscoped = vilan_core::mono::resolve_inherited_default(
+        &declined.program,
+        None,
+        declined.box_type,
+        "describe",
+    );
+    assert!(
+        unscoped == Some(declined.one_default) || unscoped == Some(declined.two_default),
+        "with no file, every impl is admitted and a default is inherited: {unscoped:?}"
+    );
+
+    let one_only = analyze_inherited_default_package("import pkg::p1;\nimport pkg::p2 only;");
+    assert_eq!(
+        vilan_core::mono::resolve_inherited_default(
+            &one_only.program,
+            Some(one_only.entry_file),
+            one_only.box_type,
+            "describe",
+        ),
+        Some(one_only.one_default),
+        "the admitted block's trait answers, and the declined one's does not"
+    );
+
+    let two_only = analyze_inherited_default_package("import pkg::p1 only;\nimport pkg::p2;");
+    assert_eq!(
+        vilan_core::mono::resolve_inherited_default(
+            &two_only.program,
+            Some(two_only.entry_file),
+            two_only.box_type,
+            "describe",
+        ),
+        Some(two_only.two_default),
+        "and the other way round: the answer follows the file's imports, not declaration order"
+    );
+}
+
+/// The §3.5 exhibit's modules, with `a.vl`'s and the entry's selector supplied
+/// per case. A generic body in `a.vl` calls `value.tag()` through a bound; the
+/// two blocks that answer it live in `ext.vl`, one per element type.
+fn monomorphization_files(a_selector: &str, entry_selector: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("t.vl", "export trait Tagged {\n\tfun tag(self): i32;\n}\n".to_string()),
+        (
+            "item.vl",
+            "export struct Boxed<T> { value: T }\n\n\
+             export impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n\
+             export impl Boxed<i32> with Tagged {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+             export impl Boxed<str> with Tagged {\n\tfun tag(self): i32 { 2 }\n}\n"
+                .to_string(),
+        ),
+        (
+            "a.vl",
+            format!(
+                "import pkg::t::Tagged;\nimport pkg::item::Boxed;\nimport pkg::ext::{{ (impl {a_selector}) }};\n\n\
+                 export fun label<type T: Tagged>(value: T): i32 {{ value.tag() }}\n"
+            ),
+        ),
+        (
+            "c.vl",
+            format!(
+                "import pkg::a::label;\nimport pkg::item::Boxed;\nimport pkg::ext::{{ (impl {entry_selector}) }};\n\n\
+                 fun main() {{\n\tlet _ = label(Boxed::make(\"a\"));\n}}\n"
+            ),
+        ),
+    ]
+}
+
+fn transform_monomorphization(a_selector: &str, entry_selector: &str) -> Result<String, String> {
+    let owned = monomorphization_files(a_selector, entry_selector);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    transform_package(&files, "c.vl", Platform::default())
+}
+
+/// B318 S4, `visibility.md` §3.5 — **the file a monomorphized body resolves
+/// under is the file the body was DECLARED in, not the file that instantiated
+/// it.** THE PIN THAT FAILS IF ANYONE IMPLEMENTS "the instantiating file's
+/// set".
+///
+/// `a.vl` admits only `ext.vl`'s `Boxed<i32>` block; the entry admits only its
+/// `Boxed<str>` block and instantiates `a.vl`'s generic `label` at
+/// `Boxed<str>`. Under the declaring file's set the body finds no `tag` it may
+/// take and emission refuses; under the instantiating file's set it would
+/// quietly emit `ext.vl`'s `str` block — one source text meaning two different
+/// things in two callers, which is `prelude.md` §7's rule ("a consumer cannot
+/// change what a dependency's source means") read backwards.
+#[test]
+fn b318_a_monomorphized_body_resolves_under_the_file_that_declared_it() {
+    let refused = transform_monomorphization("Boxed<i32>", "Boxed<str>")
+        .expect_err("the entry's own selector must not answer `a.vl`'s body");
+    assert!(
+        refused.contains("'tag' is provided by an `impl` in module `ext`")
+            && refused.contains("module `a` does not admit it")
+            && refused.contains("resolves under the file it was DECLARED in"),
+        "the refusal should name the member, the declaring module and the rule: {refused}"
+    );
+    // The control, one character apart: widen `a.vl`'s own selector and the
+    // same instantiation emits. Nothing about the entry changed.
+    let emitted = transform_monomorphization("Boxed<_>", "Boxed<str>")
+        .expect("`a.vl` admitting both blocks resolves its own body");
+    assert!(
+        emitted.contains("function"),
+        "expected an emitted program: {emitted}"
+    );
+}
+
+/// B279's consumer list, re-asserted under B318 S4's file filter.
+///
+/// `candidates_of` is NAME-keyed and program-wide — the over-approximation
+/// whose consumers B279 swept — and S4 gives it a FILE. Two claims hold the
+/// change honest, and they are the two directions a mistake could go.
+///
+/// **It narrows only where a file said so.** A file that wrote neither `only`
+/// nor a selector gets the list it always got, byte for byte, which is what
+/// makes the slice additive over an estate that writes neither.
+///
+/// **Where a file did say so, it narrows and does not widen.** The restricting
+/// file's list is a SUBSET of the program-wide one: the filter can only
+/// subtract, so every consumer that reads an edge as a DEMAND or as a REFUSAL
+/// keeps its direction — the candidate it loses is one that file cannot reach.
+#[test]
+fn b279_the_file_filter_narrows_the_candidate_list_and_never_widens_it() {
+    use vilan_core::dispatch_refine::candidates_of;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_b279_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = [
+        ("t.vl", "export trait Tagged {\n\tfun tag(self): i32;\n}\n"),
+        (
+            "item.vl",
+            "export struct Boxed<T> { value: T }\n\n\
+             export impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n\
+             export impl Boxed<i32> with Tagged {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+             export impl Boxed<str> with Tagged {\n\tfun tag(self): i32 { 2 }\n}\n",
+        ),
+        (
+            "open.vl",
+            "import pkg::t::Tagged;\nimport pkg::item::Boxed;\nimport pkg::ext;\n\n\
+             export fun open_label<type T: Tagged>(value: T): i32 { value.tag() }\n",
+        ),
+        (
+            "narrow.vl",
+            "import pkg::t::Tagged;\nimport pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>) };\n\n\
+             export fun narrow_label<type T: Tagged>(value: T): i32 { value.tag() }\n",
+        ),
+        (
+            "app.vl",
+            "import pkg::open::open_label;\nimport pkg::narrow::narrow_label;\nimport pkg::item::Boxed;\n\n\
+             fun main() {\n\tlet _ = open_label(Boxed::make(1)) + narrow_label(Boxed::make(1));\n}\n",
+        ),
+    ];
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let program = program.expect("the package analyzes");
+    assert!(errors.is_empty(), "the exhibit should be clean: {errors:?}");
+
+    // The two files, found by the function each one declares.
+    let file_of = |name: &str| {
+        let (id, _) = program
+            .functions
+            .iter()
+            .find(|(_, function)| function.name == name)
+            .expect("the function is declared");
+        program.source_of(*id).expect("it has a file")
+    };
+    let program_wide = candidates_of(&program, None, "tag");
+    assert_eq!(
+        program_wide.len(),
+        2,
+        "the name-keyed list should hold both of `ext.vl`'s overrides"
+    );
+    assert_eq!(
+        candidates_of(&program, Some(file_of("open_label")), "tag"),
+        program_wide,
+        "a file that restricts nothing must get the list it always got"
+    );
+    let narrowed = candidates_of(&program, Some(file_of("narrow_label")), "tag");
+    assert_eq!(
+        narrowed.len(),
+        1,
+        "the selector admits one of the two blocks: {narrowed:?}"
+    );
+    assert!(
+        narrowed.iter().all(|id| program_wide.contains(id)),
+        "the filter must SUBTRACT: {narrowed:?} vs {program_wide:?}"
+    );
+}
+
+/// The P8 module set — two modules each declaring `impl Thing { fun tag }` —
+/// with the entry's body supplied per case.
+fn p8_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a.vl",
+            "export struct Thing { x: i32 }\n\n\
+             export impl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "x.vl",
+            "import pkg::a::Thing;\n\nexport impl Thing {\n\tfun tag(self): i32 { 1 }\n}\n"
+                .to_string(),
+        ),
+        (
+            "z.vl",
+            "import pkg::a::Thing;\n\nexport impl Thing {\n\tfun tag(self): i32 { 2 }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_p8(app: &str) -> Vec<String> {
+    let owned = p8_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// B318 S4, `visibility.md` §3.2 — P8's pair is refused at the SECOND IMPORT of
+/// the file that takes both, with the selector named as the fix.
+///
+/// It used to be refused at the second DECLARATION, which made two independent
+/// packages that each extend one type mutually uninstallable: neither module is
+/// wrong, and neither author can see the other's. The refusal belongs where the
+/// fix is spellable.
+#[test]
+fn b318_p8s_pair_is_refused_at_the_second_import() {
+    let diagnostics = analyze_p8(
+        "import pkg::a::Thing;\nimport pkg::x;\nimport pkg::z;\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag();\n}\n",
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'tag' is already defined for 'Thing' by module 'x'")
+            && message.contains("which this file also imports; a file may take only one")
+            && message
+                .contains("Select one — `import z::{ (impl Thing)::tag };` — or drop an import")),
+        "expected the import-site refusal naming the selector: {diagnostics:?}"
+    );
+}
+
+/// Each module imported ALONE is clean — the property the declaration-site rule
+/// could not have, since it saw whatever the program happened to load.
+#[test]
+fn b318_each_colliding_module_imported_alone_is_clean() {
+    for module in ["x", "z"] {
+        let diagnostics = analyze_p8(&format!(
+            "import pkg::a::Thing;\nimport pkg::{module};\n\n\
+             fun main() {{\n\tlet _ = Thing::make().tag();\n}}\n"
+        ));
+        assert!(
+            diagnostics.is_empty(),
+            "`{module}` alone should be clean: {diagnostics:?}"
+        );
+    }
+}
+
+/// And a SELECTOR resolves the pair in the file that wants both modules: the
+/// file takes `z`'s names and only `x`'s implementation.
+#[test]
+fn b318_a_selector_resolves_the_imported_pair() {
+    let diagnostics = analyze_p8(
+        "import pkg::a::Thing;\nimport pkg::x;\nimport pkg::z only;\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`only` on one of the two should resolve the pair: {diagnostics:?}"
+    );
+}
+
+/// The same-module case STAYS at the declaration (`visibility.md` §10 (i)): no
+/// import can separate two blocks of one file, so there is nothing an import
+/// site could say.
+#[test]
+fn b318_two_blocks_of_one_module_are_still_refused_at_the_declaration() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "a.vl",
+                "export struct Thing { x: i32 }\n\n\
+                 export impl Thing {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+                 export impl Thing {\n\tfun tag(self): i32 { 2 }\n}\n",
+            ),
+            ("app.vl", "import pkg::a::Thing;\n\nfun main() {}\n"),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.iter().any(
+            |message| message.contains("'tag' is already defined for 'Thing'")
+                && message.contains("remove or rename this one")
+        ),
+        "one module declaring a name twice is still a declaration-site error: {diagnostics:?}"
+    );
+}
+
+/// The B74 geometry under the import-site rule: the file declares one block
+/// ITSELF and imports the other. There is one import, so that is where the
+/// refusal sits — and the note points at the declaration the file wrote, which
+/// is the sentence the duplicate family has always shown.
+#[test]
+fn b318_a_files_own_block_colliding_with_an_imported_one_is_refused_at_the_import() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "shape.vl",
+                "export struct Bag { n: i32 }\n\nexport impl Bag {\n\tfun new(): Bag { Bag { n = 1 } }\n}\n",
+            ),
+            (
+                "app.vl",
+                "import pkg::shape::Bag;\n\nimpl Bag {\n\tfun new(): Bag { Bag { n = 2 } }\n}\n\n\
+                 fun main() { let _ = Bag::new(); }\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'new' is already defined for 'Bag' by module 'shape'")
+            && message.contains("`import shape::{ (impl Bag)::new };`")),
+        "expected the import-site refusal naming `shape`: {diagnostics:?}"
+    );
+}
+
+/// The `export impl` exhibit: a CURATED module (it exports its struct) whose
+/// extension block carries no marker, and a consumer that reaches it plainly,
+/// with `#(impl T)`, or not at all. The subject lives in its own module so the
+/// consumer can name the type without naming the extension.
+fn export_impl_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "item.vl",
+            "export struct Thing { x: i32 }\n\n\
+             export impl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Thing;\n\nexport fun anchor(): i32 { 0 }\n\n\
+             impl Thing {\n\tfun tag(self): i32 { self.x + 1 }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_export_impl(app: &str) -> Vec<String> {
+    let owned = export_impl_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// B318 S4, RULED 2026-09-13 — `export` on an `impl` means what it means on
+/// every other declaration: a block a consumer cannot SEE contributes NO
+/// methods to it. `ext.vl` is curated (it exports `anchor`) and its block is
+/// not marked, so a file that imports `ext` plainly gets the name and not the
+/// implementation.
+#[test]
+fn b318_an_unexported_impl_is_hidden_from_a_consumer_that_did_not_reach_it() {
+    let diagnostics = analyze_export_impl(
+        "import pkg::item::Thing;\nimport pkg::ext::anchor;\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'tag' is provided by an `impl` in module `ext` that `ext` does not export")
+            && message.contains("`import ext::{ #(impl Thing) };`")),
+        "an unexported block should contribute no methods: {diagnostics:?}"
+    );
+}
+
+/// And `#(impl T)` is the reach — the only one (`#` on the impl selector, built
+/// at the `at_impl_selector` seam on `Token::Hash`).
+#[test]
+fn b318_the_marked_selector_admits_an_unexported_impl() {
+    let diagnostics = analyze_export_impl(
+        "import pkg::item::Thing;\nimport pkg::ext::{ anchor, #(impl Thing) };\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`#(impl Thing)` should admit the block: {diagnostics:?}"
+    );
+}
+
+/// An UNMARKED selector is not a reach: it says which of the blocks a file can
+/// see it takes, and an invisible block is not one of them.
+#[test]
+fn b318_an_unmarked_selector_does_not_reach_an_unexported_impl() {
+    let diagnostics = analyze_export_impl(
+        "import pkg::item::Thing;\nimport pkg::ext::{ anchor, (impl Thing) };\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'tag' is provided by an `impl` in module `ext` that `ext` does not export")),
+        "an unmarked selector should not reach past the export gate: {diagnostics:?}"
+    );
+}
+
+/// The uncurated-module exemption, UNCHANGED (`visibility.md` §14): a module
+/// with no marker at all offers everything, so the estate — which has not
+/// curated — loses nothing. Same program, `ext.vl` with its `export` removed.
+#[test]
+fn b318_an_uncurated_module_still_offers_every_impl() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "item.vl",
+                "export struct Thing { x: i32 }\n\n\
+                 export impl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n",
+            ),
+            (
+                "ext.vl",
+                "import pkg::item::Thing;\n\nfun anchor(): i32 { 0 }\n\n\
+                 impl Thing {\n\tfun tag(self): i32 { self.x + 1 }\n}\n",
+            ),
+            (
+                "app.vl",
+                "import pkg::item::Thing;\nimport pkg::ext::anchor;\n\n\
+                 fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "an uncurated module offers everything: {diagnostics:?}"
+    );
+}
+
+/// E178 — the `Program` surface vilan-ide's fourth completion consumer reads,
+/// held to `module_importables`' answer.
+///
+/// `auto_import_completions` runs OUTSIDE `owned_modules::collecting()`, so
+/// asking `module_importables` there parses every open buffer into the
+/// process-global cache once per keystroke. The analyzer has already decided
+/// this while walking, and `Program::exported_entities` / `curated_modules`
+/// carry the decision instead. The pin is the AGREEMENT: for a curated module
+/// and an uncurated one, the predicate the two fields spell —
+/// `exported_entities.contains(id) || !curated_modules.contains(scope)` —
+/// answers what the row's own bit says.
+#[test]
+fn e178_the_program_visibility_fields_agree_with_module_importables() {
+    use vilan_core::analyzer::module_importables;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_e178_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = [
+        (
+            "curated.vl",
+            "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        ),
+        ("wide.vl", "export *;\n\nfun opened(): i32 { 3 }\n"),
+        ("plain.vl", "fun offered(): i32 { 4 }\n"),
+        (
+            "app.vl",
+            "import pkg::curated::shown;\nimport pkg::wide::opened;\nimport pkg::plain::offered;\n\n\
+             fun main() {\n\tlet _ = shown() + opened() + offered();\n}\n",
+        ),
+    ];
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, _errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let program = program.expect("the package analyzes");
+
+    // Asked the way `AutoImportOrder::build` asks it: walk each module's BODY
+    // SCOPE, which is the handle that consumer already holds, and read the name
+    // out of it.
+    let offered = |module_name: &str, name: &str| -> bool {
+        let (_, module) = program
+            .modules
+            .iter()
+            .find(|(_, module)| module.name == module_name)
+            .unwrap_or_else(|| panic!("no module {module_name}"));
+        let scope = program
+            .scopes
+            .get(&module.body.1)
+            .unwrap_or_else(|| panic!("no scope for {module_name}"));
+        let id = scope
+            .name_to_id_map
+            .get(name)
+            .unwrap_or_else(|| panic!("no `{name}` in {module_name}"));
+        program.exported_entities.contains(id) || !program.curated_modules.contains(&module.body.1)
+    };
+    for (module, name, expected) in [
+        ("curated", "shown", true),
+        ("curated", "hidden", false),
+        ("wide", "opened", true),
+        ("plain", "offered", true),
+    ] {
+        let rows = module_importables(&dir.join(format!("{module}.vl")));
+        let row = rows
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"));
+        let by_source =
+            row.exported.is_exported() || !vilan_core::analyzer::module_is_curated(&rows);
+        assert_eq!(
+            by_source, expected,
+            "`module_importables` should offer `{name}`: {expected}"
+        );
+        assert_eq!(
+            offered(module, name),
+            expected,
+            "`Program`'s answer for `{name}` must match `module_importables`'"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B330's pair across two modules, with `app.vl`'s import list supplied per
+/// case: two blankets over one trait, bounded differently, each declaring
+/// `peek`, and a receiver that satisfies both.
+fn b330_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "base.vl",
+            "import std::debug::Debug;\n\n\
+             export trait Read<T> {\n\tfun get(self): T;\n}\n\n\
+             export trait Tagged {\n\tfun tag(self): str;\n}\n\n\
+             export struct Cell<T> { value: T }\n\n\
+             export impl Cell<type T> with Read<T> {\n\tfun get(self): T { self.value }\n}\n\n\
+             export struct Both { n: i32 }\n\n\
+             export impl Both with Tagged {\n\tfun tag(self): str { \"both\" }\n}\n\n\
+             export impl Both with Debug {\n\tfun debug(self): str { \"Both\" }\n}\n"
+                .to_string(),
+        ),
+        (
+            "debugside.vl",
+            "import std::debug::Debug;\nimport pkg::base::Read;\n\n\
+             export impl type S: Read<type I: Debug> {\n\tfun peek(self): str { \"debug side\" }\n}\n"
+                .to_string(),
+        ),
+        (
+            "tagside.vl",
+            "import pkg::base::{ Read, Tagged };\n\n\
+             export impl type O: Read<type J: Tagged> {\n\tfun peek(self): str { \"tagged side\" }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_b330(app: &str) -> Vec<String> {
+    let owned = b330_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// B330 across modules, under B318 S4's filter: the file that imports BOTH
+/// blankets is refused at the call, with the SELECTOR named as the fix — and
+/// the file that took one of them is clean, because choosing is the fix.
+#[test]
+fn b330_the_cross_module_pair_is_refused_under_the_filter_with_the_selector_named() {
+    let both = analyze_b330(
+        "import std::debug::Debug;\nimport pkg::base::{ Cell, Both };\n\
+         import pkg::debugside;\nimport pkg::tagside;\n\n\
+         fun main() {\n\tlet cell: Cell<Both> = Cell { value = Both { n = 1 } };\n\
+         \tlet _ = cell.peek();\n}\n",
+    );
+    assert!(
+        both.iter().any(|message| message
+            .contains("this receiver satisfies the bounds of TWO blanket `impl` blocks")
+            && message.contains("select one at the import — `import")
+            && message.contains(")::peek };`")),
+        "expected the call-site refusal naming the selector: {both:?}"
+    );
+    let chosen = analyze_b330(
+        "import std::debug::Debug;\nimport pkg::base::{ Cell, Both };\n\
+         import pkg::debugside;\nimport pkg::tagside only;\n\n\
+         fun main() {\n\tlet cell: Cell<Both> = Cell { value = Both { n = 1 } };\n\
+         \tlet _ = cell.peek();\n}\n",
+    );
+    assert!(
+        chosen.is_empty(),
+        "a file that took one of the two has already chosen: {chosen:?}"
+    );
+}
+
+/// B338 — a selector that admits NO implementation is a row at the IMPORT.
+///
+/// `import a::{ (impl Nothing) }` is almost certainly a typo, and it used to be
+/// silent: the mistake surfaced later, as the admission refusal at the first
+/// call that wanted the block, in a message about a member rather than about
+/// the selector that dropped it.
+#[test]
+fn b338_a_selector_that_admits_no_impl_is_a_row_at_the_import() {
+    let missed = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl i32) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1);\n}\n",
+    );
+    assert!(
+        missed.iter().any(|message| message
+            .contains("no `impl` this statement carries has a subject `i32` admits")
+            && message.contains("`(impl _)` admits every block they declare")),
+        "a selector admitting nothing should be reported at the import: {missed:?}"
+    );
+    // The `(impl _)` control: the whole-module form admits every block the
+    // statement carries, so it never earns this row.
+    let control = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+    );
+    assert!(control.is_empty(), "`(impl _)` admits: {control:?}");
+}
+
+/// The other shape: the subject reaches a block, and the `::` tail names a
+/// member that block does not declare.
+#[test]
+fn b338_a_method_selector_naming_no_member_is_reported_too() {
+    let missed = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>)::nowhere };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1);\n}\n",
+    );
+    assert!(
+        missed.iter().any(|message| message
+            .contains("no `impl Boxed<i32>` this statement carries declares `nowhere`")),
+        "a method selector naming nothing should be reported: {missed:?}"
+    );
+}
+
+/// B336 — `export(in <general PATH>)` is ENFORCED.
+///
+/// S1 shipped the form parsing, storing, formatting and reprinting, and
+/// ADMITTING: `mod` and `pkg` are answerable from the walk, a general path is a
+/// question about file PATHS, and those live on `Program`. The two arms the
+/// item names: reached from `pkg::b` it warns, reached from `pkg::a::c` it is
+/// silent.
+#[test]
+fn b336_a_general_export_scope_narrows_to_its_own_subtree() {
+    let files = &[
+        ("a/thing.vl", "export(in pkg::a) fun inside(): i32 { 1 }\n"),
+        (
+            "a/c.vl",
+            "import pkg::a::thing::inside;\n\nexport fun near(): i32 { inside() }\n",
+        ),
+        (
+            "b.vl",
+            "import pkg::a::thing::inside;\n\nexport fun far(): i32 { inside() }\n",
+        ),
+        (
+            "app.vl",
+            "import pkg::a::c::near;\nimport pkg::b::far;\n\nfun main() { let _ = near() + far(); }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "app.vl", Platform::default());
+    let scoped: Vec<&String> = warnings
+        .iter()
+        .filter(|message| message.contains("is exported only into `pkg::a`"))
+        .collect();
+    assert_eq!(
+        scoped.len(),
+        1,
+        "exactly the outside reach should warn: {warnings:?}"
+    );
+    assert!(
+        scoped[0].contains("`pkg::a::thing::inside` is exported only into `pkg::a`")
+            && scoped[0].contains("this file is outside it"),
+        "unexpected wording: {}",
+        scoped[0]
+    );
+}
+
+/// B335 — `source_of` on a module that owns BOTH a file and a directory answers
+/// the module's own file, not the importer's.
+///
+/// `x.vl` beside `x/y.vl` is legal (the flat file is `x`'s body; the directory
+/// holds its children), and the loader reaches `x` twice: once as the parent
+/// NAMESPACE of `x::y`, which mints an entity with a one-id range attributed to
+/// the entry because a namespace has no file, and once as a real body, which
+/// adopted that entity and pushed a SECOND range for the same id. `source_of`
+/// takes the first range containing an id, so it kept answering the entry — and
+/// `import_module_is_used` (E168/E169) asks exactly that, which is why Organize
+/// Imports was probably wrong for such a module.
+#[test]
+fn b335_a_module_owning_a_file_and_a_directory_reports_its_own_file() {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_b335_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in [
+        ("x.vl", "export fun body(): i32 { 1 }\n"),
+        ("x/y.vl", "export fun child(): i32 { 2 }\n"),
+        (
+            "app.vl",
+            "import pkg::x;\nimport pkg::x::y;\n\nfun main() { let _ = x::body() + y::child(); }\n",
+        ),
+    ] {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let program = program.expect("the package analyzes");
+    assert!(errors.is_empty(), "the exhibit should be clean: {errors:?}");
+
+    let (module_id, _) = program
+        .modules
+        .iter()
+        .find(|(_, module)| module.name == "x")
+        .expect("`x` is a module");
+    let source = program
+        .source_of(*module_id)
+        .expect("the module entity has a file");
+    let path = &program.sources[source.0 as usize];
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("x.vl"),
+        "`source_of` on `x` should answer `x.vl`, not the importer: {path:?}"
+    );
+    // And the ranges stay disjoint, which is what keeps `source_lookup` on its
+    // binary search rather than M27's linear scan.
+    let mut ranges: Vec<(u32, u32)> = program
+        .source_ranges
+        .iter()
+        .map(|range| (range.start, range.end))
+        .collect();
+    ranges.sort();
+    assert!(
+        ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+        "a duplicate one-id range would demote `source_lookup`"
+    );
+}
+
+/// The process CPU this process has burned, in milliseconds — every thread's,
+/// summed, read off `/proc/self/stat`'s `utime`/`stime` (fields 14 and 15).
+///
+/// Wall is not an instrument on this tree's box: the number below is taken
+/// beside other lanes and the load average swings by an order of magnitude
+/// between runs. `None` where the file is not there (every non-Linux host), and
+/// the measurement that reads it then DECLINES rather than reporting a wall
+/// number wearing a CPU label (M15). The same reader `base_cache.rs` carries,
+/// for the same reason; the two test binaries share no code.
+#[cfg(target_os = "linux")]
+fn process_cpu_ms() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    // `sysconf(_SC_CLK_TCK)` is 100 on every Linux this runs on; the value is
+    // fixed in the kernel ABI (USER_HZ), not a tunable.
+    Some((utime + stime) as f64 * 10.0)
+}
+
+#[cfg(target_os = "linux")]
+fn loadavg_1m() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// M75's subject: two modules extending one type, `members` inherent members
+/// each — the same names when `colliding`, disjoint ones when not — and an
+/// entry carrying `statements` further import statements that have nothing to
+/// do with either. The two legs differ in NOTHING else: same files, same
+/// statement count, same impl count, same member count, so the CPU between
+/// them is what a banked collision costs.
+#[cfg(target_os = "linux")]
+fn m75_files(colliding: bool, members: usize, statements: usize) -> Vec<(String, String)> {
+    let block = |prefix: &str| {
+        let mut body = String::from("import pkg::a::Thing;\n\nexport impl Thing {\n");
+        for index in 0..members {
+            body.push_str(&format!("\tfun {prefix}{index}(self): i32 {{ {index} }}\n"));
+        }
+        body.push_str("}\n");
+        body
+    };
+    let mut filler = String::new();
+    for index in 0..statements {
+        filler.push_str(&format!("export fun v{index}(): i32 {{ {index} }}\n"));
+    }
+    let mut app = String::from("import pkg::a::Thing;\nimport pkg::x;\nimport pkg::z;\n");
+    for index in 0..statements {
+        app.push_str(&format!("import pkg::filler::v{index};\n"));
+    }
+    app.push_str("\nfun main() {\n\tlet _thing = Thing { x = 1 };\n}\n");
+    vec![
+        (
+            "a.vl".to_string(),
+            "export struct Thing { x: i32 }\n".to_string(),
+        ),
+        ("x.vl".to_string(), block("tag")),
+        (
+            "z.vl".to_string(),
+            block(if colliding { "tag" } else { "zag" }),
+        ),
+        ("filler.vl".to_string(), filler),
+        ("app.vl".to_string(), app),
+    ]
+}
+
+/// Analyzes one [`m75_files`] package TWICE from a stable directory and returns
+/// the CPU of the second analysis, which is a base-cache hit — so the std
+/// closure's own load is out of the number and what is left is the package and
+/// its checks.
+#[cfg(target_os = "linux")]
+fn m75_cpu_ms(
+    label: &str,
+    colliding: bool,
+    members: usize,
+    statements: usize,
+) -> Option<(f64, usize)> {
+    let directory = scratch::root().join(format!(
+        "vilan_m75_{label}_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("package dir");
+    for (relative, contents) in m75_files(colliding, members, statements) {
+        std::fs::write(directory.join(relative), contents).expect("write module");
+    }
+    let entry_path = directory.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).expect("read entry");
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let spec = std_spec();
+    let analyze = || {
+        analyze_source(
+            leaked,
+            &spec,
+            &directory,
+            &entry_path,
+            Some(Platform::default()),
+            &Workspace::default(),
+        )
+    };
+    let (_program, first) = analyze();
+    let banked = first
+        .iter()
+        .filter(|error| error.msg.contains("is already defined for 'Thing'"))
+        .count();
+    assert_eq!(
+        banked > 0,
+        colliding,
+        "the {label} leg must{} refuse: {banked} collision diagnostics",
+        if colliding { "" } else { " not" }
+    );
+    let before = process_cpu_ms();
+    let _ = analyze();
+    let cpu = before.zip(process_cpu_ms()).map(|(a, b)| b - a);
+    // M77: the row count beside the clock. The analysis above ran on THIS
+    // thread, so the thread-local census is this analysis's.
+    let carried = vilan_core::analyzer::carried_rows_census();
+    let _ = std::fs::remove_dir_all(&directory);
+    cpu.map(|cpu| (cpu, carried))
+}
+
+/// **M75 — what a two-package collision costs must not follow the importing
+/// file's STATEMENT COUNT.**
+///
+/// `refuse_imported_member_collisions` answers two questions per (collision,
+/// file) pair: which import statement carried each block, and whether this
+/// file's namespace admits each member. Both used to be linear scans — the
+/// first over `carried`, which holds one row per import statement in the WHOLE
+/// program, the second over `program.implementations` — so the refusal was
+/// O(collisions x files x statements). Nothing on the estate pays it, because
+/// the whole function is gated on a banked collision; the first real
+/// two-package collision in a large program paid all of it.
+///
+/// The bound is a SHAPE, not a budget: the same collision is measured with a
+/// tenth of the statements and with all of them, and the large leg may not
+/// visit materially more rows than the small one — the exact property an index
+/// has and a scan does not.
+///
+/// **What is asserted is the COUNT** (N116). A ratio of two millisecond
+/// readings survives the profile and the load average better than an absolute
+/// figure does, and it does not survive them well enough: the clock here is
+/// `/proc/self/stat`, the whole PROCESS's CPU, and under a parallel lane the
+/// small leg's delta came back negative. The durations are measured and
+/// printed with the load average; the assertions are over `carried`.
+///
+/// **The sizes are larger than the item's 500 statements**, and deliberately:
+/// the scan's cost is the PRODUCT `collisions x files x statements`, and at 50
+/// collisions and 500 statements the whole of it — about 3 million row visits —
+/// sits inside one 10 ms tick of the `/proc` clock, which makes for a printed
+/// line that cannot tell the two implementations apart. 250 colliding members
+/// and 1,500 statements lift it to 650 ms against the index's 60, which is the
+/// gap a reader of the printed row is meant to see.
+// The reader is `/proc/self/stat`, so the pin exists only where that file does
+// (Order 37's seal: the Windows shard has no process CPU clock to read and the
+// bound would be a wall number wearing a CPU label — M15).
+#[cfg(target_os = "linux")]
+#[test]
+fn m75_a_collisions_refusal_does_not_scale_with_the_importers_statement_count() {
+    const MEMBERS: usize = 250;
+    const SMALL: usize = 150;
+    const LARGE: usize = 1500;
+    let load = loadavg_1m();
+
+    let small_clean = m75_cpu_ms("small_clean", false, MEMBERS, SMALL);
+    let small_collide = m75_cpu_ms("small_collide", true, MEMBERS, SMALL);
+    let large_clean = m75_cpu_ms("large_clean", false, MEMBERS, LARGE);
+    let large_collide = m75_cpu_ms("large_collide", true, MEMBERS, LARGE);
+
+    let (Some(small_clean), Some(small_collide), Some(large_clean), Some(large_collide)) =
+        (small_clean, small_collide, large_clean, large_collide)
+    else {
+        panic!(
+            "no process CPU clock on this host (no /proc/self/stat), so this \
+             bound would be a wall number wearing a CPU label (M15)"
+        );
+    };
+    let (small_clean, small_carried_clean) = small_clean;
+    let (small_collide, small_carried) = small_collide;
+    let (large_clean, large_carried_clean) = large_clean;
+    let (large_collide, large_carried) = large_collide;
+    let small_delta = small_collide - small_clean;
+    let large_delta = large_collide - large_clean;
+    println!(
+        "M75 profile={} members={MEMBERS} small({SMALL} statements) clean={small_clean:.0} ms \
+         collide={small_collide:.0} ms delta={small_delta:.0} ms · large({LARGE} statements) \
+         clean={large_clean:.0} ms collide={large_collide:.0} ms delta={large_delta:.0} ms \
+         · M77 carried rows small={small_carried} large={large_carried} \
+         (clean legs {small_carried_clean}/{large_carried_clean}) load={load}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    );
+    // **M77's half of the same shape, as a COUNT.** `carried` held one row per
+    // import STATEMENT in the whole program the moment any collision was
+    // banked — the linear pass M75's indexes left behind — and the refusal
+    // reads it for exactly two sources per collision. So the rows that matter
+    // are bounded by the FILES, and never by the statement count: the large
+    // leg has ten times the small leg's statements and must not have ten times
+    // its rows.
+    //
+    // A count and not a clock, deliberately: measured on this tree at these
+    // sizes the pass is ~10 ms of a ~320 ms analysis, which is one tick of the
+    // `/proc` clock above and cannot be told from noise. On a 3,000-statement
+    // entry the same change is 54.5 -> 34.4 ms of banked-collision CPU, which
+    // is a fixture too slow to keep in the suite.
+    assert!(
+        large_carried <= small_carried * 2 + 8,
+        "the collision refusal banked {large_carried} carried rows with {LARGE} import \
+         statements and {small_carried} with {SMALL} — the rows are following the \
+         statement count, which is the pass M77 narrowed to the colliding files"
+    );
+    // Non-vacuity: a leg with no collision banks no rows at all, and the
+    // colliding legs bank some — so the bound above is over a number the pass
+    // actually produces.
+    assert_eq!(
+        (small_carried_clean, large_carried_clean),
+        (0, 0),
+        "a clean leg banks no carried rows: the whole arm is gated on a collision"
+    );
+    assert!(
+        small_carried > 0 && large_carried > 0,
+        "both colliding legs must bank rows ({small_carried}, {large_carried}), or the \
+         bound above is asserted over two zeroes"
+    );
+    // N116: the millisecond half of this pin is GONE, and the counts above are
+    // the whole claim.
+    //
+    // It read `/proc/self/stat` — the whole PROCESS's CPU — and asserted that
+    // the large leg's collision delta did not follow the statement count. Under
+    // `nextest -j 32` that number includes every sibling test thread, so the
+    // small leg's delta came back NEGATIVE (`-10 ms`) often enough to red the
+    // suite for reasons that had nothing to do with the refusal. A bound whose
+    // instrument can return a negative value for the quantity it measures is
+    // not measuring that quantity.
+    //
+    // Nothing is lost that the counts do not already hold. `carried` is the
+    // linear pass M77 narrowed, and it is bounded by the FILES rather than by
+    // the statements — which is the same sentence the milliseconds were trying
+    // to say, asserted over a number the pass produces instead of over the
+    // machine's mood. The durations are still measured and still printed above
+    // with the load average, and they remain the right thing to READ when
+    // somebody suspects this pass: on a quiet box the index answers
+    // small=10 ms / large=60 ms where the scan it replaced answered 80 ms /
+    // 650 ms, and that gap is visible in the printed line.
+}
+
+/// E185 — the S4 refusal names the importing module, and is PLACED.
+///
+/// The sweep saw it sixteen times as "module `that module` does not admit it".
+/// The importing body there was `[derive(..)]`-synthesized — every `Wire`
+/// visitor is — and generated code's source id is the sentinel outside
+/// `sources`, so the module lookup fell through to the placeholder and the
+/// refusal carried `0..0` against the entry. The body resolves through
+/// `note_source_of` to the file the derive was WRITTEN in, which is the file
+/// whose import the steer asks the reader to widen, and `Program::anchored`
+/// puts the diagnostic on the attribute that generated the code (E16's rule).
+#[test]
+fn b318_the_admission_refusal_names_the_module_that_did_not_admit() {
+    let files: Vec<(&str, String)> = vec![
+        (
+            "thing.vl",
+            "import std::wire::Wire;\n\nexport *;\n\n[derive(Wire)]\nstruct Point {\n\tx: i32,\n\ty: i32,\n}\n"
+                .to_string(),
+        ),
+        (
+            "w.vl",
+            // `Counter` is exported; its `impl` is NOT, so the export gate
+            // hides the block from every file but this one.
+            "import std::wire::Serialize;\n\nexport struct Counter {\n\tcount: i32,\n}\n\n\
+             impl Counter with Serialize {\n\
+             \tfun begin_struct(&mut self, fields: i32) {}\n\
+             \tfun field(&mut self, name: str) {}\n\
+             \tfun end_struct(&mut self) {}\n\
+             \tfun begin_list(&mut self, length: i32) {}\n\
+             \tfun end_list(&mut self) {}\n\
+             \tfun begin_variant(&mut self, name: str, arity: i32) {}\n\
+             \tfun end_variant(&mut self) {}\n\
+             \tfun null_value(&mut self) {}\n\
+             \tfun some_value(&mut self) {}\n\
+             \tfun str_value(&mut self, value: str) {}\n\
+             \tfun i32_value(&mut self, value: i32) {}\n\
+             \tfun u32_value(&mut self, value: u32) {}\n\
+             \tfun i53_value(&mut self, value: i53) {}\n\
+             \tfun f64_value(&mut self, value: f64) {}\n\
+             \tfun bool_value(&mut self, value: bool) {}\n\
+             }\n"
+                .to_string(),
+        ),
+        (
+            "c.vl",
+            "import std::io::print;\nimport pkg::thing::Point;\nimport pkg::w::Counter;\n\n\
+             fun main() {\n\tmut counter = Counter { count = 0 };\n\
+             \tPoint { x = 1, y = 2 }.describe(&mut counter);\n\tprint(\"done\");\n}\nmain();\n"
+                .to_string(),
+        ),
+    ];
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    let refused = transform_package(&borrowed, "c.vl", Platform::default())
+        .expect_err("`thing.vl`'s derived visitor cannot admit `w.vl`'s hidden impl");
+    assert!(
+        refused.contains("'begin_struct' is provided by an `impl` in module `w`")
+            && refused.contains("module `thing` does not admit it")
+            && refused.contains("Widen `thing`'s own import of `w`"),
+        "the refusal must name the importing module, not a placeholder: {refused}"
+    );
+    assert!(
+        !refused.contains("that module"),
+        "the placeholder is gone: {refused}"
+    );
+}
+
+/// B349's fixture: §3.5's monomorphization exhibit with the call moved to a
+/// MODULE-LEVEL binding — `a.vl` admits only `ext.vl`'s `Boxed<i32>` block, and
+/// the entry instantiates `a.vl`'s generic at `Boxed<str>` from a top-level
+/// `let`, which is the statement position `current_admitting_file` had no
+/// writer for.
+fn module_level_files(a_selector: &str, entry_selector: &str) -> Vec<(&'static str, String)> {
+    let mut files = monomorphization_files(a_selector, entry_selector);
+    files.retain(|(name, _)| *name != "c.vl");
+    files.push((
+        "c.vl",
+        format!(
+            concat!(
+                "import pkg::a::label;\nimport pkg::item::Boxed;\n",
+                "import pkg::ext::{{ (impl {entry_selector}) }};\n\n",
+                "let top = label(Boxed::make(\"a\"));\n\n",
+                "fun main() {{\n\tlet _ = top;\n}}\n",
+            ),
+            entry_selector = entry_selector
+        ),
+    ));
+    files
+}
+
+fn transform_module_level(a_selector: &str, entry_selector: &str) -> Result<String, String> {
+    let owned = module_level_files(a_selector, entry_selector);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    transform_package(&files, "c.vl", Platform::default())
+}
+
+/// **B349 — a MODULE-LEVEL body resolves under a file, and §3.5's rule reaches
+/// it.** The transformer's `current_admitting_file` had exactly one writer,
+/// `enter_instance`, which is a FUNCTION-body seam: a top-level initializer
+/// walked under `None`, and `None` means "no file restricts anything". It was
+/// harmless in the estate — a module binding sits in the file that declares it,
+/// and that file admits its own blocks — so this pin is the WALL rather than a
+/// program that changed: it says a module-level call through a
+/// selector-restricted import is refused, exactly as the same call inside
+/// `main` is.
+#[test]
+fn b349_a_module_level_initializer_obeys_the_declaring_files_selector() {
+    let refused = transform_module_level("Boxed<i32>", "Boxed<str>")
+        .expect_err("a module-level call must not escape `a.vl`'s own selector");
+    assert!(
+        refused.contains("'tag' is provided by an `impl` in module `ext`")
+            && refused.contains("module `a` does not admit it"),
+        "the refusal should name the member and the declaring module: {refused}"
+    );
+    // The control, one selector wider: `a.vl` admitting both blocks emits the
+    // same module-level binding.
+    let emitted = transform_module_level("Boxed<_>", "Boxed<str>")
+        .expect("`a.vl` admitting both blocks resolves its own body");
+    assert!(
+        emitted.contains("function"),
+        "expected an emitted program: {emitted}"
+    );
+}
+
+/// The `#(impl ..)` fixture B350's pins run on: `ext.vl` provides `tag` for
+/// `Boxed<i32>`, `exported` or not per case, and `marker` makes the module
+/// CURATED so a plain `impl` really is hidden.
+fn marked_selector_files(block_export: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "t.vl",
+            "export trait Tagged {\n\tfun tag(self): i32;\n}\n".to_string(),
+        ),
+        (
+            "item.vl",
+            concat!(
+                "export struct Boxed<T> { value: T }\n\n",
+                "export impl Boxed<type T> {\n",
+                "\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+            )
+            .to_string(),
+        ),
+        (
+            "ext.vl",
+            format!(
+                concat!(
+                    "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n",
+                    "export fun marker(): i32 {{ 0 }}\n\n",
+                    "{block_export}impl Boxed<i32> with Tagged {{\n",
+                    "\tfun tag(self): i32 {{ 1 }}\n}}\n",
+                ),
+                block_export = block_export
+            ),
+        ),
+    ]
+}
+
+fn marked_selector_warnings(block_export: &str, marker: &str) -> Vec<String> {
+    let mut owned = marked_selector_files(block_export);
+    owned.push((
+        "c.vl",
+        format!(
+            concat!(
+                "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n",
+                "import pkg::ext::{{ {marker}(impl Boxed<i32>) }};\n\n",
+                "fun main() {{\n\tlet _ = Boxed::make(3).tag();\n}}\n",
+            ),
+            marker = marker
+        ),
+    ));
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package_warnings(&files, "c.vl", Platform::default())
+}
+
+/// **B350 — the `#` on a selector whose blocks the module EXPORTS is
+/// redundant.** The impl twin of §9 S2's leaf warning, and the symmetry B318
+/// §14/§15 left open: a marker says "this block is hidden from me and I am
+/// taking it anyway", and on an exported block that is a statement about the
+/// author's belief that is not true. A warning, not a refusal — the import
+/// means the same thing either way — and the fix is to delete a character, so
+/// the message ends in the same sentence the leaf twin ends in and the editor's
+/// "Delete the `#`" arm reads it unchanged.
+#[test]
+fn b350_a_marker_on_an_exported_impl_block_warns() {
+    let redundant = marked_selector_warnings("export ", "#");
+    assert!(
+        redundant.iter().any(|warning| warning
+            == "every `impl Boxed<i32>` in `ext` is exported, so the reach marker is \
+                redundant — delete the `#`"),
+        "a marker on an exported block warns: {redundant:#?}"
+    );
+}
+
+/// B350's two controls, which are what make the warning mean something: the
+/// marker on a genuinely HIDDEN block is silent (it is doing its job), and an
+/// unmarked selector over an exported block is silent too (there is nothing to
+/// delete).
+#[test]
+fn b350_a_marker_on_a_hidden_block_and_a_bare_selector_stay_silent() {
+    let hidden = marked_selector_warnings("", "#");
+    assert!(
+        !hidden
+            .iter()
+            .any(|warning| warning.contains("reach marker is redundant")),
+        "a marker that reaches a hidden block is silent: {hidden:#?}"
+    );
+    let bare = marked_selector_warnings("export ", "");
+    assert!(
+        !bare
+            .iter()
+            .any(|warning| warning.contains("reach marker is redundant")),
+        "an unmarked selector has no marker to delete: {bare:#?}"
+    );
+}
+
+/// B354's three files, with `thing.vl`'s own reach marker supplied per case: an
+/// exported `Counter` plus a NON-exported `impl Counter with Serialize` in
+/// `w.vl`, a `[derive(Wire)]` struct in `thing.vl`, and the entry serializing
+/// through the counter. `Thing`'s one field is a `thing.vl`-local type with a
+/// hand-written `Wire` impl, so every generic body the derive reaches is
+/// declared in `thing.vl` and this asks about `thing.vl`'s set and nothing
+/// else.
+fn derive_admission_files(thing_selector: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "w.vl",
+            "import std::shared::Shared;\nimport std::wire::Serialize;\n\n\
+             export struct Counter { fields: Shared<i32> }\n\n\
+             export impl Counter {\n\
+             \tfun new(): Counter { Counter { fields = Shared::new(0) } }\n\n\
+             \tfun count(self): i32 { self.fields.read() }\n}\n\n\
+             impl Counter with Serialize {\n\
+             \tfun begin_struct(&mut self, fields: i32) { self.fields.write() = self.fields.read() + fields; }\n\
+             \tfun field(&mut self, name: str) {}\n\
+             \tfun end_struct(&mut self) {}\n\
+             \tfun begin_list(&mut self, length: i32) {}\n\
+             \tfun end_list(&mut self) {}\n\
+             \tfun begin_variant(&mut self, name: str, arity: i32) {}\n\
+             \tfun end_variant(&mut self) {}\n\
+             \tfun null_value(&mut self) {}\n\
+             \tfun some_value(&mut self) {}\n\
+             \tfun str_value(&mut self, value: str) {}\n\
+             \tfun i32_value(&mut self, value: i32) {}\n\
+             \tfun u32_value(&mut self, value: u32) {}\n\
+             \tfun i53_value(&mut self, value: i53) {}\n\
+             \tfun f64_value(&mut self, value: f64) {}\n\
+             \tfun bool_value(&mut self, value: bool) {}\n}\n"
+                .to_string(),
+        ),
+        (
+            "thing.vl",
+            format!(
+                "import std::wire::{{ Deserialize, Serialize, Wire }};\n\
+                 import pkg::w::{{ Counter{thing_selector} }};\n\n\
+                 export *;\n\n\
+                 struct Leaf {{ n: i32 }}\n\n\
+                 impl Leaf with Wire {{\n\
+                 \tfun describe<S: Serialize>(self, serializer: &mut S) {{ serializer.i32_value(self.n); }}\n\n\
+                 \tfun rebuild<D: Deserialize>(deserializer: &mut D): Leaf {{ Leaf {{ n = deserializer.i32_value() }} }}\n}}\n\n\
+                 [derive(Wire)]\n\
+                 struct Thing {{ leaf: Leaf }}\n"
+            ),
+        ),
+        (
+            "c.vl",
+            "import std::io::print;\nimport pkg::thing::{ Leaf, Thing };\nimport pkg::w::Counter;\n\n\
+             fun main() {\n\
+             \tmut counter = Counter::new();\n\
+             \tlet thing = Thing { leaf = Leaf { n = 7 } };\n\
+             \tthing.describe(&mut counter);\n\
+             \tprint(counter.count());\n}\n"
+                .to_string(),
+        ),
+    ]
+}
+
+fn transform_derive_admission(thing_selector: &str) -> Result<String, String> {
+    let owned = derive_admission_files(thing_selector);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    transform_package(&files, "c.vl", Platform::default())
+}
+
+/// B354 — **a `[derive(..)]`-SYNTHESIZED body's admitting file is the file the
+/// ATTRIBUTE was written in.** THE PIN THAT FAILS IF ANYONE RESTORES THE
+/// SENTINEL: `source_of` answers `DERIVED_SOURCE` for generated code, and that
+/// sentinel is not a file any import can reach — it declares nothing and it has
+/// reached nothing with `#` — so B318 S4's export gate turned down every
+/// non-exported `impl` in the program for every derived visitor. That is why
+/// E185's placeholder fired sixteen times at Order 36's sweep merge, and the
+/// refusal's own advice was unfollowable: it said "widen `thing`'s own import
+/// of `w`", and `thing.vl` writing `#(impl _)` changed nothing, because
+/// `thing.vl`'s set was not the set being consulted.
+#[test]
+fn b354_a_derived_body_resolves_under_the_file_that_carries_the_derive() {
+    let emitted = transform_derive_admission(", #(impl _)")
+        .expect("`thing.vl`'s own reach marker must answer its derived body");
+    assert!(
+        emitted.contains("function"),
+        "expected an emitted program: {emitted}"
+    );
+}
+
+/// The control, and what keeps the pin above from being "the gate is off for
+/// derived code": drop `thing.vl`'s marker and the same program is refused,
+/// naming the member, the providing module and the deriving one — the gate
+/// still applies to a derived body, it just applies the RIGHT file's set.
+#[test]
+fn b354_a_derived_body_is_still_refused_when_its_own_file_cannot_reach_the_impl() {
+    let refused = transform_derive_admission("")
+        .expect_err("`thing.vl` reaching nothing must not answer its derived body");
+    assert!(
+        refused.contains("'begin_struct' is provided by an `impl` in module `w`")
+            && refused.contains("module `thing` does not admit it"),
+        "the refusal should name the member, the providing module and the deriving one: {refused}"
     );
 }

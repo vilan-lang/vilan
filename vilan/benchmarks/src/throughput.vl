@@ -6,10 +6,10 @@
 import std::binary::binary_codec;
 import std::http::{ Response, Server };
 import std::io::panic;
+import std::io::print;
 import std::json::{ Json, json_codec };
 import std::option::Option::{ None, Some };
-import std::io::print;
-import std::result::Result::{ Err, Ok, self };
+import std::result::Result::{ self, Err, Ok };
 import std::rpc::{
 	Dispatcher,
 	HttpTransport,
@@ -30,6 +30,8 @@ import std::shared::Shared;
 import std::time::now_millis;
 import std::wire::{ Codec, Serializer };
 import pkg::report::{ rate, round, section };
+
+export *;
 
 fun add_protocol(codec: Codec): RpcProtocol {
 	let total: Shared<i32> = Shared::new(0);
@@ -54,7 +56,7 @@ fun drive<T: Transport>(transport: T, codec: Codec, calls: i32): f64 {
 	for index < calls {
 		let one = 1;
 		let outcome: Result<i32, RpcError> = call(transport, codec, "add", [
-			|s: Serializer| one.describe(s),
+			|mut s: Serializer| one.describe(&mut s),
 		]);
 		match outcome {
 			Ok(let value) => {},
@@ -114,7 +116,10 @@ fun run(finished: || void) {
 						.with_service(Service::new(add_protocol(json_codec()))
 							.on_connect(|id, end| {})
 							.on_disconnect(|id| {}))
-						.on_request(|request| Response::builder().code(404).body("benchmark").build())
+						.on_request(|request| Response::builder()
+							.code(404)
+							.body("benchmark")
+							.build())
 						.on_start(|server| {
 							let ws_port = server.port();
 							print(i"[port] {ws_port}");

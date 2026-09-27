@@ -52,17 +52,72 @@
 //! `resource`-misplaced steer). Ugly-but-reproduced behaviours are recorded for
 //! the S4/S5 error-quality pass, not fixed. The differential is the referee.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 use crate::lexing;
 use crate::node::{
-    BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration, CssItem, CssNested,
-    CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExternBinding, Func,
-    GenericArguments, GenericParameter, GenericParameters, If, ImportBranch, MatchLeg, Node,
-    NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
+    ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
+    CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExportScope,
+    Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
+    ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels, Labels, MatchLeg, Node,
+    NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
+
+/// Every `(impl …)` selector element's span in an import/use tree — what the
+/// `use` refusal reports at.
+fn collect_branch_selectors(branch: &ImportBranch<'_>, into: &mut Vec<Span>) {
+    match branch {
+        ImportBranch::Path(_, _, ImportTail::Continue(child)) => {
+            collect_branch_selectors(child, into)
+        }
+        ImportBranch::Path(..) => {}
+        ImportBranch::Set(branches) => {
+            for child in branches {
+                collect_branch_selectors(child, into);
+            }
+        }
+        ImportBranch::Selector(selector) => into.push(selector.span),
+        ImportBranch::Reach(_, inner) => collect_branch_selectors(inner, into),
+    }
+}
+
+/// Every binder inside an impl selector's subject that the selector may not
+/// write (B318, RULED: "no binders are written in a selector"): a NAMED binder
+/// (`type T`) anywhere, and a bare `_` that carries a BOUND. A bound-less `_`
+/// is the placeholder and contributes nothing.
+///
+/// Walks the type grammar's own shapes; anything else (a name, a literal
+/// length) holds no binder and ends the descent.
+fn collect_selector_binders(node: &Spanned<Node<'_>>, into: &mut Vec<Span>) {
+    match &node.0 {
+        Node::TypeBinder((name, _), bounds, _) => {
+            if *name != ANONYMOUS_TYPE_BINDER || !bounds.is_empty() {
+                into.push(node.1);
+            }
+            for bound in bounds {
+                collect_selector_binders(bound, into);
+            }
+        }
+        Node::AccessorWithGenerics(_, arguments) => {
+            for argument in &arguments.0 {
+                collect_selector_binders(argument, into);
+            }
+        }
+        Node::Tuple(items) => {
+            for item in items {
+                collect_selector_binders(item, into);
+            }
+        }
+        Node::ArrayType(element, _) => collect_selector_binders(element, into),
+        Node::Reference(_, inner) | Node::TypeWithContexts(inner, _) => {
+            collect_selector_binders(inner, into)
+        }
+        _ => {}
+    }
+}
 
 /// A parse error value: where it was detected, *what* went wrong (found/expected,
 /// or a curated reason), the production context, and an optional targeted hint.
@@ -163,6 +218,47 @@ enum TerminatorRecovery<'src> {
 /// so a set that mixes it with others still renders.
 const TERMINATOR_EXPECTED: &str = "';'";
 
+/// The expectation an unfinished `::` path records (E135). Spelled as an
+/// expectation rather than as a curated rule because that is exactly what it is
+/// — the path wanted one more name — and the "found X expected …" frame is what
+/// puts the token standing in the name's place into the message.
+const A_NAME_AFTER_PATH_SEPARATOR: &str = "a name after `::`";
+
+/// The expectation a `::` path that crosses a line break records (E142).
+///
+/// E135 fixed the case where NOTHING follows the `::`; it could not fix the
+/// worse one, where the next LINE follows it. `style::` ⏎ `print(..)` is the
+/// perfectly legal path `style::print`, so the parser read the next statement
+/// as the tail of this one and swallowed it, and no diagnostic could exist —
+/// there was no error to report. Only a rule that a path may not cross a line
+/// break turns that into something the parser can see, which is why this is a
+/// rule and not a recovery.
+///
+/// Spelled as an expectation, like its E135 sibling, so the "found X expected
+/// …" frame puts the name standing on the next line into the message; the
+/// steer names both cures, because the reason to write a path over two lines
+/// is that it is long, and a long path is what an alias is for.
+const A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE: &str = "a name after `::` on the same line: a `::` path does not cross a line break, because `a::` \
+     at the end of a line joins whatever the next line starts with — join the line, or import \
+     the path under a shorter name (`import a::b::c as d;`) and write `d`";
+
+/// The rule `fun f(): || void context c` breaks (B343, R9 RULED 2026-09-17).
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself, and
+/// the two ways out are the two things the author can actually have meant.
+///
+/// The clause's POSITION stays where contexts.md §3 put it — after the return
+/// type — and this is the whole cost of keeping it there. A type's own
+/// `context` suffix parses greedily, so an un-parenthesized closure return type
+/// swallows the clause onto its OWN return type, which cannot carry one; the
+/// declaration then means neither of the two things it could have meant. Both
+/// are one parenthesis away, and both are spelled here rather than left to be
+/// guessed at.
+pub const MISBOUND_RETURN_CLAUSE: &str = "a `context` clause after an UN-PARENTHESIZED closure return type binds to the \
+     closure's own return type, which cannot carry one. Parenthesize the closure type to say \
+     which clause you mean: `fun f(): (|| void) context c` declares `c` for the FUNCTION, and \
+     `fun f(): (|| void context d) context c` declares `d` for the closure that is RETURNED \
+     and `c` for the function itself";
+
 /// The rule a program written before the `css` promotion breaks. Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spelling): `css` became a hard keyword with the `css { … }` block
@@ -186,9 +282,54 @@ const CSS_BLOCK_IS_BRACE_INITIAL: &str = "a `css { … }` block is brace-initial
      `(css { … })`";
 
 /// What a `css` block's body admits — the dot rule, spelled for the reader
-/// (proposal/css-block.md §3).
-const CSS_ITEM_EXPECTED: &str =
-    "a declaration (`property: value;`) or a nested rule (`.name { … }`)";
+/// (proposal/css-block.md §3), chain links included (A69).
+const CSS_ITEM_EXPECTED: &str = "a declaration (`property(value);`), a nested rule (`.name { … }`) or a chain link \
+     (`.name();`)";
+
+/// The rule `const mut` breaks (G24). Curated (diagnostics-standard.md B6):
+/// the prohibition explains itself and names both sanctioned spellings.
+///
+/// `const let` and `const fun` are the two compile-time declarations; `const
+/// mut` reads as "a mutable compile-time binding", which is a contradiction —
+/// the value IS the build's, there is no runtime storage for a mutation to
+/// land in, and anything that wanted one wanted a runtime `mut` seeded from a
+/// `const` expression.
+const CONST_HAS_NO_MUTATION: &str = "a compile-time value has no runtime mutation: `const let` binds a value the BUILD \
+     computes, and there is nowhere for a later write to go. Write `const let` for the \
+     compile-time binding, or `mut name = const ..;` for a runtime binding seeded from one";
+
+/// The rule a CSS pseudo-class written CSS-style breaks (tracker E153).
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself and
+/// names the sanctioned spelling.
+///
+/// `:hover { … }` is the single most likely thing for a CSS writer to type
+/// inside a block, and it reported the bare `found ':' expected a declaration
+/// …` — true, and no help at all, because the reader has to guess that the
+/// answer is a DOT. The dotted rule is deliberate: one name-blind form covers
+/// pseudo-classes, breakpoints, `within` and `divide`, so the grammar never
+/// consults a method list. The message says that, and names the fix.
+const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as a DOTTED rule: `.hover { … }`, not `:hover { … }`. \
+     One name-blind form covers pseudo-classes, breakpoints (`.md`), ancestor guards \
+     (`.within(…)`) and `.divide` — so the grammar never consults a method list, and a \
+     method added to `Style` cannot change what a block means";
+
+/// The rule a CSS-SPELLED declaration breaks (A101). Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling.
+///
+/// `property: value;` was the block's declaration form through Order 36 and is
+/// what every CSS author types, so the migration and the newcomer hit the same
+/// token — the `:` where a `(` belongs. A declaration is a CALL now: the
+/// property is the name, the value is its ordinary vilan expression arguments,
+/// and the `{ }` hole is gone because there is no token span left for one to
+/// interrupt.
+/// Public for the same reason [`IMPORTANT_HAS_NO_PLACE`] is: the language
+/// server's quick fix keys on it (E201) — one constant rather than a second
+/// copy to drift from.
+pub const A_CSS_DECLARATION_IS_A_CALL: &str = "a `css` declaration is a CALL: write `padding(space(4));`, not `padding: space(4);`. The \
+     property is the name and its value is ordinary vilan expressions, so a typed value needs \
+     no `{ }` hole — and several arguments join with one space, as CSS's own value lists do \
+     (`margin(px(4), px(8))`)";
 
 /// The rule `!important` breaks inside a `css` block. Curated
 /// (diagnostics-standard.md B6): the prohibition explains itself and names the
@@ -200,6 +341,84 @@ const CSS_ITEM_EXPECTED: &str =
 pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
      declaration on the same property already wins — remove it";
 
+/// The rule `[doc(hidden)]` breaks (B318 §7.5, RULED 2026-09-13). Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling.
+///
+/// The marker's one purpose — "callable, but omitted from editor completion" —
+/// is, word for word, what a PRIVATE item now is, so the two overlap completely
+/// and one of them has to go. It is also the one that never worked: it parsed,
+/// landed on `Function::doc_hidden`, was round-tripped by the formatter, was
+/// pinned callable and was recommended by `appendix/editor.md`, and NOTHING in
+/// `vilan-ide` or `vilan-lsp` ever read it — a promise the tool did not keep,
+/// for as long as it existed.
+const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already \
+     reachable and absent from completion, which is the whole of what this marker meant — delete \
+     it, and write `export` on the names consumers are meant to find. For an item that IS part of \
+     the surface and is dangerous to reach for, `[internal(\"reason\")]` is the other thing this \
+     marker is reached for: it stays exported and callable, and the editor hides it from \
+     completion, dims it and leads its hover with the reason";
+
+/// B415's placement rule: `mod self;` hosts the FILE's own attributes (F27
+/// R1's `[platform(..)]` today), so it leads the file — the one place a reader
+/// looks for what the whole file is. Curated: the rule states itself and names
+/// the move that satisfies it.
+pub const MODULE_SELF_LEADS_THE_FILE: &str = "`mod self;` carries the attributes of the whole file, so it is the file's first statement: \
+     move it above the first import. To fence one function instead, write `[platform(..)]` on \
+     the function";
+
+/// B415's reserved name: `self` is the file's OWN module, the one `mod self;`
+/// declares, so no nested module may take it. Curated: it names the one
+/// legal `self` module and the move.
+pub const MODULE_SELF_IS_RESERVED: &str = "`self` is reserved for the file's own module — `mod self;`, with no body, as the file's \
+     first statement — so a nested module cannot take the name: give it another";
+
+/// B382's rule: a `[deprecated]` steer on an import is about the NAME a
+/// re-export publishes, so it needs the `export`. Curated: it names the move.
+pub const DEPRECATED_IMPORT_IS_A_RE_EXPORT: &str = "`[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes, and this \
+     import is not exported, so it publishes nothing — write `export` before the attribute, or \
+     delete it";
+
+/// The rule `export <expression>;` breaks (B321). Curated
+/// (diagnostics-standard.md B6 — the prohibition explains itself and names the
+/// sanctioned spellings).
+///
+/// [`Parser::parse_export`] takes any STATEMENT, and an expression statement is
+/// one, so `export (helper);` and `export * helper;` (which is `export` of the
+/// deref `*helper`) both compiled clean and published nothing — a form with no
+/// reading, accepted silently. Zero occurrences in the estate.
+const EXPORT_TAKES_AN_ITEM: &str = "`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level \
+     `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for \
+     the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an \
+     expression is none of those, and publishes nothing, checks nothing and emits nothing";
+
+/// The rule a MALFORMED import path breaks (B320). Curated
+/// (diagnostics-standard.md B6 — the prohibition explains itself and names the
+/// sanctioned spelling).
+///
+/// `import` and `use` are keywords, so neither can begin an expression, and the
+/// statement fork that reads them sits at the END of
+/// [`Parser::parse_statement_inner`]: an import whose PATH the grammar could not
+/// read fell through to the expression attempt, whose farthest failure is
+/// recorded on the `import` keyword itself. Every mistyped import in the
+/// language therefore reported `found 'import' expected an expression` at
+/// column 1 of the statement, whatever the typo and however far into the path it
+/// sat (six probe shapes, identical output — `{ (impl T) }`, `::*`, `{ !name }`).
+///
+/// [`Parser::import_path_failure`] records how far the path grammar actually
+/// got, so the rule reports at the token it stopped on. The expression fallback
+/// is untouched for everything that is not import-led.
+const IMPORT_PATH_IS_NAMES_AND_SETS: &str = "an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an \
+     optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins \
+     none of those";
+
+/// REWRITTEN for B318 (§7.4): every sentence of the old text became false on
+/// the day the marker gained meaning. It said "a module's items are importable
+/// as they stand … so the fix is to delete the word", and the fix is not to
+/// delete the word — it is to WRITE the marker vilan does have. This is the
+/// message a Rust or Swift writer meets in their first hour, which makes it the
+/// most user-visible line in the whole feature.
+///
 /// The rule a program written with a Rust/Swift visibility marker breaks.
 /// Curated (diagnostics-standard.md B6 — the prohibition explains itself and
 /// names the sanctioned spelling): `pub` is an ordinary identifier here, so
@@ -212,14 +431,150 @@ pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` b
 /// `public` is the same reflex one synonym over, and it was being refused in a
 /// word its author never wrote (E109's F21). That is the only reason this is a
 /// function where every other curated rule is a constant.
+/// Whether `export` can take this statement (B321): an ITEM, an `import`/`use`,
+/// or another `export`. The attribute wrappers are transparent — they annotate
+/// the item under them and `export [derive(Wire)] struct S { .. }` is the same
+/// declaration — so they are asked about their inner node rather than admitted
+/// blindly.
+///
+/// [`Node::Error`] is admitted: it is the nesting bound's stand-in, already
+/// refused once, and a second message about the same input is the double-report
+/// diagnostics-standard B5 forbids.
+fn export_takes(node: &Node<'_>) -> bool {
+    match node {
+        // G24's `const let` / `const fun` is the same kind of wrapper (N89): it
+        // marks WHEN the declaration under it runs, not what kind of statement
+        // it is, and `export const fun answer(): i32 { 42 }` publishes exactly
+        // the function a bare `const fun` declares. Asked about its inner node
+        // for the attribute wrappers' reason — `const (1 + 1)` is an expression
+        // and is still refused, by the same test one level down.
+        Node::Derive(_, inner)
+        | Node::Service(_, inner)
+        | Node::MacroAttribute(_, _, _, inner)
+        | Node::Const(inner) => export_takes(&inner.0),
+        Node::Func(_)
+        | Node::MacroFun(_)
+        | Node::MacroInvocation(..)
+        | Node::MacroBlock(_)
+        | Node::Struct(..)
+        | Node::Enum(..)
+        | Node::Trait(..)
+        | Node::Impl(..)
+        | Node::Module(..)
+        | Node::Import(..)
+        | Node::Use(_)
+        | Node::Export(..)
+        | Node::ExportAll
+        | Node::ModulePlatform(_)
+        | Node::Let(..)
+        | Node::LetDestructure(..)
+        | Node::Error => true,
+        _ => false,
+    }
+}
+
 fn visibility_marker_rule(marker: &str) -> String {
     format!(
-        "`{marker}` is not a vilan keyword: a module's items are importable as they stand — \
-         `import pkg::util::helper;` reaches `fun helper` with nothing marking it — so the \
-         fix is to delete the word. (`export` exists, but it RE-exports something this \
-         module imported: `export import pkg::io::panic;`.)"
+        "`{marker}` is not a vilan keyword: the marker is `export`, so write \
+         `export fun helper()` — an item a module does not export is the module's own, and \
+         stays reachable to anyone who asks for it deliberately \
+         (`import pkg::util::{{ #helper }};`). (`export` also RE-exports something this module \
+         imported: `export import pkg::io::panic;`.)"
     )
 }
+
+/// The rule an impl selector written OUTSIDE a brace set breaks (B318 S3,
+/// `proposal/visibility.md` §2.5). Curated (diagnostics-standard.md B6): the
+/// prohibition explains itself and names the sanctioned spelling.
+///
+/// The selector is a brace-set ELEMENT and nothing else — it binds no name, so
+/// it has no leaf position to occupy, and `import a::(impl T);` would read as a
+/// statement whose whole payload is a filter. Without this the `(` falls
+/// through both halves of the path grammar and the statement reports at column
+/// one, which is the failure mode §2.5 says a build of this slice must not
+/// reproduce.
+const IMPL_SELECTOR_IS_A_BRACE_ELEMENT: &str = "an `impl` selector is a brace-set ELEMENT, because it selects \
+     implementations rather than binding a name: write `import a::{ (impl T) };`, and put any names \
+     it travels with in the same set — `import a::{ Thing, (impl Thing) };`";
+
+/// The shape an `(impl …)` selector must have (B318 S3). Curated
+/// (diagnostics-standard.md B6): stated at the token the selector stopped on,
+/// so a typo inside one reports where it is rather than at the `import`
+/// keyword (`proposal/visibility.md` §2.5's first pinned grammar fact).
+const IMPL_SELECTOR_SHAPE: &str = "an `impl` selector is `(impl TYPE)`, optionally followed by \
+     `::name` or `::{ a, b }`: `import a::{ (impl List<i32>)::{ first, last } };`. `_` stands for any \
+     type in an argument position (`(impl List<_>)`), and `(impl _)` selects every implementation the \
+     module declares";
+
+/// The rule a binder written inside a selector breaks (B318, RULED
+/// 2026-09-12: "no binders are written in a selector"). Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling, which is the placeholder.
+///
+/// A selector is a FILTER over blocks that are already generic; it introduces
+/// nothing of its own, so a `type T` in one would name a parameter no body can
+/// read, and a bound on `_` would ask for the block whose bound is that one —
+/// a selection with no exhibit, which is why `_` covers the whole design.
+const IMPL_SELECTOR_TAKES_NO_BINDER: &str = "an `impl` selector writes no binders: it filters blocks that \
+     declare their own, so there is nothing for a `type T` to name. Write `_` for a position that may \
+     be any type — `(impl List<_>)` selects every `List` block, whatever its element and whatever \
+     bound it carries";
+
+/// The rule `as` on an impl selector breaks (B318, RULED: "a method selector
+/// refuses `as` — methods are called by name on a receiver"). Curated
+/// (diagnostics-standard.md B6).
+const IMPL_SELECTOR_REFUSES_AS: &str = "an `impl` selector takes no `as`: a method is called by NAME on a \
+     receiver, so renaming one would produce a name nothing can call. `import a::Length::rem` binds a \
+     self-less function as a free name and takes an alias; `import a::{ (impl Length)::rem }` puts the \
+     member in `Length`'s namespace for this file, and that name is the member's own";
+
+/// The rule an `(impl …)` selector inside a `use` breaks (B318 S3). Curated
+/// (diagnostics-standard.md B6): a selector says which of a MODULE's `impl`
+/// blocks this file admits, and a `use` reaches no module — it destructures a
+/// namespace already in scope. The two productions share a brace set, so the
+/// selector parses there and would otherwise do nothing at all, silently.
+const USE_TAKES_NO_IMPL_SELECTOR: &str = "an `impl` selector belongs to `import`: it says which of a \
+     MODULE's implementations this file admits, and a `use` reaches no module — it destructures a \
+     namespace this file already has. Write `import <module>::{ (impl T) };`";
+
+/// The rule `use … only;` breaks (B318 §2.4). Curated
+/// (diagnostics-standard.md B6): `only` subtracts the implementations an
+/// `import` brings, and a `use` never brought any — it destructures a
+/// namespace that is already in scope — so the word would subtract nothing and
+/// read as if it did.
+const USE_TAKES_NO_ONLY: &str = "`only` belongs to `import`: it drops the implementations an import \
+     brings along its path, and a `use` brings none — it destructures a namespace this file already \
+     reaches. Delete the word";
+
+/// The rule a block-like form followed by an operator or a `.` chain breaks
+/// (B248, widened by B259). Curated (diagnostics-standard.md B6): the
+/// prohibition explains itself — a block-like form is COMPLETE — and names the
+/// sanctioned spelling, which is the parentheses B231 already admits the form
+/// inside. One sentence for every position, because the mistake and the fix are
+/// the same in all of them: B259 found the statement head was only where the
+/// refusal FIRED, not where the rule applies.
+const BLOCK_LIKE_STATEMENT_IS_COMPLETE: &str = "a `match`, `if`, `for` or `{` form is COMPLETE at its \
+     closing brace, so the operator or `.` after it does not continue it — in statement position it \
+     begins a new statement instead: parenthesize the block-like form — `(match x { .. }) + 1`, \
+     `(match x { .. }).to_str()` — to use its value as an operand. (The rule is what lets a line \
+     beginning `-x` or `*p` mean subtraction or a dereference by where it sits.)";
+
+/// The rule a block-like form followed by `::` breaks (E157). Its own rule
+/// rather than [`BLOCK_LIKE_STATEMENT_IS_COMPLETE`], because that message's
+/// STEER is a fix for every other continuation and is not one here: `::` is the
+/// only one with no valid spelling at all. `(match x { .. }) + 1` and
+/// `(match x { .. }).to_str()` both parse — B231 admits the form inside
+/// parentheses — and `(match x { .. })::foo` does not, because `::` reaches
+/// into a NAMESPACE and what stands to its left is a name rather than a value.
+/// Offering the parentheses there sent the author to a second parse error.
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself, and
+/// the two ways out are the two things the author can actually have meant.
+const A_PATH_CANNOT_START_AT_A_BLOCK: &str = "`::` reaches into a NAMESPACE — a module, a type or an enum — so what \
+     stands to its left has to be a NAME, and a `match`, `if`, `for` or `{` form is a value: \
+     parentheses do not help here, the way they do for an operator or a `.` chain after one \
+     (`(match x { .. }) + 1`). Write the path on its own if the block-like form ended the \
+     statement before it, or bind the form first — `let value = match x { .. };` — and reach \
+     for the member through the value.";
 
 /// The rule `let mut x = …` breaks. Curated (diagnostics-standard.md B6): `let`
 /// and `mut` are the two BINDING FORMS, not a keyword and a modifier on it, so
@@ -230,6 +585,26 @@ const LET_MUT_IS_ONE_WORD: &str = "a mutable binding is spelled `mut x = …`: `
      not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and \
      writing both is neither";
 
+/// The rule `Some(let mut x)` and `Some(mut let x)` break — [`LET_MUT_IS_ONE_WORD`]'s
+/// twin inside a PATTERN (A80). Curated (diagnostics-standard.md B6): a pattern
+/// binder follows the declaration syntax exactly, so `let` and `mut` are the two
+/// forms there too and the steer is the pattern spelling the author wanted. Its own
+/// constant rather than a second use of the declaration's, because that one's steer
+/// (`mut x = …`, with an initializer) is not a thing you can write in a pattern.
+///
+/// D7: and it names what `Some(mut list)` then MEANS. The author who reaches for
+/// a mutable binder is usually growing a collection inside a `SignalCell::update`
+/// — the shape A80 was filed from — and the binder is a binding, so it takes rule
+/// 1's copy: the spelling the steer offers still leaves the subject alone without
+/// a write-back. Saying "`mut x`" and stopping sends them one step down a path
+/// that ends where they started.
+const PATTERN_BINDER_IS_ONE_WORD: &str = "a pattern binds mutably with `mut x`: `let` and `mut` are the two binding forms \
+     inside a pattern exactly as they are in a declaration, not a keyword and a \
+     modifier — `Some(let list)` binds immutably, `Some(mut list)` binds mutably, and \
+     writing both is neither. A binder is a BINDING, so `Some(mut list)` binds a \
+     copy: to change the subject, assign back through it (`held = Some(list)`) or \
+     use `take`/`replace`";
+
 /// The did-you-mean note for a failure INSIDE an interpolation hole. A `{` in an
 /// `i"…"` opens a hole, so a literal brace has to be escaped — and code that
 /// GENERATES braces (a CSS rule, a JS body, a JSON object) hits this constantly,
@@ -237,11 +612,74 @@ const LET_MUT_IS_ONE_WORD: &str = "a mutable binding is spelled `mut x = …`: `
 const BRACE_IN_AN_ISTRING: &str = "a `{` inside an `i\"…\"` string opens an interpolation hole, so this is being read as \
      an expression — write `\\{` (and `\\}`) for a literal brace";
 
-/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
-/// `resource` modifiers that lead one. An item is never part of an expression, so
+/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external`
+/// modifier that leads one. An item is never part of an expression, so
 /// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
 /// is skipping (a `{` above it excepted: a block or closure body holds ordinary
 /// statements, and a nested `fun` is one of them).
+/// Whether a RETURN type can carry a `context` clause of its own (B309): a
+/// closure type, under the `(..)` grouping the clause's grammar needs and under
+/// an `async` / `sync` marker.
+///
+/// This is the one disambiguation the two clause readings need. `fun f(): i32
+/// context settings` declares what the BODY may read (B242) — `i32` cannot
+/// carry a clause, so nothing is lost by binding it to the function. `fun f():
+/// (|| View) context owner_scope` returns an INJECTED closure, and binding that
+/// clause to the function would quietly mean something else entirely.
+fn return_type_carries_its_own_clause(node: &Node<'_>) -> bool {
+    let grouped = match node {
+        Node::Tuple(elements) if elements.len() == 1 => &elements[0].0,
+        other => other,
+    };
+    matches!(
+        grouped,
+        Node::ClosureType(..) | Node::AsyncType(..) | Node::SyncType(..)
+    )
+}
+
+/// B343 (R9, RULED 2026-09-17) — the ONE shape the "clause after the return
+/// type" position cannot spell, reported instead of mis-bound.
+///
+/// `fun f(): || void context c` has three readings and the grammar takes the
+/// one nobody means: `parse_type` is greedy, so `context c` lands on the
+/// CLOSURE'S OWN return type `void`, which cannot carry a clause at all. The two
+/// readings a writer could have meant are both a parenthesis away — `(|| void)
+/// context c` gives the clause to the FUNCTION, `(|| void context c)` gives it
+/// to the closure that is returned — and contexts.md §3's position (after the
+/// return type) is kept for every other shape, so this is the whole cost of
+/// keeping it.
+///
+/// Takes the clause off as it reports it, so the analyzer does not refuse the
+/// same mistake a second time with its own ("a `context` clause is only
+/// supported on a closure type") — one mistake, one diagnostic, and the rest of
+/// the signature reads exactly as it would have without the clause.
+///
+/// Answers `false` for every legal shape, including the nested one: `fun f(): ||
+/// (|| void) context c` returns a closure that returns an INJECTED closure, and
+/// the clause is that inner closure type's — [`return_type_carries_its_own_
+/// clause`] is the same predicate the peel below uses, so the two readings are
+/// decided in one place.
+fn take_misbound_return_clause(node: &mut Node<'_>) -> bool {
+    let closure = match node {
+        Node::AsyncType(inner) | Node::SyncType(inner) => &mut inner.0,
+        other => other,
+    };
+    let Node::ClosureType(_, Some(returns)) = closure else {
+        return false;
+    };
+    let Node::TypeWithContexts(inner, _) = &returns.0 else {
+        return false;
+    };
+    if return_type_carries_its_own_clause(&inner.0) {
+        return false;
+    }
+    let Node::TypeWithContexts(inner, _) = std::mem::replace(&mut returns.0, Node::Error) else {
+        unreachable!("just matched");
+    };
+    **returns = *inner;
+    true
+}
+
 fn starts_item(token: &Token<'_>) -> bool {
     matches!(
         token,
@@ -256,7 +694,6 @@ fn starts_item(token: &Token<'_>) -> bool {
             | Token::Export
             | Token::Macro
             | Token::External
-            | Token::Resource
     )
 }
 
@@ -275,6 +712,7 @@ fn starts_statement_or_item(token: &Token<'_>) -> bool {
         || matches!(
             token,
             Token::Let
+                | Token::Lazy
                 | Token::Mut
                 | Token::Ret
                 | Token::Jump
@@ -514,6 +952,14 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
+    /// Whether the statement about to be read is the FILE's first (B415): the
+    /// one position `mod self;` — the host of the file's platform — may stand
+    /// in. Set by
+    /// [`Parser::parse_program`] before its first statement and TAKEN by the
+    /// first [`Parser::parse_statement_inner`] that runs — so a statement nested
+    /// inside that first one (a function body's, a `mod`'s) already sees it
+    /// false.
+    file_head: bool,
     /// How many levels of SOURCE NESTING are open, against
     /// [`Parser::NESTING_DEPTH_LIMIT`] (B142) — the parser's own bound, the
     /// companion to the analyzer's `WALK_DEPTH_LIMIT` and `RETURN_DEPTH_LIMIT`.
@@ -536,6 +982,20 @@ struct Parser<'a, 'src> {
     /// same way: how deep the input actually went is a fact about the INPUT, not
     /// a claim by whichever branch happened to be exploring when it got there.
     nesting_refusal: Option<ParseError>,
+    /// How far the `import`/`use` PATH grammar got before it declined (B320) —
+    /// the token index a malformed import reports at.
+    ///
+    /// Held outside `farthest_failure` because the path grammar is built from
+    /// speculative `eat_*` probes rather than committed demands, so it records
+    /// nothing there: `import a::{ (impl T) };` explores to the `(` and notes an
+    /// expectation nowhere, leaving the statement's farthest failure on the
+    /// `import` keyword. Recorded only where the path genuinely FAILS — a
+    /// [`Parser::parse_namespace_path_inner`] with no alternative left, or a
+    /// brace-set element that is not a path — never at an alternative a sibling
+    /// production then reads, so a path that parses records nothing at all.
+    /// Cleared at the head of every `import`/`use`, so one statement's record
+    /// can never be read by the next.
+    import_path_failure: Option<usize>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -648,6 +1108,7 @@ fn extern_binding_from_args<'src>(args: &[ExternArg<'src>]) -> ExternBinding<'sr
 pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "derive",
     "service",
+    "client_service",
     "extern",
     "must_use",
     "rpc",
@@ -656,6 +1117,8 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "expose",
     "platform",
     "deprecated",
+    "internal",
+    "resource",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -758,8 +1221,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             context_stack: Vec::new(),
             preserve_paren_groups,
             in_member_body: false,
+            file_head: false,
             nesting_depth: 0,
             nesting_refusal: None,
+            import_path_failure: None,
         }
     }
 
@@ -1021,6 +1486,124 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.note_expected(TERMINATOR_EXPECTED);
     }
 
+    /// Record that the `import`/`use` path grammar stopped at token `at` (B320),
+    /// keeping the FARTHEST such point — one statement's path is explored
+    /// outside-in, so the deepest stop is the one the reader typed wrong.
+    fn note_import_failure(&mut self, at: usize) {
+        if self
+            .import_path_failure
+            .is_none_or(|recorded| at > recorded)
+        {
+            self.import_path_failure = Some(at);
+        }
+    }
+
+    /// B248/B259: refuse an operator — or a `.` chain — that continues an
+    /// expression the block-like form just parsed has already ENDED, and steer to
+    /// the parentheses that spell what was meant. Called at the four block-bearing
+    /// HEADS of [`Parser::parse_secondary_inner`], so it covers every position a
+    /// block-like form can head an expression from: a statement, a `let`
+    /// initializer, an argument, a `ret` tail.
+    ///
+    /// B231 admitted a block-like form as an OPERAND (`flag && match p() { .. }`),
+    /// where nothing is ambiguous because an operator has already committed the
+    /// position to an expression. As the HEAD it is a different question, and
+    /// vilan answers it the way Rust does: a statement that begins with `match`,
+    /// `if`, `for` or `{` is COMPLETE at its closing brace, so what follows begins
+    /// a new statement. That rule is what makes a leading `-` or `*` on the next
+    /// line mean subtraction or a dereference by where it sits rather than by what
+    /// the parser felt like — and the language already relies on it:
+    /// `if c { 1 } else { 2 }` followed by `* 3;` parses today as two statements,
+    /// and admitting the tower after a block-like head would silently re-read it
+    /// as one.
+    ///
+    /// B248 put the refusal at the STATEMENT fork, which is where the shape was
+    /// found; B259 found the other three positions, where the same source got the
+    /// bare parse error the refusal exists to replace (`let y = match x { .. } + 1;`
+    /// reported "expected `;`" and nothing about why, an argument position
+    /// `found '+' expected ',' or ')'`). The rule is about the FORM, not about the
+    /// statement, so it is now stated once where the form is parsed.
+    ///
+    /// Only an operator that cannot BEGIN an expression is refused. `-`, `!`, `&`
+    /// and `*` can, and the two readings of those are exactly the ambiguity the
+    /// rule exists to settle: they begin a new statement, as they always have. `<`
+    /// and `>` are control characters here rather than operators, and a statement
+    /// CAN begin with `<` (element syntax), so they are outside the set too — as
+    /// are the `(` and `[` postfixes, which lead a parenthesized expression and a
+    /// list literal.
+    ///
+    /// `::` is INSIDE the set and takes a rule of its own (E157,
+    /// [`A_PATH_CANNOT_START_AT_A_BLOCK`]). The shared message's value is its
+    /// STEER, and the steer has to be a fix: `(match x { .. }) + 1` and
+    /// `(match x { .. }).to_str()` both parse, and `(match x { .. })::foo` does
+    /// not — a path reaches into a namespace, so its left side is a name and no
+    /// expression can stand there. Sending the author to parentheses bought
+    /// them a second parse error and nothing else.
+    ///
+    /// `=>` is outside it for a different reason, and it is the one B248 could not
+    /// see from the statement fork: it is a SEPARATOR of the enclosing production,
+    /// not a continuation of this expression. A match GUARD is an expression that
+    /// ends where the arrow begins — `Some(let n) if match n { 0 => false, _ => true }
+    /// => …` is a real shape in the tree — so an arrow after a block-like form is
+    /// the arm's, and taking it would eat the arm.
+    ///
+    /// The RECOVERY consumes what it refused, which is what makes this REPLACE the
+    /// bare failure rather than sit above it: the author gets one diagnostic naming
+    /// the shape instead of two, the second of them about a statement they did not
+    /// know they had written (diagnostics-standard B5). A `.` chain is consumed
+    /// WHOLE — skipping only the `.` would leave `to_str()` as a bare name and
+    /// cascade to "cannot find 'to_str'", a second diagnostic about generated
+    /// nonsense.
+    fn refuse_block_like_continuation(&mut self, no_struct: bool) {
+        let mut refused = false;
+        loop {
+            let operator = match self.peek() {
+                // `::` is an operator token, and the ONE continuation whose
+                // refusal is not this rule's (E157): every other one is steered
+                // to parentheses, and that steer is a FIX for every other one.
+                // A path is not an expression, so there is nothing to
+                // parenthesize and the steer sent the author to a second parse
+                // error. Its own statement, at its own site.
+                Some(Token::Op("::")) => {
+                    if !refused {
+                        self.errors.push(ParseError {
+                            span: self.here_span(),
+                            reason: ParseErrorReason::Rule(A_PATH_CANNOT_START_AT_A_BLOCK),
+                            context: self.context_stack.clone(),
+                            hint: None,
+                        });
+                        refused = true;
+                    }
+                    true
+                }
+                Some(Token::Op(symbol)) if !matches!(*symbol, "!" | "-" | "&" | "*" | "=>") => true,
+                Some(Token::Ctrl('.')) => false,
+                _ => return,
+            };
+            if !refused {
+                self.errors.push(ParseError {
+                    span: self.here_span(),
+                    reason: ParseErrorReason::Rule(BLOCK_LIKE_STATEMENT_IS_COMPLETE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+                refused = true;
+            }
+            if operator {
+                // The operator, then the rest of the tower it opened — attempted,
+                // so a right operand that does not parse leaves the position where
+                // the operator left it rather than half-consumed.
+                self.bump();
+                self.attempt(|parser| parser.parse_operators(no_struct));
+                return;
+            }
+            // Every link of the chain. Each consumes at least its own leading
+            // token, so the loop strictly advances; a following operator is then
+            // taken by the arm above, under the refusal already pushed.
+            while matches!(self.parse_one_postfix(), Some(Some(_))) {}
+        }
+    }
+
     /// Push an `Expected` error for a failure at `position`: the found token, its
     /// curated `expected` set, its production `context`, and the structural
     /// `!=`-soup hint when it applies. Shared by the top-level leftover diagnostic
@@ -1049,6 +1632,25 @@ impl<'a, 'src> Parser<'a, 'src> {
                 } else {
                     CSS_IS_A_KEYWORD
                 }),
+                context,
+                hint: None,
+            });
+            return;
+        }
+        // B320: an `import`/`use` whose PATH the grammar could not read. The
+        // located failure is on the keyword — `import` begins no expression, so
+        // the expression fork notes there and nothing deeper notes at all — and
+        // the keyword is the one token that was right. The rule replaces the
+        // message and reports where the path actually stopped.
+        if matches!(
+            self.tokens.get(position),
+            Some((Token::Import | Token::Use, _))
+        ) && let Some(stopped) = self.import_path_failure
+            && stopped > position
+        {
+            self.errors.push(ParseError {
+                span: self.token_span(stopped),
+                reason: ParseErrorReason::Rule(IMPORT_PATH_IS_NAMES_AND_SETS),
                 context,
                 hint: None,
             });
@@ -1677,6 +2279,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (`editing-dx.md` §2.2 mechanism 3 — the file-tail blackout).
     fn parse_program(&mut self) -> Spanned<NodeList<'src>> {
         let mut statements = Vec::new();
+        self.file_head = true;
         loop {
             if self.at_end() {
                 break;
@@ -1753,6 +2356,28 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_statement`]'s body, past the depth bound.
     fn parse_statement_inner(&mut self) -> Option<Spanned<Node<'src>>> {
+        // B415: only the file's first statement may be its `mod self;` (the
+        // host of F27 R1's platform). Taken here, once, so every statement
+        // nested inside this one reads false.
+        let file_head = std::mem::take(&mut self.file_head);
+        if let Some(item) = self.attempt(Self::parse_module_self) {
+            if !file_head {
+                self.errors.push(ParseError {
+                    span: item.1,
+                    reason: ParseErrorReason::Rule(MODULE_SELF_LEADS_THE_FILE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+            }
+            return Some(item);
+        }
+        // G24's `const let` / `const fun` / `const mut`, ahead of everything:
+        // `const` begins no other statement, and the expression fork below
+        // would otherwise read `const let` as its prefix over a `let`
+        // expression and `const fun` as a missing expression.
+        if let Some(item) = self.attempt(Self::parse_const_declaration) {
+            return Some(item);
+        }
         if let Some(item) = self.attempt(Self::parse_derived_item) {
             return Some(item);
         }
@@ -1774,6 +2399,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(item) = self.attempt(Self::parse_export) {
             return Some(item);
         }
+        if let Some(item) = self.attempt(Self::parse_labelled_let) {
+            return Some(item);
+        }
         // Items 8-11 & 21: `expression ;`, or a block-bearing form
         // (`if`/`for`/`match`/`{ }`) used as a statement — which needs no `;` but
         // must not be the last thing in its block (chumsky's `not_block_end`).
@@ -1782,6 +2410,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             if parser.eat_ctrl(';') {
                 return Some(expression);
             }
+            // A block-bearing form needs no `;` (chumsky's `not_block_end`). Its
+            // own continuation rule is stated where the form is parsed
+            // (`refuse_block_like_continuation`), so by here nothing operator-like
+            // is left for this fork to read.
             if is_block_like(&expression.0) && !parser.peek_is_ctrl('}') {
                 return Some(expression);
             }
@@ -1854,8 +2486,13 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// **What the bound buys.** A finite worst case where there was none, which
     /// is what the stack margins are sized from: measured through the CLI on the
     /// worst plant (5000 nested parentheses), a bounded parse peaks at depth 501
-    /// and **35.2 MiB** unoptimized, ~10 MiB optimized, against no ceiling at all
-    /// before. And because the parser will not descend past this, it cannot
+    /// and **16.24 MiB** unoptimized, 3.93 MiB optimized, against no ceiling at
+    /// all before. (Re-measured for N101 — the record said 35.2 MiB and ~10 MiB,
+    /// 2.2× what `VILAN_DEPTH_STATS` reads at this sha; `deep_nesting.rs`'s
+    /// parse pins carry the method and what is and is not settled about the
+    /// difference. `vilan check` and not `vilan build`: on a plant the bound
+    /// refuses, `build` exits before the instrument reports.) And because the
+    /// parser will not descend past this, it cannot
     /// BUILD a tree deeper than it either — so every later walk over the AST is
     /// bounded by construction rather than by a bound of its own.
     ///
@@ -2041,26 +2678,32 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_secondary`]'s body, past the depth bound.
     fn parse_secondary_inner(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        match self.peek() {
+        let block_like = match self.peek() {
             // A closure literal (`|params| body`, `|| body`) — always tried before
             // the tower, so a leading `||` is never a logical-or (which needs a left
             // operand). Nothing else in the grammar leads with `|`/`||` here.
             Some(Token::Op("|") | Token::Op("||")) => return self.parse_closure(),
-            Some(Token::Ctrl('{')) => return self.parse_block_as_expression(),
-            Some(Token::If) => return self.parse_if(),
-            Some(Token::For) => return self.parse_for(),
-            Some(Token::Match) => return self.parse_match(),
             Some(Token::Jump) => return self.parse_jump(),
-            Some(Token::Let | Token::Mut) => return self.parse_let(),
+            Some(Token::Let | Token::Mut | Token::Lazy) => return self.parse_let(),
             Some(Token::Ret) => return self.parse_return(),
-            _ => {}
-        }
-        // Assignment (an lvalue then `=`/`+=`/…) is tried before the tower; it
-        // backtracks when no assignment operator follows the place.
-        if let Some(assignment) = self.parse_assignment() {
-            return Some(assignment);
-        }
-        self.parse_operators(no_struct)
+            // The four block-bearing heads. They share one rule past their closing
+            // brace — B248/B259's: the form is COMPLETE there, so an operator or a
+            // `.` after it is refused rather than read as a continuation.
+            Some(Token::Ctrl('{')) => self.parse_block_as_expression()?,
+            Some(Token::If) => self.parse_if()?,
+            Some(Token::For) => self.parse_for()?,
+            Some(Token::Match) => self.parse_match()?,
+            _ => {
+                // Assignment (an lvalue then `=`/`+=`/…) is tried before the tower;
+                // it backtracks when no assignment operator follows the place.
+                if let Some(assignment) = self.parse_assignment() {
+                    return Some(assignment);
+                }
+                return self.parse_operators(no_struct);
+            }
+        };
+        self.refuse_block_like_continuation(no_struct);
+        Some(block_like)
     }
 
     /// The operator tower above the postfix/precedence chain: the `is` pattern test,
@@ -2348,6 +2991,29 @@ impl<'a, 'src> Parser<'a, 'src> {
             })?;
             return Some((Node::Dereference(Box::new(inner)), self.span_from(start)));
         }
+        // B231: a BLOCK-LIKE expression as an operand. `match`/`if` are values
+        // everywhere else — an initializer, an argument, a `ret` tail — and the
+        // operator tower was the one position that refused them (`flag && match
+        // probe() { … }` read as `found 'match' expected an expression`), so the
+        // steer was "bind it first" for no reason the grammar could state. Both
+        // are led by a KEYWORD, so admitting them here is unambiguous: the
+        // construct's own braces are its legs/body, and the token after them is
+        // left for whatever wanted it (an enclosing `if`'s block, the next
+        // operator). B224's `Sequence` slot is what makes the lowering uniform —
+        // an operand that lowers to statements no longer loses its
+        // short-circuit.
+        //
+        // A BARE block is admitted in expression mode only. In condition mode
+        // (`no_struct`) a `{` after an operator is the enclosing construct's
+        // body — the same ambiguity `no_struct` already resolves for struct
+        // literals and `css` blocks — so there it stays refused and parentheses
+        // are the spelling.
+        match self.peek() {
+            Some(Token::Match) => return self.parse_match(),
+            Some(Token::If) => return self.parse_if(),
+            Some(Token::Ctrl('{')) if !no_struct => return self.parse_block_as_expression(),
+            _ => {}
+        }
         self.parse_member_accessor(no_struct)
     }
 
@@ -2492,6 +3158,87 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((arguments, self.span_from(start)))
     }
 
+    /// E142: the segment after a `::` must begin on the SAME line as the `::`.
+    /// Call with the separator just consumed; returns `Some(())` when the path
+    /// may continue, and `None` — with
+    /// [`A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE`] noted, so statement
+    /// recovery surfaces it once, located — when a newline sits between the
+    /// separator and the token after it.
+    ///
+    /// The rule lands on the two productions that COMMIT to a separator: the
+    /// expression path here and the `import`/`use` path. E145 extended it to
+    /// the two that PROBE both tokens first — a type path
+    /// ([`Parser::parse_path_type`]) and a struct-literal head
+    /// ([`Parser::parse_struct_initializer`]), through
+    /// [`Parser::peeked_separator_crosses_a_line`]. Neither can swallow a
+    /// following STATEMENT, which is the harm the rule was written for, so
+    /// the extension buys consistency rather than a new save: one rule about
+    /// where a path's next name may sit, not a rule with two exceptions a
+    /// reader has to learn. The census that made it free is E142's — zero
+    /// lines end in `::` across the tree, kolt and the book — and it holds at
+    /// these two positions as well.
+    ///
+    /// The parser is otherwise entirely line-insensitive (`tokens_adjacent` is
+    /// byte adjacency, not line identity), so this reads the source text
+    /// directly: the gap between two tokens is trivia, and a newline in it is
+    /// the whole question.
+    fn separator_crosses_a_line(&self) -> bool {
+        let Some(separator) = self
+            .position
+            .checked_sub(1)
+            .and_then(|at| self.tokens.get(at))
+        else {
+            return false;
+        };
+        let from = separator.1.into_range().end;
+        let to = match self.tokens.get(self.position) {
+            Some((_, span)) => span.into_range().start,
+            None => self.eoi,
+        };
+        self.source
+            .get(from..to)
+            .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// [`Self::separator_crosses_a_line`] for a production that has NOT
+    /// consumed the separator yet (E145): a type path or a struct-literal
+    /// head, which probe the `::` and the name after it before committing to
+    /// either. The separator is therefore at the cursor rather than behind it.
+    ///
+    /// Notes the expectation and answers `true` when that `::` ends its line,
+    /// so the loop stops and leaves the separator exactly where it was — which
+    /// is what those two productions promise their callers, and what lets the
+    /// enclosing statement's recovery report the note once, located.
+    fn peeked_separator_crosses_a_line(&mut self) -> bool {
+        let Some(separator) = self.tokens.get(self.position) else {
+            return false;
+        };
+        let from = separator.1.into_range().end;
+        let to = match self.tokens.get(self.position + 1) {
+            Some((_, span)) => span.into_range().start,
+            None => self.eoi,
+        };
+        let crosses = self
+            .source
+            .get(from..to)
+            .is_some_and(|gap| gap.contains('\n'));
+        if crosses {
+            self.note_expected(A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE);
+        }
+        crosses
+    }
+
+    /// [`Self::separator_crosses_a_line`] as the guard a path continuation
+    /// takes: notes the expectation and declines when the next segment is on
+    /// another line.
+    fn refuse_a_path_crossing_a_line(&mut self) -> Option<()> {
+        if self.separator_crosses_a_line() {
+            self.note_expected(A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE);
+            return None;
+        }
+        Some(())
+    }
+
     /// `head (:: member)*` — a `::` path. The head is a generic static head
     /// (`List<str>::…`) when a `::` follows generics, else the chain head atom.
     fn parse_static_accessor(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
@@ -2505,10 +3252,24 @@ impl<'a, 'src> Parser<'a, 'src> {
             if !self.eat_op("::") {
                 break;
             }
+            // E142: the next segment must start on this line. Declining here
+            // takes the same path the "nothing after the `::`" arm below takes
+            // — cursor rolled back, expectation noted, statement recovery
+            // reporting it once — because the two are one mistake seen from
+            // two sides: a path whose next name is not where a path's next name
+            // can be.
+            if self.separator_crosses_a_line() {
+                self.note_expected(A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE);
+                self.position = save;
+                return None;
+            }
             match self.eat_ident() {
                 Some(member) => {
+                    // No generic arguments: in expression position a `<...>`
+                    // after the member belongs to the CALL that follows, which
+                    // `parse_call`'s fold takes. See `Node::StaticAccessor`.
                     current = (
-                        Node::StaticAccessor(Box::new(current), member),
+                        Node::StaticAccessor(Box::new(current), member, None),
                         self.span_from(start),
                     );
                 }
@@ -2532,8 +3293,32 @@ impl<'a, 'src> Parser<'a, 'src> {
                         current = (Node::Error, self.span_from(start));
                         continue;
                     }
+                    // `style::` with nothing after it — the shape a path is in
+                    // while it is being TYPED. The roll-back alone told the
+                    // reader nothing: `style` became the whole value, the `::`
+                    // was left for whatever came next, and the only diagnostic
+                    // was the enclosing statement's missing `;` anchored on the
+                    // operator — the name that is actually absent never named
+                    // (E135).
+                    //
+                    // NOTING the expectation is what fixes that, and it is all
+                    // that is needed: `farthest_failure` is deliberately not
+                    // rolled back by `attempt`, so the note survives every
+                    // backtrack above this one and the statement recovery
+                    // surfaces it as the located `found '<' expected a name
+                    // after `::``. The arm still DECLINES — it does not hand
+                    // back a `Node::Error` stand-in — because a stand-in leaves
+                    // the cursor on the token after the `::`, where a `<` opening
+                    // the next line reads as a comparison and drags the element
+                    // into an operator soup whose failure lands on the `let`.
+                    // Declining hands the statement to `recover_statement`,
+                    // which reports this note once and resynchronizes.
+                    //
+                    // The cursor rolls back exactly as before, so a caller that
+                    // does not backtrack sees the same position it always did.
+                    self.note_expected(A_NAME_AFTER_PATH_SEPARATOR);
                     self.position = save;
-                    break;
+                    return None;
                 }
             }
         }
@@ -2551,11 +3336,40 @@ impl<'a, 'src> Parser<'a, 'src> {
             if !parser.peek_is_op("::") {
                 return None;
             }
+            parser.refuse_generic_self(name, start);
             Some((
                 Node::AccessorWithGenerics(name, generic_arguments),
                 parser.span_from(start),
             ))
         })
+    }
+
+    /// B361 (R4) — `Self<..>`, refused with the steer.
+    ///
+    /// `Self` names the impl's SUBJECT, which is already the whole applied type:
+    /// inside `impl Cell<type T>`, `Self` IS `Cell<T>`, so writing arguments on
+    /// it names a second application of a type that has one. It parsed in a
+    /// type position, in a `::`-path head and at a struct literal, and nothing
+    /// in std, the corpus, the examples, the docs, the templates, the website,
+    /// the playground or kolt ever wrote it — and where it was written it did
+    /// not work: `fun same(self): Self<i32>` with a matching body was refused
+    /// `Expected i32, but got i32 instead`, and `Self<i32> { .. }` with
+    /// `cannot initialize a non-struct: Self`. A spelling with no use and no
+    /// coherent meaning is one refusal, at the spelling, naming the fix.
+    fn refuse_generic_self(&mut self, name: &'src str, start: usize) {
+        if name != "Self" {
+            return;
+        }
+        self.errors.push(ParseError {
+            span: self.span_from(start),
+            reason: ParseErrorReason::Rule(
+                "`Self` already names the impl's subject WITH its arguments — inside \
+                 `impl Cell<type T>` it is `Cell<T>` — so it takes none of its own: write \
+                 the type's name (`Cell<i32>`)",
+            ),
+            context: self.context_stack.clone(),
+            hint: None,
+        });
     }
 
     /// The chain head: in expression mode a `css { … }` block, then a struct
@@ -2587,16 +3401,51 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.parse_atom()
     }
 
-    /// `Name<Args>? { field, … }` — a struct initializer (expression mode only).
-    /// Backtracks when no `{` follows the name (+ optional generics), so a bare name
-    /// falls through to the atom.
+    /// `type-path { field, … }` — a struct initializer (expression mode only).
+    /// Backtracks when no `{` follows the head, so a bare name — or a qualified
+    /// path that is not a literal, `shapes::make()` — falls through to the atom.
+    ///
+    /// The head is the SAME production B172 gave every type position
+    /// (`IDENT { "::" IDENT } [ generic-args ]`, [`Parser::parse_path_type`]).
+    /// B190: the literal was the one spelling left keyed on a bare identifier,
+    /// in a language where `shapes::Dot` is a type and `shapes::make()` is a
+    /// call — so `shapes::Dot { x = 1 }` was a parse error ("expected `;` to
+    /// end this statement"), and two pins in B172's own lane had to construct
+    /// through a `make()` helper to say what they meant.
+    ///
+    /// The condition-position rule is untouched and did not need restating: a
+    /// condition parses through `no_struct`, which does not call this at all,
+    /// so a qualified path before a `{` there stays an operand exactly as the
+    /// bare form does (§3.8).
     fn parse_struct_initializer(&mut self) -> Option<Spanned<Node<'src>>> {
         self.attempt(|parser| {
             let start = parser.position;
-            let name = parser.eat_ident()?;
+            // A `::` continues the path only when a NAME follows it — probing
+            // BOTH tokens before committing, exactly as `parse_path_type`
+            // does, so a trailing `::` is left where the caller can see it.
+            let mut namespace: Vec<&'src str> = Vec::new();
+            let mut name_start = parser.position;
+            let mut name = parser.eat_ident()?;
+            while parser.peek_is_op("::")
+                && matches!(parser.peek_at(1), Some(Token::Ident(_)))
+                // E145: and that name is on this line.
+                && !parser.peeked_separator_crosses_a_line()
+            {
+                namespace.push(name);
+                parser.bump(); // `::`
+                name_start = parser.position;
+                name = parser.eat_ident().expect("peeked as an identifier");
+            }
+            let name_span = parser.span_from(name_start);
             let generic_arguments = parser.parse_generic_arguments();
             if !parser.peek_is_ctrl('{') {
                 return None;
+            }
+            // B361's third position: `Self<i32> { .. }`. Refused only once the
+            // `{` has been seen, so a declining attempt never pushes it — the
+            // attempt's own truncation covers the rest.
+            if generic_arguments.is_some() && namespace.is_empty() {
+                parser.refuse_generic_self(name, name_start);
             }
             // The `{ field, ... }` list, clean or recovered to empty fields on a
             // garbled body (chumsky's `nested_delimiters` on the struct-initializer
@@ -2624,7 +3473,12 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }
             };
             Some((
-                Node::StructInitializer(name, generic_arguments, fields),
+                Node::StructInitializer(
+                    namespace,
+                    (name, name_span),
+                    generic_arguments.map(Box::new),
+                    Box::new(fields),
+                ),
                 parser.span_from(start),
             ))
         })
@@ -2675,12 +3529,24 @@ impl<'a, 'src> Parser<'a, 'src> {
         // is markup. The attempt keeps a garbled element's notes (the farthest
         // failure survives backtracking) while the cursor rolls back for the
         // balanced `<…>` head recovery below.
-        if self.peek_is_ctrl('<') && self.peek_at_is_name(1) {
+        if (self.peek_is_ctrl('<') && self.peek_at_is_name(1)) || self.peek_is_fragment_open() {
+            let fragment = self.peek_is_fragment_open();
             if let Some(element) = self.attempt(Self::parse_element) {
                 return Some(element);
             }
-            if let Some(span) =
-                self.recover_delimited("element", '<', '>', &[('(', ')'), ('[', ']'), ('{', '}')])
+            // A FRAGMENT's head is the two-token `<>` (A46), so the balanced
+            // `<…>` recovery below would consume exactly that and hand the
+            // body back to statement parsing — which then fails FARTHER along
+            // and buries the element's own note (`</>`, or a nested tag's
+            // close) under `expected an expression`. A garbled fragment
+            // declines instead, so its farthest failure is what surfaces.
+            if !fragment
+                && let Some(span) = self.recover_delimited(
+                    "element",
+                    '<',
+                    '>',
+                    &[('(', ')'), ('[', ']'), ('{', '}')],
+                )
             {
                 return Some((Node::Error, span));
             }
@@ -2980,15 +3846,36 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// what existing `css` means.
     fn parse_css_item(&mut self) -> Option<CssItem<'src>> {
         if self.peek_is_ctrl('.') {
-            return self.parse_css_nested().map(CssItem::Nested);
+            return self.parse_css_dotted();
+        }
+        // E153: an item that STARTS with `:` is a CSS pseudo-class selector,
+        // the one thing a CSS writer is most likely to reach for here. Steered
+        // rather than reported as a missing declaration — the answer is a dot,
+        // and nothing in "expected a declaration" says so.
+        if self.peek_is_op(":") {
+            let context = self.context_stack.clone();
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(CSS_PSEUDO_CLASS_IS_DOTTED),
+                context,
+                hint: None,
+            });
+            return None;
         }
         self.parse_css_declaration().map(CssItem::Declaration)
     }
 
-    /// `.name { … }` / `.name(a, b) { … }` — a condition combinator. Only the
-    /// OUTERMOST block arrives through the atom; every nested rule re-enters
-    /// here directly, so the nesting needs its own depth level (B142).
-    fn parse_css_nested(&mut self) -> Option<CssNested<'src>> {
+    /// A DOTTED item: `.name { … }` (a condition combinator) or `.name;` (a
+    /// chain link, A69). The head is one parse either way and what FOLLOWS it
+    /// decides — a `{` makes a rule, anything else a link — so the grammar
+    /// still never consults `Style`'s method list, and the two forms need no
+    /// lookahead past the head.
+    ///
+    /// Only the OUTERMOST block arrives through the atom; every nested rule
+    /// re-enters here directly, so the nesting needs its own depth level
+    /// (B142). A link nests nothing and pays the same bound harmlessly, which
+    /// is cheaper than splitting the head parse in two.
+    fn parse_css_dotted(&mut self) -> Option<CssItem<'src>> {
         self.parse_nested_as(
             Self::CSS_NESTING_REFUSAL,
             |parser, _span| {
@@ -2998,56 +3885,110 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parser.bump();
                 None
             },
-            Self::parse_css_nested_inner,
+            Self::parse_css_dotted_inner,
         )
     }
 
-    /// [`Parser::parse_css_nested`]'s body, past the depth bound.
-    fn parse_css_nested_inner(&mut self) -> Option<CssNested<'src>> {
+    /// [`Parser::parse_css_dotted`]'s body, past the depth bound.
+    fn parse_css_dotted_inner(&mut self) -> Option<CssItem<'src>> {
         let start = self.position;
         self.expect_ctrl('.')?;
         let name_span = self.here_span();
         let Some(name) = self.eat_ident() else {
             self.report_css_failure(
-                "a condition combinator (`.hover { … }`, `.within(\"a\", \"b\") { … }`)",
+                "a condition combinator (`.hover { … }`) or a chain link (`.ghost();`)",
             );
             return None;
         };
         // The head's arguments are ORDINARY vilan expressions, so
-        // `.within("data-theme", "dark") { … }` and `.pseudo("first-child") { … }`
-        // work with no special casing (§4.3).
-        let arguments = if self.peek_is_ctrl('(') {
+        // `.within("data-theme", Some("dark")) { … }` and `.pseudo("first-child") { … }`
+        // work with no special casing (§4.3) — and so do a link's.
+        let parenthesized = self.peek_is_ctrl('(');
+        let arguments = if parenthesized {
             self.parse_argument_list()?.0
         } else {
             Vec::new()
         };
         let head = self.span_from(start);
+        // A69: `{` is the condition rule, and anything else is a chain link
+        // ended by its required `;` — the same terminator a declaration takes,
+        // reported the same gap-anchored way.
+        if !self.peek_is_ctrl('{') {
+            if !self.peek_is_ctrl(';') {
+                self.report_css_failure(TERMINATOR_EXPECTED);
+                return None;
+            }
+            self.bump();
+            return Some(CssItem::Link(crate::node::CssLink {
+                name: (name, name_span),
+                arguments,
+                parenthesized,
+                span: self.span_from(start),
+            }));
+        }
         let body = self.parse_css_body()?;
-        Some(CssNested {
+        Some(CssItem::Nested(CssNested {
             name: (name, name_span),
             arguments,
             body,
             head,
             span: self.span_from(start),
-        })
+        }))
     }
 
-    /// `property: value;` — one declaration. The `;` is REQUIRED, including
-    /// after the last: the formatter may never invent a token (the token
-    /// equality net), and a required terminator makes value scanning decidable
-    /// in one pass (§4.3).
+    /// `property(value);` — one declaration, which is a CALL (A101). The `;`
+    /// is REQUIRED, including after the last: the formatter may never invent a
+    /// token (the token equality net), and a required terminator keeps an item
+    /// decidable in one pass (§4.3).
+    ///
+    /// The arguments are an ORDINARY argument list — the same production a
+    /// nested rule's head and every other call in the language take — so a
+    /// typed value needs no hole, value completion is expression completion,
+    /// and a value whose type is not a raw value is the ordinary type error AT
+    /// the argument rather than a string that silently reaches the sheet.
     fn parse_css_declaration(&mut self) -> Option<CssDeclaration<'src>> {
         let start = self.position;
         let Some(property) = self.parse_css_property() else {
             self.report_css_failure(CSS_ITEM_EXPECTED);
             return None;
         };
-        if !self.peek_is_op(":") {
-            self.report_css_failure("':'");
+        // The one token every migrating program and every CSS author writes
+        // here. It is a committed declaration by now — the property name read
+        // — so the rule reports for itself and names the call form.
+        if self.peek_is_op(":") {
+            let context = self.context_stack.clone();
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(A_CSS_DECLARATION_IS_A_CALL),
+                context,
+                hint: None,
+            });
             return None;
         }
-        self.bump();
-        let (value, value_span) = self.parse_css_value()?;
+        if !self.peek_is_ctrl('(') {
+            self.report_css_failure("'('");
+            return None;
+        }
+        // `!important` is refused permanently and with its fix: merge is a
+        // record update, so a `Style` that needed it would be a `Style` that
+        // had lost the property the whole model is for (§10). Read off the
+        // TOKENS before the arguments are parsed, because `red !important` is
+        // not an expression and the argument list would report a `,` it never
+        // wanted — the reader would then never see the sentence that answers.
+        if let Some(span) = self.important_within_arguments() {
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(IMPORTANT_HAS_NO_PLACE),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+            return None;
+        }
+        let (arguments, parens) = self.parse_argument_list()?;
+        if arguments.is_empty() {
+            self.note_expected("a value");
+            return None;
+        }
         // The `;` reports as a MISSING TERMINATOR, gap-anchored: the mistake is
         // in the whitespace before the next item, not on it, and the message is
         // the one the language server already carries an "Insert `;`" quickfix
@@ -3059,16 +4000,50 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.bump();
         Some(CssDeclaration {
             property,
-            value,
-            value_span,
+            arguments,
+            parens,
             span: self.span_from(start),
         })
+    }
+
+    /// The span of a `!important` written inside the argument list opening at
+    /// the cursor, at any depth — `color(red !important)`, the CSS author's own
+    /// transliteration. `None` when the list holds none, or does not close.
+    fn important_within_arguments(&self) -> Option<Span> {
+        let mut depth = 0usize;
+        let mut at = self.position;
+        while let Some((token, span)) = self.tokens.get(at) {
+            match token {
+                Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+                Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return None;
+                    }
+                }
+                Token::Op("!")
+                    if matches!(
+                        self.tokens.get(at + 1),
+                        Some((Token::Ident("important"), _))
+                    ) =>
+                {
+                    return Some((span.start..self.tokens[at + 1].1.end).into());
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        None
     }
 
     /// A property name — `{ "-" } NAME { "-" NAME }`, span-adjacent, so
     /// `flex-direction` is three tokens and `--color-ink` is five, and
     /// `data - id` is a name and an operator rather than a name. Returns the
     /// SPAN; the text is sliced at desugar, exactly as an element's tag is.
+    ///
+    /// R12: the leading-dash run is what admits a CUSTOM property as a call
+    /// head — `--brand-ink(gray(900));` — and it needs nothing new, exactly as
+    /// an element attribute's `data-`/`aria-` names need nothing new.
     fn parse_css_property(&mut self) -> Option<Span> {
         let start = self.position;
         let start_offset = self.here_span().start;
@@ -3095,84 +4070,6 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         }
         Some((start_offset..name.end).into())
-    }
-
-    /// A declaration's value: everything up to the `;` at brace depth 0, as a
-    /// run of source-text pieces and `{expression}` holes. There is no typed
-    /// value grammar — typed values arrive through holes, which is where the
-    /// type system already lives (§10).
-    fn parse_css_value(&mut self) -> Option<(Vec<CssValuePiece<'src>>, Span)> {
-        let start_offset = self.here_span().start;
-        let mut pieces = Vec::new();
-        // The pieces PARTITION the value's span: a text run is the source
-        // between one hole's `}` and the next hole's `{`, whitespace included.
-        // Slicing from the first TOKEN of a run instead would drop the space a
-        // hole is separated by, and `calc({w} + 2px)` would render `calc(w+
-        // 2px)` — the i-string this lowers to keeps that space, so this must.
-        let mut text_from = start_offset;
-        let mut end = start_offset;
-        loop {
-            if self.at_end() || self.peek_is_ctrl(';') || self.peek_is_ctrl('}') {
-                break;
-            }
-            if self.peek_is_ctrl('{') {
-                let open = self.here_span();
-                if text_from < open.start {
-                    pieces.push(CssValuePiece::Text((text_from..open.start).into()));
-                }
-                self.bump();
-                let Some(expression) = self.parse_expression() else {
-                    self.report_css_failure("an expression");
-                    return None;
-                };
-                let close = self.here_span();
-                if !self.peek_is_ctrl('}') {
-                    self.report_css_failure("'}'");
-                    return None;
-                }
-                self.bump();
-                pieces.push(CssValuePiece::Hole(
-                    expression,
-                    (open.start..close.end).into(),
-                ));
-                text_from = close.end;
-                end = close.end;
-                continue;
-            }
-            // `!important` is refused permanently and with its fix: merge is a
-            // record update, so a `Style` that needed it would be a `Style` that
-            // had lost the property the whole model is for (§10). Consumed with
-            // its span excised from the value, so the declaration still lowers
-            // and the block raises one diagnostic rather than cascading.
-            if self.peek_is_op("!") && matches!(self.peek_at(1), Some(Token::Ident("important"))) {
-                let start = self.here_span().start;
-                let stop = self.tokens[self.position + 1].1.end;
-                self.errors.push(ParseError {
-                    span: (start..stop).into(),
-                    reason: ParseErrorReason::Rule(IMPORTANT_HAS_NO_PLACE),
-                    context: self.context_stack.clone(),
-                    hint: None,
-                });
-                if text_from < start {
-                    pieces.push(CssValuePiece::Text((text_from..start).into()));
-                }
-                self.bump();
-                self.bump();
-                text_from = stop;
-                end = stop;
-                continue;
-            }
-            end = self.here_span().end;
-            self.bump();
-        }
-        if text_from < end {
-            pieces.push(CssValuePiece::Text((text_from..end).into()));
-        }
-        if pieces.is_empty() {
-            self.note_expected("a value");
-            return None;
-        }
-        Some((pieces, (start_offset..end).into()))
     }
 
     // --- Elements (proposal/element-syntax.md) -------------------------------
@@ -3208,6 +4105,14 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     fn peek_at_is_op(&self, offset: usize, symbol: &str) -> bool {
         matches!(self.peek_at(offset), Some(Token::Op(found)) if *found == symbol)
+    }
+
+    /// `<>` — a fragment's nameless head (A46). SPAN-ADJACENT, like `/>` and
+    /// `</`: `<` and `>` are separate control tokens (neither is in the
+    /// operator charset, so the lexer never fuses them), and requiring them to
+    /// touch keeps the pair out of every expression `<` already begins.
+    fn peek_is_fragment_open(&self) -> bool {
+        self.peek_is_ctrl('<') && self.peek_at_is_ctrl(1, '>') && self.tokens_adjacent(0, 1)
     }
 
     /// A (possibly hyphenated) element NAME — `div`, `type`, `aria-label`,
@@ -3266,19 +4171,51 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// [`Parser::parse_element`]'s body, past the depth bound.
     fn parse_element_inner(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        // E115: the angle brackets are recorded as they are consumed — this is
+        // the only place their positions are known, and the editor's
+        // semantic-token pass needs them to paint a head that spans lines.
+        let mut punctuation = vec![self.here_span()];
+        // A46: `<>…</>` — the nameless head, a FRAGMENT. It takes no head
+        // items and has no self-closing form, so the whole head is the
+        // adjacent `<>` pair and everything after it is children up to `</>`.
+        // The lowering diverges too (`elements.rs`): a `List<View>` literal,
+        // not a `view("tag")` chain.
+        if self.peek_is_fragment_open() {
+            self.bump();
+            punctuation.push(self.here_span());
+            self.bump();
+            let (children, _close_tag, close_punctuation) = self.parse_element_children(None)?;
+            punctuation.extend(close_punctuation);
+            let body = ElementBody {
+                tag: None,
+                head: Vec::new(),
+                children,
+                self_closing: false,
+                close_tag: None,
+                punctuation,
+            };
+            return Some((Node::Element(Box::new(body)), self.span_from(start)));
+        }
         self.expect_ctrl('<')?;
         let (tag, tag_tokens) = self.parse_element_name()?;
         let mut head = Vec::new();
         let children = loop {
             // `/>` — self-closing (span-adjacent, like `<<`).
             if self.peek_is_op("/") && self.peek_at_is_ctrl(1, '>') && self.tokens_adjacent(0, 1) {
+                let slash = self.here_span();
                 self.bump();
+                let angle = self.here_span();
                 self.bump();
+                punctuation.push((slash.start..angle.end).into());
                 break (Vec::new(), true, None);
             }
-            if self.eat_ctrl('>') {
-                let (children, close_tag) = self.parse_element_children(&tag_tokens)?;
-                break (children, false, Some(close_tag));
+            if self.peek_is_ctrl('>') {
+                punctuation.push(self.here_span());
+                self.bump();
+                let (children, close_tag, close_punctuation) =
+                    self.parse_element_children(Some(&tag_tokens))?;
+                punctuation.extend(close_punctuation);
+                break (children, false, close_tag);
             }
             if self.at_end() {
                 self.note_expected("`>` or `/>`");
@@ -3290,13 +4227,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         let (children, self_closing, close_tag) = children;
         let body = ElementBody {
-            tag,
+            tag: Some(tag),
             head,
             children,
             self_closing,
             close_tag,
+            punctuation,
         };
-        Some((Node::Element(body), self.span_from(start)))
+        Some((Node::Element(Box::new(body)), self.span_from(start)))
     }
 
     /// One head item: a `.method(…)` chain link, an `on:event(handler)`, an
@@ -3359,11 +4297,44 @@ impl<'a, 'src> Parser<'a, 'src> {
         if !self.peek_is_ctrl('(') {
             return Some(Some(ElementHeadItem::Attribute(name, None)));
         }
+        let open = self.position;
         self.bump();
         let value = self.parse_expression()?;
         if self.peek_is_ctrl(',') {
+            // A second value in an attribute — `<div raw("inert", scrim)>`. The
+            // message this raises is already the right one; what E136 fixed is
+            // that it used to be a HARD decline, and a hard decline threw the
+            // message away in the shape the mistake is usually written in.
+            //
+            // Declining fails the element, `parse_atom` falls back to
+            // `recover_delimited("element", '<', '>')`, and that re-emits this
+            // failure — but only if the enclosing STATEMENT then parses. With a
+            // paired `</div>` it does not: the two angle brackets read as
+            // comparisons, `attempt`'s `errors.truncate` drops the curated
+            // message with the branch that produced it, and what surfaces is
+            // `expected ';'` on the tag. The self-closing `/>` spelling escaped
+            // only because nothing else could read it.
+            //
+            // So the comma is recovered exactly as the `.`-chain arm above
+            // recovers a nameless link (E49): report HERE, where the mistake is,
+            // skip the attribute's own parentheses, and answer `Some(None)` —
+            // the head item is dropped, the element survives, and the statement
+            // around it parses, so nothing truncates.
             self.note_expected("`)` (an attribute takes one value; a chain link starts with `.`)");
-            return None;
+            let context = self.context_stack.clone();
+            self.emit_failure(
+                self.position,
+                vec![
+                    "`)` (an attribute takes one value; a chain link starts with `.`)".to_string(),
+                ],
+                context,
+            );
+            // Unbalanced parentheses have no matching `)` to skip to; the region
+            // is genuinely garbled and the element recovery is the better
+            // reader, so that case still declines.
+            let end = self.scan_balanced(open, '(', ')', &[('[', ']'), ('{', '}')])?;
+            self.position = end;
+            return Some(None);
         }
         self.expect_ctrl(')')?;
         Some(Some(ElementHeadItem::Attribute(name, Some(value))))
@@ -3372,17 +4343,41 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// Children up to the matching `</tag>`: nested elements, quoted strings
     /// (an i-string arrives as its lexed paren group), and `{expression}`
     /// holes. Bare text is a parse error that teaches the quoted form.
+    ///
+    /// `open_tokens` is the opening tag's name tokens, or `None` for a
+    /// FRAGMENT (A46), which closes on `</>` and has no name to match.
+    ///
+    /// Returns the children, the close tag's NAME span (`None` for `</>`), and
+    /// the close tag's own two angle-bracket spans — its `</` and its `>`
+    /// (E115).
     fn parse_element_children(
         &mut self,
-        open_tokens: &std::ops::Range<usize>,
-    ) -> Option<(Vec<ElementChild<'src>>, Span)> {
+        open_tokens: Option<&std::ops::Range<usize>>,
+    ) -> Option<(Vec<ElementChild<'src>>, Option<Span>, [Span; 2])> {
         let mut children: Vec<ElementChild<'src>> = Vec::new();
         loop {
             // `</tag>` — the close (span-adjacent `</`), name-matched against
             // the opener token-by-token.
             if self.peek_is_ctrl('<') && self.peek_at_is_op(1, "/") && self.tokens_adjacent(0, 1) {
+                let angle = self.here_span();
                 self.bump();
+                let slash = self.here_span();
                 self.bump();
+                // A fragment closes on `</>`: nothing stands where the name
+                // would, and a name there is the mismatch this reports.
+                let Some(open_tokens) = open_tokens else {
+                    let closing_angle = self.here_span();
+                    if !self.peek_is_ctrl('>') {
+                        self.note_expected("`</>`");
+                        return None;
+                    }
+                    self.bump();
+                    return Some((
+                        children,
+                        None,
+                        [(angle.start..slash.end).into(), closing_angle],
+                    ));
+                };
                 let close = self.parse_element_name();
                 let matches_open = close.as_ref().is_some_and(|(_, close_tokens)| {
                     close_tokens.len() == open_tokens.len()
@@ -3396,17 +4391,24 @@ impl<'a, 'src> Parser<'a, 'src> {
                     self.note_expected(&format!("`</{open_name}>`"));
                     return None;
                 }
+                let closing_angle = self.here_span();
                 self.expect_ctrl('>')?;
                 let (close_span, _) = close.expect("matched above");
-                return Some((children, close_span));
+                return Some((
+                    children,
+                    Some(close_span),
+                    [(angle.start..slash.end).into(), closing_angle],
+                ));
             }
             if self.at_end() {
-                let open_name = self.element_name_text(open_tokens);
-                self.note_expected(&format!("`</{open_name}>`"));
+                self.note_expected(&match open_tokens {
+                    Some(open_tokens) => format!("`</{}>`", self.element_name_text(open_tokens)),
+                    None => "`</>`".to_string(),
+                });
                 return None;
             }
-            // A nested element.
-            if self.peek_is_ctrl('<') && self.peek_at_is_name(1) {
+            // A nested element, or a nested fragment (A46).
+            if (self.peek_is_ctrl('<') && self.peek_at_is_name(1)) || self.peek_is_fragment_open() {
                 children.push(ElementChild::Bare(self.parse_element()?));
                 continue;
             }
@@ -3610,14 +4612,58 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_for(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::For)?;
-        // `for IDENT in …` — a bare identifier immediately followed by `in`.
-        if matches!(self.peek(), Some(Token::Ident(_))) && self.peek_at(1) == Some(&Token::In) {
-            let variable = self.eat_ident()?;
-            self.expect(&Token::In)?;
+        // `for <binder> in …`. The binder production is `let`'s (B368/R5), so a
+        // tuple binder destructures the element in the header — `for (index,
+        // item) in list.iter().enumerate()` — exactly as `let (index, item) =
+        // pair;` does one line lower. Read as an ATTEMPT rather than by peeking
+        // for `IDENT` + `in`, because the binder is now arbitrarily wide: what
+        // decides the form is that the binder is followed by `in`, and a
+        // `for a == b { .. }` while-loop backtracks out of it with its errors
+        // truncated.
+        if let Some(binder) = self.attempt(|parser| {
+            let binder = parser.parse_binder()?;
+            parser.expect(&Token::In)?;
+            Some(binder)
+        }) {
             let iterable = self.parse_condition()?;
             let body = self.parse_block()?;
             return Some((
-                Node::ForIn(variable, Box::new(iterable), body),
+                Node::ForIn(Box::new(binder), Box::new(iterable), body),
+                self.span_from(start),
+            ));
+        }
+        // A header that SAYS `in` but whose binder is not one the binding
+        // grammar takes — `for Some(x) in xs`, `for 3 in xs`, `for (only) in
+        // xs` — is refused BY NAME, naming the sanctioned spelling (R5). Before
+        // this the attempt above fell through to the while-loop branch, the
+        // condition parse died on the `in`, and the author read `found 'for'
+        // expected a statement or '}'` anchored on the `for` keyword, with no
+        // mention of the binder at all (B368's second half). The rest of the
+        // header is consumed so the file keeps parsing.
+        if let Some(offset) = self.for_header_binder_width() {
+            // Consumed FIRST, so the span the refusal carries is the binder the
+            // author wrote and not the `for` keyword (E190's rule: the
+            // diagnostic anchors where the fix goes).
+            let binder_start = self.position;
+            for _ in 0..offset {
+                self.bump();
+            }
+            self.errors.push(ParseError {
+                span: self.span_from(binder_start),
+                reason: ParseErrorReason::Rule(
+                    "a `for … in` header binds the element with `let`'s binder — a name, or a \
+                     tuple or array of names (`for (index, item) in …`); bind the element and \
+                     destructure in the body for anything else",
+                ),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+            self.expect(&Token::In)?;
+            let iterable = self.parse_condition()?;
+            let body = self.parse_block()?;
+            let binder = Box::new((Pattern::Wildcard, self.span_from(start)));
+            return Some((
+                Node::ForIn(binder, Box::new(iterable), body),
                 self.span_from(start),
             ));
         }
@@ -3634,6 +4680,33 @@ impl<'a, 'src> Parser<'a, 'src> {
             Node::For(Some(Box::new(condition)), body),
             self.span_from(start),
         ))
+    }
+
+    /// Is this `for` header an `in` form, and if so how many tokens is its
+    /// binder? Read by scanning from just past the keyword to the `in` that
+    /// would separate binder from iterable — stopping at the header's own block
+    /// brace, and never counting an `in` inside a nested delimited region, so a
+    /// `for probe(pick(x)) { .. }` while-loop is not mistaken for one.
+    /// Consulted only once [`Parser::parse_binder`] has already declined, i.e.
+    /// only to choose between "an unreadable binder" and "a condition".
+    fn for_header_binder_width(&self) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut offset = 0usize;
+        while let Some(token) = self.peek_at(offset) {
+            match token {
+                Token::Ctrl('(' | '[') => depth += 1,
+                Token::Ctrl(')' | ']') => depth = depth.saturating_sub(1),
+                // The header's own `{` ends it: past there is the body, and an
+                // `in` inside the body is some inner loop's.
+                Token::Ctrl('{') if depth == 0 => return None,
+                // A binder of nothing is not a binder — `for in xs` is a
+                // condition parse's problem, not this refusal's.
+                Token::In if depth == 0 => return (offset > 0).then_some(offset),
+                _ => {}
+            }
+            offset += 1;
+        }
+        None
     }
 
     /// `match subject { leg, … }`.
@@ -3705,10 +4778,35 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// name to `Let` and a destructuring binder to `LetDestructure`.
     fn parse_let(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        // `lazy let name: T = init;` (proposal/lazy.md §2) — the initializer
+        // runs at the binding's first USE instead of at module load, then
+        // memoizes. `lazy` is the outermost word, as it is on a parameter, and
+        // for the same reason: it is about WHEN, before anything about what.
+        let lazy = self.eat(&Token::Lazy);
         let mutable = if self.eat(&Token::Let) {
             false
         } else if self.eat(&Token::Mut) {
             true
+        } else if lazy {
+            // `lazy name = …` — the binder word is missing. Taken as `let` and
+            // reported, rather than declined: declining would hand the word
+            // back to an expression attempt that cannot read it either, and
+            // `attempt` truncates the errors a declining branch pushed, so the
+            // rule would never reach the author (they would get "found 'lazy'
+            // expected an item" about a keyword they spelled correctly). This
+            // is `misplaced_mut`'s move on the parameter side, for the same
+            // reason (diagnostics-standard B5).
+            self.errors.push(ParseError {
+                span: self.span_from(start),
+                reason: ParseErrorReason::Rule(
+                    "a lazy binding is `lazy let name: T = <initializer>;` — `lazy` \
+                     defers a BINDING's initializer to its first use, and a parameter's \
+                     argument to the callee's first read",
+                ),
+                context: Vec::new(),
+                hint: None,
+            });
+            false
         } else {
             return None;
         };
@@ -3725,11 +4823,124 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
+        if lazy {
+            // `lazy mut` — the binding is initialized ONCE, at first use, and
+            // memoized; a `mut` module global is a different contract (a slot
+            // anything may rewrite) and the two say opposite things about when
+            // the value is settled.
+            if mutable {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a lazy binding is initialized once, at its first use, and memoized, \
+                         so it is `lazy let`; `mut` names a slot anything may rewrite",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // The initializer IS the feature — there is nothing to defer
+            // without one, and a declaration-only `let` is a shape the binding
+            // grammar allows for other reasons.
+            if value.is_none() {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a lazy binding declares the initializer it defers: write \
+                         `lazy let name: T = <initializer>;`",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // One cell, one name: a destructure would need one memo per piece
+            // and a first-use rule per piece, which is not what `lazy` means.
+            if !matches!(pattern, Pattern::Binding(..)) {
+                self.errors.push(ParseError {
+                    span: pattern_span,
+                    reason: ParseErrorReason::Rule(
+                        "a lazy binding binds ONE name to one memo cell; destructure inside \
+                         the initializer, or bind the whole value lazily and read its pieces",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
         let node = match pattern {
-            Pattern::Binding(name, _, _) => Node::Let((name, pattern_span), type_, value, mutable),
+            Pattern::Binding(name, _, _) => {
+                Node::Let((name, pattern_span), type_, value, mutable, lazy, None)
+            }
             pattern => Node::LetDestructure((pattern, pattern_span), type_, value, mutable),
         };
         Some((node, self.span_from(start)))
+    }
+
+    /// G24 — the `const` DECLARATION forms, read at STATEMENT position before
+    /// the expression grammar sees `const` as its weak-precedence prefix:
+    /// `const let NAME[: T] = EXPR;`, `const fun NAME(..) { .. }`, and `const
+    /// mut`, which is refused.
+    ///
+    /// `None` for anything else after `const` — a plain `const <expr>` is the
+    /// prefix `parse_expression` has always read, and the statement funnel
+    /// falls through to it unchanged. Declaration position is the whole of the
+    /// restriction: `const let` is a statement, not a sub-expression, which is
+    /// what makes "module level AND locally" (R3) the complete answer to where
+    /// it may be written.
+    ///
+    /// Both forms keep the shape `Node::Const(<declaration>)`. The analyzer's
+    /// `const` arm FORWARDS its inner node, so the binding and the item walk
+    /// exactly as a plain `let` and a plain `fun` do, and what the marker adds
+    /// — the initializer evaluated at build time, the body capability-checked
+    /// at its declaration — is recorded beside the entity rather than spelled
+    /// as a second AST.
+    fn parse_const_declaration(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !self.peek_is(&Token::Const) {
+            return None;
+        }
+        let start = self.position;
+        match self.peek_at(1) {
+            Some(Token::Let) => {
+                self.bump();
+                let declaration = self.parse_let()?;
+                self.eat_declaration_terminator()?;
+                Some((Node::Const(Box::new(declaration)), self.span_from(start)))
+            }
+            // `const mut` is refused and then RECOVERED as the runtime `mut`
+            // it spells, so the rest of the file parses and the author gets
+            // one diagnostic rather than a cascade. The error survives the
+            // statement funnel's `attempt` because this arm returns `Some`.
+            Some(Token::Mut) => {
+                let context = self.context_stack.clone();
+                self.errors.push(ParseError {
+                    span: self.here_span(),
+                    reason: ParseErrorReason::Rule(CONST_HAS_NO_MUTATION),
+                    context,
+                    hint: None,
+                });
+                self.bump();
+                let declaration = self.parse_let()?;
+                self.eat_declaration_terminator()?;
+                Some(declaration)
+            }
+            Some(Token::Fun) => {
+                self.bump();
+                let declaration = self.parse_function()?;
+                Some((Node::Const(Box::new(declaration)), self.span_from(start)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `;` a `const let` owes, with the statement funnel's own recovery
+    /// note on a miss — the funnel's terminator handling belongs to the
+    /// expression fork this form no longer travels through.
+    fn eat_declaration_terminator(&mut self) -> Option<()> {
+        if self.eat_ctrl(';') {
+            return Some(());
+        }
+        self.note_terminator();
+        None
     }
 
     /// An assignment: `(*)? place op value`, where `place` is the struct-free
@@ -3805,6 +5016,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                  be annotated, stored, or passed anywhere. Take a tuple parameter \
                  (`|items: T|`) and call it with one",
             );
+            parser.reject_lazy_position(
+                &parameters,
+                "a closure cannot take a `lazy` parameter: a closure TYPE \
+                 (`sync |A| B`) has no lazy form, so the thunking would be invisible \
+                 to every position the closure is annotated, stored or passed in. \
+                 Take a closure parameter (`|make: sync || T|`) and call it where the \
+                 value is wanted",
+            );
             let parameters = (parameters, parser.span_from(start));
             let return_type = if parser.eat_op(":") {
                 Some(Box::new(parser.parse_type()?))
@@ -3872,6 +5091,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         // span coincide here. They part company one level up, where the match/`is`
         // grammar's `let`/`mut` arm widens the pattern span over the keyword.
         let name_span = self.span_from(start);
+        // N113: `void` is the unit VALUE's spelling, and the atom production
+        // reads every `void` as `Node::Void` unconditionally (it is contextual,
+        // §2.2, but not contextual here). So a binder may take the name and
+        // nothing can ever read it back: `let void = 3; let x: i32 = void;` is
+        // refused `Expected i32, but got void`, about a binding the author is
+        // looking straight at. One binder production serves `let`, `for`, a
+        // function parameter and a match capture, so this is the one site.
+        // Only a BINDER — a struct field or a method named `void` is reached
+        // through a receiver and reads back perfectly well.
+        if name == "void" {
+            self.errors.push(ParseError {
+                span: name_span,
+                reason: ParseErrorReason::Rule(
+                    "`void` is the unit value's own spelling, so a binding cannot take \
+                     it: every later `void` still reads as the unit, not as this \
+                     binding — name it something else",
+                ),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         Some((Pattern::Binding(name, false, name_span), name_span))
     }
 
@@ -3892,9 +5132,28 @@ impl<'a, 'src> Parser<'a, 'src> {
         let start = self.position;
         // `let x` / `mut x` — a binder, stamped mutable per the keyword.
         if self.peek_is(&Token::Let) || self.peek_is(&Token::Mut) {
-            let mutable = self.eat(&Token::Mut);
+            let mut mutable = self.eat(&Token::Mut);
             if !mutable {
                 self.bump(); // `let`
+            }
+            // `Some(let mut x)` / `Some(mut let x)`: the two binding forms
+            // written as one, exactly as `let mut x = …` writes them at a
+            // declaration (A80). Refused by name, and CONSUMED — the binder is
+            // taken as MUTABLE, which is what either spelling was reaching for,
+            // so the arm still parses and the author reads one diagnostic
+            // naming `Some(mut x)` instead of a "found '(' expected '=>'" about
+            // the payload's own paren, thrown when the pattern backtracked out
+            // from under it (diagnostics-standard B5).
+            let paired = if mutable { Token::Let } else { Token::Mut };
+            if self.peek_is(&paired) {
+                self.bump();
+                mutable = true;
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(PATTERN_BINDER_IS_ONE_WORD),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
             }
             let (binder, _) = self.parse_binder()?;
             let pattern = apply_binding_mutability(binder, mutable);
@@ -4001,9 +5260,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// A type without the context suffix: `[T; n]`, `&T`/`&mut T`, a `type` binder,
-    /// a closure type (with the optional `async`/`sync` marker), a generic-applied
-    /// local (`List<T>`), a plain local, a mapped tuple type (`(U in T: F<U>)`), or a
-    /// tuple type. Tried in the chumsky order.
+    /// a closure type (with the optional `async`/`sync` marker), a nominal path
+    /// (`Dot`, `List<T>`, `style::Style`, `std::reactive::SignalCell<i32>`), a
+    /// mapped tuple type (`(U in T: F<U>)`), or a tuple type. Tried in the chumsky
+    /// order.
     fn parse_type_atom(&mut self) -> Option<Spanned<Node<'src>>> {
         if self.peek_is_ctrl('[')
             && let Some(array) = self.parse_array_type()
@@ -4013,18 +5273,17 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_op("&") {
             return self.parse_reference_type();
         }
-        if self.peek_is(&Token::Type) {
+        if self.peek_is(&Token::Type) || self.peek_is(&Token::Ident(ANONYMOUS_TYPE_BINDER)) {
             return self.parse_type_binder();
+        }
+        if self.peek_is(&Token::Dyn) {
+            return self.parse_dyn_type();
         }
         if let Some(closure) = self.parse_closure_type() {
             return Some(closure);
         }
-        if let Some(local) = self.parse_local_type() {
-            return Some(local);
-        }
-        if let Some(name) = self.eat_ident() {
-            let span = self.span_from(self.position - 1);
-            return Some((Node::Accessor(name), span));
+        if let Some(path) = self.parse_path_type() {
+            return Some(path);
         }
         if self.peek_is_ctrl('(') {
             if let Some(mapped) = self.parse_mapped_type() {
@@ -4036,6 +5295,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.note_expected("a type");
         None
+    }
+
+    /// `dyn Source<i32>` — a trait object type (A124 R3).
+    ///
+    /// The keyword takes a PATH TYPE and nothing else. `dyn |i32| str`,
+    /// `dyn [T; 4]`, `dyn &T` and `dyn (A, B)` name no trait, so the grammar
+    /// refuses them here rather than letting the analyzer meet a `dyn` over a
+    /// closure and say something about object safety; the message names what
+    /// may follow, which is the one thing the reader needs.
+    ///
+    /// Nesting is by the ordinary type cycle: `List<dyn Source<i32>>` reaches
+    /// this production through the application's argument walk, so a `dyn`
+    /// stands wherever a type stands.
+    fn parse_dyn_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        self.expect(&Token::Dyn)?;
+        let Some(inner) = self.parse_path_type() else {
+            self.note_expected("a trait name after `dyn`");
+            return None;
+        };
+        Some((Node::DynType(Box::new(inner)), self.span_from(start)))
     }
 
     /// `[T; length]` — a fixed-length array type; `length` is an integer literal.
@@ -4078,18 +5358,49 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// `type X (: A + B)?` — a generic binder in type position (impl subject
-    /// patterns).
+    /// `type X (: A + B)?` / `_ (: A + B)?` — a generic binder in type position
+    /// (impl subject patterns).
+    ///
+    /// Two spellings, one node. The keyword NAMES the parameter, and the
+    /// keyword is what says "this introduces a name" in a position that
+    /// otherwise reads a type. `_` (B294) introduces one the author declined to
+    /// name — the pattern wildcard's spelling (`Some(_)`, `let _`) in the
+    /// impl-subject position, and the only way to write a BOUND on an anonymous
+    /// parameter: `_: Source<type U>` was a parse error at the `:`, because
+    /// nothing but the keyword reached this production and a bare `_` was an
+    /// ordinary name that no scope declared.
+    ///
+    /// The reading is unconditional — `_` in ANY type position is this node,
+    /// not a name — so the parser stays context-free and a `_` written where no
+    /// binder may be introduced (`let x: List<_>`, an inference placeholder) is
+    /// refused where every other unbound name is, by resolution, with a message
+    /// that says what `_` is for.
     fn parse_type_binder(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        self.expect(&Token::Type)?;
+        if !self.eat(&Token::Type) && !self.peek_is(&Token::Ident(ANONYMOUS_TYPE_BINDER)) {
+            return None;
+        }
+        let name_start = self.position;
         let name = self.eat_ident()?;
-        let bounds = if self.eat_op(":") {
-            self.parse_type_bounds()?
+        // The NAME's own span, the way `GenericParameter` carries one: the
+        // node's span reaches from the `type` keyword to the end of the bounds,
+        // and what the binder's ENTITY must be spanned by is the thing an
+        // editor selects for it (E161).
+        let name_span = self.span_from(name_start);
+        // A122: a tuple-family bound (`type T: (2..)`) is tried before the
+        // trait-bound list, exactly as a generic parameter's is.
+        let (bounds, tuple_bound) = if self.eat_op(":") {
+            match self.parse_tuple_bound() {
+                Some(bound) => (Vec::new(), Some(Box::new(bound))),
+                None => (self.parse_type_bounds()?, None),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
-        Some((Node::TypeBinder(name, bounds), self.span_from(start)))
+        Some((
+            Node::TypeBinder((name, name_span), bounds, tuple_bound),
+            self.span_from(start),
+        ))
     }
 
     /// `A + B + …` — a `+`-separated bound list (≥1).
@@ -4169,18 +5480,51 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((name, Box::new(type_)))
     }
 
-    /// `Name<Args>` in type position — a generic-applied local (before the plain
-    /// local so the generics are consumed as part of the type).
-    fn parse_local_type(&mut self) -> Option<Spanned<Node<'src>>> {
-        self.attempt(|parser| {
-            let start = parser.position;
-            let name = parser.eat_ident()?;
-            let generic_arguments = parser.parse_generic_arguments()?;
-            Some((
-                Node::AccessorWithGenerics(name, generic_arguments),
-                parser.span_from(start),
-            ))
-        })
+    /// `IDENT { "::" IDENT } generic-args?` — the nominal type form: a name,
+    /// optionally reached through the modules that declare it, optionally applied
+    /// to generic arguments. `Dot`, `List<T>`, `style::Style` and
+    /// `std::reactive::SignalCell<i32>` are all this production (B172).
+    ///
+    /// The namespace spine folds into `StaticAccessor` nodes — the very shape an
+    /// expression path builds — so a qualified type resolves through the same
+    /// module-member lookup `style::style()` does, and nothing downstream needs a
+    /// second notion of what a path is.
+    ///
+    /// Generic arguments belong to the LAST segment, which is the only one that
+    /// names a type; the earlier ones name modules, which take none.
+    fn parse_path_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let mut name = self.eat_ident()?;
+        let mut namespace: Option<Spanned<Node<'src>>> = None;
+        // A `::` continues the path only when a NAME follows it. Probing BOTH
+        // tokens before committing is what keeps a trailing `::` — one that
+        // belongs to whatever the caller parses next — exactly where it was,
+        // without the backtracking an `eat_op` here would need.
+        while self.peek_is_op("::")
+            && matches!(self.peek_at(1), Some(Token::Ident(_)))
+            // E145: and that name is on this line.
+            && !self.peeked_separator_crosses_a_line()
+        {
+            let span = self.span_from(start);
+            namespace = Some(match namespace {
+                Some(inner) => (Node::StaticAccessor(Box::new(inner), name, None), span),
+                None => (Node::Accessor(name), span),
+            });
+            self.bump(); // `::`
+            name = self.eat_ident().expect("peeked as an identifier");
+        }
+        let generic_arguments = self.attempt(Self::parse_generic_arguments);
+        if generic_arguments.is_some() && namespace.is_none() {
+            self.refuse_generic_self(name, start);
+        }
+        let node = match namespace {
+            Some(namespace) => Node::StaticAccessor(Box::new(namespace), name, generic_arguments),
+            None => match generic_arguments {
+                Some(generic_arguments) => Node::AccessorWithGenerics(name, generic_arguments),
+                None => Node::Accessor(name),
+            },
+        };
+        Some((node, self.span_from(start)))
     }
 
     /// `(U in T: F<U>)` — a mapped tuple type (tried before the plain tuple type,
@@ -4218,6 +5562,24 @@ impl<'a, 'src> Parser<'a, 'src> {
             let elements =
                 parser.comma_list(Self::parse_type, |parser| parser.peek_is_ctrl(')'))?;
             parser.expect_ctrl(')')?;
+            // N113: `()` reads as the EMPTY tuple, and nothing can produce one
+            // — a field, parameter or return written at it is uninhabited, so
+            // every program that touched it was refused somewhere else, with a
+            // message about the type it did not get. The unit is `void`, and
+            // that is the whole of what the author meant. Refused here rather
+            // than in the analyzer because the spelling is the mistake: the
+            // type is read, so the rest of the declaration still parses.
+            if elements.is_empty() {
+                parser.errors.push(ParseError {
+                    span: parser.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "the unit type is spelled `void`: `()` is the empty tuple, \
+                         which no expression can produce",
+                    ),
+                    context: parser.context_stack.clone(),
+                    hint: None,
+                });
+            }
             Some((Node::Tuple(elements), parser.span_from(start)))
         })
     }
@@ -4409,13 +5771,14 @@ impl<'a, 'src> Parser<'a, 'src> {
     // --- Functions -----------------------------------------------------------
 
     /// A function declaration: the ORDERED attribute prefix (`[deprecated(..)]`,
-    /// `[extern(..)]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[doc(hidden)]`,
+    /// `[extern(..)]`, `[must_use]`, `[rpc]`, `[trait_only]`,
     /// `[platform(..)]` — each optional but IN THIS ORDER, a faithful quirk),
     /// then `async? external?
     /// fun name generics? (params) (: return)? (borrows param)? (block | ;)`.
     fn parse_function(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let deprecated = self.parse_deprecated_attribute();
+        let internal = self.parse_internal_attribute();
         let (extern_binding, extern_retains) = match self.parse_extern_attribute() {
             Some((binding, retains)) => (Some(binding), retains),
             None => (None, false),
@@ -4423,7 +5786,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let must_use = self.eat_marker_attribute("must_use");
         let rpc = self.eat_marker_attribute("rpc");
         let trait_only = self.eat_marker_attribute("trait_only");
-        let doc_hidden = self.parse_doc_hidden_attribute();
+        self.refuse_doc_hidden_attribute();
         let platform_fence = self.parse_platform_attribute().unwrap_or_default();
         let is_async = self.eat(&Token::Async);
         let external = self.eat(&Token::External);
@@ -4454,6 +5817,12 @@ impl<'a, 'src> Parser<'a, 'src> {
                 "an `external fun` binds a host function, whose calling convention is \
                  the host's; declare a tuple parameter (`items: T`) instead",
             );
+            self.reject_lazy_position(
+                &parameters.0,
+                "an `external fun` binds a host function, whose calling convention is \
+                 the host's: nothing on that side forces a thunk. Take the value \
+                 eagerly, or a closure the host calls",
+            );
         }
         if self.in_member_body {
             self.reject_spread_position(
@@ -4465,17 +5834,99 @@ impl<'a, 'src> Parser<'a, 'src> {
             );
         }
         self.reject_misplaced_spread(&parameters.0);
-        let return_type = if self.eat_op(":") {
+        let mut return_type = if self.eat_op(":") {
             Some(Box::new(self.in_context("return type", Self::parse_type)?))
         } else {
             None
         };
+        // The DECLARATION's `context` clause (B242): the contexts the body may
+        // read, stated on the signature. Two ways it arrives, because the type
+        // grammar carries the same suffix (§3.9) and takes it greedily:
+        //
+        //   `fun f(): i32 context settings`  — `parse_type` swallowed it as a
+        //     clause on the return type `i32`, where it means nothing and was
+        //     refused. PEELED here: the clause binds to the FUNCTION and
+        //     `i32` is the return type, which is the reading anyone writing it
+        //     meant.
+        //
+        // B309 splits that rule in two, because a CLOSURE return type can now
+        // carry a clause of its own: `fun f(): (|| View) context owner_scope`
+        // returns an INJECTED closure, and the clause is the type's. So the
+        // peel happens only where the return type cannot carry one — which is
+        // every shape B242 was written for, and none of B309's.
+        //   `fun f(x: i32) context settings` — no return type to swallow it, so
+        //     it is still on the token stream; parsed below, after `borrows`.
+        //
+        // Both record the NAME LIST's span, not the `context` word's: that is
+        // what the editor's "declare the inferred contexts" fix rewrites, and
+        // it is the same span whichever way the clause arrived. The formatter
+        // normalizes the two arrivals into ONE printed position — last, after
+        // `borrows` (E146 rule 3) — through a token canonicalization its
+        // safety net shares, so either way in is the same way out.
+        // B343 (R9): the one shape the position cannot spell, refused at the
+        // head rather than mis-bound. See [`take_misbound_return_clause`].
+        if let Some(annotation) = return_type.as_deref_mut() {
+            // The WRITTEN return type, taken before the clause comes off: it
+            // spans `|| void context c` whole, which is what the editor's
+            // parenthesizing fix rewrites and what makes the refusal point at
+            // the thing it is asking to be changed rather than at one name.
+            let written = annotation.1;
+            if take_misbound_return_clause(&mut annotation.0) {
+                self.errors.push(ParseError {
+                    span: written,
+                    reason: ParseErrorReason::Rule(MISBOUND_RETURN_CLAUSE),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
+        let mut contexts: Option<(Vec<Spanned<&'src str>>, Span)> = None;
+        if let Some(annotation) = return_type.take() {
+            match annotation.0 {
+                Node::TypeWithContexts(inner, names)
+                    if !return_type_carries_its_own_clause(&inner.0) =>
+                {
+                    let clause_start = names
+                        .first()
+                        .map(|(_, span)| span.start)
+                        .unwrap_or(annotation.1.start);
+                    contexts = Some((names, Span::from(clause_start..annotation.1.end)));
+                    return_type = Some(Box::new(*inner));
+                }
+                other => return_type = Some(Box::new((other, annotation.1))),
+            }
+        }
         // `borrows <param>` — the returned view is a projection of that parameter.
         let borrows = if self.eat(&Token::Borrows) {
             Some(self.eat_ident()?)
         } else {
             None
         };
+        if contexts.is_none() {
+            let clause_start = self.position;
+            if let Some(names) = self.parse_context_clause() {
+                let whole = self.span_from(clause_start);
+                let start = names
+                    .first()
+                    .map(|(_, span)| span.start)
+                    .unwrap_or(whole.start);
+                contexts = Some((names, Span::from(start..whole.end)));
+            }
+        }
+        // E148: where a `context` clause would be inserted — after the return
+        // type and after a `borrows` clause, before the body. Taken here,
+        // because this is the one moment the position exists: the analyzed
+        // program records where a signature's PIECES are and never where the
+        // signature ends, so the editor's fix had nowhere to write on a
+        // function carrying no clause.
+        let signature_end = self
+            .position
+            .checked_sub(1)
+            .and_then(|at| self.tokens.get(at))
+            .map(|(_, span)| {
+                let end = span.into_range().end;
+                Span::from(end..end)
+            });
         // A block body, or `;` for a signature-only declaration (a required trait
         // method or an `external` intrinsic). The block is tried first (chumsky
         // `block.map(Some).or(';'.map(|_| None))`), but the two lead on disjoint
@@ -4490,27 +5941,52 @@ impl<'a, 'src> Parser<'a, 'src> {
             let outer_member_body = std::mem::take(&mut self.in_member_body);
             let block = self.parse_block();
             self.in_member_body = outer_member_body;
-            Some(block?)
+            match block {
+                Some(block) => Some(block),
+                None => {
+                    // A COMMITTED demand, noted so the failure is located
+                    // (B172): `fun` + a name + `(params)` is a function and
+                    // nothing else in the grammar, so once the head has parsed
+                    // there is no alternative reading left to be quiet for. An
+                    // opening `{` is otherwise a silent head-check
+                    // (`expect_ctrl`), which left the farthest failure with the
+                    // `expression ;` alternative tried BEFORE this one — and
+                    // that one declines on the `fun` keyword, so a function
+                    // whose body was missing reported `found 'fun' expected an
+                    // expression` at the item's own first column.
+                    //
+                    // The `;` alternative is NOT spelled `"';'"`: that is
+                    // `TERMINATOR_EXPECTED` verbatim, and `emit_failure` reads
+                    // it as a statement that lost its terminator — which would
+                    // re-anchor this failure into the preceding gap and ask for
+                    // a `;` to end a statement that is not there.
+                    self.note_expected("'{'");
+                    self.note_expected("';' for a bodyless declaration");
+                    return None;
+                }
+            }
         };
         Some((
-            Node::Func(Func {
+            Node::Func(Box::new(Func {
                 name,
                 is_async,
                 external,
                 deprecated,
+                internal,
                 extern_binding,
                 extern_retains,
                 must_use,
                 rpc,
                 trait_only,
-                doc_hidden,
                 platform_fence,
                 generic_parameters,
                 parameters,
                 return_type,
                 borrows,
+                contexts,
+                signature_end,
                 body,
-            }),
+            })),
             self.span_from(start),
         ))
     }
@@ -4527,15 +6003,22 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((parameters, self.span_from(start)))
     }
 
-    /// One function parameter: `(mut | own | & mut?)? "..."? binder (: type)?`.
-    /// The convention is the explicit prefix, else inferred from a `&T` /
-    /// `&mut T` type, else `Bare`. A leading `mut` is binder mutability, not a
-    /// convention (proposal/mut-parameters.md): the body may rebind and
-    /// field-write its by-value copy, invisibly to the caller. A `...` marks a
-    /// SPREAD parameter (proposal/variadic-generics.md §S) — a call convention
-    /// over an ordinary tuple parameter.
+    /// One function parameter:
+    /// `"lazy"? (mut | own | & mut?)? "..."? binder (: type)?`. The convention
+    /// is the explicit prefix, else inferred from a `&T` / `&mut T` type, else
+    /// `Bare`. A leading `mut` is binder mutability, not a convention
+    /// (proposal/mut-parameters.md): the body may rebind and field-write its
+    /// by-value copy, invisibly to the caller. A `...` marks a SPREAD parameter
+    /// (proposal/variadic-generics.md §S) — a call convention over an ordinary
+    /// tuple parameter. A leading `lazy` marks a LAZY parameter
+    /// (proposal/lazy.md §1): the argument is thunked at the call site and
+    /// forced on the parameter's first read. `lazy` is first because it is what
+    /// the CALL SITE does with the argument, before any question of how the
+    /// callee receives it — and it composes with none of the answers to that
+    /// question (the three rules below).
     fn parse_function_parameter(&mut self) -> Option<Parameter<'src>> {
         let start = self.position;
+        let lazy = self.eat(&Token::Lazy);
         let mutable = self.eat(&Token::Mut);
         let prefix = if self.eat(&Token::Own) {
             Some(Convention::Own)
@@ -4551,6 +6034,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         // `own mut x` / `&mut mut x` — a stray `mut` after the convention,
         // consumed here so the binder still parses and the rule below fires.
         let misplaced_mut = prefix.is_some() && self.eat(&Token::Mut);
+        // `own lazy x` / `mut lazy x` — `lazy` written AFTER the prefix it
+        // belongs in front of. Consumed for `misplaced_mut`'s reason: `lazy`
+        // composes with neither, so the binder still parses and one of the
+        // composition rules below names the real problem, instead of the
+        // backtrack throwing "expected an expression" at the next declaration
+        // (diagnostics-standard B5).
+        let lazy = lazy | self.eat(&Token::Lazy);
         let spread = self.eat_spread();
         let (pattern, pattern_span) = self.parse_binder()?;
         let parameter_type = if self.eat_op(":") {
@@ -4586,6 +6076,57 @@ impl<'a, 'src> Parser<'a, 'src> {
             });
         }
         self.reject_mut_destructure(mutable, &pattern, pattern_span);
+        if lazy {
+            // A lazy argument is a THUNK the call site builds — there is no
+            // caller-side place for `own` to transfer or for a view to alias,
+            // and the value does not exist until the callee forces it
+            // (lazy.md §1). The inferred-convention arm catches `lazy x: &T`
+            // too.
+            if convention != Convention::Bare {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a `lazy` parameter receives a thunk the call site builds, and \
+                         the value does not exist until the callee forces it, so there \
+                         is nothing for `own` or a view (`&`, `&mut`) to transfer or \
+                         alias",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // `mut` makes the callee's by-value copy writable; a lazy parameter
+            // reads through its memo cell on every use, so there is no copy to
+            // rebind. `mut x = <the parameter>` in the body is the spelling.
+            if mutable {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a `lazy` parameter is forced on its first read and memoized, so \
+                         there is no by-value copy for `mut` to make writable; bind the \
+                         forced value in the body (`mut value = name;`)",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // The pack is built by the CALL SITE out of the collected
+            // arguments — one thunk cannot stand for a variable number of
+            // argument expressions.
+            if spread {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a spread parameter collects a variable number of argument \
+                         expressions into one pack, and `lazy` defers ONE expression; \
+                         declare a tuple parameter, or make the pack's elements lazy \
+                         where they are read",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
         if spread {
             // A spread parameter's argument is a value the CALL SITE builds out
             // of the collected arguments — there is no caller-side tuple to
@@ -4637,6 +6178,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             convention,
             mutable,
             spread,
+            lazy,
             span: pattern_span,
         })
     }
@@ -4711,16 +6253,36 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
+    /// A `lazy` parameter is refused wherever the thunk has no caller that could
+    /// build it or no callee that could force it (lazy.md §1): a closure literal
+    /// (a closure TYPE has no lazy form, so the modifier would be invisible
+    /// wherever the closure travels) and an `external fun` (the host's calling
+    /// convention forces nothing). The THREE homes that keep it are the three
+    /// the paper names — a free `fun`, an `impl` method and a `trait`
+    /// signature — so, unlike `...`, this is NOT refused in a member body.
+    fn reject_lazy_position(&mut self, parameters: &[Parameter<'src>], reason: &'static str) {
+        for parameter in parameters.iter().filter(|parameter| parameter.lazy) {
+            self.errors.push(ParseError {
+                span: parameter.span,
+                reason: ParseErrorReason::Rule(reason),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
+    }
+
     // --- Structs / enums -----------------------------------------------------
 
-    /// `resource? external? struct (name | null) generics? ({ fields } | ;)`. The
-    /// `resource` modifier sits in `external`'s position (canonical order `resource
-    /// external struct`); the name may be the `null` keyword (the built-in `external
-    /// struct null`); a bodyless `;` form is valid only for an `external` struct
-    /// (checked past the parser).
+    /// `labels [resource]? external? struct (name | null) generics? ({ fields } |
+    /// ;)`. The `[resource]` attribute (B413; the keyword it replaced sat in the
+    /// same place) closes the label prefix, ahead of `external` (canonical order
+    /// `[resource] external struct`); the name may be the `null` keyword (the
+    /// built-in `external struct null`); a bodyless `;` form is valid only for an
+    /// `external` struct (checked past the parser).
     fn parse_struct(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let resource = self.eat(&Token::Resource);
+        let labels = self.parse_item_labels();
+        let resource = self.parse_resource_kind();
         let external = self.eat(&Token::External);
         self.expect(&Token::Struct)?;
         let name_start = self.position;
@@ -4759,16 +6321,28 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         };
         Some((
-            Node::Struct(name, generic_parameters, external, resource, body),
+            Node::Struct(
+                name,
+                generic_parameters.map(Box::new),
+                external,
+                resource,
+                body.map(Box::new),
+                labels,
+            ),
             self.span_from(start),
         ))
     }
 
-    /// `[expose]? name (: type)?` — one struct field, carrying the whole-field span
-    /// (the inner name keeps its own span).
+    /// `[internal(..)]? [expose]? name (: type)?` — one struct field, carrying
+    /// the whole-field span (the inner name keeps its own span).
     fn parse_struct_field(&mut self) -> Option<Spanned<StructField<'src>>> {
         let start = self.position;
-        let exposed = self.eat_marker_attribute("expose");
+        // E213's label leads, as it does on a function: it is about the field
+        // rather than about what crosses the wire.
+        let internal = self.parse_internal_attribute();
+        // B413: a FIELD is no type declaration; refused, and parsed past.
+        self.refuse_misplaced_resource_attribute();
+        let exposed = self.eat_expose_attribute();
         let name_start = self.position;
         let name = self.eat_ident()?;
         let name = (name, self.span_from(name_start));
@@ -4777,14 +6351,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
-        Some(((name, type_, exposed), self.span_from(start)))
+        Some(((name, type_, exposed, internal), self.span_from(start)))
     }
 
-    /// `resource? enum name generics? { variants }`. There is no `external enum`, so
-    /// `resource` is the only leading modifier.
+    /// `labels [resource]? enum name generics? { variants }`. There is no
+    /// `external enum`, so `[resource]` (B413) is the only kind attribute.
     fn parse_enum(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let resource = self.eat(&Token::Resource);
+        let labels = self.parse_item_labels();
+        let resource = self.parse_resource_kind();
         self.expect(&Token::Enum)?;
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -4797,15 +6372,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.expect_ctrl('}')?;
         let variants = (variants, self.span_from(variants_start));
         Some((
-            Node::Enum(name, generic_parameters, resource, variants),
+            Node::Enum(
+                name,
+                generic_parameters.map(Box::new),
+                resource,
+                Box::new(variants),
+                labels,
+            ),
             self.span_from(start),
         ))
     }
 
-    /// One enum variant: `name (payload types)? (= backing value)?`, carrying
-    /// the whole-variant span.
+    /// One enum variant: `[internal(..)]? name (payload types)? (= backing
+    /// value)?`, carrying the whole-variant span.
     fn parse_enum_variant(&mut self) -> Option<Spanned<EnumVariant<'src>>> {
         let start = self.position;
+        // E221: a variant's label leads it, as a field's does (E213).
+        let internal = self.parse_internal_attribute();
+        // B413: nor is a VARIANT; refused, and parsed past.
+        self.refuse_misplaced_resource_attribute();
         let name = self.eat_name()?;
         let data = self.attempt(|parser| {
             parser.expect_ctrl('(')?;
@@ -4815,7 +6400,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         });
         let backing = self.parse_backing_literal();
         Some((
-            (name, data.unwrap_or_default(), backing),
+            (name, data.unwrap_or_default(), backing, internal),
             self.span_from(start),
         ))
     }
@@ -4882,6 +6467,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// the `+`-separated list of implemented traits.
     fn parse_impl(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         self.expect(&Token::Impl)?;
         let subject = self.parse_type()?;
         let traits = if self.eat(&Token::With) {
@@ -4892,7 +6478,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let body =
             self.within_member_body(|parser| parser.parse_item_body("implementation body"))?;
         Some((
-            Node::Impl(Box::new(subject), traits, body),
+            Node::Impl(Box::new(subject), traits, body, labels),
             self.span_from(start),
         ))
     }
@@ -4911,6 +6497,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// function declarations only.
     fn parse_trait(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         self.expect(&Token::Trait)?;
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -4923,33 +6510,92 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         let body = self.within_member_body(Self::parse_trait_body)?;
         Some((
-            Node::Trait(name, generic_parameters, supertraits, body),
+            Node::Trait(
+                name,
+                generic_parameters.map(Box::new),
+                supertraits,
+                Box::new(body),
+                labels,
+            ),
             self.span_from(start),
         ))
     }
 
-    /// `mod name { statements }` — a nested module.
+    /// `mod name { statements }` — a nested module. `self` is the file's own
+    /// module (B415's `mod self;`), so a nested module by that name is refused
+    /// where it is written — and still parsed, so the reader gets the one
+    /// sentence and not a cascade.
     fn parse_module(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Mod)?;
+        let name_span = self.here_span();
         let name = self.eat_ident()?;
+        if name == "self" {
+            self.errors.push(ParseError {
+                span: name_span,
+                reason: ParseErrorReason::Rule(MODULE_SELF_IS_RESERVED),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         let body = self.parse_item_body("module body")?;
         Some((Node::Module(name, body), self.span_from(start)))
     }
 
     // --- import / use / export -----------------------------------------------
 
-    /// `import <namespace_path>` (the node's span covers only `import <path>`; the
-    /// statement-level `;` is consumed separately).
+    /// `import <namespace_path> only?` (the node's span covers only
+    /// `import <path> only`; the statement-level `;` is consumed separately).
     fn parse_import(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Import)?;
+        // B320: one statement's record, never the previous statement's.
+        self.import_path_failure = None;
         let path = self.parse_namespace_path()?;
-        Some((Node::Import(path), self.span_from(start)))
+        let modifier = self.parse_import_modifier();
+        Some((Node::Import(path, modifier), self.span_from(start)))
     }
 
-    /// `import <namespace_path> ;` — an import used as a statement.
+    /// The trailing `only` of an `import` statement (B318 §2.4), or
+    /// [`ImportModifier::None`].
+    ///
+    /// `only` is CONTEXTUAL, exactly as `as` is
+    /// ([`Parser::parse_namespace_single_path`]'s E142 note), and for the same
+    /// reason: it is recognized only HERE, where the whole path has ended and a
+    /// `;` is the only other thing that may follow. A module or an item called
+    /// `only` is unaffected — it is reached as a path SEGMENT, which this rule
+    /// never sees — and the word occurs as an identifier nowhere in vilan, kolt
+    /// or the website (`visibility.md` §2.4: zero hits outside prose).
+    ///
+    /// It qualifies the STATEMENT, not a leaf, which is why it lives here and
+    /// not in the path grammar: `only` subtracts the implementations the walk
+    /// to the leaf brought, and that walk is the statement's.
+    fn parse_import_modifier(&mut self) -> ImportModifier {
+        if self.peek() != Some(&Token::Ident("only")) {
+            return ImportModifier::None;
+        }
+        let span = self.here_span();
+        self.bump();
+        ImportModifier::Only(span)
+    }
+
+    /// `import <namespace_path> only? ;` — an import used as a statement.
     fn parse_import_statement(&mut self) -> Option<Spanned<Node<'src>>> {
+        // B382: a steer on an import that is not re-exported publishes nothing
+        // — refused where it is written, and the import still parses, so the
+        // reader gets the one sentence and not a cascade.
+        if let Some(attribute) = self.attempt(|parser| {
+            let start = parser.position;
+            parser.parse_deprecated_attribute()?;
+            (parser.peek() == Some(&Token::Import)).then(|| parser.span_from(start))
+        }) {
+            self.errors.push(ParseError {
+                span: attribute,
+                reason: ParseErrorReason::Rule(DEPRECATED_IMPORT_IS_A_RE_EXPORT),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         let import = self.parse_import()?;
         if !self.eat_ctrl(';') {
             self.note_terminator();
@@ -4962,13 +6608,39 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_use(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Use)?;
+        // B320: one statement's record, never the previous statement's.
+        self.import_path_failure = None;
         let path = self.parse_namespace_path()?;
         Some((Node::Use(path), self.span_from(start)))
     }
 
-    /// `use <namespace_path> ;` — a use used as a statement.
+    /// `use <namespace_path> ;` — a use used as a statement. A trailing `only`
+    /// is refused where it is written ([`USE_TAKES_NO_ONLY`]) and then eaten,
+    /// so the statement still parses and the reader gets one message rather
+    /// than a cascade at the `;`.
     fn parse_use_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         let use_ = self.parse_use()?;
+        if let Node::Use(branch) = &use_.0 {
+            let mut selectors = Vec::new();
+            collect_branch_selectors(branch, &mut selectors);
+            for span in selectors {
+                self.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(USE_TAKES_NO_IMPL_SELECTOR),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
+        if self.peek() == Some(&Token::Ident("only")) {
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(USE_TAKES_NO_ONLY),
+                context: Vec::new(),
+                hint: None,
+            });
+            self.bump();
+        }
         if !self.eat_ctrl(';') {
             self.note_terminator();
             return None;
@@ -4982,8 +6654,125 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_export(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Export)?;
+        // B318 §2.1: `export *;` is the module-wide marker. The lookahead takes
+        // the `;` as well as the `*`, because a following NAME is a real
+        // expression — `export * helper;` is `export` of the deref `*helper`
+        // (probe P1b) — and reading that as a mistyped `export *;` would take
+        // a shape the language already has. Nothing else in the language has
+        // this one: `*` starts a prefix deref and finds no operand at the `;`.
+        if self.peek_is_op("*") && matches!(self.peek_at(1), Some(Token::Ctrl(';'))) {
+            self.bump();
+            self.bump();
+            return Some((Node::ExportAll, self.span_from(start)));
+        }
+        let scope = self.parse_export_scope();
+        // B382: `export [deprecated("use …")] import …;` — the steer is the
+        // RE-EXPORT's, so the export carries it. Read only ahead of `import`:
+        // before a declaration the same attribute is the declaration's own
+        // prefix, which its production reads.
+        let labels = self.attempt(|parser| {
+            let steer = parser.parse_deprecated_attribute()?;
+            (parser.peek() == Some(&Token::Import)).then(|| {
+                Box::new(Labels {
+                    deprecated: Some(steer),
+                    ..Labels::default()
+                })
+            })
+        });
         let inner = self.parse_statement()?;
-        Some((Node::Export(Box::new(inner)), self.span_from(start)))
+        // B321: `parse_statement` reads an EXPRESSION statement too, so
+        // `export (helper);` and `export * helper;` parsed and meant nothing.
+        // Reported and KEPT — the inner statement is whatever the author wrote
+        // and dropping it would unbind a name the rest of the file uses, which
+        // is `recover_missing_terminator`'s argument applied to a wrapper.
+        if !export_takes(&inner.0) {
+            self.errors.push(ParseError {
+                span: inner.1,
+                reason: ParseErrorReason::Rule(EXPORT_TAKES_AN_ITEM),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
+        Some((
+            Node::Export(scope, Box::new(inner), labels),
+            self.span_from(start),
+        ))
+    }
+
+    /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
+    /// marker carries none.
+    ///
+    /// `in` is already [`Token::In`] (`for … in`), so the inner grammar needs no
+    /// contextual-keyword dance; `mod` is [`Token::Mod`] and is admitted as a
+    /// path segment by name, which is what makes `export(in mod)` spellable
+    /// without reserving a second word. A `(` that is NOT followed by `in`
+    /// declines here and falls to the statement reader, where [`export_takes`]
+    /// refuses it and names this form — which is how `export(pkg)`, the spelling
+    /// that reads as a CALL, gets a steer rather than a silent acceptance.
+    fn parse_export_scope(&mut self) -> Option<Box<ExportScope<'src>>> {
+        self.attempt(|parser| {
+            let start = parser.position;
+            parser.expect_ctrl('(')?;
+            // §2.2: `export(pkg)` — the spelling P2c shows reads as a CALL — is
+            // the scope form with `in` left out. Taken and REPORTED rather than
+            // declined, so the author gets the steer instead of the missing-`;`
+            // three tokens later that the fall-through produced. The `;`
+            // lookahead is what keeps it off `export (helper);`, which is an
+            // expression STATEMENT and B321's case: a scope is followed by the
+            // item it narrows, never by a terminator.
+            let missing_in = !parser.eat(&Token::In);
+            if missing_in && parser.terminates_an_export_group() {
+                return None;
+            }
+            let mut path = Vec::new();
+            loop {
+                let at = parser.position;
+                let segment = if parser.eat(&Token::Mod) {
+                    "mod"
+                } else {
+                    parser.eat_name()?
+                };
+                path.push((segment, parser.span_from(at)));
+                if !parser.eat_op("::") {
+                    break;
+                }
+            }
+            parser.expect_ctrl(')')?;
+            let span = parser.span_from(start);
+            if missing_in {
+                parser.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(EXPORT_TAKES_AN_ITEM),
+                    context: parser.context_stack.clone(),
+                    hint: None,
+                });
+            }
+            Some(Box::new(ExportScope { path, span }))
+        })
+    }
+
+    /// Whether the parenthesised group opening at the current position is
+    /// closed by a `;` — an expression STATEMENT after `export`, not a
+    /// visibility scope. Scans forward at paren depth, stopping at anything a
+    /// balanced group cannot contain.
+    fn terminates_an_export_group(&self) -> bool {
+        let mut depth = 1usize;
+        let mut at = self.position;
+        while let Some((token, _)) = self.tokens.get(at) {
+            match token {
+                Token::Ctrl('(') => depth += 1,
+                Token::Ctrl(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.tokens.get(at + 1), Some((Token::Ctrl(';'), _)));
+                    }
+                }
+                Token::Ctrl('{') | Token::Ctrl('}') | Token::Ctrl(';') => return false,
+                _ => {}
+            }
+            at += 1;
+        }
+        false
     }
 
     /// A `::`-separated namespace path ending in a name or a `{ a, b }` set (H2) —
@@ -5007,36 +6796,297 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(path) = self.attempt(Self::parse_namespace_single_path) {
             return Some(path);
         }
-        self.parse_namespace_set()
+        // A selector OUTSIDE a set: refused where it is written rather than at
+        // column one, and then parsed anyway so the rest of the statement is
+        // still read (`visibility.md` §2.5). Marked or not — `#(impl T)` is the
+        // same element and earns the same rule.
+        if self.at_impl_selector() || self.at_reach_marked_impl_selector() {
+            let span = self.here_span();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(IMPL_SELECTOR_IS_A_BRACE_ELEMENT),
+                context: Vec::new(),
+                hint: None,
+            });
+            return self.parse_namespace_set_element();
+        }
+        let branch = self.parse_namespace_set();
+        if branch.is_none() {
+            // B320: neither alternative reads what stands here, so the path
+            // genuinely stops at this token. A DECLINE of this production always
+            // fails the whole statement (its caller propagates with `?`), which
+            // is what keeps the record free of positions a sibling then reads.
+            self.note_import_failure(self.position);
+        }
+        branch
     }
 
-    /// `name (:: branch)?` — one path in a namespace path (the chumsky `path`). The
-    /// name's `ImportBranch::Path` span is the name token only; the continuation is
-    /// a full [`Parser::parse_namespace_path`] (a further path or a set).
+    /// Whether the cursor sits on `( impl` — the selector's two-token gate
+    /// (B318 S3). A `(` that is not followed by `impl` is not a selector and is
+    /// left to whatever else may read it.
+    fn at_impl_selector(&self) -> bool {
+        self.peek_is_ctrl('(') && self.peek_at(1) == Some(&Token::Impl)
+    }
+
+    /// Whether the cursor sits on `# ( impl` — [`Parser::at_impl_selector`]'s
+    /// reach-marked form (B318 S4), which
+    /// [`Parser::parse_namespace_single_path`] reads and which the
+    /// outside-a-set rule has to recognize for itself.
+    fn at_reach_marked_impl_selector(&self) -> bool {
+        self.peek_is(&Token::Hash)
+            && self.peek_at(1) == Some(&Token::Ctrl('('))
+            && self.peek_at(2) == Some(&Token::Impl)
+    }
+
+    /// `"(" "impl" type ")" ( "::" ( NAME | "{" NAME,* "}" ) )?` — an impl
+    /// SELECTOR (B318 S3, `proposal/visibility.md` §2.5).
+    ///
+    /// COMMITTED at the gate: once `( impl` has been seen there is no other
+    /// reading of the tokens, so a failure past it reports at the token the
+    /// selector stopped on with [`IMPL_SELECTOR_SHAPE`] and the branch is still
+    /// produced (empty of members). Returning `None` would fail the whole
+    /// statement and the recovery would report `found 'import' expected an
+    /// expression` at column one — P5/P5b/P5c/P10b's shared failure, the one
+    /// §2.5 says this slice must remove before it adds the grammar.
+    ///
+    /// The subject is the ordinary type grammar, which already admits `_` at
+    /// any position as B294's anonymous binder — the selector's placeholder,
+    /// with no lexer or grammar rule of its own. What the selector refuses is a
+    /// NAMED binder and a bound ([`IMPL_SELECTOR_TAKES_NO_BINDER`]).
+    fn parse_impl_selector(&mut self) -> Option<ImportBranch<'src>> {
+        let start = self.position;
+        self.expect_ctrl('(')?;
+        self.expect(&Token::Impl)?;
+        let subject = match self.parse_type() {
+            Some(subject) => subject,
+            None => return Some(self.selector_refusal(start, None, Vec::new())),
+        };
+        self.refuse_selector_binders(&subject);
+        let subject_text = self.text_of(subject.1);
+        if !self.eat_ctrl(')') {
+            return Some(self.selector_refusal(start, Some((subject, subject_text)), Vec::new()));
+        }
+        let mut members = Vec::new();
+        if self.eat_op("::") {
+            if self.eat_ctrl('{') {
+                let names =
+                    self.comma_list(Self::eat_member_name, |parser| parser.peek_is_ctrl('}'));
+                match names {
+                    Some(names) => members = names,
+                    None => {
+                        return Some(self.selector_refusal(
+                            start,
+                            Some((subject, subject_text)),
+                            Vec::new(),
+                        ));
+                    }
+                }
+                if !self.eat_ctrl('}') {
+                    return Some(self.selector_refusal(
+                        start,
+                        Some((subject, subject_text)),
+                        members,
+                    ));
+                }
+            } else {
+                match self.eat_member_name() {
+                    Some(member) => members.push(member),
+                    None => {
+                        return Some(self.selector_refusal(
+                            start,
+                            Some((subject, subject_text)),
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.refuse_selector_alias();
+        Some(ImportBranch::Selector(Box::new(ImplSelector {
+            subject: Some(Box::new(subject)),
+            subject_text: Cow::Borrowed(subject_text),
+            members,
+            span: self.span_from(start),
+        })))
+    }
+
+    /// One member name inside a selector's `::name` / `::{ a, b }` tail, with
+    /// its span. `as` on one is refused where it is written
+    /// ([`IMPL_SELECTOR_REFUSES_AS`]) and eaten, so the set still reads.
+    fn eat_member_name(&mut self) -> Option<(&'src str, Span)> {
+        let start = self.position;
+        let name = self.eat_name()?;
+        let span = self.span_from(start);
+        self.refuse_selector_alias();
+        Some((name, span))
+    }
+
+    /// Refuses a contextual `as <name>` at the cursor and consumes it (B318:
+    /// a selector takes no alias, on the block or on a member).
+    fn refuse_selector_alias(&mut self) {
+        if self.peek() != Some(&Token::Ident("as"))
+            || !matches!(self.peek_at(1), Some(Token::Ident(_)))
+        {
+            return;
+        }
+        let start = self.position;
+        self.bump();
+        self.bump();
+        self.errors.push(ParseError {
+            span: self.span_from(start),
+            reason: ParseErrorReason::Rule(IMPL_SELECTOR_REFUSES_AS),
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// Refuses every NAMED binder and every BOUND binder in a selector's
+    /// subject (B318: no binders are written in a selector). A bare `_` is the
+    /// placeholder and is the one binder node that survives.
+    fn refuse_selector_binders(&mut self, subject: &Spanned<Node<'src>>) {
+        let mut refused = Vec::new();
+        collect_selector_binders(subject, &mut refused);
+        for span in refused {
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(IMPL_SELECTOR_TAKES_NO_BINDER),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
+    }
+
+    /// The shape refusal, reported at the token the selector stopped on, plus
+    /// the branch the caller returns in its place.
+    fn selector_refusal(
+        &mut self,
+        start: usize,
+        subject: Option<(Spanned<Node<'src>>, &'src str)>,
+        members: Vec<(&'src str, Span)>,
+    ) -> ImportBranch<'src> {
+        self.errors.push(ParseError {
+            span: self.here_span(),
+            reason: ParseErrorReason::Rule(IMPL_SELECTOR_SHAPE),
+            context: Vec::new(),
+            hint: None,
+        });
+        let (subject, subject_text) = match subject {
+            Some((subject, text)) => (Some(Box::new(subject)), text),
+            None => (None, ""),
+        };
+        ImportBranch::Selector(Box::new(ImplSelector {
+            subject,
+            subject_text: Cow::Borrowed(subject_text),
+            members,
+            span: self.span_from(start),
+        }))
+    }
+
+    /// The source text a span covers — the selector's subject, reprinted
+    /// verbatim by the formatter and keyed on by the sorter.
+    fn text_of(&self, span: Span) -> &'src str {
+        self.source.get(span.into_range()).unwrap_or("")
+    }
+
+    /// `name ( :: branch | as name )?` — one path in a namespace path (the
+    /// chumsky `path`). The name's `ImportBranch::Path` span is the name token
+    /// only; a `::` continuation is a full [`Parser::parse_namespace_path`] (a
+    /// further path or a set).
+    ///
+    /// `as` is CONTEXTUAL, not a keyword: it is recognized only here, where a
+    /// path segment has ended and the next two tokens are `as <name>`, so a
+    /// module or an item actually called `as` is unaffected and no existing
+    /// program's identifier is taken (E142). The alias renames the LEAF, so it
+    /// is an alternative to the `::` continuation rather than something that
+    /// can follow one — `a::b as c::d` does not parse, and the tail type says
+    /// so. It reaches a brace element by the same production: `{ a as b, c }`.
     fn parse_namespace_single_path(&mut self) -> Option<ImportBranch<'src>> {
+        // B318 §1/§2.3: `#` before a segment is the REACH marker — "I know this
+        // is not exported and I want it anyway". It wraps whatever follows
+        // rather than becoming part of it, so it composes with a leaf
+        // (`{ #hidden }`), with a segment mid-path (`a::#m::helper`) and with
+        // S3's selector, and it adds no path segment — which is what keeps
+        // go-to-definition, find-references and RENAME pointing at the name.
+        if self.peek_is(&Token::Hash) {
+            let marker = self.here_span();
+            self.bump();
+            // B318 S4: `#(impl T)` — the marker on a SELECTOR, which is the one
+            // and only reach to an `impl` block its module does not `export`
+            // (RULED 2026-09-13: an invisible impl contributes no methods and
+            // no ambient impls; `#` is the way in). The selector is not a path,
+            // so the recursion below cannot read it: this is the seam, at
+            // `at_impl_selector`, and the wrapper composes exactly as it does
+            // over a name.
+            let inner = if self.at_impl_selector() {
+                self.parse_impl_selector()?
+            } else {
+                self.parse_namespace_single_path()?
+            };
+            return Some(ImportBranch::Reach(marker, Box::new(inner)));
+        }
         let start = self.position;
         let name = self.eat_name()?;
         let name_span = self.span_from(start);
-        let continuation = if self.eat_op("::") {
-            Some(Box::new(self.parse_namespace_path()?))
-        } else {
-            None
-        };
-        Some(ImportBranch::Path(name, name_span, continuation))
+        if self.eat_op("::") {
+            self.refuse_a_path_crossing_a_line()?;
+            let continuation = Box::new(self.parse_namespace_path()?);
+            return Some(ImportBranch::Path(
+                name,
+                name_span,
+                ImportTail::Continue(continuation),
+            ));
+        }
+        if self.peek() == Some(&Token::Ident("as"))
+            && matches!(self.peek_at(1), Some(Token::Ident(_)))
+        {
+            self.bump();
+            let alias_start = self.position;
+            let alias = self.eat_name().expect("peeked as an identifier");
+            return Some(ImportBranch::Path(
+                name,
+                name_span,
+                ImportTail::Alias(alias, self.span_from(alias_start)),
+            ));
+        }
+        Some(ImportBranch::Path(name, name_span, ImportTail::Leaf))
     }
 
-    /// `{ path, ... }` — a brace-delimited set of paths (allow-trailing). Each
-    /// element is a single path (chumsky's `path`, which must start with a name),
-    /// so a nested bare set is not a legal element.
+    /// `{ path | selector, ... }` — a brace-delimited set (allow-trailing).
+    /// Each element is a single path (chumsky's `path`, which must start with a
+    /// name) or, since B318 S3, an `(impl TYPE)` SELECTOR — tried first,
+    /// because its `(` begins nothing else here. A nested bare set is still not
+    /// a legal element.
     fn parse_namespace_set(&mut self) -> Option<ImportBranch<'src>> {
         self.attempt(|parser| {
             parser.expect_ctrl('{')?;
-            let paths = parser.comma_list(Self::parse_namespace_single_path, |parser| {
-                parser.peek_is_ctrl('}')
-            })?;
+            let paths = parser.comma_list(
+                |parser| {
+                    // B320: an element that is neither a path nor a selector stops the set HERE,
+                    // and here is deeper than the `{` the enclosing production
+                    // would otherwise record — `{ (impl T) }` reports on the
+                    // `(`, which is the token that was typed.
+                    let at = parser.position;
+                    let element = parser.parse_namespace_set_element();
+                    if element.is_none() {
+                        parser.note_import_failure(at);
+                    }
+                    element
+                },
+                |parser| parser.peek_is_ctrl('}'),
+            )?;
             parser.expect_ctrl('}')?;
             Some(ImportBranch::Set(paths))
         })
+    }
+
+    /// One element of a brace set: an `(impl …)` selector, or a single path.
+    fn parse_namespace_set_element(&mut self) -> Option<ImportBranch<'src>> {
+        if self.at_impl_selector() {
+            return self.parse_impl_selector();
+        }
+        // `#(impl T)` falls through: the path production owns the marker and
+        // routes back to the selector past it (B318 S4).
+        self.parse_namespace_single_path()
     }
 
     // --- Derive / service / macro-attribute items ----------------------------
@@ -5077,36 +7127,120 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((name, self.span_from(start)))
     }
 
-    /// `[service(Client)?] struct …` — a service struct; the argument names the
-    /// generated client type (default `<Struct>Client`).
+    /// `[service(Client)?]` / `[client_service]` (either order, or both) `struct …`
+    /// — a service struct. `[service]`'s first argument names the generated client
+    /// type (default `<Struct>Client`); its `client = H` argument names the
+    /// `[client_service]` struct this server may call back into (§9.3, R1).
     fn parse_service_item(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let client_name = self.parse_service_attribute()?;
+        let mut attribute = ServiceAttr::default();
+        // Either attribute may lead, and a peer-to-peer struct writes both.
+        loop {
+            if let Some((client_name, handler_name, http)) = self.parse_service_attribute() {
+                if attribute.server_side {
+                    return None;
+                }
+                attribute.server_side = true;
+                attribute.client_name = client_name;
+                attribute.handler_name = handler_name;
+                attribute.http = http;
+            } else if self.parse_client_service_attribute().is_some() {
+                if attribute.client_side {
+                    return None;
+                }
+                attribute.client_side = true;
+            } else {
+                break;
+            }
+        }
+        if !attribute.server_side && !attribute.client_side {
+            return None;
+        }
         let item = self.parse_struct()?;
         Some((
-            Node::Service(client_name, Box::new(item)),
+            Node::Service(attribute, Box::new(item)),
             self.span_from(start),
         ))
     }
 
-    /// `[service(Name)?]` — a service attribute. The outer `Option` is whether this
-    /// is a service attribute at all (`None` ⇒ not one); the inner `Option<&str>` is
-    /// the optional `(Name)` client name.
-    fn parse_service_attribute(&mut self) -> Option<Option<&'src str>> {
+    /// `[service(Name?, http?, client = Handler?)?]` — a service attribute. The
+    /// outer `Option` is whether this is a service attribute at all (`None` ⇒
+    /// not one); the triple is the optional client name, the optional `client =
+    /// H` handler name, and whether the `http` marker was written (A120 S5).
+    #[allow(clippy::type_complexity)]
+    fn parse_service_attribute(&mut self) -> Option<(Option<&'src str>, Option<&'src str>, bool)> {
         self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("service")) {
                 return None;
             }
             parser.bump();
-            let client_name = parser.attempt(|parser| {
+            let arguments = parser.attempt(|parser| {
                 parser.expect_ctrl('(')?;
-                let name = parser.eat_ident()?;
+                let mut client_name = None;
+                let mut handler_name = None;
+                let mut http = false;
+                while !parser.peek_is_ctrl(')') {
+                    // `http` — the marker (A120 S5). A bare word in any
+                    // position, and never a client NAME: a client type spelled
+                    // `http` would be a lowercase type, which nothing in the
+                    // language writes, and reading the word as the marker is
+                    // what lets `[service(http)]` keep the default client name.
+                    if parser.peek() == Some(&Token::Ident("http")) {
+                        if http {
+                            return None;
+                        }
+                        parser.bump();
+                        http = true;
+                        if !parser.eat_ctrl(',') {
+                            break;
+                        }
+                        continue;
+                    }
+                    // `client = Handler` — the one named argument; anything else
+                    // is the positional client name, which leads or not at all.
+                    let named = parser.attempt(|parser| {
+                        if parser.peek() != Some(&Token::Ident("client")) {
+                            return None;
+                        }
+                        parser.bump();
+                        if !parser.eat_op("=") {
+                            return None;
+                        }
+                        parser.eat_ident()
+                    });
+                    match named {
+                        Some(name) => handler_name = Some(name),
+                        None => {
+                            if client_name.is_some() || handler_name.is_some() || http {
+                                return None;
+                            }
+                            client_name = Some(parser.eat_ident()?);
+                        }
+                    }
+                    if !parser.eat_ctrl(',') {
+                        break;
+                    }
+                }
                 parser.expect_ctrl(')')?;
-                Some(name)
+                Some((client_name, handler_name, http))
             });
             parser.expect_ctrl(']')?;
-            Some(client_name)
+            Some(arguments.unwrap_or((None, None, false)))
+        })
+    }
+
+    /// `[client_service]` — the handler-side attribute (§9.3, R1). No arguments:
+    /// the proxy the server calls through is always `<Struct>Proxy`.
+    fn parse_client_service_attribute(&mut self) -> Option<()> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("client_service")) {
+                return None;
+            }
+            parser.bump();
+            parser.expect_ctrl(']')?;
+            Some(())
         })
     }
 
@@ -5158,6 +7292,108 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `[ marker ]` — a bare marker attribute (`[must_use]`, `[rpc]`, `[trait_only]`,
     /// `[expose]`). Consumes it and returns `true` when the exact `[ marker ]` is
     /// next; leaves the cursor untouched and returns `false` otherwise.
+    /// `[expose]`, `[expose(keyed)]` or `[expose(keyed = K)]` — a struct
+    /// field's exposure, or [`Exposure::None`] when no expose attribute leads.
+    ///
+    /// The argument form is parsed rather than matched as a marker so that an
+    /// unrecognized one is REFUSED by name instead of silently reading as a
+    /// plain `[expose]` (the shapes differ on the wire, so a typo would ship a
+    /// whole-value channel where the author asked for a keyed one). The
+    /// attribute is still consumed on that path, so the field itself parses and
+    /// the file keeps going.
+    ///
+    /// `= K` (tracker A51) names the KEY TYPE, and it is the one attribute
+    /// argument in the language that is a type rather than a word: a keyed
+    /// mirror is a `KeyedSource<K, T>`, the `[service]` expansion reads both
+    /// types off the annotation because vilan has no associated types, and a
+    /// `List<T>` names only the element. It is parsed with the ordinary type
+    /// grammar and kept as the SOURCE TEXT it spans — the macro engine takes it
+    /// as a string and the formatter reprints it, and nothing here resolves it.
+    /// Its SPAN rides with the text (tracker A56): the analyzer's refusal of an
+    /// argument that disagrees with a `Map<K, V>` element's own key is about
+    /// the ARGUMENT, and has to point at it.
+    fn eat_expose_attribute(&mut self) -> Exposure<'src> {
+        let form = self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("expose")) {
+                return None;
+            }
+            parser.bump();
+            let form = if parser.eat_ctrl('(') {
+                let name_start = parser.position;
+                let name = parser.eat_ident()?;
+                let name_span = parser.span_from(name_start);
+                // `= K`: the key type, as written. A malformed one is refused
+                // where it stands rather than backtracking the whole attribute,
+                // which would report it as "expected a field name".
+                let key = if parser.eat_op("=") {
+                    let key_start = parser.position;
+                    match parser.parse_type() {
+                        Some((_node, span)) => {
+                            Some(Ok((&parser.source[span.start..span.end], span)))
+                        }
+                        None => {
+                            // Skip to the closing paren so the attribute still
+                            // CONSUMES, and the refusal below is what the
+                            // author reads. Without this the `attempt` fails at
+                            // `expect_ctrl(')')`, rolls the whole attribute
+                            // back — errors included — and the field is
+                            // reported as a missing name.
+                            while parser.peek().is_some() && !parser.peek_is_ctrl(')') {
+                                parser.bump();
+                            }
+                            Some(Err(parser.span_from(key_start)))
+                        }
+                    }
+                } else {
+                    None
+                };
+                parser.expect_ctrl(')')?;
+                Some((name, name_span, key))
+            } else {
+                None
+            };
+            parser.expect_ctrl(']')?;
+            Some(form)
+        });
+        match form {
+            None => Exposure::None,
+            Some(None) => Exposure::Whole,
+            Some(Some(("keyed", _span, key))) => match key {
+                None => Exposure::Keyed(None),
+                Some(Ok(written)) => Exposure::Keyed(Some(written)),
+                Some(Err(span)) => {
+                    self.errors.push(ParseError {
+                        span,
+                        reason: ParseErrorReason::Rule(
+                            "`[expose(keyed = …)]`'s argument is a TYPE — the key type the \
+                             mirror is keyed by, as in `[expose(keyed = str)]`. It is written \
+                             here because a keyed mirror is a `KeyedSource<K, T>` and a \
+                             `List<T>` names only the element; a `Map<K, V>` element names both, \
+                             and takes the bare `[expose(keyed)]`",
+                        ),
+                        context: Vec::new(),
+                        hint: None,
+                    });
+                    Exposure::Keyed(None)
+                }
+            },
+            Some(Some((_other, span, _key))) => {
+                self.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(
+                        "the only argument `[expose]` takes is `keyed` — write `[expose]` for a \
+                         whole-value channel, `[expose(keyed)]` for a keyed `Map<K, V>`, and \
+                         `[expose(keyed = K)]` for any other keyed collection",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+                Exposure::Whole
+            }
+        }
+    }
+
     fn eat_marker_attribute(&mut self, marker: &str) -> bool {
         self.attempt(|parser| {
             parser.expect_ctrl('[')?;
@@ -5224,10 +7460,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
-    /// `[doc(hidden)]` — a tooling marker (omit from completion). Returns whether it
-    /// is present.
-    fn parse_doc_hidden_attribute(&mut self) -> bool {
-        self.attempt(|parser| {
+    /// `[doc(hidden)]` — RETIRED (B318 §7.5). Recognized and REFUSED, rather
+    /// than simply deleted from the grammar: the attribute is in the wild (the
+    /// book recommended it), and "found `[` expected `fun`" would tell its
+    /// author nothing. Consumed, so the item below it parses normally and the
+    /// file raises one diagnostic rather than cascading.
+    fn refuse_doc_hidden_attribute(&mut self) {
+        let start = self.position;
+        let refused = self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("doc")) {
                 return None;
@@ -5241,8 +7481,15 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(())
-        })
-        .is_some()
+        });
+        if refused.is_some() {
+            self.errors.push(ParseError {
+                span: (self.token_span(start).start..self.token_span(self.position - 1).end).into(),
+                reason: ParseErrorReason::Rule(DOC_HIDDEN_IS_SUPERSEDED),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
     }
 
     /// `[platform("a", "b")]` — a platform fence (≥1 string patterns, allow-trailing),
@@ -5289,6 +7536,102 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(']')?;
             Some(steer)
         })
+    }
+
+    /// `[internal("reason")]` — E213's label for an item that is reachable on
+    /// purpose and dangerous on purpose. Exactly one quoted string, REQUIRED:
+    /// the reason is what hover leads with and what completion shows, and a
+    /// label with no reason is how these rot. `None` when no internal
+    /// attribute leads.
+    ///
+    /// Shaped on [`Self::parse_deprecated_attribute`], and placed beside it in
+    /// the ordered prefix for the same reason: both are labels ABOUT the
+    /// declaration rather than parts of its signature.
+    fn parse_internal_attribute(&mut self) -> Option<&'src str> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("internal")) {
+                return None;
+            }
+            parser.bump();
+            parser.expect_ctrl('(')?;
+            let Some(Token::String(reason)) = parser.peek() else {
+                return None;
+            };
+            let reason = *reason;
+            parser.bump();
+            parser.expect_ctrl(')')?;
+            parser.expect_ctrl(']')?;
+            Some(reason)
+        })
+    }
+
+    /// The labels an item declaration carries about itself (E221) — the
+    /// ordered prefix `[internal("reason")]?`, read ahead of a struct, an
+    /// enum, a trait or a module `let`. `None` when no label leads, which is
+    /// the one-null-pointer case nearly every declaration takes.
+    fn parse_item_labels(&mut self) -> ItemLabels<'src> {
+        // B382: `[deprecated("use …")]` leads, as it leads a function's prefix;
+        // F27 R1's `[platform("…")]` follows `[internal(..)]`, the order a
+        // function's prefix gives the three.
+        let deprecated = self.parse_deprecated_attribute();
+        let internal = self.parse_internal_attribute();
+        let platform = self.parse_platform_attribute().unwrap_or_default();
+        if deprecated.is_none() && internal.is_none() && platform.is_empty() {
+            return None;
+        }
+        Some(Box::new(Labels {
+            deprecated,
+            internal,
+            platform,
+        }))
+    }
+
+    /// `[platform("…", …)]? mod self;` — the host of the FILE's own
+    /// attributes (B415): today the file's platform (F27 R1), which R1 first
+    /// shipped as the bare `[platform(..)];`. `self` is the file's own module,
+    /// and a `mod` with no body is only ever this one. A host with no attribute
+    /// declares nothing (empty patterns). Where it may stand is
+    /// [`Parser::parse_statement_inner`]'s rule, not this production's; a
+    /// `mod self` WITH a body is [`Parser::parse_module`]'s refusal.
+    fn parse_module_self(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let patterns = self.parse_platform_attribute().unwrap_or_default();
+        self.expect(&Token::Mod)?;
+        if self.peek() != Some(&Token::Ident("self")) {
+            return None;
+        }
+        self.bump();
+        let span = self.span_from(start);
+        self.expect_ctrl(';')?;
+        Some((Node::ModulePlatform(patterns), span))
+    }
+
+    /// A LABELLED `let` statement (E221): `[internal("reason")] let name = …;`.
+    ///
+    /// Read at statement position ahead of the expression fork, because `[`
+    /// begins a list literal there: without this, `[internal("x")]` parses as
+    /// a one-element list and the `let` after it as a missing `;`. A label is
+    /// required — an unlabelled `let` is the expression fork's, unchanged — and
+    /// only a plain binding takes one (a destructuring `let` names several
+    /// things and none of them is an item). Whether the binding is a MODULE
+    /// binding is not the parser's to know (a module and a function body share
+    /// this production); `labels::check` refuses a labelled local.
+    fn parse_labelled_let(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let labels = self.parse_item_labels()?;
+        let (node, _) = self.parse_let()?;
+        // The statement's span ends where an unlabelled `let`'s does, before
+        // its `;` — it only STARTS earlier, at the label.
+        let span = self.span_from(start);
+        self.expect_ctrl(';')?;
+        let Node::Let(name, type_, value, mutable, lazy, None) = node else {
+            return None;
+        };
+        Some((
+            Node::Let(name, type_, value, mutable, lazy, Some(labels)),
+            span,
+        ))
     }
 
     /// One platform pattern: a quoted string with its span.
@@ -5396,15 +7739,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// `resource` NOT followed by `external` / `struct` / `enum` — the misplaced-
-    /// modifier steer (item 15 in the statement choice, after `struct`/`enum`, so a
-    /// valid `resource struct` / `resource external struct` / `resource enum` is
-    /// never shadowed). Emits a parse error and recovers to a `Node::Error` spanning
-    /// the `resource` keyword, leaving the offending token unconsumed (so
-    /// `fun`/`impl`/`let`/`trait` still parse on the next statement).
+    /// `[resource]` NOT followed by `external` / `struct` / `enum` — the
+    /// misplaced-attribute steer (item 15 in the statement choice, after
+    /// `struct`/`enum`, so a valid `[resource] struct` / `[resource] external
+    /// struct` / `[resource] enum` is never shadowed). Emits a parse error and
+    /// recovers to a `Node::Error` spanning the attribute, leaving the item after
+    /// it unconsumed (so `fun`/`impl`/`let`/`trait` still parse on the next
+    /// statement). B413 moved the kind from a keyword to this attribute; the
+    /// steer moved with it.
     fn parse_misplaced_resource(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        self.expect(&Token::Resource)?;
+        if !self.eat_marker_attribute("resource") {
+            return None;
+        }
         if matches!(
             self.peek(),
             Some(Token::External | Token::Struct | Token::Enum)
@@ -5412,16 +7759,66 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         }
         let span = self.span_from(start);
+        self.push_misplaced_resource(span);
+        Some((Node::Error, span))
+    }
+
+    /// The `[resource]` kind of a struct or an enum (B413), or `false`. The
+    /// RETIRED keyword spelling — `resource` as a word right before `struct`,
+    /// `external` or `enum`, which only a declaration can be — is taken too, as
+    /// the kind it meant, with ONE refusal steering to the attribute: the
+    /// declaration still parses, so the reader gets the sentence and not a
+    /// cascade.
+    fn parse_resource_kind(&mut self) -> bool {
+        if self.eat_marker_attribute("resource") {
+            return true;
+        }
+        if self.peek() == Some(&Token::Ident("resource"))
+            && matches!(
+                self.peek_at(1),
+                Some(Token::External | Token::Struct | Token::Enum)
+            )
+        {
+            let span = self.here_span();
+            self.bump();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(
+                    "`resource` is an attribute, not a keyword: write `[resource]` before the \
+                     declaration (`[resource] struct`, `[resource] external struct`, \
+                     `[resource] enum`)",
+                ),
+                context: Vec::new(),
+                hint: None,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// B413: `[resource]` where no type is declared — a field, a variant — is
+    /// the misplaced-attribute steer, and the position then parses as if it
+    /// were not there.
+    fn refuse_misplaced_resource_attribute(&mut self) {
+        let start = self.position;
+        if self.eat_marker_attribute("resource") {
+            let span = self.span_from(start);
+            self.push_misplaced_resource(span);
+        }
+    }
+
+    /// The one statement of the misplaced-`[resource]` rule, for every position
+    /// that refuses it.
+    fn push_misplaced_resource(&mut self, span: Span) {
         self.errors.push(ParseError {
             span,
             reason: ParseErrorReason::Rule(
-                "`resource` is a type-declaration modifier: it may appear only \
-                 before a `struct` or `enum` declaration",
+                "`[resource]` marks a type as a resource: it may label only a `struct` \
+                 or an `enum` declaration",
             ),
             context: Vec::new(),
             hint: None,
         });
-        Some((Node::Error, span))
     }
 
     /// The whole part of a `Number` token, consumed — the chumsky `integer`
@@ -5928,7 +8325,8 @@ mod tests {
         // `List<str>::new()` — the head keeps its generics because `::` follows.
         match &expr("List<str>::new()").0 {
             Node::Call(callee, None, _) => match &callee.0 {
-                Node::StaticAccessor(head, "new") => {
+                // No tail generics: an expression path never carries them.
+                Node::StaticAccessor(head, "new", None) => {
                     assert!(matches!(head.0, Node::AccessorWithGenerics("List", _)))
                 }
                 other => panic!("expected StaticAccessor over generics, got {other:?}"),
@@ -6002,7 +8400,7 @@ mod tests {
         // In expression position the same head with a brace IS a struct literal.
         assert!(matches!(
             expr("Foo { x = 1 }").0,
-            Node::StructInitializer("Foo", _, _)
+            Node::StructInitializer(_, ("Foo", _), _, _)
         ));
         // A parenthesised struct literal is admitted even in a condition.
         assert!(matches!(
@@ -6130,6 +8528,46 @@ mod tests {
         }
     }
 
+    // B242: the DECLARATION's `context` clause, both ways it can arrive — with
+    // a return type written the type grammar takes it first and the
+    // declaration peels it back off, so the two spellings parse the same.
+    #[test]
+    fn function_context_clause_binds_to_the_declaration() {
+        for source in [
+            "fun render(x: i32): i32 context settings { x }",
+            "fun render(x: i32) context settings { x }",
+            "fun render(x: i32): i32 borrows x context settings { x }",
+        ] {
+            match only_item(source) {
+                Node::Func(function) => {
+                    let (names, _) = function.contexts.as_ref().expect("a declared clause");
+                    assert_eq!(names.len(), 1, "{source}");
+                    assert_eq!(names[0].0, "settings", "{source}");
+                    // The return type is the bare one: the clause is the
+                    // FUNCTION's, never a suffix on `i32`.
+                    assert!(
+                        function
+                            .return_type
+                            .as_ref()
+                            .is_none_or(|node| matches!(node.0, Node::Accessor("i32"))),
+                        "{source}"
+                    );
+                }
+                other => panic!("expected Func, got {other:?}"),
+            }
+        }
+        match only_item("fun render(): i32 context (a, b) { 1 }") {
+            Node::Func(function) => {
+                let (names, _) = function.contexts.as_ref().expect("a declared clause");
+                assert_eq!(
+                    names.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                    vec!["a", "b"]
+                );
+            }
+            other => panic!("expected Func, got {other:?}"),
+        }
+    }
+
     // --- Decline behaviour (never more permissive than the grammar) ----------
 
     #[test]
@@ -6249,7 +8687,7 @@ mod tests {
     #[test]
     fn struct_fields_generics_and_modifiers() {
         match only_item("struct Point<T> { x: T, y: T }") {
-            Node::Struct(name, generics, external, resource, body) => {
+            Node::Struct(name, generics, external, resource, body, _) => {
                 assert_eq!(name.0, "Point");
                 assert!(generics.is_some());
                 assert!(!external && !resource);
@@ -6257,10 +8695,10 @@ mod tests {
             }
             other => panic!("expected Struct, got {other:?}"),
         }
-        // `resource external struct null;` — every modifier, the `null` name, the
+        // `[resource] external struct null;` — every modifier, the `null` name, the
         // bodyless `;` form.
-        match only_item("resource external struct null;") {
-            Node::Struct(name, _, external, resource, body) => {
+        match only_item("[resource] external struct null;") {
+            Node::Struct(name, _, external, resource, body, _) => {
                 assert_eq!(name.0, "null");
                 assert!(external && resource);
                 assert!(body.is_none());
@@ -6272,9 +8710,9 @@ mod tests {
     #[test]
     fn exposed_struct_field_is_recorded() {
         match only_item("struct Room { [expose] count: Signal, name: str }") {
-            Node::Struct(_, _, _, _, Some(fields)) => {
-                let exposed: Vec<bool> = fields.0.iter().map(|field| field.0.2).collect();
-                assert_eq!(exposed, vec![true, false]);
+            Node::Struct(_, _, _, _, Some(fields), _) => {
+                let exposed: Vec<Exposure> = fields.0.iter().map(|field| field.0.2).collect();
+                assert_eq!(exposed, vec![Exposure::Whole, Exposure::None]);
             }
             other => panic!("expected a struct with fields, got {other:?}"),
         }
@@ -6283,10 +8721,10 @@ mod tests {
     #[test]
     fn enum_variants_payloads_and_discriminants() {
         match only_item("enum Sign { Less = -1, Zero = 0, More(i32, str) }") {
-            Node::Enum(name, _, resource, variants) => {
+            Node::Enum(name, _, resource, variants, _) => {
                 assert_eq!(name.0, "Sign");
                 assert!(!resource);
-                let (_, less_data, less_backing) = &variants.0[0].0;
+                let (_, less_data, less_backing, _) = &variants.0[0].0;
                 assert!(less_data.is_empty());
                 let less_backing = less_backing.as_ref().expect("Less has a backing value");
                 match less_backing {
@@ -6299,15 +8737,15 @@ mod tests {
                     other => panic!("expected an integer backing, got {other:?}"),
                 }
                 assert_eq!(less_backing.to_string(), "-1");
-                let (_, more_data, more_backing) = &variants.0[2].0;
+                let (_, more_data, more_backing, _) = &variants.0[2].0;
                 assert_eq!(more_data.len(), 2, "More carries two payload types");
                 assert_eq!(*more_backing, None);
             }
             other => panic!("expected Enum, got {other:?}"),
         }
-        // `resource enum` — the only leading modifier on an enum.
-        match only_item("resource enum Handle { Open, Closed }") {
-            Node::Enum(_, _, resource, _) => assert!(resource),
+        // `[resource] enum` — an enum takes the attribute too (B413).
+        match only_item("[resource] enum Handle { Open, Closed }") {
+            Node::Enum(_, _, resource, _, _) => assert!(resource),
             other => panic!("expected a resource Enum, got {other:?}"),
         }
     }
@@ -6319,9 +8757,9 @@ mod tests {
         // reprinted by `Display` so the formatter round-trips it and a
         // diagnostic can tell `1` from `"1"`.
         match only_item(r#"enum Align { Start = "flex-start", End = "end" }"#) {
-            Node::Enum(name, _, _, variants) => {
+            Node::Enum(name, _, _, variants, _) => {
                 assert_eq!(name.0, "Align");
-                let (_, _, start_backing) = &variants.0[0].0;
+                let (_, _, start_backing, _) = &variants.0[0].0;
                 match start_backing.as_ref().expect("Start has a backing value") {
                     BackingLiteral::Str { text, .. } => assert_eq!(*text, "flex-start"),
                     other => panic!("expected a string backing, got {other:?}"),
@@ -6360,7 +8798,7 @@ mod tests {
     #[test]
     fn impl_with_clause_and_body() {
         match only_item("impl Point<type T> with Show + Eq { fun show(&self): str { \"p\" } }") {
-            Node::Impl(_subject, traits, body) => {
+            Node::Impl(_subject, traits, body, _) => {
                 assert_eq!(traits.len(), 2, "with Show + Eq");
                 assert_eq!(body.0.len(), 1, "one method");
                 assert!(matches!(body.0[0].0, Node::Func(_)));
@@ -6370,12 +8808,68 @@ mod tests {
     }
 
     #[test]
+    fn an_anonymous_type_binder_parses_as_the_keyword_form_does() {
+        // B294: `_` in type position is the binder production, with or without
+        // a bound, and it produces the very node `type _` does.
+        let binders = |source: &'static str| match only_item(source) {
+            Node::Impl(subject, _traits, _body, _) => match subject.0 {
+                Node::AccessorWithGenerics(_, arguments) => arguments
+                    .0
+                    .into_iter()
+                    .map(|argument| match argument.0 {
+                        Node::TypeBinder(name, bounds, _) => (name.0, bounds.len()),
+                        other => panic!("expected a TypeBinder argument, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                other => panic!("expected an applied subject, got {other:?}"),
+            },
+            other => panic!("expected Impl, got {other:?}"),
+        };
+        assert_eq!(
+            binders("impl Pair<_, type T> { }"),
+            vec![("_", 0), ("T", 0)]
+        );
+        // The bound `_` could not carry before: `_: Bound` stopped at the `:`.
+        assert_eq!(
+            binders("impl Pair<_: Show, _> { }"),
+            vec![("_", 1), ("_", 0)]
+        );
+        // Two occurrences are two nodes, which is what makes them two
+        // parameters downstream.
+        assert_eq!(
+            binders("impl Pair<type _, _> { }"),
+            vec![("_", 0), ("_", 0)]
+        );
+    }
+
+    #[test]
+    fn a_bare_underscore_annotation_is_a_binder_node_not_a_name() {
+        // B294: the reading is unconditional, so an inference-placeholder `_`
+        // is refused by RESOLUTION (with a message that says what `_` is for)
+        // rather than by the parser.
+        match only_item("fun f(value: _) { }") {
+            Node::Func(function) => {
+                match &function.parameters.0[0].declared_type.as_ref().unwrap().0 {
+                    Node::TypeBinder((name, name_span), bounds, _) => {
+                        assert_eq!(*name, "_");
+                        assert!(bounds.is_empty());
+                        // The NAME's own span (E161), not the whole binder's.
+                        assert_eq!(name_span.into_range().len(), 1);
+                    }
+                    other => panic!("expected a TypeBinder annotation, got {other:?}"),
+                }
+            }
+            other => panic!("expected Func, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn trait_body_holds_declarations_and_default_members() {
         // A signature-only declaration and a defaulted method, plus a supertrait.
         match only_item(
             "trait Ord<T> with Eq { fun cmp(&self, other: &T): i32; fun max(&self): i32 { 0 } }",
         ) {
-            Node::Trait(name, generics, supertraits, body) => {
+            Node::Trait(name, generics, supertraits, body, _) => {
                 assert_eq!(name.0, "Ord");
                 assert!(generics.is_some());
                 assert_eq!(supertraits.len(), 1);
@@ -6413,13 +8907,16 @@ mod tests {
     fn import_recursive_path_and_brace_set() {
         // `std::collections::{ Map, Set }` — a `::` path ending in a set.
         match only_item("import std::collections::{ Map, Set };") {
-            Node::Import(ImportBranch::Path("std", _, Some(next))) => match &*next {
-                ImportBranch::Path("collections", _, Some(set)) => match &**set {
-                    ImportBranch::Set(members) => assert_eq!(members.len(), 2),
-                    other => panic!("expected a Set continuation, got {other:?}"),
-                },
-                other => panic!("expected a nested path, got {other:?}"),
-            },
+            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next)), ..) => {
+                match &*next {
+                    ImportBranch::Path("collections", _, ImportTail::Continue(set)) => match &**set
+                    {
+                        ImportBranch::Set(members) => assert_eq!(members.len(), 2),
+                        other => panic!("expected a Set continuation, got {other:?}"),
+                    },
+                    other => panic!("expected a nested path, got {other:?}"),
+                }
+            }
             other => panic!("expected Import(Path), got {other:?}"),
         }
     }
@@ -6428,12 +8925,12 @@ mod tests {
     fn use_bare_path_and_export_reexport() {
         assert!(matches!(
             only_item("use option::Some;"),
-            Node::Use(ImportBranch::Path("option", _, Some(_)))
+            Node::Use(ImportBranch::Path("option", _, ImportTail::Continue(_)))
         ));
         // `export import a::b;` — the inner import consumes its own `;`; the Export
         // wraps it (and its span, tested via the differential, includes the `;`).
         match only_item("export import shared::config;") {
-            Node::Export(inner) => assert!(matches!(inner.0, Node::Import(_))),
+            Node::Export(_, inner, _) => assert!(matches!(inner.0, Node::Import(..))),
             other => panic!("expected Export, got {other:?}"),
         }
     }
@@ -6458,22 +8955,114 @@ mod tests {
         }
         // `[service(Client)] struct` names its generated client type.
         match only_item("[service(RoomClient)] struct Room { }") {
-            Node::Service(Some("RoomClient"), item) => assert!(matches!(item.0, Node::Struct(..))),
-            other => panic!("expected Service(Some), got {other:?}"),
+            Node::Service(attribute, item) => {
+                assert_eq!(attribute.client_name, Some("RoomClient"));
+                assert_eq!(attribute.handler_name, None);
+                assert!(attribute.server_side && !attribute.client_side);
+                assert!(matches!(item.0, Node::Struct(..)));
+            }
+            other => panic!("expected Service, got {other:?}"),
         }
         // Bare `[service]` defaults the client name to `None`.
-        assert!(matches!(
-            only_item("[service] struct Room { }"),
-            Node::Service(None, _)
-        ));
+        match only_item("[service] struct Room { }") {
+            Node::Service(attribute, _) => {
+                assert_eq!(attribute.client_name, None);
+                assert!(attribute.server_side && !attribute.client_side);
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_http_marker_rides_the_service_node_in_any_position_but_first_of_a_name() {
+        // A120 S5: `http` is a MARKER, not a client name — `[service(http)]`
+        // keeps the default client name.
+        for (source, client_name, handler_name) in [
+            ("[service(http)] struct Door { }", None, None),
+            (
+                "[service(DoorClient, http)] struct Door { }",
+                Some("DoorClient"),
+                None,
+            ),
+            (
+                "[service(DoorClient, http, client = Peer)] struct Door { }",
+                Some("DoorClient"),
+                Some("Peer"),
+            ),
+            (
+                "[service(client = Peer, http)] struct Door { }",
+                None,
+                Some("Peer"),
+            ),
+        ] {
+            match only_item(source) {
+                Node::Service(attribute, _) => {
+                    assert!(attribute.http, "{source}");
+                    assert_eq!(attribute.client_name, client_name, "{source}");
+                    assert_eq!(attribute.handler_name, handler_name, "{source}");
+                }
+                other => panic!("expected Service for {source}, got {other:?}"),
+            }
+        }
+        match only_item("[service(DoorClient)] struct Door { }") {
+            Node::Service(attribute, _) => assert!(!attribute.http),
+            other => panic!("expected Service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_service_attributes_ride_the_service_node() {
+        // §9.3, R1: `client = H` is a NAMED argument beside the positional
+        // client name, `[client_service]` is its own attribute, and a struct
+        // carrying both is peer-to-peer on ONE node.
+        match only_item("[service(RoomClient, client = RoomHandlers)] struct Room { }") {
+            Node::Service(attribute, _) => {
+                assert_eq!(attribute.client_name, Some("RoomClient"));
+                assert_eq!(attribute.handler_name, Some("RoomHandlers"));
+                assert!(attribute.server_side && !attribute.client_side);
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+        // `client = H` alone, with the client name defaulted.
+        match only_item("[service(client = RoomHandlers)] struct Room { }") {
+            Node::Service(attribute, _) => {
+                assert_eq!(attribute.client_name, None);
+                assert_eq!(attribute.handler_name, Some("RoomHandlers"));
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+        match only_item("[client_service] struct RoomHandlers { }") {
+            Node::Service(attribute, item) => {
+                assert!(!attribute.server_side && attribute.client_side);
+                assert_eq!(attribute.client_name, None);
+                assert!(matches!(item.0, Node::Struct(..)));
+            }
+            other => panic!("expected Service, got {other:?}"),
+        }
+        // Peer-to-peer: both attributes, either order, one node.
+        for source in [
+            "[service(PeerClient, client = Peer)] [client_service] struct Peer { }",
+            "[client_service] [service(PeerClient, client = Peer)] struct Peer { }",
+        ] {
+            match only_item(source) {
+                Node::Service(attribute, _) => {
+                    assert!(attribute.server_side && attribute.client_side);
+                    assert_eq!(attribute.client_name, Some("PeerClient"));
+                    assert_eq!(attribute.handler_name, Some("Peer"));
+                }
+                other => panic!("expected Service, got {other:?}"),
+            }
+        }
     }
 
     #[test]
     fn function_attributes_are_recognized_in_fixed_order() {
         // The full ordered attribute prefix (`deprecated`, `extern`, `must_use`,
-        // `rpc`, `trait_only`, `doc(hidden)`, `platform`) on one external function.
+        // `rpc`, `trait_only`, `platform`) on one external function.
+        // `[doc(hidden)]` used to sit between `trait_only` and `platform`; B318
+        // retired it, and its slot in the order is refused rather than read.
         match only_item(
-            "[deprecated(\"use serve_all()\")] [extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [doc(hidden)] [platform(\"@process\")] external fun serve();",
+            "[deprecated(\"use serve_all()\")] [extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [platform(\"@process\")] external fun serve();",
         ) {
             Node::Func(function) => {
                 assert!(matches!(
@@ -6483,9 +9072,7 @@ mod tests {
                         symbol: "createServer"
                     })
                 ));
-                assert!(
-                    function.must_use && function.rpc && function.trait_only && function.doc_hidden
-                );
+                assert!(function.must_use && function.rpc && function.trait_only);
                 assert_eq!(function.deprecated, Some("use serve_all()"));
                 assert_eq!(function.platform_fence.len(), 1);
                 assert!(function.external);
@@ -6524,6 +9111,296 @@ mod tests {
         // `deprecated` is a known marker, so no user-macro reading claims it
         // either: the program declines.
         assert!(declines("[deprecated] fun one() { }"));
+    }
+
+    #[test]
+    fn an_internal_attribute_carries_its_reason_on_a_function_and_on_a_field() {
+        // E213. The shape is `[deprecated(..)]`'s, deliberately: both are
+        // labels ABOUT the declaration rather than parts of its signature.
+        match only_item("[internal(\"row bookkeeping\")] fun cut_row() { }") {
+            Node::Func(function) => assert_eq!(function.internal, Some("row bookkeeping")),
+            other => panic!("expected a labelled Func, got {other:?}"),
+        }
+        match only_item("fun plain() { }") {
+            Node::Func(function) => assert_eq!(function.internal, None),
+            other => panic!("expected a Func, got {other:?}"),
+        }
+        // A FIELD is the case declaration visibility cannot serve at all.
+        match only_item("struct Region { [internal(\"the end marker\")] anchor: str, label: str }")
+        {
+            Node::Struct(_, _, _, _, Some(fields), _) => {
+                assert_eq!(fields.0[0].0.3, Some("the end marker"));
+                assert_eq!(fields.0[1].0.3, None);
+            }
+            other => panic!("expected a Struct, got {other:?}"),
+        }
+        // The reason is REQUIRED — a bare `[internal]` is not the attribute,
+        // and `internal` is a known marker, so no user-macro reading claims it
+        // either: the program declines.
+        assert!(declines("[internal] fun one() { }"));
+        // It follows `[deprecated(..)]` in the ordered prefix and precedes
+        // `[extern(..)]`; the other order declines.
+        assert!(matches!(
+            only_item("[deprecated(\"use two()\")] [internal(\"seam\")] fun one() { }"),
+            Node::Func(_)
+        ));
+        assert!(declines(
+            "[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"
+        ));
+    }
+
+    #[test]
+    fn a_deprecated_steer_rides_a_type_and_a_re_export() {
+        // B382: the function attribute, admitted on the nominals and a trait —
+        // leading the ordered prefix, as it leads a function's.
+        fn steer(source: &str) -> Option<&str> {
+            match only_item(source) {
+                Node::Struct(.., labels) | Node::Enum(.., labels) | Node::Trait(.., labels) => {
+                    labels.and_then(|labels| labels.deprecated)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(steer("[deprecated(\"use B\")] struct A {}"), Some("use B"));
+        assert_eq!(steer("[deprecated(\"use B\")] enum A { X }"), Some("use B"));
+        assert_eq!(
+            steer("[deprecated(\"use B\")] trait A { fun f(self); }"),
+            Some("use B")
+        );
+        assert_eq!(
+            steer("[deprecated(\"use B\")] [internal(\"x\")] struct A {}"),
+            Some("use B")
+        );
+        // …and on an `export import`, the re-export the ruling names.
+        match only_item("export [deprecated(\"use D\")] import pkg::a::D as K;") {
+            Node::Export(_, inner, Some(labels)) => {
+                assert_eq!(labels.deprecated, Some("use D"));
+                assert!(matches!(&inner.0, Node::Import(..)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without the `export` the steer publishes nothing: refused, and the
+        // import itself still parses.
+        let (tree, errors) = parse("[deprecated(\"use D\")] import pkg::a::D;\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| render(error) == DEPRECATED_IMPORT_IS_A_RE_EXPORT),
+            "{errors:?}"
+        );
+        assert!(matches!(tree.expect("a tree").0[0].0, Node::Import(..)));
+        // The order is the prefix's: `[internal]` before `[deprecated]` declines.
+        assert!(declines(
+            "[internal(\"x\")] [deprecated(\"use B\")] struct A {}"
+        ));
+    }
+
+    #[test]
+    fn an_impl_binder_takes_a_tuple_family_bound() {
+        // A122 (tuple-module.md §4.1): `impl type T: (2..) with Tuple` — the
+        // binder's bound is a tuple bound, tried before the trait-bound list
+        // as a generic parameter's is.
+        match only_item("impl type T: (2..) with Tuple { }") {
+            Node::Impl(subject, traits, _, _) => {
+                assert_eq!(traits.len(), 1);
+                match &subject.0 {
+                    Node::TypeBinder((name, _), bounds, Some(tuple_bound)) => {
+                        assert_eq!(*name, "T");
+                        assert!(bounds.is_empty());
+                        assert_eq!((tuple_bound.lo, tuple_bound.hi), (Some(2), None));
+                        assert!(tuple_bound.element.is_none());
+                    }
+                    other => panic!("expected a tuple-bounded binder, got {other:?}"),
+                }
+            }
+            other => panic!("expected an impl, got {other:?}"),
+        }
+        // The anonymous binder and an element bound take it too.
+        match only_item("impl _: (2..4: Display) with Tuple { }") {
+            Node::Impl(subject, ..) => assert!(matches!(
+                &subject.0,
+                Node::TypeBinder(_, _, Some(bound)) if bound.hi == Some(4) && bound.element.is_some()
+            )),
+            other => panic!("{other:?}"),
+        }
+        // A trait bound is still a trait bound.
+        match only_item("impl type T: Display with Show { }") {
+            Node::Impl(subject, ..) => {
+                assert!(
+                    matches!(&subject.0, Node::TypeBinder(_, bounds, None) if bounds.len() == 1)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_leading_mod_self_hosts_the_files_platform() {
+        // B415: `[platform("…")] mod self;` as the file's first statement is
+        // the host for the file's own attributes (F27 R1's platform).
+        let items = program("[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n");
+        match &items.0[0].0 {
+            Node::ModulePlatform(patterns) => {
+                assert_eq!(
+                    patterns.iter().map(|(text, _)| *text).collect::<Vec<_>>(),
+                    vec!["browser"]
+                );
+            }
+            other => panic!("expected the module's platform, got {other:?}"),
+        }
+        match only_item("[platform(\"@process\", \"browser\")] mod self;") {
+            Node::ModulePlatform(patterns) => assert_eq!(patterns.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        // A host with no attribute on it declares nothing, and parses.
+        match only_item("mod self;") {
+            Node::ModulePlatform(patterns) => assert!(patterns.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // The attribute on a first function is that function's fence, as it
+        // always was.
+        match only_item("[platform(\"browser\")] fun f() {}") {
+            Node::Func(function) => assert_eq!(function.platform_fence.len(), 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_bare_file_platform_statement_is_gone() {
+        // B415 removes F27 R1's `[platform("…")];`: `mod self;` is its host,
+        // and the attribute with only a `;` after it is no statement at all.
+        assert!(
+            !matches!(
+                program("[platform(\"browser\")];\n")
+                    .0
+                    .first()
+                    .map(|item| &item.0),
+                Some(Node::ModulePlatform(_))
+            ),
+            "the bare form must not parse as the file's platform"
+        );
+    }
+
+    #[test]
+    fn mod_self_anywhere_but_the_files_head_is_refused() {
+        for source in [
+            "import std::ui::Region;\n[platform(\"browser\")] mod self;\n",
+            "import std::ui::Region;\nmod self;\n",
+            "fun f() {\n\t[platform(\"browser\")] mod self;\n}\n",
+            "mod inner {\n\t[platform(\"browser\")] mod self;\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| render(error) == MODULE_SELF_LEADS_THE_FILE),
+                "{source:?}: {errors:?}"
+            );
+        }
+        // The head itself is clean, a leading comment notwithstanding.
+        assert!(!declines(
+            "// the client's slot\n[platform(\"browser\")] mod self;\nfun f() {}\n"
+        ));
+    }
+
+    #[test]
+    fn self_is_a_reserved_module_name() {
+        // B415: `self` names the file's own module, so no module may be
+        // declared by that name — at the head or anywhere else.
+        for source in [
+            "mod self {\n\tfun f() {}\n}\n",
+            "fun g() {}\nmod self {}\n",
+            "mod outer {\n\tmod self {}\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| render(error) == MODULE_SELF_IS_RESERVED),
+                "{source:?}: {errors:?}"
+            );
+        }
+        // Any other name is a module, as it always was.
+        assert!(!declines("mod selfish {\n\tfun f() {}\n}\n"));
+    }
+
+    #[test]
+    fn an_impl_and_a_nominal_carry_a_platform_label() {
+        match only_item("[platform(\"browser\")] impl Region { fun f(self) {} }") {
+            Node::Impl(_, _, _, Some(labels)) => assert_eq!(labels.platform.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        match only_item("[internal(\"x\")] [platform(\"browser\")] struct Slot {}") {
+            Node::Struct(.., Some(labels)) => {
+                assert_eq!(labels.internal, Some("x"));
+                assert_eq!(labels.platform[0].0, "browser");
+            }
+            other => panic!("{other:?}"),
+        }
+        match only_item("impl Region { fun f(self) {} }") {
+            Node::Impl(_, _, _, None) => {}
+            other => panic!("an unlabelled impl carries none: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_internal_label_rides_every_e221_position() {
+        // E221: the nominals, a variant, a trait and a module binding.
+        fn label_of(source: &str) -> Option<&str> {
+            match only_item(source) {
+                Node::Struct(.., labels)
+                | Node::Enum(.., labels)
+                | Node::Trait(.., labels)
+                | Node::Let(.., labels) => labels.and_then(|labels| labels.internal),
+                other => panic!("expected a labelled declaration, got {other:?}"),
+            }
+        }
+        assert_eq!(label_of("[internal(\"s\")] struct Region {}"), Some("s"));
+        assert_eq!(
+            label_of("[internal(\"r\")] [resource] struct Handle { id: i32 }"),
+            Some("r")
+        );
+        assert_eq!(label_of("[internal(\"e\")] enum Side { Left }"), Some("e"));
+        assert_eq!(
+            label_of("[internal(\"t\")] trait Seam { fun seam(self); }"),
+            Some("t")
+        );
+        assert_eq!(label_of("[internal(\"b\")] let cache = 3;"), Some("b"));
+        assert_eq!(label_of("[internal(\"l\")] lazy let db = 3;"), Some("l"));
+        assert_eq!(label_of("[internal(\"m\")] mut counter = 0;"), Some("m"));
+        // Unlabelled, each is the one null pointer it was.
+        assert_eq!(label_of("struct Region {}"), None);
+        assert_eq!(label_of("let cache = 3;"), None);
+        // A variant, on the variant's own record.
+        match only_item("enum Side { Left, [internal(\"v\")] Auto }") {
+            Node::Enum(_, _, _, variants, None) => {
+                assert_eq!(variants.0[0].0.3, None);
+                assert_eq!(variants.0[1].0.3, Some("v"));
+            }
+            other => panic!("expected an Enum, got {other:?}"),
+        }
+        // Behind `export`, and after a `[derive(..)]`, as a function's is.
+        match only_item("export [internal(\"x\")] struct Marker {}") {
+            Node::Export(_, inner, _) => {
+                assert!(
+                    matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("x"))
+                )
+            }
+            other => panic!("expected an Export, got {other:?}"),
+        }
+        match only_item("[derive(Clone)] [internal(\"d\")] struct Point { x: i32 }") {
+            Node::Derive(_, inner) => {
+                assert!(
+                    matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("d"))
+                )
+            }
+            other => panic!("expected a Derive, got {other:?}"),
+        }
+        // A bare `[internal]` is not the label on any of them.
+        assert!(declines("[internal] struct Region {}"));
+        assert!(declines("[internal] let cache = 3;"));
+        // And a `let` destructuring several names takes none.
+        assert!(declines("[internal(\"p\")] let (a, b) = (1, 2);"));
     }
 
     #[test]
@@ -6608,19 +9485,86 @@ mod tests {
 
     #[test]
     fn misplaced_resource_declines_but_a_valid_resource_declaration_parses() {
-        // `resource` before a non-declaration is the steer (an error) — declines.
-        assert!(declines("resource fun f() { }"));
-        assert!(declines("resource impl Foo { }"));
-        // But `resource struct` / `resource external struct` / `resource enum` are
-        // valid and parse cleanly (the steer never shadows them).
+        // `[resource]` before a non-declaration is the steer (an error) —
+        // declines (B413: the attribute, as the keyword was before it).
+        assert!(declines("[resource] fun f() { }"));
+        assert!(declines("[resource] impl Foo { }"));
+        // But `[resource] struct` / `[resource] external struct` /
+        // `[resource] enum` are valid and parse cleanly (the steer never
+        // shadows them).
         assert!(matches!(
-            only_item("resource struct File { }"),
-            Node::Struct(_, _, false, true, _)
+            only_item("[resource] struct File { }"),
+            Node::Struct(_, _, false, true, _, _)
         ));
         assert!(matches!(
-            only_item("resource enum State { A, B }"),
-            Node::Enum(_, _, true, _)
+            only_item("[resource] enum State { A, B }"),
+            Node::Enum(_, _, true, _, _)
         ));
+        // After the labels, in the prefix's order, and before `external`.
+        assert!(matches!(
+            only_item("[internal(\"r\")] [resource] external struct Db;"),
+            Node::Struct(_, _, true, true, _, Some(_))
+        ));
+    }
+
+    #[test]
+    fn the_resource_attribute_is_refused_on_everything_but_a_struct_or_an_enum() {
+        // B413: one rule, at every other position — an item, a local, a field
+        // and a variant.
+        for source in [
+            "[resource] fun f() {}\n",
+            "[resource] impl Foo {}\n",
+            "[resource] trait Foo {}\n",
+            "fun main() {\n\t[resource] let x = 1;\n}\n",
+            "struct S {\n\t[resource] handle: i32,\n}\n",
+            "enum E {\n\t[resource] Open,\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            let rendered: Vec<String> = errors.iter().map(render).collect();
+            assert!(
+                rendered.contains(
+                    &"`[resource]` marks a type as a resource: it may label only a `struct` \
+                      or an `enum` declaration"
+                        .to_string()
+                ),
+                "{source:?}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retired_resource_keyword_is_refused_with_the_attribute_steer() {
+        // B413: `resource struct` / `resource external struct` / `resource
+        // enum` — the spelling before the keyword dissolved — is ONE refusal
+        // naming the attribute, and the declaration still parses under it.
+        for source in [
+            "resource struct File { fd: i32 }\n",
+            "resource external struct Database;\n",
+            "resource enum State { A, B }\n",
+            "export resource struct File {}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert_eq!(
+                errors.iter().map(render).collect::<Vec<_>>(),
+                vec![
+                    "`resource` is an attribute, not a keyword: write `[resource]` before the \
+                     declaration (`[resource] struct`, `[resource] external struct`, \
+                     `[resource] enum`)"
+                        .to_string()
+                ],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_is_an_ordinary_name_now() {
+        // B413: the word is no longer reserved — a binding, a field, a
+        // function and a member read may all be called `resource`.
+        assert!(!declines("fun main() {\n\tlet resource = 1;\n}\n"));
+        assert!(!declines("struct Lease {\n\tresource: i32,\n}\n"));
+        assert!(!declines("fun resource(): i32 {\n\t1\n}\n"));
+        assert!(!declines("fun f(x: Lease) {\n\tlet _ = x.resource;\n}\n"));
     }
 
     #[test]
@@ -6642,7 +9586,7 @@ mod tests {
              fun main() { print(\"hi\") }\n",
         );
         assert_eq!(statements.len(), 4);
-        assert!(matches!(statements[0].0, Node::Import(_)));
+        assert!(matches!(statements[0].0, Node::Import(..)));
         assert!(matches!(statements[1].0, Node::Struct(..)));
         assert!(matches!(statements[2].0, Node::Derive(..)));
         assert!(matches!(statements[3].0, Node::Func(_)));
@@ -6686,7 +9630,7 @@ mod tests {
             ),
             (
                 "fun main() { let p = Point { 1 2 3 }; }\n",
-                "StructInitializer(\"Point\", None, ([], 27..36)",
+                "StructInitializer([], (\"Point\", 21..26), None, ([], 27..36)",
             ),
             ("fun main() { let x = (1 +); }\n", "Some((Error, 21..26))"),
             ("fun main() { let x = [1 +]; }\n", "Some((Error, 21..26))"),
@@ -6704,11 +9648,11 @@ mod tests {
             ),
             (
                 "impl Foo { 1 2 3 }\nfun after() {}\n",
-                "Impl((Accessor(\"Foo\"), 5..8), [], ([], 9..18))",
+                "Impl((Accessor(\"Foo\"), 5..8), [], ([], 9..18), None)",
             ),
             (
                 "trait Foo { 1 2 3 }\nfun after() {}\n",
-                "Trait((\"Foo\", 6..9), None, [], ([], 10..19))",
+                "Trait((\"Foo\", 6..9), None, [], ([], 10..19), None)",
             ),
             (
                 "mod foo { 1 2 3 }\nfun after() {}\n",
@@ -6739,10 +9683,10 @@ mod tests {
     fn render_states_the_resource_language_rule() {
         // diagnostics-standard.md B6 — the prohibition explains itself.
         assert_eq!(
-            rendered_errors("resource fun foo() {}\n"),
+            rendered_errors("[resource] fun foo() {}\n"),
             vec![
-                "`resource` is a type-declaration modifier: it may appear only \
-                 before a `struct` or `enum` declaration"
+                "`[resource]` marks a type as a resource: it may label only a `struct` \
+                 or an `enum` declaration"
                     .to_string()
             ]
         );
@@ -6800,6 +9744,49 @@ mod tests {
             rendered_errors("fun f() { let p: Map<str, List<i32> = m; }\n"),
             vec!["found '=' expected ',' or '>' in type annotation".to_string()]
         );
+    }
+
+    /// A46: `<>` is a SPAN-ADJACENT pair, like `/>` and `</`. Spaced apart it
+    /// is not a fragment head, and the `<` falls through to everything `<`
+    /// already begins — so nothing about a comparison changes.
+    #[test]
+    fn a_spaced_angle_pair_is_not_a_fragment() {
+        assert_eq!(
+            rendered_errors("fun main() { let p = < >; }\n"),
+            vec!["found '<' expected an expression".to_string()]
+        );
+    }
+
+    /// A46: a fragment parses as a NAMELESS element body — the shape the
+    /// formatter and the editor's markup pass read, before the desugar retires
+    /// the element node and emits the list literal. All four angle-bracket
+    /// spans are recorded (E115), because `<>` and `</>` are the only
+    /// punctuation a fragment has.
+    #[test]
+    fn a_fragment_parses_as_a_nameless_element_body() {
+        let (node, _span) = expr("<><i>\"a\"</i>{row}</>");
+        let Node::Element(body) = node else {
+            panic!("a fragment must parse as an element body, got {node:?}");
+        };
+        assert!(body.tag.is_none(), "a fragment head carries no name");
+        assert!(body.close_tag.is_none(), "`</>` carries no name either");
+        assert!(body.head.is_empty(), "a fragment takes no head items");
+        assert!(!body.self_closing, "a fragment has no self-closing form");
+        assert_eq!(body.children.len(), 2, "both children are kept");
+        assert_eq!(body.punctuation.len(), 4, "`<`, `>`, `</`, `>`");
+    }
+
+    /// A46: a NAMED element is unchanged — its head still carries a tag span,
+    /// which is what keeps the nameless case a distinguishable second form and
+    /// not a default.
+    #[test]
+    fn a_named_element_still_carries_its_tag_span() {
+        let (node, _span) = expr("<i>\"a\"</i>");
+        let Node::Element(body) = node else {
+            panic!("an element must parse as an element body, got {node:?}");
+        };
+        assert!(body.tag.is_some(), "a named head carries its name");
+        assert!(body.close_tag.is_some(), "and so does its close");
     }
 
     #[test]
@@ -6863,6 +9850,302 @@ mod tests {
         // rest still parses — one error, the skipped BEL).
         let errors = rendered_errors("fun main() { \u{0007} }\n");
         assert_eq!(errors, vec!["found '\\u{7}' expected a token".to_string()]);
+    }
+
+    #[test]
+    fn the_reach_marker_lexes_parses_and_reprints() {
+        // B318 §2.3 — the bill for `#`, paid. It marks a LEAF, a segment
+        // mid-path (§10 d: a private `mod` is reachable), and a brace-set
+        // element; `use` shares the grammar; and every one round-trips through
+        // `vilan fmt` unchanged, because the marker is a fact about the author's
+        // intent rather than a formatting decision — stripping it would silently
+        // re-arm the plain-reach warning.
+        for source in [
+            "import pkg::a::{ #hidden };\n",
+            "import pkg::a::#hidden;\n",
+            "import pkg::a::#m::helper;\n",
+            "import pkg::a::{ shown, #hidden, other };\n",
+            "use pkg::a::{ #hidden };\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        // The marker adds no path SEGMENT — it wraps the branch — which is what
+        // keeps go-to-definition, find-references and rename pointing at the
+        // name.
+        let marked = only_item("import pkg::a::#hidden;");
+        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg)), ..) =
+            &marked
+        else {
+            panic!("the path reads as written: {marked:?}");
+        };
+        let ImportBranch::Path("a", _, ImportTail::Continue(after_a)) = after_pkg.as_ref() else {
+            panic!("the path reads as written: {marked:?}");
+        };
+        assert!(
+            matches!(after_a.as_ref(), ImportBranch::Reach(_, _)),
+            "the marker wraps the branch it marks: {marked:?}"
+        );
+        // fmt keeps it, and collapses a marked singleton set exactly as it
+        // collapses a plain one.
+        assert_eq!(
+            crate::formatter::format("import pkg::a::{ #hidden };\n"),
+            "import pkg::a::#hidden;\n"
+        );
+        assert_eq!(
+            crate::formatter::format("import pkg::a::{ shown, #hidden, other };\n"),
+            "import pkg::a::{ #hidden, other, shown };\n"
+        );
+        assert_eq!(
+            crate::formatter::format("import pkg::a::#m::helper;\n"),
+            "import pkg::a::#m::helper;\n"
+        );
+    }
+
+    #[test]
+    fn a101_a_css_declaration_is_a_call() {
+        // The grammar: `declaration = property "(" [ expression { "," expression }
+        // [ "," ] ] ")" ";"`, the property span-adjacent as before. A typed value
+        // is an ordinary argument, N arguments are ordinary arguments, and a
+        // custom property is a call head (R12).
+        for source in [
+            "fun main() { let s = css { outline(\"none\"); }; }\n",
+            "fun main() { let s = css { width(pct(100)); }; }\n",
+            "fun main() { let s = css { margin(px(4), px(8)); }; }\n",
+            "fun main() { let s = css { margin(px(4), px(8),); }; }\n",
+            "fun main() { let s = css { --brand-ink(gray(900)); }; }\n",
+            "fun main() { let s = css { flex-direction(\"column\"); }; }\n",
+            "fun main() { let s = css { color(Color::current().alpha(0.5)); }; }\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        // The `:` spelling every migrating program writes: the rule names the
+        // call form, once, at the `:` itself.
+        //
+        // Written as two pieces on purpose: this is the one fixture that must
+        // KEEP the spelling A101 retired, and a whole `css { … }` block in one
+        // literal is exactly what the codemod migrates.
+        let (_tree, errors) = parse(concat!(
+            "fun main() { let s = css { padding",
+            ": 1rem; }; }\n"
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(render(&errors[0]), A_CSS_DECLARATION_IS_A_CALL);
+        assert_eq!(
+            errors[0].span.into_range().len(),
+            1,
+            "the `:` itself is the token that is wrong"
+        );
+        // A declaration still needs its `;`, and it still needs a value.
+        assert_eq!(
+            rendered_errors("fun main() { let s = css { outline(\"none\") }; }\n").len(),
+            1
+        );
+        assert!(!rendered_errors("fun main() { let s = css { outline(); }; }\n").is_empty());
+        // `!important` keeps its rule — read off the tokens, because
+        // `red !important` is not an expression and the argument list would
+        // otherwise report a `,` the author never wanted.
+        let (_tree, errors) = parse("fun main() { let s = css { color(red !important); }; }\n");
+        assert_eq!(render(&errors[0]), IMPORTANT_HAS_NO_PLACE);
+        // And the `#` colour rule is RETIRED with the value grammar it guarded:
+        // no CSS token ever reaches a declaration now, so `#333` is refused as
+        // the ordinary expression it is not.
+        assert!(
+            rendered_errors("fun main() { let s = css { color(#333); }; }\n")
+                .iter()
+                .all(|error| !error.contains("is not a colour here")),
+        );
+        // `#` outside an import still refuses as a parse error, as it did.
+        assert_eq!(
+            rendered_errors("fun main() { let x = # 3; }\n"),
+            vec!["found '#' expected an expression".to_string()]
+        );
+    }
+
+    #[test]
+    fn export_all_and_the_scope_narrowing_parse_and_reprint() {
+        // B318 §2.1/§2.2. `export *;` is a `*` + `;` LOOKAHEAD, not "`*` after
+        // `export`": `export * helper;` is a real expression (the deref
+        // `*helper`, probe P1b) and reading it as a mistyped `export *;` would
+        // take a shape the language already has — it stays B321's refusal.
+        assert!(rendered_errors("export *;\n").is_empty());
+        assert!(matches!(only_item("export *;"), Node::ExportAll));
+        assert_eq!(
+            rendered_errors("export * helper;\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        // `(in PATH)` is GENERAL (§10 c): `mod` and `pkg` are reserved heads and
+        // any other path names the module subtree it roots. `mod` is a KEYWORD
+        // token and is admitted as a segment by name, which is what makes
+        // `export(in mod)` spellable without reserving a second word.
+        for source in [
+            "export(in mod) fun helper(): i32 { 1 }\n",
+            "export(in pkg) fun helper(): i32 { 1 }\n",
+            "export(in pkg::a) struct S { x: i32 }\n",
+            "export(in mod) import pkg::io::print;\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        let Node::Export(Some(scope), _, _) = only_item("export(in pkg::a) struct S { x: i32 }")
+        else {
+            panic!("the narrowing rides the export node");
+        };
+        assert_eq!(
+            scope.path.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["pkg", "a"]
+        );
+        // `export(pkg)` — the spelling that reads as a CALL (probe P2c) — is the
+        // scope with `in` left out, and is REPORTED rather than declined, so the
+        // author gets the steer instead of a missing-`;` three tokens later. The
+        // `;` lookahead keeps that off `export (helper);`, which is B321's.
+        assert_eq!(
+            rendered_errors("export(pkg) fun helper(): i32 { 1 }\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        // fmt reprints both new shapes as written, `::`-joined, no space before
+        // the `(`.
+        assert_eq!(crate::formatter::format("export *;\n"), "export *;\n");
+        assert_eq!(
+            crate::formatter::format("export(in pkg::a) import pkg::io::print;\n"),
+            "export(in pkg::a) import pkg::io::print;\n"
+        );
+    }
+
+    #[test]
+    fn export_refuses_an_expression_and_keeps_every_item() {
+        // B321: `parse_export` took any STATEMENT, so an `export` of a
+        // parenthesised expression — and of `*` followed by a name, which is
+        // `export` of a deref — compiled clean and published nothing. The two
+        // nonsense forms, then every form `export` really takes.
+        for nonsense in ["export (helper);\n", "export * helper;\n"] {
+            assert_eq!(
+                rendered_errors(nonsense),
+                vec![EXPORT_TAKES_AN_ITEM.to_string()],
+                "for {nonsense:?}"
+            );
+        }
+        for item in [
+            "export fun helper(): i32 { 1 }\n",
+            "export struct S { x: i32 }\n",
+            "export enum E { A }\n",
+            "export trait T { fun f(); }\n",
+            "export impl S { fun make(): i32 { 1 } }\n",
+            "export mod m { fun f() {} }\n",
+            "export let answer = 42;\n",
+            "export import pkg::io::print;\n",
+            "export use pkg::a::b;\n",
+            // The attribute wrappers are transparent: the rule asks about the
+            // declaration under them, not about the wrapper.
+            "export [derive(Wire)] struct S { x: i32 }\n",
+            "export external fun serve();\n",
+        ] {
+            assert!(
+                rendered_errors(item).is_empty(),
+                "`export` takes {item:?}: {:?}",
+                rendered_errors(item)
+            );
+        }
+        // The refusal is about the SHAPE, not about the parentheses: a call and
+        // an operator tower are refused with the same rule.
+        assert_eq!(
+            rendered_errors("export helper();\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("export 1 + 1;\n"),
+            vec![EXPORT_TAKES_AN_ITEM.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_malformed_import_reports_at_the_token_it_stopped_on() {
+        // B320: the six probe shapes of visibility.md §2.7, which before this
+        // all reported `found 'import' expected an expression` at COLUMN 1 of
+        // the statement — the keyword, which is the one token that was right.
+        // Each now reports the import grammar's own rule, anchored on the token
+        // the path actually stopped at. The shapes are B318's new import forms
+        // (a selector, `::*`, a reach marker), which is why the row is owed
+        // before they are built rather than after.
+        // B318 S3 landed in the same order (visibility-b-35), so the SELECTOR
+        // shapes parse clean now — they are pinned as grammar in
+        // `inference/modules.rs`; the two forms still outside the grammar
+        // (`::*` is Order 36's, `!` is no marker) keep this rule.
+        for source in [
+            "import a::{ (impl Thing) };\n",
+            "import a::{ (impl List<i32>)::{ first, last } };\n",
+            "import a::{ (impl List<_>) };\n",
+            "import a::{ (impl _) };\n",
+        ] {
+            let (_tree, errors) = parse(source);
+            assert!(
+                errors.is_empty(),
+                "a selector is grammar now, for {source:?}: {errors:?}"
+            );
+        }
+        for (source, stopped) in [
+            ("import pkg::a::m::*;\n", "*"),
+            ("import a::{ !hidden };\n", "!"),
+        ] {
+            let (_tree, errors) = parse(source);
+            assert_eq!(errors.len(), 1, "one diagnostic for {source:?}: {errors:?}");
+            assert_eq!(
+                render(&errors[0]),
+                IMPORT_PATH_IS_NAMES_AND_SETS,
+                "the import grammar's rule, for {source:?}"
+            );
+            assert_eq!(
+                &source[errors[0].span.into_range()],
+                stopped,
+                "anchored on the token the path stopped at, for {source:?}"
+            );
+        }
+        // `use` shares the path grammar; a selector inside a `use` is S3's own
+        // refusal (it parses, then is declined where it is written), and a form
+        // the path grammar cannot read at all still names this rule.
+        assert_eq!(
+            rendered_errors("use a::{ (impl T) };\n"),
+            vec![USE_TAKES_NO_IMPL_SELECTOR.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("use a::{ !hidden };\n"),
+            vec![IMPORT_PATH_IS_NAMES_AND_SETS.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_well_formed_import_keeps_every_other_reading() {
+        // The rule REPLACES nothing it should not: a path the grammar reads is
+        // clean, a missing `;` still reports at the gap (the record is only
+        // written where the path genuinely fails, so a parsed path leaves it
+        // empty), an unclosed brace is still unclosed, and a statement that is
+        // not import-led keeps the expression fallback.
+        assert!(rendered_errors("import pkg::a::{ b, c as d };\n").is_empty());
+        // `only` is B318 S3's trailing modifier now, so it reads clean; a
+        // stray word that is not a modifier still stops at the `;` gap.
+        assert!(rendered_errors("import pkg::a only;\n").is_empty());
+        assert_eq!(
+            rendered_errors("import pkg::a merely;\n"),
+            vec!["expected `;` to end this statement".to_string()]
+        );
+        assert_eq!(
+            rendered_errors("import a::{ b\n"),
+            vec!["unclosed `{`: expected a matching `}`".to_string()]
+        );
+        assert_eq!(
+            rendered_errors("nonsense *;\n"),
+            vec!["found ';' expected an expression".to_string()]
+        );
     }
 
     #[test]

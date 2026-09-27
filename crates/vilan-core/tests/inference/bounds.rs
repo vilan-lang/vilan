@@ -1559,6 +1559,39 @@ fn math_constants_and_moved_free_functions_import() {
     );
 }
 
+/// `Vec2::length_squared` — `x² + y²` under the name a comparison wants, with
+/// `length` now stated in terms of it. `sqrt` is monotonic, so the squared
+/// comparison decides exactly what the rooted one decides; the pin holds both
+/// halves, since a `length_squared` that returned something else would still
+/// pass a threshold test written against itself.
+#[test]
+fn vec2_length_squared_compares_without_the_root() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::math::Vec2;
+
+        fun main() {
+            let travelled = Vec2 { x = 3.0, y = 4.0 };
+            print(travelled.length_squared());
+            print(travelled.length_squared() == travelled.length() * travelled.length());
+            let threshold = 3.0;
+            print(travelled.length_squared() > threshold * threshold);
+            print((travelled.length() > threshold) == (travelled.length_squared() > threshold * threshold));
+            let shorter = Vec2 { x = 1.0, y = 1.0 };
+            print(shorter.length_squared() < travelled.length_squared());
+        }
+        main();
+        "#,
+        "25
+true
+true
+true
+true
+",
+    );
+}
+
 #[test]
 fn f64_float_classification_predicates() {
     assert_compiles_and_runs(
@@ -2940,6 +2973,266 @@ fn an_out_of_bounds_view_mint_panics() {
     );
 }
 
+// --- M47: `List::remove`/`List::insert` lowered over the native `splice`. ---
+// --- `splice` CLAMPS an index past the end and reads a NEGATIVE one from  ---
+// --- the end, so the emitted helpers keep `__at`'s guard and its wording:  ---
+// --- a bare splice would answer exactly the indices the docs say a caller  ---
+// --- must be punished for, and answer them with a plausible element.       ---
+
+#[test]
+fn list_remove_and_insert_emit_the_splice_helpers_not_a_shift_loop() {
+    // The claim is about the EMITTED program, not the source: before M47 both
+    // were vilan bodies that walked the tail through `__at`/`__at_put` (and
+    // `__clone`d every moved element). One `memmove` each now.
+    let js = compile(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(1);
+            xs.push(3);
+            xs.insert(1, 2);
+            print(xs.remove(0));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        js.contains("list.splice(index, 1)[0]") && js.contains("list.splice(index, 0, value)"),
+        "the splice helpers are not emitted:\n{js}"
+    );
+    assert!(
+        !js.contains("__at_put"),
+        "a shift loop's checked store survives — the lowering is still the vilan body:\n{js}"
+    );
+}
+
+#[test]
+fn a_list_remove_past_the_end_panics_rather_than_clamping() {
+    // `[3].splice(3, 1)` is `[]` — a bare splice would return `undefined` here
+    // and carry on.
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.push(30);
+            print(xs.remove(3));
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is 3",
+    );
+}
+
+#[test]
+fn a_negative_list_remove_panics_rather_than_counting_from_the_end() {
+    // `[10,20,30].splice(-1, 1)` is `[30]` — a bare splice would hand back the
+    // LAST element, a plausible answer to a question nobody asked.
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.push(30);
+            let i = 0 - 1;
+            print(xs.remove(i));
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is -1",
+    );
+}
+
+#[test]
+fn a_list_insert_past_the_end_panics_rather_than_appending() {
+    // `len + 1`: `splice` clamps it to the end and appends, which is exactly
+    // the index `insert`'s doc says is a caller bug (`len` itself appends).
+    assert_run_panics(
+        r#"
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.push(30);
+            xs.insert(4, 40);
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is 4",
+    );
+}
+
+#[test]
+fn a_negative_list_insert_panics_rather_than_counting_from_the_end() {
+    assert_run_panics(
+        r#"
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            let i = 0 - 1;
+            xs.insert(i, 40);
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 1 but the index is -1",
+    );
+}
+
+#[test]
+fn a_list_insert_at_the_length_appends() {
+    // The one index at the boundary that is NOT a bug: `index == len` is the
+    // documented append, and the helper takes the `push` arm for it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.push(20);
+            xs.insert(2, 30);
+            print(xs.len());
+            print(xs[2]);
+            print(xs.remove(2));
+            print(xs.len());
+        }
+        main();
+        "#,
+        "3\n30\n30\n2\n",
+    );
+}
+
+#[test]
+fn const_eval_refuses_the_same_list_remove_the_runtime_refuses() {
+    // The interpreter's twin of the helper. If const eval clamped where the
+    // runtime panics, a macro could compute an answer the program cannot.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun pick(): i32 {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.remove(1)
+        }
+        let BAD: i32 = const pick();
+        fun main() { print(BAD); }
+        "#,
+        "index out of bounds: the length is 1 but the index is 1",
+    );
+}
+
+#[test]
+fn const_eval_refuses_the_same_list_insert_the_runtime_refuses() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun grow(): usize {
+            mut xs: List<i32> = List::new();
+            xs.push(10);
+            xs.insert(3, 20);
+            xs.len()
+        }
+        let BAD: usize = const grow();
+        fun main() { print(BAD); }
+        "#,
+        "index out of bounds: the length is 1 but the index is 3",
+    );
+}
+
+#[test]
+fn const_eval_agrees_with_the_runtime_on_an_in_bounds_list_splice() {
+    // Both legs of the same program: the const site folds to a literal and the
+    // runtime leg recomputes it. A disagreement here is the silent kind.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun rearranged(): i32 {
+            mut xs: List<i32> = List::new();
+            xs.push(1);
+            xs.push(3);
+            xs.push(4);
+            xs.insert(1, 2);
+            xs.insert(4, 5);
+            let head = xs.remove(0);
+            head * 100 + xs.remove(1) * 10 + xs.len().as_i32()
+        }
+        let FOLDED: i32 = const rearranged();
+        fun main() { print(FOLDED); print(rearranged()); }
+        "#,
+        "133\n133\n",
+    );
+}
+
+// --- M43: the const-eval interpreter's environment maps hash with `fx`, ---
+// --- not SipHash. `Scope::vars` is never iterated (pinned in            ---
+// --- `interpreter.rs`), so the swap moves nothing — these two say so    ---
+// --- from the outside: the same answers, and the same ORDER for the one ---
+// --- thing a const evaluation genuinely walks.                          ---
+
+#[test]
+fn const_eval_resolves_shadowed_bindings_across_nested_scopes() {
+    // Every read and write here is a `Scope::vars` hash on a short `&str`,
+    // which is what M43 rehashed. Names that shadow across three depths, in an
+    // order no lexical sort would agree with, so a table that lost or crossed
+    // an entry answers differently rather than merely more slowly.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun layered(): i32 {
+            mut total = 0;
+            mut alpha = 1;
+            let beta = 2;
+            mut index = 0;
+            for index < 4 {
+                let alpha = index * 10;
+                mut beta = alpha + 1;
+                if beta > 10 {
+                    let gamma = beta * 2;
+                    beta = gamma - alpha;
+                }
+                total = total + alpha + beta;
+                index += 1;
+            }
+            total + alpha + beta
+        }
+        let FOLDED: i32 = const layered();
+        fun main() { print(FOLDED); print(layered()); }
+        "#,
+        "130\n130\n",
+    );
+}
+
+#[test]
+fn const_eval_keeps_a_maps_insertion_order() {
+    // The interpreter's Map/Set/object values stay `indexmap::IndexMap` on
+    // std's hasher — they are HOST containers whose walk order is visible to
+    // the program. Keys chosen so neither ascending nor descending order is
+    // the insertion order, which is what makes this a pin rather than a
+    // coincidence.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        import std::map::Map;
+        fun ordered(): str {
+            mut table: Map<str, i32> = Map::new();
+            table.insert("zeta", 1);
+            table.insert("alpha", 2);
+            table.insert("mu", 3);
+            table.insert("beta", 4);
+            table.keys().join(",")
+        }
+        let FOLDED: str = const ordered();
+        fun main() { print(FOLDED); print(ordered()); }
+        "#,
+        "zeta,alpha,mu,beta\nzeta,alpha,mu,beta\n",
+    );
+}
+
 #[test]
 fn an_empty_list_subscript_panics() {
     // view-invalidation.md §1's P1 case: the empty list, subscripted.
@@ -3326,6 +3619,57 @@ fn an_interpolated_triple_quoted_hole_may_hold_a_string_with_braces() {
 }
 
 #[test]
+fn a_hole_may_hold_a_string_written_with_escaped_quotes() {
+    // B278. A hole is lexed from the source bytes and the enclosing literal's
+    // quotes never reach it, so the plain spelling has always worked; the
+    // ESCAPED one — what a writer reaches for, having escaped a quote inside a
+    // string everywhere else — was a stray `\` in no charset, and the hole was
+    // refused as malformed. Both spellings are one token now, and the same one,
+    // so a call with a string argument no longer has to be bound first.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun shout(word: str): str {
+            word + "!"
+        }
+        fun main() {
+            print(i"{shout(\"k\")}");
+            print(i"{shout("k")}");
+        }
+        main();
+        "#,
+        "k!\nk!\n",
+    );
+}
+
+#[test]
+fn an_escaped_quote_string_in_a_hole_carries_its_own_escapes() {
+    // The body is kept raw exactly as a plain literal's is, so the escapes in it
+    // are interpreted at code generation: `\n` is a newline and `\\` a
+    // backslash — and `\\` takes its pair, so the literal can end in an escaped
+    // backslash without eating its own closing `\"`. The triple-quoted form's
+    // holes go through the same scanner.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun echo(word: str): str {
+            word
+        }
+        fun main() {
+            print(i"{echo(\"a\nb\")}");
+            print(i"{echo(\"a\\\")}");
+            let text = i"""
+                {echo(\"deep\")}
+                """;
+            print(text);
+        }
+        main();
+        "#,
+        "a\nb\na\\\ndeep\n",
+    );
+}
+
+#[test]
 fn an_empty_interpolated_triple_quoted_string_is_empty() {
     assert_compiles_and_runs(
         r#"
@@ -3430,7 +3774,7 @@ fn a_macro_emits_source_from_an_interpolated_triple_quoted_string() {
             import macro_std::option::Option::{ self, Some, None };
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             source(i"""
                 fun describe_{target.name}(): str \{
@@ -4832,7 +5176,7 @@ fn a_const_read_parses_the_books_largest_page_within_budget() {
         import std::result::Result::{ Err, Ok };
         fun block_count(): i32 {
             match markdown::parse(asset::read("docs/spec/memory.md")) {
-                Ok(let doc) => doc.blocks.len()
+                Ok(let doc) => doc.blocks.len().as_i32()
                 Err(let error) => 0 - 1
             }
         }
@@ -5600,8 +5944,7 @@ fn a_changed_input_is_seen_by_the_next_analysis() {
     // pipeline (the parse cache, the base cache, the shared const world) may
     // serve the first read's value for the second analysis; if any cache ever
     // keys const results without the read inputs, this goes red.
-    let dir = std::env::temp_dir().join(format!("vilan-const-read-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch_dir(&format!("vilan-const-read-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = r#"
         import std::asset;
@@ -5635,8 +5978,7 @@ fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
     // Reads charge fuel per byte, so the budget bounds input size exactly as
     // it bounds computation — without this, a read was one fuel tick and the
     // budget bounded nothing about it.
-    let dir = std::env::temp_dir().join(format!("vilan-const-read-fuel-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch_dir(&format!("vilan-const-read-fuel-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // Comfortably past the explicit fuel budget in bytes.
     std::fs::write(dir.join("huge.txt"), "a".repeat(17_000_000)).unwrap();
@@ -6235,7 +6577,7 @@ const A_USER_SOURCE: &str = r#"
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Stored<type T> {
@@ -6243,6 +6585,83 @@ const A_USER_SOURCE: &str = r#"
             fun set(self, value: T) { self.inner.set(value); }
         }
 "#;
+
+/// A49 inverted the trait: `on_change` — the attach that does NOT call its
+/// observer — is the requirement, and `sub` is the default built over it. So
+/// the impl above is the migrated shape, and the shape it replaced is now a
+/// refusal. This is the one thing an implementor has to do, and the diagnostic
+/// is the whole instruction: the member that is missing, and the signature to
+/// declare.
+///
+/// Non-vacuous by construction — with the pre-A49 trait this exact program is
+/// the one every implementor in the estate was written against, and it compiled.
+#[test]
+fn a49_a_source_that_provides_only_sub_is_refused_and_names_on_change() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
+
+        fun main() {}
+        "#,
+        // B260: the head names the trait as the `with` clause wrote it, so this
+        // impl's `Source<T>` is what the sentence says.
+        "does not implement trait 'Source<T>': missing 'on_change'",
+    );
+}
+
+/// The refusal spells the declaration to write — for a GENERIC impl, which is
+/// the shape most of the estate's implementors are, the line is copy-pasteable
+/// and the migration is that line with `sub`'s body moved under it.
+#[test]
+fn a49_the_refusal_spells_the_declaration_to_write() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
+
+        fun main() {}
+        "#,
+        "declare `fun on_change(self, observer: |T| void): Subscription`",
+    );
+}
+
+/// The control that keeps the two above from being a claim about `Source`
+/// having any required member at all: `get` alone is still not enough either,
+/// and an impl that writes BOTH requirements and no eager member compiles and
+/// drives a binding — `A_USER_SOURCE` above is that impl, and every pin in this
+/// block runs on it.
+#[test]
+fn a49_an_on_change_only_source_satisfies_the_trait() {
+    assert_compiles(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        {A_USER_SOURCE}
+        fun consume<T, S: Source<T>>(source: S) {{
+            let _first: T = source.get();
+            let _live = source.sub(|_value| {{}});
+            let _lazy = source.on_change(|_value| {{}});
+        }}
+        fun main() {{
+            consume(Stored::new(1));
+        }}
+        "#,
+    ));
+}
 
 /// Every widened binding on the BROWSER twin, driven by a user `Source`. Before
 /// A33 each of these was a type error naming `Signal`.
@@ -6252,7 +6671,7 @@ fn a_user_source_drives_every_read_only_browser_binding() {
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::style::{{ Color, Style, style }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::ui::{{ View, each, mount_root, view, when }};
         {A_USER_SOURCE}
         fun main() {{
             let label: Stored<str> = Stored::new("alpha");
@@ -6266,8 +6685,8 @@ fn a_user_source_drives_every_read_only_browser_binding() {
                 .child(view("div").style_var("--w", label))
                 .child(view("span").bind_styled(skin))
                 .child(view("i").show(flag))
-                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
-                .child(view("aside").when(flag, || view("b").text("here"))));
+                .child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
+                .child(view("aside").child(when(flag, || view("b").text("here")))));
         }}
         "#
     ));
@@ -6283,7 +6702,7 @@ fn a_user_source_drives_the_process_twin_and_renders() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, render, view }};
+        import std::ui::{{ View, each, render, view, when }};
         {A_USER_SOURCE}
         fun main() {{
             let label: Stored<str> = Stored::new("alpha");
@@ -6296,14 +6715,14 @@ fn a_user_source_drives_the_process_twin_and_renders() {
                 .child(view("a").bind_attr("href", label))
                 .child(view("div").style_var("--w", label))
                 .child(view("i").show(hidden))
-                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
-                .child(view("aside").when(shown, || view("b").text("here")))));
+                .child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
+                .child(view("aside").child(when(shown, || view("b").text("here"))))));
         }}
         main();
         "#
         ),
         "<main><h1>alpha</h1><p class=\"alpha\"></p><a href=\"alpha\"></a>\
-         <div style=\"--w:alpha\"></div><i hidden=\"\"></i>\
+         <div style=\"--w:alpha\"></div><i hidden=\"\" style=\"display:none\"></i>\
          <ul><li>x</li><li>y</li></ul><aside><b>here</b></aside></main>\n",
     );
 }
@@ -6417,51 +6836,53 @@ fn element_syntax_still_routes_attributes_through_attr_value() {
 
 // ── B168: the three A33 held back, widened ───────────────────────────────────
 //
-// A33's sweep classified `View::swap` READ-ONLY like every other binding it
-// widened, and held it anyway: a `Source<T>` bound whose argument is a BARE
-// generic parameter lost its link to the caller's `T` inside a generic body,
-// and `swap_split` calls `self.swap(gated, render)` from exactly such a body.
+// A33's sweep classified `swap` READ-ONLY like every other binding it widened,
+// and held it anyway: a `Source<T>` bound whose argument is a BARE generic
+// parameter lost its link to the caller's `T` inside a generic body, and the
+// split gate passes its own `gated: SignalCell<T>` on from exactly such a body.
 // B168 fixed that reconciliation (`tests/inference/generics.rs` carries the
-// minimized pin and its edge cases), so the three that waited — `View::swap`,
-// `View::swap_split` and `ui::chunk_preload` — widened together, in
-// generic-parameter ORDER, which is what the split gate rebinds by position.
+// minimized pin and its edge cases), so the three that waited — `swap`,
+// `swap_split` and `ui::chunk_preload` — widened together, in generic-parameter
+// ORDER, which is what the split gate rebinds by position. A99 retired the
+// `View` methods, so all three are free functions here.
 //
 // Each pin below drives its signature with `A_USER_SOURCE`: a type that is a
 // `Source` and is NOT a `Signal`. Against the held signatures every one of them
 // was a type error naming `Signal`.
 
-/// `View::swap` on the BROWSER twin, driven by a user `Source`.
+/// `ui::swap` on the BROWSER twin, driven by a user `Source`.
 #[test]
 fn a_user_source_drives_the_browser_swap() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::ui::{{ View, mount_root, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("home");
             let _root = mount_root("app", || view("main")
-                .swap(route, |current| view("section").text(current)));
+                .child(swap(route, |current| view("section").text(current))));
         }}
         "#
     ));
 }
 
-/// `View::swap_split` — the split build's gate — driven by the same user
-/// `Source`. It is the signature whose own BODY carries the B168 shape
-/// (`self.swap(gated, render)` with `gated: SignalCell<T>`), so this pin is the
-/// compiler fix read through std rather than through a minimized exhibit.
+/// `ui::swap_split` — the split build's gate — driven by the same user
+/// `Source`. It is the signature whose own BODY carries the B168 shape (its
+/// `gated: SignalCell<T>` travels on as the same bare parameter), so this pin
+/// is the compiler fix read through std rather than through a minimized
+/// exhibit.
 #[test]
 fn a_user_source_drives_the_split_gate() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::ui::{{ View, mount_root, swap_split, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("home");
             let _root = mount_root("app", || view("main")
-                .swap_split(route, |current| view("section").text(current)));
+                .child(swap_split(route, |current| view("section").text(current))));
         }}
         "#
     ));
@@ -6497,12 +6918,12 @@ fn a_user_source_drives_the_process_swap_and_renders() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, render, view }};
+        import std::ui::{{ View, render, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("docs");
             print(render(view("main")
-                .swap(route, |current| view("section").text(current))));
+                .child(swap(route, |current| view("section").text(current)))));
         }}
         main();
         "#
@@ -6520,14 +6941,14 @@ fn a_concrete_signal_still_drives_the_swap_family() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ chunk_preload, View, mount_root, view };
+        import std::ui::{ View, chunk_preload, mount_root, swap, swap_split, view };
 
         fun main() {
             let route = Signal::new("home");
             chunk_preload(route);
             let _root = mount_root("app", || view("main")
-                .swap(route, |current| view("section").text(current))
-                .swap_split(route, |current| view("aside").text(current)));
+                .child(swap(route, |current| view("section").text(current)))
+                .child(swap_split(route, |current| view("aside").text(current))));
         }
         "#,
     );
@@ -6682,6 +7103,82 @@ fn b165_the_static_blanket_and_a_source_bounded_blanket_coexist() {
     );
 }
 
+/// B268: two blankets over ONE parameterized trait at DIFFERENT arguments,
+/// which is the child contract's shape — `impl type S: Source<str> with Slot`
+/// beside `impl type S: Source<View> with Slot`.
+///
+/// A bound's ARGUMENTS were dropped when an impl was matched to a receiver, on
+/// both sides of the pipeline: the analyzer read `Source` and called both
+/// blankets applicable to a `SignalCell<Panel>` (reporting the pair as
+/// unrankable, "neither impl subject is more specific than the other"), and
+/// emission read `Source` and picked whichever came first. So a `Signal<View>`
+/// in child position took std's TEXT arm and the DOM got `[object Object]`.
+#[test]
+fn b268_two_blankets_over_one_trait_at_different_arguments_each_reach_their_own() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Panel { name: str, weight: i32 }
+
+        trait Place { fun place(self); }
+
+        impl type S: Source<str> with Place {
+            fun place(self) { print(i"text {self.get()}"); }
+        }
+
+        impl type S: Source<Panel> with Place {
+            fun place(self) { print(i"panel {self.get().name}"); }
+        }
+
+        fun slot<C: Place>(content: C) { content.place(); }
+
+        fun main() {
+            let label: SignalCell<str> = Signal::new("hello");
+            let panel: SignalCell<Panel> = Signal::new(Panel { name = "one", weight = 1 });
+            slot(label);
+            slot(panel);
+            label.set("goodbye");
+            slot(label);
+        }
+        main();
+        "#,
+        "text hello\npanel one\ntext goodbye\n",
+    );
+}
+
+/// The same pair, reached through the ELEMENT the bound is written on rather
+/// than through a generic function — a receiver whose type the analyzer can
+/// see resolves by the same order, and the concrete-argument blanket is not
+/// shadowed by the one that merely names the same trait.
+#[test]
+fn b268_a_concrete_receiver_picks_the_blanket_bounded_at_its_own_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Panel { name: str, weight: i32 }
+
+        trait Place { fun place(self); }
+
+        impl type S: Source<str> with Place {
+            fun place(self) { print(i"text {self.get()}"); }
+        }
+
+        impl type S: Source<Panel> with Place {
+            fun place(self) { print(i"panel {self.get().name}"); }
+        }
+
+        fun main() {
+            let panel: SignalCell<Panel> = Signal::new(Panel { name = "one", weight = 1 });
+            panel.place();
+        }
+        main();
+        "#,
+        "panel one\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A32 — `Signal` is the WRITE trait, `SignalCell` the canonical cell
 // ---------------------------------------------------------------------------
@@ -6703,7 +7200,7 @@ const A_CLAMPING_SIGNAL: &str = r#"
         impl Clamped with Source<i32> {
             fun get(self): i32 { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |i32| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |i32| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Clamped with Signal<i32> {
@@ -6939,7 +7436,7 @@ fn a32_a_custom_signal_impl_drives_bind_value() {
         impl Shouted with Source<str> {
             fun get(self): str { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |str| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |str| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Shouted with Signal<str> {
@@ -6973,7 +7470,7 @@ fn a32_a_custom_signal_impl_drives_the_process_bind_value() {
         impl Upper with Source<str> {
             fun get(self): str { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |str| void): Subscription { self.inner.sub(observer) }
+            fun on_change(self, observer: |str| void): Subscription { self.inner.on_change(observer) }
         }
 
         impl Upper with Signal<str> {
@@ -7223,5 +7720,5725 @@ fn b157_a_second_blanket_for_maybe_signal_is_refused_at_its_declaration() {
         main();
         "#,
         "'MaybeSignal' is already implemented for 'T' by module 'reactive'",
+    );
+}
+
+// --- E106/M19: dispatch refinement selects per TYPE, not per call site ---
+
+/// Analyzes `source`, refines every trait-dispatch site the shared call graph
+/// leaves indirect, and reports `(impl selections evaluated, refined edges,
+/// dispatch sites)`.
+///
+/// The site enumeration is the `context` pass's own (`context.rs`): every call
+/// the graph records as `TraitDispatch`/`GenericMember`, with the candidate
+/// list `dispatch_refine::candidates_of` gives its member name. Driving
+/// `refined_edges` directly is deliberate — both shipped consumers (the
+/// context pass and `const_eval`'s const-only check) reach it through their
+/// own trigger conditions, and the property here belongs to the refinement,
+/// not to either trigger.
+///
+/// Runs on a large-stack worker with the counter zeroed there, so a
+/// concurrently running test cannot contribute to it (the isolation
+/// `call_graphs_built_by_one_analysis` documents).
+fn dispatch_selections(source: &str) -> (usize, usize, usize) {
+    use vilan_core::call_graph::{CallGraph, CallTarget, IndirectReason};
+    use vilan_core::dispatch_refine::{
+        self, DispatchSite, RefinedCaller, candidates_of, member_name_at,
+    };
+
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let graph = CallGraph::build(&program);
+            let mut sites: Vec<DispatchSite> = Vec::new();
+            for node in graph.nodes() {
+                for call in graph.calls_of(node.id()) {
+                    if !matches!(
+                        call.target,
+                        CallTarget::Indirect(
+                            IndirectReason::TraitDispatch | IndirectReason::GenericMember
+                        )
+                    ) {
+                        continue;
+                    }
+                    let Some(name) = member_name_at(&program, call.call_id) else {
+                        continue;
+                    };
+                    sites.push(DispatchSite {
+                        owner: RefinedCaller::Node(node.id()),
+                        call: call.call_id,
+                        candidates: candidates_of(
+                            &program,
+                            program.admitting_file(call.call_id),
+                            name,
+                        ),
+                    });
+                }
+            }
+            dispatch_refine::reset_selection_count();
+            let edges = dispatch_refine::refined_edges(&program, &graph, &sites);
+            (dispatch_refine::selection_count(), edges.len(), sites.len())
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// E106/M19. An `OnConstraint` site is resolved per ENTRY of the function that
+/// owns the constraint, and each entry asks which impl members its concrete
+/// type selects — a scan of every implementation whose own entries may recurse
+/// into another such scan. The entry count is a program-size quantity, so the
+/// question is what the answer is keyed on. It is keyed on the RESOLVED TYPE:
+/// twelve calls at one type ask once.
+///
+/// Only a counter can pin it. The memo changes no edge, so no behaviour test
+/// can see it, and the timing it exists for is not assertable on a shared
+/// machine. The measured instance is kolt's generated icon module: 17,895
+/// selections per pass for 32 distinct answers, twice per analysis, 2.5 s of a
+/// 5 s keystroke.
+/// Read as a DIFFERENTIAL between two caller counts, because std's own
+/// prelude contributes dispatch sites of its own and an absolute count would
+/// pin those too: what the memo owns is the SLOPE. Four extra entries must add
+/// four refined edges (the refinement is untouched) and ZERO selections.
+#[test]
+fn a_bounded_dispatch_reached_from_many_callers_selects_once_per_type() {
+    let program_with = |entries: usize| {
+        let calls: String = (0..entries)
+            .map(|index| format!("            tell(Badge {{ size = {index} }});\n"))
+            .collect();
+        format!(
+            r#"
+        trait Show3 {{ fun show3(self): str; }}
+        struct Badge {{ size: i32 }}
+        impl Badge with Show3 {{ fun show3(self): str {{ "badge" }} }}
+
+        fun tell<V: Show3>(value: V) {{ print(value.show3()); }}
+
+        fun main() {{
+{calls}        }}
+        main();
+        "#
+        )
+    };
+    let (few_selections, few_edges, few_sites) = dispatch_selections(&program_with(4));
+    let (many_selections, many_edges, many_sites) = dispatch_selections(&program_with(8));
+
+    assert_eq!(
+        few_sites, many_sites,
+        "the same one dispatch site (`value.show3()` inside `tell`) plus std's, \
+         either way: only the ENTRY count moved"
+    );
+    assert_eq!(
+        many_edges - few_edges,
+        4,
+        "four more entries of `tell` refine to four more edges — the answer is \
+         unchanged, which is what makes the memo invisible"
+    );
+    assert_eq!(
+        many_selections, few_selections,
+        "…and to NO more impl selections: eight `Badge` literals are eight type \
+         IDS but one TYPE, and the selection is keyed on the type. Without the \
+         memo this grows one-for-one with the entry count"
+    );
+}
+
+/// Analyzes `source` on a large-stack worker and reports how many BOUND
+/// EVALUATIONS `check_generic_bound_satisfaction` performed — the M19 memo's
+/// instrument. The counter is zeroed on the worker thread, so a concurrently
+/// running test cannot contribute to it (the isolation
+/// `dispatch_selections` documents).
+fn generic_bound_checks(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::analyzer::reset_generic_bound_checks();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            assert!(program.is_some(), "analysis should produce a program");
+            vilan_core::analyzer::generic_bound_checks()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// M19, tranche 1. `check_generic_bound_satisfaction` walks EVERY recorded
+/// call site of the whole program on every analysis — including every site in
+/// every module the edit did not touch — and asks, per bound, whether the
+/// value's type satisfies it. The question's answer depends only on the
+/// resolved types, so it is asked once per (type, trait, arguments), not once
+/// per call.
+///
+/// Only a counter can pin it, for `refined_edges`' reasons: the memo changes
+/// no diagnostic (the assertions below check that the analysis stays clean
+/// either way), and the timing it exists for is not assertable on a shared
+/// machine. Read as a DIFFERENTIAL between two call counts, because std's own
+/// prelude contributes bound checks of its own and an absolute count would pin
+/// those too: what the memo owns is the SLOPE. Sixteen more calls at the same
+/// type must add ZERO evaluations.
+///
+/// The measured instance is kolt with its generated icon module: `checks` is
+/// the largest remaining per-keystroke phase and 63% of it is this check, over
+/// 1,791 functions that did not change.
+#[test]
+fn a_generic_bound_checked_at_many_call_sites_is_evaluated_once_per_type() {
+    let program_with = |calls: usize| {
+        let body: String = (0..calls)
+            .map(|index| format!("            let _{index} = pass(Coin {{ face = {index} }});\n"))
+            .collect();
+        format!(
+            r#"
+        trait Flip {{ fun flip(self): i32; }}
+        struct Coin {{ face: i32 }}
+        impl Coin with Flip {{ fun flip(self): i32 {{ self.face }} }}
+
+        fun pass<V: Flip>(value: V): i32 {{ value.flip() }}
+
+        fun main() {{
+{body}        }}
+        main();
+        "#
+        )
+    };
+    let few = generic_bound_checks(&program_with(4));
+    let many = generic_bound_checks(&program_with(20));
+    assert!(
+        few > 0,
+        "the fixture must actually reach the check, or the pin is vacuous"
+    );
+    assert_eq!(
+        many, few,
+        "sixteen more `pass(Coin {{ .. }})` calls are sixteen more type IDS but \
+         ONE type: the bound is evaluated per (type, trait, arguments), not per \
+         call site. Without the memo this grows one-for-one with the call count \
+         ({few} -> {many})"
+    );
+}
+
+// --- B212: a bound names a trait -------------------------------------------
+//
+// `fun f<T: S>(…)` with `S` a struct was accepted; the only sign was `cannot
+// access field 'v' on type T` at some downstream use, which names neither the
+// bound nor its sort. The refusal goes at the bound, where the fix is.
+
+#[test]
+fn b212_a_struct_written_as_a_bound_is_refused() {
+    assert_fails_with(
+        r#"
+        struct S { v: i32 }
+        fun f<T: S>(x: T): i32 { 1 }
+        fun main() { print(f(S { v = 3 })); }
+        "#,
+        "'S' is a struct, not a trait: a bound names a trait.",
+    );
+}
+
+#[test]
+fn b212_an_enum_written_as_a_bound_is_refused() {
+    assert_fails_with(
+        r#"
+        enum E { One, Two }
+        fun f<T: E>(x: T): i32 { 1 }
+        fun main() { print(1); }
+        "#,
+        "'E' is an enum, not a trait: a bound names a trait.",
+    );
+}
+
+#[test]
+fn b212_a_bound_one_edit_from_a_trait_steers_to_it() {
+    // The steer runs the `closest_name` channel over the TRAITS in scope, so a
+    // near miss names the trait the author meant rather than leaving them to
+    // find it.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Shov { v: i32 }
+        fun f<T: Shov>(x: T): i32 { 1 }
+        fun main() { print(1); }
+        "#,
+        "'Shov' is a struct, not a trait: a bound names a trait. Did you mean 'Show'?",
+    );
+}
+
+#[test]
+fn b212_an_impl_binders_bound_is_held_to_the_same_rule() {
+    // The same channel registers an impl binder's bound (`impl Box<type T: S>`),
+    // so the rule reaches it without a second site.
+    assert_fails_with(
+        r#"
+        struct S { v: i32 }
+        struct Box<type T> { value: T }
+        impl Box<type T: S> {
+            fun get(self): T { self.value }
+        }
+        fun main() { print(1); }
+        "#,
+        "'S' is a struct, not a trait: a bound names a trait.",
+    );
+}
+
+#[test]
+fn b212_a_trait_bound_still_binds_and_dispatches() {
+    // The control: a bound that names a trait is untouched.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Show { fun show(self): str; }
+        struct Cat { n: i32 }
+        impl Cat with Show { fun show(self): str { "cat" } }
+        fun tell<T: Show>(x: T): str { x.show() }
+        fun main() { print(tell(Cat { n = 1 })); }
+        "#,
+        "cat\n",
+    );
+}
+
+// --- B251: a parameter reachable only through another's bound, and the -------
+// --- bounds a WRITTEN type application owes ---------------------------------
+//
+// Two halves of one hole in the struct-parameter path.
+//
+// A parameter no field mentions DIRECTLY — `struct Held<T, S: Signal<List<T>>>
+// { list: S }`, where every field names `S` — had nothing to ground it: the
+// literal bound `S` from the value and left `T` abstract, so
+// `Held { list = SignalCell::new([1, 2]) }` typed as
+// `Held<any, SignalCell<List<i32>>>` and that `any` satisfied anything
+// downstream. B186 built the recovery for CALLS (`derive_generics_from_bounds`
+// — once `S` is concrete, read `T` back out of the `Signal` impl); a struct
+// literal binds the same shape through a different door and never reached it.
+//
+// And a WRITTEN application (`Held<i32, SignalCell<List<str>>>`) binds those
+// same parameters while recording nothing a bound check reads: the call check
+// walks `method_call_substitution` and the construction check walks literals,
+// so an annotation's arguments were never asked. The bound the second argument
+// owes is `Signal<List<i32>>` — the first argument grounds it — and nothing
+// checked it, so the annotation carried a `str` list out through a declared
+// `i32` one.
+//
+// CENSUS of written struct arguments the new check refuses, across std, the
+// 128 corpus programs, the eleven examples, the benchmarks, macro_std and the
+// CLI templates: ZERO. Four structs in the estate declare a bounded parameter
+// (`Map<K: Hashable, V>`, `Set<T: Hashable>`, `Optimistic<T, S: Signal<T>>`,
+// the rpc example's `AccountsClient<T: Transport>`) and every written
+// application of them satisfies its bound.
+
+const HELD_WRITTEN: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    struct Held<T, S: Signal<List<T>>> { list: S }
+    "#;
+
+/// The one-parameter spelling of `HELD_WRITTEN`, where `T` is reachable ONLY
+/// through the field's bound. It was B184's sugar (`list: Signal<List<T>>`,
+/// a hidden parameter) until A124 R3 withdrew the bare trait at a field on
+/// 2026-09-22; as a `dyn` it is the same solver question — one written
+/// parameter, reachable through the field's type and nowhere else — with one
+/// argument instead of two, which is why the reports below name `Held<i32>`
+/// rather than `Held<i32, SignalCell<List<i32>>>`.
+const HELD_DYN: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Source, SignalCell };
+    struct Held<T> { list: dyn Source<List<T>> }
+    "#;
+
+#[test]
+fn b251_a_parameter_reachable_only_through_a_bound_grounds_at_the_literal() {
+    // The filed shape, read off the literal's own type: pre-fix the report said
+    // `Held<any, SignalCell<List<i32>>>`.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun main() {{
+                let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
+                print(h);
+            }}
+            "#
+        ),
+        "but got Held<i32, SignalCell<List<i32>>> instead.",
+    );
+}
+
+#[test]
+fn b251_the_object_field_form_grounds_it_too() {
+    // The one-parameter spelling: `T` is reachable only through the FIELD's
+    // bound, which is the shape the estate actually has. Same recovery, same
+    // answer, one argument.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_DYN}
+            fun main() {{
+                let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
+                print(h);
+            }}
+            "#
+        ),
+        "but got Held<i32> instead.",
+    );
+}
+
+#[test]
+fn b251_the_grounded_parameter_is_what_a_consumer_is_checked_against() {
+    // The consequence, not just the label: with `T` abstract the argument read
+    // as `Held<any, ..>` and `any` answers to anything. The report now names
+    // the element the literal actually built, which is what makes the mismatch
+    // visible at all.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_DYN}
+            fun count(h: Held<i32>): usize {{ h.list.get().len() }}
+            fun main() {{ print(count(Held {{ list = SignalCell::new(["a"]) }})); }}
+            "#
+        ),
+        "but got Held<str> instead.",
+    );
+}
+
+#[test]
+fn b251_the_matching_element_still_compiles_and_runs() {
+    // The control for the half above: grounding `T` must not refuse the
+    // program that agrees.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_DYN}
+            fun count(h: Held<i32>): usize {{ h.list.get().len() }}
+            fun main() {{ print(count(Held {{ list = SignalCell::new([1, 2, 3]) }})); }}
+            main();
+            "#
+        ),
+        "3\n",
+    );
+}
+
+#[test]
+fn b251_a_written_argument_is_checked_against_the_parameters_bound() {
+    // The second half, at the annotation, where the fix goes. The message names
+    // the BOUND (grounded by the sibling argument) and both types.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b251_the_refusal_notes_the_declaration_the_bound_is_written_on() {
+    // The bound is written on the struct, not here, so the report points at it.
+    assert_fails_noting(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "required by the bound on parameter 'S' of 'Held'",
+        "Held",
+        "'Held' is declared here",
+    );
+}
+
+#[test]
+fn b251_a_bounded_and_satisfied_written_argument_compiles() {
+    // The control: the same annotation with an argument that MEETS the bound is
+    // exactly as it was, and the program runs.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_WRITTEN}
+            fun show(h: Held<i32, SignalCell<List<i32>>>): usize {{ h.list.get().len() }}
+            fun main() {{ print(show(Held {{ list = SignalCell::new([1, 2]) }})); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b251_a_written_argument_that_is_a_parameter_answers_through_its_own_bound() {
+    // Bound-to-bound flow at an annotation: `S` here is the caller's parameter,
+    // and its own declared bound is what satisfies the struct's — the rule
+    // `satisfies_trait_bound` already applies at a call, now reached at a
+    // written application too.
+    assert_compiles(&format!(
+        r#"{HELD_WRITTEN}
+            fun count<T, S: Signal<List<T>>>(h: Held<T, S>): usize {{ h.list.get().len() }}
+            fun main() {{ print(count(Held {{ list = SignalCell::new([1, 2]) }})); }}
+            "#
+    ));
+}
+
+#[test]
+fn b251_an_unbounded_parameters_written_argument_is_still_free() {
+    // The counterweight: a parameter with no bound requires nothing of its
+    // argument, and the new check must not invent a requirement for it.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        struct Pair<A, B> { a: A, b: B }
+        fun show(p: Pair<i32, str>): i32 { p.a }
+        fun main() { print(show(Pair { a = 1, b = "x" })); }
+        "#,
+    );
+}
+
+// --- B262: the written-argument bound check, over every SORT -----------------
+//
+// B251 shipped `check_written_nominal_bounds` reading `structs` alone, and the
+// drain that feeds it recorded a struct alone. An `enum` and a `trait` declare
+// bounded parameters in the same grammar, bind them by the same positional
+// rule, and drain through the same `prepped_type_locals` queue — so
+// `Held<i32, SignalCell<List<str>>>`'s enum twin was still accepted, with the
+// same consequence: an annotation carrying a `str` list out through a declared
+// `i32` one. The sort test is B188's own, which has held all three since the
+// arity check shipped.
+//
+// The refusal is row 401's, unchanged — same wording, same note, same id. What
+// moved is which declarations reach it.
+//
+// CENSUS of bounded declarations across std, vilan/test, the eleven examples,
+// the benchmarks, macro_std, the CLI templates, the docs fences and the README:
+// four bounded STRUCTS (B251's own: `Map<K: Hashable, V>`, `Set<T: Hashable>`,
+// `Optimistic<T, S: Signal<T>>`, the rpc example's `AccountsClient<T:
+// Transport>`), TWO bounded TRAITS — the tour's `trait Holder<T: Label>` and
+// `types.md`'s `trait Doubler<T: Add>` — and ZERO bounded enums. Every written
+// application of the two traits satisfies its bound (`impl DogBox with
+// Holder<Dog>`, and `Dog` implements `Label`), so the estate refuses NOTHING
+// new: the count is zero, as it was for structs. kolt and the website, counted
+// separately and read-only, declare no bounded struct, enum or trait at all.
+
+const HELD_ENUM: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    enum Held<T, S: Signal<List<T>>> { Full(S), Empty }
+    "#;
+
+const HELD_TRAIT: &str = r#"
+    import std::io::print;
+    import std::reactive::{ Signal, SignalCell };
+    trait Held<T, S: Signal<List<T>>> { fun item(self): S; }
+    "#;
+
+#[test]
+fn b262_an_enums_written_argument_is_checked_against_the_parameters_bound() {
+    // The filed shape: B251's struct exhibit with `enum` in place of `struct`.
+    // It compiled.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b262_the_enum_refusal_notes_the_declaration_the_bound_is_written_on() {
+    // The bound is written on the enum, not here, so the report points at it —
+    // the same note B251's struct half carries, reached through the sort-blind
+    // lookup rather than through `structs`.
+    assert_fails_noting(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<str>>>): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "required by the bound on parameter 'S' of 'Held'",
+        "Held",
+        "'Held' is declared here",
+    );
+}
+
+#[test]
+fn b262_a_bounded_and_satisfied_enum_argument_compiles_and_runs() {
+    // The control per kind: the same annotation with an argument that MEETS the
+    // bound is exactly as it was.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_ENUM}
+            fun show(h: Held<i32, SignalCell<List<i32>>>): usize {{
+                match h {{
+                    Held::Full(let s) => s.get().len(),
+                    Held::Empty => 0,
+                }}
+            }}
+            fun main() {{ print(show(Held::Full(SignalCell::new([1, 2])))); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b262_a_traits_written_argument_is_checked_against_the_parameters_bound() {
+    // The third sort, reached where a trait application is written: a BOUND.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_TRAIT}
+            fun show<H: Held<i32, SignalCell<List<str>>>>(h: H): i32 {{ 1 }}
+            fun main() {{ print(1); }}
+            "#
+        ),
+        "'SignalCell<List<str>>' does not implement trait 'Signal<List<i32>>', required by \
+         the bound on parameter 'S' of 'Held'",
+    );
+}
+
+#[test]
+fn b262_a_bounded_and_satisfied_trait_argument_compiles_and_runs() {
+    // The satisfied control for the trait sort, in the same BOUND position the
+    // refusal above fires in: an argument that meets the bound is untouched.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HELD_TRAIT}
+            fun show<H: Held<i32, SignalCell<List<i32>>>>(h: H): usize {{
+                h.item().get().len()
+            }}
+            struct Box {{ inner: SignalCell<List<i32>> }}
+            impl Box with Held<i32, SignalCell<List<i32>>> {{
+                fun item(self): SignalCell<List<i32>> {{ self.inner }}
+            }}
+            fun main() {{ print(show(Box {{ inner = SignalCell::new([1, 2]) }})); }}
+            main();
+            "#
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b262_the_estates_own_bounded_trait_still_compiles() {
+    // The census's live shape, run: the tour's `trait Holder<T: Label>` with
+    // `Dog`, which implements `Label`. This is what makes the estate count ZERO
+    // rather than merely untested — the two bounded traits in the tree are this
+    // one and `types.md`'s `Doubler<T: Add>`, and every argument written for
+    // either satisfies its bound.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> {
+            fun item(self): T;
+            fun describe(self): str { "holding " + self.item().label() }
+        }
+        struct Dog {}
+        impl Dog with Label { fun label(self): str { "a dog" } }
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        fun main() { print(DogBox {}.describe()); }
+        main();
+        "#,
+        "holding a dog\n",
+    );
+}
+
+#[test]
+fn b262_an_impl_with_clauses_trait_argument_is_still_unchecked() {
+    // B262's boundary, CLOSED by B273. An impl's `with` clause writes a trait
+    // APPLICATION and did not drain through `prepped_type_locals`, so it reached
+    // neither B188's arity check nor B251's bound check: `impl CatBox with
+    // Holder<Cat>` was accepted with `Cat` implementing nothing, and so was
+    // `impl CatBox with Holder<Cat, i32>`. The clause is a THIRD recording site
+    // for the one check now, so both messages are the ones the other two sites
+    // already produce. `vilan/docs/tour/data-and-traits.md` asserted this in
+    // prose all along ("Each impl picks the argument … and is checked against
+    // the bound there"); the page was ahead of the compiler and stays.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> { fun item(self): T; }
+        struct Cat {}
+        struct CatBox {}
+        impl CatBox with Holder<Cat> {
+            fun item(self): Cat { Cat {} }
+        }
+        fun main() { print(1); }
+        "#,
+        "'Cat' does not implement trait 'Label', required by the bound on parameter 'T' \
+         of 'Holder'",
+    );
+}
+
+#[test]
+fn b262_an_unbounded_enum_parameters_written_argument_is_still_free() {
+    // The counterweight, per B251's: a parameter with no bound requires nothing
+    // of its argument, and the widened check must not invent a requirement for
+    // one — `Option<T>` and `Result<T, E>` are the estate's own unbounded
+    // enums, written everywhere.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        enum Pair<A, B> { Both(A, B), Neither }
+        fun show(p: Pair<i32, str>): i32 {
+            match p {
+                Pair::Both(let a, _) => a,
+                Pair::Neither => 0,
+            }
+        }
+        fun main() { print(show(Pair::Both(1, "x"))); }
+        "#,
+    );
+}
+
+// --- B263: a determined `List` element, erased on the way out of a call ------
+//
+// `impl Held<type T> { fun first(self): T { self.list.get()[0] } }` over
+// `struct Held<T> { list: Signal<List<T>> }` reported "cannot index this List:
+// its element type is never determined". The bound-driven recovery is not what
+// was missing: `self.list.get()` really does resolve through the bound to
+// `List<T>`, with `T` the enclosing binder. `freshen_list_element_slots` then
+// REPLACED that element with a fresh inference slot.
+//
+// That helper exists for `List::new()`, whose element is a genuine hole to fill
+// from later `push` calls, and its test was "the element is an unbound generic"
+// — true of `List::new()`'s own parameter and equally true of a caller's rigid
+// `T`, which is not a hole at all but the answer. So the one shape that had
+// already been solved was the one it discarded.
+//
+// The guard is B219's family predicate, `generic_is_enclosing_binder`: an
+// element that is a binder of the declaration the CALL sits in is determined,
+// and the call's return keeps it. Only the DECLARED-function return path is
+// guarded; `List::new()` is `external fun new(): List<T>` and reaches the other
+// one, where the element is the callee's own parameter and freshening is right.
+//
+// Not an impl-body rule, though that is where it was found: the same free
+// function `fun first<T, S: Signal<List<T>>>(s: S): T { s.get()[0] }` failed
+// identically, and is pinned below.
+
+#[test]
+fn b263_an_impl_body_reads_the_element_through_a_bounded_siblings_bound() {
+    // The filed exhibit, run. `T` is reachable only through the FIELD's bound
+    // (B184's sugar spelled `list: Signal<List<T>>`; since A124 R3 the same
+    // shape is `list: dyn Source<List<T>>`), and the body indexes what `get()`
+    // returns.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source, SignalCell };
+        struct Held<T> { list: dyn Source<List<T>> }
+        impl Held<type T> {
+            fun first(self): T { self.list.get()[0] }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([1, 2, 3]) };
+            print(h.first());
+        }
+        main();
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b263_the_written_sibling_parameter_form_reads_it_too() {
+    // The same shape with the parameter written out rather than hidden — the
+    // two spell one struct (B251's pair), so both had the defect and both are
+    // pinned.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        struct Held<T, S: Signal<List<T>>> { list: S }
+        impl Held<type T, type S: Signal<List<T>>> {
+            fun first(self): T { self.list.get()[0] }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([4, 5]) };
+            print(h.first());
+        }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b263_a_free_function_over_the_same_bound_is_the_same_defect() {
+    // Where the diagnosis parts from the filing: this is not an impl-body rule.
+    // A free function whose parameter carries the same bound indexed the same
+    // `List<unknown>`, and it is the same erasure — there is no impl, no field
+    // and no sibling parameter in it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        fun first<T, S: Signal<List<T>>>(s: S): T { s.get()[0] }
+        fun main() { print(first(SignalCell::new([6, 7]))); }
+        main();
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn b263_a_methods_own_generic_still_binds_from_its_argument() {
+    // The generic-method control: a method declaring its OWN parameter beside
+    // the impl's binder still infers that parameter from the call, and the
+    // impl's binder still reaches the element.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source, SignalCell };
+        struct Held<T> { list: dyn Source<List<T>> }
+        impl Held<type T> {
+            fun first(self): T { self.list.get()[0] }
+            fun tagged<U>(self, tag: U): U { tag }
+        }
+        fun main() {
+            let h = Held { list = SignalCell::new([8, 9]) };
+            print(h.first());
+            print(h.tagged("x"));
+        }
+        main();
+        "#,
+        "8\nx\n",
+    );
+}
+
+#[test]
+fn b263_the_literal_form_is_unchanged() {
+    // B251's half, re-asked: the recovery AT THE LITERAL still grounds `T` and
+    // still reports it, so the guard has not moved the answer this family
+    // already had.
+    assert_fails_with(
+        &format!(
+            r#"{HELD_DYN}
+            fun main() {{
+                let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
+                print(h);
+            }}
+            "#
+        ),
+        "but got Held<i32> instead.",
+    );
+}
+
+#[test]
+fn b263_an_open_list_element_is_still_filled_from_later_pushes() {
+    // The counterweight, and the reason the guard is not simply "never
+    // freshen": `List::new()`'s element IS a hole, and a later `push` is what
+    // fills it. Inside a generic declaration too, where the guard's predicate
+    // has an enclosing binder to find.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun collect<T>(a: T, b: T): List<T> {
+            mut out = List::new();
+            out.push(a);
+            out.push(b);
+            out
+        }
+        fun main() { print(collect(1, 2).len()); }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+// --- B294: `_`, the ANONYMOUS type binder -----------------------------------
+//
+// `type _` already existed — the binder is the impl's parameter whether or not
+// it is named — and only its spelling was heavy: `_` in type position was an
+// ordinary name nothing declared (`cannot find type '_'`), and `_: Bound` did
+// not parse at all, so an anonymous binder could not carry the bound that makes
+// it useful. Both spellings are one `Node::TypeBinder` now.
+
+/// The owner's exhibit: a bound on an anonymous binder, written without the
+/// keyword. `impl Source<Option<type _: Source<type U>>>` compiled at 65af4be0;
+/// `impl Source<Option<_: Source<type U>>>` was a parse error at the `:`.
+#[test]
+fn b294_an_anonymous_binder_carries_a_bound_without_the_keyword() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, Signal };
+        impl Source<Option<_: Source<type U>>> {
+            fun depth(self): i32 { 2 }
+        }
+        fun main() {
+            let nested = Signal::new(Some(Signal::new(0)));
+            print(nested.depth());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// The keyword spelling of the same head still compiles — one node, two
+/// spellings, and the old one is not retired.
+#[test]
+fn b294_the_keyword_spelling_of_an_anonymous_binder_still_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, Signal };
+        impl Source<Option<type _: Source<type U>>> {
+            fun depth(self): i32 { 2 }
+        }
+        fun main() {
+            let nested = Signal::new(Some(Signal::new(0)));
+            print(nested.depth());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// A bare `_` with no bound, in one argument of a head whose other arguments
+/// are concrete — the `Some(_)` reading, in the impl-subject position.
+#[test]
+fn b294_a_bare_anonymous_binder_matches_any_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, Signal };
+        impl Source<Option<_>> {
+            fun held(self): i32 { 7 }
+        }
+        fun main() { print(Signal::new(Some(1)).held()); }
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+// The freshness question, asked four ways. `pairwise<T>(a, b)` takes TWO
+// arguments of ONE type, so it compiles exactly when the head's two positions
+// are the same parameter — which makes it the discriminator the impl head
+// itself is not (an inherent impl applies to `Pair<i32, str>` whatever its
+// binders say). Two anonymous binders ALIASED at 65af4be0: `_` was registered
+// under the name `_`, the second registration overwrote the first, and both
+// occurrences then resolved to the last one.
+
+const B294_PAIR_PRELUDE: &str = r#"
+    struct Pair<A, B> { first: A, second: B }
+    fun pairwise<T>(a: T, b: T): i32 { 0 }
+"#;
+
+/// The control the other three are read against: two NAMED binders are two
+/// parameters, and passing one where the other is expected is refused.
+#[test]
+fn b294_two_named_binders_are_two_parameters() {
+    assert_fails_with(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<type A, type B> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = "x" }}.blend()); }}
+            main();
+            "#
+        ),
+        "but got B instead.",
+    );
+}
+
+/// Two WILDCARDS are two parameters, exactly as two named binders are — and
+/// exactly as `Some(_, _)` binds nothing twice.
+#[test]
+fn b294_two_anonymous_binders_are_two_parameters() {
+    assert_fails_with(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<_, _> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = "x" }}.blend()); }}
+            main();
+            "#
+        ),
+        "but got _ instead.",
+    );
+}
+
+/// The keyword spelling is the same node, so it is fresh now too — this is the
+/// case that compiled at 65af4be0 and should not have.
+#[test]
+fn b294_two_keyword_anonymous_binders_are_two_parameters() {
+    assert_fails_with(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<type _, type _> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = "x" }}.blend()); }}
+            main();
+            "#
+        ),
+        "but got _ instead.",
+    );
+}
+
+/// The counterweight: a binder MENTIONED twice is still one parameter. The fix
+/// withdraws the anonymous binder's name, and a written name still binds.
+#[test]
+fn b294_a_named_binder_reused_in_the_head_is_still_one_parameter() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+            {B294_PAIR_PRELUDE}
+            impl Pair<type T, T> {{
+                fun blend(self): i32 {{ pairwise(self.first, self.second) }}
+            }}
+            fun main() {{ print(Pair {{ first = 1, second = 2 }}.blend()); }}
+            main();
+            "#
+        ),
+        "0\n",
+    );
+}
+
+/// A binder bound by an anonymous parameter's BOUND is still declared and still
+/// reusable — B165's shape written with the wildcard subject.
+#[test]
+fn b294_a_binder_inside_an_anonymous_binders_bound_is_still_declared() {
+    assert_compiles_and_runs(
+        r#"
+        trait Src<T> { fun read(self): T; }
+        trait Maybe<T> { fun show(self, react: |T| void); }
+        struct Cell { value: str }
+        impl Cell with Src<str> { fun read(self): str { self.value } }
+        impl _: Src<type T> with Maybe<T> {
+            fun show(self, react: |T| void) { react(self.read()); }
+        }
+        fun tell<V: Maybe<str>>(v: V) { v.show(|text| print(text)); }
+        fun main() { tell(Cell { value = "anonymous subject" }); }
+        main();
+        "#,
+        "anonymous subject\n",
+    );
+}
+
+/// Out of scope and said so: `_` is not an inference placeholder. The refusal
+/// names what `_` is for instead of inviting a search for a type called `_`.
+#[test]
+fn b294_a_placeholder_underscore_in_an_annotation_says_what_it_is_for() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let values: List<_> = [1, 2];
+            print(values.len());
+        }
+        main();
+        "#,
+        "`_` is the anonymous type binder",
+    );
+}
+
+/// The same refusal in a PARAMETER annotation, where there is no initializer to
+/// infer from either.
+#[test]
+fn b294_a_placeholder_underscore_in_a_parameter_is_refused_too() {
+    assert_fails_with(
+        r#"
+        fun takes(value: _): i32 { 0 }
+        fun main() { print(takes(1)); }
+        main();
+        "#,
+        "only an `impl` subject introduces one",
+    );
+}
+
+/// A generic parameter a declaration NAMES `_` is an ordinary parameter that
+/// resolves by name, and the wildcard reading does not take it away: the fix is
+/// scoped to impl-subject binders, which are the only place two `_`s can meet.
+#[test]
+fn b294_a_declared_generic_named_underscore_still_resolves_by_name() {
+    assert_compiles_and_runs(
+        r#"
+        fun identity<_>(value: _): _ { value }
+        fun main() { print(identity(3)); }
+        main();
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clauses_over_supplied_arity_is_refused() {
+    // B188's check at the third site. `Holder` declares one parameter; the
+    // clause wrote two, and the clause was the one position the arity check
+    // never saw.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> { fun item(self): T; }
+        struct Cat {}
+        struct CatBox {}
+        impl Cat with Label { fun label(self): str { "a cat" } }
+        impl CatBox with Holder<Cat, i32> {
+            fun item(self): Cat { Cat {} }
+        }
+        fun main() { print(1); }
+        "#,
+        "`Holder` takes 1 type argument, 2 given",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clause_on_an_unparameterised_trait_takes_no_arguments() {
+    // The zero-arity arm of the same message: the fix is the bare name.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        struct Cat {}
+        impl Cat with Label<i32> { fun label(self): str { "a cat" } }
+        fun main() { print(1); }
+        "#,
+        "`Label` takes 0 type arguments, 1 given",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clauses_satisfied_argument_still_compiles() {
+    // The counterweight: a concrete argument that MEETS the bound is what the
+    // estate is made of, and the new site must not invent a requirement.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Label { fun label(self): str; }
+        trait Holder<T: Label> {
+            fun item(self): T;
+            fun describe(self): str { "holding " + self.item().label() }
+        }
+        struct Dog {}
+        impl Dog with Label { fun label(self): str { "a dog" } }
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        fun main() { print(DogBox {}.describe()); }
+        main();
+        "#,
+        "holding a dog\n",
+    );
+}
+
+#[test]
+fn b273_an_impls_own_binder_is_not_held_to_the_traits_bound_at_the_clause() {
+    // The BOUNDARY the census found, pinned as the rule rather than left
+    // implicit: `impl Holder<type T> with Doubler<T>` over `trait Doubler<T:
+    // Add>` does not restate the bound, and is not refused here — the
+    // requirement is discharged where `T` is GROUNDED
+    // (`a_bounded_trait_parameter_left_operand_still_dispatches` pins both
+    // halves of that). A CONCRETE argument has no grounding site left, which is
+    // the half B273 closes; this is the line between them.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler<T: Add> {
+            fun once(self): T;
+            fun twice(self): T { self.once() + self.once() }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T { self.value }
+        }
+
+        fun main() { print(Holder { value = 21 }.twice()); }
+        main();
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn b273_an_impl_with_clause_grounds_a_sibling_bound_from_its_own_arguments() {
+    // The `declared_bindings` half the shared check already does, reached from
+    // the new site: `Pairing<K, V: Tagged<K>>` reads its second argument's
+    // bound in terms of the first, so the refusal names `Tagged<str>` — the
+    // instantiation — and not the declaration's `Tagged<K>`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Tagged<K> { fun tag(self): K; }
+        trait Pairing<K, V: Tagged<K>> { fun pair(self): V; }
+        struct Note {}
+        impl Note with Tagged<i32> { fun tag(self): i32 { 1 } }
+        struct Book {}
+        impl Book with Pairing<str, Note> { fun pair(self): Note { Note {} } }
+        fun main() { print(1); }
+        "#,
+        "'Note' does not implement trait 'Tagged<str>'",
+    );
+}
+
+#[test]
+fn b275_a_supertrait_match_threads_the_bounds_arguments() {
+    // The exhibit: the only `Place` impl is the blanket over `Source<str>`, and
+    // a `SignalCell<Panel>` reaches `Source` only through `Signal` — so it used
+    // to satisfy `: Place` and the emission filter's never-empty fallback was
+    // the only thing left between that and an internal-error report.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Panel {}
+
+        trait Place {
+            fun place(self): str;
+        }
+
+        impl type S: Source<str> with Place {
+            fun place(self): str { "placed" }
+        }
+
+        fun slot<P: Place>(part: P): str {
+            part.place()
+        }
+
+        fun main() {
+            let signal_of_panel: SignalCell<Panel> = Signal::new(Panel {});
+            print(slot(signal_of_panel));
+        }
+        "#,
+        "'SignalCell<Panel>' does not implement trait 'Place'",
+    );
+}
+
+#[test]
+fn b275_a_supertrait_match_at_the_right_argument_still_satisfies() {
+    // The counterweight, and the one that proves the threading SUBSTITUTES
+    // rather than merely refusing: `SignalCell<str>` reaches `Source<str>`
+    // through `Signal<str>`, and the blanket applies to it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Place {
+            fun place(self): str;
+        }
+
+        impl type S: Source<str> with Place {
+            fun place(self): str { "placed" }
+        }
+
+        fun slot<P: Place>(part: P): str {
+            part.place()
+        }
+
+        fun main() {
+            let signal_of_text: SignalCell<str> = Signal::new("hi");
+            print(slot(signal_of_text));
+        }
+        main();
+        "#,
+        "placed\n",
+    );
+}
+
+#[test]
+fn b275_a_user_supertrait_chain_threads_its_arguments() {
+    // Two levels of user traits, with the argument RENAMED on the way up
+    // (`Middle<M>` passes `M` to `Base<M>`): the substitution is the walk's,
+    // not a same-name coincidence.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<B> {
+            fun base(self): B;
+        }
+
+        trait Middle<M> with Base<M> {
+            fun middle(self): M;
+        }
+
+        struct Holder {}
+
+        impl Holder with Middle<i32> {
+            fun base(self): i32 { 1 }
+            fun middle(self): i32 { 1 }
+        }
+
+        fun needs<T: Base<str>>(value: T): str {
+            value.base()
+        }
+
+        fun main() {
+            print(needs(Holder {}));
+        }
+        "#,
+        "'Holder' does not implement trait 'Base<str>'",
+    );
+}
+
+#[test]
+fn b275_a_user_supertrait_chain_at_the_right_argument_satisfies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<B> {
+            fun base(self): B;
+        }
+
+        trait Middle<M> with Base<M> {
+            fun middle(self): M;
+        }
+
+        struct Holder {}
+
+        impl Holder with Middle<str> {
+            fun base(self): str { "base" }
+            fun middle(self): str { "middle" }
+        }
+
+        fun needs<T: Base<str>>(value: T): str {
+            value.base()
+        }
+
+        fun main() {
+            print(needs(Holder {}));
+        }
+        main();
+        "#,
+        "base\n",
+    );
+}
+
+#[test]
+fn b275_a_bool_signal_is_not_an_attribute_value() {
+    // The std face, and the one real program the census found: an element
+    // attribute's blanket is `impl type S: Source<str> with AttrValue`, and a
+    // `SignalCell<bool>` reaches `Source` through `Signal` — so it satisfied
+    // the bound and `set_attribute(name, true)` shipped, correct only by JS
+    // coercion. kolt's `views.vl` carried exactly one such site.
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::view;
+
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _bad = <div data-b(flag) />;
+        }
+        "#,
+        "'SignalCell<bool>' does not implement trait 'AttrValue'",
+    );
+}
+
+#[test]
+fn b275_a_str_signal_is_still_an_attribute_value() {
+    // Its control: the blanket's own instantiation is untouched.
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
+        import std::ui::view;
+
+        fun main() {
+            let text: SignalCell<str> = Signal::new("on");
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                let _good = <div data-a(text) />;
+            });
+        }
+        "#,
+    );
+}
+
+// --- B309: a `context` clause lives in the TYPE, so it flows ----------------
+//
+// A85 (positional slots) asks for `when`/`swap`/`each` as VALUES — structs
+// implementing `Slot` whose body/render closure is a FIELD — with the five
+// parent methods rewritten as one-line sugar over them. Its §5 named the one
+// implementation risk and told the build to probe it first: a struct field
+// typed as a context-carrying closure, `body: (|| View) context owner_scope`,
+// which is the only shape in the design std does not already write. slots-33
+// probed it and the answer was NO, three ways, because a clause was recorded
+// SIDE-BAND by parameter id (`parameter_contexts`) and
+// `Type::Closure(parameters, return)` carried none — so a clause flowed
+// through no field, generic argument or return, and the plain-closure fallback
+// was not a fallback at all: a closure captures its context at CREATION.
+//
+// B309 (ruled 2026-09-13, shape (1)) moved the record INTO the type.
+// `Type::Closure` carries the clause; the four positions that can write one —
+// a parameter, a `let` annotation, a struct field, a function return — put it
+// there; a generic ARGUMENT carries it through substitution; and
+// `context::thread_contexts` follows the value wherever it flows. The pins
+// below are the four that held the wall, flipped, plus the shapes the flip
+// makes expressible.
+
+/// The pin slots-33 left as the wall's own CONTROL: "the day the context model
+/// admits a field clause, this pin goes red and points at [the ignored ones]".
+/// It did, and this is what it became — a clause OFF a parameter is exactly as
+/// legal as one on it. What is still refused is a clause on a type that cannot
+/// carry one, which was always the honest half of the old refusal.
+#[test]
+fn a85_a_context_clause_is_legal_off_a_parameter() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (|| View) context owner_scope,
+        }
+        fun main() {}
+        "#,
+    );
+    assert_fails_with(
+        r#"
+        import std::reactive::owner_scope;
+        struct Sized {
+            size: (i32) context owner_scope,
+        }
+        "#,
+        "a `context` clause is only supported on a closure type",
+    );
+}
+
+/// The `sync` contract stays parameter-only, and deliberately: `sync` means
+/// "an async argument is refused HERE", and the only position that could
+/// otherwise accept one is a function parameter (async-polymorphism.md A.2) —
+/// a plain closure type already refuses an async store everywhere else. So
+/// A85's field is spelled `(|| View) context owner_scope`, and the marker is
+/// still the one half of the old three-way refusal that has not moved.
+#[test]
+fn a85_a_sync_marker_on_a_context_typed_field_is_still_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (sync || View) context owner_scope,
+        }
+        "#,
+        "a `sync` closure contract is only supported on parameters",
+    );
+}
+
+/// A85 §3a: the value forms' bodies are FIELDS, not type parameters, because a
+/// helper returning one has to be able to NAME the type (§6) and a type
+/// parameterized by a closure's own type is unnameable. So the field must
+/// carry the clause — and now does.
+#[test]
+fn a85_a_value_form_holds_its_body_as_a_context_carrying_field() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ Region, Slot, View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (|| View) context owner_scope,
+        }
+        fun when<S: Source<bool>>(
+            condition: S,
+            body: (sync || View) context owner_scope,
+        ): Conditional<S> {
+            Conditional { condition, body }
+        }
+        impl Conditional<type S: Source<bool>> with Slot {
+            fun place(self, parent: View) {
+                let region = Region::open(parent);
+                region.insert((self.body)());
+            }
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+/// A85 §3b: `View::when` becomes `self.child(when(condition, body))`. That
+/// rewrite needs the method's own INJECTED parameter to reach a struct, and
+/// the value-flow restriction admits a forward only to a position with the
+/// SAME clause — which a struct field now is.
+#[test]
+fn a85_an_injected_body_reaches_the_value_form_that_stores_it() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, owner_scope };
+        import std::ui::{ View, view };
+        struct Conditional<S: Source<bool>> {
+            condition: S,
+            body: (|| View) context owner_scope,
+        }
+        fun when<S: Source<bool>>(
+            condition: S,
+            body: (sync || View) context owner_scope,
+        ): Conditional<S> {
+            Conditional { condition, body }
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+/// The three things a value read out of a `context`-typed field may do, in one
+/// program: be CALLED (the call demands the context on its caller and threads
+/// the value's argument), be FORWARDED to a position carrying the same clause,
+/// and be passed to `run` as its body.
+#[test]
+fn b309_a_field_read_may_be_called_forwarded_or_passed_to_run() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held {
+            body: (|| void) context current,
+        }
+
+        fun forward(body: (|| void) context current) {
+            body();
+        }
+
+        fun call_it(held: Held) {
+            (held.body)();
+        }
+
+        fun forward_it(held: Held) {
+            forward(held.body);
+        }
+
+        fun run_it(held: Held) {
+            current.run(7, held.body);
+        }
+
+        fun main() {
+            let held = Held { body = || print(i"saw {current.get()}") };
+            current.run(1, || call_it(held));
+            current.run(2, || forward_it(held));
+            run_it(held);
+        }
+        main();
+        "#,
+        "saw 1\nsaw 2\nsaw 7\n",
+    );
+}
+
+/// A generic ARGUMENT carries the clause: `Held<(|| void) context current>`'s
+/// `body` field is declared as the abstract `T` and reads its clause out of
+/// the argument the instantiation bound — through `substitute_type`, which
+/// carries the clause across substitution. This is the position B309 named
+/// that neither a parameter nor a plain field reaches on its own, and it is
+/// the shape A91's render closures will be written against.
+///
+/// The clause reaches the argument from the VALUE's own type, which is why the
+/// constructor takes its body as a clause-carrying parameter: a bare closure
+/// LITERAL is born clause-less (that is what makes it deferrable), so binding
+/// `T` from one binds a clause-less `T`. `hold` is the shape a value form's
+/// free function already has.
+#[test]
+fn b309_a_generic_argument_carries_the_clause_into_the_field_it_binds() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held<type T> {
+            body: T,
+        }
+
+        fun hold(body: (|| void) context current): Held<(|| void) context current> {
+            Held { body }
+        }
+
+        fun call_it(held: Held<(|| void) context current>) {
+            (held.body)();
+        }
+
+        fun main() {
+            let held = hold(|| print(i"saw {current.get()}"));
+            current.run(3, || call_it(held));
+        }
+        main();
+        "#,
+        "saw 3\n",
+    );
+}
+
+/// B323: the same generic argument written as an ANNOTATION rather than
+/// carried in by a constructor's parameter. `Held<(|| void) context current>`
+/// binds `T` from the VALUE's type, and a closure literal is born clause-less
+/// — that is what makes it deferrable — so the literal bound a clause-less `T`
+/// and the annotation reached nothing: the field landing never fired, the
+/// literal captured at construction, and the program printed the context of
+/// its CONSTRUCTION site (`saw 9`) rather than of its call (`saw 3`).
+///
+/// The landing now reads the annotated EXPECTED type of the literal, so the
+/// two spellings agree. `hold` above is the control: the constructor shape has
+/// always worked and still does.
+#[test]
+fn b323_an_annotated_generic_argument_carries_the_clause_into_the_literal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held<type T> {
+            body: T,
+        }
+
+        fun main() {
+            current.run(9, || {
+                let held: Held<(|| void) context current> =
+                    Held { body = || print(i"saw {current.get()}") };
+                current.run(3, || (held.body)());
+            });
+        }
+        main();
+        "#,
+        "saw 3\n",
+    );
+}
+
+/// B324: a `context` clause is only meaningful where a LANDING RULE follows
+/// it, and `List<T>` has none — `List` is `external` and declares no field, so
+/// there is no field type for the argument to bind. The clause parsed,
+/// type-checked and meant nothing: the literal captured at creation, the
+/// value-flow restriction never saw a value it recognized as injected, and the
+/// program answered to the context of its CONSTRUCTION site. Sound and silent,
+/// which is why the answer is a refusal rather than a rewrite.
+#[test]
+fn b324_a_clause_inside_a_list_is_refused_rather_than_silently_inert() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        fun main() {
+            current.run(9, || {
+                let bodies: List<(|| void) context current> =
+                    [|| print(i"saw {current.get()}")];
+                current.run(3, || {
+                    let body = bodies[0];
+                    body();
+                });
+            });
+        }
+        main();
+        "#,
+        "a `context` clause the threading cannot follow",
+    );
+}
+
+/// The same hole one type constructor over: `Map<K, V>`'s value position. The
+/// clause rides in on the annotation and the literal lands at `insert`'s `V`
+/// parameter, whose DECLARED type is the abstract `V` and carries no clause —
+/// so nothing the landing rules read ever sees one.
+#[test]
+fn b324_a_clause_inside_a_map_value_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::map::Map;
+
+        let current: Context<i32> = Context::new();
+
+        fun main() {
+            current.run(1, || {
+                mut bodies: Map<str, (|| void) context current> = Map::new();
+                bodies.insert("a", || print(i"saw {current.get()}"));
+            });
+        }
+        main();
+        "#,
+        "a `context` clause the threading cannot follow",
+    );
+}
+
+/// The CONTROLS the refusal above is held against: every position B309 gave a
+/// landing rule still takes its clause, in one program — a parameter, a `let`
+/// annotation, a struct FIELD, a generic ARGUMENT the struct binds to a field,
+/// and a RETURN type. The new check walks one level IN from each of these, so
+/// a clause written AT one of them is never its business.
+#[test]
+fn b324_the_landing_positions_still_admit_their_clause() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        struct Held<type T> {
+            body: T,
+        }
+
+        struct Plain {
+            body: (|| void) context current,
+        }
+
+        fun takes(body: (|| void) context current) {
+            body();
+        }
+
+        fun makes(): (|| void) context current {
+            || print(i"saw {current.get()}")
+        }
+
+        fun main() {
+            let annotated: (|| void) context current = || print(i"saw {current.get()}");
+            let held: Held<(|| void) context current> =
+                Held { body = || print(i"saw {current.get()}") };
+            let plain = Plain { body = || print(i"saw {current.get()}") };
+            current.run(1, || takes(annotated));
+            current.run(2, || (held.body)());
+            current.run(3, || (plain.body)());
+            let made = makes();
+            current.run(4, || made());
+        }
+        main();
+        "#,
+        "saw 1\nsaw 2\nsaw 3\nsaw 4\n",
+    );
+}
+
+/// A RETURN carries the clause: the closure a function hands back is injected,
+/// so its caller supplies the context at the call THROUGH it rather than the
+/// producing function capturing one it may not have.
+///
+/// The parser's disambiguation is the reason this reads as it does: a clause
+/// after a NON-closure return type binds to the function (B242 — what the body
+/// may read), and one after a closure return type is the type's.
+#[test]
+fn b309_a_return_type_carries_the_clause_to_its_caller() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        fun make(): (|| void) context current {
+            || print(i"saw {current.get()}")
+        }
+
+        fun main() {
+            let body = make();
+            current.run(5, || body());
+        }
+        main();
+        "#,
+        "saw 5\n",
+    );
+}
+
+/// B325: an UNANNOTATED binding of an injected closure is a forward, not an
+/// escape. B309 moved clause resolution ahead of the fixpoint, so `let held =
+/// body;` infers a type that carries the clause and the threading can follow
+/// it exactly as far as it follows the annotated spelling — but the binding
+/// landing rule had stayed keyed on the ANNOTATION, so this earned the
+/// value-flow refusal for a forward the pass could already see was legal. The
+/// annotated form is the control beside it: both run, and both print the
+/// context ambient at the CALL.
+#[test]
+fn b325_an_unannotated_binding_of_an_injected_closure_is_a_forward() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+
+        let current: Context<i32> = Context::new();
+
+        fun unannotated(body: (|| void) context current) {
+            let held = body;
+            held();
+        }
+
+        fun annotated(body: (|| void) context current) {
+            let held: (|| void) context current = body;
+            held();
+        }
+
+        fun main() {
+            current.run(5, || unannotated(|| print(i"saw {current.get()}")));
+            current.run(6, || annotated(|| print(i"saw {current.get()}")));
+        }
+        main();
+        "#,
+        "saw 5\nsaw 6\n",
+    );
+}
+
+/// B325 changes what an unannotated binding means, and nothing about a
+/// MISMATCHED one: a value carrying one clause bound at an annotation
+/// demanding another is still refused, naming both.
+#[test]
+fn b325_a_mismatched_clause_at_a_binding_is_still_refused_naming_both() {
+    assert_fails_with(
+        r#"
+        import std::context::Context;
+
+        let left: Context<i32> = Context::new();
+        let right: Context<i32> = Context::new();
+
+        fun forward(body: (|| void) context left) {
+            let held: (|| void) context right = body;
+            held();
+        }
+
+        fun main() {}
+        main();
+        "#,
+        "this value carries `context left` and this binding demands `context right`",
+    );
+}
+
+/// A clause is matched, not merely present: forwarding a value carrying one
+/// clause into a position demanding another is refused, and the refusal names
+/// both clauses rather than saying only what the position takes.
+#[test]
+fn b309_a_mismatched_clause_at_a_field_is_refused_naming_both() {
+    assert_fails_with(
+        r#"
+        import std::context::Context;
+
+        let left: Context<i32> = Context::new();
+        let right: Context<i32> = Context::new();
+
+        struct Held {
+            body: (|| void) context right,
+        }
+
+        fun store(body: (|| void) context left): Held {
+            Held { body }
+        }
+
+        fun main() {}
+        main();
+        "#,
+        "an injected closure forwards only to a position carrying the SAME `context` clause",
+    );
+}
+
+/// The MEASURED consequence that made the plain-closure fallback not one: a
+/// closure captures its context AT CREATION, so a body stored as a plain
+/// `|| T` field answers to the owner that was ambient where the VALUE was
+/// built, and re-entering a fresh owner around the CALL does not reach it.
+/// Here the effect registered inside the stored body survives the disposal of
+/// the owner it was called under and dies only with the outer one.
+///
+/// Kept as the CONTROL for the pin below: this is still exactly what a plain
+/// closure field does, and it is still the wrong thing for a value form.
+#[test]
+fn a85_a_plain_closure_field_answers_to_the_owner_it_was_built_under() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        struct Body {
+            build: || i32,
+        }
+        fun main() {
+            let label: SignalCell<str> = Signal::new("one");
+            let outer = Owner::new();
+            let held = run_with_owner(outer, || Body {
+                build = || {
+                    label.effect(|value: str| print(i"body sees {value}"));
+                    0
+                },
+            });
+            let inner = Owner::new();
+            let build = held.build;
+            let _first = run_with_owner(inner, || build());
+            inner.dispose();
+            label.set("two");
+            outer.dispose();
+            label.set("three");
+        }
+        main();
+        "#,
+        "body sees one\nbody sees two\n",
+    );
+}
+
+/// The same program with the field's type carrying the clause — the leak
+/// slots-33 measured, now impossible by construction. The body's effect
+/// registers under the owner ambient at the CALL, so disposing that owner ends
+/// it: `label.set("two")` after `inner.dispose()` prints nothing, where the
+/// plain-closure control above prints a second line.
+///
+/// This is A85 §3e's "ownership unchanged" made true: every instantiation's
+/// subscriptions die with the instantiation instead of with the boundary the
+/// value happened to be built in.
+#[test]
+fn b309_a_context_typed_field_answers_to_the_owner_ambient_at_the_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope, run_with_owner };
+        struct Body {
+            build: (|| i32) context owner_scope,
+        }
+        fun main() {
+            let label: SignalCell<str> = Signal::new("one");
+            let outer = Owner::new();
+            let held = run_with_owner(outer, || Body {
+                build = || {
+                    label.effect(|value: str| print(i"body sees {value}"));
+                    0
+                },
+            });
+            let inner = Owner::new();
+            let _first = run_with_owner(inner, || (held.build)());
+            inner.dispose();
+            label.set("two");
+            outer.dispose();
+            label.set("three");
+        }
+        main();
+        "#,
+        "body sees one\n",
+    );
+}
+
+/// A85 §6, B253's spelling cost made concrete: a helper that RETURNS a
+/// positional slot names the value form's type, because a trait in return
+/// position stays refused (`trait-objects.md`) and there is no opaque-type
+/// kind. `Conditional<SignalCell<bool>>` is the cheap end of that bill and
+/// `Each<T, K, S>` the expensive one — both writable, which is the finding
+/// the census was asked for.
+#[test]
+fn a85_a_helper_returns_a_value_form_by_name() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, owner_scope };
+        import std::ui::{ Conditional, Each, View, each, mount_root, view, when };
+        fun account(flag: SignalCell<bool>): Conditional<SignalCell<bool>, View> {
+            when(flag, || view("nav"))
+        }
+        fun themes(
+            list: SignalCell<List<str>>,
+        ): Each<str, str, SignalCell<List<str>>, View> {
+            each(list, |item: str| item, |item: str| view("li").text(item))
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let list: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || {
+                view("main").child(account(flag)).child(themes(list))
+            });
+        }
+        "#,
+    );
+}
+
+/// A85's propagation, probed before the build and pinned after it: `place`
+/// calls the value's injected body, so it is a needs-context node — and
+/// `View::child<C: Slot>` inherits that requirement PER INSTANTIATION, not as
+/// a blanket. A static child is placed outside every boundary exactly as it
+/// always was; a value form outside every boundary is refused, and the refusal
+/// names the `child` call it flows through.
+///
+/// This is the shape the item could have got wrong in the cheap direction:
+/// widening `child` itself would have made `view("div").child("hello")` a
+/// compile error in every helper that builds a static tree.
+#[test]
+fn a85_child_inherits_the_owner_requirement_per_instantiation() {
+    assert_compiles_browser(
+        r#"
+        import std::ui::{ View, view };
+        fun shell(): View {
+            view("div").child("hello").child(view("span")).child([view("i")])
+        }
+        fun main() { let _built = shell(); }
+        "#,
+    );
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, view, when };
+        fun unrooted(flag: SignalCell<bool>): View {
+            view("div").child(when(flag, || view("span")))
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _built = unrooted(flag);
+        }
+        main();
+        "#,
+        "this code can be reached without an enclosing `run`",
+    );
+}
+
+/// The same requirement through a GENERIC helper over the bound — the shape
+/// that would collapse the per-instantiation answer into a per-bound one. It
+/// does not: the static use of `put` compiles in a function with no boundary
+/// anywhere, and the value-form use in the same program is refused.
+#[test]
+fn a85_a_generic_slot_helper_keeps_the_requirement_per_instantiation() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, owner_scope };
+        import std::ui::{ Slot, View, mount_root, view, when };
+        fun put<C: Slot>(parent: View, content: C): View {
+            parent.child(content)
+        }
+        fun statics(): View {
+            put(view("div"), "hello")
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let base = statics();
+            let _root = mount_root("app", || put(base, when(flag, || view("span"))));
+        }
+        "#,
+    );
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ Slot, View, view, when };
+        fun put<C: Slot>(parent: View, content: C): View {
+            parent.child(content)
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _built = put(view("div"), when(flag, || view("span")));
+        }
+        main();
+        "#,
+        "this code can be reached without an enclosing `run`",
+    );
+}
+
+/// A91: a render closure yields `C: Slot`, not `View`. Every row shape the
+/// child contract admits is a row shape a run admits — a fragment, a bare
+/// string, a reactive text source, and a value form (a row that is itself a
+/// `when`, which is the shape that made the reconciler's per-row remove/move
+/// become per-REGION).
+#[test]
+fn a91_a_render_closure_may_yield_any_slot() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, each, each_by, each_values, mount_root, swap, view, when };
+        fun main() {
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            let flag: SignalCell<bool> = Signal::new(true);
+            let tab: SignalCell<i32> = Signal::new(1);
+            let _root = mount_root("app", || {
+                view("main")
+                    .child(each_values(rows, |item: str| [view("i").text(item), view("b")]))
+                    .child(each_values(rows, |item: str| item))
+                    .child(each(rows, |item: str| item, |item: str| when(flag, || view("u"))))
+                    .child(each_by(rows, |item: str| item, |cell: SignalCell<str>| cell))
+                    .child(when(flag, || [view("p"), view("p")]))
+                    .child(swap(tab, |value: i32| when(flag, || view("section"))))
+            });
+        }
+        "#,
+    );
+}
+
+// --- A99: the six retired `View` methods -------------------------------------
+//
+// `when`, `swap`, `swap_split`, `bind_each`, `bind_each_values` and
+// `bind_each_by` were one line of sugar each over the value form, and a method
+// could never sit BETWEEN siblings — its content always landed at the parent's
+// current end. Order 36 removed them outright, with no deprecation window, and
+// the refusal steers to the two spellings that replace each one.
+//
+// One pin PER METHOD, not one representative: a table of six is exactly the
+// shape that regresses by five and passes.
+
+/// The browser twin's four: the three list forms and `swap_split`, each refused
+/// on `View` with A99's steer naming its free value.
+#[test]
+fn a99_the_retired_browser_methods_are_refused_with_the_slot_steer() {
+    for (method, value) in [
+        ("bind_each", "each"),
+        ("bind_each_values", "each_values"),
+        ("bind_each_by", "each_by"),
+        ("swap_split", "swap_split"),
+    ] {
+        assert_fails_browser_with(
+            &format!(
+                r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, mount_root, view }};
+        fun main() {{
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || view("ul")
+                .{method}(rows, |item: str| item, |item: str| view("li").text(item)));
+        }}
+        "#
+            ),
+            &format!("`{method}` is no longer a `View` method (A99)"),
+        );
+        assert_fails_browser_with(
+            &format!(
+                r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, mount_root, view }};
+        fun main() {{
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || view("ul")
+                .{method}(rows, |item: str| item, |item: str| view("li").text(item)));
+        }}
+        "#
+            ),
+            &format!("write `child({value}(..))`"),
+        );
+    }
+}
+
+/// `when` and `swap`, whose free values kept the method's own name — so the
+/// steer's two spellings are the only thing that distinguishes the refusal from
+/// "you forgot an import".
+#[test]
+fn a99_the_retired_when_and_swap_methods_are_refused_with_the_slot_steer() {
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _root = mount_root("app", || view("div")
+                .when(flag, || view("b").text("here")));
+        }
+        "#,
+        "`when` is no longer a `View` method (A99)",
+    );
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            let tab: SignalCell<i32> = Signal::new(1);
+            let _root = mount_root("app", || view("div")
+                .swap(tab, |value: i32| view("section").text(i"p{value}")));
+        }
+        "#,
+        "`swap` is no longer a `View` method (A99)",
+    );
+}
+
+/// The PROCESS twin drops the same five (it never had `swap_split`), and its
+/// refusal carries the same steer — so a server-only file is not told the
+/// method exists somewhere else.
+#[test]
+fn a99_the_retired_process_methods_are_refused_with_the_slot_steer() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, render, view };
+        fun main() {
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            print(render(view("ul")
+                .bind_each_values(rows, |item: str| view("li").text(item))));
+        }
+        "#,
+        "`bind_each_values` is no longer a `View` method (A99)",
+    );
+}
+
+/// The steer is keyed on std's OWN `View`, not on the NAME: a user type that
+/// declares a `bind_each` of its own and is called with the wrong arity gets
+/// the ordinary refusal and no advice about a std function it never named.
+#[test]
+fn a99_a_user_types_own_retired_name_draws_no_slot_steer() {
+    let errors = compile_browser(
+        r#"
+        struct Board {
+            label: str,
+        }
+        impl Board {
+            fun bind_each(self, rows: List<str>): str {
+                self.label
+            }
+        }
+        fun main() {
+            let board = Board { label = "b" };
+            let _missing = board.bind_each_values(["a"]);
+        }
+        "#,
+    )
+    .expect_err("the call names no method that exists");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("has no method 'bind_each_values'")),
+        "the ordinary refusal still fires: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("(A99)")),
+        "a user type's own name must draw no slot steer: {errors:#?}"
+    );
+}
+
+/// The replacement compiles and RENDERS: `parent.child(each(..))` is what the
+/// retired method was, one line of sugar, so the estate's mechanical rewrite
+/// means exactly what it meant.
+#[test]
+fn a99_the_child_rewrite_renders_what_the_method_did() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, each, render, view, when };
+        fun main() {
+            let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
+            let flag: SignalCell<bool> = Signal::new(true);
+            print(render(view("ul")
+                .child(each(rows, |item: str| item, |item: str| view("li").text(item)))
+                .child(when(flag, || view("li").text("more")))));
+        }
+        main();
+        "#,
+        "<ul><li>a</li><li>b</li><li>more</li></ul>\n",
+    );
+}
+
+/// A99 folded `split_route` back into the free `swap_split`: the third name
+/// existed only because the `View::swap_split` METHOD shadowed the free
+/// function inside its own `impl` block, and the method is gone. The gate is
+/// reachable under the name the recognizer looks for, and it still declares
+/// `swap`'s generics in `swap`'s order.
+#[test]
+fn a99_the_split_gate_lives_under_the_free_swap_split() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, swap_split, view };
+        fun main() {
+            let route: SignalCell<str> = Signal::new("home");
+            let _root = mount_root("app", || view("main")
+                .child(swap_split(route, |current: str| view("section").text(current))));
+        }
+        "#,
+    );
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ View, mount_root, split_route, view };
+        fun main() {
+            let _root = mount_root("app", || view("main"));
+        }
+        "#,
+    )
+    .expect_err("`split_route` no longer exists");
+    assert!(
+        errors.iter().any(|error| error.contains("split_route")),
+        "`split_route` is gone, folded into `swap_split`: {errors:#?}"
+    );
+}
+
+/// A91's cost to B253's spelling (positional-slots.md §6): the row shape is a
+/// type ARGUMENT of the value form, so a helper that returns one names it.
+/// Inferable at the call, unwritable at the return — the same bill §6 priced,
+/// one argument longer.
+#[test]
+fn a91_a_value_form_names_the_row_shape_it_yields() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ Conditional, EachValues, View, each_values, mount_root, view, when };
+        fun banner(flag: SignalCell<bool>): Conditional<SignalCell<bool>, List<View>> {
+            when(flag, || [view("i"), view("b")])
+        }
+        fun labels(
+            list: SignalCell<List<str>>,
+        ): EachValues<str, SignalCell<List<str>>, str> {
+            each_values(list, |item: str| item)
+        }
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let list: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || {
+                view("main").child(banner(flag)).child(labels(list))
+            });
+        }
+        "#,
+    );
+}
+
+/// B307's ruling: an argument the `with` clause did not write for a
+/// NON-defaulted trait parameter is an arity error, not an elision.
+///
+/// `effective_trait_arguments_of` pads a missing argument with the trait's own
+/// declared parameter, and the item read that padding as an acceptance. It is
+/// not one — B273's recording site runs B188's arity check over the clause, so
+/// `impl DogBox with Holder` is refused where it is written. This pin is the
+/// ruling stated: nothing else holds the under-supply direction at a `with`
+/// clause (B273's own pins cover over-supply and the argument's bounds; B188's
+/// cover a field and a closure annotation), so without it the rule lives in one
+/// unpinned branch of a shared helper.
+#[test]
+fn b307_an_elided_with_clause_argument_for_a_bounded_parameter_is_an_arity_error() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+        trait Holder<type T: Display> { fun held(self): T; }
+        struct Dog { name: str }
+        impl Dog with Display { fun to_string(self): str { self.name } }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(DogBox { dog = Dog { name = "rex" } }.held().to_string()); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+/// The same refusal for an UNBOUNDED parameter: a bound is not what makes the
+/// argument necessary — the position is. A parameter with no bound still has
+/// nothing to be inferred from at a clause, which is why the steer here offers a
+/// concrete example (`Holder<i32>`) where the bounded one cannot.
+#[test]
+fn b307_an_elided_with_clause_argument_for_an_unbounded_parameter_is_an_arity_error_too() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Holder<type T> { fun held(self): T; }
+        struct Dog { name: str }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(DogBox { dog = Dog { name = "rex" } }.held().name); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given — write `Holder<T>` with `T` supplied here: \
+         a concrete type (`Holder<i32>`)",
+    );
+}
+
+/// A std trait, because the rule is not about locally declared ones: `Keyed<K>`
+/// is what `[expose(keyed)]` reads, and eliding its key is the mistake the
+/// service family keeps meeting from the other side.
+#[test]
+fn b307_an_elided_argument_on_a_std_parameterised_trait_is_refused_the_same_way() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::wire::Keyed;
+        struct Message { id: str }
+        impl Message with Keyed {
+            fun key(self): str { self.id }
+        }
+        fun main() { print(Message { id = "m" }.key()); }
+        "#,
+        "`Keyed` takes 1 type argument, 0 given",
+    );
+}
+
+/// The ruling's other half, and the reason the refusal is not "write every
+/// argument": a DEFAULTED parameter supplies itself, so eliding it is not
+/// eliding anything. `Add<B = Self>` is the spelling std itself writes 40 times
+/// over and the whole operator family rides on; `Combine<T = Self>` is the
+/// corpus's own exhibit.
+#[test]
+fn b307_a_defaulted_trait_parameter_stays_elidable_at_a_with_clause() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        struct Money { cents: i32 }
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+        fun main() { print((Money { cents = 1 } + Money { cents = 2 }).cents); }
+        main();
+        "#,
+        "3\n",
+    );
+}
+
+/// One written clause is ONE report (B188's rule). The arity refusal used to be
+/// joined by a conformance mismatch read off the PADDING — "`DogBox`'s `held`
+/// returns `Dog`, but `Holder` declares `T`" — a requirement against the trait's
+/// own parameter that no impl could satisfy, restating the missing argument in a
+/// vocabulary that hides it. Conformance is a question about an instantiation,
+/// and a clause whose arity is wrong has not named one.
+#[test]
+fn b307_a_clause_refused_on_its_arity_reports_nothing_about_conformance() {
+    let source = r#"
+        import std::io::print;
+        trait Holder<type T> { fun held(self): T; }
+        struct Dog { name: str }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(DogBox { dog = Dog { name = "rex" } }.held().name); }
+        "#;
+    assert_fails_without(source, "but `Holder` declares `T`");
+    let diagnostics = failure_diagnostics(source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one under-supplied clause is one diagnostic: {diagnostics:#?}"
+    );
+}
+
+/// The non-vacuity control for the stand-down above: a clause whose arity is
+/// RIGHT still has its conformance checked, so what was removed is the
+/// follow-on and not the check.
+#[test]
+fn b307_a_well_formed_clause_still_has_its_conformance_checked() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Holder<type T> { fun held(self): T; }
+        struct Dog { name: str }
+        struct Cat { name: str }
+        struct DogBox { dog: Dog }
+        impl DogBox with Holder<Cat> {
+            fun held(self): Dog { self.dog }
+        }
+        fun main() { print(1); }
+        "#,
+        "returns `Dog`",
+    );
+}
+
+#[test]
+fn b305_a_literal_over_an_unfilled_closure_parameter_is_indexable() {
+    // The observable face: `[event][0]` was "cannot index this List: its
+    // element type is never determined" — a refusal over a program that is
+    // perfectly determinate, because the erasure had thrown the element
+    // position away before the parameter was filled. With a slot the index
+    // yields the slot, `is_ev` grounds it, and the same body compiles.
+    // A compile claim, not a run one: `E` is the callee's own generic, so
+    // nothing inside `apply` may call `handler` with a concrete value, and the
+    // closure has no caller to run it.
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun is_ev(event: Ev): bool { event.code == 0 }
+
+        fun main() {
+            Holder { tag = "h" }.apply(|event| {
+                let first = [event][0];
+                if is_ev(first) { print("ev"); }
+            });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b305_a_literal_over_a_determined_element_is_unchanged() {
+    // The control: an element that DID type still names itself in the
+    // literal's type, and the index reads it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let items = [1, 2, 3];
+            print(items[0] + 1);
+        }
+
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b305_a_slot_nothing_fills_is_still_not_an_answer() {
+    // The negative control: minting a slot is not the same as answering. A
+    // literal whose element nothing ever grounds still has an open element,
+    // and reading it at a concrete type is still refused.
+    assert_fails(
+        r#"
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun wants_number(value: i32): i32 { value + 1 }
+
+        fun main() {
+            Holder { tag = "h" }.apply(|event| {
+                let first = [event][0];
+                let doubled: str = wants_number(first);
+            });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b286_a_source_generic_function_is_callable_from_generic_code() {
+    // The filed exhibit, in its own vocabulary: the inner function's `T` is
+    // reachable only through `S`'s bound, and the caller passes a parameter.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<T: Tagged, S: Read<T>>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() {
+            print(reply_source(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_the_concrete_receiver_form_is_the_control() {
+    // The spelling the estate had to use, unchanged: a CONCRETE argument reads
+    // its arguments off its impl, the channel that always worked.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun main() {
+            print(expose_dynamic(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_the_bound_is_read_through_the_supertrait_chain() {
+    // The caller's bound may name a SUB-trait: the arguments come from the
+    // chain at its own arguments, not from the bound's head alone.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+        trait Live<T> with Read<T> {}
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+        impl Cell<type T> with Live<T> {}
+        impl i32 with Tagged {
+            fun tag(self): str { "i32" }
+        }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<T: Tagged, S: Live<T>>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() {
+            print(reply_source(Cell { value = 7 }));
+        }
+
+        main();
+        "#,
+        "i32\n",
+    );
+}
+
+#[test]
+fn b286_a_caller_whose_parameter_carries_no_such_bound_is_still_refused() {
+    // The negative control: the fix reads a bound the caller WROTE. A caller
+    // whose parameter promises nothing about the trait still cannot supply the
+    // inner generic, and still says so.
+    assert_fails_with(
+        r#"
+        trait Tagged { fun tag(self): str; }
+        trait Read<T> { fun get(self): T; }
+
+        fun expose_dynamic<T: Tagged, S: Read<T>>(source: S): str {
+            source.get().tag()
+        }
+
+        fun reply_source<S>(source: S): str {
+            expose_dynamic(source)
+        }
+
+        fun main() { }
+        "#,
+        "cannot infer 'T' for this call",
+    );
+}
+
+// --- B347/B351/B352/B353: the VALUE forms' closure typing -------------------
+//
+// A99 retired the six `View` parent methods, and the free calls that replaced
+// them do not bind their generics through a receiver. Four filings came out of
+// that one change, and they are three different seams:
+//
+//   * B347 — the bidirectional fill resolved the expected parameter type
+//     through the call's substitution only when it was a BARE `Type::Generic`,
+//     so `each_by`'s `|SignalCell<T>| C` froze at the abstract `SignalCell<T>`.
+//   * B352 (2) — an explicit type ARGUMENT (`SignalCell<Option<str>>::new`) was
+//     overwritten by a later argument-side reconcile that knew less.
+//   * B353 — a method call INSIDE an unannotated closure body was checked
+//     while the parameter's one-shot slot was still `Unknown`, so the check
+//     passed vacuously and never ran again. That one was UNSOUND.
+//
+// Every program here is std-only and every closure parameter is written
+// UNANNOTATED, because the annotation is exactly what each filing had to add.
+
+/// The fixture the `each_by` pins run on: a keyed row type with a field the
+/// render closure reads through the row's own cell.
+const A_KEYED_ROW: &str = r#"
+        [derive(PartialEq)]
+        struct Handle { id: i32, title: str }
+"#;
+
+/// **B347 — `each_by`'s `T` reaches an UNANNOTATED render closure.**
+///
+/// The retired `View::bind_each_by` METHOD bound `T` through the receiver path;
+/// the free call does not, and the render parameter is `SignalCell<T>` — one
+/// constructor deep, which is what the bare-`Type::Generic` arm of the
+/// bidirectional fill could not see. `h` froze at `SignalCell<T>` and every use
+/// of the row was "cannot access field 'title' on type T".
+#[test]
+fn b347_each_by_types_an_unannotated_render_closure_from_its_source() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(each_by(handles, |h| h.id, |h| view("li")
+                    .bind_text(h.map(|c| c.title)))));
+        }}
+        "#
+    ));
+}
+
+/// B347's other reader of the same row: the cell read DIRECTLY, with no inner
+/// `map` to carry the blame. `h.get().title` is the shortest statement that the
+/// parameter is a `SignalCell<Handle>` and not a `SignalCell<T>`.
+#[test]
+fn b347_the_each_by_row_cell_reads_its_own_field() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(each_by(handles, |h| h.id, |h| view("li").text(h.get().title))));
+        }}
+        "#
+    ));
+}
+
+/// B347's second half, and the reason the filing called the cascade spurious:
+/// a render closure that is genuinely wrong reports ONCE, at the field, with no
+/// `owner_scope … can be reached without an enclosing run` behind it. The
+/// cascade was the frozen parameter's shadow — an unresolved row type left the
+/// chain's `Slot` unselected and every sibling link inherited the complaint —
+/// so the only honest way to hold it is to write a real mistake and count.
+#[test]
+fn b347_a_wrong_render_body_reports_once_with_no_owner_scope_cascade() {
+    let errors = compile_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(view("h1").text("header"))
+                .child(each_by(handles, |h| h.id, |h| view("li").text(h.get().missing)))
+                .child(view("footer").text("footer")));
+        }}
+        "#
+    ))
+    .expect_err("a field the row does not have is still a mistake");
+    assert_eq!(errors.len(), 1, "one mistake, one diagnostic: {errors:#?}");
+    assert!(
+        errors[0].contains("missing"),
+        "the one diagnostic names the field: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("owner_scope")),
+        "no `owner_scope` cascade behind it: {errors:#?}"
+    );
+}
+
+// --- B351: a block hole whose tail is a generic METHOD over a nested `swap` --
+//
+// The shape kolt's `app_shell` writes (views.vl:94, the `FIXME` and the
+// `let shell: View = ..` that works around it). Three things have to be true
+// together: the hole is a BLOCK hole (`{{ .. }}`), its tail is a call to a
+// GENERIC METHOD whose type argument comes only from its closure's return, and
+// that closure builds a NESTED `swap` one of whose render closures is a
+// `match`. `run`'s `U` then never bound, so the hole's own `child<C: Slot>`
+// took `U` for its `C` and the emitter reached `Slot::place` — a body-less
+// trait requirement, B55's never-silent refusal with no span.
+//
+// The five variants below all COMPILED on d783fbf4 and are pinned so the fix
+// cannot regress one of them into the reproduction. Two the filing listed as
+// passing do NOT (see the lane report): an expression-bodied `run` body and
+// both render closures annotated both still fail, so the trigger is not what
+// the twenty-line note said it was — and the generic may be a USER method as
+// well as an `external` one.
+
+/// B351's shared fixture: two enums to `match` on and a context to `run`.
+const A_NESTED_SWAP_WORLD: &str = r#"
+        import std::context::Context;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, swap, view };
+
+        [derive(PartialEq)]
+        enum Tab { A, B }
+
+        [derive(PartialEq)]
+        enum Leaf { X, Y }
+
+        struct User { name: str }
+
+        let user_context: Context<User> = Context::new();
+"#;
+
+/// The nested `swap` itself, written once — every pin below places the same
+/// expression somewhere different.
+const A_NESTED_SWAP: &str = r#"<section .child(swap(tab, |x| match x {
+                    Tab::A => <p/>,
+                    Tab::B => <div .child(swap(leaf, |y| match y {
+                        Leaf::X => <span/>,
+                        Leaf::Y => <b/>,
+                    })) />,
+                })) />"#;
+
+/// **B351 — the reproduction.** A block hole whose tail is `context.run(v, ||
+/// { .. })` over the nested `swap`.
+#[test]
+fn b351_a_block_hole_tailed_by_a_generic_method_over_a_nested_swap_resolves() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    user_context.run(User {{ name = "s" }}, || {{
+                        {A_NESTED_SWAP}
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 1 — a USER FREE FUNCTION with the same signature. The free path
+/// binds `U`; this one has always compiled and is the control that says the
+/// fix belongs on the method side.
+#[test]
+fn b351_a_free_generic_in_the_same_block_hole_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun ident<U>(body: || U): U {{ body() }}
+
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    ident(|| {{
+                        {A_NESTED_SWAP}
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 2 — a SINGLE (un-nested) `swap` under the same `run`.
+#[test]
+fn b351_a_single_swap_under_the_same_run_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    user_context.run(User {{ name = "s" }}, || {{
+                        <section .child(swap(tab, |x| match x {{
+                            Tab::A => <p/>,
+                            Tab::B => <b/>,
+                        }})) />
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 3 — the same `run` in a PLAIN `{expression}` hole rather than a
+/// block hole.
+#[test]
+fn b351_the_same_run_in_a_plain_child_hole_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{user_context.run(User {{ name = "s" }}, || {{
+                    {A_NESTED_SWAP}
+                }})}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 4 — the block hole WITHOUT the `run`: the nested `swap` is the
+/// hole's own tail.
+#[test]
+fn b351_a_block_hole_over_the_nested_swap_alone_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    {A_NESTED_SWAP}
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 5 — kolt's WORKAROUND, pinned as a variant because it is the
+/// program the estate actually carries until the integrator drops the
+/// `FIXME`: the same call through an ANNOTATED binding, which gives `U` an
+/// expectation that is not the hole's own `C`.
+#[test]
+fn b351_the_annotated_binding_workaround_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    let shell: View = user_context.run(User {{ name = "s" }}, || {{
+                        {A_NESTED_SWAP}
+                    }});
+                    shell
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+// --- B352/B353: the explicit type argument, and the unchecked closure body ---
+
+/// **B352 (2) — an explicit TYPE ARGUMENT survives an argument that knows
+/// less.** `Signal<Option<str>>::new(None)` is the spelling kolt's
+/// `create_new_channel_modal` uses (channel.vl:134). `None` types as
+/// `Option<unknown>`, which unifies with `Option<str>` and was then written
+/// back over the binding the path had already fixed — so the cell was a
+/// `SignalCell<Option>` with nothing in the payload, `unwrap_or_default`'s
+/// `Default` bound resolved against that hole, and emission reached
+/// `Default::default` with no body. The annotation `|x: Option<str>|` was the
+/// workaround; the mistake is one constructor above it.
+#[test]
+fn b352_an_explicit_type_argument_outlives_a_less_resolved_argument() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+
+        fun main() {
+            let error_text = Signal<Option<str>>::new(None);
+            let _root = mount_root("app", || <div .show(error_text.map(|x| x.is_some()))>
+                {error_text.map(|x| x.unwrap_or_default())}
+            </div>);
+        }
+        "#,
+    );
+}
+
+/// The same mistake with no std in sight: a user container, a user static, and
+/// a payload-less variant for the argument. The refusal names the type the
+/// path wrote, which is the shortest statement that the explicit argument won.
+#[test]
+fn b352_an_explicit_type_argument_on_a_user_static_is_not_overwritten() {
+    assert_fails_with(
+        r#"
+        struct Box<T> { v: T }
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+        fun take(x: Box<i32>) { let _ = x; }
+        fun main() {
+            let b = Box<Option<str>>::new(None);
+            take(b);
+        }
+        "#,
+        "Expected Box<i32>, but got Box<Option<str>> instead.",
+    );
+}
+
+/// The CONTROL: an explicit type argument the argument CONTRADICTS is still a
+/// refusal, and the message still reads in the written argument's terms. The
+/// fix must keep the explicit binding, not stop checking against it.
+#[test]
+fn b352_an_explicit_type_argument_still_refuses_a_contradicting_argument() {
+    assert_fails_with(
+        r#"
+        struct Box<T> { v: T }
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+        fun main() {
+            let _b = Box<Option<str>>::new(Some(1));
+        }
+        "#,
+        "Expected Option<str>, but got Option<i32> instead.",
+    );
+}
+
+/// **B353 — a call inside an UNANNOTATED closure body is checked.** The
+/// miscompile: `flag` is a `SignalCell<bool>`, `cell` a `SignalCell<str>`, and
+/// the emitted program printed `flag = a string`. Nothing downstream re-checks
+/// the argument, so this is a `miscompile` and not a missed diagnostic.
+#[test]
+fn b353_a_method_call_inside_an_unannotated_closure_body_is_checked() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let flag: SignalCell<bool> = Signal::new(false);
+                let cell = Signal::new("a string");
+                cell.effect(|incoming| {
+                    flag.set(incoming);
+                });
+                print(i"flag = {flag.get()}");
+            });
+        }
+        "#,
+        "Expected bool, but got str instead.",
+    );
+}
+
+/// B353 through a USER `Source` impl and a `Result` destructure — the
+/// exhibit's own shape (kolt views.vl:222, the commented `channels.set(
+/// incoming)` without its `if incoming is Some(..)` guard). An
+/// `Option<List<i53>>` stored where a `List<i53>` is read: the run printed
+/// `len=2`, the `Option`'s own two-slot representation read as a list.
+#[test]
+fn b353_the_remote_source_effect_shape_is_checked_too() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription, owner_scope };
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        impl Stored<type T> {
+            fun new(value: T): Stored<T> { Stored { inner = Signal::new(value) } }
+        }
+
+        fun remote<T>(value: T): Result<Stored<T>, str> { Ok(Stored::new(value)) }
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let channels: SignalCell<List<i53>> = Signal::new([]);
+                let got = remote(Some([1i53]));
+                if got is Ok(let incoming) {
+                    incoming.effect(|incoming| {
+                        channels.set(incoming);
+                    });
+                }
+            });
+        }
+        "#,
+        "Expected List<i53>, but got Option<List<i53>> instead.",
+    );
+}
+
+/// The CONTROL for B353's deferral: a closure body whose calls AGREE with the
+/// parameter its enclosing call supplies must still compile, and the parameter
+/// must still be typed by that enclosing call and by nothing nearer.
+#[test]
+fn b353_an_agreeing_closure_body_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let mirror: SignalCell<str> = Signal::new("");
+                let cell = Signal::new("a string");
+                cell.effect(|incoming| {
+                    mirror.set(incoming);
+                });
+            });
+        }
+        "#,
+    );
+}
+
+// --- B356/B357: every path shape that carries WRITTEN type arguments checks
+// them, and a payload-less variant of a generic enum carries a real hole -----
+//
+// B323's family is "an annotation-only generic argument is silently inert", and
+// B352 closed the trait-static shape. B356 asked for the sweep: enumerate the
+// path shapes that can carry written type arguments and pin each against an
+// argument that CONTRADICTS them. The table, measured at 0fa109eb:
+//
+//   static call, struct subject   `Boxy<i32>::make("x")`        checked
+//   struct literal                `Boxy<i32> { value = "x" }`   checked
+//   static fn, enum subject       `Holder<i32>::wrap("x")`      checked
+//   trait static                  `Signal<i32>::new("x")`       checked (B352)
+//   `Self<..>::member`            `Self<i32>::make("x")`        checked
+//                                 (RETIRED by B361: `Self<..>` is refused)
+//   VARIANT constructor           `Holder<i32>::Full("x")`      INERT
+//
+// and the seventh shape the sweep named — a qualified `pkg::mod::T<..>::f` —
+// does not exist: the expression grammar refuses `<` after a multi-segment
+// path, so there is nothing there to check (pinned below, so the day it parses
+// this block reds).
+//
+// The variant constructor was inert for the reason B352's trait subject was: a
+// variant has no impl for the static path's reconcile to match the subject
+// against, so nothing zipped the enum's own parameters with what the path
+// wrote — and the constructor call then built its substitution from an EMPTY
+// map, so the payload typed the enum and the written argument reached nothing.
+
+/// The INERT shape, closed: a variant constructor's written argument is checked
+/// against its payload.
+#[test]
+fn b356_a_written_type_argument_on_a_variant_constructor_is_checked() {
+    assert_fails_with(
+        r#"
+        enum Holder<T> { Full(T), Empty }
+
+        fun main() {
+            let _h = Holder<i32>::Full("x");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+/// The same shape on std's own `Option`, which is where a reader meets it:
+/// `Option<i32>::Some("y")` was an `Option<str>` — the written `i32`
+/// discarded, and `unwrap_or(3)` then refused for wanting a `str`, which is a
+/// message about the wrong line.
+#[test]
+fn b356_a_written_type_argument_on_a_std_variant_is_checked() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _o = Option<i32>::Some("y");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+/// The controls, in one program: a written argument the payload AGREES with, a
+/// nullary variant at a written argument, and a BARE variant path (no written
+/// arguments at all), which must keep taking its type from the payload.
+#[test]
+fn b356_a_variant_constructor_that_agrees_with_its_written_argument_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Holder<T> { Full(T), Empty }
+
+        fun main() {
+            let h = Holder<i32>::Full(7);
+            match h {
+                Holder::Full(let v) => { print(v + 1); },
+                Holder::Empty => { print("empty"); },
+            }
+            let e = Holder<str>::Empty;
+            print(e is Holder::Empty);
+            let bare = Holder::Full("a");
+            match bare {
+                Holder::Full(let v) => { print(v); },
+                Holder::Empty => { print("-"); },
+            }
+            let o = Option<i32>::Some(4);
+            print(o.unwrap_or(3));
+        }
+        "#,
+        "8\ntrue\na\n4\n",
+    );
+}
+
+/// The four shapes the sweep found ALREADY checked, each against a
+/// contradicting argument, so the table above is a pin rather than a note. The
+/// fifth (the trait static) is `b352_an_explicit_type_argument_still_refuses_a_
+/// contradicting_argument` and is not duplicated here.
+#[test]
+fn b356_the_already_checked_path_shapes_stay_checked() {
+    let shapes = [
+        // A static call on a struct subject.
+        "let _a = Boxy<i32>::make(\"x\");",
+        // A struct literal.
+        "let _a = Boxy<i32> { value = \"x\" };",
+        // A static function on an enum subject.
+        "let _h = Holder<i32>::wrap(\"x\");",
+        // B361 retired the `Self<..>::member` row: `Self<i32>::make("x")` is
+        // refused at the spelling now (`Self` already carries the impl's
+        // arguments), so the shape this row covered no longer exists. Its
+        // NAMED twin — the same path written `Boxy<i32>::make("x")` — is the
+        // first row above, and B361's own pins hold the refusal.
+    ];
+    for body in shapes {
+        let source = format!(
+            r#"
+            struct Boxy<T> {{ value: T }}
+
+            impl Boxy<type T> {{
+                fun make(value: T): Boxy<T> {{ Boxy {{ value }} }}
+            }}
+
+            enum Holder<T> {{ Full(T), Empty }}
+
+            impl Holder<type T> {{
+                fun wrap(value: T): Holder<T> {{ Holder::Full(value) }}
+            }}
+
+            fun main() {{
+                {body}
+            }}
+            "#
+        );
+        assert_fails_with(&source, "Expected i32, but got str instead.");
+    }
+}
+
+/// The shape that does NOT exist, pinned so it cannot quietly start parsing
+/// into an inert argument list: a multi-segment path takes no type arguments.
+#[test]
+fn b356_a_qualified_path_carries_no_written_type_arguments() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _a = std::option::Option<i32>::Some("y");
+        }
+        "#,
+        "expected an expression",
+    );
+}
+
+/// **B357 — a payload-less variant of a GENERIC enum takes its arguments from
+/// the landing constraint, and carries a real HOLE when there is none.** It
+/// typed as the bare enum with an EMPTY argument list, which unifies with every
+/// instantiation while saying nothing, and that is what made
+/// `Box<Option<str>>::new(None)` a `Box<Option>`. Observable in the message: the
+/// refusal names what the variant's type actually is.
+#[test]
+fn b357_a_payload_less_variant_takes_its_arguments_from_the_landing_constraint() {
+    assert_fails_with(
+        r#"
+        enum Slot<T> { Filled(T), Bare }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+
+        fun want(x: Box<Slot<i32>>) { let _ = x; }
+
+        fun main() {
+            let b = Box<Slot<str>>::new(Slot::Bare);
+            want(b);
+        }
+        "#,
+        "Expected Box<Slot<i32>>, but got Box<Slot<str>> instead.",
+    );
+}
+
+/// And the hole where nothing lands: a payload-less variant with no constraint
+/// to take arguments from still flows into a slot that fixes them, which is the
+/// half that must not become a refusal.
+#[test]
+fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Slot<T> { Filled(T), Bare }
+
+        fun want(x: Slot<str>): str {
+            match x {
+                Slot::Filled(let v) => v,
+                Slot::Bare => "bare",
+            }
+        }
+
+        fun main() {
+            let s = Slot::Bare;
+            print(want(s));
+            print(want(Slot::Filled("f")));
+            let n = None;
+            print(n.unwrap_or("d"));
+        }
+        "#,
+        "bare\nf\nd\n",
+    );
+}
+
+// --- B370: an arithmetic expression's EMISSION VERDICT is a property of the
+// type its CONTEXT settled, not of the default its left operand falls back to --
+//
+// An unsuffixed literal has no type of its own; `i32` is the default for a
+// context that states nothing. The checker knew that — `rem(4 / 16)` for `fun
+// rem(value: f64)` was ACCEPTED as `f64` — but the truncating-division verdict
+// was recorded in `finalize_build` from the left operand re-read at `Unknown`,
+// which answers the DEFAULT. So a program the checker had typed as float
+// division emitted `Math.trunc(4 / 16)` and printed 0, with no diagnostic
+// anywhere. The owner found it in kolt (`Length::rem(4 / 16)`), which is why
+// kolt writes `4f / 16` in seventy-seven places.
+
+/// The five positions the item reproduces, in one program: an argument, an
+/// annotated `let`, a return, a method argument, a struct field.
+#[test]
+fn b370_a_literal_division_takes_its_contexts_float_type_in_every_position() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder { value: f64 }
+
+        fun rem(value: f64): f64 { value }
+
+        fun half(): f64 { 4 / 16 }
+
+        fun main() {
+        	print(rem(4 / 16));
+        	let annotated: f64 = 4 / 16;
+        	print(annotated);
+        	print(half());
+        	mut values = List<f64>::new();
+        	values.push(1 / 4);
+        	print(values.get(0).unwrap_or(9f));
+        	let held = Holder { value = 1 / 4 };
+        	print(held.value);
+        }
+        "#,
+        "0.25\n0.25\n0.25\n0.25\n0.25\n",
+    );
+}
+
+/// NESTED: the inner expression is itself literal-only, so the context has to
+/// reach through it.
+#[test]
+fn b370_a_nested_literal_expression_takes_the_contexts_type_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun rem(value: f64): f64 { value }
+
+        fun main() {
+        	print(rem((1 + 3) / 16));
+        }
+        "#,
+        "0.25\n",
+    );
+}
+
+/// The division that actually has a fractional answer, so the pin cannot pass
+/// on integer and float agreeing.
+#[test]
+fn b370_an_annotated_float_division_is_not_truncated() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let half: f64 = 7 / 2;
+        	print(half);
+        }
+        "#,
+        "3.5\n",
+    );
+}
+
+/// The CONTROLS, both directions: an integer context still truncates, and a
+/// context that states nothing still defaults to `i32`. The law is that a
+/// literal takes its type from context — not that it stops being an integer.
+#[test]
+fn b370_an_integer_context_and_no_context_at_all_still_truncate() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let integral: i32 = 7 / 2;
+        	print(integral);
+        	let defaulted = 4 / 16;
+        	print(defaulted);
+        	let truncated = 7 / 2;
+        	print(truncated);
+        }
+        "#,
+        "3\n0\n3\n",
+    );
+}
+
+/// A VARIABLE in the same position stays refused: a literal has no type of its
+/// own and an `i32` binding has one, and this fix does not make the second into
+/// the first.
+#[test]
+fn b370_an_i32_variable_in_a_float_position_is_still_refused() {
+    assert_fails_with(
+        r#"
+        fun rem(value: f64): f64 { value }
+
+        fun main() {
+        	let count: i32 = 4;
+        	print(rem(count / 16));
+        }
+        "#,
+        "Expected f64, but got i32 instead.",
+    );
+}
+
+/// The emission itself, which is where the wrong value came from: no
+/// `Math.trunc` for the float context, and one for the integer context in the
+/// same program (so the pin cannot pass by the helper vanishing entirely).
+#[test]
+fn b370_the_emitted_float_division_carries_no_truncation() {
+    let source = r#"
+        import std::io::print;
+
+        fun main() {
+        	let floating: f64 = 4 / 16;
+        	let integral: i32 = 7 / 2;
+        	print(floating);
+        	print(integral);
+        }
+        "#;
+    assert_eq!(
+        emitted_occurrences(source, "Math.trunc"),
+        1,
+        "exactly one of the two divisions truncates — the `i32` one"
+    );
+    assert_emits_containing(source, "4 / 16");
+}
+
+/// The same ordering bug in the OTHER verdict the same loop records: the
+/// unsigned-emission decision for a bitwise operator. `let mask: u32 = 1 << 31`
+/// printed -2147483648 on c3f7d1a38 — the left literal had defaulted to `i32`,
+/// so the shift emitted signed — and the context says `u32`.
+#[test]
+fn b370_a_literal_shift_in_an_unsigned_context_emits_unsigned() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let unsigned: u32 = 1 << 31;
+        	print(unsigned);
+        	let signed: i32 = 1 << 31;
+        	print(signed);
+        }
+        "#,
+        "2147483648\n-2147483648\n",
+    );
+}
+
+// --- B361 (R4): `Self<..>` is refused -----------------------------------------
+//
+// `Self` names the impl's SUBJECT, which already carries its arguments —
+// inside `impl Cell<type T>` it IS `Cell<T>` — so arguments written on it name
+// a second application of a type that has one. It parsed in three positions
+// (a type, a `::`-path head, a struct literal), and the census found it
+// nowhere: not in std, `vilan/test`, `vilan/examples`, the docs fences,
+// `vilan/benchmarks`, the `vilan init` templates, `vilan-website`,
+// `vilan-playground` or kolt — ONE site in the whole estate, a `.vl` program
+// const in this file (`b356_the_already_checked_path_shapes_stay_checked`,
+// rewritten below to name the type).
+//
+// Its premise wanted correcting: the spelling was NOT coherent. `fun same(self):
+// Self<i32>` with a matching body was refused `Expected i32, but got i32
+// instead.`, and `Self<i32> { .. }` with `cannot initialize a non-struct:
+// Self`. It was a spelling with no use AND no meaning.
+
+#[test]
+fn b361_self_with_arguments_is_refused_in_a_type_position() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun same(self): Self<i32> { Cell<i32>::make(1) }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "write the type's name (`Cell<i32>`)",
+    );
+}
+
+#[test]
+fn b361_self_with_arguments_is_refused_as_a_path_head() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun relay(self): Cell<i32> { Self<i32>::make(2) }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "`Self` already names the impl's subject WITH its arguments",
+    );
+}
+
+#[test]
+fn b361_self_with_arguments_is_refused_at_a_struct_literal() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun build(self): Cell<i32> { Self<i32> { value = 3 } }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "so it takes none of its own",
+    );
+}
+
+/// The CONTROLS: a bare `Self` is untouched in every position, and a generic
+/// literal of the type's own name still works — the refusal is about the
+/// ARGUMENTS on `Self`, not about either half on its own.
+#[test]
+fn b361_a_bare_self_and_a_named_generic_application_still_compile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun same(self): Self { Cell { value = self.value } }
+        	fun relay(self): Cell<T> { Self::make(self.value) }
+        }
+
+        fun main() {
+        	print(Cell<i32> { value = 5 }.same().value);
+        	print(Cell<i32>::make(6).relay().value);
+        }
+        "#,
+        "5\n6\n",
+    );
+}
+
+// --- E208: a written type argument SETTLES the expression, so one refusal ------
+//
+// B356 made a variant constructor's written arguments fix the enum's parameters
+// for the PAYLOAD check, and stopped there: the expression itself still settled
+// from the payload. So `Option<i32>::Some("y")` refused at the payload (the
+// right line) and then typed as `Option<str>`, and `unwrap_or(3)` refused too —
+// a second message about a type the author never wrote, which E189's narrow
+// rule cannot suppress because both are type errors.
+//
+// The same gap had a SECOND, worse face, which the integrator's papers lane
+// found: where the payload decided nothing either, the constructor came out as
+// the ERASED `Result` with no arguments at all, so a generic BOUND on it could
+// not be checked — and `Ok<void, str>(void).to_json()` walked past the missing
+// `Json` impl into emission and died there as `internal: a call resolved to
+// `Json`'s requirement `to_json`, which has no body … please report this
+// program`. The ANNOTATED spelling of the same expression refused cleanly,
+// which is what said it was the written-arguments path and not `void`.
+//
+// The written arguments are the author's stated intent; they settle the type,
+// and the payload disagreeing with them is the one refusal B356 already makes.
+
+#[test]
+fn e208_a_refused_written_type_argument_reports_exactly_once() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+        	let o = Option<i32>::Some("y");
+        	print(o.unwrap_or(3));
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn e208_a_written_type_argument_settles_the_expressions_type() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let held = Option<i32>::Some(1);
+        	let flag: bool = held;
+        	print(flag);
+        }
+        "#,
+        "but got Option<i32>",
+    );
+}
+
+/// The BARE variant spelling writes the enum's arguments on the VARIANT name,
+/// where there is no enum path to bank them from — and that is the spelling
+/// the prelude gives every program.
+#[test]
+fn e208_a_bare_variant_path_with_written_arguments_settles_too() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let outcome = Ok<i32, str>(1);
+        	let flag: bool = outcome;
+        	print(flag);
+        }
+        "#,
+        "but got Result<i32, str>",
+    );
+}
+
+/// The internal error: a bound that cannot be checked because the receiver had
+/// no arguments to check it on. Both payload shapes, because the first report
+/// of this blamed `void`.
+#[test]
+fn e208_an_unsatisfied_bound_on_a_written_argument_constructor_refuses_cleanly() {
+    for source in [
+        r#"
+        import std::json::Json;
+
+        fun main() {
+        	print(Ok<void, str>(void).to_json());
+        }
+        "#,
+        r#"
+        import std::json::Json;
+
+        struct Opaque { seed: i32 }
+
+        fun main() {
+        	print(Ok<Opaque, str>(Opaque { seed = 1 }).to_json());
+        }
+        "#,
+    ] {
+        assert_fails_with(source, "does not implement trait 'Json'");
+        assert_fails_without(source, "internal:");
+    }
+}
+
+/// The CONTROLS: the annotated spellings still refuse the same way (they always
+/// did), and a written argument the payload AGREES with still compiles and
+/// still carries its arguments.
+#[test]
+fn e208_the_annotated_spellings_and_the_agreeing_case_are_unchanged() {
+    assert_fails_with(
+        r#"
+        import std::json::Json;
+
+        fun main() {
+        	let outcome: Result<void, str> = Ok(void);
+        	print(outcome.to_json());
+        }
+        "#,
+        "does not implement trait 'Json'",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let outcome = Ok<i32, str>(1);
+        	print(outcome.unwrap_or(0));
+        	let held = Option<i32>::Some(2);
+        	print(held.unwrap_or(3));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B378 — a SUBTRAIT bound outranks its supertrait bound
+// ---------------------------------------------------------------------------
+//
+// §13.4(a)(2) ranks two impls of equal subject shape by their binders' bounds,
+// and "stronger" was read off the bound names the author wrote. `trait Narrow<T>
+// with Base<T>` means `S: Narrow<T>` admits strictly fewer types than
+// `S: Base<T>`, so the subtrait-bounded subject is the more specific one — but
+// the written lists `[Narrow]` and `[Base]` contained neither the other, so the
+// pair never ranked and every call through it was §13.4(a)(3) residue. That is
+// the OPTIONAL-CAPABILITY dispatch A112 S3 is built on: one consumer, a blanket
+// answering "no feed" for every `Source<List<T>>` and a narrower one answering a
+// real feed for a `DeltaSource`.
+
+/// The shape collections-39 was refused, with both blankets providing one trait.
+#[test]
+fn b378_a_subtrait_bounded_blanket_outranks_its_supertrait_bounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Narrow<T> with Base<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Narrow<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        impl type S: Narrow<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "14\n",
+    );
+}
+
+/// The same pair with the impls DECLARED the other way round: the order picks
+/// the winner, not the file.
+#[test]
+fn b378_the_same_pair_declared_in_the_other_order_still_picks_the_subtrait() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Narrow<T> with Base<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Narrow<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Narrow<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "14\n",
+    );
+}
+
+/// A112 S3's own pair, over std's real `DeltaSource<C, O> with Source<C>`: a
+/// consumer written once for both kinds of source reaches the delta arm on a
+/// cell that keeps a log, and the whole-value arm on one that does not.
+#[test]
+fn b378_the_a112_shape_ranks_a_delta_source_above_a_plain_source() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{
+            DeltaCursor,
+            DeltaLog,
+            DeltaSource,
+            SeqOp,
+            Signal,
+            SignalCell,
+            Source,
+            Subscription,
+        };
+
+        struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
+
+        impl Logged with Source<List<i32>> {
+            fun get(self): List<i32> { self.elements.get() }
+
+            [must_use]
+            fun on_change(self, observer: |List<i32>| void): Subscription {
+                self.elements.on_change(observer)
+            }
+        }
+
+        impl Logged with DeltaSource<List<i32>, SeqOp<i32>> {
+            fun cursor(self): DeltaCursor { self.log.cursor() }
+
+            fun drop_cursor(self, cursor: DeltaCursor) { self.log.drop_cursor(cursor); }
+
+            fun since(self, cursor: DeltaCursor): List<SeqOp<i32>> {
+                match self.log.since(cursor) {
+                    Some(let ops) => ops,
+                    None => {
+                        mut lost: List<SeqOp<i32>> = [];
+                        lost
+                    },
+                }
+            }
+        }
+
+        trait Feed { fun feed(self): str; }
+
+        impl type S: Source<List<type T>> with Feed {
+            fun feed(self): str { "whole" }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<type O>> with Feed {
+            fun feed(self): str { "delta" }
+        }
+
+        fun consume<T, S: Source<List<T>> + Feed>(source: S): str {
+            source.feed()
+        }
+
+        fun main() {
+            let logged = Logged {
+                elements = Signal::new([1, 2]),
+                log = DeltaLog<SeqOp<i32>>::new(),
+            };
+            let plain: SignalCell<List<i32>> = Signal::new([3]);
+            print(consume(logged));
+            print(consume(plain));
+        }
+        "#,
+        "delta\nwhole\n",
+    );
+}
+
+/// The control the order must keep: two UNRELATED bounds are neither more
+/// specific, so the pair is still §13.4(a)(3)'s residue and still reported.
+#[test]
+fn b378_two_unrelated_bounds_are_still_unranked() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Other<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Other<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        impl type S: Other<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "neither impl subject is more specific than the other",
+    );
+}
+
+/// The other control: the tier this shares with `Box<type T: Display>` over
+/// `Box<type T>` — a bound beats no bound — still ranks, so trading the bound
+/// COUNT for a set difference did not cost the case the count was written for.
+#[test]
+fn b378_a_bounded_binder_still_outranks_an_unbounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Show { fun show(self): str; }
+        trait Mark { fun mark(self): str; }
+
+        struct Box1<T> { value: T }
+
+        struct Named { name: str }
+        impl Named with Show { fun show(self): str { self.name } }
+
+        impl Box1<type T> with Mark {
+            fun mark(self): str { "plain" }
+        }
+
+        impl Box1<type T: Show> with Mark {
+            fun mark(self): str { self.value.show() }
+        }
+
+        fun main() {
+            let shown = Box1 { value = Named { name = "named" } };
+            print(shown.mark());
+        }
+        "#,
+        "named\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B379 — a generic reachable only through a BLANKET provider's trait argument
+// ---------------------------------------------------------------------------
+//
+// `trait_args_for` answers "what arguments does this concrete type provide for
+// that trait", by matching the type against the providing impl's SUBJECT and
+// substituting the impl's recorded trait arguments through the bindings that
+// match produced. A blanket writes its trait arguments in binders its subject
+// does not carry — `impl type S: Wrap<type T> with Feed<T>` provides `Feed<T>`
+// where `T` lives in `S`'s BOUND — so the substitution grounded `S` and handed
+// `Feed<T>` back with `T` still abstract. A caller binding its own `T` from
+// `S: Feed<T>` bound nothing, and the parameter it could not determine was then
+// reported as missing the bound its own declaration carries. A NOMINAL provider
+// never had the problem, which is the control below.
+
+/// The isolated pair: one trait, two providers, one call.
+#[test]
+fn b379_a_blanket_providers_trait_argument_binds_the_callers_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Wrap<T> { fun unwrap(self): T; }
+        trait Feed<T> { fun feeds(self): bool; }
+
+        struct Box1<T> { value: T }
+        impl Box1<type T> with Wrap<T> { fun unwrap(self): T { self.value } }
+
+        // The BLANKET provider: `T` is written in the subject's BOUND only.
+        impl type S: Wrap<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Box2<T> { value: T }
+
+        // The NOMINAL provider, which always bound: `T` is in the subject.
+        impl Box2<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun through_a_bound<T: PartialEq, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun main() {
+            let nominal = Box2 { value = 5 };
+            let blanket = Box1 { value = 7 };
+            print(through_a_bound(nominal));
+            print(through_a_bound(blanket));
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+/// collections-39's FIND, whole: the same bound carried through a STRUCT the
+/// call constructs, and through the `Placed` impl written over that struct —
+/// which is where A112 S3 met it.
+#[test]
+fn b379_the_bound_carries_through_a_struct_built_from_a_blanket_provider() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Holder<T: PartialEq, S: Feed<T>> {
+            source: S,
+            render: |T| str,
+        }
+
+        trait Placed { fun place(self): bool; }
+
+        impl Holder<type T: PartialEq, type S: Feed<T>> with Placed {
+            fun place(self): bool { self.source.feeds() }
+        }
+
+        // The control: the SAME bound in a plain call.
+        fun direct<T: PartialEq, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun hold<T: PartialEq, S: Feed<T>>(source: S, render: |T| str): Holder<T, S> {
+            Holder { source, render }
+        }
+
+        fun take<C: Placed>(content: C): bool { content.place() }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(direct(cell));
+            let held = hold(cell, |item| item);
+            print(take(held));
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B381 — `==` on a bounded parameter inside a nested `match` arm in a closure
+// ---------------------------------------------------------------------------
+//
+// Filed from collections-39's FIND 4 as "the arm scope loses the enclosing
+// function's bounds". It does not reproduce as filed: on 49de3915 the nested
+// shape checks, two levels deep and in collections-39's own transcription.
+// What collections-39 met was B379 — its `K` bound only through the
+// `DeltaFeed` BLANKET's trait argument, so it never bound at all, and the
+// refusal ("`K` is missing the bound `: PartialEq`") read as a lost bound at
+// whichever comparison it landed on. The nesting was incidental: the same
+// program with the comparison hoisted out of the closure fails identically on
+// 49de3915 (the fourth pin's shape). These pins hold both facts — the nested
+// shapes check, and the blanket-reached parameter compares inside them.
+
+/// The item's shape, verbatim in spirit: never broken, pinned so it stays so.
+#[test]
+fn b381_eq_on_a_bounded_parameter_inside_a_match_arm_inside_a_closure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun count<K: PartialEq>(xs: List<Option<K>>, key: K): i32 {
+            mut hits = 0;
+            xs.for_each(|x| match x {
+                Some(let k) => if k == key { hits += 1; },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            print(count([Some(1), None, Some(2), Some(1)], 1));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// Two levels of `match` inside the closure.
+#[test]
+fn b381_eq_two_match_levels_deep_inside_a_closure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun count<K: PartialEq>(xs: List<Option<Option<K>>>, key: K): i32 {
+            mut hits = 0;
+            xs.for_each(|x| match x {
+                Some(let inner) => match inner {
+                    Some(let k) => if k == key { hits += 1; },
+                    None => {},
+                },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            print(count([Some(Some(1)), None, Some(None), Some(Some(1))], 1));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// What collections-39 actually met: the compared parameter is reachable only
+/// through a BLANKET provider's trait argument (B379), inside the nested arm.
+/// Red on 49de3915 with "`T` is missing the bound `: PartialEq`".
+#[test]
+fn b381_a_blanket_reached_parameter_compares_inside_a_nested_arm() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun count<T: PartialEq, S: Feed<T>>(source: S, items: List<Option<T>>, key: T): i32 {
+            mut hits = 0;
+            items.for_each(|x| match x {
+                Some(let k) => if k == key { hits += 1; },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(count(cell, [Some("a"), None, Some("b"), Some("a")], "a"));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The control that locates it: the comparison OUTSIDE the closure and the
+/// `match`, same blanket-reached parameter. It failed on 49de3915 exactly as
+/// the nested one did, which is what says the nesting was never the cause.
+#[test]
+fn b381_the_same_comparison_outside_the_closure_is_the_control() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun same<T: PartialEq, S: Feed<T>>(source: S, left: T, right: T): bool {
+            left == right
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(same(cell, "a", "a"));
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A trait whose SUPERTRAIT is the bound of its own blanket impl
+// ---------------------------------------------------------------------------
+//
+// `trait Feed<T> with Source<List<T>>` beside `impl type S: Source<List<type
+// T>> with Feed<T>` — A112 S3's `DeltaFeed`, and the most direct way to write
+// "a capability every source has". Two defects, one per face (collections-40's
+// finds, both pre-existing on 49de3915):
+//
+// - With std's `Source` it overflowed the compiler's stack. Whether a type
+//   provides `Source` asked every impl providing it; the blanket provides
+//   `Source` (a supertrait comes with the trait), and whether the blanket
+//   applies is whether the type provides `Source` — the question itself,
+//   asked again until the stack was gone. With the pair in std, EVERY program
+//   importing `std::reactive` aborted. A question already open further up the
+//   proof is no evidence for itself now (`impl_select::provides_trait`).
+// - With a user trait the recursion never started and the impl was REFUSED:
+//   "'S' does not implement trait 'Feed<T>': missing 'read'" — conformance
+//   wanted the supertrait's members from the impl or from a separate impl on
+//   the same subject, and a blanket's subject is a binder BOUNDED by that very
+//   supertrait, which provides them for every type the impl can reach.
+
+/// The std face, collections-40's repro: an abort before, runs now.
+#[test]
+fn a_supertrait_that_is_its_blankets_own_bound_does_not_overflow() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> with Source<List<T>> {
+            fun feeds(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        fun direct<T, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(i"direct={direct(cell)} method={cell.feeds()}");
+        }
+        "#,
+        "direct=false method=false\n",
+    );
+}
+
+/// The std-free face: accepted, and it answers for a type that implements the
+/// bound.
+#[test]
+fn a_blankets_subject_bound_provides_its_supertraits_members() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Cell { n: i32 }
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun both<T, S: Feed<T>>(source: S): T {
+            source.feeds();
+            source.read()
+        }
+
+        fun main() {
+            print(both(Cell { n = 3 }));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+/// The bound answers AT ITS ARGUMENTS: `Feed<str>` needs `Base<str>`, and a
+/// subject bounded on `Base<i32>` is not one — still refused.
+#[test]
+fn a_subject_bound_at_other_arguments_does_not_provide_the_supertrait() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<i32> with Feed<str> {
+            fun feeds(self): bool { false }
+        }
+
+        fun main() { print("hello"); }
+        "#,
+        "'S' does not implement trait 'Feed<str>': missing 'read'",
+    );
+}
+
+/// The cycle answers NO, not yes: a type with no `Base` of its own does not
+/// become a `Feed` through the blanket that requires one.
+#[test]
+fn a_type_without_the_bound_does_not_reach_the_blanket_through_the_cycle() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source };
+
+        trait Feed<T> with Source<List<T>> {
+            fun feeds(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Bare { n: i32 }
+
+        fun main() {
+            print(Bare { n = 1 }.feeds());
+        }
+        "#,
+        "Bare has no method 'feeds'",
+    );
+}
+
+/// A112 S3's whole shape, std-free of `std::ui`: the supertrait form of the
+/// optional capability, a "no feed" blanket over `Source` and a real one over
+/// `DeltaSource` (B378 ranks the second), reached through ONE bound.
+#[test]
+fn the_a112_optional_capability_takes_the_supertrait_form() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{
+            DeltaCursor,
+            DeltaLog,
+            DeltaSource,
+            SeqOp,
+            Signal,
+            SignalCell,
+            Source,
+            Subscription,
+        };
+
+        struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
+
+        impl Logged with Source<List<i32>> {
+            fun get(self): List<i32> { self.elements.get() }
+
+            [must_use]
+            fun on_change(self, observer: |List<i32>| void): Subscription {
+                self.elements.on_change(observer)
+            }
+        }
+
+        impl Logged with DeltaSource<List<i32>, SeqOp<i32>> {
+            fun cursor(self): DeltaCursor { self.log.cursor() }
+
+            fun drop_cursor(self, cursor: DeltaCursor) { self.log.drop_cursor(cursor); }
+
+            fun since(self, cursor: DeltaCursor): List<SeqOp<i32>> {
+                mut none: List<SeqOp<i32>> = [];
+                none
+            }
+        }
+
+        trait Feed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<T>> with Feed<T> {
+            fun has_feed(self): bool { true }
+        }
+
+        fun consume<T, S: Feed<T>>(source: S): str {
+            i"feed={source.has_feed()} len={source.get().len()}"
+        }
+
+        fun main() {
+            let logged = Logged {
+                elements = Signal::new([1, 2]),
+                log = DeltaLog<SeqOp<i32>>::new(),
+            };
+            let plain: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+            print(consume(logged));
+            print(consume(plain));
+        }
+        "#,
+        "feed=true len=2\nfeed=false len=3\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The supertrait blanket must not PROVE ITS OWN BOUND (UNSOUND on 3e4e6c51)
+// ---------------------------------------------------------------------------
+//
+// Once `impl type S: Base<type T> with Feed<T>` under `trait Feed<T> with
+// Base<T>` was accepted (the conformance rule above), the analyzer's bound
+// check took the blanket as a provider of `Base` for ANY type: `Other: Base?`
+// -> the blanket provides `Base` through `Feed` -> does `Other` meet the
+// blanket's subject bound `Base`? -> the same question, recursing until the
+// depth cap, whose lenient answer was YES. `takes<S: Base<T>>(Other)` checked
+// clean; with A112's `DeltaFeed` in std every `S: Source<T>` bound admitted a
+// plain struct and an `i32`. A question already open further up the proof is
+// no evidence for itself, and the cap no longer answers yes.
+
+/// The std-free repro: `Other` implements nothing.
+#[test]
+fn a_supertrait_blanket_does_not_satisfy_its_own_bound_for_a_stranger() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Other { n: i32 }
+
+        fun takes<T, S: Base<T>>(source: S): i32 { 1 }
+
+        fun main() {
+            print(takes(Other { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// Nor its own subtrait: `Other` is not a `Feed` either, the blanket's
+/// promise notwithstanding.
+#[test]
+fn a_supertrait_blanket_does_not_make_a_stranger_its_subtrait() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Other { n: i32 }
+
+        fun fed<T, S: Feed<T>>(source: S): bool { source.feeds() }
+
+        fun main() {
+            print(fed(Other { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// The std shape: with A112's `DeltaFeed` declared, a `Source` bound still
+/// refuses a plain struct...
+#[test]
+fn the_delta_feed_shape_does_not_make_a_plain_struct_a_source() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        struct Plain { n: i32 }
+
+        fun src<T, S: Source<T>>(source: S): i32 { 1 }
+
+        fun main() {
+            print(src(Plain { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// ...and an `i32`.
+#[test]
+fn the_delta_feed_shape_does_not_make_an_integer_a_source() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        fun src<T, S: Source<T>>(source: S): i32 { 1 }
+
+        fun main() {
+            print(src(7));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// ...and a `DeltaFeed` bound refuses a plain struct, while a real cell still
+/// satisfies both (the control the S3 landing needs).
+#[test]
+fn the_delta_feed_shape_admits_a_real_source_and_refuses_a_plain_struct() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        struct Plain { n: i32 }
+
+        fun fed<T, S: DeltaFeed<T>>(source: S): bool { source.has_feed() }
+
+        fun main() {
+            let cell: SignalCell<List<i32>> = Signal::new([1]);
+            print(fed(cell));
+            print(fed(Plain { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        fun fed<T, S: DeltaFeed<T>>(source: S): bool { source.has_feed() }
+        fun src<T, S: Source<T>>(source: S): T { source.get() }
+
+        fun main() {
+            let cell: SignalCell<List<i32>> = Signal::new([1, 2]);
+            print(fed(cell));
+            print(src(cell).len());
+        }
+        "#,
+        "false\n2\n",
+    );
+}
+
+// --- B395: a supertrait DEFAULT on a type that implements the supertrait at
+// --- OTHER arguments than a subtrait's blanket bounds it at. The default is
+// --- reached through both the type's own impl and the blanket (its subject is
+// --- a hole); the blanket used to carry it because it registered first, and the
+// --- call was then refused at the blanket's bound. The blanket's bound is now
+// --- read at its arguments (B268) and a blanket it does not hold for does not
+// --- carry the member.
+
+/// The item's repro: `Cell` is a `Base<i32>`, the blanket is over
+/// `Base<List<T>>`, and `twice` is `Base`'s default. Red before the fix:
+/// "'Cell' does not implement trait 'Base<List<T>>'".
+#[test]
+fn b395_a_supertrait_default_on_other_arguments_reaches_the_types_own_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<List<T>> { fun feeds(self): bool; }
+
+        impl type S: Base<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The same pair with the type's own impl declared FIRST — ordering-sensitive
+/// by construction, since the old answer was the first registered impl. Green
+/// before the fix too; it holds that the fix is not an order flip.
+#[test]
+fn b395_the_same_default_with_the_types_impl_declared_first() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<List<T>> { fun feeds(self): bool; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        impl type S: Base<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The item's control: the supertrait at the SAME arguments as the blanket's
+/// bound (`Base<T>`) — the blanket's bound holds, so it may carry the default
+/// and the answer is the same. Green before the fix.
+#[test]
+fn b395_the_control_at_matching_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+            print(cell.feeds());
+        }
+        "#,
+        "2\nfalse\n",
+    );
+}
+
+/// A112 S3's ruled shape, as std will declare it: a feed trait `with
+/// Source<List<T>>` and BOTH its blankets — the "no log" one over every list
+/// source and the forwarding one over every `DeltaSource`. `Source`'s defaults
+/// (`sub`, `map`) must reach a custom `Source<i32>` (`reactive-on-change.vl`'s
+/// `Stored`) and a `SignalCell<i32>`, a list-valued custom source must still
+/// map, and the feed must still answer per source kind through the
+/// supertrait. Red before the fix at `stored.sub` ("'Stored<i32>' does not
+/// implement trait 'Source<List<T>>'").
+#[test]
+fn b395_the_ruled_delta_feed_shape_leaves_source_defaults_on_other_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ DeltaCursor, DeltaSource, ListCell, SeqOp, Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> {
+            fun cursor_of(self): Option<DeltaCursor>;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { None }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { Some(self.cursor()) }
+        }
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun fed<T, S: Feed<T>>(source: S): str {
+            match source.cursor_of() {
+                Some(let _cursor) => i"log over {source.get().len()}",
+                None => i"none over {source.get().len()}",
+            }
+        }
+
+        fun main() {
+            let stored = Stored { inner = Signal::new(10) };
+            let eagerly = stored.sub(|value| print(i"eager {value}"));
+            eagerly.dispose();
+            let labelled = stored.map(|value| i"n={value}");
+            print(labelled.get());
+            let number: SignalCell<i32> = Signal::new(3);
+            print(number.map(|value| value * 2).get());
+            let listed = Stored { inner = Signal::new([1, 2]) };
+            print(listed.map(|items| items.len() * 10).get());
+            let cell: ListCell<str> = ListCell<str>::of(["a"]);
+            let plain: SignalCell<List<str>> = Signal::new(["a", "b"]);
+            print(i"{fed(cell)} / {fed(plain)} / {fed(listed)}");
+            print(plain.map(|items| items.len()).get());
+        }
+        "#,
+        "eager 10\nn=10\n6\n20\nlog over 1 / none over 2 / none over 2\n2\n",
+    );
+}
+
+/// The soundness half of the same shape: carrying the default through the
+/// type's own impl must not make a `Source<i32>` a feed. Green before the fix
+/// (B394's guard); held here beside the fix that reads the blanket's bound.
+#[test]
+fn b395_the_ruled_shape_still_refuses_a_scalar_source_as_a_feed() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ DeltaCursor, Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> {
+            fun cursor_of(self): Option<DeltaCursor>;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { None }
+        }
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun fed<T, S: Feed<T>>(source: S): bool { source.cursor_of().is_none() }
+
+        fun main() {
+            let stored = Stored { inner = Signal::new(10) };
+            print(stored.map(|value| value + 1).get());
+            print(fed(stored));
+        }
+        "#;
+    let errors = compile(source).expect_err("a `Source<i32>` must not be a feed");
+    assert_eq!(
+        errors.len(),
+        1,
+        "the ONE refusal is the feed bound; `stored.map` must check clean: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("'Stored<i32>' does not implement trait 'Feed<T>'"),
+        "{errors:#?}"
+    );
+}
+
+/// `reactive_channels`' keyed mirror in miniature: a source over
+/// `Option<List<T>>` whose impl binds `T: Keyed<K>` — a bound whose ARGUMENT
+/// is another of the impl's binders, itself bounded (`K: PartialEq`; an
+/// unbounded `K` compares as a hole and hides the defect). The receiver's own
+/// impl must be read as holding for it (`Keyed<K>` at `K := str`, which `Row`
+/// provides), or the
+/// only impl left to carry `Source`'s default is the feed blanket, refused at
+/// `Source<List<T>>`. Red with the raw argument read: "'Mirror<str, Row>' does
+/// not implement trait 'Source<List<T>>'".
+#[test]
+fn b395_an_impl_whose_bound_names_another_binder_carries_the_default() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        trait Keyed<K> { fun key(self): K; }
+
+        struct Row { id: str }
+
+        impl Row with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+
+        struct Mirror<K, T> { inner: SignalCell<Option<List<T>>>, last: SignalCell<Option<K>> }
+
+        impl Mirror<type K: PartialEq, type T: Keyed<K>> with Source<Option<List<T>>> {
+            fun get(self): Option<List<T>> { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |Option<List<T>>| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun main() {
+            let seeded: Option<List<Row>> = Some([Row { id = "a" }]);
+            let nothing: Option<str> = None;
+            let mirror = Mirror { inner = Signal::new(seeded), last = Signal::new(nothing) };
+            let shown = mirror.sub(|value| match value {
+                Some(let rows) => print(i"rows:{rows.len()}"),
+                None => print("rows:none"),
+            });
+            shown.dispose();
+        }
+        "#,
+        "rows:1\n",
+    );
+}
+
+// --- B389: the five literal positions B370's ruling covers and its fix did not
+// --- deliver. An unsuffixed literal takes its type from its context in each,
+// --- for every numeric width; each position is pinned at `i53`, `u32` and
+// --- `f64` (all red before the fix, all green at `i32`, which was the default
+// --- they fell back to), and the census's thirteen passing positions are the
+// --- controls. `take` is the typed use each program ends in.
+
+/// One program over the width `ty`: `take` (a function of that width) and
+/// `body` inside `main`, run and compared.
+fn b389_program(ty: &str, prelude: &str, body: &str) -> String {
+    format!(
+        "import std::io::print;\n\nfun take(count: {ty}): {ty} {{ count }}\n{prelude}\nfun main() {{\n{body}\n}}\n"
+    )
+    .replace("WIDTH", ty)
+}
+
+fn b389_runs(ty: &str, prelude: &str, body: &str, expected: &str) {
+    let program = b389_program(ty, prelude, body);
+    match compile_and_run(&program) {
+        Ok(stdout) => assert_eq!(stdout, expected, "at `{ty}`:\n{program}"),
+        Err(errors) => panic!("at `{ty}` the program was refused: {errors:#?}\n{program}"),
+    }
+}
+
+/// Position 1: a literal LEFT of a binary operator — arithmetic, a
+/// comparison, and an unannotated binding over the arithmetic (whose type is
+/// the right operand's, not the literal's default).
+fn b389_left_operand(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n: WIDTH = 4;\n\tprint(take(1 + n));\n\tif 0 < n { print(\"positive\"); }\n\tlet m = 10 - n;\n\tprint(take(m));",
+        "5\npositive\n6\n",
+    );
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_i53() {
+    b389_left_operand("i53");
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_u32() {
+    b389_left_operand("u32");
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_f64() {
+    b389_left_operand("f64");
+}
+
+/// Position 2: the elements of an ANNOTATED list literal, and (the same law
+/// with no annotation) literal elements beside a typed sibling.
+fn b389_list_elements(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet xs: List<WIDTH> = [0, 1, 2];\n\tprint(take(xs[2]));\n\tlet n: WIDTH = 7;\n\tlet ys = [0, n];\n\tprint(take(ys[1]));",
+        "2\n7\n",
+    );
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_i53() {
+    b389_list_elements("i53");
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_u32() {
+    b389_list_elements("u32");
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_f64() {
+    b389_list_elements("f64");
+}
+
+/// Position 3: a literal MATCH pattern takes the subject's type.
+fn b389_match_pattern(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n: WIDTH = 4;\n\tmatch n {\n\t\t0 => print(\"zero\"),\n\t\t4 => print(\"four\"),\n\t\t_ => print(\"other\"),\n\t}",
+        "four\n",
+    );
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_i53() {
+    b389_match_pattern("i53");
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_u32() {
+    b389_match_pattern("u32");
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_f64() {
+    b389_match_pattern("f64");
+}
+
+/// Position 4: a GENERIC call's return — the literal argument is typed by
+/// what the call's expectation binds the generic to, free function and
+/// method alike.
+fn b389_generic_call(ty: &str) {
+    b389_runs(
+        ty,
+        "fun identity<T>(value: T): T { value }\n\nstruct Box {}\n\nimpl Box {\n\tfun same<T>(self, value: T): T { value }\n}\n",
+        "\tlet n: WIDTH = identity(5);\n\tprint(take(n));\n\tlet m: WIDTH = Box {}.same(6);\n\tprint(take(m));",
+        "5\n6\n",
+    );
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_i53() {
+    b389_generic_call("i53");
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_u32() {
+    b389_generic_call("u32");
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_f64() {
+    b389_generic_call("f64");
+}
+
+/// Position 5: a bare `let n = 0` takes its type from a LATER use — a typed
+/// argument, a comparison peer (`i < limit`, the loop an index walks), and a
+/// binding built from it (`let doubled = chained * 2`).
+fn b389_bare_let(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n = 7;\n\tprint(take(n));\n\tmut i = 0;\n\tlet limit: WIDTH = 3;\n\tfor i < limit { i += 1; }\n\tprint(take(i));\n\tlet chained = 2;\n\tlet doubled = chained * 2;\n\tprint(take(doubled));",
+        "7\n3\n4\n",
+    );
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_i53() {
+    b389_bare_let("i53");
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_u32() {
+    b389_bare_let("u32");
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_f64() {
+    b389_bare_let("f64");
+}
+
+/// The binding's type is its USE's, so the operators over it are too: `one`
+/// is an `f64` because `take` makes it one, and `one / 2` divides as floats
+/// (`0.5`). Typing the binding late without its arithmetic following would
+/// be B370's truncation again.
+#[test]
+fn b389_a_literal_binding_typed_by_a_later_use_divides_at_that_type() {
+    b389_runs(
+        "f64",
+        "",
+        "\tlet one = 1;\n\tlet half = one / 2;\n\tprint(take(one));\n\tprint(half);",
+        "1\n0.5\n",
+    );
+}
+
+/// A literal binding no use types keeps its default, `i32` — an integer
+/// division still truncates, and the literal still reaches an `i32` use.
+#[test]
+fn b389_an_untyped_literal_binding_keeps_its_default() {
+    b389_runs(
+        "i32",
+        "",
+        "\tlet three = 3;\n\tprint(three / 2);\n\tmut count = 0;\n\tfor count < 2 { count += 1; }\n\tprint(take(count));",
+        "1\n2\n",
+    );
+}
+
+/// A literal binding's first typed use decides; a SECOND use at another width
+/// is that use's mismatch — the binding does not quietly serve both.
+#[test]
+fn b389_a_literal_binding_used_at_two_widths_is_refused_at_the_second() {
+    assert_fails_with(
+        "import std::io::print;\n\nfun take(count: u53): u53 { count }\nfun other(count: u32): u32 { count }\n\nfun main() {\n\tlet n = 7;\n\tprint(take(n));\n\tprint(other(n));\n}\n",
+        "Expected u32, but got u53",
+    );
+}
+
+/// The controls: the census's thirteen positions that already took their
+/// context's type, at each of the three widths — none may move.
+fn b389_controls(ty: &str) {
+    let cases: [(&str, &str); 13] = [
+        ("argument", "\tlet _ = take(3);"),
+        ("annotated_let", "\tlet n: WIDTH = 0;\n\tlet _ = take(n);"),
+        (
+            "binary_right",
+            "\tlet n: WIDTH = 4;\n\tlet _ = take(n + 1);",
+        ),
+        (
+            "struct_field",
+            "\tlet h = Holder { at = 0 };\n\tlet _ = take(h.at);",
+        ),
+        ("return_position", "\tlet _ = take(zero());"),
+        (
+            "comparison",
+            "\tlet n: WIDTH = 4;\n\tif n > 0 { print(\"yes\"); }",
+        ),
+        (
+            "compound_assign",
+            "\tmut n: WIDTH = 4;\n\tn -= 1;\n\tlet _ = take(n);",
+        ),
+        (
+            "tuple_element",
+            "\tlet pair: (WIDTH, str) = (0, \"a\");\n\tlet _ = take(pair.0);",
+        ),
+        (
+            "closure_parameter",
+            "\tlet f = |n: WIDTH| take(n);\n\tlet _ = f(7);",
+        ),
+        (
+            "option_some",
+            "\tlet found: Option<WIDTH> = Some(0);\n\tmatch found {\n\t\tSome(let n) => {\n\t\t\tlet _ = take(n);\n\t\t},\n\t\tNone => {},\n\t}",
+        ),
+        (
+            "list_index_literal",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tprint(xs[0]);",
+        ),
+        (
+            "downward_loop",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tmut i: WIDTH = xs.len().as_WIDTH();\n\tfor i > 0 {\n\t\ti -= 1;\n\t\tprint(xs[i.as_i32()]);\n\t}",
+        ),
+        (
+            "underflow_runs",
+            "\tmut i: WIDTH = 0;\n\ti -= 1;\n\tprint(i\"{i}\");",
+        ),
+    ];
+    for (name, body) in cases {
+        let program = b389_program(
+            ty,
+            "struct Holder { at: WIDTH }\n\nfun zero(): WIDTH { 0 }\n",
+            body,
+        );
+        if let Err(errors) = compile(&program) {
+            panic!("control `{name}` at `{ty}` was refused: {errors:#?}\n{program}");
+        }
+    }
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_i53() {
+    b389_controls("i53");
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_u32() {
+    b389_controls("u32");
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_f64() {
+    b389_controls("f64");
+}
+
+// --- B406: B389's remaining gap — a literal passed to a GENERIC CONSTRUCTOR
+// --- inside a struct literal's FIELD takes its type from the field.
+// --- `S { count = Shared::new(0) }` against `count: Shared<u53>` was refused
+// --- "Expected Shared<u53>, but got Shared<i32>": the field's type reached the
+// --- value as a constraint, and the call binds a literal-only generic from its
+// --- EXPECTATION (B389's channel), which a field never seeded. std's rpc.vl
+// --- carried two `0usize` suffixes for it (index-41's gap patch).
+
+/// The item's shape, at the widths the index migration meets it at and one
+/// float: a literal argument to `Shared::new` inside a field.
+fn b406_field_constructor(ty: &str) {
+    b389_runs(
+        ty,
+        "import std::shared::Shared;\nstruct Counter { count: Shared<WIDTH> }\n",
+        "\tlet c = Counter { count = Shared::new(3) };\n\tprint(take(c.count.read()));",
+        "3\n",
+    );
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_u53() {
+    b406_field_constructor("u53");
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_usize() {
+    b406_field_constructor("usize");
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_u8() {
+    b406_field_constructor("u8");
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_f64() {
+    b406_field_constructor("f64");
+}
+
+/// The premise, corrected: the gap was never the FIELD's alone. The literal
+/// generic of a STATIC reached through its impl's path (`Shared::new`'s `T`,
+/// an `impl Shared<type T>` binder, not a generic of `new`'s own) was left out
+/// of B389's expectation step at every position — an annotated `let` and a
+/// declared return refused the same program.
+#[test]
+fn b406_an_impl_binder_literal_takes_the_expectation_at_a_let_and_a_return() {
+    b389_runs(
+        "u53",
+        "import std::shared::Shared;\nfun made(): Shared<WIDTH> { Shared::new(4) }\n",
+        "\tlet x: Shared<WIDTH> = Shared::new(3);\n\tprint(take(x.read()));\n\tprint(take(made().read()));",
+        "3\n4\n",
+    );
+}
+
+/// index-42's relay, kolt's shape: `let selected_index: SignalCell<usize> =
+/// Signal::new(0)` — a static reached through another type's path whose
+/// return names the binder.
+#[test]
+fn b406_kolts_signal_new_literal_takes_the_annotated_width() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "fun main() {\n",
+            "\tlet selected_index: SignalCell<usize> = Signal::new(0);\n",
+            "\tlet a: SignalCell<u53> = SignalCell::new(3);\n",
+            "\tprint(i\"{selected_index.get()} {a.get()}\");\n",
+            "}\n",
+        ),
+        "0 3\n",
+    );
+}
+
+/// index-42's residual, in BOTH field orders: an EARLIER field of the same
+/// literal holding a `Shared<i32>` (a literal, and a binding) no longer leaves
+/// the later field's constructor without its expectation — the shape std's
+/// `rpc.vl` `RemoteSource`/`KeyedSource` write.
+#[test]
+fn b406_a_later_fields_constructor_literal_takes_its_type_in_either_order() {
+    for (fields, expected) in [
+        ("channel = Shared::new(5), count = Shared::new(0)", "5 0\n"),
+        ("count = Shared::new(0), channel = Shared::new(5)", "5 0\n"),
+        (
+            "channel = Shared::new(seed), count = Shared::new(0)",
+            "3 0\n",
+        ),
+        (
+            "count = Shared::new(0), channel = Shared::new(seed)",
+            "3 0\n",
+        ),
+    ] {
+        let program = format!(
+            "{}{}{}{fields}{}{}",
+            "import std::io::print;\nimport std::shared::Shared;\n",
+            "struct Rs { channel: Shared<i32>, count: Shared<usize> }\n",
+            "fun make(seed: i32): Rs {\n\tRs { ",
+            " }\n}\n",
+            "fun main() {\n\tlet r = make(3);\n\tprint(i\"{r.channel.read()} {r.count.read()}\");\n}\n",
+        );
+        match compile_and_run(&program) {
+            Ok(stdout) => assert_eq!(stdout, expected, "{fields}"),
+            Err(errors) => panic!("`{fields}` was refused: {errors:#?}"),
+        }
+    }
+}
+
+/// The control: a non-numeric field still refuses a numeric literal.
+#[test]
+fn b406_a_literal_constructor_argument_still_mismatches_a_non_numeric_field() {
+    assert_fails_with(
+        concat!(
+            "import std::shared::Shared;\n",
+            "struct Named { name: Shared<str> }\n",
+            "fun main() { let n = Named { name = Shared::new(0) }; }\n",
+        ),
+        "Expected Shared<str>, but got Shared<i32>",
+    );
+}
+
+// --- B396: a SECOND bound over `T` on a generic function's `S` stopped the
+// --- argument that determines `T` from binding it. `trait_args_for` answers a
+// --- blanket's still-abstract arguments as its fallback, and
+// --- `derive_generics_from_bounds` bound the caller's `T` to that foreign
+// --- binder first; the key closure could no longer bind it and every bound
+// --- was reported against an abstract `T`.
+
+/// The source that is NOT a list source (an rpc mirror's shape), and a feed
+/// trait declared the way std's `DeltaFeed` is — a blanket over every
+/// `Source<List<T>>`. `BOUNDS` is the two-bound clause under test.
+const B396_PROGRAM: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Signal, SignalCell, Source, Subscription };\n",
+    "\n",
+    "trait Feed<T> { fun feeds(self): bool; }\n",
+    "\n",
+    "impl type S: Source<List<type T>> with Feed<T> {\n",
+    "\tfun feeds(self): bool { false }\n",
+    "}\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Todo { id: i32, label: str }\n",
+    "\n",
+    "struct Mirror<T> { inner: SignalCell<Option<List<T>>> }\n",
+    "\n",
+    "impl Mirror<type T> with Source<Option<List<T>>> {\n",
+    "\tfun get(self): Option<List<T>> { self.inner.get() }\n",
+    "\n",
+    "\t[must_use]\n",
+    "\tfun on_change(self, observer: |Option<List<T>>| void): Subscription {\n",
+    "\t\tself.inner.on_change(observer)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun run<T: PartialEq, K: PartialEq, BOUNDS>(source: S, key: |T| K): i32 {\n",
+    "\tmut total = 0;\n",
+    "\tfor item in source.get() {\n",
+    "\t\tif key(item) == key(item) { total += 1; }\n",
+    "\t}\n",
+    "\ttotal\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tBODY\n",
+    "}\n",
+);
+
+fn b396_refusal(bounds: &str) {
+    let program = B396_PROGRAM.replace("BOUNDS", bounds).replace(
+        "BODY",
+        "let seeded: Option<List<Todo>> = None;\n\tlet remote = Mirror { inner = Signal::new(seeded) };\n\tprint(run(remote, |todo: Todo| todo.id));",
+    );
+    let errors = compile(&program).expect_err("a mirror is not a list source");
+    assert_eq!(
+        errors.len(),
+        2,
+        "one refusal per bound, each at `Todo`, with `{bounds}`: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error
+                .contains("'Mirror<Todo>' does not implement trait 'Source<List<Todo>>'")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("'Mirror<Todo>' does not implement trait 'Feed<Todo>'")),
+        "{errors:#?}"
+    );
+}
+
+/// Red before the fix: three errors, `Feed<T>`, `Source<List<T>>` and "generic
+/// parameter 'T' is missing the bound ': PartialEq'".
+#[test]
+fn b396_a_second_bound_does_not_unbind_the_key_closures_parameter() {
+    b396_refusal("S: Source<List<T>> + Feed<T>");
+}
+
+/// The same in the other order (red before the fix, the same three errors).
+#[test]
+fn b396_a_second_bound_written_first_does_not_unbind_it_either() {
+    b396_refusal("S: Feed<T> + Source<List<T>>");
+}
+
+/// The control: a real list source satisfies both bounds, with the key
+/// closure's parameter unannotated, in either order — green before and after.
+#[test]
+fn b396_a_list_source_under_both_bounds_runs_in_either_order() {
+    for bounds in [
+        "S: Source<List<T>> + Feed<T>",
+        "S: Feed<T> + Source<List<T>>",
+    ] {
+        let program = B396_PROGRAM.replace("BOUNDS", bounds).replace(
+            "BODY",
+            "let todos: SignalCell<List<Todo>> = Signal::new([Todo { id = 1, label = \"a\" }]);\n\tprint(run(todos, |todo| todo.id));",
+        );
+        match compile_and_run(&program) {
+            Ok(stdout) => assert_eq!(stdout, "1\n", "with `{bounds}`"),
+            Err(errors) => panic!("with `{bounds}`: {errors:#?}"),
+        }
+    }
+}
+
+// --- Found under B389: an expression of unsuffixed literals with a FRACTIONAL
+// --- one in it divided as integers when nothing stated a type — the left
+// --- literal took `i32`, so `1 / 4.0` was `i32 / f64`, recorded truncating
+// --- division, and printed `0`.
+
+/// Red before: `0`, `1`, `0` (the binding over the literal typed by its peer
+/// likewise truncated).
+#[test]
+fn a_literal_expression_with_a_fractional_literal_divides_as_floats() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet quarter = 1 / 4.0;\n",
+            "\tprint(quarter);\n",
+            "\tprint(3 / 2.0);\n",
+            "\tlet one = 1;\n",
+            "\tprint(one / 4.0);\n",
+            "}\n",
+        ),
+        "0.25\n1.5\n0.25\n",
+    );
+}
+
+/// The control: the fractional literal on the LEFT, which already typed the
+/// expression as `f64` (green before and after).
+#[test]
+fn a_fractional_left_literal_already_divided_as_floats() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(1.0 / 4);\n",
+            "\tprint(7 / 2);\n",
+            "}\n",
+        ),
+        "0.25\n3\n",
+    );
+}
+
+// --- B405 (RULED 2026-09-25): a FRACTIONAL literal at an INTEGER-typed
+// --- position is refused with an `as_f64()` steer. `let y: i32 = 3; y / 2.0`
+// --- printed `1`: the literal took the left operand's `i32` under B389's
+// --- rule and the division truncated, with no diagnostic. The literal-only
+// --- case above (B402's) has no integer peer and stays a float division.
+
+/// The item's shape: the fractional literal on the RIGHT of an `i32`.
+#[test]
+fn b405_a_fractional_literal_right_of_an_integer_is_refused_with_the_steer() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y / 2.0);\n",
+            "}\n",
+        ),
+        "the literal `2.0` is fractional, and the other operand of `/` is `i32`: an integer \
+         has no fractional part, so the literal would be typed `i32` and the arithmetic done \
+         in integers. Convert the integer first — `y.as_f64()` — or write an integer literal",
+    );
+}
+
+/// Under every arithmetic operator and a comparison, at other integer widths.
+#[test]
+fn b405_a_fractional_literal_right_of_an_integer_is_refused_at_every_operator() {
+    for (operation, width) in [
+        ("n * 2.5", "u53"),
+        ("n + 0.5", "i53"),
+        ("n - 1.5", "u32"),
+        ("n % 2.5", "i32"),
+        ("n < 0.5", "usize"),
+    ] {
+        let program = format!(
+            "import std::io::print;\nfun main() {{\n\tlet n: {width} = 3;\n\tprint({operation});\n}}\n"
+        );
+        assert_fails_with(&program, "is fractional, and the other operand of");
+        assert_fails_with(&program, &format!("is `{width}`"));
+    }
+}
+
+/// A fractional literal on the LEFT types the expression `f64` itself — the
+/// shape `vilan/benchmarks`' report writes (`1000.0 * count / elapsed_ms`) —
+/// so it is a float product, not this refusal (the numeric mixing B148
+/// deferred stays deferred).
+#[test]
+fn b405_a_fractional_literal_left_of_an_integer_stays_a_float_expression() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet count: i32 = 3;\n",
+            "\tprint(2.5 * count);\n",
+            "}\n",
+        ),
+        "7.5\n",
+    );
+}
+
+/// A negative fractional literal is the same literal.
+#[test]
+fn b405_a_negative_fractional_literal_is_refused_too() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y * -0.5);\n",
+            "}\n",
+        ),
+        "is fractional, and the other operand of `*` is `i32`",
+    );
+}
+
+/// The controls: a float peer, two literals, and the converted spelling the
+/// steer names all run.
+#[test]
+fn b405_a_float_peer_and_the_converted_spelling_still_run() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet f: f64 = 3.0;\n",
+            "\tprint(f / 2.0);\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y.as_f64() / 2.0);\n",
+            "\tprint(3 / 2.0);\n",
+            "\tprint(y / 2);\n",
+            "}\n",
+        ),
+        "1.5\n1.5\n1.5\n1\n",
+    );
+}
+
+// --- B404: an UNSUFFIXED literal typed `BigInt` by its context emits a
+// --- BigInt. B370/B389's literal law types `3` as `BigInt` at `tb(3)` for
+// --- `fun tb(v: BigInt)`, but the emitter wrote `3` — a JS number — and
+// --- `v + 1n` inside threw "Cannot mix BigInt and other types".
+
+/// Every position the literal law types from: an argument, an annotated
+/// `let`, a negative argument, and the right operand beside a `BigInt`.
+#[test]
+fn b404_an_unsuffixed_literal_typed_bigint_emits_a_bigint() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun tb(v: BigInt): BigInt { v + 1n }\n",
+            "fun main() {\n",
+            "\tprint(tb(3));\n",
+            "\tlet b: BigInt = 7;\n",
+            "\tprint(b * 2n);\n",
+            "\tprint(tb(-4));\n",
+            "\tlet c: BigInt = 5n;\n",
+            "\tprint(c + 1);\n",
+            "}\n",
+        ),
+        "4n\n14n\n-3n\n6n\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E218: a numeric mismatch names its conversion
+// ---------------------------------------------------------------------------
+//
+// "Expected u53, but got i32 instead." was the whole message wherever a value
+// met a declared numeric type of another width, while the binary-operator path
+// (ledger 357) already said "there are no implicit conversions". Every
+// position that reports the plain mismatch now appends the conversion by name,
+// `.as_<expected>()` — the method every numeric width carries — and the editor
+// offers it as a quick fix. One pin per position, and the two shapes that must
+// NOT carry it: a non-numeric side, and a `BigInt` target (no `as_BigInt`).
+
+const E218_STEER: &str = "There are no implicit numeric conversions; convert with";
+
+#[test]
+fn e218_a_let_annotation_names_the_conversion() {
+    assert_fails_spanning_nth(
+        r#"
+        fun main() {
+        	let width: i32 = 2;
+        	let n: u53 = width;
+        	print(i"{n}");
+        }
+        "#,
+        "width",
+        1,
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+}
+
+#[test]
+fn e218_a_call_argument_names_the_conversion() {
+    assert_fails_spanning(
+        r#"
+        fun take(count: i32): i32 { count }
+
+        fun main() {
+        	print(take(7u53));
+        }
+        "#,
+        "7u53",
+        "Expected i32, but got u53 instead. There are no implicit numeric conversions; \
+         convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn e218_a_closure_call_argument_names_the_conversion() {
+    // A closure-typed value called directly — `(serializer.begin_list)(n)` is
+    // std's own shape — against a DECLARED parameter type.
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet describe: |i32| i32 = |count: i32| count;\n",
+            "\tprint(describe(7u53));\n",
+            "}\n",
+        ),
+        "Expected i32, but got u53 instead. There are no implicit numeric conversions; \
+         convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn e218_a_method_argument_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let floor: i32 = 1;
+        	let at: u53 = 1u53;
+        	print(floor.max(at));
+        }
+        "#,
+        "Expected i32, but got u53 instead. There are no implicit numeric conversions; \
+         convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn e218_a_return_position_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        fun count(width: i32): u53 {
+        	width
+        }
+
+        fun main() {
+        	print(i"{count(1)}");
+        }
+        "#,
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+}
+
+#[test]
+fn e218_a_struct_field_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        struct Cursor { at: u53 }
+
+        fun main() {
+        	let width: i32 = 2;
+        	let cursor = Cursor { at = width };
+        	print(i"{cursor.at}");
+        }
+        "#,
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+}
+
+#[test]
+fn e218_a_reassignment_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let width: i32 = 2;
+        	mut n: f64 = 0.5;
+        	n = width;
+        	print(i"{n}");
+        }
+        "#,
+        "Expected f64, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_f64()`",
+    );
+}
+
+#[test]
+fn e218_a_non_numeric_side_carries_no_conversion() {
+    assert_fails_without(
+        r#"
+        fun main() {
+        	let at: u53 = 1u53;
+        	let text: str = at;
+        	print(text);
+        }
+        "#,
+        E218_STEER,
+    );
+}
+
+#[test]
+fn e218_a_bigint_target_carries_no_conversion() {
+    // No width converts INTO `BigInt` by an `as_*` method, so naming one
+    // would steer to a call that does not exist.
+    assert_fails_without(
+        r#"
+        fun main() {
+        	let at: u53 = 1u53;
+        	let big: BigInt = at;
+        	print(i"{big}");
+        }
+        "#,
+        E218_STEER,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B410 — MISCOMPILE: an override selected through a bound whose trait
+// argument is a TUPLE
+// ---------------------------------------------------------------------------
+//
+// `through<T, S: Src<T>>(s) { s.label() }` with `T = (i32, i32)` ran the
+// trait's DEFAULT `label` where the impl overrides it (JS printed `default`).
+// The emitter re-dispatches the call through the impl that provides
+// `Src<(i32, i32)>`, and its instantiation filter (`instantiation_agrees`)
+// compared a TUPLE argument by its type ids — minted per spelling, never
+// interned — so the wanted `(i32, i32)` never agreed with the provided one,
+// the impl was turned down, and the trait's default answered. Arrays had the
+// same hole. Tuples and arrays now compare element-wise.
+
+/// reactive-41's repro: five instantiations, every one the override.
+#[test]
+fn b410_an_override_is_selected_through_a_bound_at_a_tuple_argument() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun label(self): str { \"default\" }\n",
+            "}\n",
+            "struct Id<T> { v: T }\n",
+            "impl Id<type T> with Src<T> {\n",
+            "\tfun get(self): T { self.v }\n",
+            "\tfun label(self): str { \"id override\" }\n",
+            "}\n",
+            "fun through<T, S: Src<T>>(s: S): str { s.label() }\n",
+            "fun through2<S: Src<(i32, i32)>>(s: S): str { s.label() }\n",
+            "fun main() {\n",
+            "\tprint(through(Id { v = 1 }));\n",
+            "\tlet b = Id { v = (1, 2) };\n",
+            "\tprint(through(b));\n",
+            "\tprint(through2(b));\n",
+            "\tprint(through(Id { v = [1] }));\n",
+            "\tprint(through(Id { v = Some(1) }));\n",
+            "}\n",
+        ),
+        "id override\nid override\nid override\nid override\nid override\n",
+    );
+}
+
+/// A fixed ARRAY argument, and a tuple nested inside a nominal one.
+#[test]
+fn b410_an_override_is_selected_through_a_bound_at_an_array_and_a_nested_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun label(self): str { \"default\" }\n",
+            "}\n",
+            "struct Id<T> { v: T }\n",
+            "impl Id<type T> with Src<T> {\n",
+            "\tfun get(self): T { self.v }\n",
+            "\tfun label(self): str { \"id override\" }\n",
+            "}\n",
+            "fun through<T, S: Src<T>>(s: S): str { s.label() }\n",
+            "fun main() {\n",
+            "\tlet pair: [i32; 2] = [1, 2];\n",
+            "\tprint(through(Id { v = pair }));\n",
+            "\tprint(through(Id { v = Some((1, \"a\")) }));\n",
+            "}\n",
+        ),
+        "id override\nid override\n",
+    );
+}
+
+/// The instantiation filter still SEPARATES tuple arguments that differ: two
+/// impls of one trait at `(i32, i32)` and `(str, str)` each answer their own.
+#[test]
+fn b410_two_tuple_instantiations_of_one_trait_stay_apart_through_a_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Tag<T> { fun tag(self): str; }\n",
+            "struct Box {}\n",
+            "impl Box with Tag<(i32, i32)> { fun tag(self): str { \"ints\" } }\n",
+            "impl Box with Tag<(str, str)> { fun tag(self): str { \"strs\" } }\n",
+            "fun ints<S: Tag<(i32, i32)>>(s: S): str { s.tag() }\n",
+            "fun strs<S: Tag<(str, str)>>(s: S): str { s.tag() }\n",
+            "fun main() { print(ints(Box {})); print(strs(Box {})); }\n",
+        ),
+        "ints\nstrs\n",
     );
 }

@@ -63,6 +63,7 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("await", Token::Await),
     ("const", Token::Const),
     ("css", Token::Css),
+    ("dyn", Token::Dyn),
     ("else", Token::Else),
     ("enum", Token::Enum),
     ("export", Token::Export),
@@ -76,6 +77,7 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("in", Token::In),
     ("is", Token::Is),
     ("jump", Token::Jump),
+    ("lazy", Token::Lazy),
     ("let", Token::Let),
     ("macro", Token::Macro),
     ("match", Token::Match),
@@ -85,7 +87,6 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("own", Token::Own),
     ("borrows", Token::Borrows),
     ("ret", Token::Ret),
-    ("resource", Token::Resource),
     ("struct", Token::Struct),
     ("trait", Token::Trait),
     ("type", Token::Type),
@@ -236,6 +237,14 @@ impl<'src> Lexer<'src> {
         } else if first.is_ascii_digit() {
             let (token, end) = self.read_number(start);
             self.push(token, start, end);
+        } else if first == b'#' {
+            // B318 §2.3: `#` is the import reach marker, so it is a TOKEN. It
+            // used to reach `skip_illegal` and carry a curated rule about hex
+            // colours — a context-free refusal giving context-ful advice, which
+            // told an author writing `import a::{ #hidden }` about `Color::hex`.
+            // The colour rule moved to the `css` block's own value parser, the
+            // one place that knows a `#` is a colour.
+            self.push(Token::Hash, start, start + 1);
         } else if is_ident_start(first) {
             let (token, end) = self.read_identifier(start);
             self.push(token, start, end);
@@ -278,7 +287,6 @@ impl<'src> Lexer<'src> {
             position: self.position,
             character,
             rule: match character {
-                '#' => Some(HASH_IS_NOT_A_TOKEN),
                 '@' => Some(AT_IS_NOT_A_TOKEN),
                 _ => None,
             },
@@ -465,6 +473,61 @@ impl<'src> Lexer<'src> {
         }
         let content = &self.source[content_start..position];
         StringScan::Complete(Token::String(content), position + 1)
+    }
+
+    /// A string literal written with its quotes ESCAPED — `\"k\"` — which is legal
+    /// in ONE place: inside an interpolation hole (B278). `start` is the `\` of the
+    /// opening `\"`, and the literal closes at the next `\"`.
+    ///
+    /// The escaped spelling buys nothing the raw one does not — a hole is lexed
+    /// from the raw bytes, so `i"{get("k")}"` has always worked — but it is what an
+    /// author writes by habit, having escaped a quote inside a string everywhere
+    /// else, and the two now lex to the SAME token: the body is kept raw, exactly
+    /// as [`Lexer::read_string`] keeps it, and the escapes in it are interpreted at
+    /// code generation. `\\` still takes its pair, so a body may end in an escaped
+    /// backslash (`\"a\\\"` is `a\`) and a `\"` inside the body has no spelling —
+    /// the raw form (`"a\"b"`) is the one that carries an embedded quote.
+    fn read_escaped_quote_string(&self, start: usize) -> StringScan<'src> {
+        let content_start = start + 2;
+        let mut position = content_start;
+        loop {
+            match self.bytes.get(position) {
+                None => return StringScan::Unterminated,
+                // The ban, exactly as in the raw form: a `"…"` never spans lines.
+                Some(b'\n') | Some(b'\r') => {
+                    return StringScan::LineBreak {
+                        content: &self.source[content_start..position],
+                        at: position,
+                    };
+                }
+                Some(b'\\') => {
+                    let Some(escaped) = self.source[position + 1..].chars().next() else {
+                        return StringScan::Unterminated;
+                    };
+                    // The closing delimiter — the one `\X` this scan does not step
+                    // over.
+                    if escaped == '"' {
+                        break;
+                    }
+                    if escaped == '\n' || escaped == '\r' {
+                        return StringScan::LineBreak {
+                            content: &self.source[content_start..position],
+                            at: position + 1,
+                        };
+                    }
+                    position += 1 + escaped.len_utf8();
+                }
+                Some(_) => {
+                    let character = self.source[position..]
+                        .chars()
+                        .next()
+                        .expect("byte present implies a character");
+                    position += character.len_utf8();
+                }
+            }
+        }
+        let content = &self.source[content_start..position];
+        StringScan::Complete(Token::String(content), position + 2)
     }
 
     // --- Interpolated strings ------------------------------------------------
@@ -799,11 +862,44 @@ impl<'src> Lexer<'src> {
             match self.bytes.get(self.position) {
                 None => break self.position, // unterminated; best-effort
                 Some(b'}') => break self.position,
+                // A `"…"` inside the hole that does not close — at a line break
+                // or at end of input. It is the one `None` that is NOT a
+                // malformed hole: it says nothing of its own because the
+                // enclosing literal holds the same break and states the rule
+                // once (diagnostics-standard B5), and ending the hole here is
+                // what carries the body scan to that break.
+                Some(b'"') => match self.lex_hole_token() {
+                    Some(token) => inner.push(token),
+                    None => break self.position,
+                },
+                // The same string, written with its quotes ESCAPED — `\"k\"` where
+                // `"k"` would also do (B278). The hole is lexed from the raw bytes
+                // and the enclosing literal's quotes never reach it, so the raw
+                // form always worked; the escaped form is what an author writes by
+                // habit, and it read as a stray `\` in no charset — a malformed
+                // hole, three diagnostics deep. Both forms lex to the same token.
+                Some(b'\\') if self.bytes.get(self.position + 1) == Some(&b'"') => {
+                    match self.lex_hole_token() {
+                        Some(token) => inner.push(token),
+                        // The unclosed case, and the one place the two spellings
+                        // differ: the opening delimiter is TWO bytes, so the hole
+                        // has to end at the quote rather than at the backslash for
+                        // the body scan to resume inside the literal's text — where
+                        // it meets the same break the raw form's scan meets, and
+                        // the enclosing i-string states the rule once. Ending at
+                        // the backslash resumes ON the quote, which reads as the
+                        // i-string's own closing one.
+                        None => break self.position + 1,
+                    }
+                }
                 Some(_) => match self.lex_hole_token() {
                     Some(token) => inner.push(token),
-                    // A construct no hole token matches (a nested `{`, an illegal
-                    // char) makes the hole malformed; stop (clean sources never do).
-                    None => break self.position,
+                    // A construct no hole token matches — a nested `{` (a block, a
+                    // `match`, an `if`, a struct literal), or a character in no
+                    // charset. The hole holds an EXPRESSION (`lexical.md` §3.4:
+                    // `hole = '{' , expression , '}'`) and this text is not one, so
+                    // it is REFUSED by name rather than abandoned mid-body — B247.
+                    None => return self.refuse_malformed_hole(brace_open),
                 },
             }
         };
@@ -817,13 +913,67 @@ impl<'src> Lexer<'src> {
         wrapped
     }
 
+    /// Refuse a hole whose text is not an expression ([`HOLE_IS_NOT_AN_EXPRESSION`])
+    /// and resynchronize past it, returning what the hole contributes to the
+    /// literal: one EMPTY fragment.
+    ///
+    /// Before B247 the malformed hole simply ENDED at the offending byte and the
+    /// body scan resumed one byte later, in the middle of the hole — so `i"{if c {
+    /// 1 } else { 2 }}"` produced six diagnostics, among them the line-break ban
+    /// about a break nobody wrote and an unclosed `(` from the hole's own generated
+    /// paren. Now the offender is stated once, at the hole's own `{` (the span the
+    /// author has to edit), and the rest of the literal lexes normally: one
+    /// diagnostic per root cause (diagnostics-standard.md B5).
+    ///
+    /// The empty fragment is what keeps it to one: the wrapper `("" + …)` stays
+    /// well formed, so nothing downstream reports a second time. It is never a
+    /// VALUE — the error above fails the program before any fragment is unescaped —
+    /// which is also why the hole's raw text is not carried through: an i-string
+    /// hole must never be emitted verbatim (B247's find).
+    ///
+    /// Resynchronization is the matching `}` by brace depth, bounded by the
+    /// literal's own edges (a line break or a quote, neither of which a hole may
+    /// cross unbroken) so the scan can never leave the literal it started in.
+    fn refuse_malformed_hole(&mut self, brace_open: usize) -> Vec<Spanned<Token<'src>>> {
+        self.errors.push(LexError {
+            position: brace_open,
+            character: '{',
+            rule: Some(HOLE_IS_NOT_AN_EXPRESSION),
+        });
+        let mut depth = 0usize;
+        let mut at = brace_open;
+        while let Some(&byte) = self.bytes.get(at) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        at += 1;
+                        break;
+                    }
+                }
+                b'\n' | b'\r' | b'"' => break,
+                _ => {}
+            }
+            at += 1;
+        }
+        self.position = at;
+        vec![(Token::String(""), span(brace_open, at))]
+    }
+
     /// Lex one token inside an interpolation hole, or `None` if the current
     /// character starts no hole token. Whitespace is already skipped.
     fn lex_hole_token(&mut self) -> Option<Spanned<Token<'src>>> {
         let start = self.position;
         let first = self.bytes[start];
-        let (token, end) = if first == b'"' {
-            match self.read_string(start) {
+        let escaped_quote = first == b'\\' && self.bytes.get(start + 1) == Some(&b'"');
+        let (token, end) = if first == b'"' || escaped_quote {
+            let scan = if escaped_quote {
+                self.read_escaped_quote_string(start)
+            } else {
+                self.read_string(start)
+            };
+            match scan {
                 StringScan::Complete(token, end) => (token, end),
                 // A string inside a hole that does not close — at end of input or
                 // at a line break — cannot be recovered locally; the hole is
@@ -875,31 +1025,27 @@ enum IStringEnd {
     Unterminated,
 }
 
-/// The rule a `#` breaks. It is in no charset, so it cannot lex — and lexing is
-/// context-free by spec (`lexical.md` §2.5) and by construction, so a `css` block
-/// cannot make it lex there either (proposal/css-block.md §4.1). The byte's one
-/// realistic use is a hex colour, and the refusal is the right one: the vilan
-/// spelling routes the value through `Color`, which carries its own `:root`
-/// line, where a raw hex would be the one spelling that can silently produce a
-/// literal outside the token system. Curated (diagnostics-standard.md B6).
-///
-/// Public because the language server's quickfix keys on it (css-block S5,
-/// §7.2 fix 1) — one constant rather than a second copy to drift from.
-pub const HASH_IS_NOT_A_TOKEN: &str = "`#` is not a vilan token; in a `css` block a colour is a hole — \
-     `color: {Color::hex(\"#333\")};` — which routes it through the `Color` type that carries its \
-     own `:root` line";
-
-/// The rule an `@` breaks — [`HASH_IS_NOT_A_TOKEN`]'s twin, and the reason a
+/// The rule an `@` breaks — the `css` block's one remaining un-lexable byte, and the reason a
 /// `css` block has no at-rules of any kind (proposal/css-block.md §10). A media
 /// query's spelling is the breakpoint combinator; `@supports`, `@font-face` and
 /// `@keyframes` have none yet.
 ///
-/// Public for the same reason as [`HASH_IS_NOT_A_TOKEN`]: §7.2's fix 2 keys on
-/// it. That the combinator spelling exists only for a min-width media query is
+/// Public because the language server's quickfix keys on it (css-block S5,
+/// §7.2 fix 2) — one constant rather than a second copy to drift from. That the combinator spelling exists only for a min-width media query is
 /// exactly why the fix offers nothing for the other three at-rules.
 pub const AT_IS_NOT_A_TOKEN: &str = "`@` is not a vilan token; a `css` block has no at-rules — a media query is a \
      breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is \
      `std::style::declare`";
+
+/// The rule a hole whose text is not an expression breaks (B247). A hole holds
+/// an EXPRESSION and `{` / `}` DELIMIT it (`lexical.md` §3.4), so a nested brace
+/// closes the hole early — a block, a `match`, an `if` and a struct literal
+/// cannot be written inline — and a character in no charset cannot lex there at
+/// all. Curated (diagnostics-standard.md B6): the prohibition explains itself and
+/// names the sanctioned spelling.
+const HOLE_IS_NOT_AN_EXPRESSION: &str = "an interpolation hole holds one expression, and `{` and `}` delimit it: a \
+     nested brace — a block, a `match`, an `if`, a struct literal — ends the hole early; bind the \
+     value with a `let` first and write its name in the hole";
 
 /// The rule an unescaped `}` in an interpolated string breaks. Curated
 /// (diagnostics-standard.md B6): the braces are the hole's, and the sanctioned
@@ -1093,7 +1239,7 @@ mod tests {
             ("own", Token::Own),
             ("borrows", Token::Borrows),
             ("ret", Token::Ret),
-            ("resource", Token::Resource),
+            ("dyn", Token::Dyn),
             ("struct", Token::Struct),
             ("trait", Token::Trait),
             ("type", Token::Type),
@@ -1109,6 +1255,9 @@ mod tests {
         assert_eq!(lex("await123"), vec![Token::Ident("await123")]);
         assert_eq!(lex("_foo"), vec![Token::Ident("_foo")]);
         assert_eq!(lex("_"), vec![Token::Ident("_")]);
+        // B413: `resource` is no keyword — the kind is the `[resource]`
+        // attribute, and the word is an ordinary name.
+        assert_eq!(lex("resource"), vec![Token::Ident("resource")]);
     }
 
     // --- Numbers ------------------------------------------------------------
@@ -1461,6 +1610,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_string_in_a_hole_lexes_the_same_raw_or_escaped() {
+        // B278. The hole is lexed from the raw bytes, so `"k"` in it has always
+        // been a string; `\"k\"` — the spelling an author writes by habit — was a
+        // stray `\` in no charset, and the hole was refused as malformed. Both
+        // spellings are ONE token now, and the same one.
+        let raw = lex(r#"i"{f("k")}""#);
+        let escaped = lex(r#"i"{f(\"k\")}""#);
+        assert_eq!(
+            raw,
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("f"),
+                Token::Ctrl('('),
+                Token::String("k"),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+            ]
+        );
+        assert_eq!(escaped, raw);
+    }
+
+    #[test]
+    fn an_escaped_quote_string_in_a_hole_keeps_its_body_raw() {
+        // The body is kept raw exactly as `read_string` keeps it — the escapes in
+        // it are interpreted at code generation — and `\\` takes its pair, so the
+        // literal can end in an escaped backslash without eating its delimiter.
+        assert_eq!(
+            lex(r#"i"{f(\"a\nb\")}""#),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("f"),
+                Token::Ctrl('('),
+                Token::String(r"a\nb"),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+            ]
+        );
+        assert_eq!(
+            lex(r#"i"{f(\"a\\\")}""#),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("f"),
+                Token::Ctrl('('),
+                Token::String(r"a\\"),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+                Token::Ctrl(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_break_inside_an_escaped_quote_string_in_a_hole_reports_the_rule_once() {
+        // The escaped spelling takes the raw one's recovery with it: a literal in
+        // a hole that does not close ENDS the hole rather than refusing it, so the
+        // break the enclosing i-string holds is what states the rule
+        // (diagnostics-standard B5). Without the arm in `lex_hole` the hole ends
+        // at the BACKSLASH, the body scan resumes on the quote behind it and reads
+        // it as the i-string's own closing one — and the break is never reported
+        // at all.
+        let (_tokens, errors) = lex_rejecting("i\"a{f(\\\"x\ny\\\")}b\"");
+        assert_eq!(errors[0], line_break_error(0, 'i')[0], "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.rule != Some(HOLE_IS_NOT_AN_EXPRESSION)),
+            "the hole is not refused on top of the break: {errors:?}"
+        );
+        // What follows is the salvage's own noise and not a second statement of
+        // the rule: lexing resumes AT the break, so the second line's `\"` is a
+        // stray backslash at the top level, exactly as any `\` outside a string
+        // is. The raw spelling's second line happens to lex (`y")}b"` is a name
+        // and a string), which is the only reason its pin can read as one error.
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert_eq!(errors[1].character, '\\');
+    }
+
+    #[test]
+    fn a_backslash_that_is_not_a_quote_still_makes_a_hole_malformed() {
+        // Only `\"` is a hole token. A lone `\` is in no charset and the hole is
+        // still refused by name (B247's message), which is the control for B278:
+        // the fix opened one spelling, not the backslash.
+        let (_tokens, errors) = lex_rejecting(r#"i"{f(\k)}""#);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].rule, Some(HOLE_IS_NOT_AN_EXPRESSION));
+    }
+
     // --- Interpolated triple-quoted strings (backlog H7) ---------------------
 
     #[test]
@@ -1642,19 +1890,35 @@ mod tests {
         );
     }
 
-    // The two bytes a `css` block makes an author reach for
-    // (proposal/css-block.md §4.1/§7.3): neither lexes — lexing is
-    // context-free — so each carries a curated rule naming the vilan spelling,
+    // The byte a `css` block makes an author reach for
+    // (proposal/css-block.md §4.1/§7.3): `@` does not lex — lexing is
+    // context-free — so it carries a curated rule naming the vilan spelling,
     // the `UNESCAPED_BRACE` precedent. Every OTHER un-lexable character keeps
     // the generic "found X expected a token".
+    //
+    // `#` used to be its twin and is a TOKEN now (B318 §2.3): it lexes with no
+    // error at all, and the colour rule it carried lives in the `css` block's
+    // own value parser, which is the only place that knows a `#` is a colour.
     #[test]
     fn the_css_bytes_carry_their_own_rules() {
-        let (_, hash) = tokenize("color: #333");
+        let (tokens, hash) = tokenize("color: #333");
+        assert!(hash.is_empty(), "`#` lexes now: {hash:?}");
         assert_eq!(
-            hash.iter().map(|error| error.rule).collect::<Vec<_>>(),
-            vec![Some(HASH_IS_NOT_A_TOKEN)]
+            tokens
+                .iter()
+                .map(|(token, _)| token.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Token::Ident("color"),
+                Token::Op(":"),
+                Token::Hash,
+                Token::Number("333", None, None),
+            ]
         );
-        assert!(HASH_IS_NOT_A_TOKEN.contains("Color::hex"), "names the fix");
+        assert!(
+            tokenize("import a::{ #hidden };").1.is_empty(),
+            "the reach marker lexes with no error at all"
+        );
         let (_, at) = tokenize("@media");
         assert_eq!(
             at.iter().map(|error| error.rule).collect::<Vec<_>>(),

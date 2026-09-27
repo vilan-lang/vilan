@@ -1,9 +1,18 @@
 # The browser member of the workspace. It takes `common` by an explicit `path`
 # dependency — the price of the workspace shape, and the reason a two-entry
 # single package is the default when both legs are one app.
+#
+# `prelude` names this package's ambient scope, and only this package's — the key
+# is never inherited from the workspace root or from a dependency
+# (`proposal/prelude.md` §7). `std::web` is the application set: the base seven
+# (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) plus `Signal`,
+# `SignalCell`, `view` and `View`, plus the MODULES `style` and `ui`. This client
+# is raw `std::dom` and reaches for none of them today, but it is the browser leg
+# of an app — the moment it grows a view it wants the set that serves one.
 [package]
 name = "client"
 target = "browser"
+prelude = "std::web"
 
 [package.dependencies]
 common = { path = "../common" }

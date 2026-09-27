@@ -12,6 +12,8 @@
 import pkg::bytes::{ Bytes, decode_utf8, encode_utf8 };
 import pkg::shared::Shared;
 
+export *;
+
 // --- Encoding (server → client: FIN set, unmasked) ---------------------------
 
 /// One complete frame: FIN | `opcode`, the length ladder, then the payload.
@@ -19,20 +21,20 @@ fun encode_frame(opcode: i32, payload: Bytes): Bytes {
 	let length = payload.len();
 	mut header = Bytes::alloc(2);
 	if length < 126 {
-		header.set(1, length);
+		header.set(1, length.as_i32());
 	} else if length < 65536 {
 		header = Bytes::alloc(4);
 		header.set(1, 126);
-		header.set(2, length >> 8);
-		header.set(3, length);
+		header.set(2, (length >> 8).as_i32());
+		header.set(3, length.as_i32());
 	} else {
 		header = Bytes::alloc(10);
 		header.set(1, 127);
 		// Bytes 2–5 stay zero (payloads are capped well under 2^32).
-		header.set(6, length >> 24);
-		header.set(7, length >> 16);
-		header.set(8, length >> 8);
-		header.set(9, length);
+		header.set(6, (length >> 24).as_i32());
+		header.set(7, (length >> 16).as_i32());
+		header.set(8, (length >> 8).as_i32());
+		header.set(9, length.as_i32());
 	}
 	header.set(0, 0x80 | opcode);
 	Bytes::concat(header, payload)
@@ -57,8 +59,8 @@ fun close_frame(): Bytes {
 // --- Parsing (client → server) ------------------------------------------------
 
 /// What one `feed` can surface. Pongs are consumed silently; a `Ping` asks the
-/// caller to write `pong_frame(payload)` back; `Closed` ends the connection
-/// (sent close, or a protocol violation).
+/// caller to write `pong_frame(payload)` back; `Closed` ends the connection (sent
+/// close, or a protocol violation).
 enum WsEvent {
 	Text(str),
 	Binary(Bytes),
@@ -66,9 +68,9 @@ enum WsEvent {
 	Closed,
 }
 
-/// A stateful frame parser: feed it raw socket chunks, get complete events.
-/// Partial frames wait in `buffer`; fragmented messages accumulate in
-/// `fragment_*` until their FIN.
+/// A stateful frame parser: feed it raw socket chunks, get complete events. Partial
+/// frames wait in `buffer`; fragmented messages accumulate in `fragment_*` until
+/// their FIN.
 struct WsParser {
 	buffer: Shared<Bytes>,
 	fragment_opcode: Shared<i32>,
@@ -121,37 +123,40 @@ impl WsParser {
 						valid = false;
 						scanning = false;
 					} else {
-						// The high 5 bytes must be zero AND the low 31 bits
-						// must not carry the sign — anything larger is hostile.
-						let oversized = buffer.get(2) != 0 || buffer.get(3) != 0 || buffer.get(4) != 0 || buffer.get(5) != 0 || buffer.get(6) & 0x80 != 0;
+						// The high 5 bytes must be zero AND the low 31 bits must
+						// not carry the sign — anything larger is hostile.
+						let oversized = buffer.get(2) != 0
+							|| buffer.get(3) != 0
+							|| buffer.get(4) != 0
+							|| buffer.get(5) != 0
+							|| buffer.get(6) & 0x80 != 0;
 						if oversized {
 							self.violated.write() = true;
 							events.push(WsEvent::Closed);
 							ret events;
 						}
-						length = buffer.get(6) << 24 | buffer.get(7) << 16 | buffer.get(8) << 8 | buffer.get(9);
+						length = buffer.get(6) << 24
+							| buffer.get(7) << 16
+							| buffer.get(8) << 8
+							| buffer.get(9);
 						header = 10;
 					}
 				}
 				if valid {
 					let mask_at = header;
 					let total = if masked {
-						header + 4 + length
+						header + 4 + length.as_usize()
 					} else {
-						header + length
+						header + length.as_usize()
 					};
 					if available < total {
 						scanning = false;
 					} else {
-						let payload_at = if masked {
-							mask_at + 4
-						} else {
-							mask_at
-						};
-						let payload = buffer.slice(payload_at, payload_at + length);
+						let payload_at = if masked { mask_at + 4 } else { mask_at };
+						let payload = buffer.slice(payload_at, payload_at + length.as_usize());
 						if masked {
 							mut index = 0;
-							for index < length {
+							for index < length.as_usize() {
 								payload.set(index, payload.get(index) ^ buffer.get(mask_at + (index & 3)));
 								index += 1;
 							}

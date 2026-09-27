@@ -12,7 +12,7 @@
 //! measured as the whole overlap (nine functions) when completion was lifted
 //! out of the server. Everything hover-shaped above them stays in the server.
 
-use std::cell::{Ref, RefCell};
+use std::cell::{OnceCell, Ref, RefCell};
 
 use vilan_core::analyzer::{Expr, SourceId};
 use vilan_core::fx::FxHashMap as HashMap;
@@ -52,6 +52,11 @@ pub struct Analysis<'a, 'src> {
     /// the analysis resolved no package tree (the language server's degraded
     /// internal-error document).
     pub import_roots: Option<&'a ImportRoots>,
+    /// What completion may read that is a function of the ANALYSIS alone,
+    /// derived once when it landed (M25, E121 §2.1.4): the auto-import
+    /// candidate table and the origins' module listings. A request reads it;
+    /// nothing in a request rebuilds it.
+    pub index: &'a crate::completion::CompletionIndex,
     /// Non-entry source texts already materialized FOR THIS QUERY — the one
     /// owned field on this otherwise reference-only struct, so the cache
     /// lives exactly as long as the query does (E83). [`Analysis::doc_comment_of`]
@@ -64,17 +69,50 @@ pub struct Analysis<'a, 'src> {
     /// query's reads. A failed read is recorded (`None`) so it is not
     /// retried. Construct with `Default::default()`.
     pub source_texts: RefCell<HashMap<SourceId, Option<String>>>,
+    /// The two-sided, line-aligned edit anchor between `analyzed` and `live`,
+    /// as `(prefix, suffix)` byte counts — computed at most once per query, by
+    /// [`Analysis::anchor`], and only where something asks. Construct with
+    /// `Default::default()`.
+    ///
+    /// The server's keystroke path computes the same two numbers per request
+    /// (`keystroke::Anchor`) and cannot hand them here: the engine is below it,
+    /// and the playground has no keystroke path at all. What reads it is E131's
+    /// gate — whether the ANALYZED text still describes the bytes at a given
+    /// live offset — which is a question only the engine's own two texts can
+    /// answer.
+    pub anchor: OnceCell<(usize, usize)>,
+    /// The entry file's scope EXTENTS — `(start, end, scope id)`, narrowest
+    /// first — computed at most once per query by
+    /// [`Analysis::scope_extents`], and only where something asks (E165).
+    /// Construct with `Default::default()`.
+    pub scope_extents: OnceCell<Vec<(usize, usize, Id)>>,
 }
 
 /// `(start, end, id)` for every entry-file entity with a real span, for
 /// [`entity_at`]'s innermost-containing lookup. Computed once per analysis by
 /// both front-ends through this one function, so neither can drift.
 pub fn entity_spans(program: &Program) -> Vec<(usize, usize, Id)> {
+    // M27: walked by the ENTRY'S ID RANGE, not by scanning `span_map`.
+    //
+    // The map is whole-program, and this table is the entry file's alone: on
+    // kolt's client that was ~100,000 rows visited (each paying `source_of`'s
+    // linear scan over ~60 source ranges) to keep the few thousand the open
+    // buffer wrote. Ids are assigned per file in contiguous blocks, so the
+    // entry's rows can be FETCHED — the same move `Program::id_ranges_of` was
+    // introduced for (E114). The cost is now the edited buffer's size, which
+    // is what M27 asks of `lsp-index`.
+    //
+    // The rows are the same rows; they come out in ascending id order rather
+    // than in the map's arbitrary one, which is the more defined of the two —
+    // `entity_at` breaks a tie on span width by taking the first, and "the
+    // first" now means something.
     let mut entity_spans = Vec::new();
-    for (id, span) in &program.span_map {
-        if program.source_of(*id) != Some(SourceId(0)) {
+    let entry_ids = program.id_ranges_of(SourceId(0));
+    for id in entry_ids.into_iter().flatten().map(Id) {
+        let Some(span) = program.span_map.get(&id) else {
             continue;
-        }
+        };
+        let id = &id;
         // A synthesized `Expr::Void` (S3, editing-dx.md §3.9: the parser's
         // filler for a block with no trailing expression, now spanning the
         // closing brace instead of a zero-width point past it) is not
@@ -95,10 +133,33 @@ pub fn entity_spans(program: &Program) -> Vec<(usize, usize, Id)> {
 
 /// The innermost entry-file entity whose span contains `offset`, over an
 /// [`entity_spans`] table.
+///
+/// Containment is END-INCLUSIVE, the same convention
+/// the language server's `ReferenceIndex::at` gave the reference index
+/// in E133: a caret at `name|`, where the user just finished typing the word,
+/// is ON that word. The index could take the convention as a FALLBACK because
+/// its rows are identifier-exact and non-nesting, so the strict test simply
+/// answered nothing there. Entity spans nest, so the strict test did not fail
+/// at `let _ = count|` — it succeeded, with the enclosing FUNCTION, whose span
+/// runs well past the caret. A fallback would never have been consulted, which
+/// is why hover on a bare use went on answering `fun main()` after E133 landed
+/// (E139).
+///
+/// Widening the test itself is what closes it, and the innermost-wins rule is
+/// what keeps it honest: at `count|` the use (5 bytes) and the function (a
+/// whole body) both contain the offset and the narrower one wins, exactly as
+/// it does one byte to the left. The rule is end-INCLUSIVE, not end-plus-one:
+/// a caret past the word's last byte is outside it and the answer moves on,
+/// so the two adjacent identifiers of `a.b` still each own their own bytes.
+///
+/// Completion's receiver arm is unaffected by construction: it resolves
+/// `x|.` by asking about `receiver_end - 1`, an offset strictly INSIDE the
+/// receiver's last token, and no span can end there that did not already
+/// contain it.
 pub fn entity_at(entity_spans: &[(usize, usize, Id)], offset: usize) -> Option<Id> {
     entity_spans
         .iter()
-        .filter(|(start, end, _)| *start <= offset && offset < *end)
+        .filter(|(start, end, _)| *start <= offset && offset <= *end)
         .min_by_key(|(start, end, _)| end - start)
         .map(|(_, _, id)| *id)
 }
@@ -148,10 +209,9 @@ pub fn signature_label(program: &Program, target: Id) -> Option<String> {
 pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>> {
     let parameter_ids = if let Some(function) = program.functions.get(&target) {
         &function.parameters
-    } else if let Some(external) = program.external_functions.get(&target) {
-        &external.parameters
     } else {
-        return None;
+        let external = program.external_functions.get(&target)?;
+        &external.parameters
     };
     Some(
         parameter_ids
@@ -161,6 +221,33 @@ pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>
             .map(|parameter| parameter.name.to_string())
             .collect(),
     )
+}
+
+/// The start of the line containing `at` — `0`, or one past the nearest
+/// preceding `\n`.
+fn line_start(bytes: &[u8], at: usize) -> usize {
+    let mut at = at.min(bytes.len());
+    while at > 0 && bytes[at - 1] != b'\n' {
+        at -= 1;
+    }
+    at
+}
+
+/// The start of the line AFTER the one containing `at` — the length when `at`
+/// is on the last line.
+fn next_line_start(bytes: &[u8], at: usize) -> usize {
+    let mut at = at.min(bytes.len());
+    if at > 0 && bytes[at - 1] == b'\n' {
+        return at;
+    }
+    while at < bytes.len() {
+        let byte = bytes[at];
+        at += 1;
+        if byte == b'\n' {
+            return at;
+        }
+    }
+    bytes.len()
 }
 
 /// The nominal struct/enum id a resolved type names, ignoring its type
@@ -201,6 +288,107 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// produces — including one past the end of a shorter analyzed text.
     pub(crate) fn to_analyzed_offset(&self, live_offset: usize) -> usize {
         self.analyzed.offset(self.live.position(live_offset))
+    }
+
+    /// The line-aligned common prefix and suffix of the analyzed text and the
+    /// live buffer, in bytes — the same two-sided anchor E121's keystroke path
+    /// computes, memoized per query.
+    ///
+    /// Both edges are trimmed to a line boundary, for the reason the server's
+    /// anchor states: a `\n` cannot occur inside a UTF-8 sequence, so a line
+    /// boundary is a char boundary in both texts and never cuts a token in
+    /// half.
+    fn anchor(&self) -> (usize, usize) {
+        *self.anchor.get_or_init(|| {
+            let analyzed = self.analyzed.text().as_bytes();
+            let live = self.live.text().as_bytes();
+            if analyzed == live {
+                return (analyzed.len(), 0);
+            }
+            let common_prefix = analyzed
+                .iter()
+                .zip(live)
+                .take_while(|(old, new)| old == new)
+                .count();
+            let prefix = line_start(analyzed, common_prefix);
+            let common_suffix = analyzed
+                .iter()
+                .rev()
+                .zip(live.iter().rev())
+                .take_while(|(old, new)| old == new)
+                .count();
+            // Clamp before trimming so the two edges cannot overlap in EITHER
+            // text — `"aa"` -> `"a"` shares a one-byte prefix and a one-byte
+            // suffix that are the same byte.
+            let room = analyzed.len().min(live.len()).saturating_sub(prefix);
+            let common_suffix = common_suffix.min(room);
+            let live_suffix_start = next_line_start(live, live.len() - common_suffix);
+            (prefix, live.len() - live_suffix_start)
+        })
+    }
+
+    /// Whether the ANALYZED text still describes the live bytes at
+    /// `live_offset` — outside the edit window, where the two texts are
+    /// byte-identical, so a `program` lookup keyed on a converted offset is
+    /// answering about the same characters the user is looking at.
+    ///
+    /// False inside the window, and the cursor's OWN line is inside it by
+    /// construction: the anchor is line-aligned, and the line being typed on is
+    /// the line that differs. That is why a converted offset cannot be trusted
+    /// there — [`Analysis::to_analyzed_offset`] is a line/character round-trip
+    /// that CLAMPS, so a live column past the end of the shorter analyzed line
+    /// lands on that line's last character and `entity_at` answers about
+    /// whatever expression used to be written there (E131).
+    pub(crate) fn analyzed_agrees_at(&self, live_offset: usize) -> bool {
+        let (prefix, suffix) = self.anchor();
+        let live_len = self.live.text().len();
+        live_offset < prefix || live_offset >= live_len.saturating_sub(suffix)
+    }
+
+    /// An ANALYZED span in LIVE coordinates, or `None` when it has no image —
+    /// the engine's own form of `keystroke::Anchor::map_span`, for the answers
+    /// that are computed against the analyzed text and delivered as edits to
+    /// the live buffer (M29's captured import edits).
+    ///
+    /// A span maps only when it lies ENTIRELY inside one anchor: one that
+    /// straddles the edit window is dropped rather than clamped, because half
+    /// of it describes bytes that are gone. That is what keeps this a
+    /// re-mapping instead of a guess.
+    pub(crate) fn map_analyzed_span(&self, span: Span) -> Option<Span> {
+        let (prefix, suffix) = self.anchor();
+        // `prefix > 0` is not redundant, and the arm below it is why. An import
+        // edit is a zero-width INSERTION POINT, and `0..0` satisfies
+        // `end <= prefix` vacuously when there is no common prefix at all —
+        // the shape of an edit at the top of a file whose FIRST line the user
+        // just changed. Where the suffix reaches back to offset 0 (a line
+        // inserted above the imports) the point belongs to the suffix and moves
+        // with the text it precedes; where it does not (a file with no imports
+        // at all, so the edit is "a new first line"), offset 0 is offset 0 in
+        // both texts and the identity is right. Taking the head arm first would
+        // answer the identity for both.
+        if prefix > 0 && span.end <= prefix {
+            return Some(span);
+        }
+        let analyzed_len = self.analyzed.text().len();
+        let live_len = self.live.text().len();
+        if span.start >= analyzed_len.saturating_sub(suffix) {
+            let shift = live_len as i64 - analyzed_len as i64;
+            let start = span.start as i64 + shift;
+            let end = span.end as i64 + shift;
+            if start < 0 || end < start || end as usize > live_len {
+                return None;
+            }
+            return Some(Span {
+                start: start as usize,
+                end: end as usize,
+            });
+        }
+        // The file's very first byte: an insertion point there names the same
+        // place in both texts however the rest of them differ.
+        if span.start == 0 && span.end == 0 {
+            return Some(span);
+        }
+        None
     }
 
     /// The innermost entry-file entity whose span contains `offset`.
@@ -263,9 +451,22 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// ([`Self::source_text`] — once per module per query, not once per
     /// candidate, E83).
     pub fn doc_comment_of(&self, declaration_id: Id) -> Option<String> {
-        let program = self.program;
-        let source = program.source_of(declaration_id)?;
         let name_span = self.definition_name_span(declaration_id)?;
+        self.doc_comment_at(
+            self.program.source_of(declaration_id)?,
+            name_span.into_range().start,
+        )
+    }
+
+    /// The `///` block above the name starting at `name_start` in `source` —
+    /// [`Self::doc_comment_of`]'s body over coordinates rather than a
+    /// declaration id, for the members that HAVE no id of their own.
+    ///
+    /// A struct field is the case (E160): `analyzer::Field` is a name, a name
+    /// span and a type id, so there is no entity to look up and no
+    /// `definition_name_span` to ask. The span it does carry is enough, and
+    /// this is the same read `doc_comment_of` performs.
+    pub fn doc_comment_at(&self, source: SourceId, name_start: usize) -> Option<String> {
         let owned;
         let text: &str = if source == SourceId(0) {
             self.analyzed.text()
@@ -273,16 +474,92 @@ impl<'a, 'src> Analysis<'a, 'src> {
             owned = self.source_text(source)?;
             &owned
         };
-        let start = name_span.into_range().start.min(text.len());
+        doc_comment_above(text, name_start)
+    }
+
+    /// The first paragraph of the `///` doc above the name at `name_start` in
+    /// `source` (E160) — [`Self::doc_first_paragraph`] for a member with no
+    /// declaration id.
+    ///
+    /// It renders rather than reading M39's captured table, which holds
+    /// FUNCTIONS and externals only. The cost M39 was about does not arise
+    /// here: a struct-initializer completion's candidates all come from ONE
+    /// declaration in ONE module, so this is a single module read per request
+    /// — and for the entry file, where a program's own structs live, the text
+    /// is already in hand.
+    pub(crate) fn doc_first_paragraph_at(
+        &self,
+        source: SourceId,
+        name_start: usize,
+    ) -> Option<String> {
+        first_paragraph(&self.doc_comment_at(source, name_start)?)
+    }
+
+    /// The first paragraph of a declaration's `///` doc — up to the first blank
+    /// line — for a completion item's brief documentation (WO-3). `None` when
+    /// there is no doc.
+    ///
+    /// **M39.** The captured index answers first. Rendering this from the
+    /// declaring module's text costs that module's TEXT — a non-entry source is
+    /// read through [`Self::source_text`], which is a cache per QUERY, so a
+    /// completion that offers names imported from a large module pays that
+    /// module's read on every keystroke (0.415 ms per request against 0.324 ms
+    /// with the render stubbed out). The paragraphs are a function of the
+    /// analysis alone, so they are rendered once where the analysis is — the
+    /// server's analysis thread, the playground's retained handle — into
+    /// [`crate::CompletionIndex`], and a request reads a lookup. The entry's
+    /// own declarations are deliberately NOT in that table and still render
+    /// here: their text is `self.analyzed`, already in hand, and it is the one
+    /// text a keystroke changes.
+    pub fn doc_first_paragraph(&self, declaration_id: Id) -> Option<String> {
+        if let Some(covered) = self.index.doc_paragraph(declaration_id) {
+            return covered.map(|paragraph| paragraph.to_string());
+        }
+        first_paragraph(&self.doc_comment_of(declaration_id)?)
+    }
+}
+
+/// The contiguous `///` block directly above the declaration whose name starts
+/// at `start` in `text`, markers stripped — [`Analysis::doc_comment_of`]'s
+/// body, over a text and an offset so the captured index (M39) can render the
+/// same answer off the analysis thread.
+pub(crate) fn doc_comment_above(text: &str, name_start: usize) -> Option<String> {
+    {
+        let start = name_start.min(text.len());
         let head = &text[..start];
-        let mut lines: Vec<&str> = head.lines().collect();
+        // The lines above the declaration, read BACKWARDS from it — never
+        // collected (M29). `head.lines().collect()` was O(the whole prefix),
+        // and a candidate declared deep in a large module made a completion
+        // that offers it cost the module's length: on E121's 1,791-function
+        // exhibit that is seven thousand line slices built to look at three.
+        // Only the last few lines are ever read, and the loops below already
+        // stop at the first line that is not one of them.
+        //
+        // `str::lines()` treats a final newline as a TERMINATOR rather than a
+        // separator, so the one trailing `\n` is stripped before the walk and
+        // the sequence this yields is that iterator's, reversed, line for line.
+        let mut remaining = head.strip_suffix('\n').unwrap_or(head);
+        let mut previous_line = move || {
+            if remaining.is_empty() {
+                return None;
+            }
+            Some(match remaining.rfind('\n') {
+                Some(at) => {
+                    let line = &remaining[at + 1..];
+                    remaining = &remaining[..at];
+                    line
+                }
+                None => std::mem::take(&mut remaining),
+            })
+        };
         // Drop the (partial) declaration line itself.
-        lines.pop();
+        previous_line();
+        let mut line = previous_line();
         // Skip attribute and modifier-only lines between docs and the name.
-        while let Some(last) = lines.last() {
-            let trimmed = last.trim();
+        while let Some(current) = line {
+            let trimmed = current.trim();
             if trimmed.starts_with('[') || trimmed == "async" || trimmed == "external" {
-                lines.pop();
+                line = previous_line();
             } else {
                 break;
             }
@@ -290,13 +567,13 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // `///` is the doc-comment syntax (user decision, 2026-07-16); a
         // plain `//` block is an implementation note and never surfaces.
         let mut docs: Vec<String> = Vec::new();
-        while let Some(last) = lines.last() {
-            let trimmed = last.trim();
+        while let Some(current) = line {
+            let trimmed = current.trim();
             let Some(comment) = trimmed.strip_prefix("///") else {
                 break;
             };
             docs.push(comment.strip_prefix(' ').unwrap_or(comment).to_string());
-            lines.pop();
+            line = previous_line();
         }
         if docs.is_empty() {
             return None;
@@ -304,20 +581,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
         docs.reverse();
         Some(docs.join("\n"))
     }
+}
 
-    /// The first paragraph of a declaration's `///` doc — up to the first blank
-    /// line — for a completion item's brief documentation (WO-3). `None` when
-    /// there is no doc.
-    pub fn doc_first_paragraph(&self, declaration_id: Id) -> Option<String> {
-        let docs = self.doc_comment_of(declaration_id)?;
-        let paragraph = docs.split("\n\n").next().unwrap_or(&docs).trim();
-        if paragraph.is_empty() {
-            None
-        } else {
-            Some(paragraph.to_string())
-        }
-    }
+/// A doc comment's first paragraph — up to the first blank line — or `None`
+/// when it is empty.
+pub(crate) fn first_paragraph(docs: &str) -> Option<String> {
+    let paragraph = docs.split("\n\n").next().unwrap_or(docs).trim();
+    (!paragraph.is_empty()).then(|| paragraph.to_string())
+}
 
+impl Analysis<'_, '_> {
     /// The requirement-carrying entity the cursor *names*, if any: a function
     /// declaration name, a binding that resolves to a function or to a
     /// module-level binding with a requirement (its initializer is code), or

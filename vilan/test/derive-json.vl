@@ -1,5 +1,5 @@
 import std::io::print;
-import std::result::Result::{ self, Ok, Err };
+import std::result::Result::{ self, Err, Ok };
 
 // `[derive(Json)]` synthesizes both directions — `to_json` (a faithful JSON object
 // with real field names, which a bare `JSON.stringify` of a vilan struct can't
@@ -39,15 +39,25 @@ fun main() {
 	// `Point` and every scalar survive, so re-serializing reproduces the
 	// original document.
 	print(Person::from_json(text) is Ok(let back)
-		&& back.to_json() == text // re-serializes identically
-		&& back.home.y == 4       // nested field survives
-		&& back.name == "Ada \"A\""); // escaped string survives
+		&& back.to_json() == text
+		&& back.home.y == 4
+		&& back.name == "Ada \"A\"");
+	// re-serializes identically
+	// nested field survives
+	// escaped string survives
 
 	// A missing field is a decode error naming the field, not silent garbage.
-	print(Person::from_json("{\"name\":\"x\",\"age\":1,\"active\":true}") is Err(let missing));
-	print(missing); // missing field home
+	// The capture is read INSIDE the branch the test selects: an `is` written
+	// outside a condition yields a plain `bool` and binds nothing after itself
+	// (B215), because nothing there proves the test passed.
+	if Person::from_json("{\"name\":\"x\",\"age\":1,\"active\":true}") is Err(let missing) {
+		print(true);
+		print(missing); // missing field home
+	}
 
 	// A wrong-typed field is a decode error too.
-	print(Person::from_json("{\"name\":5,\"age\":1,\"active\":true,\"home\":{\"x\":0,\"y\":0}}") is Err(let wrong));
-	print(wrong); // expected a string
+	if Person::from_json("{\"name\":5,\"age\":1,\"active\":true,\"home\":{\"x\":0,\"y\":0}}") is Err(let wrong) {
+		print(true);
+		print(wrong); // expected a string
+	}
 }

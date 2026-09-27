@@ -1,5 +1,7 @@
 import pkg::iterator::Iterator;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
+
+export *;
 
 /// A half-open integer range `[start, end)`. Iterate it with
 /// `for i in Range::new(start, end)`, which yields `start, start + 1, ..., end - 1`
@@ -11,7 +13,7 @@ struct Range {
 
 impl Range {
 	fun new(start: i32, end: i32): Range {
-		Range { current = start, end = end }
+		Range { current = start, end }
 	}
 }
 

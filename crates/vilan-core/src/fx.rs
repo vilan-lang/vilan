@@ -56,9 +56,28 @@
 //!
 //! **Where it is applied.** The id-keyed modules: `analyzer`, `async_infer`,
 //! `context`, `const_eval`, `init_order`, `call_graph`, `chunks`, `type_`,
-//! `platform_color`, `transformer`, `macros`. The string-keyed modules —
-//! `bindgen`, `manifest`, `interpreter` — keep `std`'s default hasher, since
-//! they are not in the cold-analysis hot path and have nothing to win.
+//! `platform_color`, `transformer`, `macros` — and, since backlog M43, the
+//! *string*-keyed environment maps of the const-evaluation `interpreter`.
+//!
+//! That last one is the correction of a claim this file used to make. E48 left
+//! `bindgen`, `manifest` and `interpreter` on `std`'s hasher "since they are not
+//! in the cold-analysis hot path and have nothing to win", and M31's profile
+//! falsified the interpreter half of it in the only way that settles such a
+//! question: after the analyzer's 35 `IndexMap`s moved here, **83M of the 85M
+//! Ir still in `sip.rs` was `interpreter::lookup`/`assign`** — 1.3% of a cold
+//! kolt client check, spent hashing short `&str` names in `Scope::vars` on
+//! every variable read and write a `const` evaluation performs. A const site is
+//! cold-path *code* and hot-path *work*: it runs a whole program at analysis
+//! time. `bindgen` and `manifest` do stay on `std`'s hasher — they are consulted
+//! a few hundred times per build, and no profile has ever named them.
+//!
+//! `Scope::vars` is a plain `FxHashMap`, never `IndexMap`: it is read by
+//! `get`/`get_mut` and written by `insert`/`clear`, and is **never iterated**,
+//! so no iteration order exists for a hasher to move (`the_scope_map_is_never_
+//! iterated` in `interpreter.rs` holds that shape). What a const evaluation DOES
+//! iterate — a JS `Map`, `Set` or object literal it builds — stays an
+//! `indexmap::IndexMap` on `std`'s hasher, because those are host containers
+//! whose insertion order is program-visible and whose keys are values, not ids.
 //!
 //! **The collision-resistance question, answered rather than waved at.** This
 //! hasher is fast, not adversarial-proof: an attacker who can choose keys can
@@ -100,6 +119,22 @@ pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
 
 /// A `HashSet` of small integers — the twin of [`FxHashMap`].
 pub type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
+
+/// An insertion-ordered map keyed by small integers — the analyzer's
+/// registration tables (`functions`, `traits`, `scopes`, …), which need
+/// `IndexMap`'s stable iteration order *and* the cheap hash.
+///
+/// `indexmap`'s own default is `RandomState`, i.e. SipHash-1-3, so the tables
+/// E48 could not convert kept paying setup costs against a `u32` key
+/// (backlog M31: 7.4M SipHash calls, 6.7% of a cold kolt client check).
+/// Swapping the hasher moves **nothing observable**: an `IndexMap` iterates in
+/// insertion order whatever hashes its keys, which is the property the
+/// analyzer's emission and diagnostic order already rests on. Everything the
+/// module header argues about the hash — the dense-id bijection, the
+/// collision-resistance question, the `enable_seed_shuffle` instrument —
+/// applies here unchanged, and no dependency was added: `indexmap` was already
+/// this crate's.
+pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
 /// The hash-order shuffle, forced on in-process by [`enable_seed_shuffle`].
 static FORCED_SHUFFLE: AtomicBool = AtomicBool::new(false);
@@ -399,5 +434,38 @@ mod tests {
         assert_eq!(set.len(), 1000);
         assert!(set.contains(&crate::type_::TypeId(500)));
         assert!(!set.contains(&crate::type_::TypeId(1000)));
+    }
+
+    /// The whole argument for swapping the analyzer's `IndexMap`s onto this
+    /// hasher (backlog M31): an `IndexMap` iterates in INSERTION order, so the
+    /// hash decides bucket placement and nothing else. Pinned two ways — the
+    /// literal insertion sequence, and against the same insertions into
+    /// indexmap's own default (`RandomState`) table — because it is the
+    /// property every golden this change must not move rests on. It goes red
+    /// the moment `FxIndexMap` stops being an `IndexMap`.
+    #[test]
+    fn the_index_map_alias_iterates_in_insertion_order() {
+        // Deliberately not ascending: an id-ordered walk would agree with a
+        // sorted map by accident and pin nothing.
+        let inserted: Vec<u32> = vec![900, 3, 41, 7, 1000, 0, 512, 64, 5, 99];
+        let mut ours: FxIndexMap<crate::id::Id, u32> = FxIndexMap::default();
+        let mut theirs: indexmap::IndexMap<crate::id::Id, u32> = indexmap::IndexMap::new();
+        for id in &inserted {
+            ours.insert(crate::id::Id(*id), id * 2);
+            theirs.insert(crate::id::Id(*id), id * 2);
+        }
+        let ours_order: Vec<u32> = ours.keys().map(|id| id.0).collect();
+        assert_eq!(ours_order, inserted);
+        assert_eq!(
+            ours_order,
+            theirs.keys().map(|id| id.0).collect::<Vec<_>>(),
+            "the hasher must not change which order the table is walked in"
+        );
+        // Re-inserting an existing key keeps its ORIGINAL position — the rule
+        // the analyzer's registration tables re-write entries under.
+        ours.insert(crate::id::Id(900), 1);
+        assert_eq!(ours.keys().map(|id| id.0).collect::<Vec<_>>(), inserted);
+        assert_eq!(ours.get(&crate::id::Id(900)), Some(&1));
+        assert_eq!(ours.get(&crate::id::Id(1)), None);
     }
 }

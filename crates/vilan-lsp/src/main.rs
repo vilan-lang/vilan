@@ -4,18 +4,22 @@
 
 #[cfg(test)]
 mod book_sync;
+mod dead_items;
 mod document;
+mod keystroke;
 mod line_index;
 mod manifest_completion;
+mod memory;
 mod publish;
 mod references;
+mod schedule;
 mod session_trace;
 mod uri;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -25,14 +29,27 @@ use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result};
 use vilan_core::Span;
 use vilan_core::analyzer::SourceId;
 
-use crate::document::{Document, Symbol, SymbolKind as VilanSymbolKind, hash_text};
+use crate::document::{
+    Document, RETAINED_PROGRAMS, Symbol, SymbolKind as VilanSymbolKind, hash_text,
+};
 use crate::line_index::LineIndex;
 use crate::publish::PublishState;
+use crate::schedule::Schedule;
+use vilan_core::cancel::CancelToken;
 use vilan_ide::{Completion, CompletionFunctionCall, CompletionKind as VilanCompletionKind};
 
 /// How long to wait after the last edit before re-analyzing, so a burst of
 /// keystrokes collapses to a single analysis instead of one per character.
 const DEBOUNCE_MS: u64 = 150;
+
+/// E124: how long the editor must be at rest before the package clock
+/// recomputes a union (`proposal/dead-code-paint.md` §2.4).
+///
+/// Well above `DEBOUNCE_MS` on purpose: the union costs one full analysis per
+/// declared entry, and it must never run inside the debounce window, where the
+/// document's own analysis is the thing the user is waiting for. Four windows
+/// is the settle a person's typing pause clears and a burst does not.
+const UNION_IDLE_MS: u64 = 600;
 
 /// The client's feature settings (VS Code `contributes.configuration`), received
 /// as `initializationOptions` at startup and refreshed live by
@@ -45,6 +62,15 @@ struct Config {
     inlay_hints_enabled: bool,
     semantic_tokens_enabled: bool,
     completion_function_call: CompletionFunctionCall,
+    /// E222: the client pairs a generic `<` ITSELF — it asked
+    /// [`OPENS_A_GENERIC_LIST`] before placing a `>`, and it types over that
+    /// `>` when the author reaches it — so `onTypeFormatting` must not place
+    /// a second one. Declared by the VS Code extension as
+    /// `autoClosing.generics` while its `type` override is installed; a
+    /// client that never sends it keeps today's `onTypeFormatting` answer,
+    /// which is the whole of the pairing an LSP client that cannot move the
+    /// caret gets.
+    client_closes_generics: bool,
 }
 
 impl Default for Config {
@@ -53,6 +79,7 @@ impl Default for Config {
             inlay_hints_enabled: true,
             semantic_tokens_enabled: true,
             completion_function_call: CompletionFunctionCall::Full,
+            client_closes_generics: false,
         }
     }
 }
@@ -88,6 +115,12 @@ impl Config {
                 // `full` and any unrecognized value keep the default.
                 _ => CompletionFunctionCall::Full,
             };
+        }
+        if let Some(closes) = root
+            .pointer("/autoClosing/generics")
+            .and_then(|v| v.as_bool())
+        {
+            config.client_closes_generics = closes;
         }
         config
     }
@@ -184,6 +217,18 @@ fn to_completion_item(
         item.insert_text_format = Some(format);
         item.sort_text = Some(format!("~{}", snippet.fallback));
     }
+    // A plain insertion (E160): a struct-initializer field writes `name = `,
+    // or the bare `name` where the shorthand applies. No `sort_text` — the
+    // fields are the only candidates at that position, so the label order is
+    // the right one.
+    if let Some(plain) = completion.insert {
+        item.insert_text = Some(plain.text);
+        item.insert_text_format = Some(if plain.is_snippet {
+            InsertTextFormat::SNIPPET
+        } else {
+            InsertTextFormat::PLAIN_TEXT
+        });
+    }
     // An auto-import candidate (E54c): LABEL it with the module it comes
     // from (overriding any signature/type `detail` — the point here is
     // making the import visible, not the candidate's shape) and carry the
@@ -212,6 +257,41 @@ fn to_completion_item(
         }]);
         item.sort_text = Some(format!("|{}{}", auto_import.origin_tier, item.label));
     }
+    // E213: an internal candidate survived the engine's prefix rule, so it is
+    // shown — LAST, and saying why it is one. `~~` sorts after every label
+    // (alphanumeric) and after a construct snippet's single `~`, which is the
+    // ordering the ruling asks for: present, and never in front of a name the
+    // author should be reaching for. The reason REPLACES the signature in
+    // `detail` for the reason an auto-import candidate's module does: what
+    // matters about this candidate is not its shape.
+    if let Some(reason) = completion.internal {
+        item.detail = Some(format!("internal — {reason}"));
+        item.sort_text = Some(format!("~~{}", item.label));
+    }
+    // E211: state the prefix this candidate replaces, and the text to filter it
+    // by. E194 fixed the hyphenated case from the CLIENT's side, in VS Code's
+    // `wordPattern`; every other LSP client has its own word rules and no such
+    // file, so `stroke-width` was filtered out of its own list there. A
+    // `textEdit` settles it for all of them at once: a client given an explicit
+    // range filters against the text in THAT range rather than against its own
+    // notion of a word, and accepting the candidate replaces the prefix instead
+    // of doubling it.
+    //
+    // The edit carries whatever insertion the passes above settled on
+    // (`insert_text`), because `textEdit` WINS over `insertText` per the spec —
+    // leaving the two to disagree would silently drop a call shape or a
+    // snippet body. `insert_text` stays set for a client that reads it instead.
+    if let Some(span) = completion.replace_span {
+        let new_text = item
+            .insert_text
+            .clone()
+            .unwrap_or_else(|| completion.label.clone());
+        item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+            range: line_index.range(&span),
+            new_text,
+        }));
+    }
+    item.filter_text = completion.filter_text;
     item
 }
 
@@ -450,6 +530,21 @@ fn is_manifest(uri: &Url) -> bool {
         .is_some_and(|name| name == "vilan.toml")
 }
 
+/// Whether `uri` names a vilan source file — asked of watched-file events
+/// (E127), which arrive for whatever the client's watcher glob matched and are
+/// not routed by `documentSelector` the way requests are.
+///
+/// On the URI path rather than through `to_file_path`, exactly as
+/// [`is_manifest`] is: an event can name a file that no longer exists (a
+/// delete) or one that never will (a directory the watcher reported), and
+/// neither has to resolve for the extension to be readable.
+fn is_vilan_source(uri: &Url) -> bool {
+    uri.path()
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.ends_with(".vl") && name.len() > 3)
+}
+
 struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
@@ -463,9 +558,17 @@ struct Backend {
     /// `Document::analyze`, which would publish a wall of lexer errors on a
     /// perfectly good manifest. Completion is all it feeds.
     manifests: Arc<DashMap<Url, ManifestDocument>>,
-    /// The latest edit generation per document, so a debounced analysis can tell
-    /// whether a newer edit (or a close) has superseded it before it runs.
-    pending: Arc<DashMap<Url, u64>>,
+    /// M26: what analysis each open document owes, and how to stop the ones it
+    /// no longer does — the edit generation a debounced pause compares itself
+    /// against, plus the cancellation token of every analysis in flight for
+    /// that document. `did_open` registers a generation here like an edit does
+    /// (E123 routed it through the same scheduling, but it registered nothing),
+    /// so an edit right after an open supersedes the open's analysis instead of
+    /// racing it.
+    schedule: Arc<Schedule>,
+    /// M26: how many analyses this session started, landed and cancelled — the
+    /// session trace's second line, and what the cancellation pins read.
+    analyses: Arc<session_trace::AnalysisTally>,
     /// The publish planner (backlog E6): every open document's last
     /// diagnostic groups, merged per target URI so shared dependencies show
     /// the union of their importers' views, and stale targets get explicit
@@ -482,9 +585,12 @@ struct Backend {
     /// *stale* rather than merely absent, which is why `plan_publish` drops the
     /// re-planning owner's entry before it computes the new one — see there.
     publish_state: Arc<std::sync::Mutex<PublishState>>,
-    /// `std` files don't change during a session, so cache their line indices
-    /// rather than re-reading the file on every cross-file definition/reference.
-    line_indices: Arc<DashMap<PathBuf, Arc<LineIndex>>>,
+    /// Line indices for files that are on disk and not buffered — `std`, and
+    /// the workspace files a cross-file definition or reference reaches — so a
+    /// query does not re-read and re-index one on every lookup. Each entry
+    /// carries the [`FileStamp`] it was built from and is only served while the
+    /// file still matches it (E112).
+    line_indices: Arc<DashMap<PathBuf, (FileStamp, Arc<LineIndex>)>>,
     /// The client's feature settings, seeded from `initializationOptions` and
     /// updated live by `workspace/didChangeConfiguration`. Read per request
     /// (`inlay_hint`, `semantic_tokens_full`, …) so a toggle takes effect without
@@ -497,6 +603,83 @@ struct Backend {
     /// the session); when absent, call-shaped completions degrade to plain text
     /// (WO-3).
     snippet_support: Arc<AtomicBool>,
+    /// The WORLD revision (E117): bumped by every notification that changes what
+    /// an analysis would read — an open, an edit, a close, a save. An analysis
+    /// is stamped with the value it started from
+    /// ([`Document::stamp_analysis`]), which orders two results that finish out
+    /// of order even when neither document's own text moved: a dependent's
+    /// buffer is unchanged by an edit in the module it imports, so text equality
+    /// cannot separate "read the module mid-edit" from "read it restored", and
+    /// the loser used to publish last. That is the ghost diagnostic.
+    revision: Arc<AtomicU64>,
+    /// Serializes a publish's PLAN with its SEND (E117). The planner is a
+    /// synchronous mutex, so plan order is well defined; without this gate the
+    /// `publish_diagnostics` awaits of two publishes could still interleave and
+    /// deliver the older plan last, which is the same ghost by a different
+    /// route. Held across the sends and nothing else — the analyses themselves
+    /// stay fully concurrent.
+    publish_gate: Arc<tokio::sync::Mutex<()>>,
+    /// E124's package clock, keyed by the directory of the package's
+    /// `vilan.toml`: the last completed union of the pruner's reachability
+    /// across the package's entries, the edit revision each package is at, and
+    /// the token that stops a union an edit has already invalidated.
+    ///
+    /// Per PACKAGE, which is what makes it new machinery: every other cache in
+    /// `Backend` is per-URI or per-path, and this one deliberately is not — the
+    /// question "does any entry reach this item" has no per-file answer.
+    ///
+    /// The three move together. An edit bumps `package_revision`, cancels
+    /// `union_tokens`' entry and REMOVES `package_unions`, which is the
+    /// withdrawal and needs no analysis; the clock re-inserts a union only if
+    /// the revision it started from is still current, which is the restoration
+    /// and rides an idle timer well above the debounce.
+    package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
+    package_revision: Arc<DashMap<PathBuf, u64>>,
+    union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
+    /// M63: the documents the editor has most recently worked IN, newest
+    /// first, at most [`RETAINED_PROGRAMS`] of them — and therefore the
+    /// documents that keep their `Program`. Every other open document holds
+    /// its editor tables and re-analyzes when it is focused again.
+    ///
+    /// A `Vec` under a plain mutex rather than a map: it is two entries, the
+    /// operation on it is "move this one to the front", and the order IS the
+    /// state. Poison-recovering like every other synchronous lock here (E97).
+    focus: Arc<std::sync::Mutex<Vec<Url>>>,
+    /// E197: the formatting decline each document was last TOLD about, by
+    /// cause. `window/showMessage` is a toast and format-on-save fires on every
+    /// save, so a file the printer cannot render would raise one per save
+    /// otherwise — which is how a useful message becomes noise the user turns
+    /// off. One per file per cause: the same decline stays quiet, a DIFFERENT
+    /// one speaks (the author moved the construct, or fixed one gap and met
+    /// another), and a format that succeeds clears the entry so the next
+    /// decline is heard again. Evicted on close like every other per-URI table
+    /// here.
+    formatting_declines: Arc<DashMap<Url, String>>,
+}
+
+/// What a cached read of a file is only valid for: the file's length and its
+/// modification time, as one comparable value (E112).
+///
+/// This is the whole invalidation rule for [`Backend::line_indices`]. It is
+/// deliberately not a content hash — the point of the cache is to avoid reading
+/// the file, and a `metadata` call is orders of magnitude cheaper than a read
+/// plus an index build, so the cache keeps the win it exists for and stops
+/// answering for text that is gone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileStamp {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// The current stamp of the file at `path`, or `None` when it cannot be
+/// stat-ed — which is the "do not cache this" answer: an entry with no stamp
+/// could never be invalidated, which is the bug.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// Locate the `std` package directory: `$VILAN_STD`, else the nearest ancestor
@@ -522,7 +705,7 @@ fn discover_std_dir(start: &Path) -> PathBuf {
     // CLI does the same, so both tools see the identical std from any
     // directory. On a materialization failure (no writable home OR temp dir)
     // the path is left nonexistent and imports diagnose it.
-    vilan_embedded_std::materialize()
+    vilan_embedded::materialize()
         .unwrap_or_else(|_| PathBuf::from("<the embedded std could not be materialized>"))
 }
 
@@ -607,6 +790,25 @@ mod config_tests {
         assert_eq!(
             config.completion_function_call,
             CompletionFunctionCall::None
+        );
+    }
+
+    // E222: the declaration is the client's, and only a client that makes it
+    // stands `onTypeFormatting` down — absent, it is off.
+    #[test]
+    fn the_client_declares_that_it_closes_generics() {
+        assert!(!Config::default().client_closes_generics);
+        assert!(
+            Config::from_settings(&json!({ "autoClosing": { "generics": true } }))
+                .client_closes_generics
+        );
+        assert!(
+            Config::from_settings(&json!({ "vilan": { "autoClosing": { "generics": true } } }))
+                .client_closes_generics
+        );
+        assert!(
+            !Config::from_settings(&json!({ "autoClosing": { "generics": "yes" } }))
+                .client_closes_generics
         );
     }
 
@@ -702,7 +904,9 @@ mod manifest_routing_tests {
 mod completion_item_tests {
     use super::{CompletionFunctionCall, to_completion_item};
     use crate::line_index::LineIndex;
-    use tower_lsp::lsp_types::{CompletionItemKind, Documentation, InsertTextFormat};
+    use tower_lsp::lsp_types::{
+        CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat,
+    };
     use vilan_ide::{AutoImport, Completion, CompletionKind, SnippetInsertion};
 
     /// An empty-buffer index — every fixture below whose `needs_import` is
@@ -722,6 +926,10 @@ mod completion_item_tests {
             call_parameters: call_parameters
                 .map(|names| names.into_iter().map(str::to_string).collect()),
             snippet: None,
+            insert: None,
+            filter_text: None,
+            replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -859,6 +1067,10 @@ mod completion_item_tests {
                 body: "for ${1:item} in ${2:items} {\n\t$0\n}".to_string(),
                 fallback: "for".to_string(),
             }),
+            insert: None,
+            filter_text: None,
+            replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -875,6 +1087,10 @@ mod completion_item_tests {
             documentation: None,
             call_parameters: None,
             snippet: None,
+            insert: None,
+            filter_text: None,
+            replace_span: None,
+            internal: None,
             needs_import: Some(AutoImport {
                 module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },
@@ -882,6 +1098,64 @@ mod completion_item_tests {
                 origin_tier: tier,
             }),
         }
+    }
+
+    // --- E211: the prefix a candidate replaces, and what to filter by -------
+
+    /// A `LineIndex` over one line of text, for the range conversions below.
+    fn index_over(text: &str) -> LineIndex {
+        LineIndex::new(text)
+    }
+
+    // A candidate carrying a replace span becomes a `textEdit` over exactly
+    // that range, and the edit's text is the INSERTION the other passes
+    // settled on — `textEdit` wins over `insertText` per the spec, so the two
+    // disagreeing would silently drop a call shape.
+    #[test]
+    fn e211_a_replace_span_becomes_a_text_edit_carrying_the_insertion() {
+        let text = "\t\t<svg stroke-w";
+        let mut candidate = function(Some(vec!["host"]));
+        candidate.label = "stroke-width".to_string();
+        candidate.filter_text = Some("stroke-width".to_string());
+        candidate.replace_span = Some(vilan_core::Span {
+            start: text.find("stroke-w").expect("the prefix"),
+            end: text.len(),
+        });
+        let item = to_completion_item(
+            candidate,
+            CompletionFunctionCall::Full,
+            true,
+            &index_over(text),
+        );
+        let CompletionTextEdit::Edit(edit) = item.text_edit.expect("a text edit") else {
+            panic!("a plain edit, not an insert/replace pair");
+        };
+        assert_eq!(edit.range.start.character, 7, "the `s` of `stroke-w`");
+        assert_eq!(edit.range.end.character, text.chars().count() as u32);
+        assert_eq!(
+            edit.new_text, "stroke-width(${1:host})$0",
+            "the edit carries the call shape, not the bare label"
+        );
+        assert_eq!(item.filter_text.as_deref(), Some("stroke-width"));
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("stroke-width(${1:host})$0"),
+            "and `insert_text` stays, for a client that reads it instead"
+        );
+    }
+
+    // No span, no edit — which is what the keystroke path's candidates carry,
+    // and today's behavior for every client.
+    #[test]
+    fn e211_a_candidate_without_a_span_sends_no_text_edit() {
+        let item = to_completion_item(
+            function(None),
+            CompletionFunctionCall::None,
+            true,
+            &blank_index(),
+        );
+        assert!(item.text_edit.is_none());
+        assert!(item.filter_text.is_none());
     }
 
     // E14: a snippet-capable client gets the SNIPPET-iconed item with the
@@ -1282,38 +1556,385 @@ mod sweep_tests {
         assert_eq!(pause_action(None, 6, Some(1), 2), PauseAction::Superseded);
         assert_eq!(pause_action(Some(6), 6, Some(9), 9), PauseAction::Unchanged);
         assert_eq!(pause_action(Some(6), 6, Some(1), 2), PauseAction::Analyze);
-        // A document with no analysis yet (never possible today — `did_open`
-        // analyzes inline — but the skip must not swallow the work if it ever is).
+        // A document with no analysis yet. `did_open` makes exactly one (E123)
+        // and schedules its analysis in the same breath, so it reports the hash
+        // of the text being analyzed rather than `None`; the skip must not
+        // swallow the work if that ever changes.
         assert_eq!(pause_action(Some(6), 6, None, 2), PauseAction::Analyze);
     }
+}
+
+/// Everything one scheduled analysis touches, cloned out of the [`Backend`] so
+/// a spawned task can own it. Cheap — six `Arc`s and a `Client` handle — and it
+/// replaces the five-to-seven separate clones every scheduling site used to
+/// make by hand, which is what kept [`analyze_and_publish`]'s parameter list
+/// growing with each item that gave the analysis path one more thing to reach.
+#[derive(Clone)]
+struct AnalysisContext {
+    documents: Arc<DashMap<Url, Document>>,
+    client: Client,
+    publish_state: Arc<std::sync::Mutex<PublishState>>,
+    publish_gate: Arc<tokio::sync::Mutex<()>>,
+    revision: Arc<AtomicU64>,
+    schedule: Arc<Schedule>,
+    analyses: Arc<session_trace::AnalysisTally>,
+    /// E124's package clock — the three maps `Backend` holds, carried here so
+    /// the clock can be started from a spawned task once the analysis that
+    /// resolved the file's package has landed. Read at publish time; the
+    /// debounced analysis itself neither computes a union nor waits for one.
+    package_unions: Arc<DashMap<PathBuf, Arc<dead_items::PackageReach>>>,
+    package_revision: Arc<DashMap<PathBuf, u64>>,
+    union_tokens: Arc<DashMap<PathBuf, Vec<CancelToken>>>,
+    /// M63's retained set, so the seam where an analysis LANDS can apply the
+    /// retention rule: the dependency sweep re-analyzes background documents,
+    /// and a program that lands on one of them has to go straight back.
+    focus: Arc<std::sync::Mutex<Vec<Url>>>,
+}
+
+/// What one scheduled analysis did (M26).
+///
+/// The three are not a ranking of the same axis. `Landed` and `Dropped` are
+/// E117's outcomes — the analysis ran to the end, and `land` either adopted it
+/// or found the world had moved past it. `Cancelled` is M26's: the analysis
+/// stopped at a checkpoint because a newer generation of its document had
+/// arrived, and there is no result at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnalysisOutcome {
+    /// Adopted as the document's analyzed snapshot, and published.
+    Landed,
+    /// Ran to the end and was dropped by [`land`] — superseded, or the
+    /// document closed under it.
+    Dropped,
+    /// Stopped part-way: a newer generation of this document arrived while it
+    /// ran. Nothing landed and nothing published.
+    Cancelled,
+}
+
+impl AnalysisOutcome {
+    /// Whether the analyzed snapshot moved — what the client's token and hint
+    /// refresh (S5) keys off.
+    fn landed(self) -> bool {
+        matches!(self, AnalysisOutcome::Landed)
+    }
+}
+
+/// The package a URI belongs to, for E124's clock: the document's own resolved
+/// manifest directory, or — for a `vilan.toml`, which is no document at all —
+/// its own directory.
+///
+/// `None` when there is no package to speak of: a `[library]` (no entries, so
+/// no union and no gray), a workspace root, a file with no project, and a file
+/// whose first analysis has not landed yet. All four get no top-level gray, so
+/// there is nothing to withdraw and nothing to restore.
+fn package_of(documents: &DashMap<Url, Document>, uri: &Url) -> Option<PathBuf> {
+    let path = uri.to_file_path().ok()?;
+    if is_manifest(uri) {
+        return path.parent().map(vilan_core::util::canonical_path);
+    }
+    documents
+        .get(uri)
+        .and_then(|document| document.manifest_dir().map(Path::to_path_buf))
+}
+
+/// E124's package clock: recompute the union after the editor has been at
+/// rest, off every request path.
+///
+/// The trigger is the settle, not the keystroke. `UNION_IDLE_MS` sits well
+/// above `DEBOUNCE_MS` so the union never runs inside the debounce window,
+/// and the revision check at the top of the task is what collapses a burst:
+/// each edit bumped the package's revision, so every task but the last
+/// one's returns having done nothing.
+///
+/// The work is one full analysis per declared entry — 0.4–1.2 s each on
+/// kolt, cold — and it happens in `spawn_blocking`, like every other
+/// analysis the server runs. M21's `BASE_CACHE` cannot amortize it: the
+/// cache revalidates by content, and the edit that invalidates an entry's
+/// world is exactly an edit to a module that entry loads
+/// (`dead-code-paint.md` §2.3). The walk over the finished programs is the
+/// cheap part — 8.2 ms for kolt's three entries.
+fn schedule_package_union(context: &AnalysisContext, uri: &Url) {
+    let Some(manifest_dir) = package_of(&context.documents, uri) else {
+        return;
+    };
+    let started_at = context
+        .package_revision
+        .get(&manifest_dir)
+        .map(|revision| *revision.value())
+        .unwrap_or(0);
+    let documents = Arc::clone(&context.documents);
+    let package_unions = Arc::clone(&context.package_unions);
+    let package_revision = Arc::clone(&context.package_revision);
+    let union_tokens = Arc::clone(&context.union_tokens);
+    let schedule = Arc::clone(&context.schedule);
+    let client = context.client.clone();
+    let publish_state = Arc::clone(&context.publish_state);
+    let publish_gate = Arc::clone(&context.publish_gate);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(UNION_IDLE_MS)).await;
+        let current = |dir: &Path| {
+            package_revision
+                .get(dir)
+                .map(|revision| *revision.value())
+                .unwrap_or(0)
+        };
+        // A newer edit arrived during the idle window; its own task is
+        // behind it, and this one would compute a union for a world that
+        // is already gone.
+        if current(&manifest_dir) != started_at {
+            return;
+        }
+        if package_unions.contains_key(&manifest_dir) {
+            return;
+        }
+        let Some(entries) = dead_items::entry_paths(&manifest_dir) else {
+            return;
+        };
+        // The entries' texts as the editor has them, sampled synchronously
+        // (no map guard may cross an await): a buffered entry is what the
+        // user is looking at, and a union taken off the stale disk copy
+        // would gray on a world nobody can see.
+        let buffers: HashMap<PathBuf, String> = entries
+            .iter()
+            .filter_map(|(_, path)| {
+                let uri = Url::from_file_path(path).ok()?;
+                let document = documents.get(&uri)?;
+                Some((
+                    vilan_core::util::canonical_path(path),
+                    document.text.clone(),
+                ))
+            })
+            .collect();
+        let std_dir = discover_std_dir(&manifest_dir);
+        let walked = manifest_dir.clone();
+        // E140: one task per entry, not one task over every entry. A package's
+        // union costs a full analysis per leg — kolt's three are 9.2 s, 1.6 s
+        // and 1.3 s in a debug build — and the serial loop paid them end to
+        // end AND gave them one token between them, so an edit to `client.vl`
+        // could only stop the union by stopping all of it.
+        //
+        // Each leg registers with M26's scheduler under its OWN entry's
+        // document when that entry is open, so the token it runs under is the
+        // one a `did_change` to that entry already cancels — the same
+        // instrument, the same checkpoints, no second mechanism. An entry with
+        // no open buffer gets a plain token. Both are recorded on the package
+        // so the withdrawal above can stop every leg at once.
+        let mut legs = Vec::with_capacity(entries.len());
+        let mut tokens = Vec::with_capacity(entries.len());
+        for (_, entry) in &entries {
+            let entry_uri = Url::from_file_path(entry).ok();
+            let started = entry_uri.as_ref().and_then(|uri| {
+                let generation = schedule.generation(uri)?;
+                Some((uri.clone(), schedule.start(uri, generation)))
+            });
+            let token = match &started {
+                Some((_, started)) => started.token.clone(),
+                None => CancelToken::new(),
+            };
+            tokens.push(token.clone());
+            let entry = entry.clone();
+            let std_dir = std_dir.clone();
+            let text = buffers
+                .get(&vilan_core::util::canonical_path(&entry))
+                .cloned()
+                .or_else(|| std::fs::read_to_string(&entry).ok());
+            let schedule_for_leg = Arc::clone(&schedule);
+            legs.push(tokio::spawn(async move {
+                let text = text?;
+                let leg = tokio::task::spawn_blocking(move || {
+                    dead_items::analyze_entry(&entry, &std_dir, &token, &text)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some((uri, started)) = started {
+                    schedule_for_leg.finish(&uri, &started);
+                }
+                leg
+            }));
+        }
+        union_tokens.insert(manifest_dir.clone(), tokens);
+        let mut computed = Vec::with_capacity(legs.len());
+        for leg in legs {
+            computed.push(leg.await.ok().flatten());
+        }
+        union_tokens.remove(&walked);
+        let Some(reach) = dead_items::union_of(computed, started_at) else {
+            return;
+        };
+        // The world may have moved while the entries were analyzed. A union
+        // is only ever installed for the revision it was computed against —
+        // the restoration half of determination 8, and the reason the union
+        // carries that revision rather than the caller remembering it.
+        if current(&walked) != reach.revision {
+            return;
+        }
+        package_unions.insert(walked.clone(), Arc::new(reach));
+        // Repaint every open document of this package: the union just
+        // landed, and their last publish was taken without it.
+        let owners: Vec<Url> = documents
+            .iter()
+            .filter(|document| document.manifest_dir() == Some(walked.as_path()))
+            .map(|document| document.key().clone())
+            .collect();
+        for owner in owners {
+            publish_document(
+                &documents,
+                &client,
+                &publish_state,
+                &publish_gate,
+                &package_unions,
+                &owner,
+            )
+            .await;
+        }
+    });
 }
 
 /// Analyze `text` as the document at `uri`, land the result on the open
 /// document, and publish its diagnostics (grouped per file — backlog E1). The
 /// analysis is CPU-bound, so it runs on a blocking thread to keep the async
-/// runtime responsive. Returns whether the analysis landed (see [`land`]).
+/// runtime responsive.
+///
+/// `generation` is the document's edit generation this analysis answers, from
+/// [`Schedule::supersede`]. The scheduler hands back the cancellation token the
+/// analysis runs under and cancels it the moment a newer generation arrives, so
+/// a superseded analysis stops at its next checkpoint instead of finishing a
+/// whole program's work for a result [`land`] would drop (M26,
+/// `proposal/editor-latency.md` §4.2). If the generation is ALREADY stale when
+/// the analysis is registered, the token comes back cancelled and the analysis
+/// stops almost immediately — the race between scheduling and superseding is
+/// closed inside the scheduler, not here.
 async fn analyze_and_publish(
-    documents: &DashMap<Url, Document>,
-    client: &Client,
-    publish_state: &std::sync::Mutex<PublishState>,
+    context: &AnalysisContext,
     uri: Url,
     text: String,
-) -> bool {
+    generation: u64,
+) -> AnalysisOutcome {
     let path = uri.to_file_path().unwrap_or_default();
     let std_dir = discover_std_dir(&path);
-    let analysis = match tokio::task::spawn_blocking(move || {
-        Document::analyze(&text, &std_dir, &path)
+    let started = context.schedule.start(&uri, generation);
+    context.analyses.record_started();
+    // E117: the world this analysis is about to read, sampled BEFORE it starts.
+    // A later notification bumps the counter, so a result stamped lower is by
+    // construction a view of an older world — whatever its own text says.
+    let started_at = context.revision.load(Ordering::SeqCst);
+    let token = started.token.clone();
+    let analysis = tokio::task::spawn_blocking(move || {
+        Document::analyze_cancellable(&text, &std_dir, &path, &token)
     })
-    .await
-    {
-        Ok(analysis) => analysis,
-        Err(_) => return false,
+    .await;
+    // The registration goes whatever the outcome: a joined task is an analysis
+    // that is over, and leaving its ticket behind would make the next
+    // supersede cancel a token nobody holds.
+    context.schedule.finish(&uri, &started);
+    let Ok(analysis) = analysis else {
+        return AnalysisOutcome::Dropped;
     };
-    if !land(documents, &uri, analysis) {
-        return false;
+    let Some(mut analysis) = analysis else {
+        // Cancelled: there is no result. The truncated one was destroyed on the
+        // analysis thread, so nothing here can land or publish it even by
+        // mistake.
+        context.analyses.record_cancelled();
+        return AnalysisOutcome::Cancelled;
+    };
+    analysis.stamp_analysis(started_at);
+    // M27: read before `land` takes the analysis — the editor tables it built
+    // are a per-keystroke cost the session trace had no column for.
+    let index_time = analysis.index_time;
+    if !land(&context.documents, &uri, analysis) {
+        return AnalysisOutcome::Dropped;
     }
-    publish_document(documents, client, publish_state, &uri).await;
-    true
+    context.analyses.record_landed();
+    context.analyses.record_index(index_time);
+    // The landed snapshot was built over the edited dependency, so this
+    // document's keystroke-path answers are current again (§2.1.2's case 4).
+    context.schedule.clear_dependency_moved(&uri);
+    publish_document(
+        &context.documents,
+        &context.client,
+        &context.publish_state,
+        &context.publish_gate,
+        &context.package_unions,
+        &uri,
+    )
+    .await;
+    // M63, and the seam that makes the policy hold: this analysis has been
+    // adopted and published, so its editor tables are current — and if the
+    // document it landed on is not one of the focused few (the dependency
+    // sweep re-analyzes every open importer of an edited file), the program it
+    // brought goes straight back. Published FIRST, so the groups the planner
+    // reads are the program's own and the capture is taken from them.
+    // M68: the reading the trim is conditional on, taken ahead of the release —
+    // 266 ns on a path that has just paid for a whole analysis. The trim itself
+    // is 3.4–32.6 ms of CPU and the dependency sweep reaches this seam once per
+    // open importer of an edited file, so what it costs is worth knowing and
+    // what it returns (14–135 MiB of resident size per landing, measured) is
+    // worth keeping.
+    let before_release = memory::heap_in_use_bytes();
+    if enforce_program_retention(&context.focus, &context.documents) {
+        memory::trim_if_released(before_release);
+    }
+    AnalysisOutcome::Landed
+}
+
+/// M63: hold a `Program` only for the [`RETAINED_PROGRAMS`] most recently
+/// focused documents; every other open document drops to its editor tables.
+/// Answers whether anything was released, which is M64's cue to trim.
+///
+/// A sweep of the open documents rather than a list of evictions, for one
+/// reason: it is the POLICY stated directly, and a policy stated directly
+/// cannot drift from its bookkeeping. Releasing a document that already
+/// released is free (`Document::release_analysis` answers `false` at once),
+/// and the map is one entry per open file — a dozen probes, on a path that
+/// runs when focus moves or an analysis lands, never per keystroke and never
+/// per request.
+///
+/// Called at exactly two seams, which between them cover every way a program
+/// can come into existence: [`Backend::focus`], where the retained SET moves,
+/// and [`analyze_and_publish`], where an analysis lands — the dependency sweep
+/// re-analyzes background documents on every save, and without the second seam
+/// each of those would silently take its program back.
+///
+/// Takes no document guard of its own beyond the one it releases through, so
+/// no caller may hold one: `iter_mut` walks the map's shards, and a guard held
+/// across it would deadlock the shard it belongs to.
+fn enforce_program_retention(
+    focus: &std::sync::Mutex<Vec<Url>>,
+    documents: &DashMap<Url, Document>,
+) -> bool {
+    let retained = focus
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // M67: the same set, told to the analyzer's base cache — the worlds these
+    // documents' analyses are served from are the ones its byte budget may not
+    // evict. Here rather than beside each caller because the set is this
+    // function's subject: one policy, one place, and a declaration that cannot
+    // drift from the releases it is stated against.
+    declare_live_entries(&retained);
+    let mut released = false;
+    for mut document in documents.iter_mut() {
+        if retained.contains(document.key()) {
+            continue;
+        }
+        released |= document.value_mut().release_analysis();
+    }
+    released
+}
+
+/// M67: tell the base cache which documents are LIVE, so its byte budget never
+/// evicts a world one of them is analyzed from.
+///
+/// The retained set, rendered as entry paths. A URI with no file path (an
+/// untitled buffer) contributes none: it is not an entry the analyzer can key
+/// a world by, and dropping it silently is right — the declaration is an
+/// exemption, and an exemption nothing can match is simply not one.
+fn declare_live_entries(retained: &[Url]) {
+    let entries: Vec<std::path::PathBuf> = retained
+        .iter()
+        .filter_map(|uri| uri.to_file_path().ok())
+        .collect();
+    vilan_core::analyzer::set_base_cache_live_entries(&entries);
 }
 
 /// Land a completed analysis on the open document at `uri`
@@ -1336,6 +1957,16 @@ async fn analyze_and_publish(
 ///   implies a later `did_change` whose own debounced task (or an
 ///   already-landed fresher analysis) covers the buffer.
 ///
+/// - **The world moved on** (E117). The analysis read an older world than the
+///   one already adopted here: some file it loaded has been edited since it
+///   started. Text equality cannot see this — it is the DEPENDENT's case, where
+///   this document's own buffer never moved and both of its in-flight analyses
+///   match it — so the [`Backend::revision`] stamp decides. Without it, the
+///   analysis that read a module mid-edit could land (and publish) after the
+///   one that read it restored, and the editor kept the error from a state the
+///   user had already undone. Older strictly: an equal stamp is a second look
+///   at the same world and lands normally.
+///
 /// So the analyzed snapshot only ever advances to *the* live text, never
 /// sideways to a different stale one. `adopt_analysis` keeps its own
 /// keep-the-live-side guard all the same — two independent layers: this one
@@ -1348,6 +1979,9 @@ fn land(documents: &DashMap<Url, Document>, uri: &Url, analysis: Document) -> bo
         return false;
     };
     if document.text != analysis.text {
+        return false;
+    }
+    if analysis.analysis_revision() < document.analysis_revision() {
         return false;
     }
     document.adopt_analysis(analysis);
@@ -1363,14 +1997,32 @@ async fn publish_document(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
+    publish_gate: &tokio::sync::Mutex<()>,
+    package_unions: &DashMap<PathBuf, Arc<dead_items::PackageReach>>,
     uri: &Url,
 ) {
+    // E117: plan and send as one step. The plan is already ordered (the planner
+    // is a mutex, and it drops a superseded owner's plan outright); the gate is
+    // what stops two publishes' `publish_diagnostics` awaits from interleaving
+    // and delivering the older plan last.
+    let _sending = publish_gate.lock().await;
     // Plan before the first await (neither the map guard nor the planner
     // lock may be held across one).
     let actions = {
-        let Some(document) = documents.get(uri) else {
+        let Some(mut document) = documents.get_mut(uri) else {
             return;
         };
+        // E124: the union this document's top-level gray is served from, taken
+        // fresh at every publish. The map IS the state — an edit removed the
+        // entry, so this hands over `None` and the grays are withdrawn without
+        // anything having to remember to clear them; the clock re-inserts, and
+        // the next publish paints again. Nothing is stored across an analysis.
+        let reach = document.manifest_dir().and_then(|dir| {
+            package_unions
+                .get(dir)
+                .map(|entry| Arc::clone(entry.value()))
+        });
+        document.set_package_reach(reach);
         publish_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1393,27 +2045,143 @@ async fn publish_document(
 /// a changed URL that is not a file path sweeps everyone — both are the old
 /// behavior, kept exactly where its reason still holds. Returns whether any
 /// of them landed an analysis.
+///
+/// `recolored` widens the sweep to a whole package (E116): every open document
+/// whose package root is at or under that path is swept, dependency edge or
+/// not. The edge is the right gate for DIAGNOSTICS — a file that never loaded
+/// the edited one cannot see the edit — and the wrong one for platform COLOR,
+/// which is decided by which entry REACHES a file. That relation points the
+/// other way: writing `import pkg::a` in the entry re-colors `a.vl`, and
+/// `a.vl` depends on nothing, so the edge swept it never and the process
+/// fallback stuck until the server restarted.
+///
+/// A saved MANIFEST arrives here the same way, and had the same hole from the
+/// other end: `vilan.toml` is in no program's `canonical_sources`, so once the
+/// sweep was gated on the edge (B39a) a manifest save re-analyzed nothing at
+/// all — a target change, a new entry, a fixed dependency all sat there until
+/// a restart. It passes its own directory, which every package root beneath it
+/// is under.
 async fn reanalyze_dependents(
-    documents: &DashMap<Url, Document>,
-    client: &Client,
-    publish_state: &std::sync::Mutex<PublishState>,
+    context: &AnalysisContext,
     changed: &Url,
+    recolored: Option<&Path>,
 ) -> bool {
     let changed_path = changed.to_file_path().ok();
-    let dependents: Vec<(Url, String)> = documents
+    // The URIs only — each dependent's text is read inside the loop, AFTER its
+    // supersede. Capturing the texts here instead would let an edit that lands
+    // mid-sweep be starved: the sweep would supersede that dependent (skipping
+    // the pause the edit scheduled) and then analyze the text as it was before
+    // the edit, which `land` drops for a text mismatch — leaving the newest
+    // buffer with nothing scheduled to analyze it. Reading late makes the sweep
+    // answer the live buffer; the residual race (an edit landing between the
+    // supersede and the read) is closed on the other side, by `Schedule::start`
+    // refusing a generation that is no longer current, which hands the buffer
+    // back to the edit's own pause.
+    let dependents: Vec<Url> = context
+        .documents
         .iter()
         .filter(|entry| entry.key() != changed)
-        .filter(|entry| match &changed_path {
-            Some(path) => entry.value().depends_on(path),
-            None => true,
+        .filter(|entry| {
+            if let Some(recolored) = recolored
+                && entry
+                    .value()
+                    .package_root()
+                    .is_some_and(|root| root.starts_with(recolored))
+            {
+                return true;
+            }
+            match &changed_path {
+                Some(path) => entry.value().depends_on(path),
+                None => true,
+            }
         })
-        .map(|entry| (entry.key().clone(), entry.value().text.clone()))
+        .map(|entry| entry.key().clone())
         .collect();
+    // M26, the DEPENDENCY seam (`editor-latency.md` §2.1.2 case 4). Each
+    // dependent's own buffer is untouched, so its anchor against its landed
+    // snapshot is the identity and the keystroke path would go on serving
+    // answers computed over the module as it was BEFORE the edit. Mark them all
+    // now — before the first re-analysis, so the window opens the moment the
+    // edit lands rather than when the sweep reaches that file — and each clears
+    // its own mark when its analysis lands. Inside the window the verdict is
+    // `Stale`: whole-file syntax-only tokens, hints still served (Q1/Q4).
+    for uri in &dependents {
+        context.schedule.mark_dependency_moved(uri);
+    }
+    // §4.2: the sweep used to await one FULL analysis per dependent with no
+    // supersession check between them, so on a shared module an edit landing
+    // mid-sweep cost an entire analysis per remaining dependent. The world this
+    // sweep answers is the one it started in; if the counter has moved, a newer
+    // edit has landed and is bringing its own sweep, so this one stops. The
+    // dependents it did not reach keep their `dependency_moved` mark until that
+    // sweep re-lands them, which is exactly the state they are in.
+    let swept_at = context.revision.load(Ordering::SeqCst);
     let mut landed = false;
-    for (uri, text) in dependents {
-        landed |= analyze_and_publish(documents, client, publish_state, uri, text).await;
+    for uri in dependents {
+        if context.revision.load(Ordering::SeqCst) != swept_at {
+            break;
+        }
+        // Supersede rather than merely schedule: an analysis of this dependent
+        // already in flight read the edited module in its pre-edit state, and
+        // the one about to start replaces it. One cancel and one re-schedule
+        // per sweep — the sweep itself runs once per landed edit. The text is
+        // read after, and synchronously, so what this analyzes is the buffer as
+        // it stands now (see the collection above).
+        let generation = context.schedule.supersede(&uri);
+        let Some(text) = context
+            .documents
+            .get(&uri)
+            .map(|document| document.text.clone())
+        else {
+            // Closed under the sweep. `supersede` above created a schedule
+            // entry for it (it is an upsert — `did_open` needs that), so put it
+            // back: a document with no buffer has no analysis to owe, and the
+            // session trace counts these entries.
+            context.schedule.close(&uri);
+            continue;
+        };
+        landed |= analyze_and_publish(context, uri, text, generation)
+            .await
+            .landed();
     }
     landed
+}
+
+/// How far the open document at `uri` reaches through its own package, and
+/// which package that is (E116) — the two facts [`recolored_package`] compares
+/// across a re-analysis. A closed or never-opened document reaches nothing.
+///
+/// Read synchronously; the guard is taken and dropped here, never held across
+/// the caller's await.
+fn package_reach(documents: &DashMap<Url, Document>, uri: &Url) -> Option<(u64, PathBuf)> {
+    let document = documents.get(uri)?;
+    let root = document.package_root()?;
+    Some((document.package_graph_fingerprint(), root.to_path_buf()))
+}
+
+/// The package whose platform coloring a re-analysis invalidated, if any
+/// (E116): its root when the set of package modules the edited file reaches
+/// MOVED, `None` when the import graph is where it was.
+///
+/// The `pkg::` graph is what `platform_color::file_platforms` walks to decide
+/// which entry reaches — and therefore colors — each file, so a change in it
+/// can re-color files this one neither imports nor is imported by. Nothing
+/// else in the file can: a body edit, a rename, a new `std` import all leave
+/// the reach identical and skip the sweep.
+///
+/// Separated from its effects so the decision is testable without a server.
+fn recolored_package(
+    before: Option<(u64, PathBuf)>,
+    after: Option<(u64, PathBuf)>,
+) -> Option<PathBuf> {
+    let (after_reach, root) = after?;
+    match before {
+        // The same package, reaching the same modules: nothing to re-color.
+        Some((before_reach, before_root)) if before_reach == after_reach && before_root == root => {
+            None
+        }
+        _ => Some(root),
+    }
 }
 
 /// One thing the server asks the client to re-request after a sweep of
@@ -1523,6 +2291,97 @@ impl Backend {
         }
     }
 
+    /// E222: [`OPENS_A_GENERIC_LIST`] — the rule `onTypeFormatting` applies,
+    /// asked as a question so the client can place the `>` and type over it
+    /// (which an edit cannot do). LIVE coordinates, for `on_type_formatting`'s
+    /// reason: the position is the one the client just typed into.
+    ///
+    /// Fenced like every other request, and `false` is the fallback: an answer
+    /// the client cannot get must leave the `<` alone, since a wrong `>` is
+    /// worse than a missing one.
+    async fn opens_a_generic_list(&self, params: TextDocumentPositionParams) -> Result<bool> {
+        self.fenced("opensAGenericList", Ok(false), || {
+            let Some(document) = self.documents.get(&params.text_document.uri) else {
+                return Ok(false);
+            };
+            let offset = document.line_index.offset(params.position);
+            Ok(document.opens_a_generic_list(offset))
+        })
+    }
+
+    /// F27 R1/R6: [`ANALYSIS_PLATFORM`] — the status line's one question.
+    async fn analysis_platform(
+        &self,
+        params: TextDocumentIdentifier,
+    ) -> Result<Option<serde_json::Value>> {
+        self.fenced("analysisPlatform", Ok(None), || {
+            let Some(document) = self.documents.get(&params.uri) else {
+                return Ok(None);
+            };
+            Ok(document
+                .analysis_platform()
+                .map(|(platform, kind, reason)| {
+                    serde_json::json!({ "platform": platform, "kind": kind, "reason": reason })
+                }))
+        })
+    }
+
+    /// The session summary as this server would write it now: the request
+    /// profile, the retained-state cardinalities, the analysis counts and
+    /// E166's memory reading.
+    ///
+    /// Its own method since E174, because it has two callers and they must not
+    /// be able to produce two different pages: the 500-request tick below, and
+    /// [`Backend::execute_command`] when the user asks for it.
+    fn session_summary(&self) -> String {
+        session_trace::summary(
+            session_trace::StateSizes {
+                documents: self.documents.len(),
+                // M63: of those documents, how many still hold a program —
+                // the retention rule's own number, on the page beside the
+                // memory it is there to bound.
+                programs: self
+                    .documents
+                    .iter()
+                    .filter(|document| document.value().holds_program())
+                    .count(),
+                semantic_token_cache: self.semantic_token_cache.len(),
+                manifests: self.manifests.len(),
+                pending: self.schedule.len(),
+                line_indices: self.line_indices.len(),
+            },
+            // E179: the analyzer's base cache, which is not one of the maps
+            // above — it is process-global and outlives every document — and
+            // was the one large retained thing this page did not name.
+            session_trace::BaseCacheSizes::sample(),
+            self.analyses.counts(),
+            // E166: the numbers E106 and M63 were found with, on the page
+            // the owner reads when a session starts feeling slow.
+            memory::Memory::sample(),
+        )
+    }
+
+    /// What one `workspace/executeCommand` puts on the client's channel
+    /// (E174) — the handler minus the send, so the payload is pinnable without
+    /// a live client socket.
+    ///
+    /// A command the server does not declare is a client bug rather than a
+    /// user error: it is NAMED at warning level and answered, instead of
+    /// raising a protocol error the editor would show as a failed action.
+    fn execute_command_log(&self, command: &str) -> (MessageType, String) {
+        if command == LOG_SESSION_SUMMARY {
+            (MessageType::INFO, self.session_summary())
+        } else {
+            (
+                MessageType::WARNING,
+                format!(
+                    "workspace/executeCommand: this server declares only `{LOG_SESSION_SUMMARY}`, \
+                     and was sent `{command}`"
+                ),
+            )
+        }
+    }
+
     /// E106: fold one request's duration into the session tally, and put the
     /// trace's own verdict on the client's output channel.
     ///
@@ -1541,15 +2400,7 @@ impl Backend {
         let text = match session_trace::record(request, elapsed_ms) {
             session_trace::TraceEvent::Quiet => return,
             session_trace::TraceEvent::Slow(line) => line,
-            session_trace::TraceEvent::Summarize => {
-                session_trace::summary(session_trace::StateSizes {
-                    documents: self.documents.len(),
-                    semantic_token_cache: self.semantic_token_cache.len(),
-                    manifests: self.manifests.len(),
-                    pending: self.pending.len(),
-                    line_indices: self.line_indices.len(),
-                })
-            }
+            session_trace::TraceEvent::Summarize => self.session_summary(),
         };
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -1560,25 +2411,259 @@ impl Backend {
         });
     }
 
+    /// M63: record that the editor is working in `uri`, apply the retention
+    /// rule, and re-analyze this document if it had been released.
+    ///
+    /// **What counts as focus.** LSP has no "the user switched tabs"
+    /// notification, so focus is read off the traffic — but not off all of it.
+    /// The requests an editor sends for every VISIBLE document, and re-sends on
+    /// every refresh — semantic tokens, inlay hints, the outline, folding — are
+    /// exactly the ones a released document answers from its tables, and
+    /// letting them move the retained set would make three visible editors
+    /// evict each other in a burst that nobody asked for. What moves it is the
+    /// traffic that follows the CARET: the notifications (`didOpen`,
+    /// `didChange`) and the requests that need the program under a cursor
+    /// (hover, completion, definition, references, rename, code actions). Those
+    /// arrive for the document the user is actually in.
+    ///
+    /// **The re-analysis.** A released document is re-analyzed at the front
+    /// door rather than lazily at the first query that misses, so that the
+    /// second after a tab switch has the program back (M58's warm path,
+    /// sub-second on kolt's `client.vl`). It runs under the document's CURRENT
+    /// generation, not a superseded one: this is not an edit, and cancelling a
+    /// debounced analysis that is already computing the same answer would be a
+    /// step backwards. One at a time — [`Schedule::is_analyzing`] is what stops
+    /// the five requests an editor sends on a tab switch from starting five
+    /// analyses of one file.
+    fn focus(&self, uri: &Url) {
+        let moved = {
+            let mut focus = self
+                .focus
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if focus.first() == Some(uri) {
+                false
+            } else {
+                focus.retain(|held| held != uri);
+                focus.insert(0, uri.clone());
+                focus.truncate(RETAINED_PROGRAMS);
+                true
+            }
+        };
+        // Only when the retained SET moved. Focus is asked on every caret
+        // request, and the common case is the same document twice — where
+        // nothing fell out of the set, so nothing can need releasing, and a
+        // sweep would take a write lock on every shard of the document map for
+        // an answer of "no". A document that takes a program BACK while the set
+        // stands still is covered at the other seam, where its analysis lands.
+        if moved {
+            // M64: a release hands a whole analysis back to the allocator at
+            // once — the one moment glibc has something to give the OS. M68:
+            // and only when that is more than a page's worth, read either side
+            // of the release.
+            let before_release = memory::heap_in_use_bytes();
+            if enforce_program_retention(&self.focus, &self.documents) {
+                memory::trim_if_released(before_release);
+            }
+        }
+        self.reanalyze_if_released(uri);
+    }
+
+    /// M63's other half: schedule the re-analysis a refocused document needs.
+    ///
+    /// Only for a RELEASED document — one that HAD an analysis and gave it back
+    /// — never for a document that simply has not analyzed yet, whose own open
+    /// or edit already scheduled one.
+    fn reanalyze_if_released(&self, uri: &Url) {
+        let Some(text) = self
+            .documents
+            .get(uri)
+            .and_then(|document| document.is_released().then(|| document.text.clone()))
+        else {
+            return;
+        };
+        if self.schedule.is_analyzing(uri) {
+            return;
+        }
+        let Some(generation) = self.schedule.generation(uri) else {
+            return;
+        };
+        // The tally and the fence are usable from a plain synchronous caller;
+        // spawning is not. A test that drives a handler off-runtime keeps the
+        // released tables and answers from them, which is the degraded state
+        // this path exists to leave.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let context = self.analysis_context();
+        let uri = uri.clone();
+        tokio::spawn(async move {
+            let landed = analyze_and_publish(&context, uri.clone(), text, generation)
+                .await
+                .landed();
+            // The analyzed snapshot moved under whatever the client asked for
+            // while this document was released — its tokens and hints were
+            // served from the capture, and the capture is new now (S5).
+            send_refreshes(&context.client, refresh_plan(landed)).await;
+        });
+    }
+
+    /// The shared state one scheduled analysis needs, cloned out of `self` so a
+    /// spawned task owns it.
+    fn analysis_context(&self) -> AnalysisContext {
+        AnalysisContext {
+            documents: Arc::clone(&self.documents),
+            client: self.client.clone(),
+            publish_state: Arc::clone(&self.publish_state),
+            publish_gate: Arc::clone(&self.publish_gate),
+            revision: Arc::clone(&self.revision),
+            schedule: Arc::clone(&self.schedule),
+            analyses: Arc::clone(&self.analyses),
+            package_unions: Arc::clone(&self.package_unions),
+            package_revision: Arc::clone(&self.package_revision),
+            union_tokens: Arc::clone(&self.union_tokens),
+            focus: Arc::clone(&self.focus),
+        }
+    }
+
+    /// E124's withdrawal: a change anywhere in a package takes that package's
+    /// top-level grays off the screen at once, before any analysis runs.
+    ///
+    /// This is determination 8, and it is asymmetric on purpose. The two
+    /// staleness errors are not equally bad: a stale gray on an item the user
+    /// has just started calling from another file says "dead" about live code,
+    /// and the user's response to a gray is to DELETE — that is the worst
+    /// outcome paint has. A missing gray on an item that has just become unused
+    /// is merely late, and nothing follows from lateness. So a top-level gray
+    /// may be arbitrarily stale toward FEWER grays and must never be served
+    /// stale toward more.
+    ///
+    /// Withdrawal is instant and needs no analysis, which is what makes the
+    /// rule affordable: drop the union and every consumer of it goes quiet in
+    /// the same breath. Restoration is slow and rides the clock below. The
+    /// consequence, stated plainly rather than discovered later: **during an
+    /// editing burst a package's top-level gray is off**, and it returns when
+    /// the editor settles. That is correct for a paint whose value is "you may
+    /// delete this" — it is acted on at rest, not mid-keystroke — and it is the
+    /// opposite of E114's locals and unreachable paint, which are file-local,
+    /// cheap, and stay on throughout.
+    ///
+    /// **The cone, not the whole package** (E140). The first cut withdrew a
+    /// package's entire paint on a keystroke anywhere in it, on the reasoning
+    /// that the union is cached per package so the package is the granularity
+    /// the withdrawal has to speak in. It is safe — withdrawal only ever
+    /// removes grays — and in a package of any size it means the grays are off
+    /// essentially all the time, because some file in the package is always
+    /// being typed in. The relation that decides it was already computable: a
+    /// union is a walk over the closure of its entries, so an edit can only
+    /// change a term of it if the edited file is IN that closure. The union
+    /// carries the closure it read (`PackageReach::sources`, the inverted
+    /// `depends_on` relation materialized where the answer was already in
+    /// hand), and an edit to a file outside it — an orphan module, a file no
+    /// entry reaches under any platform, a sibling package's file that
+    /// resolved to this manifest — leaves the paint standing.
+    ///
+    /// The narrowing is only ever applied against a union that EXISTS. While
+    /// one is in flight there is no closure to test, so the old package-wide
+    /// behavior stands for that window: the revision bumps and the legs are
+    /// cancelled. That is the conservative direction and it costs one idle
+    /// cycle, not a wrong gray.
+    fn withdraw_package_grays_for(&self, uri: &Url) {
+        let Some(manifest_dir) = package_of(&self.documents, uri) else {
+            return;
+        };
+        if let Ok(path) = uri.to_file_path()
+            && let Some(union) = self.package_unions.get(&manifest_dir)
+            && !union.depends_on(&path)
+        {
+            return;
+        }
+        self.withdraw_package_grays(&manifest_dir);
+    }
+
+    /// [`withdraw_package_grays_for`](Backend::withdraw_package_grays_for) with
+    /// the package already resolved, and unconditionally — the cone test is the
+    /// caller's, because a caller that has no single edited file (a manifest
+    /// save, a recolor) has no cone to test against.
+    fn withdraw_package_grays(&self, manifest_dir: &Path) {
+        let key = manifest_dir.to_path_buf();
+        *self.package_revision.entry(key.clone()).or_insert(0) += 1;
+        self.package_unions.remove(&key);
+        // A union already walking is a union for a world that has moved. It
+        // costs a full analysis per entry, so stopping it is worth the tokens —
+        // one per leg since E140 fanned them out.
+        if let Some(tokens) = self.union_tokens.get(&key) {
+            for token in tokens.value() {
+                token.cancel();
+            }
+        }
+    }
+
+    /// The root a watched-file event sweeps (E127) — the `recolored` argument
+    /// [`reanalyze_dependents`] widens its sweep by: every open document whose
+    /// package root is at or under this path re-analyzes, dependency edge or
+    /// not.
+    ///
+    /// The edge is the wrong gate here for the same reason it is wrong for a
+    /// platform recolor, and one reason of its own: a file that has just been
+    /// CREATED is in nobody's `canonical_sources`, so there is no edge to find
+    /// it by, and yet every open document in its package can see it — a
+    /// `pkg::` import path completes from the module listing, which is a
+    /// `read_dir` the next analysis performs.
+    ///
+    /// A manifest stands for its own directory, exactly as a manifest SAVE
+    /// does. A `.vl` file stands for the package root of the open document
+    /// that contains it, deepest first, so a nested package sweeps itself
+    /// rather than its parent. `None` when no open document's package contains
+    /// the path — a file changing somewhere no open buffer belongs to, where
+    /// the dependency edge alone is exactly the right gate.
+    fn watched_sweep_root(&self, uri: &Url) -> Option<PathBuf> {
+        let path = uri.to_file_path().ok()?;
+        if is_manifest(uri) {
+            return path.parent().map(vilan_core::util::canonical_path);
+        }
+        // The arriving file may not exist yet (a create event, or a delete
+        // that already happened), so resolve it through its deepest EXISTING
+        // ancestor — `canonical_path` alone would fall back to a lexical
+        // normalization and keep the URI's spelling (short on Windows) while
+        // the root below is canonical.
+        let path = vilan_core::util::canonical_path_of_unwritten(&path);
+        self.documents
+            .iter()
+            // Both sides canonical: on Windows a document's root can carry the
+            // short spelling of a directory (`RUNNER~1`) while the arriving
+            // path is canonical, and `starts_with` compares components.
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .package_root()
+                    .map(vilan_core::util::canonical_path)
+            })
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+    }
+
     /// Schedule a debounced re-analysis. A burst of edits collapses to a single
     /// analysis once typing pauses, and an edit that leaves the buffer unchanged
     /// is skipped entirely.
     fn on_change(&self, uri: Url, text: String) {
-        let generation = {
-            let mut entry = self.pending.entry(uri.clone()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        let documents = Arc::clone(&self.documents);
-        let pending = Arc::clone(&self.pending);
-        let publish_state = Arc::clone(&self.publish_state);
-        let client = self.client.clone();
+        // M26: superseding does two things now — it advances the generation the
+        // pause below compares itself against, and it CANCELS whatever analysis
+        // of this document is already in flight. Before, an analysis started by
+        // the previous keystroke ran to the end on its 128 MiB thread and was
+        // dropped at `land`; a burst paid one whole analysis per debounce
+        // window for answers nobody would see.
+        let generation = self.schedule.supersede(&uri);
+        let context = self.analysis_context();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
             // Read both facts synchronously (no map guard may cross an await),
             // then decide.
-            let current_generation = pending.get(&uri).map(|current| *current);
-            let analyzed_hash = documents.get(&uri).map(|document| document.text_hash);
+            let current_generation = context.schedule.generation(&uri);
+            let analyzed_hash = context
+                .documents
+                .get(&uri)
+                .map(|document| document.text_hash);
             match pause_action(
                 current_generation,
                 generation,
@@ -1588,33 +2673,61 @@ impl Backend {
                 PauseAction::Superseded | PauseAction::Unchanged => return,
                 PauseAction::Analyze => {}
             }
-            let landed =
-                analyze_and_publish(&documents, &client, &publish_state, uri.clone(), text).await;
+            let reach_before = package_reach(&context.documents, &uri);
+            let outcome = analyze_and_publish(&context, uri.clone(), text, generation).await;
+            if outcome == AnalysisOutcome::Cancelled {
+                // A newer edit stopped this analysis, and it is bringing its own
+                // sweep behind its own debounce. Sweeping now would re-analyze
+                // every dependent against a module whose analysis never landed
+                // — work the newer sweep would immediately supersede — and the
+                // refresh below has nothing to announce either.
+                return;
+            }
+            let landed = outcome.landed();
             // The edit may change what other open files see (they import this
             // one, or a file it re-exports) — bring their diagnostics up to date.
+            let recolored =
+                recolored_package(reach_before, package_reach(&context.documents, &uri));
             let dependents_landed =
-                reanalyze_dependents(&documents, &client, &publish_state, &uri).await;
+                reanalyze_dependents(&context, &uri, recolored.as_deref()).await;
             // The analyzed snapshot moved under the client's highlighting and
             // hints; ask for them again (S5). Every guard is long dropped here.
-            send_refreshes(&client, refresh_plan(landed || dependents_landed)).await;
+            send_refreshes(&context.client, refresh_plan(landed || dependents_landed)).await;
+            // E124: the edit withdrew this package's top-level grays before the
+            // debounce; this is the other half — the idle timer that brings
+            // them back, if the editor stays at rest long enough for it.
+            schedule_package_union(&context, &uri);
         });
     }
 
     /// The line index for a file another source's span points into, cached by
     /// path so a cross-file query doesn't re-read and re-index on every lookup.
     ///
-    /// The cache holds only files whose text is STABLE for the session — which
-    /// is what "on disk, not open in the editor" means. A path with a buffer
-    /// registered is indexed fresh every time and never stored: its text is one
-    /// keystroke old, so a stored index would misplace every range it converts
-    /// from the next edit onward. (The session cache has no invalidation, by
-    /// design — it was written for `std`, whose files genuinely do not change.
-    /// Once `read_source` began answering from the overlay, "never invalidate"
-    /// stopped being safe for anything else, so the fix is to not cache those.)
+    /// A path with a buffer registered is indexed fresh every time and never
+    /// stored: its text is one keystroke old, so a stored index would misplace
+    /// every range it converts from the next edit onward.
+    ///
+    /// Every other entry is validated against the file's [`FileStamp`] (E112).
+    /// The cache used to have no invalidation at all, documented as safe
+    /// because it was written for `std`, "whose files genuinely do not change".
+    /// That was never a property of the KEY — it is a property of std, and the
+    /// map holds whatever a cross-file query asks for. A workspace file is
+    /// exempt from the cache only while it is buffered, so CLOSING a document
+    /// makes it cacheable; a file cached before it was ever opened kept its
+    /// pre-edit index across the whole open/edit/save/close cycle, and every
+    /// later reference into it converted through the wrong line breaks. So the
+    /// invariant is made true instead of assumed: a hit must match the file's
+    /// current length and modification time, and anything else re-reads. That
+    /// also covers what no did-close hook could — a change made outside the
+    /// editor entirely, a `git checkout` or a generator's rewrite.
     fn line_index_for(&self, path: &Path) -> Option<Arc<LineIndex>> {
         let buffered = vilan_core::analyzer::document_overlay_contains(path);
-        if !buffered && let Some(cached) = self.line_indices.get(path) {
-            return Some(Arc::clone(cached.value()));
+        let stamp = if buffered { None } else { file_stamp(path) };
+        if let Some(stamp) = stamp
+            && let Some(cached) = self.line_indices.get(path)
+            && cached.value().0 == stamp
+        {
+            return Some(Arc::clone(&cached.value().1));
         }
         // A disk read is BOM-stripped, matching the analyzer's read of the same
         // file (windows-support.md §2); a buffer comes back verbatim. Either
@@ -1622,9 +2735,12 @@ impl Backend {
         // analyzer saw, which is the whole point.
         let text = vilan_core::util::read_source(path).ok()?;
         let line_index = Arc::new(LineIndex::new(&text));
-        if !buffered {
+        // Stamped with what was read BEFORE the read, so a file that changed
+        // during it looks stale on the next lookup and is read again — the
+        // conservative direction, and the only one that cannot answer wrong.
+        if let Some(stamp) = stamp {
             self.line_indices
-                .insert(path.to_path_buf(), Arc::clone(&line_index));
+                .insert(path.to_path_buf(), (stamp, Arc::clone(&line_index)));
         }
         Some(line_index)
     }
@@ -1691,6 +2807,52 @@ impl Backend {
 /// for, and by omission every one it does not. A pure value, so the book's
 /// editor page can be held to it (`book_sync.rs`): the page's "what it gives
 /// you" and "what it does not have" are claims about exactly this struct.
+/// E174: the one `workspace/executeCommand` this server declares — put the
+/// session summary on the client's channel NOW.
+///
+/// E166 put RSS, the heap split and `programs=` on that summary, and the only
+/// way to see them was to wait for the 500-request tick: `Vilan: Show Language
+/// Server Status` printed the CLIENT's tally and opened the channel the
+/// server's summary would eventually arrive on. The numbers exist to be read
+/// when a session starts feeling slow, which is the moment the user asks — not
+/// five hundred requests later.
+///
+/// The extension sends this name from `editors/vscode/src/extension.ts`; the
+/// two spellings are gated against each other in `book_sync`.
+pub const LOG_SESSION_SUMMARY: &str = "vilan.logSessionSummary";
+
+/// E222: the server's first CUSTOM request — "does the `<` just before this
+/// position open a generic list?" — answered by
+/// [`Document::opens_a_generic_list`], the rule `onTypeFormatting` already
+/// applies (E202).
+///
+/// It exists because an edit is the only thing `onTypeFormatting` can answer
+/// with, and an edit cannot move the caret: VS Code types over a closing
+/// character only when it auto-inserted that character itself, so the `>` the
+/// server placed was doubled whenever the author typed their own
+/// (`List<i32>>`). A client that can move the caret — the VS Code extension's
+/// `type` override — asks this instead, places the `>` itself, and swallows
+/// the next `>` typed onto it; it says so in `initializationOptions`
+/// (`autoClosing.generics`), and `onTypeFormatting` then stands down for `<`.
+///
+/// Params are `TextDocumentPositionParams` in LIVE coordinates — the
+/// position just past the `<` the client has already typed, which is what
+/// `onTypeFormatting` receives too. The answer is a bare `bool`.
+///
+/// The extension spells this name in `editors/vscode/src/extension.ts`; the
+/// two spellings are gated against each other in `book_sync`.
+pub const OPENS_A_GENERIC_LIST: &str = "vilan/opensAGenericList";
+
+/// F27 R1/R6: "which platform is this file analyzed under, and why?" — what
+/// the editor's status line shows (`analyzed as: browser — declared`) so the
+/// answer is visible before any error is. Params are a
+/// `TextDocumentIdentifier`; the answer is `{ platform, kind, reason }` from
+/// the document's last analysis, or `null` before there is one.
+///
+/// The extension spells this name in `editors/vscode/src/extension.ts`; the
+/// two spellings are gated against each other in `book_sync`.
+pub const ANALYSIS_PLATFORM: &str = "vilan/analysisPlatform";
+
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -1714,6 +2876,17 @@ fn server_capabilities() -> ServerCapabilities {
         })),
         document_symbol_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        // E202 (R9): the `>` that closes a `<` opened in TYPE position. `<` is
+        // also the comparison operator, and a static `autoClosingPairs` entry
+        // cannot tell the two apart — its only filter is
+        // `notIn: [string, comment]` — so the decision is the server's, where
+        // the names have meanings. Whole-document formatting is still the only
+        // thing `formatting` does; this shares nothing with it but the LSP
+        // family name.
+        document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+            first_trigger_character: "<".to_string(),
+            more_trigger_character: None,
+        }),
         completion_provider: Some(CompletionOptions {
             // `.` and `:` (the second `:` of `::`) re-trigger completion so
             // member/path candidates appear without a manual invoke.
@@ -1755,6 +2928,11 @@ fn server_capabilities() -> ServerCapabilities {
             ]),
             ..Default::default()
         })),
+        // E174: the session summary, on demand.
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![LOG_SESSION_SUMMARY.to_string()],
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -1769,6 +2947,50 @@ fn server_capabilities() -> ServerCapabilities {
 /// drifts from the terminal's.
 fn formatting_declined(path: &std::path::Path) -> bool {
     vilan_core::manifest::generated_root_covering(path).is_some()
+}
+
+/// E197: the `window/showMessage` a formatting decline earns — or `None`
+/// because this document has already been told about this exact cause.
+///
+/// The silence N90 closed for the terminal was still whole in the editor.
+/// `formatter::format` answers the original bytes on every way out, so the
+/// handler's `formatted == source` test read "the printer cannot render this
+/// file" and "this file is already canonical" as the same thing and returned no
+/// edit for both: format-on-save on a declining file did nothing, said nothing,
+/// and looked exactly like success.
+///
+/// The sentence is [`vilan_core::formatter::Decline::sentence`] — the CLI's own
+/// (`report_decline`), so the two tools name the same construct in the same
+/// words and neither can drift — under a lead-in that says what did not happen,
+/// because a toast arrives with no command line above it to explain itself.
+///
+/// `seen` is the per-document cause record. The KEY is the sentence, not the
+/// reason: the reason is one of four, while the sentence carries the construct,
+/// so moving on to a second unprintable construct in the same file speaks
+/// again.
+fn formatting_decline_notice(
+    seen: &DashMap<Url, String>,
+    uri: &Url,
+    decline: &vilan_core::formatter::Decline,
+) -> Option<String> {
+    let sentence = decline.sentence();
+    if seen.get(uri).is_some_and(|last| *last == sentence) {
+        return None;
+    }
+    seen.insert(uri.clone(), sentence.clone());
+    let name = uri
+        .to_file_path()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| uri.to_string());
+    let where_ = match decline.line {
+        Some(line) => format!("{name}:{line}"),
+        None => name,
+    };
+    Some(format!("vilan fmt left {where_} unchanged — {sentence}"))
 }
 
 #[cfg(test)]
@@ -1853,6 +3075,119 @@ mod formatting_gate_tests {
     }
 }
 
+#[cfg(test)]
+mod formatting_decline_notice_tests {
+    //! E197: format-on-save SAYS it declined — once per file per cause.
+    //!
+    //! The handler itself cannot be unit-tested without a `Client` to toast
+    //! into, so the decision is a pure function of the cause record and the
+    //! decline, and this is the pin on it. What the handler adds around it is
+    //! one `show_message` and the `remove` on a successful reprint, both of
+    //! which are one line at the site.
+    use super::formatting_decline_notice;
+    use dashmap::DashMap;
+    use tower_lsp::lsp_types::Url;
+    use vilan_core::formatter::{Decline, DeclineReason};
+
+    fn uri(name: &str) -> Url {
+        Url::parse(&format!("file:///tmp/{name}")).expect("a file url")
+    }
+
+    fn gap(construct: &str, line: usize) -> Decline {
+        Decline {
+            reason: DeclineReason::NoRule,
+            construct: construct.to_string(),
+            line: Some(line),
+        }
+    }
+
+    /// The first decline speaks, and it names the file, the line and the
+    /// construct — "this file did not format" sends a reader into a long module
+    /// looking for what, which is the lesson `report_decline` already learned.
+    #[test]
+    fn the_first_decline_names_the_file_the_line_and_the_construct() {
+        let seen = DashMap::new();
+        let notice = formatting_decline_notice(&seen, &uri("client.vl"), &gap("const {", 7))
+            .expect("the first decline is reported");
+        assert!(notice.contains("client.vl:7"), "{notice}");
+        assert!(notice.contains("const {"), "{notice}");
+        assert!(
+            notice.contains("vilan fmt left"),
+            "the lead-in says what did NOT happen: {notice}"
+        );
+    }
+
+    /// Format-on-save fires on every save. The same cause must go quiet, or the
+    /// message is a toast per save and the user turns it off.
+    #[test]
+    fn the_same_cause_is_reported_once_and_a_different_one_speaks_again() {
+        let seen = DashMap::new();
+        let file = uri("client.vl");
+        assert!(formatting_decline_notice(&seen, &file, &gap("const {", 7)).is_some());
+        assert!(
+            formatting_decline_notice(&seen, &file, &gap("const {", 7)).is_none(),
+            "the second save on the same cause is silent"
+        );
+        // A DIFFERENT construct is a different fact about the file — the author
+        // fixed one gap and met another, or moved this one.
+        assert!(
+            formatting_decline_notice(&seen, &file, &gap("css {", 40)).is_some(),
+            "a new cause speaks"
+        );
+        assert!(formatting_decline_notice(&seen, &file, &gap("css {", 40)).is_none());
+        // And back to the first: the record holds ONE cause, so returning to it
+        // is news again. Cheap, and it cannot go silent forever on a file the
+        // author is editing back and forth.
+        assert!(formatting_decline_notice(&seen, &file, &gap("const {", 7)).is_some());
+    }
+
+    /// Per FILE, not per session: two declining documents each get their word.
+    #[test]
+    fn two_documents_are_reported_independently() {
+        let seen = DashMap::new();
+        let decline = gap("const {", 7);
+        assert!(formatting_decline_notice(&seen, &uri("a.vl"), &decline).is_some());
+        assert!(formatting_decline_notice(&seen, &uri("b.vl"), &decline).is_some());
+        assert!(formatting_decline_notice(&seen, &uri("a.vl"), &decline).is_none());
+    }
+
+    /// The two reasons that carry no construct still produce a readable
+    /// sentence, and the line-less one does not print a bare `:`.
+    #[test]
+    fn a_source_that_does_not_lex_or_parse_reports_without_a_line() {
+        let seen = DashMap::new();
+        for reason in [DeclineReason::DoesNotLex, DeclineReason::DoesNotParse] {
+            let decline = Decline {
+                reason,
+                construct: String::new(),
+                line: None,
+            };
+            let notice =
+                formatting_decline_notice(&seen, &uri(&format!("{reason:?}.vl")), &decline)
+                    .expect("reported");
+            assert!(!notice.contains(".vl:"), "no empty line suffix: {notice}");
+            assert!(notice.ends_with(&decline.sentence()), "{notice}");
+        }
+    }
+
+    /// A clean reprint CLEARS the record (the handler's `remove`), so a decline
+    /// that comes back is heard. Pinned here over the same map the handler
+    /// holds, since that is the whole of the interaction.
+    #[test]
+    fn a_successful_format_lets_the_next_decline_speak() {
+        let seen = DashMap::new();
+        let file = uri("client.vl");
+        let decline = gap("const {", 7);
+        assert!(formatting_decline_notice(&seen, &file, &decline).is_some());
+        assert!(formatting_decline_notice(&seen, &file, &decline).is_none());
+        seen.remove(&file);
+        assert!(
+            formatting_decline_notice(&seen, &file, &decline).is_some(),
+            "after a format that stood, the same decline is news again"
+        );
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -1915,16 +3250,52 @@ impl LanguageServer for Backend {
         Ok(())
     }
 
+    /// E174: `workspace/executeCommand`, the server's first. One command, and
+    /// it exists so the session summary can be READ when the user wants it
+    /// rather than when the 500-request tick comes round — see
+    /// [`LOG_SESSION_SUMMARY`]. The extension's `Vilan: Show Language Server
+    /// Status` sends it, so one palette entry now prints both tallies onto the
+    /// one output channel: the client's, then the server's.
+    ///
+    /// Answers `null`: the payload is the LOG LINE, not a return value. Fenced
+    /// and timed like every other handler — building the summary walks four
+    /// maps and takes a memory reading, which is exactly the kind of work the
+    /// trace exists to notice.
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        let (level, text) = self.fenced(
+            "execute_command",
+            (MessageType::INFO, String::new()),
+            || self.execute_command_log(&params.command),
+        );
+        if !text.is_empty() {
+            self.client.log_message(level, text).await;
+        }
+        Ok(None)
+    }
+
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        // Analyze inline and insert the document before the first `.await`, so a
-        // query that arrives right after open — before diagnostics are published
-        // — still finds it. (The debounced change path runs off the async thread,
-        // but there a previous analysis is always already in place.)
+        // Insert the document before the first `.await`, so a query that
+        // arrives right after open still finds it — and so `land`'s "a missing
+        // entry can only mean closed" stays true — then SCHEDULE the first
+        // analysis the way an edit's is scheduled.
+        //
+        // E123: this used to call `Document::analyze` right here, on the async
+        // handler. That call joins a 128 MiB analysis thread, so opening
+        // kolt's `views.vl` parked a tokio worker for the whole 1.1 s first
+        // analysis and every other request on that worker waited behind it
+        // (`proposal/editor-latency.md` §1.6; the session trace's "slow
+        // request: didOpen took 1112 ms"). The work is unchanged and the
+        // stamping is E117's; only its thread is different — `spawn_blocking`,
+        // like every other analysis in this file.
         let uri = params.text_document.uri;
-        // The synchronous prefix fences (B40); the trailing publish is pure
-        // message sending. A panicked open publishes nothing — the map entry
-        // it failed to make is what "open" means everywhere else.
-        let publish = self.fenced("didOpen", false, || {
+        // The synchronous prefix fences (B40) and hands back the text to
+        // analyze, or nothing when there is no analysis to schedule. A panicked
+        // open publishes nothing — the map entry it failed to make is what
+        // "open" means everywhere else.
+        let opened = self.fenced("didOpen", None, || {
             // A manifest is not a vilan source file: it feeds completion and
             // nothing else. It is deliberately NOT registered as a document
             // overlay either — project resolution reads `vilan.toml` from disk, so
@@ -1935,7 +3306,7 @@ impl LanguageServer for Backend {
                     uri.clone(),
                     ManifestDocument::new(params.text_document.text),
                 );
-                return false;
+                return None;
             }
             let path = uri.to_file_path().unwrap_or_default();
             // Register the buffer so OTHER documents' analyses load this one's
@@ -1944,18 +3315,58 @@ impl LanguageServer for Backend {
                 &path,
                 Some(params.text_document.text.clone()),
             );
-            let std_dir = discover_std_dir(&path);
-            let document = Document::analyze(&params.text_document.text, &std_dir, &path);
+            // The overlay just changed what every analysis reads (E117). The
+            // analysis scheduled below samples the counter AFTER this bump, so
+            // it is stamped with the world it actually reads.
+            self.revision.fetch_add(1, Ordering::SeqCst);
             // The ONLY place a document enters the map. Every later analysis lands
             // by merge onto what is here (`land`), which is what lets a result
             // arriving after `did_close` be dropped instead of resurrecting the
             // file: a missing entry can only mean "closed", never "not opened yet".
-            self.documents.insert(uri.clone(), document);
-            true
+            // It holds the buffer and no analysis yet — the state the debounce
+            // window has always had between an edit and the analysis that
+            // answers it, and every query handler already reads it.
+            self.documents.insert(
+                uri.clone(),
+                Document::unanalyzed(&params.text_document.text),
+            );
+            // M63: an open IS a focus — the editor opened this file because the
+            // user is about to be in it — and it is registered before the
+            // analysis below is scheduled, so the result is kept rather than
+            // released the moment it lands.
+            self.focus(&uri);
+            // M26: register the open's generation, exactly as an edit registers
+            // its own. E123 routed the open through the same SCHEDULING but it
+            // registered nothing, so an edit arriving before the open's
+            // analysis finished did not supersede it — the two ran to
+            // completion side by side and E117's stamp decided which landed
+            // last. Now the edit cancels the open, like any other supersession.
+            Some((params.text_document.text, self.schedule.supersede(&uri)))
         });
-        if publish {
-            publish_document(&self.documents, &self.client, &self.publish_state, &uri).await;
-        }
+        let Some((text, generation)) = opened else {
+            return;
+        };
+        // Spawned, not awaited: `did_change` returns the instant it has
+        // scheduled its analysis, and an open must too — the notification
+        // handler is on the same runtime every request is served from.
+        let context = self.analysis_context();
+        tokio::spawn(async move {
+            // The shared path: `spawn_blocking`, stamped with the world it
+            // read, under the scheduler's cancellation token, landed only if it
+            // is still the newest view of the live text (E117), then published.
+            let landed = analyze_and_publish(&context, uri.clone(), text, generation)
+                .await
+                .landed();
+            // E124: the open's analysis is what RESOLVED this file's package,
+            // so the clock can only be started after it (before it, the
+            // document carries no manifest directory to key on).
+            schedule_package_union(&context, &uri);
+            // The analyzed snapshot moved under whatever the client asked for
+            // in the meantime — it opened the file and immediately asked for
+            // tokens and hints over a document that had none. Ask it to ask
+            // again (S5); this is what makes the empty first answer transient.
+            send_refreshes(&context.client, refresh_plan(landed)).await;
+        });
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -1983,9 +3394,16 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
+                // E124: a manifest edit can change the entry set itself, so
+                // the package's union is withdrawn like any other change in it.
+                self.withdraw_package_grays_for(&uri);
                 self.manifests.insert(uri, ManifestDocument::new(text));
                 return;
             }
+            // M63: typing in a file is the strongest focus signal there is.
+            // Before the edit, so the analysis this change schedules lands on a
+            // document the retention rule keeps.
+            self.focus(&uri);
             // Apply the edits to the open document immediately — in order,
             // each against the text as already edited (the incremental-sync
             // contract) — so a completion request arriving before the
@@ -2006,6 +3424,15 @@ impl LanguageServer for Backend {
             if let Ok(path) = uri.to_file_path() {
                 vilan_core::analyzer::set_document_overlay(&path, Some(text.clone()));
             }
+            // The world every analysis reads has moved (E117) — bump BEFORE the
+            // debounced task samples it, so an analysis already in flight is
+            // stamped with the world it actually read and this edit's own
+            // analysis is stamped strictly higher.
+            self.revision.fetch_add(1, Ordering::SeqCst);
+            // E124: the package's top-level grays come off NOW, before the
+            // debounce, before any analysis — the withdrawal is the half of the
+            // staleness rule that must not wait for anything.
+            self.withdraw_package_grays_for(&uri);
             self.on_change(uri, text);
         })
     }
@@ -2014,26 +3441,114 @@ impl LanguageServer for Backend {
         // A save changes what OTHER documents' analyses read from disk (module
         // loading is disk-backed), so re-analyze every open document.
         let saved = params.text_document.uri;
+        // A save changes what a disk read answers, so it moves the world too
+        // (E117) — a manifest save especially, which re-colors every open file.
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        // E116: a saved `vilan.toml` is the coloring input itself — its target,
+        // its entries, its `default-entry` all decide what every file under it
+        // analyzes as — and it is in no program's `canonical_sources`, so the
+        // dependency edge alone finds nothing to sweep. Its own directory
+        // stands for the packages beneath it.
+        let saved_manifest_directory = is_manifest(&saved)
+            .then(|| saved.to_file_path().ok())
+            .flatten()
+            .and_then(|path| path.parent().map(vilan_core::util::canonical_path));
+        let reach_before = package_reach(&self.documents, &saved);
         // `.map` consumes the map guard inside the closure, so nothing is held
         // across the awaits below (which take the same key for writing).
+        let context = self.analysis_context();
         let mut landed = false;
         if let Some((uri, text)) = self
             .documents
             .get(&saved)
             .map(|document| (saved.clone(), document.text.clone()))
         {
-            landed = analyze_and_publish(
-                &self.documents,
-                &self.client,
-                &self.publish_state,
-                uri,
-                text,
-            )
-            .await;
+            // A save is a supersession like any other: whatever analysis of
+            // this document is in flight read the pre-save world.
+            let generation = self.schedule.supersede(&uri);
+            let outcome = analyze_and_publish(&context, uri, text, generation).await;
+            if outcome == AnalysisOutcome::Cancelled {
+                // An edit landed on top of the save and stopped its analysis;
+                // that edit's own pause sweeps the dependents. (A manifest save
+                // reaches neither this branch nor this `if` — it has no open
+                // document of its own — and still sweeps below, which is the
+                // whole point of its directory standing in for the edge.)
+                return;
+            }
+            landed = outcome.landed();
         }
-        landed |=
-            reanalyze_dependents(&self.documents, &self.client, &self.publish_state, &saved).await;
+        let recolored = saved_manifest_directory
+            .or_else(|| recolored_package(reach_before, package_reach(&self.documents, &saved)));
+        landed |= reanalyze_dependents(&context, &saved, recolored.as_deref()).await;
         // Same sweep rule as a typing pause (S5).
+        send_refreshes(&self.client, refresh_plan(landed)).await;
+        // E124: a save is the clock's other trigger, and the cleanest one — the
+        // package's content on disk is now what the union will read, and the
+        // editor is by definition at rest.
+        schedule_package_union(&context, &saved);
+    }
+
+    /// E127: files that change on DISK, outside every open buffer.
+    ///
+    /// The VS Code client registers `synchronize.fileEvents` and has been
+    /// sending `workspace/didChangeWatchedFiles` all along; the server
+    /// registered no handler, so `tower-lsp`'s default discarded them. A
+    /// package file created, deleted or renamed by something that is not the
+    /// editor — a generator, a `git checkout`, a `mv` in a terminal — was
+    /// therefore invisible until something else happened to re-analyze,
+    /// because the module listing behind the `pkg::` import steer and the
+    /// library contract are read from DISK inside the analyzer
+    /// (`modules_in_root`) and are only ever as fresh as the analysis that read
+    /// them. The listing is captured per analysis rather than cached
+    /// process-globally (M25), which is what keeps this a staleness of TIMING
+    /// rather than of content: nothing here has to be invalidated, something
+    /// has to be re-run.
+    ///
+    /// So this does for a file with no buffer exactly what a save does for one
+    /// that has: drop the by-path caches for it, move the world revision (E117
+    /// — a disk read answers differently now), and sweep the open documents the
+    /// change can reach. The sweep is wider than the dependency edge on
+    /// purpose, for the same reason a manifest save's is: a file that did not
+    /// exist a moment ago is in no program's `canonical_sources`, so the edge
+    /// finds nothing to sweep, and a CREATED file is the case this item is
+    /// about.
+    ///
+    /// An event on a file the editor has OPEN is ignored: the buffer is the
+    /// truth there (the analyzer reads it through the overlay), `did_change`
+    /// and `did_save` already own that path, and acting on the disk copy would
+    /// schedule an analysis against text the user has typed past.
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // A rename arrives as a delete plus a create, and a save-by-tool can
+        // arrive as several events for one path; each path is worth one sweep.
+        let mut changed: Vec<Url> = params
+            .changes
+            .into_iter()
+            .map(|event| event.uri)
+            .filter(|uri| is_manifest(uri) || is_vilan_source(uri))
+            .filter(|uri| !self.documents.contains_key(uri) && !self.manifests.contains_key(uri))
+            .collect();
+        changed.sort();
+        changed.dedup();
+        if changed.is_empty() {
+            return;
+        }
+        // The world moved: every disk read the analyzer does may answer
+        // differently now (E117's ordering stamp).
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        let context = self.analysis_context();
+        let mut landed = false;
+        for uri in changed {
+            if let Ok(path) = uri.to_file_path() {
+                // The line-index cache is stamped by length and mtime, so it
+                // heals itself for a rewrite — but a DELETED file leaves an
+                // entry with nothing left to disagree with its stamp. Dropping
+                // it is correct for every event kind and costs one map probe.
+                self.line_indices.remove(&path);
+            }
+            let root = self.watched_sweep_root(&uri);
+            landed |= reanalyze_dependents(&context, &uri, root.as_deref()).await;
+        }
+        // Same sweep rule as a typing pause and a save (S5).
         send_refreshes(&self.client, refresh_plan(landed)).await;
     }
 
@@ -2051,13 +3566,43 @@ impl LanguageServer for Backend {
         if let Ok(path) = uri.to_file_path() {
             vilan_core::analyzer::set_document_overlay(&path, None);
         }
+        // Dropping the overlay changes what every other analysis reads (E117).
+        self.revision.fetch_add(1, Ordering::SeqCst);
         self.documents.remove(&uri);
         self.semantic_token_cache.remove(&uri);
-        // Drop the edit generation so any in-flight debounced analysis bails.
-        self.pending.remove(&uri);
+        // E197: and the formatting-decline record, so re-opening the file hears
+        // its decline once more rather than inheriting a silence from a session
+        // the user has forgotten.
+        self.formatting_declines.remove(&uri);
+        // M63: give the retained slot back. A closed document holds nothing,
+        // and leaving its URI in the focus list would spend one of the two
+        // slots on a file that is gone — the next document to be focused would
+        // evict a live one instead of it.
+        let retained = {
+            let mut focus = self
+                .focus
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            focus.retain(|held| held != &uri);
+            focus.clone()
+        };
+        // M67: and the base cache's exemption goes with it. A closed
+        // document's world must become evictable in the same breath its slot
+        // is given back, or a session of opening and closing files would pin a
+        // world per file it ever focused — the one growth the budget exists to
+        // stop.
+        declare_live_entries(&retained);
+        // Drop the edit generation so any in-flight debounced analysis bails,
+        // and CANCEL whatever is already past its pause (M26): a closed
+        // document's analysis is dropped by `land` in any case, so finishing it
+        // is a whole program's work for a result with nowhere to go.
+        self.schedule.close(&uri);
         // Clear this document's diagnostics AND the ones it published onto
         // other files — each target republishes as the remaining owners'
-        // merged view (empty where this was the only contributor).
+        // merged view (empty where this was the only contributor). Under the
+        // same plan-with-send gate every other publish takes (E117), so a
+        // concurrent analysis's sends cannot land in the middle of the clear.
+        let _sending = self.publish_gate.lock().await;
         let actions = self
             .publish_state
             .lock()
@@ -2068,6 +3613,15 @@ impl LanguageServer for Backend {
         }
         // A document that never analyzed (open failed) still clears.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        // M64: the close above dropped this document's whole analysis — its
+        // program, its entry text and tree, its editor tables — and glibc does
+        // not hand that back to the OS on its own: closing kolt's eighteen
+        // files returned 418 MB to the allocator's free list and 62 MB to the
+        // system, so resident size ratcheted up across a session of opening and
+        // closing files and never came down. This is the ask. Linux/glibc only,
+        // a no-op everywhere else, and it is here rather than on a timer
+        // because a close is exactly the moment there is something to give.
+        memory::trim();
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
@@ -2087,33 +3641,23 @@ impl LanguageServer for Backend {
             };
             let range = params.range;
             let hints = document
-                .inlay_hints()
+                // E121 (Q1/Q4): the landed hints re-mapped through the
+                // two-sided anchor, WITHHELD inside the edit window — a hint on
+                // the line you are typing is the most likely to be wrong and
+                // the least useful, and its absence there is invisible because
+                // it was about to move anyway. A hint outside the window sits
+                // on byte-identical text, so its position is exact.
+                //
+                // That exactness is what retires the analyzed/live index dance
+                // this filter used to need: the offsets are already live-space,
+                // so one index answers both the hint's position and the
+                // viewport compare, and there is no approximation left to
+                // fall back to.
+                .keystroke_hints(self.schedule.dependency_moved(&uri))
                 .into_iter()
                 .filter_map(|(offset, label)| {
-                    // The anchor is a program offset, so it converts through the
-                    // ANALYZED index (S1). Through the live one, an insertion above
-                    // slid every hint below it — and the viewport filter on the next
-                    // line then dropped the ones that slid out of range entirely.
-                    //
-                    // The filter compares against `params.range`, which is
-                    // live-space. With incremental sync (B39c) the recorded
-                    // edits map the anchor into live space and the compare
-                    // is EXACT; when the map is broken (a whole-text set, an
-                    // analysis of an older text) it falls back to the old
-                    // approximation — exact for same-line edits, off by the
-                    // inserted or deleted lines near the viewport edge until
-                    // the refresh lands. The HINT keeps its analyzed-space
-                    // position either way: program answers describe the
-                    // analyzed snapshot (the snapshot-consistency rule), and
-                    // the client clips out-of-range answers harmlessly.
-                    let position = document.analyzed_position(offset);
-                    let visible = match document.live_offset(offset) {
-                        Some(live) => {
-                            let live_position = document.line_index.position(live);
-                            live_position >= range.start && live_position <= range.end
-                        }
-                        None => position >= range.start && position <= range.end,
-                    };
+                    let position = document.line_index.position(offset);
+                    let visible = position >= range.start && position <= range.end;
                     visible.then_some(InlayHint {
                         position,
                         label: InlayHintLabel::String(label),
@@ -2149,8 +3693,15 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            let data =
-                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+            // E121's keystroke path: the LANDED stream re-mapped through the
+            // two-sided anchor plus the edit window painted from syntax, in
+            // LIVE coordinates — so the encode goes through the LIVE index, not
+            // the analyzed one. That index switch IS the change: an answer that
+            // describes the buffer on screen has to be positioned against it.
+            let data = encode_semantic_tokens(
+                &document.keystroke_tokens(self.schedule.dependency_moved(&uri)),
+                &document.line_index,
+            );
             drop(document);
             let id = fresh_result_id();
             self.semantic_token_cache
@@ -2179,8 +3730,12 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            let data =
-                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+            // The same stream `semantic_tokens_full` answers with (E121), or
+            // the delta chain would compare two different pictures.
+            let data = encode_semantic_tokens(
+                &document.keystroke_tokens(self.schedule.dependency_moved(&uri)),
+                &document.line_index,
+            );
             drop(document);
             let id = fresh_result_id();
             // Swap the baseline for the new stream in one motion; the OLD
@@ -2228,27 +3783,85 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // Filter the ABSOLUTE tokens to the requested lines, then encode:
-            // the first kept token's delta is from the document start, which
-            // is exactly the encoding a range response specifies. Line
-            // granularity is what editors ask with (a viewport), and a token
-            // never spans lines (the encoder drops any that would).
-            let index = document.analyzed_index();
-            let start_line = params.range.start.line;
-            let end_line = params.range.end.line;
-            let tokens: Vec<_> = document
-                .semantic_tokens()
-                .into_iter()
-                .filter(|(span, _, _)| {
-                    let line = index.range(span).start.line;
-                    line >= start_line && line <= end_line
-                })
-                .collect();
-            let data = encode_semantic_tokens(&tokens, index);
+            // SLICE the captured stream to the requested lines, then encode:
+            // the first kept token's delta is from the document start, which is
+            // exactly the encoding a range response specifies. Line granularity
+            // is what editors ask with (a viewport), and a token never spans
+            // lines (the encoder drops any that would).
+            //
+            // E122: this used to compute the WHOLE file's stream and filter it
+            // — a whole-file walk of the program, plus a raw re-parse, plus one
+            // line lookup per token in the file — so twenty visible lines cost
+            // what the whole file cost (12.2 ms on kolt's `views.vl`,
+            // `proposal/editor-latency.md` §1.6). E121 moved `full` and the
+            // delta onto the captured stream but left THIS request on the walk,
+            // and the gate below measured it at 0.851× the whole file for a
+            // twenty-line window. The slice reads E121's own capture
+            // (`LandedSnapshot::tokens`) through the line index built beside it
+            // when the analysis landed — one capture, not a second memo of the
+            // same tokens.
+            //
+            // E125: LIVE coordinates, through the same two-sided anchor `full`
+            // answers through — because it is answering the same picture, and
+            // a viewport that disagreed with the full stream about where a
+            // token is is exactly the drift the keystroke path exists to
+            // remove. Slicing the capture in the ANALYZED snapshot's
+            // coordinates, which is what this did, left every token below an
+            // unlanded edit at the line it occupied before the edit until the
+            // next analysis landed — on the request an editor sends most.
+            let tokens = document.keystroke_tokens_in_lines(
+                params.range.start.line,
+                params.range.end.line,
+                false,
+            );
+            let data = encode_semantic_tokens(&tokens, &document.line_index);
             Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data,
             })))
+        })
+    }
+
+    /// E202 (R9): the `>` that closes a `<` the author opened in TYPE position.
+    ///
+    /// LIVE coordinates, in and out, for `linked_editing_range`'s reason: the
+    /// client sends the position it has just typed into and applies the edit to
+    /// the buffer it has now, so naming a position in the ANALYZED snapshot
+    /// would insert into whatever code had moved into those offsets during the
+    /// debounce. The decision itself reads the retained program (which names
+    /// are types), and that is a question about the last landing rather than
+    /// about the current keystroke.
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.fenced("onTypeFormatting", Ok(None), || {
+            // E222: a client that pairs `<` itself has said so, and a second
+            // `>` from here would be exactly the character it swallows once.
+            if params.ch == "<"
+                && self
+                    .config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .client_closes_generics
+            {
+                return Ok(None);
+            }
+            let uri = params.text_document_position.text_document.uri;
+            let position = params.text_document_position.position;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = document.line_index.offset(position);
+            let edits: Vec<TextEdit> = document
+                .on_type_edits(offset, &params.ch)
+                .into_iter()
+                .map(|(span, new_text)| TextEdit {
+                    range: document.line_index.range(&span),
+                    new_text,
+                })
+                .collect();
+            Ok((!edits.is_empty()).then_some(edits))
         })
     }
 
@@ -2262,15 +3875,23 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // Program-space lookup, like hover: the position converts through
-            // the ANALYZED index (S1).
-            let offset = document.analyzed_offset(position);
+            // LIVE coordinates, in and out (E132). `linked_tag_ranges` is a
+            // raw parse of the live buffer — no program data touches this
+            // answer — and the ranges it returns are handed straight back to
+            // the client as the pair it MIRRORS KEYSTROKES BETWEEN. Converting
+            // through the analyzed index (which is what this did, on the
+            // "program-space lookup, like hover" reading) named the tag's
+            // position in a text the user had already typed past: during the
+            // debounce the client happily mirrored into whatever live code had
+            // moved into those offsets. Hover's convention does not transfer,
+            // because hover only shows.
+            let offset = document.line_index.offset(position);
             Ok(document
                 .linked_tag_ranges(offset)
                 .map(|(open, close)| LinkedEditingRanges {
                     ranges: vec![
-                        document.analyzed_range(&open),
-                        document.analyzed_range(&close),
+                        document.line_index.range(&open),
+                        document.line_index.range(&close),
                     ],
                     word_pattern: None,
                 }))
@@ -2281,6 +3902,9 @@ impl LanguageServer for Backend {
         self.fenced("hover", Ok(None), || {
             let uri = params.text_document_position_params.text_document.uri;
             let position = params.text_document_position_params.position;
+            // M63: hover is a caret request and needs the program — focus this
+            // document, which re-analyzes it if it had been released.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -2309,6 +3933,8 @@ impl LanguageServer for Backend {
                     .collect();
                 return Ok(Some(CompletionResponse::Array(items)));
             }
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -2324,8 +3950,18 @@ impl LanguageServer for Backend {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .completion_function_call;
             let snippet_support = self.snippet_support.load(Ordering::Relaxed);
+            // E121 §2.1.4. The keystroke path's index answers FIRST, because it
+            // is the only source that knows what the live buffer declares: a
+            // `fun` typed one keystroke ago is in the index and cannot be in
+            // the landed analysis. The landed engine's candidates then fill in
+            // everything resolution alone can supply — members, keywords,
+            // snippets, auto-imports — and a label the index already offered is
+            // dropped rather than repeated. Retiring the engine's own
+            // whole-program sweeps behind the index (`auto_import_completions`,
+            // `modules_in_root`'s per-request `read_dir`) is the next tranche;
+            // this is the seam it happens at.
             let items = document
-                .completion(offset)
+                .keystroke_completion(offset, self.schedule.dependency_moved(&uri))
                 .into_iter()
                 .map(|completion| {
                     to_completion_item(completion, mode, snippet_support, &document.line_index)
@@ -2342,6 +3978,8 @@ impl LanguageServer for Backend {
         self.fenced("goto_definition", Ok(None), || {
             let uri = params.text_document_position_params.text_document.uri;
             let position = params.text_document_position_params.position;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -2359,6 +3997,8 @@ impl LanguageServer for Backend {
         self.fenced("references", Ok(None), || {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             // Every open document at once (kolt.local 034): the union below
             // re-resolves the definition in each neighbor's program, which is
             // what lets a query IN the defining file see the files that import
@@ -2389,6 +4029,8 @@ impl LanguageServer for Backend {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
             let new_name = params.new_name;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             // The same one-pass guard collection the references handler uses
             // (kolt.local 034): rename reads the same cross-document union, so
             // a rename issued at a definition rewrites the files that import it.
@@ -2414,13 +4056,17 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter(|entry| *entry.key() != uri)
                 .map(|entry| entry.value());
-            let spans = match document.rename_edits_across(offset, &new_name, neighbors) {
-                Ok(spans) => spans,
+            let edits = match document.rename_edits_across(offset, &new_name, neighbors) {
+                Ok(edits) => edits,
                 Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
                 Err(refusal) => return Err(rename_refused(&refusal)),
             };
             let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-            for (path, span) in spans {
+            // Each edit carries its OWN text (E143). It is `new_name` for every
+            // site that is a plain identifier — which is all of them but one —
+            // and the struct-init shorthand's expansion (`A { new = x }`) where
+            // the one identifier had to become two.
+            for (path, span, new_text) in edits {
                 // An occurrence that cannot be turned into a location would be a
                 // reference this rename silently skips — the partial edit set the
                 // rule forbids — so refuse rather than drop it.
@@ -2434,7 +4080,7 @@ impl LanguageServer for Backend {
                 };
                 changes.entry(location.uri).or_default().push(TextEdit {
                     range: location.range,
-                    new_text: new_name.clone(),
+                    new_text,
                 });
             }
             Ok(Some(WorkspaceEdit {
@@ -2453,6 +4099,8 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         self.fenced("prepare_rename", Ok(None), || {
             let uri = params.text_document.uri;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let open: Vec<_> = self.documents.iter().collect();
             let Some(origin) = open.iter().find(|entry| *entry.key() == uri) else {
                 return Ok(None);
@@ -2506,33 +4154,82 @@ impl LanguageServer for Backend {
         })
     }
 
+    /// E197: `reprint`, not `format`. A decline is a `window/showMessage`
+    /// (once per file per cause, [`formatting_decline_notice`]) instead of the
+    /// silent no-edit that read as success — the answer to the REQUEST is
+    /// unchanged, since there is genuinely nothing to edit.
+    ///
+    /// The toast is sent after `fenced` returns rather than from inside it: the
+    /// fence's closure is synchronous (that is what makes it a `catch_unwind`
+    /// seam), so the notice travels out beside the answer and is awaited here.
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
-        self.fenced("formatting", Err(handler_panicked()), || {
-            let uri = params.text_document.uri;
-            if let Ok(path) = uri.to_file_path()
-                && formatting_declined(&path)
+        let (answer, notice) = self.fenced("formatting", (Err(handler_panicked()), None), || {
+            let uri = params.text_document.uri.clone();
+            let path = uri.to_file_path().ok();
+            if let Some(path) = path.as_deref()
+                && formatting_declined(path)
             {
-                return Ok(None);
+                // Not a printer gap: a product under a declared `generated`
+                // root is deliberately not formatted, and saying so on every
+                // save would toast a file the developer only opened to read.
+                return (Ok(None), None);
             }
             let Some(document) = self.documents.get(&uri) else {
-                return Ok(None);
+                return (Ok(None), None);
             };
             let source = document.line_index.text();
-            let formatted = vilan_core::formatter::format(source);
-            // `format` returns the input unchanged when the file is already canonical
-            // or hits a construct it can't print (it never produces non-round-tripping
-            // output) — either way there is nothing to edit.
+            // E216: the package's own `[fmt]` knobs, from the same climb
+            // `vilan fmt` walks (E205) — without this, format-on-save was the
+            // one formatter in the toolchain that did not honour the key, so
+            // an opted-in package's comments wrapped from the command line and
+            // not from the editor. A buffer with no file path (an untitled
+            // document) keeps the defaults, which is what it had.
+            let options = match path.as_deref() {
+                Some(path) => {
+                    // E215 + E216 met at the merge: one walk answers both
+                    // `[fmt]` keys, so format-on-save fills at the package's
+                    // own width and not only when it opted in.
+                    let opinions = vilan_core::manifest::fmt_opinions_covering(path);
+                    vilan_core::formatter::FormatOptions {
+                        wrap_comments: opinions.wrap_comments.unwrap_or(false),
+                        comment_width: opinions
+                            .comment_width
+                            .unwrap_or(vilan_core::formatter::DEFAULT_COMMENT_WIDTH),
+                    }
+                }
+                None => vilan_core::formatter::FormatOptions::default(),
+            };
+            let formatted = match vilan_core::formatter::reprint_with(source, options) {
+                Ok(formatted) => formatted,
+                Err(decline) => {
+                    let notice =
+                        formatting_decline_notice(&self.formatting_declines, &uri, &decline);
+                    return (Ok(None), notice);
+                }
+            };
+            // A reprint that equals the source is an already-canonical file —
+            // now distinguishable from a decline, which is the whole item. It
+            // also clears the cause record, so a decline that comes BACK (the
+            // construct re-typed) is heard again.
+            self.formatting_declines.remove(&uri);
             if formatted == source {
-                return Ok(None);
+                return (Ok(None), None);
             }
             // Replace the whole document in one edit, from the start to the end
             // position the line index reports for the final byte.
             let end = document.line_index.position(source.len());
-            Ok(Some(vec![TextEdit {
-                range: Range::new(Position::new(0, 0), end),
-                new_text: formatted,
-            }]))
-        })
+            (
+                Ok(Some(vec![TextEdit {
+                    range: Range::new(Position::new(0, 0), end),
+                    new_text: formatted,
+                }])),
+                None,
+            )
+        });
+        if let Some(notice) = notice {
+            self.client.show_message(MessageType::WARNING, notice).await;
+        }
+        answer
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
@@ -2550,6 +4247,8 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
             let uri = params.text_document.uri;
+            // M63: a caret request, and one the program answers — focus it.
+            self.focus(&uri);
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
@@ -2630,18 +4329,76 @@ impl LanguageServer for Backend {
                     }
                 }));
             }
+            // E216: the comment run the caret is in, re-filled. A refactor
+            // rather than a source action for the css conversions' reason —
+            // it is offered on the construct the cursor is in — and, like
+            // them, it needs no `program`: a comment is trivia the lexer
+            // drops, so this reads the buffer's own text.
+            // The fill width is the package's `[fmt] comment_width` (E215),
+            // climbed from the buffer's path; the formatter's default for an
+            // untitled buffer.
+            let comment_width = uri
+                .to_file_path()
+                .ok()
+                .and_then(|path| vilan_core::manifest::fmt_opinions_covering(&path).comment_width)
+                .unwrap_or(vilan_core::formatter::DEFAULT_COMMENT_WIDTH);
+            if wants_refactor
+                && let Some((span, replacement)) =
+                    document.comment_reflow(live_span(&document, params.range), comment_width)
+            {
+                let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: document.line_index.range(&span),
+                        new_text: replacement,
+                    }],
+                );
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "Reflow this comment".to_string(),
+                    kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
             if let Some(program) = document.program.as_ref() {
                 if wants_quickfix {
                     let range = live_span(&document, params.range);
                     for fix in document.quickfixes(program, range) {
                         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-                        changes.insert(
-                            uri.clone(),
-                            vec![TextEdit {
-                                range: document.line_index.range(&fix.span),
-                                new_text: fix.replacement,
-                            }],
-                        );
+                        // E177: a fix may edit ANOTHER file — B318 §4/§5's
+                        // "Export `S`" inserts one word in front of a
+                        // declaration wherever it lives, which is usually a
+                        // sibling module. The target carries its own converted
+                        // RANGE, so this document's line index is never asked
+                        // about another file's span; a fix whose path has no
+                        // URL is dropped rather than applied here.
+                        match fix.target {
+                            Some(target) => {
+                                let Ok(target_uri) = Url::from_file_path(&target.path) else {
+                                    continue;
+                                };
+                                changes.insert(
+                                    target_uri,
+                                    vec![TextEdit {
+                                        range: target.range,
+                                        new_text: fix.replacement,
+                                    }],
+                                );
+                            }
+                            None => {
+                                changes.insert(
+                                    uri.clone(),
+                                    vec![TextEdit {
+                                        range: document.line_index.range(&fix.span),
+                                        new_text: fix.replacement,
+                                    }],
+                                );
+                            }
+                        }
                         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                             title: fix.title,
                             kind: Some(CodeActionKind::QUICKFIX),
@@ -2843,10 +4600,18 @@ mod snapshot_consistency_tests {
             semantic_token_cache: Arc::new(DashMap::new()),
             manifests: Arc::new(DashMap::new()),
             publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
-            pending: Arc::new(DashMap::new()),
+            schedule: Arc::new(Schedule::default()),
+            analyses: Arc::new(session_trace::AnalysisTally::default()),
             line_indices: Arc::new(DashMap::new()),
             config: Arc::new(std::sync::RwLock::new(Config::default())),
             snippet_support: Arc::new(AtomicBool::new(false)),
+            revision: Arc::new(AtomicU64::new(0)),
+            publish_gate: Arc::new(tokio::sync::Mutex::new(())),
+            package_unions: Arc::new(DashMap::new()),
+            package_revision: Arc::new(DashMap::new()),
+            union_tokens: Arc::new(DashMap::new()),
+            focus: Arc::new(std::sync::Mutex::new(Vec::new())),
+            formatting_declines: Arc::new(DashMap::new()),
         })
     }
 
@@ -2927,6 +4692,89 @@ mod snapshot_consistency_tests {
             changes[&uri].len(),
             2,
             "the declaration and its use are renamed",
+        );
+    }
+
+    // E133: `prepare_rename` with the caret at `name|` opens the rename box.
+    // A caret at the very end of a word is where it sits the moment the word
+    // is finished being typed, and the reference index's containment test was
+    // strictly half-open — so `at` answered `None`, `rename_edits` answered
+    // `NotAnIdentifier`, and this handler turned that into `Ok(None)`, which
+    // VS Code shows as "the element can't be renamed". The pin drives the real
+    // handler and asserts the RANGE it hands back, so an answer that merely
+    // stopped being `None` without naming the identifier still reds.
+    #[tokio::test]
+    async fn prepare_rename_answers_with_the_caret_at_the_end_of_the_name() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+        // `\tlet value = 1;` — the name spans characters 5..10 on line 1.
+        let name = Range::new(Position::new(1, 5), Position::new(1, 10));
+        for (label, character) in [("inside the name", 7), ("at `value|`", 10)] {
+            let answer = backend
+                .prepare_rename(TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(1, character),
+                })
+                .await
+                .expect("the handler never errors here")
+                .unwrap_or_else(|| panic!("{label}: `value` is renameable"));
+            assert_eq!(answer, PrepareRenameResponse::Range(name), "{label}");
+        }
+        // One byte further on is the space before `=`, and names nothing.
+        assert_eq!(
+            backend
+                .prepare_rename(TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(1, 11),
+                })
+                .await
+                .expect("the handler never errors here"),
+            None,
+        );
+        // And the rename itself agrees from the same caret — the standing rule
+        // that rename and find-references read one index, held at the offset
+        // that used to divide them.
+        let edit = backend
+            .rename(rename_params(&uri, Position::new(1, 10)))
+            .await
+            .expect("a rename from `value|`")
+            .expect("`value` is renameable");
+        assert_eq!(
+            edit.changes.expect("one file's edits")[&uri].len(),
+            2,
+            "the declaration and its use",
+        );
+    }
+
+    // E143: the handler carries a rename edit's OWN text. Every edit it emits
+    // used to be `new_name`, unconditionally, which is exactly why a
+    // struct-init shorthand could not be renamed at all — an expansion is not
+    // an identifier. The pin drives the real handler, because the expansion
+    // reaching the client is the whole deliverable and the document layer
+    // cannot prove it.
+    #[tokio::test]
+    async fn rename_at_a_shorthand_sends_the_expansion_as_the_edits_text() {
+        const SHORTHAND: &str = "struct A { x: i32 }\n\nfun main(): i32 {\n\tlet x = 1;\n\tlet a = A { x };\n\ta.x\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(SHORTHAND));
+        // `\tlet x = 1;` is line 3; the binding's name is at character 5.
+        let edit = backend
+            .rename(rename_params(&uri, Position::new(3, 5)))
+            .await
+            .expect("a rename at the local")
+            .expect("`x` is renameable");
+        let mut texts: Vec<String> = edit.changes.expect("one file's edits")[&uri]
+            .iter()
+            .map(|edit| edit.new_text.clone())
+            .collect();
+        texts.sort();
+        assert_eq!(
+            texts,
+            vec!["renamed".to_string(), "x = renamed".to_string()],
+            "the declaration takes the plain name, the shorthand takes the expansion",
         );
     }
 
@@ -3084,6 +4932,79 @@ mod snapshot_consistency_tests {
         assert_eq!(edits[0].new_text, "import pkg::topic::help_topic;\n");
     }
 
+    // E177, end to end: a quickfix whose edit belongs to ANOTHER FILE. Every
+    // action the server offered before this one edited the buffer it was
+    // invoked in, and the `WorkspaceEdit` it built was one map entry keyed on
+    // that buffer's own URI — so B318 §4/§5's "Export `S`" could not be an
+    // action at all, however well the paper described it. The claim here is
+    // the whole of what E177 changed: the change map is keyed on `a.vl`, not
+    // on `main.vl`, and the range in it was converted through `a.vl`'s own line
+    // index (which is what the `1` — the second line of `a.vl`, not of the open
+    // buffer — is asserting).
+    #[tokio::test]
+    async fn the_export_quickfix_edits_the_file_that_declares_the_item() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (dir, document) = crate::document::tests::analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("the reach warning's fixes are offered");
+        let export = response
+            .iter()
+            .find_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action) if action.title == "Export `hidden`" => {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Export action: {response:#?}"));
+        assert_eq!(export.kind, Some(CodeActionKind::QUICKFIX));
+        let changes = export
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .expect("a workspace edit");
+        assert_eq!(changes.len(), 1, "one file is edited: {changes:#?}");
+        let (edited, edits) = changes.iter().next().expect("the one entry");
+        assert_ne!(edited, &uri, "the edit does NOT belong to the open buffer");
+        assert!(
+            edited.path().ends_with("a.vl"),
+            "the edit belongs to the declaring file: {edited}"
+        );
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "export ");
+        assert_eq!(edits[0].range.start, edits[0].range.end, "an insertion");
+        assert_eq!(
+            edits[0].range.start,
+            Position::new(1, 0),
+            "line 1 column 0 of `a.vl` — that file's own coordinates"
+        );
+        // And the same-file fix is still offered beside it, unchanged.
+        assert!(
+            response.iter().any(|action| matches!(
+                action,
+                CodeActionOrCommand::CodeAction(action) if action.title == "Import as `#hidden`"
+            )),
+            "{response:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // css-block S5, end to end: the server's first `refactor.rewrite` action
     // is registered, routed, and carries its edit — through
     // `Backend::code_action` itself, and driven by where the CURSOR is rather
@@ -3093,7 +5014,7 @@ mod snapshot_consistency_tests {
     async fn the_css_spelling_refactor_is_offered_through_the_real_handler() {
         let (service, _socket) = backend();
         let backend = service.inner();
-        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay: flex;\n\t}\n}\n";
+        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t}\n}\n";
         let (_dir, document) = crate::document::tests::analyze_workspace(&[("main.vl", source)]);
         let cursor = document
             .line_index
@@ -3307,11 +5228,25 @@ mod snapshot_consistency_tests {
     }
 
     // S1/S3: read-only queries never refuse — they answer
-    // correctly-for-the-snapshot. Semantic tokens over a stale buffer come back
-    // byte-identical to the pre-edit answer, which is what stops the
-    // highlighting from breaking up while the analysis catches up.
+    // correctly-for-the-snapshot.
+    //
+    // **E121 (RULED 2026-09-01) narrows what "the snapshot" means for this one
+    // handler, and this pin is rewritten to the narrower rule.** S1's original
+    // claim was that the whole token stream comes back byte-identical to the
+    // pre-edit answer — the highlighting holds still for the full staleness
+    // window, measured at 409 ms on the fast file and 1.1 s on the slow one
+    // (`proposal/editor-latency.md` §1.5). Q5 rules that out: *"commenting a
+    // line out must read as a comment at once, not keep its semantic colors for
+    // the staleness window"*. The keystroke path therefore repaints the EDIT
+    // WINDOW from syntax on every keystroke and re-maps everything outside it
+    // through the two-sided anchor.
+    //
+    // So the property this pin now holds is the sharper, true one: **the
+    // anchors hold still and the window tracks the buffer.** Nothing is lost,
+    // no classification changes, and the only movement is the edited line's own
+    // token following the character that was typed in front of it.
     #[tokio::test]
-    async fn semantic_tokens_answer_the_analyzed_snapshot_while_typing() {
+    async fn semantic_tokens_track_the_edit_window_and_anchor_the_rest() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = uri();
@@ -3334,19 +5269,49 @@ mod snapshot_consistency_tests {
             .semantic_tokens_full(params)
             .await
             .expect("tokens while typing");
-        // The DATA holds still; the `result_id` is fresh per response by
-        // design (B39b's delta chain), so the comparison names the claim.
+        // The `result_id` is fresh per response by design (B39b's delta chain),
+        // so the comparison names the data.
         let data_of = |answer: Option<SemanticTokensResult>| match answer {
             Some(SemanticTokensResult::Tokens(tokens)) => tokens.data,
             other => panic!("the full provider returns tokens, got {other:?}"),
         };
         let baseline = data_of(baseline);
-        assert_eq!(
-            baseline,
-            data_of(mid_edit),
-            "the answer holds still until the analysis lands",
-        );
+        let mid_edit = data_of(mid_edit);
         assert!(!baseline.is_empty(), "the fixture must produce tokens");
+        assert_eq!(
+            baseline.len(),
+            mid_edit.len(),
+            "no token may be lost mid-keystroke: the window repaints from syntax and the \
+             anchors re-map, so the stream keeps its shape",
+        );
+        // `EDITED` inserts one space on line 0, so `main` — the only token in
+        // the edit window — starts one column later, and its CLASS is
+        // unchanged because syntax alone decides that an identifier after `fun`
+        // is a function declaration.
+        assert_eq!(
+            (
+                mid_edit[0].delta_line,
+                mid_edit[0].delta_start,
+                mid_edit[0].token_type,
+                mid_edit[0].token_modifiers_bitset,
+            ),
+            (
+                baseline[0].delta_line,
+                baseline[0].delta_start + 1,
+                baseline[0].token_type,
+                baseline[0].token_modifiers_bitset,
+            ),
+            "the token in the edit window must follow the character typed in front of it",
+        );
+        // Everything below the edited line rode the anchor: the encoding is
+        // relative, and byte-identical text at a constant shift encodes
+        // identically.
+        assert_eq!(
+            &baseline[1..],
+            &mid_edit[1..],
+            "every token outside the edit window sits on byte-identical text, so its answer \
+             is exact and unmoved",
+        );
     }
 
     // S1: inlay hints, same property — and the viewport filter is what made
@@ -3975,7 +5940,7 @@ mod snapshot_consistency_tests {
             other => panic!("the array form is expected, got {other:?}"),
         };
         assert!(
-            labels.contains(&"bind_each".to_string()) && labels.contains(&"text".to_string()),
+            labels.contains(&"bind_text".to_string()) && labels.contains(&"text".to_string()),
             "the View chain's methods: {labels:?}",
         );
         assert!(
@@ -4081,6 +6046,53 @@ mod snapshot_consistency_tests {
             SOURCE,
             "the snapshot stays consistent at the last adopted analysis",
         );
+    }
+
+    // E117, the ghost diagnostic. The two guards above are both text
+    // comparisons, and text is exactly what a DEPENDENT's buffer does not
+    // change: an edit in a module it imports leaves this file byte-identical,
+    // so both of its in-flight analyses match the live text and both land — in
+    // whichever order they finish. The one that read the module mid-edit could
+    // therefore land, and publish, after the one that read it restored, which
+    // is the error that flashes back after a comment/uncomment round trip. The
+    // world revision each analysis READ is what separates them.
+    #[test]
+    fn an_analysis_of_an_older_world_is_dropped_though_its_text_still_matches() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        documents.insert(uri.clone(), document(SOURCE));
+        // The analysis that read the RESTORED world finishes first.
+        let mut newer = document(SOURCE);
+        newer.stamp_analysis(5);
+        assert!(land(&documents, &uri, newer), "the later world lands");
+        // The one that read the module mid-edit finishes second.
+        let mut older = document(SOURCE);
+        older.stamp_analysis(3);
+        assert!(
+            !land(&documents, &uri, older),
+            "an older world is dropped even though the buffer never moved",
+        );
+        assert_eq!(
+            documents.get(&uri).expect("still open").analysis_revision(),
+            5,
+            "the adopted snapshot is not regressed to the superseded world",
+        );
+    }
+
+    // …and the ordering is STRICT on older only: two analyses stamped with the
+    // same world say the same thing, and a dependents' sweep legitimately
+    // re-runs a document within one world. Dropping an equal stamp would make
+    // that sweep a no-op and leave the dependent's diagnostics stale.
+    #[test]
+    fn an_analysis_of_the_same_world_still_lands() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        let mut opened = document(SOURCE);
+        opened.stamp_analysis(4);
+        documents.insert(uri.clone(), opened);
+        let mut resweep = document(SOURCE);
+        resweep.stamp_analysis(4);
+        assert!(land(&documents, &uri, resweep));
     }
 }
 
@@ -4198,27 +6210,327 @@ mod cross_document_reach_tests {
     }
 }
 
+/// The retained-world byte budget knob (M24), read once at server start and
+/// named beside the other `VILAN_*` instruments (`VILAN_PHASE_TIMING`,
+/// `VILAN_LEAK_REPORT`, `VILAN_LEAK_SOAK_WINDOW`): the value is MEBIBYTES,
+/// because that is the unit anyone reasoning about a language server's
+/// footprint reaches for, and `0` is honoured as "retain nothing but the
+/// world just stored" rather than rejected — a legitimate way to take the
+/// cache out of a measurement.
+///
+/// The default lives in the compiler (`BASE_CACHE_DEFAULT_BUDGET`), so a
+/// front end that never sets it gets the bound anyway. A value that does not
+/// parse is a typo, not a policy: it is reported on stderr and the default
+/// stands.
+///
+/// M50: the number here is MEBIBYTES OF MEMORY, and the cache's own budget is
+/// spent in the currency its retained-bytes counter records — 24× smaller.
+/// `base_cache_budget_for_resident` is the one conversion between them; before
+/// it, this knob set a bound 24× looser than the number it printed.
+const BASE_CACHE_BUDGET_ENV: &str = "VILAN_BASE_CACHE_BUDGET_MIB";
+
+fn apply_base_cache_budget_from_env() {
+    let Ok(value) = std::env::var(BASE_CACHE_BUDGET_ENV) else {
+        return;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    match value.parse::<usize>() {
+        Ok(mebibytes) => {
+            let bytes = mebibytes.saturating_mul(1024 * 1024);
+            let recorded = vilan_core::analyzer::base_cache_budget_for_resident(bytes);
+            vilan_core::analyzer::set_base_cache_budget(recorded);
+            eprintln!(
+                "[vilan lsp] base-cache budget set to {mebibytes} MiB resident \
+                 ({recorded} recorded bytes)"
+            );
+        }
+        Err(_) => eprintln!(
+            "[vilan lsp] ignoring {BASE_CACHE_BUDGET_ENV}={value:?}: expected a whole number of \
+             mebibytes; the default of {} MiB stands",
+            vilan_core::analyzer::BASE_CACHE_RESIDENT_BUDGET / (1024 * 1024),
+        ),
+    }
+}
+
+/// M24: the budget knob is read once, in mebibytes, and a typo does not
+/// silently reconfigure the cache.
+#[cfg(test)]
+mod base_cache_budget_knob {
+    /// Sets or clears the knob for the duration of one assertion. The whole
+    /// process belongs to this test under nextest, so the environment is not
+    /// shared with anything.
+    fn with_knob(value: Option<&str>, body: impl FnOnce()) {
+        // SAFETY: nextest runs each test in its own process, and nothing else
+        // in this one reads the environment concurrently.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(super::BASE_CACHE_BUDGET_ENV, value),
+                None => std::env::remove_var(super::BASE_CACHE_BUDGET_ENV),
+            }
+        }
+        body();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(super::BASE_CACHE_BUDGET_ENV) };
+    }
+
+    #[test]
+    fn the_budget_knob_reads_mebibytes_and_a_typo_leaves_the_default() {
+        let default = vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET;
+        vilan_core::analyzer::set_base_cache_budget(default);
+
+        with_knob(None, || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                default,
+                "an unset knob leaves the compiler's default in force"
+            );
+        });
+
+        with_knob(Some("7"), || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                vilan_core::analyzer::base_cache_budget_for_resident(7 * 1024 * 1024),
+                "the knob is read in MEBIBYTES of memory, and converted into the \
+                 currency the budget is spent in (M50)"
+            );
+        });
+
+        vilan_core::analyzer::set_base_cache_budget(default);
+        with_knob(Some("512MiB"), || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                default,
+                "a value that does not parse is a typo, not a policy"
+            );
+        });
+
+        with_knob(Some("0"), || {
+            super::apply_base_cache_budget_from_env();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_budget(),
+                0,
+                "zero is honoured — a legitimate way to take the cache out of \
+                 a measurement"
+            );
+        });
+
+        vilan_core::analyzer::set_base_cache_budget(default);
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    apply_base_cache_budget_from_env();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(|client| Backend {
+    // E222: the one custom request, beside the standard surface.
+    let (service, socket) = LspService::build(|client| Backend {
         client,
         documents: Arc::new(DashMap::new()),
         semantic_token_cache: Arc::new(DashMap::new()),
         manifests: Arc::new(DashMap::new()),
         publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
-        pending: Arc::new(DashMap::new()),
+        schedule: Arc::new(Schedule::default()),
+        analyses: Arc::new(session_trace::AnalysisTally::default()),
         line_indices: Arc::new(DashMap::new()),
         config: Arc::new(std::sync::RwLock::new(Config::default())),
         snippet_support: Arc::new(AtomicBool::new(false)),
-    });
+        revision: Arc::new(AtomicU64::new(0)),
+        publish_gate: Arc::new(tokio::sync::Mutex::new(())),
+        package_unions: Arc::new(DashMap::new()),
+        package_revision: Arc::new(DashMap::new()),
+        union_tokens: Arc::new(DashMap::new()),
+        focus: Arc::new(std::sync::Mutex::new(Vec::new())),
+        formatting_declines: Arc::new(DashMap::new()),
+    })
+    .custom_method(OPENS_A_GENERIC_LIST, Backend::opens_a_generic_list)
+    .custom_method(ANALYSIS_PLATFORM, Backend::analysis_platform)
+    .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
 /// B39b: the delta path's protocol contract — a full answer carries a
 /// `result_id`, a delta request echoing it gets EDITS (zero for an unchanged
 /// document), and an unknown baseline re-synchronizes with a full stream.
+/// E222: a client that pairs `<` itself declares it, and the server then
+/// answers the QUESTION and stops placing the `>` — while every other client
+/// keeps today's `onTypeFormatting` edit. Driven through the real `Backend`,
+/// because the stand-down is the handler's, not the document's.
+#[cfg(test)]
+mod generic_pairing_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// `List<` just typed: the caret one past the `<`, on line 1.
+    const TYPED: &str = "fun main() {\n\tlet xs: List<\n}\n";
+    /// The caret sits after `\tlet xs: List<` — fourteen characters in.
+    const CARET: Position = Position {
+        line: 1,
+        character: 14,
+    };
+
+    fn open(backend: &Backend, text: &str) -> Url {
+        let uri = Url::parse("file:///pairing/main.vl").expect("a url");
+        backend.documents.insert(
+            uri.clone(),
+            Document::analyze(text, &std_root(), Path::new("pairing.vl")),
+        );
+        uri
+    }
+
+    fn typed_params(uri: &Url, ch: &str) -> DocumentOnTypeFormattingParams {
+        DocumentOnTypeFormattingParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: CARET,
+            },
+            ch: ch.to_string(),
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn declare(backend: &Backend, settings: serde_json::Value) {
+        *backend
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Config::from_settings(&settings);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_declares_nothing_keeps_the_on_type_edit() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, TYPED);
+        let edits = backend
+            .on_type_formatting(typed_params(&uri, "<"))
+            .await
+            .expect("answers")
+            .expect("the `>` for `List<`");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ">");
+        assert_eq!(edits[0].range, Range::new(CARET, CARET));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_closes_generics_itself_gets_no_on_type_edit() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, TYPED);
+        declare(
+            backend,
+            serde_json::json!({ "autoClosing": { "generics": true } }),
+        );
+        assert_eq!(
+            backend
+                .on_type_formatting(typed_params(&uri, "<"))
+                .await
+                .expect("answers"),
+            None,
+            "the client places the `>` itself; a second one from here is the \
+             character it swallows once and the author deletes by hand"
+        );
+        // …and a client that turns its override OFF (the setting, live) gets
+        // the edit back.
+        declare(
+            backend,
+            serde_json::json!({ "vilan": { "autoClosing": { "generics": false } } }),
+        );
+        assert!(
+            backend
+                .on_type_formatting(typed_params(&uri, "<"))
+                .await
+                .expect("answers")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_question_is_the_on_type_rule() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        // Declared or not, the question answers — it is the client's to ask.
+        declare(
+            backend,
+            serde_json::json!({ "autoClosing": { "generics": true } }),
+        );
+        for (text, position, expected) in [
+            (TYPED, CARET, true),
+            // The comparison the whole item turns on.
+            (
+                "fun main() {\n\tlet a = 1;\n\tlet _c = a <\n}\n",
+                Position::new(2, 13),
+                false,
+            ),
+            // A declaration's own list, which the program cannot know yet.
+            ("struct Pair<\n", Position::new(0, 12), true),
+        ] {
+            let uri = open(backend, text);
+            let answer = backend
+                .opens_a_generic_list(TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                })
+                .await
+                .expect("answers");
+            assert_eq!(answer, expected, "{text:?}");
+        }
+    }
+
+    /// F27 R1/R6: the status line's request answers from the document's last
+    /// analysis, and `null` for a document the server does not have.
+    #[tokio::test]
+    async fn the_status_lines_request_names_the_platform_and_why() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(
+            backend,
+            "[platform(\"browser\")] mod self;\n\nfun main() {}\n",
+        );
+        let answer = backend
+            .analysis_platform(TextDocumentIdentifier { uri })
+            .await
+            .expect("answers")
+            .expect("an analysed document");
+        assert_eq!(answer["platform"], "browser");
+        assert_eq!(answer["kind"], "declared");
+        assert_eq!(answer["reason"], "it declares `[platform(\"browser\")]`");
+        let nothing = backend
+            .analysis_platform(TextDocumentIdentifier {
+                uri: Url::parse("file:///nowhere.vl").expect("a url"),
+            })
+            .await
+            .expect("answers");
+        assert_eq!(nothing, None);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_document_answers_no() {
+        let (service, _socket) = backend();
+        let answer = service
+            .inner()
+            .opens_a_generic_list(TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: Url::parse("file:///nowhere.vl").expect("a url"),
+                },
+                position: Position::new(0, 0),
+            })
+            .await
+            .expect("answers");
+        assert!(!answer, "no document, no `>`");
+    }
+}
+
 #[cfg(test)]
 mod semantic_token_delta_protocol_tests {
     use super::snapshot_consistency_tests::{SOURCE, backend, open_with_live_edit};
@@ -4336,6 +6648,391 @@ mod semantic_token_delta_protocol_tests {
                 .iter()
                 .all(|token| token.delta_line == 0),
             "everything answered sits on the requested line"
+        );
+    }
+}
+
+/// E122: `semantic_tokens_range` — the request an editor sends most, because it
+/// is the VIEWPORT one — used to compute the whole file's token stream and then
+/// filter it by line, so twenty visible lines cost exactly what the whole file
+/// cost (12.2 ms on kolt's `views.vl`, `proposal/editor-latency.md` §1.6).
+///
+/// E121's keystroke path moved `full` and the delta onto the analysis's own
+/// capture and left THIS request on the walk, so the cost survived the
+/// keystroke path intact: on the merged tree, before this fold, the gate below
+/// read **0.851×** (20 lines 1752.71 ms, whole file 2059.89 ms of thread CPU
+/// over 40 rounds, 12,000 tokens, loadavg 1.29). The request now SLICES E121's
+/// capture (`LandedSnapshot::tokens`) through the line index built beside it
+/// when the analysis landed — one capture, one invalidation point
+/// (`Document::adopt_analysis`), no second memo of the same tokens.
+///
+/// E125 then moved the request's COORDINATES: it now answers through the same
+/// two-sided anchor `full` does, so a viewport is the window of `full`'s own
+/// stream instead of a second picture positioned against the analyzed snapshot.
+///
+/// Four pins over three halves of the claim. The answer did not change:
+/// byte-identical to the filter it replaces over every window shape, and
+/// byte-identical across an adoption that retains B38's salvage tail — the one
+/// shape a single analysis cannot reach, and the one the fold had to repair to
+/// serve `full` and `range` from a single capture. The answer FOLLOWS THE
+/// BUFFER: a viewport below an unlanded edit is `full`'s window byte for byte,
+/// and is not what the pre-E125 mechanism answered. And the cost follows the
+/// WINDOW rather than the file.
+#[cfg(test)]
+mod semantic_token_range_cost_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// A module of `functions` four-line functions — the synthetic series
+    /// `editor-latency.md` §1.4 scales with, in one file, so the token stream
+    /// is large and the viewport is a fixed twenty lines of it.
+    fn synthetic_module(functions: usize) -> String {
+        let mut text = String::with_capacity(functions * 60);
+        for index in 0..functions {
+            text.push_str(&format!(
+                "fun subject_{index}(input: i32): i32 {{\n\tlet doubled = input + input;\n\tdoubled\n}}\n"
+            ));
+        }
+        text
+    }
+
+    fn open(backend: &Backend, text: &str) -> Url {
+        let uri = Url::parse("file:///range/subject.vl").expect("a url");
+        backend.documents.insert(
+            uri.clone(),
+            Document::analyze(text, &std_root(), Path::new("subject.vl")),
+        );
+        uri
+    }
+
+    async fn range(backend: &Backend, uri: &Url, first: u32, last: u32) -> Vec<SemanticToken> {
+        let answer = backend
+            .semantic_tokens_range(SemanticTokensRangeParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(first, 0), Position::new(last, 0)),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("a range answer");
+        let SemanticTokensRangeResult::Tokens(tokens) = answer else {
+            panic!("expected tokens");
+        };
+        tokens.data
+    }
+
+    /// The calling thread's CPU time — the cycles it was actually given, not
+    /// the time that passed (backlog M15, `perf_baseline.rs`'s clock). A ratio
+    /// on wall clock is a claim about the compiler only on an idle machine, and
+    /// this one is gated on a box that runs a dozen lanes at once.
+    #[cfg(unix)]
+    fn thread_cpu_now() -> Option<Duration> {
+        let mut timespec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `clock_gettime` writes the `timespec` we hand it and reads
+        // nothing else; the pointer is to a live local.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timespec) };
+        (result == 0).then(|| {
+            Duration::new(
+                timespec.tv_sec.max(0) as u64,
+                timespec.tv_nsec.clamp(0, 999_999_999) as u32,
+            )
+        })
+    }
+
+    /// Every other host: no thread CPU clock, so the gate below says so and
+    /// asserts nothing rather than asserting on wall time.
+    #[cfg(not(unix))]
+    fn thread_cpu_now() -> Option<Duration> {
+        None
+    }
+
+    fn loadavg_1m() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| text.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// Half one: the answer is unchanged. The expected stream is written the
+    /// way the handler used to compute it — the WHOLE stream, filtered by the
+    /// start line of each token, then encoded — so this compares the slice
+    /// against the filter it replaced, byte for byte, over windows that start
+    /// mid-file, end past the end, land on a line with no tokens, and cover
+    /// everything.
+    #[tokio::test]
+    async fn a_window_answers_byte_for_byte_what_filtering_the_full_stream_answers() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let text = synthetic_module(40);
+        let uri = open(backend, &text);
+
+        for (first, last) in [(0, 0), (0, 19), (7, 7), (12, 31), (100, 400), (0, 100_000)] {
+            let sliced = range(backend, &uri, first, last).await;
+            let expected = {
+                let document = backend.documents.get(&uri).expect("open");
+                let index = document.analyzed_index();
+                let filtered: Vec<_> = document
+                    .semantic_tokens()
+                    .into_iter()
+                    .filter(|(span, _, _)| {
+                        let line = index.range(span).start.line;
+                        line >= first && line <= last
+                    })
+                    .collect();
+                encode_semantic_tokens(&filtered, index)
+            };
+            assert_eq!(
+                sliced, expected,
+                "lines {first}..={last}: the slice and the filter must answer identically",
+            );
+        }
+        // Non-vacuous: the windows above are not all the same answer.
+        let narrow = range(backend, &uri, 0, 3).await;
+        let whole = range(backend, &uri, 0, 100_000).await;
+        assert!(
+            !narrow.is_empty() && narrow.len() < whole.len(),
+            "the fixture must have tokens inside AND outside the narrow window \
+             ({} vs {})",
+            narrow.len(),
+            whole.len(),
+        );
+    }
+
+    /// The same equality through the shape the handler cannot reach by
+    /// analyzing once: a document that has ADOPTED a truncating analysis and
+    /// is serving B38's salvage tail. The tail is folded into the capture at
+    /// adoption (`Document::adopt_analysis`), so the slice covers it; without
+    /// that fold the handler would answer nothing below the break while the
+    /// filter answered the salvaged tokens.
+    #[tokio::test]
+    async fn a_window_answers_the_filter_across_a_salvaged_adoption() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        // An unterminated interpolated triple-quoted string: the lexer stops
+        // there, so the analysis is truncated to a prefix and the byte-identical
+        // tail below it is what B38 retains.
+        let broken = "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let uri = open(backend, whole);
+        {
+            let mut document = backend.documents.get_mut(&uri).expect("open");
+            document.adopt_analysis(Document::analyze(
+                broken,
+                &std_root(),
+                Path::new("subject.vl"),
+            ));
+            // The state a server is actually in once that analysis lands: the
+            // buffer holds the text it ran on. E125 answers a viewport against
+            // the LIVE buffer, so leaving the document with `whole` in it and
+            // `broken` analyzed would compare a live answer with an analyzed
+            // filter — a difference about the ANCHOR, which is the next pin's
+            // subject, not this one's. Here the two coincide and the equality
+            // is about the salvage fold alone.
+            document.set_text(broken);
+        }
+
+        for (first, last) in [(0, 0), (4, 4), (3, 5), (0, 100_000)] {
+            let sliced = range(backend, &uri, first, last).await;
+            let expected = {
+                let document = backend.documents.get(&uri).expect("open");
+                let index = document.analyzed_index();
+                let filtered: Vec<_> = document
+                    .semantic_tokens()
+                    .into_iter()
+                    .filter(|(span, _, _)| {
+                        let line = index.range(span).start.line;
+                        line >= first && line <= last
+                    })
+                    .collect();
+                encode_semantic_tokens(&filtered, index)
+            };
+            assert_eq!(
+                sliced, expected,
+                "lines {first}..={last}: the slice and the filter must answer \
+                 identically across a salvaged adoption",
+            );
+        }
+        // Non-vacuous: line 4 is `let zeta = 9;`, below the break, and it is
+        // ANSWERED — that is the salvage this pin is about.
+        assert!(
+            !range(backend, &uri, 4, 4).await.is_empty(),
+            "the salvaged tail line must still be painted, or the equality \
+             above holds because both sides are empty",
+        );
+    }
+
+    /// E125: a viewport answered after an UNLANDED EDIT ABOVE IT agrees with
+    /// `semanticTokens/full`'s own window, byte for byte.
+    ///
+    /// This is the drift the keystroke path exists to remove, on the request an
+    /// editor sends most. `full` re-serves the landed capture through the
+    /// two-sided anchor, so it is positioned against the buffer on screen;
+    /// `range` sliced the same capture by ANALYZED line and encoded it against
+    /// the analyzed index, so every token below an inserted line was painted
+    /// one line high until the next analysis landed. Two requests, one
+    /// capture, two pictures.
+    ///
+    /// The edit is a whole line inserted inside a function BODY, which is the
+    /// shape the anchor is built for: the declaration-shape stamp does not
+    /// move, so the verdict is `Exact` and the landed classification below the
+    /// edit is still true — it has only moved down a line.
+    ///
+    /// **Non-vacuous by construction**: the pre-E125 mechanism is computed
+    /// beside the answer (the capture sliced by analyzed line, encoded against
+    /// the analyzed index) and asserted to DIFFER. If the anchor ever became a
+    /// no-op here, that assertion reds before the equality does.
+    #[tokio::test]
+    async fn a_viewport_follows_an_unlanded_edit_above_it() {
+        const FUNCTIONS: usize = 40;
+        // The viewport, in LIVE lines — far enough below the edit that every
+        // token in it comes from the anchor's TAIL.
+        const FIRST: u32 = 100;
+        const LAST: u32 = 119;
+
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let analyzed = synthetic_module(FUNCTIONS);
+        let uri = open(backend, &analyzed);
+        // One line typed into the FIRST function's body, above the viewport.
+        let live = analyzed.replacen(
+            "\tlet doubled = input + input;\n",
+            "\tlet doubled = input + input;\n\tlet spare = input;\n",
+            1,
+        );
+        assert_eq!(
+            live.lines().count(),
+            analyzed.lines().count() + 1,
+            "the edit must add exactly one line above the viewport",
+        );
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+
+        let sliced = range(backend, &uri, FIRST, LAST).await;
+        let (full_window, stale_mechanism) = {
+            let document = backend.documents.get(&uri).expect("open");
+            let live_index = &document.line_index;
+            let window: Vec<_> = document
+                .keystroke_tokens(false)
+                .into_iter()
+                .filter(|(span, ..)| {
+                    let line = live_index.range(span).start.line;
+                    (FIRST..=LAST).contains(&line)
+                })
+                .collect();
+            // The pre-E125 mechanism, written the way its own pins write it:
+            // the capture selected by ANALYZED line and encoded against the
+            // analyzed index.
+            let analyzed_index = document.analyzed_index();
+            let stale: Vec<_> = document
+                .semantic_tokens()
+                .into_iter()
+                .filter(|(span, ..)| {
+                    let line = analyzed_index.range(span).start.line;
+                    (FIRST..=LAST).contains(&line)
+                })
+                .collect();
+            (
+                encode_semantic_tokens(&window, live_index),
+                encode_semantic_tokens(&stale, analyzed_index),
+            )
+        };
+        assert!(
+            !sliced.is_empty(),
+            "the viewport must hold tokens, or the equality below is vacuous",
+        );
+        assert_eq!(
+            sliced, full_window,
+            "a viewport after an unlanded edit above it must be exactly \
+             `full`'s window — one capture, one picture (E125)",
+        );
+        assert_ne!(
+            sliced, stale_mechanism,
+            "the pre-E125 mechanism — the capture sliced by ANALYZED line — \
+             answered the same bytes here, so this pin proves nothing about \
+             the anchor",
+        );
+    }
+
+    /// Half two: the cost follows the window. Same handler, same document, same
+    /// warm stream — only the window differs, and a twenty-line viewport must
+    /// cost a small fraction of the whole file.
+    ///
+    /// Non-vacuous, measured on both sides of the fold on the MERGED tree:
+    /// planting the pre-fold mechanism — the walk plus a per-token line
+    /// filter, which is what E121's keystroke path left this one request on —
+    /// reads **0.851×** (20 lines 1752.71 ms, whole file 2059.89 ms of thread
+    /// CPU over 40 rounds, loadavg 1.29), and the slice reads **0.003×**
+    /// (0.98 ms vs 286.26 ms). The 0.25 bound sits between two MECHANISMS, not two
+    /// tunings: no recompute-then-filter form can get under it, and the slice
+    /// has forty times the headroom it needs.
+    #[tokio::test]
+    async fn a_viewport_costs_the_viewport_and_not_the_file() {
+        const FUNCTIONS: usize = 1_500;
+        const ROUNDS: usize = 40;
+        const BOUND: f64 = 0.25;
+
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let text = synthetic_module(FUNCTIONS);
+        let lines = text.lines().count() as u32;
+        let uri = open(backend, &text);
+        // Warm the per-analysis stream, so what follows measures SERVING a
+        // window and not building the stream. An editor's first request pays
+        // this once per analysis whatever window it asks for; every request
+        // after it is what this gate is about.
+        let all = range(backend, &uri, 0, lines).await;
+        assert!(
+            all.len() > FUNCTIONS * 4,
+            "the synthetic module must produce a large stream for the ratio to \
+             mean anything (got {})",
+            all.len(),
+        );
+
+        let Some(start) = thread_cpu_now() else {
+            println!("PERF-SCALE semantic_tokens_range clock=none: no thread CPU clock, not gated");
+            return;
+        };
+        for _ in 0..ROUNDS {
+            let _ = range(backend, &uri, 100, 119).await;
+        }
+        let viewport = thread_cpu_now().expect("the clock does not disappear") - start;
+        let start = thread_cpu_now().expect("the clock does not disappear");
+        for _ in 0..ROUNDS {
+            let _ = range(backend, &uri, 0, lines).await;
+        }
+        let file = thread_cpu_now().expect("the clock does not disappear") - start;
+
+        let ratio = viewport.as_secs_f64() / file.as_secs_f64().max(f64::MIN_POSITIVE);
+        println!(
+            "PERF-SCALE semantic_tokens_range clock=thread load={} \
+             {FUNCTIONS} functions / {lines} lines / {} tokens, {ROUNDS} rounds: \
+             20 lines = {:.2} ms, whole file = {:.2} ms, ratio {ratio:.3}×",
+            loadavg_1m(),
+            all.len(),
+            viewport.as_secs_f64() * 1000.0,
+            file.as_secs_f64() * 1000.0,
+        );
+        assert!(
+            file > Duration::ZERO,
+            "the whole-file measurement read zero, so the ratio means nothing",
+        );
+        assert!(
+            ratio <= BOUND,
+            "a 20-line viewport cost {ratio:.3}× the whole file ({:.2} ms vs \
+             {:.2} ms of thread CPU over {ROUNDS} rounds, loadavg {}), over the \
+             {BOUND} bound: the range request is paying for the file again \
+             (editor-latency.md §1.6, E122)",
+            viewport.as_secs_f64() * 1000.0,
+            file.as_secs_f64() * 1000.0,
+            loadavg_1m(),
         );
     }
 }
@@ -4498,6 +7195,34 @@ mod incremental_sync_tests {
     }
 }
 
+/// How long a language-server test may wait for an ANALYSIS to land before it
+/// calls the server stuck.
+///
+/// A LIVENESS bound, not a performance assertion: no pin that reads it claims
+/// an analysis is fast, only that it arrives without a restart. So the number
+/// only has to be too large for a healthy analysis and finite for a stuck one,
+/// and a green run never pays it — every reader polls and returns the moment
+/// its condition holds.
+///
+/// The recolor pins' version of it was 10 s (200 × 50 ms), and 10 s is not too
+/// large for a healthy sweep (tracker N46): the recolor is a real re-analysis
+/// of a real package on a blocking thread, it costs 13.8 s for the whole pin on
+/// an idle box, and two sibling lanes' unions turned it red under ten-lane load
+/// while the same pin PASSED at 19.7 s at loadavg ~85 and passes on CI. That is
+/// E39/E40's disease exactly — `WATCH_LIVENESS` was raised 20 s → 120 s →
+/// 300 s for it, one strike at a time — so this takes 300 s at once, for the
+/// same recorded reason: the whole point of the bound is to catch work that
+/// never fires, and the machine's speed is not what any of these pins is about.
+///
+/// It is ONE constant because it is one claim. E123 made `did_open` schedule
+/// its first analysis instead of running it on the notification handler, which
+/// gave three more pins a wall-clock wait of exactly this shape (an open's own
+/// analysis, on a blocking thread, on the same box); giving them their own
+/// numbers would have been three more claims about how long an analysis may
+/// take, and none of them makes such a claim.
+#[cfg(test)]
+const ANALYSIS_LIVENESS: Duration = Duration::from_secs(300);
+
 /// E106: the scripted session — an open/edit/close loop driven straight through
 /// the server's own handlers, asserting that every retained map comes back to
 /// where it started.
@@ -4524,7 +7249,7 @@ mod session_leak_tests {
 
     const PROGRAM: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
 
-    fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
+    pub(crate) fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
         DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
@@ -4535,7 +7260,11 @@ mod session_leak_tests {
         }
     }
 
-    fn whole_file_change(uri: &Url, version: i32, text: &str) -> DidChangeTextDocumentParams {
+    pub(crate) fn whole_file_change(
+        uri: &Url,
+        version: i32,
+        text: &str,
+    ) -> DidChangeTextDocumentParams {
         DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: uri.clone(),
@@ -4549,13 +7278,39 @@ mod session_leak_tests {
         }
     }
 
+    /// Waits for an open's analysis to land. E123 made an open SCHEDULE its
+    /// first analysis instead of running it on the handler, and without this
+    /// the scripted session below would open four files, close them, and
+    /// never once run the work whose residue it exists to measure — the pin
+    /// went from tens of seconds to 88 ms the day the open stopped blocking,
+    /// which is exactly the shape of a gate quietly becoming vacuous.
+    async fn analyzed(backend: &Backend, uri: &Url) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
     /// Every retained map's cardinality, as one comparable tuple.
     fn sizes(backend: &Backend) -> session_trace::StateSizes {
         session_trace::StateSizes {
             documents: backend.documents.len(),
+            programs: backend
+                .documents
+                .iter()
+                .filter(|document| document.value().holds_program())
+                .count(),
             semantic_token_cache: backend.semantic_token_cache.len(),
             manifests: backend.manifests.len(),
-            pending: backend.pending.len(),
+            pending: backend.schedule.len(),
             line_indices: backend.line_indices.len(),
         }
     }
@@ -4590,6 +7345,10 @@ mod session_leak_tests {
                 std::fs::write(&path, PROGRAM).expect("a source file");
                 let uri = Url::from_file_path(&path).expect("a file url");
                 backend.did_open(open_params(&uri, PROGRAM)).await;
+                assert!(
+                    analyzed(backend, &uri).await,
+                    "round {round}: the open's analysis lands",
+                );
                 open.push(uri);
             }
             assert_eq!(
@@ -4649,5 +7408,2404 @@ mod session_leak_tests {
         }
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E123: `did_open` used to run `Document::analyze` INLINE on the async
+/// handler. That call joins a 128 MiB analysis thread, so opening kolt's
+/// `views.vl` parked a tokio worker for the whole 1.1 s first analysis and
+/// every other request scheduled on that worker waited behind it — the session
+/// trace's "slow request: didOpen took 1112 ms"
+/// (`proposal/editor-latency.md` §1.6). The open now inserts the buffer and
+/// schedules the analysis the way an edit's is scheduled: `spawn_blocking`,
+/// stamped with the world it read (E117), landed only if it is still the newest
+/// view.
+#[cfg(test)]
+mod open_scheduling_tests {
+    use super::session_leak_tests::open_params;
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// Big enough that its analysis is unmistakably work, and wrong, so the
+    /// diagnostic the open must still publish is unambiguous.
+    fn subject() -> String {
+        let mut text = String::from("fun main() {\n\tlet value = undefined_name;\n}\n");
+        for index in 0..200 {
+            text.push_str(&format!(
+                "fun helper_{index}(input: i32): i32 {{\n\tinput + input\n}}\n"
+            ));
+        }
+        text
+    }
+
+    fn workspace(name: &str) -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-open-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("opened.vl");
+        std::fs::write(&path, subject()).expect("a source file");
+        let uri = Url::from_file_path(&path).expect("a file url");
+        (directory, uri)
+    }
+
+    /// Polls for the open's analysis to land, rather than sleeping a fixed
+    /// span: it is real work on a blocking thread and a loaded machine is
+    /// exactly when a fixed sleep turns a pin into a flake
+    /// (`package_recolor_tests::settled`'s rule).
+    async fn landed(backend: &Backend, uri: &Url) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// The pin. A request issued while a fresh open's analysis is in flight is
+    /// ANSWERED — it does not queue behind the analysis — and the open's
+    /// diagnostics still publish once it lands.
+    ///
+    /// `#[tokio::test]` is a current-thread runtime, which is what makes this
+    /// exact rather than statistical: the analysis is spawned, so it cannot
+    /// have run before the request below is served, and on the pre-fix tree
+    /// `did_open().await` did not return until the analysis had landed —
+    /// the "not landed yet" assertion is red there by construction.
+    #[tokio::test]
+    async fn a_request_during_a_fresh_open_answers_before_the_analysis_lands() {
+        let (directory, uri) = workspace("inflight");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        let opened = std::time::Instant::now();
+        backend.did_open(open_params(&uri, &subject())).await;
+        let open_wall = opened.elapsed();
+
+        // The buffer is in the map immediately: a query finds the document,
+        // which is what `land`'s "a missing entry can only mean closed" rests
+        // on, and what the ordering of these two facts is about.
+        let document = backend.documents.get(&uri).expect("the open registered");
+        assert_eq!(
+            document.analysis_revision(),
+            0,
+            "the open's analysis must still be in flight — an open that has \
+             already analyzed blocked its worker to do it (E123)",
+        );
+        drop(document);
+
+        let answering = std::time::Instant::now();
+        let answer = backend
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the request is answered, not refused");
+        let answer_wall = answering.elapsed();
+        assert!(
+            answer.is_some(),
+            "the handler answers over the open document, empty stream and all",
+        );
+        assert!(
+            backend
+                .documents
+                .get(&uri)
+                .is_some_and(|document| document.analysis_revision() == 0),
+            "…and it answered while the analysis was still in flight",
+        );
+
+        assert!(landed(backend, &uri).await, "the open's analysis lands");
+        let published = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .published_diagnostics()
+            .len();
+        assert!(
+            published > 0,
+            "the open's diagnostics still publish: the subject has an \
+             undefined name in it",
+        );
+        println!(
+            "E123 open scheduling: load={} didOpen returned in {:.1} ms, the \
+             request answered in {:.1} ms, {published} diagnostics landed after",
+            std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|text| text.split_whitespace().next().map(str::to_string))
+                .unwrap_or_else(|| "?".to_string()),
+            open_wall.as_secs_f64() * 1000.0,
+            answer_wall.as_secs_f64() * 1000.0,
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other half of "route it through the same scheduling": an edit that
+    /// arrives while the open's analysis is still running wins. Both analyses
+    /// are stamped with the world they read (E117) and `land` keeps the newer
+    /// one, so the document does not settle on the opened text.
+    #[tokio::test]
+    async fn an_edit_during_a_fresh_open_is_the_analysis_that_settles() {
+        let (directory, uri) = workspace("superseded");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        backend.did_open(open_params(&uri, &subject())).await;
+        let edited = format!("{}\nfun added(): i32 {{\n\t1\n}}\n", subject());
+        backend
+            .did_change(super::session_leak_tests::whole_file_change(
+                &uri, 2, &edited,
+            ))
+            .await;
+
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            let settled = backend.documents.get(&uri).is_some_and(|document| {
+                document.analysis_revision() > 0 && document.analyzed_text() == edited
+            });
+            if settled {
+                let _ = std::fs::remove_dir_all(&directory);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+        panic!("the edit's analysis never became the analyzed snapshot");
+    }
+}
+
+/// M26 (`proposal/editor-latency.md` §4.2): a superseded analysis is
+/// CANCELLED, not merely dropped when it finishes.
+///
+/// E117 stamped every analysis with the world revision it read and taught
+/// `land` to drop a result the world has moved past. That is the correctness
+/// half and it is untouched here — every pin below still passes with every
+/// checkpoint removed, more slowly. What the checkpoints buy is the CPU: before
+/// them, the superseded analysis ran to the end on its 128 MiB thread, so a
+/// keystroke burst paid one WHOLE analysis per debounce window for answers
+/// nobody would ever see, and `did_open` (E123) registered no generation at all,
+/// so an edit arriving right after an open raced the open's analysis instead of
+/// superseding it.
+///
+/// The scheduler's own decisions are pinned without a server in `schedule.rs`;
+/// these are the pins that need the real notification handlers, because what is
+/// being pinned is which analyses the server chooses to start and to stop.
+#[cfg(test)]
+mod cancellation_tests {
+    use super::session_leak_tests::{open_params, whole_file_change};
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// Big enough that one analysis is unmistakably work — the burst pin needs
+    /// an analysis that outlives the gap between two keystrokes, or there is
+    /// nothing in flight for the next one to cancel — and wrong, so the
+    /// diagnostic a landed analysis publishes is unambiguous.
+    fn subject(helpers: usize) -> String {
+        let mut text = String::from("fun main() {\n\tlet value = undefined_name;\n}\n");
+        for index in 0..helpers {
+            text.push_str(&format!(
+                "fun helper_{index}(input: i32): i32 {{\n\tinput + input\n}}\n"
+            ));
+        }
+        text
+    }
+
+    /// The default subject size for the pins that only need "an analysis takes
+    /// a moment".
+    const HELPERS: usize = 200;
+
+    fn workspace(name: &str) -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-cancel-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("edited.vl");
+        std::fs::write(&path, subject(HELPERS)).expect("a source file");
+        let uri = Url::from_file_path(&path).expect("a file url");
+        (directory, uri)
+    }
+
+    /// Polls for an analysis of `uri` to land, rather than sleeping a fixed
+    /// span (`package_recolor_tests::settled`'s rule).
+    async fn landed(backend: &Backend, uri: &Url) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// Polls for `uri`'s analyzed snapshot to become `text`.
+    async fn settled_on(backend: &Backend, uri: &Url, text: &str) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            let settled = backend.documents.get(uri).is_some_and(|document| {
+                document.analysis_revision() > 0 && document.analyzed_text() == text
+            });
+            if settled {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// **A cancelled analysis lands nothing and publishes nothing.**
+    ///
+    /// Exact, with no clock in it: the generation is superseded BEFORE the
+    /// analysis registers, so `Schedule::start` hands back an already-cancelled
+    /// token and the analysis stops at its first checkpoint whatever the
+    /// machine is doing. What the pin asserts is the contract — the outcome is
+    /// `Cancelled`, the analyzed snapshot is exactly where it was, and the
+    /// published diagnostics are exactly what they were — which is the claim
+    /// "cancellation is an optimisation on a correctness mechanism, not a new
+    /// way for a wrong answer to reach the editor" reduced to something a test
+    /// can check.
+    #[tokio::test]
+    async fn a_cancelled_analysis_lands_nothing_and_publishes_nothing() {
+        let (directory, uri) = workspace("nothing");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&uri, &subject(HELPERS))).await;
+        assert!(landed(backend, &uri).await, "the open's analysis lands");
+
+        let before_text = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .analyzed_text()
+            .to_string();
+        let before_revision = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .analysis_revision();
+        let before_published = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .published_diagnostics()
+            .len();
+        assert!(
+            before_published > 0,
+            "the subject has an undefined name in it, so the open published something \
+             for the cancelled analysis below to be unable to disturb",
+        );
+        let before_counts = backend.analyses.counts();
+
+        // The supersession happens first, so the analysis scheduled for the
+        // older generation is born cancelled. This is the ordering the debounce
+        // makes possible in the shipped server — an edit landing between a
+        // pause's decision to analyze and its registration — made deterministic.
+        let stale = backend.schedule.supersede(&uri);
+        backend.schedule.supersede(&uri);
+        let edited = format!("{}\nfun added(): i32 {{\n\t1\n}}\n", subject(HELPERS));
+        let outcome =
+            analyze_and_publish(&backend.analysis_context(), uri.clone(), edited, stale).await;
+
+        assert_eq!(
+            outcome,
+            AnalysisOutcome::Cancelled,
+            "an analysis registered for a superseded generation stops at its first checkpoint",
+        );
+        let document = backend.documents.get(&uri).expect("still open");
+        assert_eq!(
+            document.analyzed_text(),
+            before_text,
+            "the analyzed snapshot did not move: there was no result to move it",
+        );
+        assert_eq!(
+            document.analysis_revision(),
+            before_revision,
+            "and nothing re-stamped it",
+        );
+        assert_eq!(
+            document.published_diagnostics().len(),
+            before_published,
+            "and nothing was published — a cancelled analysis has no diagnostics to publish",
+        );
+        drop(document);
+        let counts = backend.analyses.counts();
+        assert_eq!(
+            counts.cancelled,
+            before_counts.cancelled + 1,
+            "the session trace counts it as cancelled",
+        );
+        assert_eq!(
+            counts.landed, before_counts.landed,
+            "and not as landed: {counts:?}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **The open-then-edit case.** `did_open` registers its generation, so an
+    /// edit arriving before the open's analysis finishes SUPERSEDES it rather
+    /// than racing it.
+    ///
+    /// E123 routed the open through the same scheduling as an edit, but it
+    /// registered nothing: both analyses ran to completion side by side and
+    /// E117's revision stamp decided which one landed last. The correctness of
+    /// that is `an_edit_during_a_fresh_open_is_the_analysis_that_settles`, which
+    /// still passes and still must. This pin is about the CPU: exactly one of
+    /// the two analyses is allowed to finish.
+    #[tokio::test]
+    async fn an_edit_right_after_an_open_cancels_the_opens_analysis() {
+        let (directory, uri) = workspace("openedit");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        backend.did_open(open_params(&uri, &subject(HELPERS))).await;
+        let edited = format!("{}\nfun added(): i32 {{\n\t1\n}}\n", subject(HELPERS));
+        backend
+            .did_change(whole_file_change(&uri, 2, &edited))
+            .await;
+
+        assert!(
+            settled_on(backend, &uri, &edited).await,
+            "the edit's analysis is the one that settles",
+        );
+        let counts = backend.analyses.counts();
+        assert!(
+            counts.cancelled >= 1,
+            "the open's analysis was cancelled by the edit, not left to run to the end \
+             and be dropped at `land`: {counts:?}",
+        );
+        assert_eq!(
+            counts.landed, 1,
+            "and exactly one analysis landed — the edit's: {counts:?}",
+        );
+        println!(
+            "M26 open-then-edit: load={} {counts:?}",
+            crate::keystroke::gate::loadavg_1m(),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A burst of N edits performs ONE complete analysis plus at most one
+    /// partial.**
+    ///
+    /// The edits are spaced a debounce window apart, which is the shape the
+    /// item names: closer together and the debounce alone collapses them (that
+    /// path is `pause_action`'s and was always cheap); further apart and each
+    /// analysis finishes before the next edit, which is a session that is not
+    /// behind. In between — typing at about the rate the debounce is tuned for,
+    /// on a file whose analysis outlasts the gap — every keystroke used to
+    /// start a whole analysis and all but the last were wasted.
+    ///
+    /// What is asserted is a COUNT, not a duration: of the analyses the burst
+    /// started, at most two ran to completion (the one that answers the last
+    /// keystroke, plus at most one that outran its own cancellation), and the
+    /// rest were cancelled. A slow machine makes MORE of them cancelled, never
+    /// fewer, so there is no bound here for load to break.
+    #[tokio::test]
+    async fn a_burst_of_edits_performs_one_complete_analysis_plus_at_most_one_partial() {
+        const KEYSTROKES: usize = 8;
+        let (directory, uri) = workspace("burst");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        let base = subject(HELPERS);
+        backend.did_open(open_params(&uri, &base)).await;
+        assert!(landed(backend, &uri).await, "the open's analysis lands");
+        let settled_counts = backend.analyses.counts();
+
+        // One keystroke per debounce window, as a person typing does.
+        let mut last = base.clone();
+        for keystroke in 0..KEYSTROKES {
+            last = format!("{base}\nfun typed_{keystroke}(): i32 {{\n\t{keystroke}\n}}\n");
+            backend
+                .did_change(whole_file_change(&uri, 2 + keystroke as i32, &last))
+                .await;
+            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS + 20)).await;
+        }
+        assert!(
+            settled_on(backend, &uri, &last).await,
+            "the last keystroke's analysis lands",
+        );
+
+        let counts = backend.analyses.counts();
+        let started = counts.started - settled_counts.started;
+        let landed_count = counts.landed - settled_counts.landed;
+        let cancelled = counts.cancelled - settled_counts.cancelled;
+        println!(
+            "M26 burst of {KEYSTROKES}: load={} started={started} landed={landed_count} \
+             cancelled={cancelled}",
+            crate::keystroke::gate::loadavg_1m(),
+        );
+        assert!(
+            started >= 2,
+            "the burst must actually schedule analyses, or the numbers below are vacuous \
+             — {started} started",
+        );
+        assert!(
+            landed_count <= 2,
+            "a burst of {KEYSTROKES} keystrokes performed {landed_count} complete analyses; \
+             the contract is ONE (the last keystroke's) plus at most one partial that outran \
+             its own cancellation",
+        );
+        assert!(
+            landed_count >= 1,
+            "the burst must still answer the last keystroke",
+        );
+        assert!(
+            started - cancelled <= 2,
+            "of the {started} analyses the burst started, {} ran to the end and only \
+             {cancelled} were stopped part-way; the contract is at most two complete ones. \
+             Before the checkpoints EVERY one of them ran to the end on its 128 MiB thread \
+             and all but the last were dropped by `land`'s revision check, which is the \
+             number this pin exists to hold down",
+            started - cancelled,
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The dependency fixture: `widget.vl` defines a function, `app.vl` imports
+    /// it. An edit to the widget is an edit to a module the app's analysis
+    /// loaded, and the app's own buffer never moves.
+    const WIDGET: &str = "export fun widget_value(): i32 {\n\t7\n}\n";
+    const WIDGET_EDITED: &str = "export fun widget_value(): i32 {\n\t8\n}\n";
+
+    fn dependency_workspace(name: &str) -> (PathBuf, Url, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-cancel-dep-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        let mut app = String::from(
+            "import pkg::widget::widget_value;\n\nfun main() {\n\tlet value = widget_value();\n}\n",
+        );
+        for index in 0..HELPERS {
+            app.push_str(&format!(
+                "fun app_helper_{index}(input: i32): i32 {{\n\tinput + input\n}}\n"
+            ));
+        }
+        std::fs::write(directory.join("vilan.toml"), "[package]\nname = \"dep\"\n")
+            .expect("a manifest");
+        std::fs::write(directory.join("src/widget.vl"), WIDGET).expect("a source file");
+        std::fs::write(directory.join("src/app.vl"), &app).expect("a source file");
+        let widget = Url::from_file_path(directory.join("src/widget.vl")).expect("a file url");
+        let app_uri = Url::from_file_path(directory.join("src/app.vl")).expect("a file url");
+        (directory, widget, app_uri)
+    }
+
+    /// **The dependency case.** An edit to an imported module cancels the
+    /// dependent's in-flight analysis and re-lands it ONCE.
+    ///
+    /// The dependent's own buffer never moves, so nothing about its generation
+    /// changes on its own account and text equality cannot tell "read the
+    /// module before the edit" from "read it after" — the same blindness E117's
+    /// revision stamp exists for. The sweep therefore supersedes each dependent
+    /// explicitly, which cancels whatever it had in flight and schedules the one
+    /// replacement.
+    ///
+    /// A registration stands in for an analysis already in flight: it holds the
+    /// scheduler's token exactly as a real one does, which makes the pin exact
+    /// about WHAT the sweep stops without having to win a race to observe it.
+    /// The edit itself goes through the real notification handler, so the sweep
+    /// under test is the shipped one.
+    #[tokio::test]
+    async fn a_dependency_edit_cancels_the_dependents_analysis_and_relands_it_once() {
+        let (directory, widget_uri, app_uri) = dependency_workspace("cancel");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let app_text = std::fs::read_to_string(directory.join("src/app.vl")).expect("the app");
+
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend.did_open(open_params(&app_uri, &app_text)).await;
+        assert!(
+            landed(backend, &widget_uri).await && landed(backend, &app_uri).await,
+            "both opens' analyses land — the settled state this pin edits from",
+        );
+        assert!(
+            backend
+                .documents
+                .get(&app_uri)
+                .expect("open")
+                .depends_on(&widget_uri.to_file_path().expect("a path")),
+            "the app must actually import the widget, or the sweep below finds nothing \
+             and every assertion after it is vacuous",
+        );
+        assert!(
+            !backend.schedule.dependency_moved(&app_uri),
+            "nothing has moved under the app yet",
+        );
+
+        // A stand-in for an analysis of the app already in flight: it holds the
+        // scheduler's registration exactly as a real one does, which is what the
+        // sweep has to find and stop.
+        let generation = backend
+            .schedule
+            .generation(&app_uri)
+            .expect("the open registered a generation");
+        let in_flight = backend.schedule.start(&app_uri, generation);
+        assert!(!in_flight.token.is_cancelled(), "it has only just started");
+
+        let before = backend.analyses.counts();
+        let app_revision = backend
+            .documents
+            .get(&app_uri)
+            .expect("open")
+            .analysis_revision();
+
+        // The widget's edit, through the real handler: its own analysis lands,
+        // then the sweep re-analyzes the one open document that imports it.
+        std::fs::write(directory.join("src/widget.vl"), WIDGET_EDITED).expect("the edit");
+        backend
+            .did_change(whole_file_change(&widget_uri, 2, WIDGET_EDITED))
+            .await;
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        let mut swept = false;
+        while std::time::Instant::now() < deadline {
+            swept = backend
+                .documents
+                .get(&app_uri)
+                .is_some_and(|document| document.analysis_revision() > app_revision);
+            if swept {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            swept,
+            "the sweep must re-land the dependent over the edited widget",
+        );
+
+        assert!(
+            in_flight.token.is_cancelled(),
+            "the app's in-flight analysis read the widget before the edit; the sweep \
+             stopped it rather than letting it finish and be dropped at `land`",
+        );
+        let after = backend.analyses.counts();
+        assert_eq!(
+            after.landed - before.landed,
+            2,
+            "exactly two analyses landed for this edit — the widget's own, and its one \
+             dependent re-analyzed ONCE: {before:?} -> {after:?}",
+        );
+        assert!(
+            !backend.schedule.dependency_moved(&app_uri),
+            "the mark is cleared by the re-landing — the app's landed snapshot is built \
+             over the edited widget again, so its keystroke answers are current",
+        );
+        println!(
+            "M26 dependency sweep: load={} {before:?} -> {after:?}",
+            crate::keystroke::gate::loadavg_1m(),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A dependent edited while its dependency is being swept still settles
+    /// on its own live text.**
+    ///
+    /// The sweep SUPERSEDES each dependent (M26), which is what cancels the
+    /// analysis that read the module in its pre-edit state — and which also
+    /// takes the dependent's own debounced pause out of the running, because
+    /// that pause skips the moment its generation is no longer the latest. So
+    /// the sweep inherits an obligation the old one did not have: whatever it
+    /// analyzes has to be the buffer as it stands, not as it stood when the
+    /// sweep collected its list. It reads each dependent's text after
+    /// superseding it, for exactly that reason, and this is the pin that says
+    /// the buffer is never left with an analysis nobody is scheduled to make.
+    #[tokio::test]
+    async fn a_dependent_edited_during_a_sweep_still_settles_on_its_live_text() {
+        let (directory, widget_uri, app_uri) = dependency_workspace("starve");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let app_text = std::fs::read_to_string(directory.join("src/app.vl")).expect("the app");
+
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend.did_open(open_params(&app_uri, &app_text)).await;
+        assert!(
+            landed(backend, &widget_uri).await && landed(backend, &app_uri).await,
+            "both opens' analyses land",
+        );
+
+        // The dependent is edited, and the dependency is edited right behind it
+        // — so the app's own pause and the widget's sweep are both in flight for
+        // the app at once, which is the collision the late read exists for.
+        let app_edited = format!("{app_text}\nfun app_added(): i32 {{\n\t1\n}}\n");
+        backend
+            .did_change(whole_file_change(&app_uri, 2, &app_edited))
+            .await;
+        std::fs::write(directory.join("src/widget.vl"), WIDGET_EDITED).expect("the edit");
+        backend
+            .did_change(whole_file_change(&widget_uri, 2, WIDGET_EDITED))
+            .await;
+
+        assert!(
+            settled_on(backend, &app_uri, &app_edited).await,
+            "the dependent's own edit must reach an analysis: the sweep either analyzed \
+             the live buffer itself or stood aside for the pause that would",
+        );
+        assert!(
+            settled_on(backend, &widget_uri, WIDGET_EDITED).await,
+            "and the dependency settles on its own edit",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **The `dependency_moved` seam** (§2.1.2's case 4, the keystroke path's
+    /// fourth verdict input). The server passed a hard-coded `false` for it
+    /// because nothing knew when a dependency had moved; the sweep now does, and
+    /// says so for exactly the window between the dependency's edit and the
+    /// dependent's re-landing.
+    ///
+    /// Inside the window the verdict is `Stale`: whole-file syntax-only tokens,
+    /// and hints STILL SERVED (Q1's anti-flicker, Q4's "a withheld hint beats a
+    /// possibly-wrong one" applying only inside the edit window). Driven at the
+    /// scheduler + document seam rather than through a race, so what is pinned
+    /// is the rule and not a timing.
+    #[tokio::test]
+    async fn a_moved_dependency_degrades_the_keystroke_verdict_to_stale() {
+        let (directory, widget_uri, app_uri) = dependency_workspace("verdict");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let app_text = std::fs::read_to_string(directory.join("src/app.vl")).expect("the app");
+
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend.did_open(open_params(&app_uri, &app_text)).await;
+        assert!(
+            landed(backend, &app_uri).await,
+            "the app's analysis lands, so there is a snapshot to degrade",
+        );
+
+        let exact = backend
+            .documents
+            .get(&app_uri)
+            .expect("open")
+            .keystroke_verdict(backend.schedule.dependency_moved(&app_uri));
+        assert_eq!(
+            exact,
+            crate::keystroke::Verdict::Exact,
+            "nothing has moved: the buffer is the analyzed text and no dependency was edited",
+        );
+        let tokens_when_exact = backend
+            .documents
+            .get(&app_uri)
+            .expect("open")
+            .keystroke_tokens(false)
+            .len();
+
+        backend.schedule.mark_dependency_moved(&app_uri);
+        let document = backend.documents.get(&app_uri).expect("open");
+        let moved = backend.schedule.dependency_moved(&app_uri);
+        assert!(moved, "the sweep marked it");
+        assert_eq!(
+            document.keystroke_verdict(moved),
+            crate::keystroke::Verdict::Stale,
+            "an edited dependency is exactly what no amount of local anchoring can repair",
+        );
+        let stale_tokens = document.keystroke_tokens(moved).len();
+        assert!(
+            stale_tokens < tokens_when_exact,
+            "Stale means the whole file falls back to syntax, which classifies strictly \
+             fewer tokens than the landed semantic stream ({stale_tokens} vs \
+             {tokens_when_exact})",
+        );
+        assert!(
+            !document.keystroke_hints(moved).is_empty(),
+            "…and hints are still served: Q1's anti-flicker ruling — a hint one analysis \
+             old is a smaller harm than a display that blinks",
+        );
+        drop(document);
+
+        backend.schedule.clear_dependency_moved(&app_uri);
+        assert_eq!(
+            backend
+                .documents
+                .get(&app_uri)
+                .expect("open")
+                .keystroke_verdict(backend.schedule.dependency_moved(&app_uri)),
+            crate::keystroke::Verdict::Exact,
+            "and the window closes when the dependent re-lands",
+        );
+
+        // The WIRING, not just the rule: the handlers are what pass the flag,
+        // and they used to pass a hard-coded `false`. Asserted through the real
+        // request path so a handler that stops asking the scheduler reds here.
+        let tokens = |result: Option<SemanticTokensResult>| match result {
+            Some(SemanticTokensResult::Tokens(tokens)) => tokens.data.len(),
+            _ => 0,
+        };
+        let request = || SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: app_uri.clone(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let current = tokens(
+            backend
+                .semantic_tokens_full(request())
+                .await
+                .expect("the handler answers"),
+        );
+        backend.schedule.mark_dependency_moved(&app_uri);
+        let degraded = tokens(
+            backend
+                .semantic_tokens_full(request())
+                .await
+                .expect("the handler answers"),
+        );
+        assert!(
+            degraded < current,
+            "`semantic_tokens_full` must ASK the scheduler whether a dependency moved: it \
+             answered the same {current} tokens either way, which is the hard-coded `false` \
+             the keystroke path shipped with",
+        );
+        assert!(
+            !backend
+                .inlay_hint(InlayHintParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: app_uri.clone(),
+                    },
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(u32::MAX, 0),
+                    },
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .expect("the handler answers")
+                .unwrap_or_default()
+                .is_empty(),
+            "…and hints keep coming through it: Q1's anti-flicker ruling reaches the wire, \
+             not just the document",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The exhibit the latency gate uses, written to a fresh directory: a
+    /// generated module of `functions` functions sized like kolt-with-lucide,
+    /// plus the app-shaped entry that calls four of them (§6.1, Q6 — kolt is
+    /// never integrated into this codebase, so the subject is GENERATED).
+    fn exhibit(functions: usize) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-m26-exhibit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the exhibit directory");
+        std::fs::write(
+            directory.join("table.vl"),
+            crate::keystroke::gate::exhibit_module(functions),
+        )
+        .expect("the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, crate::keystroke::gate::EXHIBIT_ENTRY).expect("the exhibit entry");
+        (directory, entry)
+    }
+
+    /// One machine-readable row, the shape the gate's `PERF`/`E121` lines have.
+    fn row(subject: &str, measure: &str, cpu_ms: Option<f64>, wall_ms: f64, count: usize) {
+        println!(
+            "M26 {{\"section\":\"cancellation\",\"subject\":\"{subject}\",\
+             \"measure\":\"{measure}\",\"profile\":\"{}\",\"load\":\"{}\",\
+             \"cpu_ms\":{},\"wall_ms\":{wall_ms:.1},\"count\":{count}}}",
+            crate::keystroke::gate::profile(),
+            crate::keystroke::gate::loadavg_1m(),
+            cpu_ms.map_or_else(|| "null".to_string(), |value| format!("{value:.1}")),
+        );
+    }
+
+    /// The burst instrument (M26's numbers), over one subject.
+    ///
+    /// Two numbers, and the second is the one the lane is about:
+    ///
+    /// - **`warm_analysis`** — one uncancelled analysis of an EDITED buffer,
+    ///   after the open's analysis has already warmed the base-world cache
+    ///   (M21). This is what every keystroke of a burst used to cost: before
+    ///   the checkpoints, a superseded analysis ran to the end and was thrown
+    ///   away at `land`, so a burst of N keystrokes a debounce window apart cost
+    ///   N of these. The COLD first analysis is recorded beside it as
+    ///   `first_analysis` and is deliberately NOT the reference — comparing a
+    ///   burst of warm analyses against a cold one would credit cancellation
+    ///   with M21's saving.
+    /// - **`burst_per_keystroke`** — the same burst driven through the real
+    ///   notification handlers, measured in PROCESS CPU (the analyses run on
+    ///   their own threads; the calling thread's clock cannot see them) and
+    ///   divided by N.
+    ///
+    /// Plus **`last_keystroke`**: the wall from the final `did_change` to that
+    /// keystroke's diagnostics landing — the one latency the user actually
+    /// experiences, since the earlier ones' answers are overwritten before they
+    /// are read.
+    ///
+    /// The assertion is the lane's claim reduced to a comparison, and it is
+    /// non-vacuous by construction: swap the two operands and it reds on any
+    /// machine. Everything else is recorded, not asserted — a burst's wall
+    /// clock is the machine's business, and the CPU clocks are load-proof for
+    /// the reason M15 gives.
+    async fn burst_measurement(name: &str, entry: &Path, entry_text: &str, keystrokes: usize) {
+        use crate::keystroke::gate::{loadavg_1m, process_cpu_now};
+
+        let uri = Url::from_file_path(entry).expect("a file url");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        // The cold first analysis, on its own server so no other scheduling
+        // overlaps it. Recorded, not the reference.
+        let cpu_before = process_cpu_now();
+        let wall_before = std::time::Instant::now();
+        backend.did_open(open_params(&uri, entry_text)).await;
+        assert!(landed(backend, &uri).await, "the subject analyzes");
+        let first_wall = wall_before.elapsed().as_secs_f64() * 1000.0;
+        let first_cpu = cpu_before
+            .zip(process_cpu_now())
+            .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
+        let diagnostics = backend
+            .documents
+            .get(&uri)
+            .expect("open")
+            .published_diagnostics()
+            .len();
+        row(name, "first_analysis", first_cpu, first_wall, diagnostics);
+
+        // ONE keystroke, waited out to its landing: a warm, complete analysis,
+        // which is the reference the burst is measured against.
+        let warm_text = format!("{entry_text}\n// warm\n");
+        let cpu_before = process_cpu_now();
+        let wall_before = std::time::Instant::now();
+        backend
+            .did_change(whole_file_change(&uri, 2, &warm_text))
+            .await;
+        assert!(
+            settled_on(backend, &uri, &warm_text).await,
+            "the warm analysis lands",
+        );
+        let warm_wall = wall_before.elapsed().as_secs_f64() * 1000.0;
+        let full_cpu = cpu_before
+            .zip(process_cpu_now())
+            .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
+        row(name, "warm_analysis", full_cpu, warm_wall, 1);
+
+        // The burst: one keystroke per debounce window, the shape §4.2 names.
+        let settled_counts = backend.analyses.counts();
+        let cpu_before = process_cpu_now();
+        let wall_before = std::time::Instant::now();
+        let mut last = warm_text.clone();
+        let mut last_edit_at = std::time::Instant::now();
+        for keystroke in 0..keystrokes {
+            last = format!("{entry_text}\n// keystroke {keystroke}\n");
+            last_edit_at = std::time::Instant::now();
+            backend
+                .did_change(whole_file_change(&uri, 3 + keystroke as i32, &last))
+                .await;
+            if keystroke + 1 < keystrokes {
+                tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS + 20)).await;
+            }
+        }
+        assert!(
+            settled_on(backend, &uri, &last).await,
+            "the last keystroke's analysis lands",
+        );
+        let last_keystroke_wall = last_edit_at.elapsed().as_secs_f64() * 1000.0;
+        let burst_wall = wall_before.elapsed().as_secs_f64() * 1000.0;
+        let burst_cpu = cpu_before
+            .zip(process_cpu_now())
+            .map(|(before, after)| after.saturating_sub(before).as_secs_f64() * 1000.0);
+
+        let counts = backend.analyses.counts();
+        let started = counts.started - settled_counts.started;
+        let landed_count = counts.landed - settled_counts.landed;
+        let cancelled = counts.cancelled - settled_counts.cancelled;
+        row(
+            name,
+            "burst_per_keystroke",
+            burst_cpu.map(|cpu| cpu / keystrokes as f64),
+            burst_wall / keystrokes as f64,
+            keystrokes,
+        );
+        row(name, "last_keystroke", None, last_keystroke_wall, 1);
+        println!(
+            "M26 burst {name}: load={} keystrokes={keystrokes} started={started} \
+             landed={landed_count} cancelled={cancelled}",
+            loadavg_1m(),
+        );
+
+        let (Some(full_cpu), Some(burst_cpu)) = (full_cpu, burst_cpu) else {
+            panic!(
+                "no process CPU clock on this host, so the instrument cannot say anything \
+                 load-proof (M15's rule); wall was {burst_wall:.1} ms at loadavg {}",
+                loadavg_1m(),
+            );
+        };
+        let per_keystroke = burst_cpu / keystrokes as f64;
+        assert!(
+            per_keystroke < full_cpu,
+            "a keystroke of the burst cost {per_keystroke:.1} ms of process CPU against \
+             {full_cpu:.1} ms for one WARM whole analysis of the same buffer — which is what \
+             every keystroke of a burst cost before the checkpoints, so the two being equal \
+             means nothing was cancelled (started={started} landed={landed_count} \
+             cancelled={cancelled}, loadavg {})",
+            loadavg_1m(),
+        );
+    }
+
+    /// **The cancel latency**: how long after the token is set does the
+    /// analysis thread actually stop?
+    ///
+    /// The checkpoints are placed at the phase boundaries the
+    /// `VILAN_PHASE_TIMING` line names and per call site inside the checks that
+    /// dominate them, so the answer depends on WHERE in the analysis the cancel
+    /// lands — which is why this measures at several points through one
+    /// analysis's own duration rather than at one. A cancel that arrives during
+    /// the module load waits for the entry tail to begin; one that arrives in
+    /// the checks stops within a call site.
+    ///
+    /// Recorded, and asserted only on the two facts that make the number mean
+    /// anything: the analysis really was cancelled (it answered `None`), and it
+    /// stopped in less time than it had left to run.
+    #[test]
+    #[ignore = "E121: the cancel-latency instrument (M26) — a generated 1,791-function exhibit, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
+    fn cancel_latency_on_the_exhibit() {
+        use crate::keystroke::gate::loadavg_1m;
+        use vilan_core::cancel::CancelToken;
+
+        let (directory, entry) = exhibit(crate::keystroke::gate::GATE_FUNCTIONS);
+        let text = crate::keystroke::gate::EXHIBIT_ENTRY;
+        let std_dir = crate::document::tests::std_root();
+
+        // The reference: whole analyses, uncancelled, so the fractions below
+        // are fractions of something measured on THIS machine — WARM, because
+        // that is what the cancelled runs below are, and the FASTEST of three,
+        // because the failure mode of an over-long reference is a sleep that
+        // outlasts the analysis it was meant to interrupt. That reads as "the
+        // cancel did not land" when what happened is that there was nothing
+        // left to cancel, so the rows say which (`count` is 1 when the analysis
+        // really was stopped) and assert nothing when they missed.
+        let mut whole = Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let document =
+                Document::analyze_cancellable(text, &std_dir, &entry, &CancelToken::new())
+                    .expect("an uncancelled analysis answers");
+            whole = whole.min(started.elapsed());
+            assert!(document.program.is_some(), "the exhibit analyzes");
+            drop(document);
+        }
+        row(
+            "syn1791",
+            "whole_analysis",
+            None,
+            whole.as_secs_f64() * 1000.0,
+            1,
+        );
+
+        for percent in [10u32, 25, 50, 75, 90] {
+            let token = CancelToken::new();
+            let analysis = {
+                let token = token.clone();
+                let std_dir = std_dir.clone();
+                let entry = entry.clone();
+                std::thread::spawn(move || {
+                    Document::analyze_cancellable(text, &std_dir, &entry, &token)
+                })
+            };
+            std::thread::sleep(whole.mul_f64(f64::from(percent) / 100.0));
+            let cancelled_at = std::time::Instant::now();
+            token.cancel();
+            let answer = analysis.join().expect("the analysis thread");
+            let latency = cancelled_at.elapsed();
+            let stopped = answer.is_none();
+            row(
+                "syn1791",
+                &format!("cancel_at_{percent}pct"),
+                None,
+                latency.as_secs_f64() * 1000.0,
+                usize::from(stopped),
+            );
+            println!(
+                "M26 cancel latency: load={} at {percent}% of {:.0} ms the thread stopped \
+                 {:.0} ms after the token was set (cancelled={stopped})",
+                loadavg_1m(),
+                whole.as_secs_f64() * 1000.0,
+                latency.as_secs_f64() * 1000.0,
+            );
+            if stopped {
+                assert!(
+                    latency < whole,
+                    "a cancel at {percent}% took {latency:?} to land, which is longer than the \
+                     whole analysis ({whole:?}) — the checkpoints are not where the time is",
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// M26's numbers on the generated exhibit at kolt's size (1,791 functions).
+    /// Minutes of analysis — run deliberately, like the latency gate it shares
+    /// its subject with.
+    #[tokio::test]
+    #[ignore = "E121: the cancellation instrument (M26) — a generated 1,791-function exhibit and a ten-keystroke burst, minutes of analysis; run deliberately (proposal/editor-latency.md §4.2)"]
+    async fn cancellation_measurement_on_the_exhibit() {
+        let (directory, entry) = exhibit(crate::keystroke::gate::GATE_FUNCTIONS);
+        burst_measurement("syn1791", &entry, crate::keystroke::gate::EXHIBIT_ENTRY, 10).await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The same instrument over a REAL file, named by `VILAN_M26_SUBJECT`.
+    ///
+    /// An environment variable rather than a fixture, and that is the point:
+    /// the owner's standing rule is that kolt is never integrated into this
+    /// codebase — no fixture, no golden, no copy — so the application evidence
+    /// is produced by pointing this at a checkout that lives elsewhere and
+    /// reading the rows. With the variable unset there is nothing to measure
+    /// and the test says so rather than pretending.
+    #[tokio::test]
+    #[ignore = "E121: the cancellation instrument (M26) over an external subject; set VILAN_M26_SUBJECT to a .vl file in its own package and run deliberately"]
+    async fn cancellation_measurement_on_an_external_subject() {
+        let Ok(path) = std::env::var("VILAN_M26_SUBJECT") else {
+            panic!(
+                "VILAN_M26_SUBJECT is unset: this instrument measures a file that lives \
+                 outside this repository (the owner's rule — kolt is read-only evidence, \
+                 never a fixture here), so there is nothing for it to measure",
+            );
+        };
+        let entry = PathBuf::from(path);
+        let text = std::fs::read_to_string(&entry).expect("the subject is readable");
+        let name = entry
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("external")
+            .to_string();
+        burst_measurement(&name, &entry, &text, 10).await;
+    }
+}
+
+/// E116: a file's platform color is decided by which ENTRY reaches it, and the
+/// reachability walk is per-analysis — so the coloring only moves when the file
+/// is re-analyzed, and nothing used to re-analyze a file because SOMEONE ELSE'S
+/// import graph changed. The owner's report: an unreferenced file falls back to
+/// the process layer (E113's designated-entry rule, correct), then keeps that
+/// color after the import that reaches it is written, until the server is
+/// restarted.
+///
+/// Driven through the real notification handlers, because the bug is entirely
+/// in which documents the server chooses to re-analyze.
+#[cfg(test)]
+mod package_recolor_tests {
+    use super::session_leak_tests::{open_params, whole_file_change};
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// The kolt shape: a browser `client`, a node `server`, the process side
+    /// designated — so a module NO entry reaches falls back to process.
+    const MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+         [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+    /// A module using the BROWSER `View`'s `element` field: clean under
+    /// `browser`, "no field 'element'" under any process target.
+    const WIDGET: &str = "import std::ui::{ View, view };\n\n\
+         fun attach(): View {\n\tlet root = view(\"div\");\n\t\
+         root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
+    const CLIENT_WITHOUT_IMPORT: &str =
+        "import std::io::print;\n\nfun main() {\n\tprint(\"client\");\n}\n";
+    const CLIENT_WITH_IMPORT: &str =
+        "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\n";
+    const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+
+    /// The fixture package on disk, and the URIs of the two files the editor
+    /// opens. Uniquified per test process and per thread, like every other
+    /// workspace fixture here.
+    fn workspace(name: &str) -> (PathBuf, Url, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-recolor-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        for (relative, contents) in [
+            ("vilan.toml", MANIFEST),
+            ("src/widget.vl", WIDGET),
+            ("src/client.vl", CLIENT_WITHOUT_IMPORT),
+            ("src/server.vl", SERVER),
+        ] {
+            std::fs::write(directory.join(relative), contents).expect("a source file");
+        }
+        let widget = Url::from_file_path(directory.join("src/widget.vl")).expect("a file url");
+        let client = Url::from_file_path(directory.join("src/client.vl")).expect("a file url");
+        (directory, widget, client)
+    }
+
+    /// Whether the open document at `uri` is currently publishing the
+    /// process-`View` error — the exact squiggle the owner sees on a
+    /// browser-only file colored as process.
+    fn colored_as_process(backend: &Backend, uri: &Url) -> bool {
+        backend
+            .documents
+            .get(uri)
+            .expect("open")
+            .published_diagnostics()
+            .iter()
+            .any(|item| item.message.contains("has no field 'element'"))
+    }
+
+    /// Wait for the debounced analysis and the sweep it triggers to settle.
+    /// Polls rather than sleeping a fixed span: the analysis is real work on a
+    /// blocking thread, and a loaded machine is exactly when a fixed sleep
+    /// turns a pin into a flake.
+    async fn settled(backend: &Backend, uri: &Url, expected: bool) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if colored_as_process(backend, uri) == expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Waits for an OPEN's own analysis to land (E123: it is scheduled, not
+    /// run on the notification handler). Distinct from [`settled`], which polls
+    /// a diagnostic: "no error yet" and "no analysis yet" look the same from
+    /// there, and the premise assertions below would be vacuous.
+    async fn analyzed(backend: &Backend, uri: &Url) -> bool {
+        // The file's one `ANALYSIS_LIVENESS`, like [`settled`]: this waits for
+        // the same kind of work on the same box — two whole analyses of a
+        // two-file package, now started CONCURRENTLY because each open
+        // schedules its own (E123).
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_package_import_edit_recolors_the_open_file_it_reaches() {
+        let (directory, widget_uri, client_uri) = workspace("import");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend
+            .did_open(open_params(&client_uri, CLIENT_WITHOUT_IMPORT))
+            .await;
+        assert!(
+            analyzed(backend, &widget_uri).await && analyzed(backend, &client_uri).await,
+            "both opens' analyses land (they are scheduled, not inline — E123), \
+             which is the settled starting state this pin edits from",
+        );
+        assert!(
+            colored_as_process(backend, &widget_uri),
+            "no entry reaches the widget yet, so `default-entry = \"server\"` colors it process \
+             — E113's fallback, and the premise of this pin",
+        );
+
+        // The entry gains the import that reaches it. The widget's own buffer
+        // does not move, and it does not depend on the entry — the entry
+        // depends on IT — so the dependency-edge sweep finds nothing to do.
+        backend
+            .did_change(whole_file_change(&client_uri, 2, CLIENT_WITH_IMPORT))
+            .await;
+        assert!(
+            settled(backend, &widget_uri, false).await,
+            "the error must clear without a restart: the widget is now reached by the browser \
+             entry, so it analyzes as browser",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn removing_the_import_colors_the_file_back() {
+        // The mirror, so the sweep is not one-way: deleting the import makes
+        // the widget unreached again and the process fallback returns. A fix
+        // that only ever re-colored TOWARD browser would pass the first pin
+        // and fail this one.
+        let (directory, widget_uri, client_uri) = workspace("removal");
+        std::fs::write(directory.join("src/client.vl"), CLIENT_WITH_IMPORT).expect("a source file");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend
+            .did_open(open_params(&client_uri, CLIENT_WITH_IMPORT))
+            .await;
+        assert!(
+            analyzed(backend, &widget_uri).await && analyzed(backend, &client_uri).await,
+            "both opens' analyses land (they are scheduled, not inline — E123), \
+             which is the settled starting state this pin edits from",
+        );
+        assert!(
+            !colored_as_process(backend, &widget_uri),
+            "the browser entry reaches it, so it starts clean",
+        );
+        backend
+            .did_change(whole_file_change(&client_uri, 2, CLIENT_WITHOUT_IMPORT))
+            .await;
+        assert!(
+            settled(backend, &widget_uri, true).await,
+            "unreached again: the designated process entry colors it once more",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The decision itself, without a server. An ordinary body edit leaves the
+    /// `pkg::` graph exactly where it was, so it must NOT drag every open file
+    /// in the package through a re-analysis — the sweep is the expensive half
+    /// of a typing pause, and widening it unconditionally would undo B39a.
+    #[test]
+    fn an_edit_that_does_not_move_the_graph_recolors_nothing() {
+        let root = PathBuf::from("/pkg/src");
+        assert_eq!(
+            recolored_package(Some((7, root.clone())), Some((7, root.clone()))),
+            None,
+            "same package, same reach",
+        );
+        assert_eq!(
+            recolored_package(Some((7, root.clone())), Some((9, root.clone()))),
+            Some(root.clone()),
+            "the reach moved: the whole package is re-colored",
+        );
+        assert_eq!(
+            recolored_package(None, Some((7, root.clone()))),
+            Some(root.clone()),
+            "a file that had no package and now has one re-colors it",
+        );
+        assert_eq!(
+            recolored_package(Some((7, root)), None),
+            None,
+            "a file with no package of its own sweeps nobody",
+        );
+    }
+}
+
+/// E112: `line_indices` is a by-path cache of files that are on disk and not
+/// buffered, and it had no invalidation — documented as safe because it was
+/// "written for `std`, whose files do not change". Stability was never a
+/// property of the key. A workspace file is exempt only while a buffer is
+/// registered for it, so a file cached before it was ever opened kept its
+/// pre-edit index across the whole open/edit/save/close cycle, and every later
+/// cross-file reference into it converted spans through the wrong line breaks.
+/// Correctness, not perf — a wrong position, published.
+#[cfg(test)]
+mod line_index_cache_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// A scratch file with `contents`, in a directory unique to this test.
+    fn scratch(name: &str, contents: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-line-index-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("module.vl");
+        std::fs::write(&path, contents).expect("a source file");
+        (directory, path)
+    }
+
+    #[test]
+    fn a_file_that_changed_on_disk_is_re_indexed() {
+        // One line, then three: the line breaks the index converts through move,
+        // which is exactly what a stale entry gets wrong.
+        let (directory, path) = scratch("stale", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let first = backend.line_index_for(&path).expect("readable");
+        assert_eq!(
+            first.position(20).line,
+            0,
+            "the one-line file puts every offset on line 0",
+        );
+        // The file is rewritten under the server — a save from another window,
+        // a `git checkout`, a generator. Nothing notifies it.
+        std::fs::write(&path, "fun answer(): i32 {\n\t1\n}\n").expect("a rewrite");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert_eq!(
+            second.position(21).line,
+            1,
+            "the index must describe the file that is there now, not the one that was",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unchanged_file_still_answers_from_the_cache() {
+        // The other half: the validation must not turn the cache off. An
+        // unchanged file answers with the very same `Arc` — no re-read, no
+        // re-index, which is the whole reason the map exists.
+        let (directory, path) = scratch("cached", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let first = backend.line_index_for(&path).expect("readable");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged file is served from the cache",
+        );
+        assert_eq!(backend.line_indices.len(), 1, "one entry, not two");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_buffered_file_is_never_cached() {
+        // Unchanged from before, and re-pinned here because the stamp must not
+        // become an excuse to start caching a buffer: its text is one keystroke
+        // old on disk, and the overlay is the truth.
+        let (directory, path) = scratch("buffered", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        vilan_core::analyzer::set_document_overlay(&path, Some("fun answer(): i32 { 2 }\n".into()));
+        let first = backend.line_index_for(&path).expect("readable");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert!(!Arc::ptr_eq(&first, &second), "indexed fresh every time");
+        assert!(backend.line_indices.is_empty(), "and never stored");
+        vilan_core::analyzer::set_document_overlay(&path, None);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E132: `linkedEditingRange` answers in LIVE coordinates, so the pair the
+/// client mirrors keystrokes between names the tags the user is looking at.
+///
+/// This is the one handler whose answer the client turns into EDITS without
+/// asking again: VS Code accepts the pair when a returned range contains the
+/// caret and then types every keystroke into both. Answered in the analyzed
+/// snapshot's coordinates — a raw parse of `analyzed_text()`, converted through
+/// `analyzed_offset`/`analyzed_range` — the pair named where the tags SAT when
+/// the last analysis ran, and during the debounce (150 ms plus the analysis)
+/// that is a pair of live lines with no tag on them. The owner's report was
+/// "editing under element syntax deletes unrelated text"; the repro is one line
+/// typed above an element and then typing where the tag used to be.
+///
+/// The three pins are the two halves of the claim plus its non-vacuity: the
+/// answer follows the buffer during an unlanded edit, the caret that used to be
+/// armed on unrelated code is not armed any more, and the control after the
+/// analysis lands is unchanged.
+#[cfg(test)]
+mod linked_editing_range_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// An element with a real statement line available to insert above it, so
+    /// the stale answer has live CODE to land on rather than blank space.
+    const VIEW: &str = "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div>\n\t\t\"hello world\"\n\t</div>\n}\n";
+
+    fn open(backend: &Backend, text: &str) -> Url {
+        let uri = Url::parse("file:///linked/page.vl").expect("a url");
+        backend.documents.insert(
+            uri.clone(),
+            Document::analyze(text, &std_root(), Path::new("page.vl")),
+        );
+        uri
+    }
+
+    async fn ranges(backend: &Backend, uri: &Url, position: Position) -> Option<Vec<Range>> {
+        backend
+            .linked_editing_range(LinkedEditingRangeParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("the handler never errors")
+            .map(|answer| answer.ranges)
+    }
+
+    /// The live text a returned range covers — what the client would actually
+    /// be typing into.
+    fn live_text(backend: &Backend, uri: &Url, range: Range) -> String {
+        let document = backend.documents.get(uri).expect("open");
+        let start = document.line_index.offset(range.start);
+        let end = document.line_index.offset(range.end);
+        document.text[start.min(document.text.len())..end.min(document.text.len())].to_string()
+    }
+
+    /// Half one: with an unlanded insert above the element, the caret ON THE
+    /// TAG (where it now is) gets the pair, and both ranges cover the live
+    /// `section` tags. Before E132 this answered `None` — the feature was dead
+    /// during exactly the typing it exists for.
+    #[tokio::test]
+    async fn the_mirrored_pair_lands_on_the_tags_in_live_text() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, VIEW);
+        // One line typed above the element; the analysis has not landed.
+        let live = VIEW.replacen("\t<div>", "\tlet counter = 1;\n\t<div>", 1);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        assert!(
+            backend.documents.get(&uri).expect("open").is_stale(),
+            "the pin needs the debounce window it describes",
+        );
+        // The open tag now sits on live line 4.
+        let answer = ranges(backend, &uri, Position::new(4, 3))
+            .await
+            .expect("a pair for the caret on the tag");
+        assert_eq!(answer.len(), 2);
+        assert_eq!(live_text(backend, &uri, answer[0]), "div");
+        assert_eq!(live_text(backend, &uri, answer[1]), "div");
+    }
+
+    /// Half two, the corrupting half: the caret on the line the tag OCCUPIED
+    /// when the analysis ran — live line 3, now `let counter = 1;` — gets no
+    /// pair. This is the assertion that reds on the shipped code: it answered
+    /// open=3:2–3:9 close=5:3–5:10 there, the open range contains the caret, so
+    /// the client accepted the pair and mirrored keystrokes into two lines of
+    /// unrelated live code.
+    #[tokio::test]
+    async fn a_caret_on_the_tags_old_line_is_not_armed() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, VIEW);
+        let live = VIEW.replacen("\t<div>", "\tlet counter = 1;\n\t<div>", 1);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let caret = Position::new(3, 4);
+        assert_eq!(
+            live_text(
+                backend,
+                &uri,
+                Range::new(Position::new(3, 1), Position::new(3, 17))
+            ),
+            "let counter = 1;",
+            "the pin needs the caret to be on the inserted line, not a tag",
+        );
+        assert_eq!(
+            ranges(backend, &uri, caret).await,
+            None,
+            "there is no tag under the caret, so nothing may be mirrored",
+        );
+    }
+
+    /// The control: once the analysis lands, the answer is the same pair it
+    /// always was. The live parse is not a licence for the feature to change
+    /// its answer on a settled buffer.
+    #[tokio::test]
+    async fn the_pair_is_unchanged_once_the_analysis_lands() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let live = VIEW.replacen("\t<div>", "\tlet counter = 1;\n\t<div>", 1);
+        let uri = open(backend, &live);
+        assert!(!backend.documents.get(&uri).expect("open").is_stale());
+        for (label, position) in [
+            ("the open tag", Position::new(4, 3)),
+            ("the close tag", Position::new(6, 4)),
+        ] {
+            let answer = ranges(backend, &uri, position)
+                .await
+                .unwrap_or_else(|| panic!("a pair from {label}"));
+            assert_eq!(live_text(backend, &uri, answer[0]), "div", "{label}");
+            assert_eq!(live_text(backend, &uri, answer[1]), "div", "{label}");
+        }
+        assert_eq!(
+            ranges(backend, &uri, Position::new(3, 4)).await,
+            None,
+            "and a caret on a plain statement is still not a tag",
+        );
+    }
+}
+
+/// E127: a file that appears on disk is offered by the next completion, with
+/// no edit to the open buffer.
+///
+/// The client has always sent `workspace/didChangeWatchedFiles`; the server
+/// registered no handler and `tower-lsp` dropped them. The consequence is not
+/// a wrong answer but a LATE one: `modules_in_root` is a `read_dir` the
+/// analyzer performs, captured per analysis (M25), so a module written by a
+/// generator or arriving with a `git checkout` is offered only once something
+/// else happens to re-analyze — an edit to an unrelated buffer, or a restart.
+///
+/// Driven through the real notification handler against a real directory,
+/// because every part of the claim is about the server's own choice of what to
+/// re-analyze. Non-vacuous by construction: the same completion is asked
+/// BEFORE the file exists and asserted not to offer it, so a pin that passed
+/// because the module was always there would red on its first half.
+#[cfg(test)]
+mod watched_files_tests {
+    use super::session_leak_tests::open_params;
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    const MANIFEST: &str = "[package]\nname = \"app\"\n";
+    /// An import path with nothing after `pkg::` — the completion that reads
+    /// the package's module listing, and the one the B4 import steer is built
+    /// on. The buffer is never edited after the open.
+    const ENTRY: &str = "import pkg::\n\nfun main() {\n}\n";
+    const ARRIVING: &str = "fun helper(): i32 {\n\t1\n}\n";
+
+    fn workspace(name: &str) -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-watched-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        std::fs::write(directory.join("vilan.toml"), MANIFEST).expect("a manifest");
+        std::fs::write(directory.join("src/main.vl"), ENTRY).expect("an entry");
+        let entry = Url::from_file_path(directory.join("src/main.vl")).expect("a file url");
+        (directory, entry)
+    }
+
+    /// The module names `import pkg::|` offers on line 0.
+    async fn module_completions(backend: &Backend, uri: &Url) -> Vec<String> {
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(0, 12),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion answers");
+        match response {
+            Some(CompletionResponse::Array(items)) => {
+                items.into_iter().map(|item| item.label).collect()
+            }
+            None => Vec::new(),
+            other => panic!("the array form is expected, got {other:?}"),
+        }
+    }
+
+    /// Waits for an open's scheduled analysis to land (E123).
+    async fn analyzed(backend: &Backend, uri: &Url) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if backend
+                .documents
+                .get(uri)
+                .is_some_and(|document| document.analysis_revision() > 0)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// Waits for the completion to offer `name`. Polls rather than sleeping:
+    /// the sweep the notification starts is a real analysis on a blocking
+    /// thread, and a fixed sleep is what turns a pin like this into a flake on
+    /// a loaded box.
+    async fn offers(backend: &Backend, uri: &Url, name: &str) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if module_completions(backend, uri)
+                .await
+                .iter()
+                .any(|label| label == name)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    fn created(path: &std::path::Path) -> DidChangeWatchedFilesParams {
+        DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: Url::from_file_path(path).expect("a file url"),
+                typ: FileChangeType::CREATED,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_module_that_appears_on_disk_is_offered_by_the_next_completion() {
+        let (directory, entry_uri) = workspace("created");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(
+            analyzed(backend, &entry_uri).await,
+            "the open's analysis lands (it is scheduled, not inline — E123), \
+             which is the settled starting state this pin changes the disk from",
+        );
+        let before = module_completions(backend, &entry_uri).await;
+        assert!(
+            !before.contains(&"helper".to_string()),
+            "the module does not exist yet — the premise of this pin: {before:?}",
+        );
+
+        // Something that is not the editor writes a new package module. The
+        // open buffer is untouched, and stays untouched for the rest of this
+        // test.
+        let arrived = directory.join("src/helper.vl");
+        std::fs::write(&arrived, ARRIVING).expect("a new module");
+        backend.did_change_watched_files(created(&arrived)).await;
+
+        assert!(
+            offers(backend, &entry_uri, "helper").await,
+            "the notification must re-analyze the package, so the module \
+             listing the completion reads includes the new file",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other direction, so the sweep is not one-way: a module DELETED off
+    /// disk stops being offered. A handler that only ever swept on creation
+    /// would pass the pin above and fail this one.
+    #[tokio::test]
+    async fn a_module_deleted_off_disk_stops_being_offered() {
+        let (directory, entry_uri) = workspace("deleted");
+        let doomed = directory.join("src/spare.vl");
+        std::fs::write(&doomed, ARRIVING).expect("a module to delete");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(analyzed(backend, &entry_uri).await);
+        assert!(
+            module_completions(backend, &entry_uri)
+                .await
+                .contains(&"spare".to_string()),
+            "the module is offered while it exists — the premise of this pin",
+        );
+
+        std::fs::remove_file(&doomed).expect("the module goes away");
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&doomed).expect("a file url"),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        let mut gone = false;
+        while std::time::Instant::now() < deadline {
+            if !module_completions(backend, &entry_uri)
+                .await
+                .contains(&"spare".to_string())
+            {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "a deleted module must stop being offered");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The manifest arm, and the shape of the sweep the notification widens
+    /// to. A `vilan.toml` stands for its own DIRECTORY — it is in no program's
+    /// `canonical_sources`, so the dependency edge finds nothing to sweep for
+    /// it, exactly as a manifest SAVE found nothing before E116 gave it the
+    /// same treatment. A source file stands for the package root of the open
+    /// document that contains it, which is the set a creation is invisible to.
+    #[tokio::test]
+    async fn a_watched_event_names_the_root_its_sweep_covers() {
+        let (directory, entry_uri) = workspace("root");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(analyzed(backend, &entry_uri).await);
+        let manifest_directory = vilan_core::util::canonical_path(&directory);
+        // The package root the analysis resolved is the SOURCE root, one level
+        // below the manifest — which the manifest's own directory contains, so
+        // both answers sweep the same open documents.
+        let source_root = vilan_core::util::canonical_path(directory.join("src"));
+        assert!(source_root.starts_with(&manifest_directory));
+        let manifest = Url::from_file_path(directory.join("vilan.toml")).expect("a file url");
+        assert_eq!(
+            backend.watched_sweep_root(&manifest),
+            Some(manifest_directory),
+            "a manifest stands for its own directory",
+        );
+        let arriving = Url::from_file_path(directory.join("src/helper.vl")).expect("a file url");
+        assert_eq!(
+            backend.watched_sweep_root(&arriving),
+            Some(source_root),
+            "a source file stands for the package root that contains it",
+        );
+        let elsewhere = Url::from_file_path(std::env::temp_dir().join("unrelated-vilan-file.vl"))
+            .expect("a file url");
+        assert_eq!(
+            backend.watched_sweep_root(&elsewhere),
+            None,
+            "a file no open package contains widens nothing — the dependency \
+             edge alone is the right gate there",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An event on a file the editor has OPEN is ignored: the buffer is the
+    /// truth there, `did_change`/`did_save` own that path, and acting on the
+    /// disk copy would schedule an analysis of text the user has typed past.
+    /// Pinned through the observable consequence — the world revision, which
+    /// every other arm of this handler moves.
+    #[tokio::test]
+    async fn an_event_on_an_open_buffer_is_ignored() {
+        let (directory, entry_uri) = workspace("buffered");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&entry_uri, ENTRY)).await;
+        assert!(analyzed(backend, &entry_uri).await);
+        let before = backend.revision.load(Ordering::SeqCst);
+        backend
+            .did_change_watched_files(created(&directory.join("src/main.vl")))
+            .await;
+        assert_eq!(
+            backend.revision.load(Ordering::SeqCst),
+            before,
+            "the open buffer's own file moves nothing",
+        );
+        // …and neither does a file this server has no business with.
+        std::fs::write(directory.join("notes.md"), "not vilan\n").expect("a stray file");
+        backend
+            .did_change_watched_files(created(&directory.join("notes.md")))
+            .await;
+        assert_eq!(backend.revision.load(Ordering::SeqCst), before);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E124's clock, driven through the real notification handlers: **the paint is
+/// withdrawn the moment a change arrives and returns only when the package
+/// union lands again** (`proposal/dead-code-paint.md` §3.2, determination 8).
+///
+/// The rule is asymmetric and the asymmetry is the whole design. A stale gray
+/// on an item the user has just started calling from ANOTHER file says "dead"
+/// about live code, and the response a gray asks for is deletion — that is the
+/// worst outcome paint has. A missing gray on an item that has just become
+/// unused is merely late. So: downgraded on edit, upgraded on land.
+///
+/// A wall-clock pin (it waits for the debounced analysis and then for the
+/// package clock's idle timer), so it joins the `wall-clock-waits` group in
+/// `.config/nextest.toml` beside `package_recolor_tests`, whose shape it is.
+#[cfg(test)]
+mod dead_item_clock_tests {
+    use super::session_leak_tests::{open_params, whole_file_change};
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    const MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n[entry.client]\n\n[entry.server]\n";
+    const CLIENT: &str =
+        "import pkg::shared::used_by_client;\n\nfun main() {\n\tused_by_client();\n}\n";
+    const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n";
+    const SHARED: &str = "import std::io::print;\n\n\
+         fun used_by_client() {\n\tprint(\"c\");\n}\n\n\
+         fun used_by_nobody() {\n\tprint(\"n\");\n}\n";
+
+    fn workspace() -> (PathBuf, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-e124-clock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        for (relative, contents) in [
+            ("vilan.toml", MANIFEST),
+            ("src/client.vl", CLIENT),
+            ("src/server.vl", SERVER),
+            ("src/shared.vl", SHARED),
+        ] {
+            std::fs::write(directory.join(relative), contents).expect("a source file");
+        }
+        let shared = Url::from_file_path(directory.join("src/shared.vl")).expect("a file url");
+        (directory, shared)
+    }
+
+    /// How many top-level items the server is currently fading in `uri` — read
+    /// off the open document, which is where `publish_document` leaves the
+    /// union it served the last publish from.
+    fn grays(backend: &Backend, uri: &Url) -> usize {
+        backend
+            .documents
+            .get(uri)
+            .map(|document| document.dead_item_spans().len())
+            .unwrap_or(0)
+    }
+
+    async fn wait_for_grays(backend: &Backend, uri: &Url, wanted: bool) -> bool {
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline {
+            if (grays(backend, uri) > 0) == wanted {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// E140: **the withdrawal is the cone, not the package.** An edit to a file
+    /// no entry loads cannot move a term of the union, so the paint stays up.
+    /// The first cut dropped the whole package's grays on any keystroke
+    /// anywhere in it, which in a package of any size means the grays are off
+    /// essentially all the time.
+    ///
+    /// The orphan is opened as its own document, which is what puts it in the
+    /// package and gives `withdraw_package_grays_for` something to resolve; it
+    /// is in no entry's closure, so it is outside the union's `sources`.
+    #[tokio::test]
+    async fn an_edit_outside_the_unions_cone_leaves_the_paint_up() {
+        let (directory, shared) = workspace();
+        std::fs::write(
+            directory.join("src/orphan.vl"),
+            "import std::io::print;\n\nfun nobody_loads_this() {\n\tprint(\"o\");\n}\n",
+        )
+        .expect("the orphan module");
+        let orphan = Url::from_file_path(directory.join("src/orphan.vl")).expect("a file url");
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        // The orphan is opened FIRST and waited for: `withdraw_package_grays_for`
+        // resolves a document's package off its landed analysis, so an orphan
+        // whose analysis has not landed resolves to no package at all and the
+        // withdrawal never reaches the cone test. Waiting for it is what makes
+        // this pin able to fail.
+        let orphan_text =
+            "import std::io::print;\n\nfun nobody_loads_this() {\n\tprint(\"o\");\n}\n";
+        server.did_open(open_params(&orphan, orphan_text)).await;
+        let deadline = std::time::Instant::now() + ANALYSIS_LIVENESS;
+        while std::time::Instant::now() < deadline
+            && server
+                .documents
+                .get(&orphan)
+                .and_then(|document| document.manifest_dir().map(Path::to_path_buf))
+                .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            server
+                .documents
+                .get(&orphan)
+                .and_then(|document| document.manifest_dir().map(Path::to_path_buf)),
+            Some(vilan_core::util::canonical_path(&directory)),
+            "the orphan resolves to the package, which is the premise",
+        );
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union and `used_by_nobody` fades",
+        );
+        let union_before = server
+            .package_unions
+            .iter()
+            .next()
+            .map(|entry| entry.value().revision)
+            .expect("a union");
+
+        server
+            .did_change(whole_file_change(
+                &orphan,
+                2,
+                &format!("{orphan_text}\nfun also_nobodys() {{\n\tprint(\"a\");\n}}\n"),
+            ))
+            .await;
+        assert!(
+            !server.package_unions.is_empty(),
+            "an edit outside the union's cone leaves it standing",
+        );
+        assert_eq!(
+            server
+                .package_unions
+                .iter()
+                .next()
+                .map(|entry| entry.value().revision),
+            Some(union_before),
+            "and does not bump the package revision either",
+        );
+        assert_eq!(
+            grays(server, &shared),
+            1,
+            "so the paint on the file the user is NOT editing stays up",
+        );
+
+        // The control: an edit INSIDE the cone still withdraws, so the
+        // narrowing is about the relation rather than about withdrawal
+        // having quietly stopped.
+        server
+            .did_change(whole_file_change(
+                &shared,
+                3,
+                &format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n"),
+            ))
+            .await;
+        assert!(
+            server.package_unions.is_empty(),
+            "an edit to a file the entries DO load withdraws, as it always did",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn an_edit_withdraws_the_packages_grays_and_the_clock_brings_them_back() {
+        let (directory, shared) = workspace();
+        let (service, _socket) = backend();
+        let server = service.inner();
+
+        server.did_open(open_params(&shared, SHARED)).await;
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the package clock lands a union and `used_by_nobody` fades",
+        );
+        assert_eq!(
+            grays(server, &shared),
+            1,
+            "exactly the item no entry reaches — `used_by_client` is reached by \
+             the `client` entry and must not fade",
+        );
+
+        // The edit. Withdrawal is synchronous and needs no analysis: the union
+        // is gone before `did_change` returns.
+        let edited = format!("{SHARED}\nfun just_typed() {{\n\tprint(\"t\");\n}}\n");
+        server
+            .did_change(whole_file_change(&shared, 2, &edited))
+            .await;
+        assert!(
+            server.package_unions.is_empty(),
+            "the union is dropped by the edit itself, before any analysis runs",
+        );
+        assert!(
+            wait_for_grays(server, &shared, false).await,
+            "and the first publish after the edit carries no top-level gray",
+        );
+
+        // The settle. The clock recomputes and the paint returns.
+        assert!(
+            wait_for_grays(server, &shared, true).await,
+            "the editor came to rest, the union recomputed, and the gray is back",
+        );
+        println!(
+            "E124 clock: load={} grays={}",
+            crate::keystroke::gate::loadavg_1m(),
+            grays(server, &shared),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// M50: the knob's number is MEMORY, and the cache's budget is not counted in
+/// memory — so the conversion between them is a thing the knob can get wrong
+/// silently, in the loose direction, which is the direction that matters.
+#[cfg(test)]
+mod base_cache_budget_denomination {
+    /// The two constants are the same bound in two currencies, and `0` is the
+    /// one value that must survive the conversion unchanged.
+    #[test]
+    fn the_resident_budget_and_the_recorded_budget_are_one_bound() {
+        assert_eq!(
+            vilan_core::analyzer::base_cache_budget_for_resident(
+                vilan_core::analyzer::BASE_CACHE_RESIDENT_BUDGET
+            ),
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            "the default budget must be the resident bound, converted — not a \
+             second number that happens to be near it"
+        );
+        assert_eq!(
+            vilan_core::analyzer::base_cache_budget_for_resident(0),
+            0,
+            "`0` means retain nothing but the world just stored (M24); the \
+             conversion must not turn it into something else"
+        );
+        let resident = vilan_core::analyzer::BASE_CACHE_RESIDENT_BUDGET;
+        assert!(
+            vilan_core::analyzer::base_cache_budget_for_resident(resident) < resident,
+            "a world weighs MORE than the counter records, so the budget in the \
+             counter's currency must be the SMALLER of the two — this reds if \
+             the factor is ever inverted"
+        );
+    }
+}
+
+/// E174: the session summary on demand.
+///
+/// E166 put the numbers that locate a leak — RSS, the heap in-use/retained-free
+/// split, `programs=` — on the server's session summary, and left them
+/// unreachable until the 500-request tick came round: `Vilan: Show Language
+/// Server Status` printed the CLIENT's tally and opened the channel the
+/// server's page would eventually arrive on. A page nobody can ask for is a
+/// page that is read after the session it was meant to describe.
+///
+/// The handler is pinned through [`Backend::execute_command_log`], which is the
+/// handler minus the send — the summary is a LOG line, not a return value, so
+/// what is worth asserting is the text and the level it goes out at.
+#[cfg(test)]
+mod execute_command_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    #[test]
+    fn the_declared_command_answers_the_session_summary() {
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            Url::parse("file:///summary/main.vl").expect("a url"),
+            Document::analyze("fun main() {}\n", &std_root(), Path::new("main.vl")),
+        );
+        let (level, text) = server.execute_command_log(LOG_SESSION_SUMMARY);
+        assert_eq!(level, MessageType::INFO, "{text}");
+        // E166's page, whole: the trace's own head, the retained-state line
+        // carrying the document just opened, and the memory reading that is the
+        // entire reason for asking on demand.
+        assert!(
+            text.starts_with("session trace after "),
+            "not the summary: {text}"
+        );
+        assert!(
+            text.contains("retained state: documents=1 "),
+            "the open document is not on the page: {text}"
+        );
+        assert!(
+            text.contains("\n  memory: rss="),
+            "E166's memory line is the payload: {text}"
+        );
+        // E179: the ANALYZER's base cache, sampled live by the server rather
+        // than passed in by a test — the numbers are the process's own and
+        // cannot be asserted (the cache is process-global and this runner is
+        // parallel), so what is pinned is that the page NAMES all three, in
+        // this order, on the retained-state line. The analysis above is what
+        // makes them non-vacuous: a world was stored to reach this point.
+        let retained = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("retained state: "))
+            .unwrap_or_else(|| panic!("no retained-state line: {text}"));
+        for field in [
+            "base_cache_worlds=",
+            "base_cache_weight=",
+            "base_cache_budget=",
+        ] {
+            assert!(
+                retained.contains(field),
+                "the base cache is the largest thing the server retains and \
+                 `{field}` is not on its line: {retained}"
+            );
+        }
+        assert!(
+            retained.contains(" MiB"),
+            "the two byte figures are rendered in the memory line's own unit: {retained}"
+        );
+        assert!(
+            text.contains("analyses: started="),
+            "the analysis counts are part of the page: {text}"
+        );
+    }
+
+    #[test]
+    fn the_command_the_extension_sends_is_the_one_the_server_declares() {
+        let declared = server_capabilities()
+            .execute_command_provider
+            .expect("the server declares `workspace/executeCommand`")
+            .commands;
+        assert_eq!(declared, vec![LOG_SESSION_SUMMARY.to_string()]);
+    }
+
+    // A command this server does not own is a CLIENT bug, and it is named
+    // rather than turned into a protocol error the editor reports as a failed
+    // action — the user did nothing wrong, and a warning naming both spellings
+    // is what the next bug report needs.
+    #[test]
+    fn an_undeclared_command_is_named_at_warning_level() {
+        let (service, _socket) = backend();
+        let (level, text) = service.inner().execute_command_log("vilan.notACommand");
+        assert_eq!(level, MessageType::WARNING);
+        assert!(text.contains("vilan.notACommand"), "{text}");
+        assert!(text.contains(LOG_SESSION_SUMMARY), "{text}");
+    }
+
+    // And the handler itself: fenced, timed, and answering `null` — the payload
+    // went to the channel, not to the caller.
+    #[tokio::test]
+    async fn the_handler_answers_null_and_logs() {
+        let (service, _socket) = backend();
+        let answer = service
+            .inner()
+            .execute_command(ExecuteCommandParams {
+                command: LOG_SESSION_SUMMARY.to_string(),
+                arguments: Vec::new(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("the command is answered");
+        assert_eq!(answer, None, "the summary is a log line, not a result");
+    }
+}
+
+/// E216: the language server reads the package's own `[fmt]` knobs — the half
+/// E205 left undone, where `vilan fmt` honoured the key and format-on-save did
+/// not — and offers the reflow of ONE comment run as a refactor.
+#[cfg(test)]
+mod fmt_options_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// A scratch package on disk: the manifest climb reads real files, so the
+    /// fixture has to be one. Returns the directory and the file's URI.
+    fn package(tag: &str, manifest: &str, source: &str) -> (PathBuf, Url) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_e216_{tag}_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("create the scratch package");
+        std::fs::write(dir.join("vilan.toml"), manifest).expect("write the manifest");
+        let file = dir.join("src/main.vl");
+        std::fs::write(&file, source).expect("write the source");
+        let uri = Url::from_file_path(&file).expect("a file url");
+        (dir, uri)
+    }
+
+    /// One comment, well past the code width, over a canonical program.
+    const LONG_COMMENT: &str = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed\nfun main() {}\n";
+
+    fn formatting_params(uri: &Url) -> DocumentFormattingParams {
+        DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: false,
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    async fn formatted(manifest: &str, tag: &str) -> (PathBuf, Option<Vec<TextEdit>>) {
+        let (dir, uri) = package(tag, manifest, LONG_COMMENT);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(
+                LONG_COMMENT,
+                &std_root(),
+                &uri.to_file_path().expect("a path"),
+            ),
+        );
+        let edits = server
+            .formatting(formatting_params(&uri))
+            .await
+            .expect("the formatting request is answered");
+        (dir, edits)
+    }
+
+    #[tokio::test]
+    async fn format_on_save_wraps_for_an_opted_in_package() {
+        let (dir, edits) = formatted(
+            "[package]\nname = \"wrapprobe\"\n\n[fmt]\nwrap_comments = true\n",
+            "optedin",
+        )
+        .await;
+        let edits = edits.expect("the opted-in package's comment is re-filled");
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert!(
+            edits[0].new_text.starts_with(
+                "// the formatter has laid code out to a width since the day it existed and left \
+                 every comment\n// exactly as typed\n"
+            ),
+            "the key must reach `reprint_with`: {:?}",
+            edits[0].new_text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn format_on_save_leaves_a_silent_packages_comment_alone() {
+        // The other direction, and the one that makes the first mean something:
+        // with no key the file is already canonical, so there is nothing to
+        // edit at all.
+        let (dir, edits) = formatted("[package]\nname = \"wrapprobe\"\n", "silent").await;
+        assert_eq!(
+            edits, None,
+            "a package that declared nothing keeps today's formatter"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The actions the server offers with the caret on line 0, column 4.
+    async fn actions_at_the_first_comment(
+        manifest: &str,
+        source: &'static str,
+        tag: &str,
+    ) -> (PathBuf, Url, Vec<CodeActionOrCommand>) {
+        let (dir, uri) = package(tag, manifest, source);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(source, &std_root(), &uri.to_file_path().expect("a path")),
+        );
+        let actions = server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(0, 4), Position::new(0, 4)),
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the code-action request is answered")
+            .unwrap_or_default();
+        (dir, uri, actions)
+    }
+
+    fn reflow_edit(actions: &[CodeActionOrCommand], uri: &Url) -> Option<String> {
+        actions.iter().find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action) if action.title == "Reflow this comment" => {
+                Some(action.edit.clone()?.changes?[uri][0].new_text.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_reflow_refactor_is_not_offered_away_from_a_comment() {
+        // The action is about the run the caret is in, so the caret has to be
+        // in one — and this is also what keeps the two reprints off every
+        // other code-action request.
+        const RUN: &str = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed\nfun main() {}\n";
+        let (dir, uri) = package("awayfromcomment", "[package]\nname = \"wrapprobe\"\n", RUN);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(RUN, &std_root(), &uri.to_file_path().expect("a path")),
+        );
+        let actions = server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                // Line 1 is `fun main() {}` — code, not a comment.
+                range: Range::new(Position::new(1, 2), Position::new(1, 2)),
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the code-action request is answered")
+            .unwrap_or_default();
+        assert_eq!(reflow_edit(&actions, &uri), None, "{actions:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_reflow_refactor_declines_a_never_reflow_class() {
+        // E205's ten classes are the filler's own, and this is the action
+        // asking the same function: a table row is structure, not prose, and
+        // is over the budget besides.
+        const TABLE: &str = "// | a column whose header runs well past the hundred-column budget all by itself | and a second one |
+fun main() {}
+";
+        let (dir, uri, actions) =
+            actions_at_the_first_comment("[package]\nname = \"wrapprobe\"\n", TABLE, "table").await;
+        assert_eq!(
+            reflow_edit(&actions, &uri),
+            None,
+            "a table row is never reflowed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_reflow_refactor_is_offered_on_an_over_budget_run() {
+        let (dir, uri) = package("action", "[package]\nname = \"wrapprobe\"\n", LONG_COMMENT);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(
+                LONG_COMMENT,
+                &std_root(),
+                &uri.to_file_path().expect("a path"),
+            ),
+        );
+        let actions = server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(0, 4), Position::new(0, 4)),
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the code-action request is answered")
+            .expect("a comment over the budget has one");
+        let reflow = actions
+            .iter()
+            .find_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action)
+                    if action.title == "Reflow this comment" =>
+                {
+                    Some(action.clone())
+                }
+                _ => None,
+            })
+            .expect("`Reflow this comment` is offered");
+        // The action applies the FILLER, whatever the package's opt-in says —
+        // an explicit action is consent where a save is not. This package
+        // declares nothing, and the edit still arrives. The edit is the whole
+        // buffer, re-printed with the wrap forced on: the formatter has no
+        // public paragraph entry, and asking it the question it already
+        // answers is what keeps the action and format-on-save agreeing.
+        let changes = reflow.edit.expect("an edit").changes.expect("one file's");
+        let edits = &changes[&uri];
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert!(
+            edits[0].new_text.starts_with(
+                "// the formatter has laid code out to a width since the day it existed and left \
+                 every comment\n// exactly as typed\n"
+            ),
+            "{:?}",
+            edits[0].new_text
+        );
+        assert!(
+            edits[0].new_text.contains("fun main() {}"),
+            "the rest of the buffer rides with it: {:?}",
+            edits[0].new_text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

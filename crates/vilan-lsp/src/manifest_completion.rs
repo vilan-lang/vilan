@@ -55,6 +55,8 @@ pub enum ValueSet {
     Preset,
     /// Only `true` — `project = true` is the whole inherited-dependency form.
     OnlyTrue,
+    /// A `[lints]` level (E221): `allow` or `warn`.
+    LintLevel,
 }
 
 impl ValueSet {
@@ -65,6 +67,7 @@ impl ValueSet {
             ValueSet::Open => Vec::new(),
             ValueSet::Boolean => vec!["true".to_string(), "false".to_string()],
             ValueSet::OnlyTrue => vec!["true".to_string()],
+            ValueSet::LintLevel => vec!["allow".to_string(), "warn".to_string()],
             ValueSet::Preset => Preset::all()
                 .iter()
                 .map(|preset| preset.name().to_string())
@@ -461,6 +464,38 @@ pub const TABLES: &[Table] = &[
         ],
     },
     Table {
+        path: "fmt",
+        documentation: "`vilan fmt`'s knobs for this package.",
+        keys: &[
+            Key {
+                name: "wrap_comments",
+                documentation: "Re-fill a paragraph of `//` / `///` comment lines to the \
+                                comment width, the way code is already laid out \
+                                (default false).",
+                values: ValueSet::Boolean,
+            },
+            Key {
+                name: "comment_width",
+                documentation: "The column budget a re-filled comment paragraph is laid out \
+                                to (default 100, the code width). Prose is not code: a \
+                                package writing narrower comments says so here.",
+                values: ValueSet::Open,
+            },
+        ],
+    },
+    Table {
+        path: "lints",
+        documentation: "The warnings this package asks for that the compiler does not raise \
+                        by default.",
+        keys: &[Key {
+            name: "internal_use",
+            documentation: "`warn`: a warning at every use of an `[internal(\"reason\")]` item \
+                            outside the module that declares it. Default `allow` — the label \
+                            on its own only changes what the editor shows.",
+            values: ValueSet::LintLevel,
+        }],
+    },
+    Table {
         path: "macro",
         documentation: "The compile-time interpreter's budget.",
         keys: &[
@@ -490,6 +525,8 @@ pub const HEADERS: &[&str] = &[
     "project",
     "project.dependencies",
     "build",
+    "fmt",
+    "lints",
     "macro",
 ];
 
@@ -1013,6 +1050,23 @@ mod tests {
     }
 
     #[test]
+    fn the_lints_section_offers_its_lint_and_its_two_levels() {
+        // E221: a NEW section, so all four places a manifest key lives carry
+        // it — this listing, the schema (`schema_and_listing_agree`), the
+        // parsed `Manifest` and the book.
+        assert!(labels("[|\n").contains(&"lints".to_string()));
+        assert_eq!(labels("[lints]\n|\n"), vec!["internal_use".to_string()]);
+        let mut levels = labels("[lints]\ninternal_use = |\n");
+        levels.sort();
+        assert_eq!(levels, vec!["allow".to_string(), "warn".to_string()]);
+        // A level is a string, so it is inserted quoted.
+        assert_eq!(
+            applied("[lints]\ninternal_use = |\n", "warn"),
+            "[lints]\ninternal_use = \"warn\"\n"
+        );
+    }
+
+    #[test]
     fn a_boolean_value_is_inserted_unquoted() {
         assert_eq!(
             applied("[build]\nindent = |\n", "true"),
@@ -1142,7 +1196,9 @@ mod tests {
     fn schema_and_listing_agree() {
         let schema = schema();
         let root = &schema["properties"];
-        for table in ["package", "library", "project", "build", "macro"] {
+        for table in [
+            "package", "library", "project", "build", "fmt", "lints", "macro",
+        ] {
             assert_eq!(
                 properties(&root[table]),
                 listed(table),
@@ -1213,6 +1269,11 @@ mod tests {
             enumerated(&root["build"]["properties"]["preset"]),
             sorted(ValueSet::Preset.values()),
             "`[build] preset`"
+        );
+        assert_eq!(
+            enumerated(&root["lints"]["properties"]["internal_use"]),
+            sorted(ValueSet::LintLevel.values()),
+            "`[lints] internal_use`"
         );
         assert_eq!(
             enumerated(

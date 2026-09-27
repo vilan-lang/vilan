@@ -1,7 +1,9 @@
 // `std::process` — the Node platform layer's process surface (stdin, arguments,
 // environment, exit). Not available when building for the browser.
 
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
+
+export *;
 
 /// Terminate the process with `code` (0 = success). Never returns.
 [extern("process.exit")]
@@ -19,8 +21,8 @@ external fun env(key: str): Option<str>;
 
 /// The process's current working directory, as an absolute path — what every
 /// relative path in the program (`build_of`'s `"dist"`, a `read_dir` argument)
-/// resolves against. One extern to `process.cwd()`; deliberately NOT a
-/// project-root finder — discovering the project root (walking up to
-/// `vilan.toml`) is a separate decision this binding does not preempt.
+/// resolves against. One extern to `process.cwd()`; deliberately NOT a project-root
+/// finder — discovering the project root (walking up to `vilan.toml`) is a separate
+/// decision this binding does not preempt.
 [extern("process.cwd")]
 external fun cwd(): str;

@@ -5,12 +5,15 @@
 // `x` stays 0), so `b.x` is 1 every time and the total is 3, not 6.
 import std::io::print;
 
-struct Point { x: i32, y: i32 }
+struct Point {
+	x: i32,
+	y: i32,
+}
 
 fun main() {
 	mut a = Point { x = 0, y = 0 };
 	mut total = 0;
-	for n in [ 1, 2, 3 ] {
+	for n in [1, 2, 3] {
 		mut b = a;
 		b.x = b.x + 1;
 		total = total + b.x;

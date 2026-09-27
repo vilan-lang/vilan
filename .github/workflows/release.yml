@@ -3,11 +3,35 @@
 # build paths remapped away, packages tarballs + the VS Code .vsix + the
 # install script, and publishes the GitHub Release with the changelog section
 # as its notes. Cutting a release is: bump, changelog, commit, tag, push.
+#
+# It is also RUNNABLE as a dry run (tracker L23): `workflow_dispatch` walks the
+# same graph up to the asset list and stops, because every publishing step and
+# job is guarded on the ref being a `v*` tag. That is what a bump to
+# `upload-artifact` or `download-artifact` is merged on — a green dispatch on
+# its own branch — instead of being first RUN on a tag, where four of the five
+# channels are one-way.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  # The DRY RUN (tracker L23). Every job below runs on a dispatch except the
+  # ones that publish, so the artifact actions — upload, download, the
+  # checksum pass and the asset list — are exercised on a branch instead of
+  # for the first time on a tag, where four of the five channels are one-way.
+  #
+  # The trigger is here and not in a sibling workflow because a sibling would
+  # be a second copy of this graph, and a rehearsal of a different graph is
+  # not a rehearsal. What makes it safe is that the publishing steps are
+  # guarded on the REF being a tag, not on the event: a dispatch cannot reach
+  # a channel however it is spelled, and neither can a `push` to a branch if
+  # one is ever added.
+  #
+  # The gate jobs run too. They duplicate `ci.yml`, which is a cost, and
+  # skipping them would change the `needs` graph the dry run is meant to
+  # rehearse — a skipped `needs` skips its dependents, so the shape a release
+  # takes would not be the shape the dispatch takes.
+  workflow_dispatch:
 
 # The gate runs on the SAME platform matrix as ci.yml (ubuntu + windows,
 # backlog L17): a tag can be pushed from a commit no PR ever saw, and a gate
@@ -50,7 +74,20 @@ jobs:
         # git-bash is preinstalled there, and the default pwsh speaks none of
         # this.
         shell: bash
+        # On a REHEARSAL (`workflow_dispatch`, tracker L23) the ref is a branch,
+        # so there is no version to look up: the rehearsal asks the question a
+        # tag WILL ask — are there notes to cut — of the `## Unreleased`
+        # section instead. The first rehearsal (2026-09-21) failed here in four
+        # seconds looking for `## vnext`, which is what it exists to find.
         run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            if ! awk '/^## Unreleased/{inside=1; next} /^## /{inside=0} inside && /[^[:space:]]/{found=1} END{exit !found}' CHANGELOG.md; then
+              echo "rehearsal: CHANGELOG.md's '## Unreleased' section is missing or empty — a tag cut from here would have no notes."
+              exit 1
+            fi
+            echo "rehearsal on $GITHUB_REF_NAME: '## Unreleased' carries notes; a tag's own section is checked at the tag."
+            exit 0
+          fi
           VERSION="${GITHUB_REF_NAME#v}"
           if ! grep -q "^## v$VERSION " CHANGELOG.md; then
             echo "CHANGELOG.md has no '## v$VERSION — <date>' section — write the notes before tagging."
@@ -59,6 +96,23 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
+      # The TextMate grammar's SCOPE pins (tracker E163). They tokenise with
+      # `vscode-textmate` over `vscode-oniguruma` — the tokeniser and the regex
+      # engine VS Code itself loads — so they answer "which scope does this
+      # bracket end up with" rather than "which rule could match this text",
+      # which is the question the two E164 defects were invisible to. Nothing
+      # else in a checkout creates `editors/vscode/node_modules`, so without
+      # this step every scope pin would skip and the grammar would be gated on
+      # its own rules' text again. Both packages are devDependencies: the vsix
+      # bundles `dependencies` only and `.vscodeignore` drops `node_modules/`,
+      # so nothing here reaches a published extension. ~1 s warm, +2 lockfile
+      # packages, 0 advisories. `grammar_sync.rs` REFUSES to skip when `CI` is
+      # set, which is what makes a dropped step a red suite rather than a
+      # quietly thinner gate. ci.yml's `test` job carries it too, and the two
+      # must move together like every other leg here.
+      - name: The VS Code grammar's tokeniser
+        shell: bash
+        run: npm ci --prefix editors/vscode
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       # Everything below this line is ci.yml's `test` job, character for
       # character, and it must stay that way (process.md §7.2 and §8.1;
@@ -84,8 +138,60 @@ jobs:
       - name: The doc-tests are green
         run: cargo test --workspace --doc
 
+  # ── ci.yml's other three legs, on the release side ──────────────────────────
+  #
+  # The suite legs above carry a two-sided rule ("change these two legs and
+  # ci.yml's together") because a release gate weaker than the CI gate is how
+  # v0.32.0 published on a tree ci.yml was red on. The same argument reaches
+  # further than the suite: `fmt`, `clippy` and `audit` each decide a commit is
+  # green on an ordinary push, and until now none of them decided a RELEASE was
+  # publishable. A tag can be pushed from a commit no PR ever saw, so a tree
+  # that is unformatted, carries a clippy finding, or links a crate with a
+  # RustSec advisory could reach five publishing channels, several one-way,
+  # with nothing in this file to stop it.
+  #
+  # Each is ci.yml's job character for character below its key. Separate JOBS
+  # rather than steps in `gate`, for two halves of one reason: `gate` is a
+  # two-OS matrix and all three legs are ubuntu-only there (formatting and
+  # lints are platform-independent, and the advisory database is a property of
+  # `Cargo.lock`), and `gate` declares `RUSTUP_TOOLCHAIN: stable` while `fmt`
+  # and `clippy` must carry NONE — they resolve through rust-toolchain.toml,
+  # whose pinned toolchain is exactly what makes their answer byte-stable
+  # across a rustfmt or clippy release. Folding them into `gate` would silently
+  # change both things.
+  #
+  # No `needs:` or `if:` on any of them: ci.yml gates these on its `changes`
+  # job, which has no analogue on a tag push. A release runs every leg, every
+  # time. `crates/vilan-cli/tests/release_gate.rs` holds all of this.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The tree is formatted
+        run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The tree is clippy-clean
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The same installer the suite legs use for nextest, same pin.
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-audit
+      - name: No advisory against the dependency tree
+        run: cargo audit --deny unsound
+
   build:
-    needs: gate
+    needs: [gate, fmt, clippy, audit]
     strategy:
       matrix:
         include:
@@ -203,7 +309,7 @@ jobs:
           if-no-files-found: error
 
   vsix:
-    needs: gate
+    needs: [gate, fmt, clippy, audit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -226,7 +332,7 @@ jobs:
   # downloads install.sh, so the site job stays free of Rust — the property
   # 53aa11d bought and this deliberately does not spend.
   wasm:
-    needs: gate
+    needs: [gate, fmt, clippy, audit]
     runs-on: ubuntu-latest
     # Same reason as `build`: the wasm32 target belongs to the action's
     # toolchain, not rust-toolchain.toml's pinned channel.
@@ -271,6 +377,16 @@ jobs:
               --target wasm32-unknown-unknown
           wasm-bindgen --target web --out-dir pkg \
             target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
+      # And RUN it before it can ship (N134). v0.41.0 published a compiler
+      # that built and bound here, loaded on the page, and trapped on every
+      # compile (B432): nothing between this job and the release ran one. The
+      # smoke is the website's deploy-time gate, moved to where the artifact
+      # is made — the same script `scripts/ci-local.sh wasm` runs.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: The compiler compiles
+        run: node scripts/wasm-smoke.mjs pkg
       # Shipped gzipped: it halves what the visitor downloads, and it sidesteps
       # the two things GitHub Pages will not let the site control — the `.wasm`
       # Content-Type and whether Pages compresses it. The page inflates through
@@ -307,22 +423,58 @@ jobs:
           # special-casing here. (Scratch dir is release-assets, NOT assets/
           # — that is a tracked directory holding the brand SVGs.)
           cd release-assets && sha256sum * > sha256sums.txt
+      # The asset list a release carries, asserted before anything is
+      # published — and the whole of what a DRY RUN checks (L23). Five
+      # platform archives, the .vsix, the playground wasm, the two install
+      # scripts and the checksum file. A leg that silently stopped uploading
+      # shows up here rather than as a release missing a platform.
+      - name: The asset list is the one a release carries
+        run: |
+          # `-e` explicitly: the default shell is `bash -e {0}`, and a step
+          # whose failure depends on an implicit flag is the shape L23 is
+          # about.
+          set -eu
+          # Scratch files live OUTSIDE release-assets/, because `publish`
+          # below uploads that directory by glob: a file written into it is a
+          # file published with the release.
+          ls -1 release-assets | sort > "$RUNNER_TEMP/actual.txt"
+          cat > "$RUNNER_TEMP/expected.txt" <<'ASSETS'
+          install.ps1
+          install.sh
+          sha256sums.txt
+          vilan-aarch64-apple-darwin.tar.gz
+          vilan-aarch64-unknown-linux-musl.tar.gz
+          vilan-playground-wasm.tar.gz
+          vilan-vscode.vsix
+          vilan-x86_64-apple-darwin.tar.gz
+          vilan-x86_64-pc-windows-msvc.zip
+          vilan-x86_64-unknown-linux-musl.tar.gz
+          ASSETS
+          diff -u "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/actual.txt"
+          test -s release-assets/sha256sums.txt
       - name: Release notes from the changelog
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           awk -v heading="^## v$VERSION " \
             '$0 ~ heading {inside=1; next} /^## / && inside {exit} inside' \
             CHANGELOG.md > notes.md
           test -s notes.md
-          # GitHub caps a release body at 125,000 characters, and a large
-          # release's section can exceed it (v0.40.0 did, at 74 entries).
+          # GitHub caps a release body at 125,000 CHARACTERS, and a large
+          # release's section can exceed it (v0.40.0 did, at 74 entries:
+          # 220,256 characters in 221,530 bytes). The unit matters, because
+          # the changelog is dense with em-dashes and `§` and the two counts
+          # drift apart by over a thousand: `read()` returns a decoded `str`,
+          # so `len(text)` below is characters — GitHub's unit — and NOT the
+          # file's byte length. Measuring bytes would cut early, which is
+          # merely wasteful; the reverse would fail the publish.
           # Over the cap, keep whole entries up to a safe margin and point
           # at the changelog for the rest — never a mid-entry cut.
           python3 - "$VERSION" <<'PY'
           import sys
           version = sys.argv[1]
           text = open("notes.md").read()
-          CAP = 110_000
+          CAP = 120_000
           if len(text) > CAP:
               entries = text.split("\n<!-- family:")
               kept, size = [entries[0]], len(entries[0])
@@ -337,7 +489,11 @@ jobs:
                       f"(https://github.com/vilan-lang/vilan/blob/v{version}/CHANGELOG.md).*\n")
               open("notes.md", "w").write("\n<!-- family:".join(kept) + tail)
           PY
+      # The one step a dry run must not reach. Guarded on the REF and not on
+      # the event, so nothing but a `v*` tag can publish however this workflow
+      # comes to run (L23).
       - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -354,6 +510,9 @@ jobs:
     # never replaced, so npm must not carry a version whose GitHub Release
     # failed to go out.
     needs: [build, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       # Trusted publishing (distribution.md §2): npm trusts *this workflow in
@@ -464,6 +623,9 @@ jobs:
     # marketplace version can be unpublished but never replaced, so it must not
     # carry a version whose GitHub Release failed to go out.
     needs: [vsix, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # The environment is not decoration: the federated credential in Entra
     # trusts the subject `repo:vilan-lang/vilan:environment:marketplace`, so
@@ -531,6 +693,9 @@ jobs:
     # Separate from the marketplace job on purpose: one gallery being down, or
     # one token missing, must not hold the other back.
     needs: [vsix, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -592,6 +757,9 @@ jobs:
     # retry. `build` is named too because those are the archives being pointed
     # at.
     needs: [build, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

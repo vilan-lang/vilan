@@ -7,7 +7,9 @@ The full syntactic grammar, in the notation of §1.3. Token classes
 ## 3.1 Modules and statements
 
 ```text
-module    = { statement } ;
+module    = [ module-self ] { statement } ;
+module-self   = [ platform-attr ] "mod" "self" ";" ;  (* B415, §4.1, §11.3 *)
+platform-attr   = "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ;
 
 statement = derived-item
           | service-item
@@ -15,7 +17,7 @@ statement = derived-item
           | macro-fun
           | macro-block [ ";" ]
           | macro-invocation [ ";" ]
-          | "export" statement
+          | export         (* the visibility marker, §3.2 *)
           | expression ";"
           | if-expr        (* not before "}" — see below *)
           | for-expr       (* not before "}" *)
@@ -25,12 +27,21 @@ statement = derived-item
           | enum
           | impl
           | trait
+          | labelled-let   (* §3.4 *)
           | "mod" IDENT "{" { statement } "}"
           | import ";"
           | use ";"
           | block          (* not before "}" *)
           ;
 ```
+
+A `module-self` — `mod self;`, the file's OWN module, with no body — is
+the host for attributes about the whole file (§4.1): `[platform("browser")]
+mod self;` declares the platform of the WHOLE FILE (§11.3). It is legal
+only as the file's first statement; anywhere else it is refused and told to
+move above the first import. `self` is reserved for it: a nested
+`"mod" IDENT` block may not be named `self`. The same attribute with no
+`mod self` after it fences the file's first function.
 
 A block-like form (`if`/`for`/`match`/`{…}`) in statement position must
 not be the last thing in its enclosing block: in that position it is
@@ -40,18 +51,74 @@ instead the block's **trailing expression** and supplies the block's value
 ## 3.2 Imports and exports
 
 ```text
-import  = "import" path-branch ;
+import  = "import" path-branch [ "only" ] ;   (* impls-free, §4.3 *)
 use     = "use"    path-branch ;
-path-branch = NAME [ "::" ( path-branch | path-set ) ] ;
-path-set    = "{" path-branch { "," path-branch } [ "," ] "}" ;
+path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
+                   | "as" NAME ] ;        (* alias, §4.3 *)
+path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
+set-element = path-branch | impl-selector ;
+impl-selector = "(" "impl" type ")"
+                [ "::" ( NAME | "{" NAME { "," NAME } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
+
+export      = "export" [ "(" "in" path-branch ")" ]
+              [ deprecated-label ]   (* only before `import`: B382's re-export *)
+              statement   (* §4.8 *)
+            | "export" "*" ";" ;          (* the whole-module marker *)
 ```
 
 `import` brings names from another module into scope; `use` brings names
 from a type's namespace (e.g. variants) into scope. In a set, `self` names
 the item itself (`Option::{ self, Some, None }` imports the type and its
-variants). Semantics: §4. `export statement` re-exports an import or
-exposes a declaration to importers of the module.
+variants). Semantics: §4.
+
+`export` is a statement WRAPPER, not a declaration kind: it takes the
+statement under it, which is what lets one production cover every
+declaration and the re-export alike. `export statement` marks a
+declaration as the module's surface (or re-exports an import);
+`export(in PATH) statement` narrows that to a scope subtree (`mod`,
+`pkg`, or a module path); `export *;` marks every item of the module and
+is the one form carrying no inner statement. The wrapper does not change
+the statement's own shape, so a wrapped `let` keeps its terminator —
+`export let registry = …;` — and a wrapped `fun` still takes none. A
+declaration carrying attributes is wrapped as a whole, with the marker
+ahead of them: `export [derive(Wire)] struct Handle { … }`. A `#` before
+a path element is the **reach** marker:
+`import pkg::a::{ #hidden };` imports an item the module does not export,
+deliberately (§4.3, §4.8).
+
+`as` renames the LEAF a branch ends at — `import a::b::c as d;` binds
+`d`, and `import a::{ b as x, c }` binds `x` and `c`. It is an
+alternative to the `::` continuation, not something that may follow one
+(`a::b as c::d` does not parse), and it is **contextual**: `as` is an
+ordinary identifier everywhere else in the language, including as a
+module or item name, and reads as an alias only where a path segment has
+ended and a NAME follows it.
+
+`only` is a trailing modifier on an `import` STATEMENT, not on a leaf: it
+says the statement brings its names and no implementations (§4.3). Like
+`as` it is **contextual** — an ordinary identifier everywhere else, read
+as the modifier only where the whole path has ended — and a `use` refuses
+it, because a `use` never brought an implementation along.
+
+An `impl-selector` is a brace-set ELEMENT that binds no name: it says
+which of the module's `impl` blocks this file admits, and its optional
+`::` tail names the members it takes (§4.3). `_` stands for any type at
+an argument position (`(impl List<_>)`) and `(impl _)` selects every
+implementation the module declares; a selector writes no `type X` binders
+and takes no `as`. The subject is the ordinary `type` production, and it
+resolves in the IMPORTING file's scope, so `impl S` reaches an alias that
+file bound and `impl item::Struct` is the qualified spelling.
+
+A `::` path may **not cross a line break**: the segment after a `::`
+must begin on the same line the `::` is on. Without the rule `a::` at the
+end of a line joins whatever the next line starts with — `style::` then
+`print(…)` on the line below is the legal path `style::print`, and the
+next statement is silently swallowed. Import a long path under a shorter
+name instead. The rule binds the two productions that COMMIT to a
+separator, the expression path (§3.6) and the import path here; a type
+path and a struct-literal head read the `::` and the name that follows it
+together and leave a trailing separator where it was.
 
 ## 3.3 Items
 
@@ -59,18 +126,21 @@ exposes a declaration to importers of the module.
 
 ```text
 function = [ "[" "deprecated" "(" STRING ")" "]" ]
+           [ "[" "internal" "(" STRING ")" "]" ]
            [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
-           [ "[" "trait_only" "]" ] [ "[" "doc" "(" "hidden" ")" "]" ]
+           [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "async" ] [ "external" ]
            "fun" IDENT [ generic-params ]
            "(" [ parameter { "," parameter } [ "," ] ] ")"
-           [ ":" type ] [ "borrows" IDENT ]
+           [ ":" type ] [ "borrows" IDENT ] [ context-clause ]
            ( block | ";" ) ;
 
 parameter  = [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
-binder     = IDENT | "(" binder "," binder { "," binder } [ "," ] ")" ;
+binder     = IDENT
+           | "(" binder "," binder { "," binder } [ "," ] ")"
+           | "[" binder { "," binder } [ "," ] "]" ;
 
 extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] [ "," ] ")" "]" ;
 extern-args = STRING [ "," STRING ]              (* global, or module and symbol *)
@@ -145,16 +215,74 @@ when the function is removed, so is the mark. When the item goes away is
 the CHANGELOG's fact, not the source's — the removal comes no earlier
 than the minor release after the warning first shipped.
 
+The same steer labels a **struct**, an **enum**, a **trait** or a module
+binding (leading its prefix, as on a function), and a **re-export**:
+`export [deprecated("use pkg::inner::DeltaCursor")] import
+pkg::inner::DeltaCursor as KeyedCursor;` deprecates the name `KeyedCursor`
+the re-export publishes, while the item stays exactly the item —
+`KeyedCursor` is still a `DeltaCursor`. A use of a deprecated type in
+another module — an import, an annotation, a literal's head — warns with
+the function's own warning; so does every other module's import that
+reaches a deprecated re-export, and importing the item from where it is
+declared does not. The declaring module's own uses are silent, as std's
+are. A `[deprecated]` import that is not exported publishes nothing and is
+refused, and so is a `[deprecated]` or `[internal]` on an `impl` block,
+which nobody names — label its members. The editor strikes a deprecated
+name through at its declaration and every use (the standard `deprecated`
+semantic-token modifier) and leads its hover with the steer.
+
+`[internal("reason")]` follows it, and answers a different question.
+Visibility says whether a module may **name** an item; this says whether
+a reader should **reach for** one that is named — an item exported on
+purpose and dangerous on purpose, like `std::ui`'s `Region.anchor`,
+which `each` and a hand-written `Slot` legitimately need and which
+corrupts the reconciler's view when a row is moved through it without
+`hold_rows`. The one argument is the reason, and it is required: it is
+what the editor shows, and a label with no reason is how these rot.
+
+It is **not a diagnostic**. Nothing warns, nothing refuses, and the item
+stays exported and callable — the attribute changes what the editor
+does. Completion omits the name unless what is already typed is an exact
+prefix of three characters or more, and what survives that is sorted
+last with the reason as its detail; every use of the name, and the
+declaration itself, carries a semantic-token `internal` modifier that a
+theme dims; hover leads with the reason. A **field** is the case
+declaration visibility cannot serve at all, since vilan has no per-field
+visibility, and it is the case the attribute was asked for.
+
+The same label rides every other declaration a reader may be steered
+away from: a **struct**, an **enum**, one enum **variant**, a **trait**
+and a **module binding** (`[internal("…")] let cache = …;`, the
+`labelled-let` statement of §3.4). On a struct, an enum or a trait it
+leads the declaration, ahead of `[resource]`; on a variant it leads the
+variant, as on a field. A label on a *local* `let` is refused — nothing
+outside the body can name a local, so the label would have no reader.
+The editor treats each exactly as it treats a function: hidden from
+completion below an exact three-character prefix, dimmed at the
+declaration and at every use (a type position included), and leading its
+hover. A package that also wants the terminal to say so opts in with
+`[lints] internal_use = "warn"` in its `vilan.toml`: every import and use
+of an internal item outside the module that declares it then warns
+`` `{name}` is internal: {reason} ``; the declaring module's own uses,
+std's and a dependency's stay silent.
+
 ### Structs and enums
 
 ```text
-struct = [ "resource" ] [ "external" ] "struct" (IDENT | "null") [ generic-params ]
+struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-attr ]
+         [ "external" ] "struct"
+         (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
-field  = [ "[" "expose" "]" ] IDENT [ ":" type ] ;
+field  = [ internal-label ]
+         [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
+internal-label = "[" "internal" "(" STRING ")" "]" ;
+deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
+resource-attr    = "[" "resource" "]" ;   (* B413 *)
 
-enum          = [ "resource" ] "enum" IDENT [ generic-params ]
-                "{" [ variant { "," variant } [ "," ] ] "}" ;
-variant       = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
+enum          = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-attr ]
+                "enum" IDENT
+                [ generic-params ] "{" [ variant { "," variant } [ "," ] ] "}" ;
+variant       = [ internal-label ] NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
                 [ "=" backing-value ] ;
 backing-value = [ "-" ] INTEGER | STRING ;
 INTEGER       = NUMBER without a fractional part and without a SUFFIX ;
@@ -211,26 +339,42 @@ data-less siblings: an enum with any payload variant uses the tagged
 representation, in which a bare backing value has nowhere to put a
 payload.
 
-The leading `resource` modifier marks a type declaration as a *resource*:
+The `[resource]` attribute marks a type declaration as a *resource*:
 the owned-resource class, whose semantics are specified in
-[§6.8](memory.md). It
-precedes `external`, so the full modifier order is `resource external
-struct`, and it is accepted only on `struct` and `enum` declarations;
-`resource` before any other item is a parse error.
+[§6.8](memory.md). It closes the label prefix and precedes `external`, so
+the full order is `[resource] external struct`, and it is accepted only on
+`struct` and `enum` declarations; `[resource]` on any other item, a field
+or a variant is a parse error. `resource` is not a keyword (B413 dissolved
+it into the attribute): it is an ordinary name everywhere else, and the
+retired spelling `resource struct` is refused with a steer to
+`[resource] struct`.
 
 ### Impls and traits
 
 ```text
-impl  = "impl" type [ "with" type { "+" type } ] "{" { statement } "}" ;
-trait = "trait" IDENT [ generic-params ] [ "with" type { "+" type } ]
-        "{" { function } "}" ;
+impl  = [ internal-label ] [ platform-attr ] "impl" type [ "with" type { "+" type } ]
+        "{" { statement } "}" ;
+trait = [ deprecated-label ] [ internal-label ] [ platform-attr ] "trait" IDENT
+        [ generic-params ]
+        [ "with" type { "+" type } ] "{" { function } "}" ;
 ```
 
 An impl's subject is a **type pattern**: `type X [: bounds]` binders
 anywhere inside it (`impl List<type T>`, `impl Option<(type T, type U)>`,
-bare `impl type T`) declare the impl's generic parameters (§5.6). `with`
-lists the implemented trait(s). An impl without `with` provides inherent
-members. A trait's `with` lists supertraits.
+bare `impl type T`) declare the impl's generic parameters (§5.6). A binder
+the head never mentions again is written `_` instead — the pattern
+wildcard's spelling, with the same optional bound (`impl
+Source<Option<_: Source<type U>>>`); each `_` is a parameter of its own, so
+two of them in one head are two parameters, exactly as `Some(_, _)` binds
+nothing twice. `type _` is accepted and `vilan fmt` prints it as `_`.
+A binder's bound may be a **tuple bound** instead of a trait-bound list,
+exactly as a generic parameter's may (§5.9): `impl type T: (2..) with
+Tuple { … }` is a blanket over every tuple of two or more elements, and
+impl selection admits a receiver the way a tuple-bounded parameter admits
+an argument — arity inside the range, every element satisfying the element
+bound.
+`with` lists the implemented trait(s). An impl without `with` provides
+inherent members. A trait's `with` lists supertraits.
 
 ### Generic parameters and arguments
 
@@ -251,7 +395,11 @@ optionally, each element (`T: (2..)`, `T: (..: Display)`); see §5.9.
 ```text
 derived-item   = "[" "derive" "(" IDENT { "," IDENT } [ "," ] ")" "]"
                  ( struct | enum ) ;
-service-item   = "[" "service" [ "(" IDENT ")" ] "]" struct ;
+service-item   = { service-attr | client-service-attr }- struct ;
+service-attr   = "[" "service" [ "(" service-args ")" ] "]" ;
+service-args   = service-arg { "," service-arg } ;   (* a client name leads or is absent; each other arg at most once *)
+service-arg    = IDENT | "http" | "client" "=" IDENT ;
+client-service-attr = "[" "client_service" "]" ;
 macro-attributed-item = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]"
                         ( struct | enum | function ) ;
 macro-fun        = "macro" function ;
@@ -261,14 +409,25 @@ macro-block      = "macro" block ;
 
 A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
-attribute names (`derive`, `service`, `extern`, `must_use`, `rpc`,
-`trait_only`, `doc`, `expose`, `platform`, `deprecated`) are not
-available as user macro-attribute names.
+attribute names (`derive`, `service`, `client_service`, `extern`,
+`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
+`deprecated`, `internal`) are not available as user macro-attribute
+names.
+
+`[service(..)]` and `[client_service]` may be written in either order
+on one struct; a struct carrying both is peer-to-peer and expands
+once (`proposal/transport-rpc.md` §9.3). `http` in `[service(..)]` is a
+marker, never a client name: `[service(http)]` keeps the default
+`<Struct>Client` (`transport-rpc.md` §9.7.5).
 
 ## 3.4 Bindings and assignment
 
 ```text
-let        = ("let" | "mut") binder [ ":" type ] [ "=" expression ] ;
+let        = [ "lazy" ] ("let" | "mut") binder [ ":" type ]
+             [ "=" expression ] ;
+labelled-let = ( deprecated-label [ internal-label ] | internal-label )
+               [ "lazy" ] ("let" | "mut") IDENT [ ":" type ]
+               [ "=" expression ] ";" ;
 assignment = [ "*" ] place ( "=" | "+=" | "-=" | "*=" | "/=" | "%=" )
              expression ;
 place      = chain ;                 (* an assignable location, §3.6 *)
@@ -278,7 +437,10 @@ jump       = "jump" IDENT ;          (* break | continue *)
 
 `let` binds immutably, `mut` mutably; a tuple binder destructures
 (irrefutably: names and nested tuples only). Both the type and the
-initializer are syntactically optional. A **place** is a chain expression
+initializer are syntactically optional. `lazy` is accepted only on a
+MODULE-LEVEL `let` binding one name to one initializer (§6.10): a `lazy
+mut`, a lazy destructure, a lazy binding with no initializer and a lazy
+local are each refused. A **place** is a chain expression
 (§3.6) denoting a location: a local, a field chain, an index, or a place
 reached through a call (`a.write().count`); the optional leading `*`
 assigns through a view. `jump break` / `jump continue` control the
@@ -289,7 +451,7 @@ innermost enclosing loop.
 ```text
 block      = "{" { statement } [ expression ] "}" ;
 if-expr    = "if" condition-expr block [ "else" ( block | if-expr ) ] ;
-for-expr   = "for" IDENT "in" condition-expr block   (* iteration *)
+for-expr   = "for" binder "in" condition-expr block  (* iteration *)
            | "for" condition-expr block              (* while *)
            | "for" block ;                           (* infinite *)
 match-expr = "match" condition-expr "{" { match-leg [ "," ] } "}" ;
@@ -302,6 +464,28 @@ initializers and `css` blocks are excluded there, keeping `if Foo {`
 unambiguous. A match leg's comma-separated patterns form an or-pattern;
 the optional `if` guard applies to the whole leg; the trailing comma
 after a leg is optional.
+
+A `for <binder> in` subject must have **one element type**, which the
+binder takes: a `List<T>`, a `Set<T>`, a `[T; n]`, a `str` (yielding
+characters), or any type providing the iterator protocol
+`next(&mut self): Option<T>`
+(§5.7 dispatches it; `for e in &mut c` drives `next_mut` and binds each
+element as a view, §6). A **tuple is not iterable**, and the loop over one
+is refused: a tuple is a fixed sequence of independently typed elements
+rather than a container of one element type, so there is no single type
+for the binder to take and one body cannot be checked for every element.
+Read the elements positionally (`t.0`, `t.1`) or destructure the tuple
+(§5.9). The header's binder is `let`'s (`binder`, §3.3), so a tuple or
+array binder destructures each ELEMENT — `for (index, item) in
+list.iter().enumerate()` — with exactly the rules a destructuring `let`
+takes; any other pattern is refused by name, and the element is bound and
+destructured in the body instead. The same holds for a **mapped tuple**
+`(U in T: F<U>)`, whose elements have no positions to read while `T` is
+abstract: its element-wise
+form is the tuple comprehension. *Whether such a loop should instead be
+UNROLLED — the body checked and emitted once per element, at that element's
+own type — is recorded future work; the refusal is forward-compatible with
+it.*
 
 ## 3.6 Chain expressions (postfix)
 
@@ -320,13 +504,14 @@ postfix = "." member
         | "!"                            (* try-assert, §5.10 *)
         | "(" [ entry { "," entry } [ "," ] ] ")"
                                           (* direct call on the chain result *)
-        | "?." member ;                  (* lift link, §5.10 *)
+        | "?." member                    (* lift link, §5.10 *)
+        | "?" ;                           (* expression lift, §5.10 *)
 
 atom    = literal | IDENT | IDENT generic-args | struct-init
         | "(" expression ")" | tuple | list
         | tuple-comprehension | macro-invocation | macro-block
         | element | css-block ;
-literal = NUMBER | STRING | "true" | "false" | "null" ;
+literal = NUMBER | STRING | "true" | "false" | "null" | "void" ;
 tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
 entry   = spread | expression ;
 spread  = ".." expression ;
@@ -334,7 +519,9 @@ list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
 tuple-comprehension = "(" IDENT "in" secondary-expr "=>" expression ")" ;
 
 element      = "<" element-name { head-item }
-               ( "/>" | ">" { child } "</" element-name ">" ) ;
+               ( "/>" | ">" { child } "</" element-name ">" )
+             | fragment ;
+fragment     = "<>" { child } "</>" ;              (* a List<View> literal *)
 head-item    = "." member                          (* a chain link, verbatim *)
              | "on" ":" IDENT "(" expression ")"   (* event form *)
              | element-name [ "(" expression ")" ] ;
@@ -344,14 +531,14 @@ child        = element | STRING | ISTRING | "{" expression "}" ;
 
 css-block    = "css" css-body ;        (* atom position; excluded in conditions *)
 css-body     = "{" { css-item } "}" ;
-css-item     = css-declaration | css-rule ;
-css-declaration = css-property ":" css-value ";" ;
+css-item     = css-declaration | css-rule | css-link ;
+css-declaration = css-property "(" [ expression { "," expression } [ "," ] ]
+               ")" ";" ;               (* a CALL: the property is the name *)
 css-property = { "-" } element-name ;  (* span-adjacent, as an element name is *)
 css-rule     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                css-body ;
-css-value    = css-piece { css-piece } ;   (* to the ";" at brace depth 0 *)
-css-piece    = "{" expression "}"          (* a hole *)
-             | TOKEN ;                     (* any token but ";", "{", "}" *)
+css-link     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
+               ";" ;                   (* a chain link, verbatim *)
 ```
 
 `Name<Args>` is read as a generic path head only when `::` immediately
@@ -361,7 +548,11 @@ chain's result, calling a closure-typed value
 (`self.hook.read()(a, b)`). A `?.` link's **continuation** extends
 through the following plain postfixes up to the next `?.` or `!`:
 `a?.b.c()!` lifts `b.c()` into the container, then try-asserts the
-result (§5.10).
+result (§5.10). A bare `?` — a `?` with no `.` after it — is the
+**expression lift**: it takes no member and lifts its whole enclosing
+SLOT rather than a continuation, so the slot receives the container
+(§5.10). It has been in the language since 2026-07-16 and had no
+production here until now.
 
 A leading `..` marks a **tuple-value spread** (§5.9). It is recognized
 only where an *entry* begins — a tuple construction's entry, or a call
@@ -387,6 +578,17 @@ view chain (`view("tag")` with one method call per head item and a
 `.child(…)` per child), and postfix suffixes apply to it
 (`<div />.show(flag)`).
 
+A **fragment** `<>…</>` is the nameless head, and it is a different
+lowering rather than an element with no tag: it desugars to a LIST
+LITERAL of its children, so its type is `List<View>`. `<>` and `</>`
+are span-adjacent pairs like `/>` and `</`, and neither is a lexical
+token — `<` and `>` are the same control characters the element and
+generic-argument rules use, so nothing about a comparison changes. A
+fragment takes no head items and has no self-closing form. Its type is
+where its uses are: a child position and every position a list fills
+(A46); it is not a `View`, so it is not a `fun …: View` return, a
+`when` body, a `swap` render or an `each` row.
+
 A **`css` block** is the same shape on the style side, and it appears in
 atom position too — but where an element occupies grammar space nothing
 else could want, a `css` block is **brace-initial**, so it is excluded
@@ -395,25 +597,36 @@ from condition operands exactly as a struct initializer is (§3.8).
 followed immediately by `{`.
 
 Inside the body the **dot decides, and decides alone**: an undotted item
-is a *declaration* and a dotted one is a *condition rule*, so the
-grammar never consults any method list and a method added to `Style`
-cannot change what an existing block means. A property name is a
+is a *declaration* and a dotted one is a method call, so the grammar
+never consults any method list and a method added to `Style` cannot
+change what an existing block means. What FOLLOWS a dotted head splits
+it, exactly as it does in a head item's element syntax: a `{ … }` body
+makes a **condition rule**, and a `;` makes a **chain link** — a
+verbatim method call spliced into the chain at its written position
+(`.ghost();`, `.flex_row();`, `.custom(a, b);`). A bare member and an
+empty argument list are the same call, so `.ghost;` and `.ghost();`
+both mean `.ghost()`. A property name is a
 span-adjacent name-`-`-name run, the element-name rule (so
 `flex-direction` is three tokens and `--color-ink` is five, while
-`data - id` is arithmetic). The `;` is **required** after every
-declaration, the last one included: the formatter may never invent a
-token, and a required terminator makes value scanning decidable in one
-pass. A value is a run of tokens and `{expression}` holes — there is no
-typed value grammar, and typed values arrive through the holes. A
-condition rule's parenthesized arguments are ordinary expressions
-(`.within("data-theme", "dark") { … }`).
+`data - id` is arithmetic). A declaration is a **call**: the property is
+the name and the value is its ordinary vilan expression arguments
+(`outline("none");`, `width(pct(100));`, `--brand-ink(gray(900));`), so
+there is no value grammar and no `{expression}` hole — a typed value is
+simply an argument, checked where the type system already lives. SEVERAL
+arguments are ONE value joined by a single space, CSS's own list
+separator (`margin(px(4), px(8))` is `margin:4px 8px`). The `;` is
+**required** after every declaration, the last one included: the
+formatter may never invent a token. A condition rule's parenthesized
+arguments are ordinary expressions
+(`.on(within(attribute("data-theme").eq("dark")) + hover()) { … }`).
 
 Like an element, a block is an ordinary expression that desugars before
 analysis — to the `std::style` chain: `style()`, then `.raw(property,
 value)` per declaration and `.name(args…, style() … )` per condition
 rule, with the rule's own chain appended as the final argument, in
-written order. `#` and `@` do not lex at all, so there are no hex
-literals and no at-rules inside one (lexical spec §2.4).
+written order. `@` does not lex at all, so there are no at-rules inside
+one (lexical spec §2.4); `#` lexes (it is the import reach marker) but
+begins no expression, so there are no hex literals either.
 
 ## 3.7 Operator precedence
 
@@ -421,7 +634,7 @@ From tightest to loosest; every binary level is left-associative:
 
 | Level | Operators | Notes |
 |---|---|---|
-| 1 | `::` paths, calls, `.` `[]` `!` `?.` | §3.6 |
+| 1 | `::` paths, calls, `.` `[]` `!` `?.` `?` | §3.6 |
 | 2 | prefix `!` `-` `await` `async` `&` `&mut` `*` | unary; `async` also takes a block |
 | 3 | `*` `/` `%` | |
 | 4 | `+` `-` | |
@@ -447,7 +660,7 @@ secondary-expr = closure | block | if-expr | for-expr | match-expr
                | operator-expr ;           (* §3.7 levels 1–12 *)
 condition-expr = secondary-expr ;    (* struct-init and css-block excluded *)
 
-struct-init   = IDENT [ generic-args ]
+struct-init   = type-path                      (* §3.9; qualified heads too *)
                 "{" [ init-field { "," init-field } [ "," ] ] "}" ;
 init-field    = IDENT [ "=" expression ] ;   (* shorthand: name alone *)
 closure       = ( "||" | "|" [ closure-param { "," closure-param } [ "," ] ] "|" )
@@ -473,7 +686,10 @@ Two consequences of the tier split are normative:
   condition, a `for … in` iterable, and a `match` subject parse
   `condition-expr`, whose operands exclude struct initializers, so the
   `{` after `if Foo` is the block. Parenthesize a literal to use it in a
-  condition (`if p == (Point { x = 1 }) { … }`). A **`css` block**
+  condition (`if p == (Point { x = 1 }) { … }`). The head is a
+  `type-path`, so a **qualified** literal (`shapes::Dot { x = 1 }`) is the
+  same production and takes the same exclusion — `if k ==
+  shapes::Kind::Flat { … }` reads the `{` as the block. A **`css` block**
   (§3.6) is brace-initial for the same reason and is excluded in the
   same three places, with the same escape: `if (css { … }).class_list()
   != "" { … }`.
@@ -489,23 +705,63 @@ recognized between two operands.
 
 ```text
 type = "&" [ "mut" ] type                       (* view type *)
-     | "type" IDENT [ ":" bound-list ]          (* impl-subject binder *)
+     | ( "type" IDENT | "_" ) [ ":" ( bound-list | tuple-bound ) ]
+                                                 (* impl-subject binder *)
      | [ "async" | "sync" ] closure-type [ context-clause ]
-     | IDENT generic-args                        (* nominal, generic *)
-     | IDENT                                     (* nominal *)
+     | "dyn" type-path                           (* trait object, §5.12 *)
+     | type-path                                 (* nominal *)
      | "(" IDENT "in" type ":" type ")"          (* mapped tuple, §5.9 *)
      | "(" [ type { "," type } [ "," ] ] ")"     (* tuple type *)
      ;
+type-path      = IDENT { "::" IDENT } [ generic-args ] ;
 closure-type   = ( "||" | "|" [ [IDENT ":"] type { "," [IDENT ":"] type } "|" )
                  [ type ] ;
 context-clause = "context" ( IDENT | "(" IDENT { "," IDENT } [ "," ] ")" ) ;
 ```
 
-`context` here is the contextual keyword (§2.2); the clause is only valid
-on closure types, checked semantically (§8.5). `sync` is likewise
+`context` here is the contextual keyword (§2.2); in TYPE position the
+clause is only valid on closure types, checked semantically (§8.5), and it
+is part of the closure's type wherever one may be written — a parameter, a
+`let` annotation, a struct field, a generic argument, a return type. The
+same production is the DECLARATION clause a `fun` may carry (§8.6), and the
+RETURN TYPE is where the two meet: the type rule above takes the clause
+first, and the declaration peels it back off only when the return type
+cannot carry one. So `fun f(): i32 context settings` binds its clause to the
+FUNCTION (`i32` is the return type), while `fun f(): (|| i32) context
+settings` leaves it on the closure TYPE — the returned closure is injected
+(§8.5). The one shape this position cannot spell is an UN-PARENTHESIZED
+closure return type carrying a clause (`fun f(): || i32 context settings`):
+the greed takes the clause onto the closure's own return type, which cannot
+carry one, so the form is refused with both parenthesized readings named.
+With no return type at all the clause is read by the function
+production above instead. Written after the return type it precedes a
+`borrows` clause, and written without one it follows it; the formatter
+prints it where it was written.
+
+`dyn` takes a `type-path` and nothing else: the keyword erases a TRAIT's
+implementation, so a closure type, a tuple, an array or a view after it names
+nothing that could be erased and is a parse error. A `dyn` type stands
+wherever a type stands, nesting included (`List<dyn Source<i32>>`), and the
+trait it names must be object-safe (§5.12).
+
+`sync` is likewise
 contextual (§7.4: the synchronous contract; parameters only). A closure
 type's parameters may carry documentation names (`|value: T| U`); only
 the types are significant.
+
+A `type-path` names a type, optionally through the modules that declare
+it: `Style`, `List<T>`, `style::Style`, `std::reactive::SignalCell<i32>`.
+Every segment but the last selects a namespace, and the resolution is the
+one an expression path uses (§4.2, §4.6) — so a module in scope reaches
+its types exactly as it reaches its values. Generic arguments belong to
+the LAST segment, the only one that names a type; there is no
+`List<str>::Item` in type position (a generic path head, §3.6, is an
+expression form).
+
+Every type position takes a `type-path`: a return type, a `let`
+annotation, a parameter, a struct field, an `impl` subject, a trait
+bound, a generic argument, and any of these nested inside another type
+form.
 
 ## 3.10 Patterns (match)
 
@@ -522,6 +778,15 @@ Bindings inside patterns are written explicitly (`Some(let x)`), so a
 bare name is always a **variant** reference, never a fresh binding: the
 classic mistyped-variant trap is a resolution error instead of a silent
 catch-all. `bool` and `null` literals match as variants of their enums.
+
+`let` and `mut` are the two binding forms here exactly as they are at a
+declaration (§3.4): `Some(let list)` binds immutably, `Some(mut list)`
+binds mutably, and `mut` at a tuple or array binder stamps every name
+under it. A binder is a **binding**, so it takes rule 1's copy like any
+other (§6.1): mutating `list` leaves the matched value alone, and an
+arm that means to change the subject assigns back through it. Writing
+both forms — `Some(let mut list)`, in either order — is refused, and the
+refusal names `Some(mut list)`.
 The `let`/parameter binder grammar (names and tuples, §3.3) is the
 irrefutable subset; refutable forms (literals, variants) are match-only.
 A tuple pattern is irrefutable only when its elements are: `(let a, let b)`

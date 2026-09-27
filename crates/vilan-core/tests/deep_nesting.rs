@@ -3,13 +3,32 @@
 //! overflow.
 //!
 //! The walk recurses once per level of syntactic nesting with the largest
-//! frame in the analyzer (~36 KiB per level unoptimized, `VILAN_DEPTH_STATS`
-//! measured), which is how a modest server program's analysis closed a CI
-//! worker's ~2 MiB margin in the v0.36.0 incident (commit 0fb5e5f0). The
+//! frame in the analyzer — 42,464 bytes (41.5 KiB) per level unoptimized at
+//! this sha, re-measured for N97 two ways that agree to the byte: gdb's frame
+//! deltas down one 60-level recursion (sixty of the sixty-three deltas are
+//! exactly 42,464) and `VILAN_DEPTH_STATS` over chains of 13/33/63/103/203/403
+//! levels. The binary agrees to the byte and says where it goes:
+//! `walk_expr_node_inner`'s prologue probes down `0xa000` and then subtracts
+//! `0x1a8` — 41,384 bytes of locals — and the outer `walk_expr_node` subtracts
+//! `0x408`, which with the pushes and the two return addresses is exactly the
+//! 42,464 gdb reads. That local area is ONE `sub rsp` taken on every call, so
+//! every level of nesting pays for every arm's locals whichever arm runs.
+//! N128 re-measured it (2026-09-25, `VILAN_DEPTH_STATS` over 13/33/103/203/403
+//! levels, the CLI's debug and release binaries): ~47,400 bytes (46.3 KiB) a
+//! level unoptimized — the frame has grown ~12% since N97's count — and
+//! ~2,120 bytes optimized; the gdb decomposition below is N97's.
+//! It was ~36 KiB when this comment was written; Order 36's lazy,
+//! const, callable and visibility arms landed IN that frame while the
+//! recursion stayed put, which is how a nine-level module-cycle pin came to
+//! abort the Windows shard at the seal. That is the same shape as the v0.36.0
+//! incident, where a modest server program's analysis closed a CI worker's
+//! ~2 MiB margin (commit 0fb5e5f0). The
 //! worker below spawns with 64 MiB ON PURPOSE — not the harness convention's
 //! 256 MiB: the plant's 5000 levels cost the UNBOUNDED walk ~180 MiB
 //! unoptimized and overflowed exactly this spawn before the bound existed,
-//! while the bounded walk stops near 18 MiB. Growing this spawn to make a
+//! while the bounded walk stops near 20.3 MiB (500 levels at the 42,464 bytes
+//! this header measures; "near 18 MiB" was the pre-N97 frame's figure and
+//! three comments went on quoting it — N111). Growing this spawn to make a
 //! failure pass again would make the pin vacuous.
 //!
 //! The file grew past that one bound, because the recursive families that can
@@ -104,10 +123,32 @@ fn a_5000_deep_expression_is_refused_cleanly() {
     );
 }
 
-/// The PARSER is bounded too (B142), and it is the pipeline's deepest stack
-/// consumer: `VILAN_DEPTH_STATS`'s `parse` family measured it at ~71.8 KiB per
-/// level of source nesting unoptimized (~20.3 KiB optimized) — twice the
-/// bounded phase-1 walk's frame unoptimized, four times it optimized.
+/// The PARSER is bounded too (B142), and it recurses once per level of source
+/// nesting at **34,181 bytes (33.4 KiB) unoptimized, 8,315 bytes (8.1 KiB)
+/// optimized** — four fifths of the bounded phase-1 walk's frame unoptimized,
+/// about twice it optimized.
+///
+/// Re-measured for N101 with N97's method, because the figures this comment
+/// carried (~71.8 KiB and ~20.3 KiB per level) do not reproduce at this sha and
+/// are 2.2× what the instrument reads:
+/// `VILAN_DEPTH_STATS=1 vilan check` over chains of 34/134/434 parentheses,
+/// per-level figure taken as the DELTA between two depths so the analysis's own
+/// baseline falls out of it. The three deltas agree to two decimal places
+/// (33.38 KiB debug across 34→134, 34→434 and 134→434; 8.09/8.12/8.12 KiB
+/// release), and the `parse` counter advances exactly once per level of source
+/// nesting here — depth 38 at 34 parentheses, 138 at 134, 438 at 434. Which
+/// side of the 2.2× is the artifact is NOT settled: the old number was taken
+/// before the counter moved to `parse_nested_as`, so its denominator was a
+/// different quantity, and the frame may also have shrunk. What is settled is
+/// the number a reader can reproduce today, and the method that produced it.
+///
+/// The bounded WORST CASE is measured the same way and moves with it: this
+/// file's own 5000-parenthesis plant, refused at depth 501, peaks at **16.24
+/// MiB unoptimized and 3.93 MiB optimized** where the record said 35.2 MiB and
+/// ~10 MiB. `vilan check` and not `vilan build`, deliberately — on a plant the
+/// parse bound refuses, `build` exits before the instrument reports, so the
+/// only command that can read the bound's own worst case is the one that keeps
+/// going.
 ///
 /// It also runs FIRST, so before the bound it reached the stack cliff before
 /// either analyzer bound could refuse: `a_5000_deep_expression_is_refused_cleanly`
@@ -122,8 +163,8 @@ fn a_5000_deep_expression_is_refused_cleanly() {
 /// the whole pipeline and arrive as a diagnostic. `every_nesting_door_is_refused_cleanly`
 /// is the exhaustive per-door leg, and parses directly. Both share the 64 MiB
 /// worker, which must NOT grow — see the module comment; the bounded parse of
-/// this very plant measures 35.2 MiB unoptimized, so the margin is real but not
-/// large.
+/// this very plant measures 16.24 MiB unoptimized, so the margin is a factor of
+/// four rather than the not-quite-two the record claimed.
 #[test]
 fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
     let source = format!(
@@ -153,6 +194,132 @@ fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
         refusals[0].contains("lift inner expressions into `let` bindings"),
         "the refusal must steer toward the flattening fix, got: {}",
         refusals[0]
+    );
+}
+
+/// N97's CANARY: a thirty-level chain fits libtest's own 2 MiB thread.
+///
+/// At Order 36's seal, `b250_a_declared_leg_with_no_manifest_is_unchanged`
+/// ABORTED the Windows shard with `0xc00000fd` — a stack overflow, at NINE
+/// levels of nesting, in a module-cycle pin nobody would call deep. The walk's
+/// recursion had not changed; `walk_expr_node_inner`'s FRAME had, because
+/// Order 36 landed the lazy, const, callable and visibility arms in it. Linux
+/// passed at 2 MiB and failed at 1 MiB, so nothing here could see it coming,
+/// and the seal fix raised the whole suite's threads to 8 MiB
+/// (`.cargo/config.toml`'s `RUST_MIN_STACK`) — which buys margin and buys no
+/// warning at all.
+///
+/// This is the warning. Thirty levels of chain, on a thread pinned at libtest's
+/// ORIGINAL 2 MiB, measured against the frame as it is today:
+///
+/// | codegen | bytes per level of `expr-walk` | 30 levels + baseline |
+/// |---|---|---|
+/// | debug | 42,464 B (41.5 KiB) | 1.49 MiB |
+/// | release | ~4,650 B (4.5 KiB) | 0.23 MiB |
+///
+/// (N128, 2026-09-25: debug ~47,400 B and 1.66 MiB at 33 levels — 83% of the
+/// thread; release ~2,120 B and 0.16 MiB. The frame grew; the canary did not
+/// red, and the margin it guards is now about a sixth.)
+///
+/// So the debug leg — the one the suite runs — sat at 75% of a 2 MiB thread,
+/// and the canary reds when the frame grows by about a third, or when twelve
+/// more levels of it are needed. Optimized, the same walk costs a NINTH of
+/// that, which is why nothing the binaries do has ever been near the cliff and
+/// why the suite is the only place this can be caught. Measured with the tree's
+/// own instrument (`VILAN_DEPTH_STATS=1 vilan check` over chains of
+/// 13/33/63/103/203/403 levels; the per-level figure is the DELTA between two
+/// depths, so the analysis's own baseline — 0.15 MiB debug, 0.08 MiB optimized
+/// — falls out of it). A chain and not parentheses on purpose: a method chain
+/// is FLAT to the parser and deep only to the walk, so this measures the frame
+/// N97 is about and not `parse`'s. The release column is the instrument's and
+/// not gdb's: `[profile.release]` sets `strip = true`, so a symbol-level read
+/// of the optimized frame wants `cargo build --profile profiling`.
+///
+/// **A red here is a SIGABRT, not an assertion.** A stack overflow takes the
+/// process, so there is no message from the `assert!` below — the runtime
+/// prints `thread '<unknown>' has overflowed its stack` and aborts, and nextest
+/// reports `SIGABRT … (test aborted with signal 6)` rather than `FAIL`. Read
+/// the sentence above, not the assertion. Nextest's process-per-test is what
+/// keeps that from taking the rest of the binary down with it, and it is why
+/// the thread is pinned rather than left to `RUST_MIN_STACK`:
+/// `Builder::stack_size` is what libtest's own worker does, and the suite-wide
+/// 8 MiB would hide exactly the growth this exists to catch.
+///
+/// Planted red by running it at 1 MiB, where it aborts as designed.
+#[test]
+fn a_thirty_level_chain_still_fits_libtests_own_two_mib_thread() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(30)
+    );
+    let produced = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, _errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("canary.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            program.is_some()
+        })
+        .expect("spawn the 2 MiB worker")
+        .join()
+        .expect("the worker panicked");
+    assert!(
+        produced,
+        "thirty levels of chain must analyze on a 2 MiB thread — that is \
+         libtest's own worker, and the margin above it is what the Windows \
+         shard spent at Order 36's seal"
+    );
+}
+
+/// The same canary for the PARSE frame, which had none (N101).
+///
+/// The walk's canary exists because a frame grew 15% while the comment that
+/// recorded its size did not notice. `parse`'s comment was off by 2.2×, for
+/// longer, and nothing anywhere would have said so — which is the same failure
+/// mode with a bigger number. So the parse frame gets a canary of its own, at
+/// the same tightness: **forty-five levels of parentheses spend 1.49 MiB of a
+/// 2 MiB thread, 73% of it**, which is what thirty levels of chain spend of the
+/// walk's. It reds when the parse frame grows by about a third, or when fifteen
+/// more levels of it are needed, and it reds here rather than on the shard that
+/// costs the most to read.
+///
+/// Forty-five and not thirty: the corpus sweep below measures a `parse` peak of
+/// 23 with a median of 14, so 45 is twice the deepest real file — the same
+/// ratio-to-reality the walk's thirty carries — and 34,181 bytes a level is
+/// what puts 45 at three quarters of the thread.
+///
+/// It PARSES and does not analyze, so the parse frame is the only consumer on
+/// the thread and the number above is the whole of what is spent. A red here is
+/// a SIGABRT and not an assertion, for the reason the walk's canary states.
+///
+/// Planted red at 1 MiB, where it aborts with
+/// `thread '<unknown>' has overflowed its stack`.
+#[test]
+fn a_forty_five_level_nesting_still_parses_on_libtests_own_two_mib_thread() {
+    let source = format!(
+        "fun main() {{\n\tlet x = {}1{};\n}}\n",
+        "(".repeat(45),
+        ")".repeat(45)
+    );
+    let produced = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::parsing::parse(leaked).0.is_some()
+        })
+        .expect("spawn the 2 MiB worker")
+        .join()
+        .expect("the worker panicked");
+    assert!(
+        produced,
+        "forty-five levels of parenthesis must parse on a 2 MiB thread — that \
+         is libtest's own worker, and 73% of it is what the frame spends today"
     );
 }
 
@@ -626,4 +793,164 @@ fn the_formatters_parse_mode_is_bounded_too() {
         1,
         "group-preserving mode must carry the same bound, got: {messages:#?}"
     );
+}
+
+/// Analyzes `source` on a thread spawned with `thread_size` whose stack is
+/// DECLARED to the probe (N121, `vilan_core::stack_guard`) as `declared_size`
+/// — the way the language server's analysis thread declares its 128 MiB.
+/// `analyze_source` is the playground's call, so what comes back is what the
+/// playground's fence answers.
+fn analyze_on_a_declared_stack(
+    thread_size: usize,
+    declared_size: usize,
+    source: String,
+) -> Analysis {
+    std::thread::Builder::new()
+        .stack_size(thread_size)
+        .spawn(move || {
+            vilan_core::stack_guard::with_declared_stack(declared_size, || {
+                let leaked: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    leaked,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("declared.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                Analysis {
+                    produced: program.is_some(),
+                    messages: errors.into_iter().map(|error| error.msg).collect(),
+                    inference_entries: 0,
+                }
+            })
+        })
+        .expect("spawn the declared worker")
+        .join()
+        .expect("the declared worker panicked — the fence must hold the probe's refusal")
+}
+
+/// N121: a recursion that reaches the end of a DECLARED stack is refused by
+/// the probe and answered by the fence as a diagnostic — the process lives.
+///
+/// The plant is a 490-link method chain: under the walk's 500-level bound, so
+/// nothing refuses it by DEPTH, and flat to the parser. The stack is declared
+/// at 2 MiB, so the probe refuses past 1 MiB (the red zone's minimum). Measured
+/// with `VILAN_DEPTH_STATS` (N128, 2026-09-25), the chain's walk needs ~1 MiB
+/// optimized (~2.1 KiB a level; the 11.3 KiB AGENTS.md once recorded was an
+/// older frame) and ~21 MiB unoptimized (~47,400 bytes a level), so the probe
+/// refuses it under both profiles.
+///
+/// The THREAD is 16 MiB, larger than the declaration: it was the headroom the
+/// UNPROBED syntactic visitors needed before N128 (`collect_module_paths`, over
+/// `Node::for_each_child`, recurses once per link and needs over 2 MiB here
+/// unoptimized). Since N128 `for_each_child` probes, so in the debug suite this
+/// plant is refused THERE, before the walk starts — which is why the walk's own
+/// probe has its isolating pin below
+/// (`the_walks_own_probe_refuses_the_chain_when_the_visitors_fit`); optimized,
+/// the visitors fit under the floor and the refusal here is still the walk's.
+#[test]
+fn a_walk_that_would_overflow_a_declared_stack_is_refused_with_the_fences_diagnostic() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(490)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(16 * 1024 * 1024, 2 * 1024 * 1024, source);
+    assert!(!produced, "a refused analysis lands no program");
+    assert_eq!(
+        messages,
+        vec![
+            "internal error: the compiler panicked analyzing this file (this is a bug; the \
+             details are on stderr)"
+                .to_string()
+        ],
+        "the fence answers the refusal with its one internal-error diagnostic"
+    );
+}
+
+/// The walk's own funnel, isolated in the debug suite (N128). Since the
+/// syntactic visitors are probed, the 2 MiB declaration above is refused in
+/// `for_each_child` before the walk starts when unoptimized, so that pin no
+/// longer isolates the WALK's probe there. Declared at 16 MiB, the visitors'
+/// ~2.4 MiB fits under the floor (14 MiB used) and the walk's ~20 MiB does
+/// not, so the refusal is the walk's; the 32 MiB thread keeps even the
+/// unprobed walk off the guard page, so removing the probe reds as a program
+/// PRODUCED rather than as an abort. Debug only: optimized, the walk needs
+/// ~1.2 MiB and nothing refuses — the pin above covers that profile.
+///
+/// Planted red by removing the `walk_expr_node` probe.
+#[cfg(debug_assertions)]
+#[test]
+fn the_walks_own_probe_refuses_the_chain_when_the_visitors_fit() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(490)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(32 * 1024 * 1024, 16 * 1024 * 1024, source);
+    assert!(!produced, "a refused analysis lands no program");
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    assert!(
+        messages[0].starts_with("internal error: the compiler panicked"),
+        "{messages:#?}"
+    );
+}
+
+/// N128: the SYNTACTIC visitors are probed too. The same 490-link chain on a
+/// thread that is exactly its declared 2 MiB — no hidden headroom beneath the
+/// declaration, which is what the pin above needs its 16 MiB thread for.
+///
+/// `collect_module_paths` (and every other whole-tree scan) recurses through
+/// `Node::for_each_child` once per link BEFORE the analyzer's walk starts, and
+/// unoptimized that needs more than 2 MiB for this chain. With no probe on that
+/// path the thread runs into its guard page and the process ABORTS
+/// (`thread '<unknown>' has overflowed its stack`, SIGABRT — a red with no
+/// assertion message, read the sentence); the probe in `for_each_child` is the
+/// fifth funnel, and it turns the abort into the fence's diagnostic. Optimized,
+/// the visitors fit and the walk's own probe refuses — the same answer.
+///
+/// Planted red by removing the `for_each_child` probe: the debug suite aborted.
+#[test]
+fn a_syntactic_walk_that_would_overflow_a_declared_stack_is_refused_too() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(490)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(2 * 1024 * 1024, 2 * 1024 * 1024, source);
+    assert!(!produced, "a refused analysis lands no program");
+    assert_eq!(
+        messages,
+        vec![
+            "internal error: the compiler panicked analyzing this file (this is a bug; the \
+             details are on stderr)"
+                .to_string()
+        ],
+        "the fence answers the syntactic walk's refusal with its one internal-error \
+         diagnostic"
+    );
+}
+
+/// The control: the probe on a 4 MiB thread declared at its real size does not
+/// refuse a program that fits it. Thirty links is the walk canary's plant,
+/// which fits a 2 MiB thread with room over, so a probe that fired here would
+/// be refusing code the thread can hold.
+#[test]
+fn a_program_that_fits_a_declared_stack_is_not_refused() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(30)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(4 * 1024 * 1024, 4 * 1024 * 1024, source);
+    assert!(
+        produced,
+        "a thirty-link chain analyzes on a declared 4 MiB thread"
+    );
+    assert!(messages.is_empty(), "{messages:#?}");
 }

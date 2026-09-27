@@ -15,6 +15,13 @@ A **service** is that struct. Three attributes do the work:
 There are no REST endpoints, fetch calls, or JSON shapes to keep in
 sync by hand. The compiler knows both sides.
 
+The attribute reads the `[rpc]` methods off this module's inherent `impl`
+blocks, and `export impl` is one of them — `export` is visibility, not shape.
+A service that declares nothing at all — no `[rpc]` method, no `[expose]`d
+field, no `client = ..` handler — is refused: its client could call nothing,
+and because both generated sides would agree about that empty surface, even
+`verify()` would say they match.
+
 Here's a complete little server:
 
 ```vilan,norun
@@ -124,11 +131,13 @@ the full shape.
 
 ## What can cross the wire: `Wire`
 
-Everything that travels (rpc parameters, return types, mirrored
-payloads) must be serializable, which Vilan calls **Wire**. The scalars
-are Wire (`bool`, the integers including `i53`, floats, `str`). `List`
-and `Option` of Wire types are Wire. And your own types opt in with a
-derive:
+Everything that travels — an rpc's parameters, the values a call answers
+with, mirrored payloads — must be serializable, which Vilan calls
+**Wire**. The scalars
+are Wire (`bool`, every integer width from `i8` to `u53`, `usize`, both
+floats, `str`). `List`, `Option`, `Result` and `Map` of Wire types are Wire — so a
+fallible reply, `Result<Row, str>`, is an ordinary return type. And your own
+types opt in with a derive:
 
 ```vilan,fragment
 [derive(Wire, PartialEq, Debug)]
@@ -143,6 +152,17 @@ That triple is the standard shape for payload types: `Wire` to travel,
 hiding inside a payload type is a compile error at the derive, which is
 exactly where you want to find out.
 
+`Wire` is an ordinary trait, so the derive is a convenience and not the
+only door: a type with a hand-written `impl … with Wire` is Wire
+everywhere the compiler asks — in an `[rpc]` signature, in a payload
+type's fields, and as an `[expose]`d source's element. A *conditional*
+impl carries its own recursion: `impl Pair<type A: Wire, type B: Wire>
+with Wire` makes `Pair<i53, str>` sendable and `Pair<Conn, str>`
+refused, naming the argument, while an impl whose binder declares no
+bound — `impl Handle<type T> with Wire`, which is what the derive emits
+— leaves its argument unconstrained, because a phantom parameter never
+reaches the payload.
+
 A `resource` never travels, in either position: not as a field, and not as
 the derived type itself — `derive(Wire)` and `derive(Json)` are both refused
 for a `resource` struct or enum. A resource is an owned handle, and the
@@ -153,6 +173,44 @@ section is about.
 The codec is chosen at connect time: `json_codec()` for a readable wire,
 `binary_codec()` for a compact one. Client and server must use the same
 one.
+
+### A method with nothing to say: `void`
+
+One return type is not Wire and does not have to be. An `[rpc]` method
+that returns *nothing* — write no return type, or write `: void`, they
+mean the same thing — has no reply payload to encode, so its reply is
+just the acknowledgement, and the generated stub **waits for it**:
+
+```vilan,fragment
+[rpc]
+fun remove_row(self, id: i53) {
+	self.rows.update(|&mut rows| { … });
+}
+```
+
+The stub answers `Result<void, RpcError>` — the shape every other stub
+has, with nothing in its `Ok`: `void` is Vilan's unit value, so the ack
+is `Ok(void)` and a call that did not land is `Err(error)`.
+
+```vilan,fragment
+// Wait and check.
+match client.remove_row(id) {
+	Ok(_) => {},
+	Err(let error) => print(i"remove failed: {error.debug()}"),
+}
+
+// Wait and don't check — still a round trip, the value discarded.
+let _ = client.remove_row(id);
+```
+
+**This is not a notification, and the difference is the wait.** A
+notification (`[client_service]`, or the server's
+`connection.client().…`) returns as soon as the request is sent: no
+wait, no failure, nothing that orders it against what comes next. An
+awaited `void` means *it happened* — the handler ran to completion on
+the server before the stub returned, so the next call sees its effect.
+Reach for `void` when you need the ordering and have nothing to report,
+and for a notification when you need neither.
 
 ## Naming server entities: `Handle<T>`
 
@@ -202,11 +260,13 @@ check is still what decides who may act.
 
 - On the client they return `Result<T, RpcError>` and are implicitly
   awaited, like any async call.
-- `RpcError` tells you what went wrong, in five variants:
+- `RpcError` tells you what went wrong, in six variants:
   `Transport(str)` (couldn't reach the server), `Decode(str)`,
   `Remote(str)` (the handler failed), `Contract(str)` (the connect-time
-  check below refused a drifted server), and `Unauthorized`. Errors are
-  values. Look at them and decide.
+  check below refused a drifted server), `Unauthorized` (the credential
+  will not open this connection) and `Unavailable` (the server is up and
+  refusing for now — retry later, and re-authenticating is beside the
+  point). Errors are values. Look at them and decide.
 - At connect time, both sides compare a hash of the service's shape. If
   a stale client meets a redeployed server, the connect fails cleanly —
   as `Contract(reason)` — instead of calls corrupting halfway. This is
@@ -244,20 +304,36 @@ A mirror is a `RemoteSource<T>`, not a `SignalCell<T>`, for one honest
 reason: before the first update lands it has **no value**, and nothing
 about the type pretends otherwise. You read it one of four ways:
 
-- `mirror.or(initial): SignalCell<T>` — the common one, for a view. A plain
-  signal you hand to `bind_each`, `bind_text`, or a `{…}` hole: `initial`
-  until the first sync, the mirrored value after. Write it inside the
-  view (not in `main`), because it is a **subscription**: it opens the
-  channel, and it is released when the view that created it is unmounted.
-- `mirror.map(|value| …): SignalCell<U>` — the same, with the `Option<T>`
-  in your hands once, which is where a fallback of a *different* type
-  belongs (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for
-  the same-type case.
+- `mirror.or(initial)` — the common one, for a view. A source you hand
+  to `each`, `bind_text`, or a `{…}` hole: `initial` until the first sync,
+  the mirrored value after. It is a cold node — building it opens nothing —
+  and the view that places it is what **subscribes**: that opens the
+  channel, and it is released when the view is unmounted.
+- `mirror.map(|value| …)` — the same, with the `Option<T>` in your hands
+  once, which is where a fallback of a *different* type belongs
+  (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for the
+  same-type case. Add `.cell()` where one value is read in several places.
 - `mirror.sub(|value| …): Subscription` — the manual form: an observer
   of present values, and a handle you dispose yourself. For code with no
   view and no owner (a probe, a script).
 - `mirror.get(): Option<T>` and `mirror.status(): SignalCell<Status>`
-  (`Waiting` / `Ready`) — passive reads. They open nothing.
+  (`Waiting` / `Ready` / `Absent` / `Failed(RpcError)`) — passive reads.
+  They open nothing. The last two arms are a *handle* mirror's (below): a
+  call that answered "no such source", and a call that failed.
+
+A mirror is also a **`Source<Option<T>>`**, so everything the trait gives
+every other observable value is on it: `on_change` (the lazy attach — no
+immediate call, and the channel's first frame is a change), `effect` /
+`effect_on_change`, and any generic `S: Source<…>` function, `selector`
+included. The trait argument is `Option<T>` because that is what a mirror
+holds; a `RemoteSource<List<Note>>` is therefore *not* a `Source<List<Note>>`,
+and `each` still takes `mirror.or([])` rather than the mirror. `sub` has
+one spelling per view of the value: `mirror.sub(|note| …)` is the inherent
+present-only one above, and the trait's `sub` — reached through a generic
+receiver — hands you the `Option<T>`. `map` and `or` stay inherent, which is
+what keeps their stricter law (a mirror derivation *must* have an owner) on a
+concrete receiver; a generic `S: Source<…>` calling `.map` gets the trait's
+owner-optional default.
 
 ```vilan,browser
 import std::json::json_codec;
@@ -265,7 +341,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::SocketTransport;
 import std::shared::Shared;
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 [derive(Wire, PartialEq, Debug)]
 struct Note {
@@ -284,7 +360,7 @@ fun notes_panel(client: NotesClient<SocketTransport>): View {
 	// open while — and only while — the panel is showing. `[]` until the
 	// first sync; the empty list takes its element type from the mirror.
 	let entries = client.entries.or([]);
-	view("ul").bind_each(entries, |note| note.id, |note| view("li").text(note.text))
+	view("ul").child(each(entries, |note| note.id, |note| view("li").text(note.text)))
 }
 
 async fun main() {
@@ -297,20 +373,428 @@ async fun main() {
 }
 ```
 
-**Subscription follows demand.** Every `or`, `map`, and `sub` takes a
-counted lease on the channel: the first one sends `Subscribe`, the last
-release sends `Unsubscribe` (deferred to the end of the turn, so a view
-that re-renders in place churns nothing). Ten bindings on one mirror
-cost one channel; unmounting the page closes it. Which is also why
-`or`/`map` must be called where an owner is ambient (inside a view, or
-under `run_with_owner`): a network subscription with nobody to release
-it is a compile error, not a slow leak.
+**Subscription follows demand.** Every subscribing leaf — a binding, an
+`each`, an `effect`, a `.cell()`, a `sub` — takes a counted lease on the
+channel, whether it sits on the mirror or on an `or`/`map` over it: the
+first one sends `Subscribe`, the last release sends `Unsubscribe`
+(deferred to the end of the turn, so a view that re-renders in place
+churns nothing). Ten bindings on one mirror cost one channel; unmounting
+the page closes it. The owner is asked where the lease is taken: an
+`effect` on a mirror (or on its `or`) needs an ambient owner (inside a
+view, or under `run_with_owner`) — a network subscription with nobody to
+release it is a compile error, not a slow leak — and a `.cell()` ties its
+lease to the owner that is ambient.
 
 One sentence to keep in mind: **`status` reports; it does not ask.** A
 `status()` observer alone never sees `Waiting → Ready`, because nothing
 opened the channel — the mirror stays `Waiting` until something that
-renders the value (`or`, `map`, `sub`) subscribes. That is the passive
+renders the value (a binding over `or`, an `effect`, a `sub`) subscribes. That is the passive
 read being honest, and the count is what makes the active ones cheap.
+
+### Handles: a method that returns a source
+
+`[expose]` names its channels at compile time, one per field per
+connection, and that is right for state the whole client watches — a
+task list, a topic. It is wrong for state the client watches a
+*fraction* of. A chat with a hundred thousand messages cannot expose
+them all and cannot expose them one field at a time.
+
+An `[rpc]` method whose **return type is a source** is the other half.
+The server hands back a `SignalCell<T>`; what crosses the wire is a
+channel id, and what the client's stub answers is a mirror:
+
+| the server writes | the client's stub returns |
+| --- | --- |
+| `SignalCell<T>` | `RemoteSource<T>` |
+| `Option<SignalCell<T>>` | `RemoteSource<T>` |
+| `KeyedCell<K, T>` | `KeyedSource<K, T>` |
+
+**The stub is sync, and it makes no call.** No `async`, no `!`, no
+`Result` — because there is nothing to await: the mirror is handed back
+*unleased*, and the **first lease** is what issues the call, mints the
+channel and seeds it. A handle nothing watches costs nothing at all —
+not a call, not a capability on the server, not a frame.
+
+Both written forms map to the same mirror. An `Option<SignalCell<T>>`
+does **not** become an `Option<RemoteSource<T>>`: a mirror already has a
+word for "the server has no such source" — `Status::Absent`, with `get()`
+answering `None` — and wrapping it would ask you to take apart an absence
+that was only true at the instant of the reply and then hold whichever
+half you got forever.
+
+```vilan,fragment
+[service(ChatClient)]
+struct Chat {
+	[expose] topic: SignalCell<str>,
+	bodies: Shared<List<(str, SignalCell<MessageBody>)>>,
+}
+
+impl Chat {
+	// The index: cheap, plain, and a hundred of them is one reply.
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> { … }
+
+	// The detail: a handle per message. The client subscribes to the ones
+	// on screen and to no others.
+	[rpc]
+	fun get_message(self, id: str): SignalCell<MessageBody> {
+		self.cell_for(id)
+	}
+}
+
+// At the client — no await, one mirror, read like any other:
+let ids = client.get_messages("general", 100)!;
+let body = client.get_message(ids[3]);
+view("p").bind_text(body.map(|value| match value {
+	Some(let message) => message.body,
+	None => "loading…",
+}))
+```
+
+Everything you already know about a mirror applies to this one: it is a
+`RemoteSource<T>`, you read it with `or` / `map` / `sub` / `get` /
+`status`, and **subscription follows demand**. That last rule is what
+makes the shape affordable — a hundred handles held and ten watched is
+**ten calls and ten forwards**, and the other ninety are free.
+
+**A failure is a status, not a return.** A sync stub has no `Result` to
+put one in, so what the minting call was told is reported where every
+other fact about a mirror already lives:
+
+| `status()` | what happened |
+| --- | --- |
+| `Waiting` | nothing has arrived — including "nothing has been asked", which is what an unwatched handle reads, forever |
+| `Ready` | the mirror holds a value |
+| `Absent` | the call answered `None` — this is a method written `Option<SignalCell<T>>` saying there is no such source |
+| `Failed(error)` | the call failed, and this is what it said |
+
+`Absent` and `Failed` are both answers about *now*: the mirror keeps
+whatever it last held, and the **next** 0→1 lease asks again. So a row
+that re-renders after a failure retries by itself, and a view that shows
+a spinner or a retry button reads `status()` to decide which.
+
+**One handle per id.** Two views calling `get_message(id)` get two
+mirrors, two calls and two leases of one row. The server collapses the
+*channel* — a reply carrying a source it has already exported answers
+the channel it already minted, and withdraws it only when the last
+mirror lets go — but the client-side fix is yours and it is one line: a
+[`Memo`](../std/collections.md#memokv) keyed by the id, whose maker is
+the call.
+
+```vilan,fragment
+let bodies: Memo<str, RemoteSource<MessageBody>> = Memo::new();
+
+fun body_of(id: str): RemoteSource<MessageBody> {
+	bodies.get_or(id, || client().get_message(id))
+}
+```
+
+The stub does not memoize for you, deliberately: memoizing a handle is a
+decision about *identity* — which asks are the same ask — and generated
+code has no business making it.
+
+**The element must be Wire, not the source.** The `SignalCell` never
+crosses; its values do, one `Update` frame at a time. So the Wire rule
+lands on `T`, and a handle over a non-Wire element is refused naming the
+element rather than the wrapper.
+
+**The contract hash covers the mapped type.** `get_message`'s surface
+entry is written `get_message(str)->RemoteSource<MessageBody>;` — what
+the *client* will see, because the hash exists to protect the client. A
+server that changes a handle return to a plain value moves the hash and
+a stale client is refused at connect, instead of decoding a channel id
+as a message.
+
+**A handle method is WebSocket-only.** Its reply is a channel id minted
+in *this connection's* capability table, so the connectionless legs
+cannot serve one. Over `POST {mount}rpc` the call fails at its first
+lease and `status()` reads `Failed`, naming the
+method — the service's plain methods keep answering beside it, and the
+same mount's WebSocket leg serves the handle fine, so it is the route the
+client dialled that is wrong and not the mount. In process, a `local_rpc`
+transport over a protocol no `for_connection` stamped is refused where it
+is *wired*, before the first call: register the session and stamp it
+(`register_session(id, end, codec)`, then
+`into_protocol(codec).for_connection(id)`) and handles work in process
+too, which is how `vilan/examples/rpc` is written. Everything a generated
+`Client::connect` builds rides the socket, so reaching this at all means
+having assembled the client by hand.
+
+**A handle-returning method must be safe to re-run.** Its return type is
+the declaration that it is a *getter*: the runtime issues the call at
+the first lease, again when a released mirror is watched afresh, and
+again after a reconnect. Write it as a lookup — `self.cell_for(id)` —
+not as something that counts, charges, or appends. (This is also why the
+method body does not run when you *call* the stub: nothing has been
+asked yet. If you need a server-side effect, that is a plain `[rpc]`
+method, not a handle.)
+
+**When the server frees it.** Demand decides. A mirror's last lease
+going away sends `Unsubscribe`, and for a channel a reply minted that
+withdraws the capability whole: the forward stops, the starter is
+dropped, and the source it captured is released. Nothing accumulates
+over a long session. The mirror remembers the call it came from, so the
+next lease re-issues it, rebinds to the fresh channel, and paints its
+last known value until the first update lands. (An `[expose]`d field
+channel does *not* work this way: its `Unsubscribe` is demand-only and
+its capability survives, because it is minted once per connection and a
+remount must find it on the same id.)
+
+"Last lease" means the last one on the **channel**, not on your mirror:
+where two mirrors ended up sharing a channel because they named the same
+source, the first to let go withdraws nothing.
+
+Two consequences worth having in mind. A dispose and a remount anywhere
+inside one macrotask — two event handlers, a route change, an `each`
+rebuilding rows — send **nothing**: a handle's close waits for the
+turn's settle and then one microtask, and a lease returning in that
+window cancels it. (A `[expose]`d field mirror keeps the prompter
+cadence: its close is due at the settle and goes then, because its
+channel survives it and there is nothing to buy by waiting.) And a
+handle held inside a view — anywhere an owner is ambient — that nothing
+ever leases is released when that owner is disposed; held with no
+ambient owner (at the top of `main`, say) it lives with the connection,
+which frees every channel it ever minted when the socket closes. A
+handle that never reached a lease has nothing to free either way: it
+never asked.
+
+### Keyed mirrors: `[expose(keyed)]`
+
+A plain `[expose]` sends the **whole value** on every change. That is the
+right trade for a settings record or a counter, and the wrong one for a
+collection that grows: exposing a message platform's five thousand
+messages means every edit, every post and every delete resends all five
+thousand, to every connected client.
+
+`[expose(keyed)]` makes the collection **keyed**, and then only what moved
+crosses. Two things are required of it:
+
+- the **key type is written somewhere the expansion can read it**, before
+  any type resolves — a `Map<K, V>` element names it in the collection and
+  takes the bare `[expose(keyed)]`; every other collection names it in the
+  attribute, as `[expose(keyed = K)]`;
+- the value implements **`Keyed<K>`** (its own identity) and
+  **`PartialEq`** (what "changed" means).
+
+The two spellings are **one contract**: same frames, same
+`KeyedSource<K, T>` on the client, same surface entry, same contract hash.
+What differs is only what the server stores.
+
+```vilan,fragment
+import std::reactive::SignalCell;
+
+[service(TaskClient)]
+struct Tasks {
+	// A list needs the key in the attribute: `List<Task>` names only the
+	// element, and a keyed mirror is a `KeyedSource<K, T>`.
+	[expose(keyed = str)] items: SignalCell<List<Task>>,
+}
+```
+
+```vilan,fragment
+import std::map::Map;
+import std::reactive::SignalCell;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	channel: i32,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(ChatClient)]
+struct Chat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+```
+
+The server writes `self.messages` exactly as before — `insert`, `remove`,
+whatever it likes. What changed is the wire: the channel diffs successive
+snapshots by key and sends a **`Patch`** of `Delta` ops (`Reset`,
+`Insert`, `Update`, `Remove`) instead of an `Update` carrying the whole
+map.
+
+### A third spelling that skips the diff: `KeyedCell<K, T>`
+
+Diffing is what a `SignalCell` forces: the channel is handed two snapshots
+and has to work out what moved, which re-keys the whole collection on every
+change — and pays for it once per subscribed connection. Only the *mutation*
+knows what changed, so `KeyedCell<K, T>` is the field type that says it:
+
+```vilan,fragment
+import std::rpc::KeyedCell;
+
+[service(ChatClient2)]
+struct Chat2 {
+	[expose] messages: KeyedCell<str, Message>,
+}
+```
+
+```vilan,fragment
+fun edit(messages: KeyedCell<str, Message>) {
+	messages.insert(Message { id = "m9", channel = 1, body = "hello" });
+	messages.update("m9", |&mut message| {
+		message.body = "hello again";
+	});
+	messages.remove("m9");
+}
+```
+
+Each write appends the `Delta` op it *is*, and a subscriber's forward sends
+the ops since it last looked. The cell names both its key and its element in
+its own type, so `keyed` is redundant on it and there is nothing for
+`keyed = K` to add; and `PartialEq` is no longer required of the element,
+because nothing is compared.
+
+**Nothing on the wire changes** — the same `Patch` frames, the same
+`KeyedSource<K, T>` on the client, the same contract hash as the
+`[expose(keyed = str)] SignalCell<List<Message>>` spelling, so a service may
+swap one field for the other without breaking a deployed client. What changes
+is the cost per change per connection: 0.0078 ms at 1,000 rows and 0.0103 at
+10,000, where diffing the same edits costs 0.315 and 3.814 (children CPU).
+Bind it locally with `each(messages, …)` — it is a `Source<List<T>>` with
+no `Option` in it, because a cell always holds a collection.
+
+### A keyed handle: a method that returns a `KeyedCell`
+
+`[expose(keyed)]` names one collection per field per connection, which is
+the same limit the plain form has — and the same answer applies. An `[rpc]`
+method whose return type is a `KeyedCell<K, T>` hands the client a
+`KeyedSource<K, T>`, minted per **call**:
+
+```vilan,fragment
+impl Board {
+	// One board per workspace — not a set the compiler can name as fields.
+	[rpc]
+	fun tasks_in(self, workspace: str): KeyedCell<i32, Task> {
+		self.board_for(workspace)
+	}
+}
+
+// At the client — sync and unleased, exactly like a plain handle:
+let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
+view("ul").child(each(tasks.or([]), |task| task.id, |task| view("li").text(task.title)))
+```
+
+Everything a plain handle does, this one does at the keyed type: no call
+until the first lease, `status()` for what that call was told, and demand
+deciding the channel's life. The one difference is what *counts* as demand
+— a **per-key** lease is a first demand too, and mints the channel exactly
+as a whole-collection one does — and what the channel is finished with: a
+keyed channel carries one forward per demand, so it is withdrawn when the
+last of them goes, not when the first does.
+
+An `Option<KeyedCell<K, T>>` is **not** a handle return in v1; it is refused
+as a non-Wire return like any other unrecognized type.
+
+### Reading a keyed mirror
+
+The mirror is a `KeyedSource<K, T>`, and it holds **exactly what this
+client subscribed to**, in the server's order. It reads two ways.
+
+**The whole collection** — the same four calls a `RemoteSource` has, with
+`List<T>` in place of `T`:
+
+```vilan,fragment
+fun feed(client: ChatClient<SocketTransport>): View {
+	let messages = client.messages.or([]);
+	view("ul").child(each(messages, |message| message.id, |message| view("li").text(message.body)))
+}
+```
+
+**One key** — the part a plain mirror has no spelling for:
+
+```vilan,fragment
+fun message_row(client: ChatClient<SocketTransport>, id: str): View {
+	// Counted per KEY: this opens a subscription for `id` alone, and the
+	// server forwards that message's changes and nothing else. Released
+	// when the row unmounts, like any other lease.
+	let message = client.messages.of(id);
+	view("li").bind_text(message.map(|held| match held {
+		Some(let found) => found.body,
+		None => "…",
+	}))
+}
+```
+
+`of(key)` is the view seam (owner-released, like `or`/`map`);
+`sub_key(key, |value| …)` is its manual form, for code with no owner.
+`get()`, `status()` and `fault()` are passive.
+
+**Whole-collection demand subsumes per-key demand.** Holding both leases
+on one channel does not double anything: while the whole collection is
+held, a key asks for nothing, and when the whole lease is released the
+keys still held take the wire back. You never have to reason about which
+of two forwards a message arrived through.
+
+**`fault()`** is the keyed mirror's one extra read: `Some(reason)` if a
+patch ever named a key the mirror does not hold. That is a server bug or a
+lost frame — never something application code can cause — so the op is
+refused rather than applied, and the first fault is the one kept.
+
+### What it costs
+
+Measured over twenty channels of fifty messages (`reactive_channels.rs`),
+server → client bytes for one event:
+
+| event | `[expose]`, whole platform | `[expose]`, one channel | `[expose(keyed)]` | one key leased |
+| --- | --- | --- | --- | --- |
+| open the channel | 123,816 | 6,156 | 123,827 | 160 |
+| edit one message | 123,753 | 6,093 | **95** | **95** |
+| edit another message | 123,693 | 6,033 | 98 | **0** |
+| post a message | 123,813 | 6,033 | **163** | **0** |
+| delete a message | 123,691 | 5,911 | **34** | **0** |
+
+Three things that table says out loud:
+
+- a keyed channel is **not cheaper to open** — it sends the collection
+  once, as a `Reset`. Leasing one key is what makes a seed small;
+- an edit costs the message, not the platform;
+- a per-key subscriber is told **nothing** about keys it did not ask for,
+  which is the column no amount of client-side filtering can produce.
+
+### The rules worth knowing
+
+- **A reorder falls back to `Reset`.** There is no move op: when the
+  elements retained across a change are not in the same relative order on
+  both sides, the whole collection goes again. Appending, editing and
+  deleting never reorder, so the fallback is rare — and correct where a
+  cleverer diff would be subtly wrong.
+- **A reconnect clears the mirror first.** A plain mirror may keep its
+  last value across a reconnect because the fresh subscription resends
+  the whole value; a keyed forward reseeds only what it is asked for, so
+  a keeping mirror could hold an element deleted while the connection was
+  down and no later op would ever name it. The keys you still hold are
+  re-subscribed and re-seeded.
+- **A key written twice has to agree.** A `Map<K, V>` element names the key
+  and takes the bare `[expose(keyed)]`; writing the argument beside it as
+  well is redundant but fine — *while the two spellings agree*. A
+  `[expose(keyed = i32)]` over a `SignalCell<Map<str, Message>>` is
+  **refused at the attribute**, naming both spellings. Neither is knowably
+  the intended one, and the expansion reads `K` off the annotation before
+  any type resolves, so it has nothing to pick between them with: drop the
+  argument, or write the map with the key the argument names.
+- **The contract hash moves — and only for services that use the form.**
+  A keyed exposure is its own surface entry, so a client built against
+  `[expose]` will not connect to a server that has since made the field
+  keyed. That is the point: the frames differ.
+- **Hand-wired exposures have the same three shapes.**
+  `ReactiveServer::expose_keyed(source, key_of)` for a `List<T>`,
+  `expose_keyed_map(source, key_of)` for a `Map<K, V>` and
+  `expose_keyed_cell(cell)` for a `KeyedCell<K, T>` (no `key_of` — the cell
+  names its key), with `ReactiveClient::attached_keyed_source` /
+  `keyed_source` on the other end. `[expose(keyed = K)]` generates the first,
+  `[expose(keyed)]` over a map the second and `[expose]` over a cell the
+  third, frame for frame — the hand-wired form is the escape for a source
+  none of the three attributes can name, not for the `List`.
 
 ## Connection state and reconnection
 
@@ -360,9 +844,9 @@ at-least-once — see
 
 ## Authentication
 
-The straightforward shape, and the one the walkthrough app uses: a
-`login` rpc returns a token, later rpcs take the token as their first
-parameter, and the server validates it per call.
+The straightforward shape, and the one a first draft usually reaches
+for: a `login` rpc returns a token, later rpcs take the token as their
+first parameter, and the server validates it per call.
 
 ```vilan,fragment
 [rpc]
@@ -372,9 +856,181 @@ fun login(self, username: str, password: str): AuthOutcome { … }
 fun create_task(self, token: str, workspace_id: i32, name: str): i32 { … }
 ```
 
-When token-per-call gets noisy, the recorded refinement is
-connection-scoped identity via `std::context`. It isn't built into the
-generated dispatch yet.
+It works, and it has two costs: every method carries a parameter that is
+not about what the method does, and **the socket itself is open to
+anyone** — a client that never logs in still connects, still holds a
+connection, and still receives whatever the service exposes.
+
+### Authorizing the connection
+
+The refinement is to decide once, at the handshake, before a socket
+exists: `Service::authorize`.
+
+```vilan,fragment
+Service::factory(|connection: Connection| Store {
+	user = connection.session.identity,
+	notes = Signal::new([]),
+}, json_codec())
+	.authorize(|handshake: Handshake| match handshake.token() {
+		Some(let token) => match verify(token) {
+			Some(let subject) => Result::Ok(Session::of(subject)),
+			None => Result::Err(Reject::Forbidden),
+		},
+		None => Result::Err(Reject::Unauthorized),
+	})
+```
+
+`Err` answers the socket a status and destroys it: no connection id, no
+reactive session, no service instance — nothing of the service is built
+for a client it refused. `Ok(session)` becomes `Connection.session`, which
+the [factory](#one-instance-per-connected-client) reads to build that
+client's instance. So identity arrives **on the handshake**, and the
+methods lose their token parameter.
+
+Four arms, and the line they are drawn on is **who decided**:
+
+| `Reject` | Status | The refusal it makes |
+| --- | --- | --- |
+| `Unauthorized` | `401` | no credential, or one that did not verify |
+| `Forbidden` | `403` | a good credential for someone who may not have this |
+| `TooMany` | `429` | a **limit**, not a judgement — `max_connections`, the handshake rate, `authorize_timeout`, or your own |
+| `Unavailable` | `503` | the app's own "not now": the token may be perfect and the client the only one asking, and the database is down or the node is draining |
+
+`503` is the one arm that reports a judgement **the app made**, which is
+why std never answers it on your behalf: a verifier `authorize_timeout`
+cut off said nothing at all, so reporting its silence as the app's
+judgement would be a claim std cannot make. That refusal is a `429` —
+[below](#cheap-limits-with-or-without-a-gate).
+
+The mechanism is yours. Vilan verifies nothing and knows no token
+format — `authorize` may await, so signing checks (`std::jwt`, WebCrypto)
+belong right there.
+
+**How the credential gets there.** A browser cannot put a header on a
+WebSocket handshake. The one field it can fill is the subprotocol list,
+so that is the convention: `["vilan-rpc", "token." + credential]`, which
+`std::rpc::rpc_protocols(credential)` writes for you.
+
+```vilan,fragment
+let client = TodoClient::connect_with(url, json_codec(), rpc_protocols(token))!;
+```
+
+The server selects `vilan-rpc`, echoes it in the 101 (required — a
+browser closes a connection whose subprotocol offer went unanswered), and
+hands the whole offer list to `authorize` as `Handshake.protocols`;
+`handshake.token()` picks the `"token."` one out. A subprotocol is a
+token, not a header value: no commas, no spaces — every JWT already
+qualifies. The same list is re-presented on each reconnect, so an
+authorized connection re-authorizes itself automatically.
+
+`Client::connect(url, codec)` carries no credential and offers only
+`vilan-rpc`, which is right for a service with no gate — and enough for
+one with a gate to tell it apart from a stranger, which is what the next
+section is about.
+
+An authorized service answers **only** the WebSocket upgrade: the
+connectionless SSE and POST legs carry no handshake to authorize, so they
+answer `401` rather than standing open as the way around the gate — the
+rpc leg with a typed `RpcError::Unauthorized` envelope. The POST leg can be
+gated in its own vocabulary instead, with a second hook:
+[`authorize_request`](#gating-the-post-leg-authorize_request).
+
+### A refused client is told, and stops
+
+`connect`/`connect_with` against a credential the server refuses returns
+`RpcError::Unauthorized`, on the first attempt.
+
+That reads like a triviality and is not one. **No host WebSocket shows a
+client the HTTP status of a failed handshake.** Measured on node 24
+(undici's global `WebSocket`, which is what `std::rpc` binds): a `401`, a
+`403`, a `429`, a socket destroyed mid-handshake, a refused TCP
+connection and a server with no upgrade handler all raise the identical
+error and the identical close code. The browser API exposes less still,
+deliberately. So a refused client could not tell "my token is wrong" from
+"the server is down", and did the only safe thing — ten redials over
+about 24 seconds of backoff, then `Transport("could not reach …")`, which
+is a false sentence about a server that answered immediately.
+
+The fix is that the refusal is **sent, not inferred**. A client that
+offered `vilan-rpc` — every vilan client — is upgraded and handed one
+frame naming the status before the socket closes. Everything else still
+gets the plain HTTP status line: a browser opening the URL, `curl`, a
+probe, a health check, a scanner. The HTTP semantics of a refused
+handshake are unchanged for everything that speaks HTTP and not this
+protocol.
+
+The cost is one 101 and one small frame per refused vilan client, on a
+socket destroyed in the same turn either way. It is bounded by which
+refusals are eligible: **`Reject::TooMany` is never one**, and `TooMany`
+is exactly what `max_connections`, `handshake_rate` and
+`authorize_timeout` produce — so the refusals a flood produces are the
+ones that never upgrade, and nobody can reach the upgrading path more
+often than the rate limiter admits.
+
+`401` and `403` both arrive as `RpcError::Unauthorized`; the client's
+answer to either is the same, and this credential will not open this
+connection. `503` arrives as its own arm, `RpcError::Unavailable`,
+because the answer to it is a different one: not "not with this
+credential" but "not now" — retry later, and re-authenticating is beside
+the point.
+
+### Cheap limits, with or without a gate
+
+Four knobs on the same seam, all refusing at the handshake, all working
+with no `authorize` at all:
+
+```vilan,fragment
+Service::new(protocol)
+	.max_connections(500)          // 429 over the ceiling
+	.handshake_rate(20, 10000.0)   // 20 handshakes per client per 10s
+	.handshake_timeout(5000)       // a socket that never greets is destroyed
+	.authorize_timeout(2000)       // a verifier that never answers is refused
+```
+
+`max_connections` counts **upgraded sockets on this mount**, and nothing
+else: not the SSE or POST legs, which hold no connection to count, and
+not a handshake still inside `authorize`. A service whose clients arrive
+over `{mount}events` is not limited by it at all.
+
+`handshake_timeout` bounds the **greeting**, not idleness: the first
+inbound byte disarms it, so a client that connected and is only watching
+mirrors is never touched.
+
+`authorize_timeout` is its twin on the other side of the upgrade. The
+hook is awaited **inside** the upgrade handler, so a verifier that hangs
+— a token endpoint that stopped answering, a database that is gone —
+holds an unanswered socket for as long as it hangs, one per client trying
+to connect. That is a denial of service the server inflicts on itself,
+reached without a single malformed byte from anyone. `handshake_rate`
+caps how fast the pile grows; only this caps how big it gets. A hook that
+answers late is not raced back in — the socket is already gone.
+
+Its refusal is `429`, **not** `503`, and the reason is the line the
+[table above](#authorizing-the-connection) draws. `503` is the app's own
+judgement, given from its own `authorize` as `Reject::Unavailable`; a
+verifier that ran out of time gave no judgement at all, and std answering
+`503` on its behalf would report a decision the app never made. A timeout
+is std's limit — which is also the reading the client wants: it says
+nothing about the credential, and it is the one refusal to retry.
+
+**Behind a proxy**, every client shares the proxy's socket address, so a
+per-address `handshake_rate` becomes a global one that refuses everybody
+as soon as one client is noisy. `trust_forwarded_for(true)` reads the
+client's address from the first entry of `X-Forwarded-For` instead — for
+`handshake_rate`, for `Handshake.remote_addr`, and for
+`Connection.remote_addr`, one switch for all three.
+
+```vilan,fragment
+Service::new(protocol)
+	.trust_forwarded_for(true)
+	.handshake_rate(20, 10000.0)
+```
+
+It is **off by default and must stay off** unless a proxy you control is
+the only way to reach the server: the header is written by whoever spoke
+last, so a directly-exposed server that trusts it lets any client pick
+its own rate-limit bucket — and its own audit trail — by writing one
+line.
 
 ## Where the service lives
 
@@ -428,6 +1084,222 @@ and checked against the build, is in
 per-connection state, `Service::on_connect`/`on_disconnect` replace the
 default session lifecycle (see the [rpc reference](../std/rpc.md)).
 
+### One instance per connected client
+
+`Service::new` mounts **one instance for the whole process**: every client
+is answered by the same `self`, so a method cannot tell who called and an
+`[expose]`d field is one cell shared by everybody. When a method needs to
+know its caller — which is most apps the moment they have users — mount the
+service with a **factory** instead, and the struct instance becomes the
+connection's session:
+
+```vilan,fragment
+Server::builder()
+	.port(port)
+	.with_service(Service::factory(|connection: Connection| Store {
+		user = user_of(connection.session.identity),
+		notes = Signal::new([]),
+	}, json_codec()))
+	.build()
+	.start();
+```
+
+`build` runs once per connection, with that connection's `Connection`
+(`id`, the `session` an [`authorize`](#authentication) hook proved, and
+`remote_addr`), and every route of that connection's dispatcher closes over
+the instance it returned. Three things follow:
+
+- A method reads its caller off `self` — no token parameter, no per-call
+  re-resolution.
+- `[expose]`d fields are **per client**: each instance has its own cells,
+  so each connection's mirrors carry that client's own data.
+- The instance dies with the connection, alongside the reactive session
+  `on_disconnect` already releases.
+
+`Service::new(protocol)` is the stateless shorthand for
+`Service::factory(|_connection| shared, codec)`, and stays exactly as
+useful for a service with nothing per-client to hold.
+
+One limitation, stated plainly: the connectionless `POST {mount}rpc` leg has
+no connection to build an instance for, so a factory service **refuses it**
+(`501`, with the reason in the body). A factory service is reached over the
+WebSocket transport — which is what every generated `Client::connect` uses.
+
+### Mutable session state
+
+That instance is the connection's session, so its fields are ordinary
+mutable state — and the **receiver** you write on the method decides where
+the write goes.
+
+`&mut self` is the idiomatic one. The connection's dispatcher is built once,
+around that connection's instance, and a `&mut self` method writes to it in
+place — so the write is still there on the next call over the same socket, and
+no other connection can see it:
+
+```vilan,fragment
+[service(GateClient)]
+struct Gate {
+	is_authenticated: bool,
+}
+
+impl Gate {
+	[rpc]
+	fun login(&mut self, password: str): bool {
+		if password == "hunter2" {
+			self.is_authenticated = true;
+		}
+		self.is_authenticated
+	}
+
+	[rpc]
+	fun secret(self): str {
+		if self.is_authenticated { "the answer is 42" } else { "sign in first" }
+	}
+}
+```
+
+`mut self` is **refused** on an `[rpc]` method, naming the method. It reads
+like the same thing and is not: `mut self` is a copy the handler may write,
+so the reply carries the new value and the next call reads the old field —
+a write lost in silence. The compiler says so instead:
+
+```text
+`[rpc]` method `login` takes `mut self`, and an `[rpc]` method's `mut self`
+copy is discarded after the call: the handler mutates it, the reply carries
+the new value, and the next call on this connection reads the old one. Write
+`&mut self` to mutate this connection's instance, or hold the state in a
+`Shared<T>` field
+```
+
+`Shared<T>` is the third spelling, and it is not merely the older one: reach
+for it when something *other than a method body* must reach the state — a
+callback the service stored, a timer, a task that outlives the call. A
+`&mut self` borrow lasts for the call; a `Shared<T>` handle is the instance's
+own cell and can be captured. A `[expose]`d `SignalCell` is the same idea
+with a wire behind it.
+
+## The other direction: calling the client
+
+Sometimes the server is the one with news. A session was revoked, a
+background job finished, another user moved something on the screen you
+are looking at — facts the client cannot poll for without asking a
+hundred times to hear once.
+
+Declare the functions the server may call on a struct in the browser half
+and mark it `[client_service]`:
+
+```vilan,fragment
+[client_service]
+struct KoltHandlers {
+	revoked: SignalCell<str>,
+}
+
+impl KoltHandlers {
+	[rpc]
+	fun session_revoked(self, reason: str) {
+		self.revoked.set(reason);
+	}
+}
+```
+
+Then name it on the service, and hold the generated proxy as a field:
+
+```vilan,fragment
+[service(KoltClient, client = KoltHandlers)]
+struct KoltStore {
+	user: str,
+	client: KoltHandlersProxy,
+}
+
+impl KoltStore {
+	[rpc]
+	fun sign_out(self): bool {
+		self.client.session_revoked("signed out elsewhere");
+		true
+	}
+}
+
+Service::factory(|connection: Connection| KoltStore {
+	user = connection.session.identity,
+	client = connection.client(),
+}, json_codec())
+```
+
+`connection.client()` needs no annotation: the FIELD's declared type is
+what the attribute named, and that is what resolves it. The proxy is the
+connection's id and nothing else, so it is cheap to copy into as many
+places as want it, and it goes quiet the moment the connection closes.
+
+On the browser side, mount the handler instance on the connected client:
+
+```vilan,fragment
+let handlers = KoltHandlers { revoked = Signal::new("") };
+let client = KoltClient::connect(url, json_codec())!.with_handlers(handlers);
+```
+
+**Notifications only, in this version.** A `[client_service]` method
+declares no return type and is refused if it does — `: void` included,
+which is the one place that spelling is not interchangeable with
+omission. A server→client
+notification has no reply lane to settle on and no pending table to
+correlate with, so there is nothing for a value to come back through,
+and nothing to *wait* for either: `self.client.session_revoked(reason)`
+is synchronous, returns nothing,
+and cannot fail visibly. That is why the awaited `void` above is a
+server-side shape only. If the client must answer, have its handler call
+back on the connection it already holds.
+
+Both attributes on one struct is peer-to-peer, and needs no new spelling:
+one dispatcher, a transport client, and a proxy, all from the same
+`[rpc]` method set.
+
+### What the turn model owes you here
+
+Three sentences, and they are the same three whichever direction a
+handler runs in.
+
+1. **The router never blocks on a handler.** A chunk off the socket is
+   parsed into its events and every handler's turn is STARTED before any
+   of them is awaited. Two frames that TCP coalesced into one read are
+   two handlers in flight, not a queue.
+2. **A held turn is per handler, not per connection.** Each dispatch
+   establishes its own turn, so two handlers on one connection settle
+   independently. Signal writes inside one handler coalesce into one
+   wave, exactly as they do for a client→server call.
+3. **Reply order within a chunk is not promised.** Replies carry their
+   request id and arrive when their handler is done — a slow first frame
+   does not hold a fast second one behind it. Nothing in the protocol
+   ever depended on the order; this only makes it visible.
+
+One consequence of the first two, and it is now ENFORCED: two handlers in
+flight on one connection share that connection's one instance. A `&mut
+self` method that never awaits runs to completion before the next handler
+starts and is safe by construction; a `&mut self` method that AWAITS can
+have its instance written by another handler underneath it. So an `[rpc]`
+method declared `async` may not take `&mut self` — the attribute refuses
+it, naming the method — and the rule is read off the KEYWORD and the
+receiver rather than off the body, because a handler that grows its first
+await a week later would otherwise turn silent. Keep a `&mut self`
+handler synchronous, or hold the state somewhere other than the receiver
+reaches (a `Shared<T>` field) when the handler must await.
+
+### What happens to a peer that has not heard of any of this
+
+The contract hash covers BOTH directions. A service that declares
+`client = KoltHandlers` appends the handler surface to its own, so its
+hash moves — and a client generated against that surface is refused at
+`__contract` by a server that declares no handler, before it has a client
+value to mount handlers on and therefore before any reverse frame could
+be dispatched. A service that declares no `client = …` hashes exactly as
+it always did.
+
+(The reverse lane is a `s:<id>:<payload>` text frame, or a `0x73` tag
+byte, beside the `r:`/`d:` lanes that were already there. Both routers
+ignore prefixes and tags they do not know, so a client too old to have a
+router arm for it drops the frame instead of failing — but the hash check
+above is what is meant to catch that case, and the silent drop is only
+the floor under it.)
+
 ## Growing past one service
 
 That chain is the whole layer — `Service::new(protocol)`, installed with
@@ -476,8 +1348,127 @@ routes are untouched. Two constants either way: services always answer
 before `on_request` (so an app route can't accidentally shadow a
 service route), and the connection lifecycle is the service's own knob —
 `Service::on_connect`/`on_disconnect` swap the default session registry
-for the app's per-connection state (an auth identity, an app-written
-attach) without changing anything else about the chain.
+for the app's per-connection state (an app-written attach), and
+`Service::factory` is the same knob for CONSTRUCTION — without changing
+anything else about the chain.
+
+## Reaching a service over plain HTTP
+
+A service you can hold without a connection — no `[expose]`d field, no
+handle-returning method, no `client = ..` — gets a second constructor, for the
+connectionless `POST {mount}rpc` route the server already installs beside every
+mount:
+
+```vilan,fragment
+let auth = AuthClient::over_http("/auth/", json_codec());
+match auth.login(name.get(), password.get()) {
+	Ok(let outcome) => match outcome {
+		Ok(let token) => sign_in(token),
+		Err(let message) => show_error(message),
+	},
+	Err(let failure) => show_error(offline_text(failure)),
+}
+```
+
+This is the shape for a login door, and login is why it exists: the token a
+socket's `authorize` reads back is what login RETURNS, so login has to happen
+before there is a socket to authorize. The nesting is the point — the outer arm
+is "did the call happen", the inner is "what did the server decide".
+
+`over_http` takes the same `mount` string `connect` takes, and it makes no
+call: an HTTP client is unversioned unless you call `verify()`. There are no
+mirrors and no reverse direction over this leg, which is why the constructor
+exists only for a service that declares neither.
+
+A service that is MEANT to be an HTTP API can say so, and hear about a mistake
+where it made it:
+
+```vilan,fragment
+[service(AuthClient, http)]
+struct Auth {}
+```
+
+The `http` marker generates nothing. It refuses, at the member that declared
+it, each thing the connectionless leg cannot carry — a method returning a
+`SignalCell`/`KeyedCell` handle, an `[expose]`d field, a `client = ..`
+handler — so a handle added to the login door a month later is an error on
+that method, not a puzzle at the page that can no longer build its client.
+Leave it off a service that wants both legs.
+
+### Gating the POST leg: `authorize_request`
+
+A login door is open on purpose. The services after it are not, and a POST
+has no handshake for `authorize` to read — but it has headers, so it gets its
+own hook:
+
+```vilan,fragment
+Service::new(Billing {}.dispatcher().into_protocol(json_codec()))
+	.at("/billing/")
+	.authorize_request(|request: Request| match request.header("authorization") {
+		Some(let bearer) => match verify(bearer) {
+			Some(let subject) => Result::Ok(Session::of(subject)),
+			None => Result::Err(Reject::Forbidden),
+		},
+		None => Result::Err(Reject::Unauthorized),
+	})
+```
+
+It runs on every POST, after the leg's own method and content-type checks and
+before the frame is read. `Ok(session)` is stamped on that one request —
+`RpcRequest.session`, which a hand-written `Dispatcher` route reads — and
+`Err` answers the reject's status: `401`/`403` as an `Unauthorized` envelope
+and `503` as `Unavailable`, the arms a refused socket already gives a vilan
+client, and `429` as a bare status, which a client reads as `Transport(..)`.
+
+A second hook rather than `authorize` reading a request, because the
+credential lives somewhere else — a socket's in the `"token."` subprotocol, a
+POST's in a header or a cookie — and a `handshake.token()` that answered `None`
+for a request carrying a perfectly good `Authorization` header would be a trap.
+The two compose, and neither opens the other's leg:
+
+| installed | the socket upgrade | `POST {mount}rpc` |
+| --- | --- | --- |
+| neither | open | open |
+| `authorize` only | gated | `401` — no silent back door |
+| `authorize_request` only | open | gated per request |
+| both | gated | gated per request |
+
+The SSE pair is a connection, so it follows the upgrade's column. A
+`Service::factory` service stays `501` on the POST leg whatever the hook says:
+the instance, not the identity, is what a POST cannot supply.
+
+The client end of a bearer is `over_http_with`, which sends its headers on
+every POST the client makes:
+
+```vilan,fragment
+let billing = BillingClient::over_http_with("/billing/", json_codec(), [("Authorization", i"Bearer {token}")]);
+```
+
+A cookie rides a same-origin POST without being asked; a token the page keeps
+in storage does not, and `over_http` carries no header at all.
+
+### CORS, and the credential
+
+std does no CORS. The mechanism is already on the builder, a service's mount is
+a string you wrote, and an allowed-origin list is a security decision std has
+no information for — so it is three lines of yours:
+
+```vilan,fragment
+.on_request(|request| match request.method() {
+	"OPTIONS" => Response::builder()
+		.code(204)
+		.set_header("Access-Control-Allow-Origin", "https://app.example.com")
+		.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		.build(),
+	_ => page(request),
+})
+```
+
+Two sentences are the whole posture. A credential in a HEADER is CSRF-immune by
+construction: a cross-site page cannot set one without a preflight, and the rpc
+leg requires `Content-Type: application/json`, which a cross-site HTML form
+cannot produce. A credential in a COOKIE needs `SameSite=Lax` *and* that
+content-type check — and std will not read a cookie for you.
 
 ## Traps
 
@@ -491,3 +1482,16 @@ attach) without changing anything else about the chain.
 - An rpc handler's reply is its return value, so the handler runs to
   completion before the client hears back. Long work belongs in spawned
   tasks that write signals when done.
+- Minting channels at runtime — an rpc that calls `session_of` +
+  `ReactiveServer::expose`, with `ReactiveClient::source(channel)` on the
+  other end, rather than `[expose]` — is hand-wiring, and what makes it
+  hand-wiring is that the mirror has **no origin**: nothing on the client
+  side records which call minted that channel, so nothing but your own
+  code can decide when it is finished or bring it back. Two things follow,
+  and `[expose]` gets both for free. Withdraw a channel you are done with,
+  explicitly — `ReactiveServer::revoke(channel)` — rather than reading a
+  client that stopped watching as a client that is done. And register
+  `invalidate_on_reconnect(socket, client)` beside your `ReactiveClient`,
+  because a reconnect mints a fresh session that has never heard of a
+  channel your method minted: the mirror is invalidated (`status` back to
+  `Waiting`), and re-running the rpc that minted it is your app's job.

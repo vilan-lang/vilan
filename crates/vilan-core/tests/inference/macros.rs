@@ -538,6 +538,61 @@ fn a_body_import_of_a_missing_module_errors_cleanly() {
 // expansion interpreter; `[name(args)]` and `[derive(Name)]` splice their
 // returned Source before analysis.
 
+// B194's reflection surface: a struct's own GENERIC PARAMETERS reach a macro —
+// names, written bounds, and defaults — plus the two spellings every derive
+// generator needs from them. Without these a generator can only name its
+// subject bare, which is an under-supplied application (B188).
+#[test]
+fn a_macro_reads_its_subjects_generic_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::debug::Debug;
+
+        macro fun report(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+            import macro_std::build::{ impl_of, fun_of, quote, join };
+
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [], generics = [] },
+            };
+            mut described: List<str> = [];
+            for parameter in target.generics {
+                mut bounds: List<str> = [];
+                for bound in parameter.bounds {
+                    bounds.push(bound.render());
+                }
+                described.push(parameter.name + "/" + join(bounds, "+") + "/" + parameter.default_);
+            }
+            let binder_list = target.binders("Debug");
+            let reporter = fun_of("report")
+                .parameter("self")
+                .returns("str")
+                .expr(quote(target.subject() + " " + binder_list + " " + join(described, " ")));
+            source(impl_of(target.name).generics(binder_list).member(reporter.render()).render())
+        }
+
+        // `K` is reached (a field is typed by it) and carries a written bound
+        // and no default; `P` is phantom and carries a default and no bound.
+        [report]
+        struct Pack<K: Debug, P = i32> {
+            key: K,
+            count: i32,
+        }
+
+        fun main() {
+            print(Pack { key = 1, count = 2 }.report());
+        }
+
+        main();
+        "#,
+        "Pack<K, P> <type K: Debug, type P> K/Debug/ P//i32\n",
+    );
+}
+
 // The whole pipeline: hermetic world compile, attribute dispatch, reflection,
 // interpreter run, splice, and dispatch INTO the generated impl.
 #[test]
@@ -554,7 +609,7 @@ fn a_macro_attribute_expands_and_the_generated_impl_dispatches() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             mut arms = "";
             mut first = true;
@@ -605,7 +660,7 @@ fn a_derive_name_dispatches_to_a_registered_macro() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             source("impl " + target.name + " {\nfun tag(self): str {\n\"" + target.name + "\"\n}\n}\n")
         }
@@ -639,7 +694,7 @@ fn a_macro_receives_its_arguments_as_source_text() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             mut body = "";
             mut first = true;
@@ -1207,7 +1262,7 @@ fn a_user_macro_shadows_a_prelude_derive_in_its_file() {
 
             let target = match item.as_struct() {
                 Some(let found) => found,
-                None => StructItem { name = "?", fields = [] },
+                None => StructItem { name = "?", fields = [], generics = [] },
             };
             source(i"impl {target.name} \{\nfun shadowed(self): str \{\n\"local\"\n\}\n\}\n")
         }
@@ -2102,7 +2157,7 @@ fn reconcile_plans_keep_refresh_fresh_and_removals() {
         import std::reactive::{ reconcile, RowStep };
 
         fun main() {
-            let plan = reconcile([1, 2], [10, 20], [20, 11, 35, 20], |item| item / 10);
+            let plan = reconcile([1, 2], [10, 20], [20, 11, 35, 20], |item| item / 10, |a, b| a == b);
             for step in plan.steps {
                 let rendered = match step {
                     RowStep::Keep(let index) => i"keep {index}",
@@ -2119,6 +2174,37 @@ fn reconcile_plans_keep_refresh_fresh_and_removals() {
         main();
         "#,
         "keep 1\nrefresh 0\nfresh\nfresh\n",
+    );
+}
+
+// `reconcile`'s `same` predicate is the CALLER's (A42), not `T: PartialEq`:
+// `each_by` passes "always the same", so a surviving key is kept and no
+// `Refresh` is ever produced — over the exact input that refreshes above.
+#[test]
+fn reconcile_never_refreshes_when_every_surviving_key_counts_as_unchanged() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ reconcile, RowStep };
+
+        fun main() {
+            let plan = reconcile([1, 2], [10, 20], [20, 11, 35, 20], |item| item / 10, |_a, _b| true);
+            for step in plan.steps {
+                let rendered = match step {
+                    RowStep::Keep(let index) => i"keep {index}",
+                    RowStep::Refresh(let index) => i"refresh {index}",
+                    RowStep::Fresh => "fresh",
+                };
+                print(rendered);
+            }
+            for index in plan.removed {
+                print(i"removed {index}");
+            }
+        }
+
+        main();
+        "#,
+        "keep 1\nkeep 0\nfresh\nfresh\n",
     );
 }
 
@@ -2482,9 +2568,11 @@ fun main() {
                 0,
                 "the context requirement flows through this call",
             ),
+            // The callee's own name, not the receiver chain (B229): a
+            // dispatch hop takes the same anchor every method hop does.
             (
-                "subject.report()",
-                0,
+                "report",
+                1,
                 "the context requirement may flow through this call (dispatch may select a reader)",
             ),
         ],
@@ -2708,6 +2796,805 @@ main();
     );
 }
 
+// --- B229: a `run` the solver never selected is still a `run` ---
+//
+// The context pass finds its sites by scanning `function_calls`, which holds
+// only SELECTED calls. One `run` argument that fails to type leaves the
+// method unselected, so the site vanishes from the scan, the context looks
+// bound nowhere, and every strict read of it fences — a wall of refusals about
+// a missing `run` the program plainly writes, with the one real error last.
+// The fix reads the unresolved sites' shape and stands the coverage verdict
+// down for exactly the contexts they name.
+
+/// The owner's shape (kolt, 2026-09-04): a field added to the context struct
+/// and not to the initializer. ONE error, at the initializer.
+#[test]
+fn b229_a_missing_initializer_field_does_not_fence_every_read() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+    density: i32,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun badge(): str {
+    app_ctx.get().theme + "-badge"
+}
+
+fun footer(): str {
+    app_ctx.get().theme + "-footer"
+}
+
+fun component(): str {
+    label() + badge() + footer()
+}
+
+fun main() {
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(component());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`density` is missing");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The arity mismatch's other half: an EXTRA field cascades the same way, and
+/// is stood down the same way.
+#[test]
+fn b229_an_extra_initializer_field_does_not_fence_every_read() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun main() {
+    app_ctx.run(AppCtx { theme = "dark", density = 2 }, || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`density` is not a field of `AppCtx`");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The general form: ANY unresolved value argument deletes the site, so the
+/// stand-down is keyed on the unselected call and not on the initializer.
+#[test]
+fn b229_an_unresolved_run_argument_does_not_fence_every_read() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun main() {
+    app_ctx.run(missing_fn(), || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "cannot find 'missing_fn' in this scope");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The invariant the stand-down may not weaken: an uncovered read in a program
+/// with nothing else wrong is still a compile error, not a silent miscompile.
+#[test]
+fn b229_an_uncovered_read_in_a_clean_program_still_fences() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun main() {
+    print(label());
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(label());
+    });
+}
+main();
+        "#,
+        "context `app_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// **RESTATED AS A DEFERRAL (B355 / E189's broad gate).** It used to say that
+/// the stand-down is per CONTEXT, not per program: the context whose `run`
+/// failed stood down, and a second context's genuinely uncovered read in the
+/// same program kept its refusal. The program does not type — the `run`'s
+/// struct literal is missing a field — and the whole context family now stands
+/// down on such a program and says so once, because every verdict this pass
+/// reaches is computed over a call graph that a call the solver could not wire
+/// leaves holes in. So the claim that survives is the DEFERRAL: neither
+/// context is spoken about, the primary error stands alone, and the warning
+/// names how many checks did not run. The per-context grain is still real and
+/// is pinned on a CLEAN program by
+/// `b229_the_stand_down_is_per_context_on_a_program_that_types`.
+#[test]
+fn b229_only_the_unresolved_run_s_own_context_stands_down() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+    density: i32,
+}
+
+struct Other {
+    tint: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+let other_ctx: Context<Other> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun tint(): str {
+    other_ctx.get().tint
+}
+
+fun main() {
+    print(tint());
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_without(source, "context `other_ctx` is read here");
+    assert_fails_without(source, "context `app_ctx` is read here");
+    assert!(
+        warnings(source)
+            .iter()
+            .any(|warning| warning.contains("`context` check")),
+        "the deferral must say so: {:#?}",
+        warnings(source)
+    );
+}
+
+/// B229's second face: a trace label on a METHOD-call hop points at the
+/// callee's name, not at the whole receiver chain — which in a
+/// component-shaped body is the body. The plain hops in the same trace
+/// (`label()`, `panel(..)`, `main()`) are the control: they carry no member
+/// name and keep their own already-tight spans.
+#[test]
+fn b229_a_method_call_hop_spans_the_callee_name() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun label(): i32 {
+    current.get()
+}
+
+struct Row {
+    id: i32,
+}
+
+impl Row {
+    fun render_body(self): i32 {
+        label()
+    }
+}
+
+fun panel(row: Row): i32 {
+    row
+        .render_body()
+}
+
+fun main() {
+    print(panel(Row { id = 1 }));
+}
+main();
+        "#;
+    assert_traces(
+        source,
+        "context `current` is read here",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "panel(Row { id = 1 })",
+                0,
+                "the context requirement flows through this call",
+            ),
+            (
+                "render_body",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "label()",
+                1,
+                "the context requirement flows through this call",
+            ),
+        ],
+    );
+}
+
+// --- B241: an arity-invalid call is still a CALL of its callee ---
+//
+// B229's hole, second lid. The context pass reads every call's subject out of
+// `function_calls`, which holds the calls the solver WIRED — and an arity
+// mismatch is refused before wiring. The written subject then appeared in
+// `entity_map` as an `Expr::Local` naming a function with no call in sight:
+// the callee read as taken AS A VALUE, which for a context reader is a
+// refusal of its own AND makes the callee permanently uncovered, so its whole
+// transitive read set fenced too (the owner's kolt report: one missing
+// argument, three value-use refusals and five coverage fences, four of them
+// inside std's `reactive.vl`). `Program::arity_invalid_calls` keeps the shape.
+
+/// The owner's shape (kolt views.vl:107, 2026-09-05): the call sits inside a
+/// closure handed to a method, under a component the `run` calls. ONE error,
+/// the arity one.
+#[test]
+fn b241_an_arity_invalid_call_is_not_a_value_use() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct AppCtx {
+    theme: str,
+}
+
+let app_ctx: Context<AppCtx> = Context::new();
+
+fun label(): str {
+    app_ctx.get().theme
+}
+
+fun channel_component(user: str, extra: str): str {
+    label() + user + extra
+}
+
+struct Holder {
+    value: str,
+}
+
+impl Holder {
+    fun swap(self, next: str, make: (|str| str)): str {
+        make(next)
+    }
+}
+
+fun shell(): str {
+    let holder = Holder { value = "a" };
+    holder.swap("route", |route| channel_component(route))
+}
+
+fun main() {
+    app_ctx.run(AppCtx { theme = "dark" }, || {
+        print(shell());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`channel_component` expects 2 arguments");
+    assert_fails_without(source, "so it can't be used as a value");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The isolated shape the report expected to be clean and is not: the closure
+/// argument was never the ingredient — ANY arity-invalid call to a
+/// context-reading function cascaded, straight inside the `run` body.
+#[test]
+fn b241_the_isolated_arity_shape_reports_the_arity_error_alone() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun f(x: i32): i32 {
+    settings.get() + x
+}
+
+fun main() {
+    settings.run(10, || {
+        print(f());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`f` expects 1 argument, but got 0 instead");
+    assert_fails_without(source, "so it can't be used as a value");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The refusal the stand-down may not swallow: a context reader written
+/// where a VALUE is wanted is still an indirect call that would bypass the
+/// hidden parameter.
+#[test]
+fn b241_a_real_value_use_of_a_context_reader_is_still_refused() {
+    assert_fails_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun f(x: i32): i32 {
+    settings.get() + x
+}
+
+fun apply(g: (|i32| i32)): i32 {
+    g(1)
+}
+
+fun main() {
+    settings.run(10, || {
+        print(apply(f));
+    });
+}
+main();
+        "#,
+        "`f` reads context `settings`, so it can't be used as a value",
+    );
+}
+
+/// And the stand-down is the invalid call's own, not the program's: a second
+/// context read outside every `run` keeps its fence in the same program.
+#[test]
+fn b241_a_genuinely_uncovered_read_beside_an_arity_error_still_fences() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun reads_a(x: i32): i32 {
+    a_ctx.get() + x
+}
+
+fun reads_b(): i32 {
+    b_ctx.get()
+}
+
+fun main() {
+    print(reads_b());
+    a_ctx.run(10, || {
+        print(reads_a());
+    });
+}
+main();
+        "#;
+    // RESTATED AS A DEFERRAL (B355 / E189's broad gate): the program carries an
+    // arity error, so the context family stands down whole rather than fencing
+    // `b_ctx`'s genuinely uncovered read. The arity error reports alone and the
+    // warning says what was not checked; the fence itself is pinned on a clean
+    // program by `b241_a_genuinely_uncovered_read_on_a_program_that_types_still_fences`.
+    assert_fails_once_with(source, "`reads_a` expects 1 argument, but got 0 instead");
+    assert_fails_without(source, "context `b_ctx` is read here");
+    assert_fails_without(source, "context `a_ctx` is read here");
+    assert!(
+        warnings(source)
+            .iter()
+            .any(|warning| warning.contains("`context` check")),
+        "the deferral must say so: {:#?}",
+        warnings(source)
+    );
+}
+
+/// The per-CONTEXT grain B229's pin above used to carry, moved to a program
+/// that TYPES: one context's uncovered read is refused and a second context,
+/// properly covered, is silent. Nothing defers here, so the grain is what is
+/// being observed.
+#[test]
+fn b229_the_stand_down_is_per_context_on_a_program_that_types() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let app_ctx: Context<i32> = Context::new();
+let other_ctx: Context<i32> = Context::new();
+
+fun label(): i32 {
+    app_ctx.get()
+}
+
+fun tint(): i32 {
+    other_ctx.get()
+}
+
+fun main() {
+    print(tint());
+    app_ctx.run(10, || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `other_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "context `app_ctx` is read here");
+}
+
+/// B241's fence, on a program that TYPES: the uncovered read is refused, the
+/// covered one is not, and no deferral is involved. This is the claim the
+/// arity-shaped pin above can no longer make for itself.
+#[test]
+fn b241_a_genuinely_uncovered_read_on_a_program_that_types_still_fences() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun reads_a(x: i32): i32 {
+    a_ctx.get() + x
+}
+
+fun reads_b(): i32 {
+    b_ctx.get()
+}
+
+fun main() {
+    print(reads_b());
+    a_ctx.run(10, || {
+        print(reads_a(1));
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `b_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "context `a_ctx` is read here");
+}
+
+// --- B232: a stalled method call speaks for itself ---
+//
+// The post-solve residual sweep reported StructInitializer / FieldAccessor /
+// Variable / CallSubject leftovers only, so a `MethodCall` the fixpoint never
+// selected was spoken about by whatever error stalled it — and, when nothing
+// else was wrong, by nothing at all. That silence is why B229's stand-down
+// asked first whether the program was clean: excusing a coverage verdict on a
+// program carrying no diagnostic would have turned a fence into a silent
+// miscompile. With the call reporting itself, the question is gone.
+
+/// The previously silent program: a method on a binder whose type is never
+/// determined compiled to nothing and said nothing. One diagnostic now.
+#[test]
+fn b232_a_stalled_method_call_on_a_clean_program_reports_once() {
+    assert_fails_once_with(
+        r#"
+fun main() {
+    let empty = [];
+    for item in empty {
+        item.len();
+    }
+}
+main();
+        "#,
+        "this call could not be resolved: the type of `len`'s receiver is never determined",
+    );
+}
+
+/// B229's dangerous case, made honest: a `run` the fixpoint never selected on
+/// an otherwise clean program. The guard used to keep the coverage fence here
+/// — a wall of "read here, but this code can be reached without an enclosing
+/// `run`" about a `run` the program plainly writes — because the alternative
+/// was saying nothing. The residual names the argument that stalled it, and
+/// the fence stands down.
+#[test]
+fn b232_a_stalled_run_reports_its_own_argument_instead_of_fencing() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let app_ctx: Context<i32> = Context::new();
+
+fun label(): i32 {
+    app_ctx.get()
+}
+
+fun main() {
+    let empty = [];
+    for item in empty {
+        app_ctx.run(item, || {
+            print(label());
+        });
+    }
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "this call could not be resolved: the type of argument 1 of `run` is never determined",
+    );
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+// --- B242: a DECLARED context requirement ---
+//
+// An inferred requirement is a fact about a body, so every diagnostic about it
+// is a fact about a body — and surfaces wherever inference breaks (B229,
+// B241), leaving the reader to walk back to the boundary themself. A clause on
+// the declaration makes it a fact about the SIGNATURE: the body's reads must
+// be a subset of it, callers are checked against it alone, and nothing a
+// caller is told depends on the callee's body any more.
+
+/// The accepted shape: the clause covers what the body reads, and a call under
+/// a `run` of that context compiles.
+#[test]
+fn b242_a_declared_clause_covering_the_body_compiles() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// The subset rule: a strict read the clause does not declare is refused AT
+/// the declaration, naming the clause the body needs — which is what the
+/// editor's fix writes.
+#[test]
+fn b242_a_clause_narrower_than_the_body_is_refused_at_the_declaration() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun both(): i32 {
+    a_ctx.get() + b_ctx.get()
+}
+
+fun render(): i32 context a_ctx {
+    both()
+}
+
+fun main() {
+    a_ctx.run(1, || {
+        b_ctx.run(2, || {
+            print(render());
+        });
+    });
+}
+main();
+        "#,
+        "`render`'s body reads context `b_ctx`, which this `context` clause does not declare \
+         — write `context (a_ctx, b_ctx)`",
+    );
+}
+
+/// The other direction is a WARNING, not an error: declaring a context the
+/// body does not yet read is a deliberate API surface — the signature is the
+/// promise, and adding the read later must not break callers.
+#[test]
+fn b242_a_clause_wider_than_the_body_warns_and_still_compiles() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun render(x: i32): i32 context settings {
+    x + 1
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#;
+    assert_compiles(source);
+    let warnings = warning_diagnostics(source);
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|(message, _)| {
+            message.contains(
+                "this `context` clause declares `settings`, which `render`'s body never reads",
+            )
+        })
+        .collect();
+    assert_eq!(matching.len(), 1, "{warnings:#?}");
+    // Anchored on the clause's NAME LIST — the span the editor's fix rewrites.
+    assert_eq!(&source[matching[0].1.clone()], "settings");
+}
+
+/// Callers are checked against the DECLARATION: the refusal lands at the call,
+/// names the clause and the callee, and says nothing about what the body reads
+/// — one hop, not a walk down into `deep`.
+#[test]
+fn b242_an_undeclared_caller_is_refused_at_the_call_naming_the_clause() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun main() {
+    print(render(1));
+    settings.run(3, || {
+        print(render(2));
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `settings` is required by `render`'s `context` clause, but this code can be \
+         reached without an enclosing `run`",
+    );
+    // The declaring function's own body is never the site of the refusal —
+    // that is the boundary the clause draws — and the covered call is clean.
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// A caller that declares the clause ITSELF is covered by its own signature,
+/// and the demand moves up one more hop.
+#[test]
+fn b242_a_declaring_caller_is_covered_by_its_own_clause() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32): i32 context settings {
+    deep() + x
+}
+
+fun panel(): i32 context settings {
+    render(1)
+}
+
+fun main() {
+    settings.run(3, || {
+        print(panel());
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// B241's shape with the boundary drawn: an arity-invalid call to a declaring
+/// function reports the arity error and nothing else — no coverage fence, no
+/// value-use refusal, and nothing at all about the callee's body.
+#[test]
+fn b242_the_b241_shape_with_a_declared_clause_reports_at_the_boundary_only() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+fun deep(): i32 {
+    settings.get()
+}
+
+fun render(x: i32, y: i32): i32 context settings {
+    deep() + x + y
+}
+
+fun main() {
+    settings.run(3, || {
+        print(render(1));
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "`render` expects 2 arguments, but got 1 instead");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+    assert_fails_without(source, "so it can't be used as a value");
+}
+
+/// Trait and `impl` methods are DEFERRED: a dispatched call selects its callee
+/// at the call site, so there is no single declaration to check against.
+#[test]
+fn b242_a_clause_on_a_method_is_refused_for_now() {
+    assert_fails_once_with(
+        r#"
+import std::context::Context;
+
+let settings: Context<i32> = Context::new();
+
+struct Row {
+    id: i32,
+}
+
+impl Row {
+    fun render(self): i32 context settings {
+        settings.get() + self.id
+    }
+}
+
+fun main() {}
+main();
+        "#,
+        "a `context` clause on a trait or `impl` method is not supported yet",
+    );
+}
+
 // --- E84: the demotion/trace contract widens to any dependency package ---
 // (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
 // user did not write — std or ANY external/linked package — demotes and
@@ -2758,7 +3645,7 @@ fn analyze_workspace_with_dependencies(
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_e84_{}_{unique}", std::process::id()));
+    let root = scratch_dir(&format!("vilan_e84_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
     let app_dir = root.join("app");
@@ -3509,13 +4396,31 @@ fn a_trait_default_body_reads_context_through_covered_dispatch() {
 // matched impl subjects by exact type equality, so generic subjects never
 // matched and the call silently bound to the trait's ABSTRACT member (the
 // B12 silent-miscompile shape). Now nominal, like `resolve_member_on_type`.
+//
+// MIGRATED for B174, and this is the whole of the estate's migration: the
+// census swept std, the corpus, docs fences, examples, benchmarks, templates,
+// kolt and the website and found exactly one trait default written over the
+// trait's own UNBOUNDED parameter, which is this one. `T: Add` is orthogonal to
+// what the fixture asserts — that an inherited default dispatches on a generic
+// impl subject — and the answer is unchanged at `42`. It was an answer this
+// declaration got by luck: `Holder { value = "ab" }.twice()` printed `abab`
+// through the same default, one type argument from demonstrating the bug the
+// fixture was silently relying on.
+//
+// The impl's own binder deliberately does NOT restate the bound. It does not
+// have to: satisfaction is checked where the parameter is GROUNDED, so
+// `Holder { value = Point { … } }.twice()` is refused at that call — "'Point'
+// does not implement trait 'Add'", labelled at the trait's declaration —
+// whether the binder repeats `: Add` or not. Restating it would make the
+// migration look like two edits when it is one.
 #[test]
 fn an_inherited_default_on_a_generic_subject_dispatches() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
+        import std::operators::Add;
 
-        trait Doubler<T> {
+        trait Doubler<T: Add> {
             fun once(self): T;
 
             fun twice(self): T {
@@ -3661,6 +4566,13 @@ main();
 
 // The value-flow restriction: an injected closure may be called, forwarded to
 // a matching clause, or handed to `run` — nothing else.
+//
+// The escape was written `let escaped = body;` until B325, which admitted that
+// spelling: an unannotated binding takes its clause FROM the initializer, so it
+// is a forward to a position carrying the same clause by construction and the
+// threading follows it. A parameter that carries NO clause is the escape the
+// rule is actually about — the value would have to capture, and there is no
+// hidden argument at that call to thread.
 #[test]
 fn an_injected_closure_cannot_escape() {
     let source = r#"
@@ -3668,8 +4580,10 @@ import std::context::Context;
 
 let current: Context<i32> = Context::new();
 
+fun plain(fn: || void) {}
+
 fun hold(body: (|| void) context current) {
-    let escaped = body;
+    plain(body);
 }
 
 fun main() {}
@@ -3789,6 +4703,129 @@ fun main() {
 main();
         "#,
         "a `context`-typed binding takes a closure literal, or a value with the same `context` clause",
+    );
+}
+
+// B333, shape 1: the call's own type carries the clause its CALLEE DECLARED.
+// The pin above stays red because `make(): || void` promises nothing; this one
+// is the same program with the promise written, and it runs — the threading
+// follows the declaration, which is the only place a call's clause is stated.
+#[test]
+fn a_context_typed_binding_takes_a_call_whose_callee_declares_the_clause() {
+    assert_compiles_and_runs(
+        r#"
+import std::context::Context;
+import std::io::print;
+import std::display::Display;
+
+let current: Context<i32> = Context::new();
+
+fun read(): i32 {
+    current.get()
+}
+
+fun make(): (|| void) context current {
+    || { print(read().to_string()); }
+}
+
+fun main() {
+    let body: (|| void) context current = make();
+    current.run(1, || { body() });
+}
+main();
+        "#,
+        "1\n",
+    );
+}
+
+// B333, shape 1's control: a callee whose declared return carries a DIFFERENT
+// clause is refused, and the refusal names both — the call is a value with a
+// clause now, so it earns the mismatch message rather than the "takes a
+// closure literal" one.
+#[test]
+fn a_context_typed_binding_refuses_a_call_carrying_a_different_clause() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun read(): i32 {
+    b_ctx.get()
+}
+
+fun make(): (|| void) context b_ctx {
+    || { let n = read(); }
+}
+
+fun main() {
+    let body: (|| void) context a_ctx = make();
+    a_ctx.run(1, || { body() });
+}
+main();
+        "#,
+        "an injected closure forwards only to a position carrying the SAME `context` clause",
+    );
+}
+
+// B333, shape 2: an UNANNOTATED local closure binding adopts the clause of the
+// FIELD it lands in — the rule an argument binding has had since B309, at the
+// other landing. std's own route gate is the exhibit: `browser/ui.vl` writes
+// `let wire: (|| void) context owner_scope = || { .. };` and stores it into
+// `Swap`'s `wire` field, and the annotation was doing the work the landing can
+// do on its own.
+#[test]
+fn an_unannotated_closure_binding_adopts_the_clause_of_the_field_it_lands_in() {
+    assert_compiles_and_runs(
+        r#"
+import std::context::Context;
+import std::io::print;
+import std::display::Display;
+
+let current: Context<i32> = Context::new();
+
+struct Held {
+    body: (|| void) context current,
+}
+
+fun read(): i32 {
+    current.get()
+}
+
+fun main() {
+    let wire = || { print(read().to_string()); };
+    let held = Held { body = wire };
+    current.run(1, || { (held.body)() });
+}
+main();
+        "#,
+        "1\n",
+    );
+}
+
+// B333, shape 2's control: the adoption is for a binding with no clause of its
+// OWN. One that carries a different clause is still the mismatch.
+#[test]
+fn an_annotated_closure_binding_with_the_wrong_clause_is_still_refused_at_a_field() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+struct Held {
+    body: (|| void) context a_ctx,
+}
+
+fun main() {
+    let wire: (|| void) context b_ctx = || {};
+    let held = Held { body = wire };
+}
+main();
+        "#,
+        "an injected closure forwards only to a position carrying the SAME `context` clause",
     );
 }
 
@@ -4031,5 +5068,528 @@ fn a_clause_can_name_an_imported_context() {
         main();
         "#,
         "4\nok\n",
+    );
+}
+
+// --- B217: a generated type miss resolved in `build()` anchors at the attribute
+//
+// B188's anchoring rule re-anchors a diagnostic raised against GENERATED code at
+// the attribute that generated it — a template is not a file, and its spans
+// index text no file holds. The redirect covered the walk's own diagnostics and
+// the whole-program passes (`Program::anchored`), and missed the route in
+// between: a written type annotation is not resolved during the walk at all, it
+// is PREPPED and drained in `build()`, long after the generated walk closed. Two
+// of B201's four pre-fix diagnostics came out that way and landed at the
+// declaring `mod` and at the type, because `push_in_source` had a bare
+// `SourceId` and no entity id to look an origin up by.
+//
+// The plant is a derive generator of the test's own: a macro that emits a member
+// returning a type nobody declared.
+
+const PLANTS_A_MISSING_TYPE: &str = r#"
+        import std::io::print;
+
+        macro fun Planted(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [], generics = [] },
+            };
+            source("impl " + target.name + " {\nfun planted(self): NoSuchType {\nself\n}\n}\n")
+        }
+
+        [derive(Planted)]
+        struct Widget {
+            size: i32,
+        }
+
+        fun main() { print(Widget { size = 3 }.size); }
+        main();
+        "#;
+
+#[test]
+fn b217_a_generated_type_miss_is_anchored_at_the_deriving_attribute() {
+    // The message says the provenance, exactly as the walk's own route does.
+    assert_fails_with(
+        PLANTS_A_MISSING_TYPE,
+        "in code generated by this attribute: cannot find type 'NoSuchType'",
+    );
+}
+
+#[test]
+fn b217_the_generated_type_miss_spans_the_derive_and_not_the_deriving_item() {
+    // The half a message cannot state: WHERE the label is drawn. Pre-fix the
+    // span indexed the template, which the deriving file does not hold, and the
+    // label landed on whatever that file happened to have at those offsets.
+    // The anchor is the derive's own name — the `[derive(Planted)]` occurrence,
+    // not the `macro fun Planted` that generated it, which is the location
+    // acting on the report means editing (standard A2).
+    assert_fails_spanning_nth(
+        PLANTS_A_MISSING_TYPE,
+        "Planted",
+        1,
+        "cannot find type 'NoSuchType'",
+    );
+}
+
+#[test]
+fn b217_a_hand_written_type_miss_is_still_reported_where_it_was_written() {
+    // The control: the redirect keys on the type id's own walk, so an
+    // annotation the AUTHOR wrote keeps its own span and says nothing about an
+    // attribute — in the same program that carries the generated one.
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+
+        macro fun Planted(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [], generics = [] },
+            };
+            source("impl " + target.name + " {\nfun planted(self): NoSuchType {\nself\n}\n}\n")
+        }
+
+        [derive(Planted)]
+        struct Widget {
+            size: i32,
+        }
+
+        fun by_hand(): AlsoMissing { 1 }
+
+        fun main() { print(Widget { size = 3 }.size); }
+        main();
+        "#,
+        "AlsoMissing",
+        "cannot find type 'AlsoMissing'",
+    );
+}
+
+// --- E189: a closure handed to a call that did not resolve ------------------
+//
+// B229's hole, third lid, and the one that cascaded furthest. The call-graph
+// collector reads a call's operands out of `function_calls` — the calls the
+// solver WIRED — and an unwired METHOD call has no `entity_map` entry either,
+// so the walk stopped at the head of the chain: every call written inside the
+// unresolved one lost its owner (which reads back as "entered from outside the
+// graph"), and every closure literal among them lost its lexical parent (which
+// the coverage rule reads as uncovered). On kolt at d783fbf4 with its nine
+// retired `View` methods still written that turned nine real errors into 184,
+// 74 of them in a generated module that writes no closure at all.
+// `Program::unwired_calls` keeps the shape the walk needs.
+
+/// The kolt shape, minimised: a method that does not exist, handed a closure
+/// whose body reaches a context read. ONE error — the method — and no coverage
+/// fence anywhere under it.
+#[test]
+fn e189_a_closure_argument_of_an_unresolved_call_does_not_fence_its_reads() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct Thing {
+    label: str,
+}
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf() {
+    print(current.get());
+}
+
+fun page() {
+    leaf();
+}
+
+fun main() {
+    let thing = Thing { label = "x" };
+    host(|| {
+        thing.no_such_method(|| page());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "Thing has no method 'no_such_method'");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The same hole through a FREE call the scope never resolved: the closure is
+/// an argument either way, and `Expr::Call` records the wired shape only.
+#[test]
+fn e189_a_closure_argument_of_an_unresolved_free_call_does_not_fence_its_reads() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf() {
+    print(current.get());
+}
+
+fun main() {
+    host(|| {
+        no_such_fn(|| leaf());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "cannot find 'no_such_fn' in this scope");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The half the coverage rule cannot see on its own: the calls written inside
+/// an unresolved one keep their OWNER, so a function called only from there is
+/// not read as entered from outside the graph. Without it kolt still reported
+/// 115 of its 184 — every icon in the generated module among them, reached
+/// only through a chain whose head did not resolve.
+#[test]
+fn e189_a_call_inside_an_unresolved_call_keeps_its_owner() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct Thing {
+    label: str,
+}
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf(): str {
+    print(current.get());
+    "leaf"
+}
+
+fun main() {
+    let thing = Thing { label = "x" };
+    host(|| {
+        thing.no_such_method(leaf());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "Thing has no method 'no_such_method'");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+    assert_fails_without(source, "so it can't be used as a value");
+}
+
+/// The invariant neither rule may weaken: a program whose ONLY fault is the
+/// missing `run` still fences. Nothing here is unresolved, so nothing stands
+/// down and nothing is deferred.
+#[test]
+fn e189_a_clean_program_with_an_uncovered_read_still_fences() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun leaf() {
+    print(current.get());
+}
+
+fun main() {
+    leaf();
+}
+main();
+        "#,
+        "context `current` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// E191 — one arity error in an ELEMENT HEAD (kolt login.vl:181/286, the
+/// owner's FIXME: `href(href())` "caused a ton of error noise"). The head
+/// lowers to a chain, so an attribute call that does not resolve leaves every
+/// later link and every hole under it unwired — which is E189's hole reached
+/// through the desugar rather than through a retired method. ONE error at this
+/// grain: the arity error, no coverage fence under the head.
+///
+/// The ITEM does not close on this. Measured on a kolt copy at 0decf84 with
+/// `href(href())` restored: 194 errors on the base, 139 with E189's rule (55
+/// gone). The remainder does NOT trace through the head at all — it enters at
+/// `app_shell`'s own body (`views.vl:81`/`:85`) because the failed attribute
+/// poisons the return type of the component the route arm calls, and that is
+/// E189's family reached by a route the narrow rule cannot name. It is what the
+/// BROAD gate was for (with it, the same copy reports 1), and that gate is the
+/// open decision this order hands back.
+#[test]
+fn e191_an_arity_error_in_an_element_head_reports_alone() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+
+        fun target(name: str): str {
+            "/" + name
+        }
+
+        fun counter(count: SignalCell<i32>): View {
+            count.effect(|value| print(value));
+            view("span")
+        }
+
+        fun link(count: SignalCell<i32>): View {
+            <a
+                href(target())
+                title("Sign up")
+                on:click(|event| {
+                    print("clicked");
+                })
+                .child(counter(count))
+            >
+                "Sign Up"
+            </a>
+        }
+
+        fun main() {
+            let count = Signal::new(0);
+            let _root = mount_root("app", || view("div").child(link(count)));
+        }
+        "#;
+    assert_fails_browser_once_with(source, "`target` expects 1 argument, but got 0 instead");
+    assert_fails_browser_without(source, "is read here, but this code can be reached without");
+}
+
+// --- B343 (R9): where the `context` clause sits on a declaration ------------
+//
+// RULED 2026-09-17: it stays after the return type (contexts.md §3), and the
+// ONE shape that position cannot spell is refused rather than mis-bound. The
+// type grammar's own `context` suffix is greedy, so an un-parenthesized closure
+// return type swallows the clause onto its OWN return type — which cannot carry
+// one — and the declaration means neither of the two things it could have
+// meant. Both are a parenthesis away and the refusal spells both.
+
+/// The ambiguous form, refused — and refused ONCE: the clause is taken off as
+/// it is reported, so the analyzer does not add its own "a `context` clause is
+/// only supported on a closure type" beside it.
+#[test]
+fn b343_an_unparenthesized_closure_return_carrying_a_clause_is_refused() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun make(): || void context c {
+    || print(c.get())
+}
+
+fun main() {
+    c.run(1, || {
+        let body = make();
+        body();
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "UN-PARENTHESIZED closure return type");
+    assert_fails_without(source, "only supported on a closure type");
+}
+
+/// Both parenthesized readings still compile, which is what makes the refusal a
+/// steer rather than a prohibition: the clause on the FUNCTION, and the clause
+/// on the closure it returns.
+#[test]
+fn b343_both_parenthesized_readings_still_compile() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun make(): (|| void) context c {
+    || print(c.get())
+}
+
+fun reads(): i32 context c {
+    c.get()
+}
+
+fun main() {
+    c.run(1, || {
+        let body = make();
+        body();
+        print(reads());
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// The nested shape the refusal must NOT take: a closure that returns an
+/// INJECTED closure. The inner type is parenthesized, so the clause is its own
+/// and nothing is ambiguous.
+#[test]
+fn b343_a_returned_closure_whose_own_return_is_injected_is_untouched() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun outer(): || (|| void) context c {
+    || || print(c.get())
+}
+
+fun main() {
+    c.run(1, || {
+        let make = outer();
+        let body = make();
+        body();
+    });
+}
+main();
+        "#,
+    );
+}
+
+// --- B376: a derive name nothing declares a macro for is refused AT THE
+// --- ATTRIBUTE ---------------------------------------------------------------
+//
+// `[derive(PartialOrd)]` was accepted and expanded to nothing. The reasoning
+// was recorded and is not wrong about the mechanism — an unknown derive is a
+// missing macro, and the missing impl does surface at the use site — but the
+// use site is the wrong place to learn it: forty lines later `a < b` reads
+// "type `P` does not implement the `PartialOrd` operator; add `impl P with
+// PartialOrd`", which is advice to write by hand the impl the author believed
+// the attribute had just asked for. A program that never compares says nothing
+// at all, and ships without the derive it declares.
+
+#[test]
+fn b376_a_derive_no_macro_backs_is_refused_by_name() {
+    assert_fails_with(
+        r#"
+        [derive(PartialOrd)]
+        struct P {
+            x: i32,
+        }
+
+        fun main() {}
+        "#,
+        "`PartialOrd` is not a derivable trait",
+    );
+}
+
+#[test]
+fn b376_the_refusal_names_what_is_derivable() {
+    // A "no" with no next step is half a diagnostic. The list is
+    // `STD_DERIVE_MACROS` itself, which `derives_are_the_macros_std_declares`
+    // holds to std's own `macro fun`s — so what this prints cannot drift into
+    // offering a name that expands to nothing.
+    assert_fails_with(
+        r#"
+        [derive(Ord)]
+        struct P {
+            x: i32,
+        }
+
+        fun main() {}
+        "#,
+        "std derives `PartialEq`, `Default`, `Debug`, `Json`, `Wire`, `Hashable`",
+    );
+}
+
+#[test]
+fn b376_a_typo_on_a_real_derive_is_refused_at_the_attribute() {
+    // The shape this actually costs people: one character out, and before
+    // this the program compiled with no `PartialEq` in it.
+    assert_fails_with(
+        r#"
+        [derive(PartialEQ)]
+        struct P {
+            x: i32,
+        }
+
+        fun main() {}
+        "#,
+        "`PartialEQ` is not a derivable trait",
+    );
+}
+
+#[test]
+fn b376_every_std_derive_still_expands() {
+    // The line the refusal must not cross: all six of the table's names, on
+    // the two item shapes they apply to, still expand and still compile.
+    assert_compiles(
+        r#"
+        import std::json::Json;
+        import std::wire::Wire;
+        import std::hash::Hashable;
+
+        [derive(PartialEq, Debug, Default, Json, Wire, Hashable)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        [derive(PartialEq, Debug, Json, Wire)]
+        enum Shape {
+            Dot,
+            Line(i32),
+        }
+
+        fun main() {
+            let origin: Point = Point::default();
+            let _ = origin == Point { x = 0, y = 0 };
+            let _ = Shape::Line(1) == Shape::Dot;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b376_a_users_own_derive_macro_is_not_refused() {
+    // The refusal is "nothing declares a macro for this name", not "std does
+    // not". A `macro fun` in the file dispatches exactly as before.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        macro fun Greeter(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [], generics = [] },
+            };
+            source("impl " + target.name + " {\nfun greet(self): str {\n\"hello\"\n}\n}\n")
+        }
+
+        [derive(Greeter)]
+        struct Host {
+            id: i32,
+        }
+
+        fun main() {
+            print(Host { id = 1 }.greet());
+        }
+
+        main();
+        "#,
+        "hello\n",
     );
 }

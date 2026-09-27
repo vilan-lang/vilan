@@ -60,6 +60,17 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # The OTHER half of N27, self-checked. This leg can tell you a pin now
+      # passes; it cannot tell you a pin's `#[ignore]` reason names an item that
+      # has been CLOSED, because that needs the tracker, which is a different
+      # repository and is not in a CI checkout. `scripts/ignored-pins.py
+      # --tracker <path>` is what answers that, run at close by whoever has both
+      # repositories. CI cannot run it, so CI runs its self-test instead — the
+      # script's readers are proven here even though its verdict is produced
+      # elsewhere.
+      - name: Self-test the close-time tracker cross-check
+        run: python3 scripts/ignored-pins.py --self-test
+
       - name: Run the ignored pins
         # `--run-ignored only` is nextest's spelling for libtest's
         # `--ignored` (`ignored-only` is its deprecated alias — do not

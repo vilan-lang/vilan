@@ -2,7 +2,10 @@ import std::io::print;
 
 // A list built with `List::new()` + `push` infers its element type from the
 // pushed values, so a `for`-loop binding is concrete and answers method calls.
-struct Point { x: i32, y: i32 }
+struct Point {
+	x: i32,
+	y: i32,
+}
 
 impl Point {
 	fun sum(self): i32 {

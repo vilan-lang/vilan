@@ -26,19 +26,22 @@
 //! House process hygiene: the server never exits on its own, so it is killed at
 //! the end (inside a `catch_unwind` so a failed assertion still tears it down);
 //! the client leg is a quick-exit node run. The example is copied to a temp dir
-//! and given a free port, so the test is hermetic and parallel-safe.
+//! and asks for port 0, so the test is hermetic and parallel-safe.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+mod support;
 
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_ssr_{tag}_{}_{unique}", std::process::id()));
+    let dir =
+        support::scratch_root().join(format!("vilan_ssr_{tag}_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -76,16 +79,6 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Bind an ephemeral port, then release it — a free port for the server (a small
-/// TOCTOU window, standard for this kind of test).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn build(dir: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["build", dir.to_str().unwrap()])
@@ -98,18 +91,6 @@ fn build(dir: &Path) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-/// Poll until the server accepts a connection (or the deadline passes).
-fn wait_for_port(port: u16, deadline: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 /// A plain HTTP GET, returning the response body bytes.
@@ -138,52 +119,10 @@ fn http_get(port: u16, path: &str) -> Vec<u8> {
 /// The A10 DOM stub plus the replace-matrix assertions, run under node against the
 /// built `dist/client.js` (passed as argv[2]). One `ok`/`FAIL` line per assertion;
 /// exits 1 on any failure.
-const BOOT_HARNESS: &str = r#"class StubElement {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.attributes = {};
-        this.style = { setProperty: () => {} };
-        this.hidden = false;
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    set className(v) { this.attributes["class"] = v; }
-    get className() { return this.attributes["class"] || ""; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    set value(v) { this.attributes["value"] = v; }
-    get value() { return this.attributes["value"] || ""; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter((c) => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter((c) => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    click() { for (const h of (this.listeners.click || [])) h({ preventDefault() {} }); }
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-    findAll(predicate, acc) {
-        acc = acc || [];
-        if (predicate(this)) acc.push(this);
-        for (const c of this.children) c.findAll(predicate, acc);
-        return acc;
-    }
-}
-
-let failures = 0;
+const BOOT_HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/ssr_fullstack.js"),
+    r##"let failures = 0;
 function check(condition, message) {
     if (condition) console.log("ok   - " + message);
     else { failures += 1; console.error("FAIL - " + message); }
@@ -193,15 +132,14 @@ function check(condition, message) {
 // hand-built mirror of render(app())'s output — the stub has no HTML parser, and
 // the replace path only needs the container non-empty with foreign nodes the
 // client did not build. The texts mirror the server markup phase 1 asserted.
-const container = new StubElement("div");
-const serverMain = new StubElement("main");
+const serverMain = newElement("main");
 serverMain.className = "app";
-const serverList = new StubElement("ul");
-const serverLi1 = new StubElement("li"); serverLi1.textContent = "Render on the server";
-const serverLi2 = new StubElement("li"); serverLi2.textContent = "Replace on boot";
+const serverList = newElement("ul");
+const serverLi1 = newElement("li"); serverLi1.textContent = "Render on the server";
+const serverLi2 = newElement("li"); serverLi2.textContent = "Replace on boot";
 serverList.appendChild(serverLi1);
 serverList.appendChild(serverLi2);
-const serverButton = new StubElement("button"); serverButton.textContent = "idle";
+const serverButton = newElement("button"); serverButton.textContent = "idle";
 serverMain.appendChild(serverList);
 serverMain.appendChild(serverButton);
 container.appendChild(serverMain);
@@ -209,14 +147,9 @@ container.appendChild(serverMain);
 // Pre-boot: the container holds the server-rendered tree, before any client JS.
 check(container.children.length === 1 && container.children[0] === serverMain, "pre-boot: container holds the server-rendered <main>");
 
-global.document = {
-    createElement: (tag) => new StubElement(tag),
-    getElementById: (id) => (id === "app" ? container : null),
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.window = { addEventListener: () => {} };
-global.location = { pathname: "/" };
+// The page the client boots into: the container built above, already holding
+// the server's markup, answering `getElementById("app")`.
+installStubDocument({ root: container, rootId: "app", element: newElement });
 
 // Boot the client bundle: its top-level mount_root("app", ...) runs on require.
 require(process.argv[2]);
@@ -246,20 +179,31 @@ check(container.find((el) => el === serverButton) === null, "dead: the server bu
 check(serverButton.textContent === "idle", "dead: the detached server button got no update from the write");
 
 process.exit(failures === 0 ? 0 : 1);
-"#;
+"##,
+);
 
 #[test]
 fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
     let dir = temp_project("fullstack");
     copy_tree(&example_dir(), &dir);
 
-    // A free port injected into the server source (both the `.port(..)` and the
-    // cosmetic banner) so the test is hermetic and parallel-safe.
-    let port = free_port();
+    // The SERVER picks the port: `.port(0)` asks the OS, and the banner is
+    // rewritten to announce what it got, which is how the harness learns it.
+    // N40 — the example's literal used to be replaced by a port this test bound
+    // and released before the build, a race under parallel suites; there is no
+    // release now, because the bind is the server's own.
     let server_source = dir.join("src/server.vl");
     let patched = std::fs::read_to_string(&server_source)
         .unwrap()
-        .replace("8791", &port.to_string());
+        .replace(".port(8791)", ".port(0)")
+        .replace(
+            r#"print("ssr example: http://localhost:8791/")"#,
+            support::port::ANNOUNCE_PORT,
+        );
+    assert!(
+        patched.contains(".port(0)") && patched.contains(support::port::ANNOUNCE_PORT),
+        "the example's port literal and banner moved under this test:\n{patched}"
+    );
     std::fs::write(&server_source, patched).unwrap();
 
     write(&dir, "boot_harness.js", BOOT_HARNESS);
@@ -267,20 +211,12 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
 
     // The server runs from the project root (it reads `dist/client.js` and
     // `src/app.html` by relative path).
-    let mut server = Command::new("node")
-        .arg("dist/server.mjs")
-        .current_dir(&dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn node server");
+    let mut command = Command::new("node");
+    command.arg("dist/server.mjs").current_dir(&dir);
+    let mut server = support::port::Server::spawn(&mut command);
+    let port = server.port();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert!(
-            wait_for_port(port, Duration::from_secs(20)),
-            "the SSR server should accept connections on port {port}"
-        );
-
         // --- Phase 1: the served HTML carries the rendered content, pre-JS. ---
         let page = String::from_utf8_lossy(&http_get(port, "/")).to_string();
         assert!(
@@ -341,8 +277,7 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
         );
     }));
 
-    let _ = server.kill();
-    let _ = server.wait();
+    server.stop();
     if outcome.is_ok() {
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -5,7 +5,7 @@ payloads (`created_at: Instant` in a mirrored record is the standard
 timestamp shape).
 
 ```vilan,fragment
-import std::time::{ now, Instant, Duration, sleep, sleep_for, Timer };
+import std::time::{ now, Instant, Duration, sleep, sleep_for, Timer, Debounce };
 ```
 
 ## Instant
@@ -126,6 +126,89 @@ difference between the two cancellations matters:
   structured path) and does *not* touch the timer. No verdict, no
   `clearTimeout`: the timer belongs to whoever holds the value, so its other
   holders can still wait on it, or call it off themselves.
+
+## Debounce
+
+`Debounce` collapses a burst of calls into **one**, `delay` after the last of
+them — trailing edge. Each `run` pushes the deadline out *and* replaces the
+callback, and there is at most one timer in flight however many times `run` is
+called, so a burst costs one run of the **last** closure.
+
+`flush()` is the explicit-save half: it fires the pending callback **now** and
+calls the window off, so a blur handler, a Save button or a form that unloads
+does not lose the coalesced work. Exactly one run results and nothing runs
+twice — the callback is taken out before it is called, so the parked loop finds
+nothing at the deadline it pre-empted — and a `flush` with nothing pending is a
+no-op. A `run` from inside the flushed callback opens a fresh window in the
+ordinary way.
+
+```vilan,fragment
+struct Debounce { … }
+impl Debounce {
+	fun new(delay: Duration): Debounce
+	fun run(self, fn: || void)   // pushes the deadline out, replaces the callback
+	fun flush(self)              // fires the pending callback NOW, once
+	fun cancel(self)             // drops the pending callback, calls the timer off
+}
+```
+
+```vilan
+import std::io::print;
+import std::time::{ Debounce, Duration, sleep };
+
+async fun main() {
+	let save = Debounce::new(Duration::millis(300));
+	save.run(|| print("first"));
+	save.run(|| print("second"));
+	save.run(|| print("third"));
+	sleep(600);   // one line printed: "third"
+}
+```
+
+**Trailing, not leading.** The first call of a burst does not fire; the last one
+does, 300 ms after it. That is what a search field wants (one query, for the
+text the user stopped typing) and what a resize handler wants (one layout pass,
+at the size the window settled at). A leading-edge `Throttle` is deliberately
+**not** shipped beside it: it is a different mechanism rather than a flag on
+this one — it fires immediately and then *suppresses*, so it holds no pending
+callback and its timer gates rather than schedules — and it lands when something
+asks for it.
+
+**A call that arrives during a wait cannot fire early.** The driving loop
+re-reads the deadline after every wait, so the timer armed for an earlier call
+fires, finds the deadline moved, and takes another turn.
+
+`cancel()` drops the pending callback and calls the in-flight timer off, so
+nothing fires and the host is released now rather than at the deadline. It is
+idempotent, safe with nothing pending, and a `run` after it starts a fresh
+window in the ordinary way.
+
+Like `Timer`, a `Debounce` is a value wrapping shared cells: copying it shares
+the one debounce, and `run` through any copy pushes the same deadline.
+
+**The driving loop runs under the ambient nursery**, so cancelling that nursery
+stops the window — nothing fires, exactly as `cancel()` would. It does not
+retire the `Debounce`: the loop's bookkeeping is cleared however it unwinds
+(cancellation, or a callback of yours that throws), so the next `run` opens a
+fresh window in the ordinary way.
+
+**It takes no owner and registers no cleanup.** `std::time` is the base clock
+module and sits below `std::reactive`, so a `Debounce` is a plain value in the
+shape `Timer` established — `cancel()` is the teardown, and an app that wants
+one tied to a scope wraps it itself. A pending debounce keeps the host alive
+until it fires, exactly as the outstanding `Timer` inside it does.
+
+### Why the `Shared` cells
+
+They are load-bearing, in both directions of the memory model
+([spec §6](../spec/memory.md)). `run` takes `self` by loan and the `async` block
+it spawns **outlives that loan** — it reads the pending deadline on every timer
+tick, long after `run` returned. Rule 1 (§6.1) is why a plain field cannot
+serve: values are copied, so the block would hold a copy of the deadline made at
+spawn time and never see a later `run`'s push, and the copy it wrote would be
+discarded. `Shared` is the cell that makes the escape legal, and rule 3 (§6.3)
+is what lets the block **write** through what is only a loan — `write()` is a
+view projected from the cell, not from `self`'s stack slot.
 
 ## Notes
 

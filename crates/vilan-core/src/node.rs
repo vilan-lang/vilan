@@ -1,4 +1,5 @@
 use crate::span::{Span, Spanned};
+use std::borrow::Cow;
 
 pub type GenericParameters<'src> = Spanned<Vec<GenericParameter<'src>>>;
 
@@ -83,6 +84,13 @@ pub struct Func<'src> {
     // convention the steer reads `use …`. Honored wherever the attribute
     // appears — std and user code alike.
     pub deprecated: Option<&'src str>,
+    // Declared `[internal("reason")]` (E213): this function is public on
+    // purpose and dangerous on purpose — reachable, and not a name a reader
+    // should reach for. Distinct from visibility, which answers whether a
+    // module may NAME it; this answers whether someone should. The reason is
+    // REQUIRED, and it is what hover leads with and completion shows in
+    // `detail`; a label with no reason is how these rot.
+    pub internal: Option<&'src str>,
     // A `[extern(..)]` host binding, lowering this external to a JS import/call,
     // method, or property access. `None` for a plain `external` (compiler
     // intrinsic) or an ordinary function.
@@ -109,9 +117,6 @@ pub struct Func<'src> {
     // through a trait bound, never on a concrete type's own surface
     // (`proposal/transport-rpc.md` §3.2).
     pub trait_only: bool,
-    // Declared `[doc(hidden)]`: fully callable, but omitted from editor
-    // completion (a tooling marker — no resolution change).
-    pub doc_hidden: bool,
     pub generic_parameters: Option<GenericParameters<'src>>,
     pub parameters: Spanned<Vec<Parameter<'src>>>,
     pub return_type: Option<Box<Spanned<Node<'src>>>>,
@@ -119,9 +124,55 @@ pub struct Func<'src> {
     // (`fun slot(&mut self): &mut i32 borrows self`): the returned view is a
     // projection of that parameter, so it may escape (rule 3's sanctioned case).
     pub borrows: Option<&'src str>,
+    // The `context` clause on the DECLARATION (`fun f(x: f64) context settings`
+    // / `fun f(): T context (a, b)`) — the contexts the body may read, stated
+    // rather than inferred (B242, spec §8.6): the names in written order, and
+    // the clause's whole span (the anchor for the subset refusal and the
+    // editor's fix). Distinct from a clause on a parameter's closure TYPE
+    // (§8.5), which defers a closure's binding to its call sites.
+    pub contexts: Option<(Vec<Spanned<&'src str>>, Span)>,
+    // Where a `context` clause would be INSERTED: the zero-width point after
+    // everything the signature already carries — the parameter list, the
+    // return type, a `borrows` clause — and before the body's `{` or the
+    // bodyless `;` (E148). The parser is the only thing that knows this
+    // position: nothing in the analyzed program records where a signature
+    // ENDS, only where its pieces are, so the editor's "declare the inferred
+    // contexts" fix had no span to insert at on a function that declares no
+    // clause at all. `None` for a synthesized function with no source text.
+    pub signature_end: Option<Span>,
     // `None` for a function signature without a body: a required trait method
     // declaration (`fun default(): Self;`) or an `external` intrinsic.
     pub body: Option<Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>>,
+}
+
+impl<'src> Func<'src> {
+    /// The RECEIVER this function declares, as written — `"self"`,
+    /// `"mut self"`, `"&self"`, `"&mut self"`, `"own self"` — or `None` for an
+    /// associated function that takes none.
+    ///
+    /// Rebuilt from the parsed convention rather than sliced out of the source
+    /// so it is one canonical spelling per receiver kind: the macro surface
+    /// (`meta::FunctionItem::receiver`) compares it against literals, and a
+    /// generator that branches on it must not have to normalize whitespace.
+    ///
+    /// It is a receiver only in the first position and only under the name
+    /// `self`, which is what the language means by one.
+    pub fn receiver_spelling(&self) -> Option<&'static str> {
+        let parameter = self.parameters.0.first()?;
+        let Pattern::Binding(name, _, _) = &parameter.pattern else {
+            return None;
+        };
+        if *name != "self" {
+            return None;
+        }
+        Some(match (parameter.convention, parameter.mutable) {
+            (Convention::Ref, _) => "&self",
+            (Convention::RefMut, _) => "&mut self",
+            (Convention::Own, _) => "own self",
+            (Convention::Bare, true) => "mut self",
+            (Convention::Bare, false) => "self",
+        })
+    }
 }
 
 /// A parsed parameter: binder, optional declared type, how it receives its
@@ -145,6 +196,15 @@ pub struct Parameter<'src> {
     /// parameter only, at most one, must declare its type, plain name binder,
     /// no rule-3 convention. Unlike `mut`, it IS part of the signature.
     pub spread: bool,
+    /// `lazy message: str` — a LAZY parameter (proposal/lazy.md §1): the call
+    /// site packages the argument as a thunk instead of evaluating it, the
+    /// callee forces it on its first read, and the result memoizes
+    /// (call-by-need — at most once, late; never read, never run). Like
+    /// `spread` and unlike `mut`, it IS part of the signature: laziness changes
+    /// what the CALL SITE builds, so an impl of a lazy-parameter trait
+    /// signature must agree. Exclusive with `own`/`&`/`&mut`, with `mut` and
+    /// with `...`; refused on a closure and on an `external fun`.
+    pub lazy: bool,
     pub span: Span,
 }
 
@@ -179,13 +239,21 @@ pub struct CssBody<'src> {
 }
 
 /// One item of a `css` block. The dot is the whole disambiguator (§3):
-/// undotted is a declaration, dotted is a condition combinator — so the
-/// grammar never consults `Style`'s method list, and adding a method to
-/// `Style` can never change what existing `css` means.
+/// undotted is a declaration, dotted is a method call — so the grammar never
+/// consults `Style`'s method list, and adding a method to `Style` can never
+/// change what existing `css` means.
+///
+/// A69 splits the dotted half by what FOLLOWS the head, which is the element
+/// syntax's own rule read on the style side: a `{ … }` body makes it a
+/// condition rule, and a `;` makes it a plain CHAIN LINK — `.ghost();`,
+/// `.flex_row();`, `.custom(a, b);` — spliced into the chain at its written
+/// position. That is how an app's own helpers and std's combinators reach the
+/// block, and it claims the grammar space css-block.md §10 left free for it.
 #[derive(Debug)]
 pub enum CssItem<'src> {
     Declaration(CssDeclaration<'src>),
     Nested(CssNested<'src>),
+    Link(CssLink<'src>),
 }
 
 impl CssItem<'_> {
@@ -196,12 +264,19 @@ impl CssItem<'_> {
         match self {
             CssItem::Declaration(declaration) => declaration.span,
             CssItem::Nested(nested) => nested.span,
+            CssItem::Link(link) => link.span,
         }
     }
 }
 
-/// `property: value;` — one declaration, lowering to exactly one
+/// `property(value);` — one declaration, lowering to exactly one
 /// `.raw(property, value)` call (§5.2).
+///
+/// A101: a declaration is a CALL, the strategy element syntax took for
+/// attributes (`type("checkbox")`). The property keeps its hyphenated CSS name
+/// and its ARGUMENTS are ordinary vilan expressions — so there is no value
+/// grammar, no `{ }` hole and no CSS token soup, and the type system decides
+/// what a value means exactly where it already lives.
 #[derive(Debug)]
 pub struct CssDeclaration<'src> {
     /// The property name's SPAN, not a slice: a hyphenated or custom property
@@ -209,26 +284,38 @@ pub struct CssDeclaration<'src> {
     /// joined text, and the parser has no source access — the desugar slices
     /// it where the source is in scope, exactly as an element's tag name is.
     pub property: Span,
-    pub value: Vec<CssValuePiece<'src>>,
-    /// The value's whole extent, `:` exclusive and `;` exclusive. The slice
-    /// the mixed-value row of §5.2's table renders, and the anchor a
-    /// wrong-typed value reports at.
-    pub value_span: Span,
+    /// The declaration's arguments, ordinary vilan expressions. ONE argument
+    /// is the value and passes through to `raw` untouched, keeping its type
+    /// and its `:root` line; N are joined by a single space — CSS's own list
+    /// separator (A101 R10) — so `margin(px(4), px(8))` is `margin:4px 8px`.
+    pub arguments: Vec<Spanned<Node<'src>>>,
+    /// The argument list's `( … )` span: the anchor a wrong-typed value
+    /// reports at, and the extent the joined value's generated node takes.
+    pub parens: Span,
     /// The declaration's own span, `;` inclusive.
     pub span: Span,
 }
 
-/// One piece of a declaration's value: a `{expr}` hole, or a run of source
-/// text between holes. A value is a TOKEN RUN, not a typed grammar — typed
-/// values arrive through holes, which is where the type system already lives
-/// (§10).
+/// `.name;` / `.name(a, b);` — a CHAIN LINK (A69), lowering to exactly the
+/// method call it reads as, at its written position in the chain. Nothing is
+/// appended and nothing is consulted: a link is the one item whose meaning is
+/// entirely the method's, which is what lets an app's helpers (`.flex_row()`,
+/// `.ghost()`, `.select_off()`) and std's own combinators be written inside a
+/// block at all.
 #[derive(Debug)]
-pub enum CssValuePiece<'src> {
-    /// `{expression}` — the hole's expression, and the span of the whole
-    /// `{…}` including its braces (what a reprint has to reproduce).
-    Hole(Spanned<Node<'src>>, Span),
-    /// A run of value text, verbatim from source.
-    Text(Span),
+pub struct CssLink<'src> {
+    pub name: Spanned<&'src str>,
+    /// The call's arguments, ordinary vilan expressions. A bare member and an
+    /// empty list are the same call — `.ghost;` and `.ghost();` both LOWER to
+    /// `.ghost()`, because a bare member and a zero-argument call are one
+    /// thing on a `Style`.
+    pub arguments: Vec<Spanned<Node<'src>>>,
+    /// Whether a `(` was written. The two spellings mean the same call, so the
+    /// desugar never reads this — the FORMATTER does, because it may never
+    /// invent or delete a token, and `.ghost;` and `.ghost();` differ by two.
+    pub parenthesized: bool,
+    /// The link's own span, `;` inclusive.
+    pub span: Span,
 }
 
 /// `.name { … }` / `.name(a, b) { … }` — a condition combinator, lowering to
@@ -257,7 +344,12 @@ pub struct ElementBody<'src> {
     /// tags (`<use>`) and hyphenated custom elements (`<my-widget>`) span
     /// several tokens, and the parser has no source access — the desugar pass
     /// slices the text where the source is in scope.
-    pub tag: Span,
+    ///
+    /// `None` is a FRAGMENT — `<>…</>` (A46), the nameless head. A fragment
+    /// carries no head items and is never self-closing, and it lowers to a
+    /// `List<View>` LITERAL rather than to a `view("tag")` chain, so the
+    /// nameless case is a different lowering and not merely a missing name.
+    pub tag: Option<Span>,
     pub head: Vec<ElementHeadItem<'src>>,
     pub children: Vec<ElementChild<'src>>,
     /// Whether the element was written self-closing (`<div />`). `<div></div>`
@@ -268,6 +360,29 @@ pub struct ElementBody<'src> {
     /// one — the language server's matching-tag features read it. `None` for a
     /// self-closing element.
     pub close_tag: Option<Span>,
+    /// Every angle-bracket span the element wrote, in source order: the opening
+    /// `<`, the `>` or `/>` that closes the head, and — when the element has a
+    /// close tag — its `</` and its `>`.
+    ///
+    /// Recorded because the editor's two highlight sources have to agree about
+    /// this punctuation and only the parser knows where it is (E115). A
+    /// TextMate rule is matched one line at a time, so a head whose attributes
+    /// span lines puts its `>` on a line with no `<tag` on it, out of the
+    /// rule's reach — the parser has no such limit, and the semantic-token pass
+    /// paints from these spans whatever shape the head was written in.
+    pub punctuation: Vec<Span>,
+}
+
+impl ElementBody<'_> {
+    /// Where the head's items begin, for span bookkeeping that needs one point
+    /// per element: the tag's span, or — for a nameless fragment — the opening
+    /// `<` the parser recorded first. Never the whole head, so a comment scan
+    /// or a split layout anchored here sees the same shape either way.
+    pub fn head_anchor(&self) -> Span {
+        self.tag
+            .or_else(|| self.punctuation.first().copied())
+            .unwrap_or_else(|| (0..0).into())
+    }
 }
 
 /// One child of an element. The distinction is TOKEN-carrying, not semantic —
@@ -334,15 +449,143 @@ pub enum NodeIfBranch<'src> {
     Else(Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>),
 }
 
+/// The `(in PATH)` narrowing on an `export` (B318 §2.2, §10 c): the scope the
+/// marker publishes into.
+///
+/// GENERAL rather than the two useful spellings, because the grammar is
+/// `"(" "in" path ")"` either way: `mod` and `pkg` are RESERVED heads — "this
+/// module and its inline `mod` blocks" and "the item's own package" — matching
+/// `names.md` §4.2's existing roots, and any other path names the module
+/// subtree it roots (`export(in pkg::a)`).
+#[derive(Debug)]
+pub struct ExportScope<'src> {
+    /// The path's segments with their spans, the reserved head included.
+    pub path: Vec<(&'src str, Span)>,
+    /// The whole `(in …)` group — what a diagnostic about the narrowing spans.
+    pub span: Span,
+}
+
 #[derive(Debug)]
 pub enum ImportBranch<'src> {
-    // A path segment: its name, the span of that name, and an optional `::`
-    // continuation. The span drives go-to-definition / hover on imports.
-    Path(&'src str, Span, Option<Box<Self>>),
+    // A path segment: its name, the span of that name, and what follows it.
+    // The span drives go-to-definition / hover on imports.
+    Path(&'src str, Span, ImportTail<'src>),
     Set(Vec<Self>),
+    // `#<branch>` — the REACH marker (B318 §1/§2.3): "I know this is not
+    // exported and I want it anyway". A WRAPPER rather than a field on `Path`,
+    // for three reasons: it composes with every element production (a name, a
+    // `mod` segment mid-path, and S3's `(impl T)` selector) without any of them
+    // knowing about it; it adds no segment, so `record_reference` files the
+    // leaf's own span and RENAME still rewrites `{ #hidden }`; and every reader
+    // that does not care about the marker delegates to the inner branch in one
+    // line. The span is the `#` itself.
+    Reach(Span, Box<Self>),
+    /// `(impl TYPE)` — an IMPL SELECTOR element of a brace set (B318 S3,
+    /// `proposal/visibility.md` §2.5). It binds no NAME: it says which of the
+    /// module's `impl` blocks this file admits, so it is a sibling of a path
+    /// rather than a kind of one, and every walk that asks a branch for its
+    /// leaves skips it.
+    Selector(Box<ImplSelector<'src>>),
+}
+
+/// One `(impl TYPE)` / `(impl TYPE)::name` / `(impl TYPE)::{ a, b }` selector
+/// (B318, RULED 2026-09-12: the selector is PARENTHESIZED, `_` is its
+/// placeholder, and no binders are written in one).
+#[derive(Debug)]
+pub struct ImplSelector<'src> {
+    /// The subject as a TYPE node, resolved in the IMPORTER's scope — `impl S`
+    /// reaches an alias this file's own imports bound, `impl item::Struct` is
+    /// the qualified spelling. `_` at any argument position is B294's anonymous
+    /// binder, which is exactly the placeholder the selector wants: a hole that
+    /// unifies with whatever the block admits.
+    ///
+    /// `None` only on a selector the ORGANIZER synthesized for E168's rewrite,
+    /// which is printed and never walked.
+    pub subject: Option<Box<Spanned<Node<'src>>>>,
+    /// The subject's text — the source slice for a written selector, and the
+    /// rendered type for a synthesized one. The formatter reprints it verbatim
+    /// and keys the sort on it (`visibility.md` §7.2: selectors sort after
+    /// every name in a set, by their rendered type text).
+    pub subject_text: Cow<'src, str>,
+    /// `::name` / `::{ a, b }` — the members this selector takes into the
+    /// type's namespace for this file. Empty when the selector takes the whole
+    /// block.
+    pub members: Vec<(&'src str, Span)>,
+    /// The whole `(impl …)` element's span, where a refusal naming the selector
+    /// is spanned.
+    pub span: Span,
+}
+
+/// The trailing modifier on an `import` statement (B318 §2.4, RULED).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportModifier {
+    /// No modifier — today's meaning: the statement binds its names, and every
+    /// `impl` declared in the files on the path to them arrives with it.
+    None,
+    /// `only` — the names and nothing else: no `impl` arrives with this
+    /// statement. The span is the word's own, where a refusal is spanned.
+    Only(Span),
+}
+
+/// What follows one segment of an `import`/`use` path. A tail is a THREE-way
+/// choice rather than an `Option<continuation>` plus an `Option<alias>`,
+/// because `a::b as c::d` is not a path anyone can write: an alias renames the
+/// LEAF, so the two are alternatives and the type says so (E142).
+#[derive(Debug)]
+pub enum ImportTail<'src> {
+    /// Nothing follows: this segment is the leaf and binds under its own name.
+    Leaf,
+    /// `:: <branch>` — the path continues into a further path or a brace set.
+    Continue(Box<ImportBranch<'src>>),
+    /// `as <name>` — the leaf binds under `name` instead of its own, with the
+    /// span of the alias as written (which is the identifier the language
+    /// server renames and finds references for).
+    Alias(&'src str, Span),
 }
 
 pub type NodeList<'src> = Vec<Spanned<Node<'src>>>;
+
+/// What a `[service(..)]` / `[client_service]` attribute pair says about the
+/// struct it annotates (`proposal/transport-rpc.md` §9.3, R1).
+///
+/// Both attributes ride ONE node so that a struct carrying both — the
+/// peer-to-peer spelling — expands once and generates one dispatcher rather
+/// than two colliding ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ServiceAttr<'src> {
+    /// `[service(Name)]`'s argument: the generated client type's name.
+    /// `None` on a bare `[service]` (the name defaults to `<Struct>Client`)
+    /// AND on a struct that carries only `[client_service]`, which generates no
+    /// transport client at all — `client_side` tells the two apart.
+    pub client_name: Option<&'src str>,
+    /// `[service(.., client = H)]`'s argument: the `[client_service]` struct
+    /// whose `[rpc]` methods this server may call. `None` when none is declared.
+    pub handler_name: Option<&'src str>,
+    /// Whether `[service(..)]` was written at all. `false` means the struct
+    /// carries only `[client_service]`.
+    pub server_side: bool,
+    /// Whether `[client_service]` was written: this struct's `[rpc]` methods are
+    /// callable BY a server, and it generates a `<Struct>Proxy`.
+    pub client_side: bool,
+    /// Whether `[service(.., http)]` was written: the opt-in MARKER that this
+    /// service is an HTTP API (A120 S5, `transport-rpc.md` §9.7.5, Q1 RULED).
+    /// It generates nothing; it moves the refusal of what the connectionless
+    /// leg cannot carry — a handle return, an `[expose]`d field, `client = H`
+    /// — from a far-away call site to the member that declared it.
+    pub http: bool,
+}
+
+/// The name a [`Node::TypeBinder`] carries when it was written ANONYMOUSLY —
+/// `_`, or its keyword spelling `type _` (B294).
+///
+/// It is not a keyword and nothing lexes it specially: `_` is an ordinary
+/// identifier, and the wildcard reading is a decision three places share —
+/// `parse_type_atom` routes it to the binder production, the formatter prints
+/// the binder back without the keyword, and `register_subject_binders` declines
+/// to register it under a name (`_` names nothing, so two of them in one head
+/// are two parameters). The spelling lives here, next to the node, so the three
+/// cannot drift apart.
+pub const ANONYMOUS_TYPE_BINDER: &str = "_";
 
 #[derive(Debug)]
 pub enum Node<'src> {
@@ -356,8 +599,25 @@ pub enum Node<'src> {
     Await(Box<Spanned<Self>>),
     // A `type X` generic binder appearing inside a type — the impl subject
     // pattern (`impl Option<(type T, type U)>`), including a bare blanket
-    // (`impl type T`). The optional bounds are `T: A + B`.
-    TypeBinder(&'src str, Vec<Spanned<Self>>),
+    // (`impl type T`). The optional bounds are `T: A + B`. The ANONYMOUS
+    // spelling `_` (B294) is this same node with [`ANONYMOUS_TYPE_BINDER`] as
+    // its name — one node, one analyzer path, no second set of semantics.
+    //
+    // The name carries its OWN span, the way `GenericParameter` does, and not
+    // only the node's: the node's reaches from the `type` keyword to the end of
+    // the bounds, and the entity registered for the binder is spanned by what
+    // the editor must select for it — a go-to-definition target, and one
+    // semantic token (E161: the wide span painted `type _: Source<type U>` as
+    // one type-parameter run and the overlap filter then dropped every name
+    // inside it).
+    // A122: `impl type T: (2..) with Tuple` — a TUPLE-family bound in place of
+    // the trait-bound list (the two are exclusive, as on a generic parameter),
+    // boxed so the rare case costs the common one a pointer.
+    TypeBinder(
+        Spanned<&'src str>,
+        Vec<Spanned<Self>>,
+        Option<Box<TupleBound<'src>>>,
+    ),
     // `x = v` or a compound assignment like `x += v` (the operator is the
     // binary op the assignment applies, e.g. `Add` for `+=`). The target is an
     // lvalue: a local (`Accessor`) or a field place (`MemberAccessor`, e.g.
@@ -387,6 +647,14 @@ pub enum Node<'src> {
     // keyword (lexes as an identifier; only means the contract directly
     // before a closure type). Wraps the closure type it marks.
     SyncType(Box<Spanned<Node<'src>>>),
+    // `dyn Source<i32>` — a TRAIT OBJECT type (A124 R3, reopening B4 in the
+    // object-safe scope). Wraps the trait path it erases, which is the only
+    // thing that may follow the keyword: a nominal path, applied or not.
+    //
+    // The keyword is REQUIRED (trait-objects.md Q4/P15): coercing a value into
+    // an object changes which member runs where an inherent one outranks the
+    // trait's, so the change of surface must be written, not inferred.
+    DynType(Box<Spanned<Node<'src>>>),
     // `(|| void) context owner_scope` / `context (a, b)` — a closure type
     // carrying a context requirement (proposal/ambient-owner.md §5): the
     // closure defers those contexts' bindings to its CALL sites instead of
@@ -418,16 +686,17 @@ pub enum Node<'src> {
     // markup sugar over the `std::ui` view chain. Exists only between parse
     // and the pre-analysis desugar (`elements::rewrite_items`); the formatter
     // prints it from source.
-    Element(ElementBody<'src>),
+    Element(Box<ElementBody<'src>>),
     // An enum declaration: name, generics, the `resource` flag (the
     // owned-resource modifier, destruction.md §3 — SURFACE ONLY, carried but
     // not yet classified on), and the variants — each a name, the types of its
     // optional data, and an optional explicit discriminant (`Less = -1`).
     Enum(
         Spanned<&'src str>,
-        Option<GenericParameters<'src>>,
+        Option<Box<GenericParameters<'src>>>,
         bool,
-        Spanned<Vec<Spanned<EnumVariant<'src>>>>,
+        Box<Spanned<Vec<Spanned<EnumVariant<'src>>>>>,
+        ItemLabels<'src>,
     ),
     Error,
     // A loop: `for { .. }` (infinite, condition `None`) or `for cond { .. }`
@@ -436,13 +705,29 @@ pub enum Node<'src> {
         Option<Box<Spanned<Self>>>,
         Spanned<(NodeList<'src>, Box<Spanned<Self>>)>,
     ),
-    // `for item in iterable { .. }` — the binding name, the iterable, the body.
+    // `for item in iterable { .. }` — the element BINDER, the iterable, the
+    // body. The binder is `let`'s (B368/R5, spec §3.3's `binder`): a bare name,
+    // or a tuple/array pattern that destructures the element in the header.
+    // Anything else the binding grammar does not take is refused by name in
+    // `parse_for`, so only `Pattern::Binding`, `Pattern::Tuple` and
+    // `Pattern::Array` ever reach here.
+    //
+    // BOXED, for M53's reason and by its rule: a `Spanned<Pattern>` inline put
+    // this variant at 104 bytes and `Node` over the 96-byte ceiling
+    // `node_size.rs` pins — paid on every expression the parser returns. A
+    // `for` header is one per LOOP, so the allocation is in the same class as
+    // the item declarations M53 boxed by field.
     ForIn(
-        &'src str,
+        Box<Spanned<Pattern<'src>>>,
         Box<Spanned<Self>>,
         Spanned<(NodeList<'src>, Box<Spanned<Self>>)>,
     ),
-    Func(Func<'src>),
+    // BOXED (M32): `Func` is 312 bytes — inlined here it made `Node` 320 and
+    // `Spanned<Node>` 336, and the parser moves that whole value up through
+    // every precedence level on every `Option<Spanned<Node>>` return. The box
+    // costs one allocation per function DECLARATION (rare) to take the enum's
+    // ceiling — and with it every expression memcpy — down by a factor.
+    Func(Box<Func<'src>>),
     // `ret <expr>` / bare `ret` (an early return of void).
     FuncReturn(Option<Box<Spanned<Self>>>),
     // `expr!` — assert-or-return (proposal/try-and-lift.md): the good half of a
@@ -497,15 +782,41 @@ pub enum Node<'src> {
         // The traits being implemented: the `A`, `B` in `impl Subject with A + B`.
         Vec<Spanned<Self>>,
         Spanned<NodeList<'src>>,
+        // F27 R1: `[platform("browser")] impl …` — everything inside requires
+        // that platform, and it is the platform the file is analyzed under.
+        ItemLabels<'src>,
     ),
-    Import(ImportBranch<'src>),
-    // `export <item>` — re-export an import or expose a local declaration.
-    Export(Box<Spanned<Self>>),
+    // `import <path> only?;` — the path and B318's trailing modifier.
+    Import(ImportBranch<'src>, ImportModifier),
+    // `export <item>` — mark an item as this module's surface, or re-export an
+    // import. The first field is the optional `(in PATH)` narrowing (B318 §2.2).
+    //
+    // The third field is the re-export's `[deprecated("use …")]` (B382):
+    // `export [deprecated(..)] import …;` deprecates the NAME the re-export
+    // publishes, so the steer belongs to the export and not to the import —
+    // which also keeps `Import`'s already-wide payload out of `node_size`'s way.
+    Export(
+        Option<Box<ExportScope<'src>>>,
+        Box<Spanned<Self>>,
+        ItemLabels<'src>,
+    ),
+    // `export *;` — every item of this module is exported (B318 §2.1). A
+    // module-level item with no inner statement: the marker IS the statement.
+    ExportAll,
+    // `[platform("browser")] mod self;` — the FILE's platform (F27 R1), on the
+    // host B415 gave file-level attributes: `self` is the file's own module,
+    // and the statement must lead the file (a bare `mod self;` carries no
+    // patterns and declares nothing). Everything
+    // the file declares requires that platform, and it is the platform the file
+    // is analyzed under — outranking every heuristic and the `default-entry`
+    // colour. The patterns are carried as written, with their spans, exactly as
+    // a function's fence is (`Func::platform_fence`).
+    ModulePlatform(Vec<Spanned<&'src str>>),
     // `macro fun name(..) { .. }` — a macro definition (macro-engine.md §3).
     // Its body is HERMETIC: never walked in the program world, compiled in the
     // per-file macro world instead (its imports resolve against `macro_std`
     // only), and executed by the expansion interpreter.
-    MacroFun(Func<'src>),
+    MacroFun(Box<Func<'src>>),
     // `[name(args)] <item>` — a user macro attribute on a struct/enum/function:
     // the macro's name (with its span), the argument SPANS (their source text
     // is what `Arguments` carries — arguments are syntax), and the annotated
@@ -533,13 +844,33 @@ pub enum Node<'src> {
     // pre-analysis pass generates its dispatcher, its client sibling (named by
     // the argument, defaulting to `<Struct>Client`), and the contract hash from
     // the struct's `[rpc]` impl methods and `[expose]`d fields.
-    Service(Option<&'src str>, Box<Spanned<Self>>),
-    // `let`/`mut` binding: name, type annotation, value, mutability.
+    //
+    // `[client_service]` rides the SAME node (`ServiceAttr::client_side`): the
+    // generator is direction-agnostic, and a struct carrying both attributes is
+    // peer-to-peer with ONE dispatcher (§9.3, R1).
+    Service(ServiceAttr<'src>, Box<Spanned<Self>>),
+    // `let`/`mut` binding: name, type annotation, value, mutability, laziness.
+    //
+    // `lazy` (proposal/lazy.md §2) is MODULE-LEVEL only — `lazy let database:
+    // Database = Database::open("kolt.db");` — and the flag says the
+    // initializer runs at the binding's FIRST USE instead of at module load,
+    // then memoizes. Everything else about the binding is unchanged: the module
+    // owns the value, it has process lifetime, a resource is loan-only and
+    // write-frozen, and it never drops. The analyzer refuses a lazy LOCAL (§3:
+    // an end-of-scope drop would need a runtime was-it-initialized flag, and
+    // drop flags are ratified out), so the flag is false for every `let` inside
+    // a body.
     Let(
         Spanned<&'src str>,
         Option<Box<Spanned<Self>>>,
         Option<Box<Spanned<Self>>>,
         bool,
+        bool,
+        // The labels a MODULE binding carries about itself (E221). Always
+        // empty on a local: the parser reads them only ahead of a `let`
+        // statement, and `labels::check` refuses them on a binding that is
+        // not module-level.
+        ItemLabels<'src>,
     ),
     // `let`/`mut` binding with a destructuring pattern: `let (a, b) = pair`. The
     // pattern is irrefutable (a tuple of names/sub-patterns); the rest mirrors
@@ -567,7 +898,44 @@ pub enum Node<'src> {
     Null,
     // The whole part, an optional fractional part, and an optional type suffix.
     Number(&'src str, Option<&'src str>, Option<&'src str>),
-    StaticAccessor(Box<Spanned<Self>>, &'src str),
+    // `subject::member` — one step of a `::` path: the namespace to look
+    // `member` up in, and the name. Paths of any depth nest to the left
+    // (`a::b::C` is `StaticAccessor(StaticAccessor(a, "b"), "C")`).
+    //
+    // The generic arguments are the ones written directly ON `member`, which
+    // only TYPE position offers: `std::reactive::SignalCell<i32>` names a
+    // parameterized type, while in expression position a `<...>` belongs to the
+    // CALL that follows (`math::min<i32>(a, b)` is a `Call`'s generics, folded
+    // by `parse_call`), so an expression's path always carries `None`.
+    StaticAccessor(
+        Box<Spanned<Self>>,
+        &'src str,
+        Option<GenericArguments<'src>>,
+    ),
+    // A DESUGAR's scope-independent reference to a std item (B270): the module
+    // under `std` and the item's name. `css { … }` seeds its chain with
+    // `StdItem("style", "style")` and element syntax calls
+    // `StdItem("ui", "view")`, so both mean std's function whatever the site's
+    // scope binds those names to — a `let style = 1;`, an ambient `style`
+    // MODULE from `std::web`, an `import … as s`, or nothing at all.
+    //
+    // No source spells this: it exists only in a desugared tree, which is why
+    // it is not a path (`std::style::style` written inline is refused by
+    // design — names.md §4.7) and why the loader seeds the module it names
+    // (`collect_std_item_modules`) rather than waiting for an import.
+    StdItem(&'src str, &'src str),
+    // A70: the desugared body of a `css { … }` block, wrapping the whole chain
+    // it lowered to. It FORWARDS like `const` does — the inner expression is
+    // the entity, no wrapper — and exists only to tell the analyzer which
+    // expressions were written INSIDE a block, because `std::style::prelude`
+    // is ambient exactly there: a bare name in a hole, a condition head's
+    // argument or a chain link's argument resolves against the site's scope
+    // first and against that module only if nothing in scope answers.
+    //
+    // A whole-subtree mark rather than a per-hole one, because every
+    // expression a block can hold sits under this node and the generated
+    // scaffolding around them binds no names of its own.
+    CssScope(Box<Spanned<Self>>),
     String(&'src str),
     // A triple-quoted string's raw inner text; trimmed to its content by
     // `util::trim_multiline_string` (validated in the analyzer, trimmed in the
@@ -581,28 +949,36 @@ pub enum Node<'src> {
     // struct; the second marks a `resource` — the owned-resource declaration
     // modifier (destruction.md §3), SURFACE ONLY for now: parsed, carried, and
     // formatted, with no classification or affine checking yet. In source the
-    // modifiers read `resource external struct`; the node keeps `external` in
+    // modifiers read `[resource] external struct`; the node keeps `external` in
     // its original slot (so existing reads are undisturbed) and appends
     // `resource` after it. The body is `Some(fields)` for `{ .. }` and `None`
     // for a bodyless `;` declaration (only valid when `external`).
     Struct(
         Spanned<&'src str>,
-        Option<GenericParameters<'src>>,
+        Option<Box<GenericParameters<'src>>>,
         bool,
         bool,
-        Option<Spanned<Vec<Spanned<StructField<'src>>>>>,
+        Option<Box<Spanned<Vec<Spanned<StructField<'src>>>>>>,
+        ItemLabels<'src>,
     ),
+    // B190: the head is B172's `type-path`, not a bare identifier. The
+    // namespace segments are the modules the name was reached through, in
+    // source order (`shapes::deep::Ring` gives `["shapes", "deep"]`) and empty
+    // for the bare spelling; the name carries its own span, since with a
+    // prefix in front of it the literal's start is no longer where it begins.
     StructInitializer(
-        &'src str,
-        Option<GenericArguments<'src>>,
-        Spanned<Vec<Spanned<StructInitializerField<'src>>>>,
+        Vec<&'src str>,
+        Spanned<&'src str>,
+        Option<Box<GenericArguments<'src>>>,
+        Box<Spanned<Vec<Spanned<StructInitializerField<'src>>>>>,
     ),
     Trait(
         Spanned<&'src str>,
-        Option<GenericParameters<'src>>,
+        Option<Box<GenericParameters<'src>>>,
         // Supertraits: the `A`, `B` in `trait T with A + B`.
         Vec<Spanned<Self>>,
-        Spanned<NodeList<'src>>,
+        Box<Spanned<NodeList<'src>>>,
+        ItemLabels<'src>,
     ),
     Tuple(NodeList<'src>),
     // `..e` — a tuple-value SPREAD element (proposal/variadic-generics.md §T):
@@ -650,9 +1026,16 @@ impl<'src> Node<'src> {
     /// deliberately exhaustive with no catch-all: adding a `Node` variant must
     /// extend it or compilation fails here — a container variant silently
     /// missing from the scan is exactly the bug this prevents.
+    ///
+    /// It is also the FIFTH stack-probe funnel (N128, `stack_guard`): every
+    /// syntactic visitor that recurses through here — `collect_module_paths`
+    /// first among them, which runs before the analyzer's walk — passes one
+    /// probe per level, so a runaway on a declared stack is refused rather than
+    /// aborting in the guard page before the analyzer's own funnels are reached.
     pub fn for_each_child<'a>(&'a self, visit: &mut dyn FnMut(&'a Spanned<Node<'src>>)) {
+        crate::stack_guard::ensure_sufficient_stack("a syntactic tree walk");
         fn visit_generic_parameters<'a, 'src>(
-            parameters: &'a Option<GenericParameters<'src>>,
+            parameters: Option<&'a GenericParameters<'src>>,
             visit: &mut dyn FnMut(&'a Spanned<Node<'src>>),
         ) {
             for parameter in parameters.iter().flat_map(|parameters| &parameters.0) {
@@ -730,9 +1113,12 @@ impl<'src> Node<'src> {
         match self {
             // Leaves.
             Node::Accessor(_)
+            | Node::StdItem(..)
             | Node::Bool(_)
             | Node::Error
-            | Node::Import(_)
+            | Node::ExportAll
+            | Node::ModulePlatform(_)
+            | Node::Import(..)
             | Node::Jump(_)
             | Node::LiftBinder
             | Node::LiftHole(_)
@@ -765,28 +1151,40 @@ impl<'src> Node<'src> {
                     visit(child.node());
                 }
             }
+            Node::Export(_, inner, _) => visit(inner),
             Node::Async(inner)
             | Node::Await(inner)
             | Node::Dereference(inner)
             | Node::Derive(_, inner)
-            | Node::Export(inner)
             | Node::Reference(_, inner)
             | Node::Service(_, inner)
-            | Node::StaticAccessor(inner, _)
             | Node::TryAssert(inner)
             | Node::Lifted(inner)
             | Node::LiftGroup(inner)
             | Node::Spread(inner)
+            | Node::CssScope(inner)
             | Node::Unary(_, inner) => visit(inner),
+            Node::StaticAccessor(subject, _, generic_arguments) => {
+                visit(subject);
+                for argument in generic_arguments.iter().flat_map(|arguments| &arguments.0) {
+                    visit(argument);
+                }
+            }
             Node::LiftRegion(steps, body) => {
                 for (step, _) in steps {
                     visit(step);
                 }
                 visit(body);
             }
-            Node::TypeBinder(_, bounds) => {
+            Node::TypeBinder(_, bounds, tuple_bound) => {
                 for bound in bounds {
                     visit(bound);
+                }
+                if let Some(element) = tuple_bound
+                    .as_ref()
+                    .and_then(|bound| bound.element.as_ref())
+                {
+                    visit(element);
                 }
             }
             Node::Assign(target, _, value) => {
@@ -825,6 +1223,7 @@ impl<'src> Node<'src> {
             }
             Node::AsyncType(inner) => visit(inner),
             Node::SyncType(inner) => visit(inner),
+            Node::DynType(inner) => visit(inner),
             Node::Const(inner) => visit(inner),
             Node::MappedType {
                 source, template, ..
@@ -836,9 +1235,9 @@ impl<'src> Node<'src> {
                 visit(source);
                 visit(body);
             }
-            Node::Enum(_, generic_parameters, _resource, variants) => {
-                visit_generic_parameters(generic_parameters, visit);
-                for (_, data, _) in variants.0.iter().map(|variant| &variant.0) {
+            Node::Enum(_, generic_parameters, _resource, variants, _) => {
+                visit_generic_parameters(generic_parameters.as_deref(), visit);
+                for (_, data, _, _) in variants.0.iter().map(|variant| &variant.0) {
                     for type_ in data {
                         visit(type_);
                     }
@@ -850,12 +1249,13 @@ impl<'src> Node<'src> {
                 }
                 visit_body(&body.0, visit);
             }
-            Node::ForIn(_, iterable, body) => {
+            Node::ForIn(binder, iterable, body) => {
+                visit_pattern(&binder.0, visit);
                 visit(iterable);
                 visit_body(&body.0, visit);
             }
             Node::Func(function) | Node::MacroFun(function) => {
-                visit_generic_parameters(&function.generic_parameters, visit);
+                visit_generic_parameters(function.generic_parameters.as_ref(), visit);
                 visit_parameters(&function.parameters, visit);
                 if let Some(return_type) = function.return_type.as_deref() {
                     visit(return_type);
@@ -879,7 +1279,7 @@ impl<'src> Node<'src> {
                 visit(subject);
                 visit_pattern(&pattern.0, visit);
             }
-            Node::Impl(subject, traits, body) => {
+            Node::Impl(subject, traits, body, _) => {
                 visit(subject);
                 for trait_ in traits {
                     visit(trait_);
@@ -888,7 +1288,7 @@ impl<'src> Node<'src> {
                     visit(member);
                 }
             }
-            Node::Let(_, type_, value, _) => {
+            Node::Let(_, type_, value, _, _, _) => {
                 if let Some(type_) = type_.as_deref() {
                     visit(type_);
                 }
@@ -935,9 +1335,9 @@ impl<'src> Node<'src> {
                     visit(statement);
                 }
             }
-            Node::Struct(_, generic_parameters, _, _resource, fields) => {
-                visit_generic_parameters(generic_parameters, visit);
-                for (_, type_, _) in fields
+            Node::Struct(_, generic_parameters, _, _resource, fields, _) => {
+                visit_generic_parameters(generic_parameters.as_deref(), visit);
+                for (_, type_, _, _) in fields
                     .iter()
                     .flat_map(|fields| &fields.0)
                     .map(|field| &field.0)
@@ -947,7 +1347,7 @@ impl<'src> Node<'src> {
                     }
                 }
             }
-            Node::StructInitializer(_, generic_arguments, fields) => {
+            Node::StructInitializer(_, _, generic_arguments, fields) => {
                 for argument in generic_arguments.iter().flat_map(|arguments| &arguments.0) {
                     visit(argument);
                 }
@@ -957,8 +1357,8 @@ impl<'src> Node<'src> {
                     }
                 }
             }
-            Node::Trait(_, generic_parameters, supertraits, body) => {
-                visit_generic_parameters(generic_parameters, visit);
+            Node::Trait(_, generic_parameters, supertraits, body, _) => {
+                visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for supertrait in supertraits {
                     visit(supertrait);
                 }
@@ -976,7 +1376,40 @@ pub type EnumVariant<'src> = (
     &'src str,
     Vec<Spanned<Node<'src>>>,
     Option<BackingLiteral<'src>>,
+    // `[internal("reason")]` (E221): a variant of a public enum that a reader
+    // should not reach for — `[internal]` on a struct FIELD's shape, since a
+    // variant is the enum's field-level case.
+    Option<&'src str>,
 );
+
+/// The labels an item declaration carries ABOUT itself — attributes that are
+/// not part of its signature and change nothing it means to the type system
+/// (E221). Carried on the nominal and binding declarations (`Node::Struct`,
+/// `Node::Enum`, `Node::Trait`, a module `Node::Let`); a function keeps its own
+/// on `Func`, where E213 put them.
+///
+/// Boxed and optional: nearly every declaration carries none, and a
+/// `Node` variant pays for its widest field on every expression the parser
+/// returns (`node_size.rs`), so the empty case is one null pointer.
+pub type ItemLabels<'src> = Option<Box<Labels<'src>>>;
+
+/// [`ItemLabels`]'s contents, when there are any.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Labels<'src> {
+    /// `[deprecated("use …")]` (B382): on a struct, an enum or a trait — and on
+    /// an `export import`, where it deprecates the NAME that re-export
+    /// publishes. A use warns `` `{name}` is deprecated; {steer} ``, the
+    /// function attribute's own warning.
+    pub deprecated: Option<&'src str>,
+    /// `[internal("reason")]` (E213, E221): reachable on purpose and
+    /// dangerous on purpose. Read by the editor, and by the opt-in
+    /// `[lints] internal_use` warning.
+    pub internal: Option<&'src str>,
+    /// `[platform("…")]` on an `impl` block or a nominal (F27 R1), as written
+    /// with spans — empty when absent. On an `impl` everything inside requires
+    /// the platform; on either, the file is analyzed under it.
+    pub platform: Vec<Spanned<&'src str>>,
+}
 
 // An explicit enum backing value, `= ( (-)? NUMBER | STRING )`
 // (proposal/backed-enums.md §3.1). The production GENERALIZES the integer
@@ -1055,10 +1488,85 @@ impl std::fmt::Display for BackingLiteral<'_> {
     }
 }
 
+/// Whether a struct field is exposed to a service's client, and in what shape
+/// (`proposal/transport-rpc.md` §4.2; tracker A39, A51).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Exposure<'src> {
+    /// Not exposed.
+    #[default]
+    None,
+    /// `[expose]` — the source's WHOLE value crosses on every change, as an
+    /// `Update` frame, and the client mirrors it in a `RemoteSource<T>`.
+    Whole,
+    /// `[expose(keyed)]` / `[expose(keyed = K)]` — the source is a keyed
+    /// collection, and only what changed crosses, as a `Patch` of `Delta` ops.
+    /// The client mirrors it in a `KeyedSource<K, T>`, which can also subscribe
+    /// to ONE key.
+    ///
+    /// The payload is the key type AS WRITTEN in the attribute argument, when
+    /// one was written. It exists because the mirror needs TWO types and vilan
+    /// has no associated types to read the key from: a `Map<K, V>` element
+    /// names both and needs no argument (`None`), and every other collection —
+    /// a `List<T>`, which is what A39 refused — names only the element, so the
+    /// key comes from the attribute (`Some("str")`). It is source text rather
+    /// than a node because it is handed to the macro engine as a string and to
+    /// the formatter as one; nothing here resolves it.
+    ///
+    /// Its SPAN rides with it (tracker A56) because the one refusal that is
+    /// about the argument itself — an argument that disagrees with the key a
+    /// `Map<K, V>` element already names — has to point at the argument, not
+    /// at the field's type: the type is not the half that is wrong, and there
+    /// are two ways out, only one of which touches it.
+    Keyed(Option<Spanned<&'src str>>),
+}
+
+impl<'src> Exposure<'src> {
+    /// Whether the field crosses to the client at all — the question every
+    /// caller that does not care about the shape is asking.
+    pub fn is_exposed(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether the field is the keyed form.
+    pub fn is_keyed(self) -> bool {
+        matches!(self, Self::Keyed(_))
+    }
+
+    /// The key type the attribute named, if it named one — `""` when the field
+    /// is not keyed or the key is to be read off a `Map<K, V>` element. The
+    /// empty string is the discriminator the macro engine and the generated
+    /// service both already read for "no key here".
+    pub fn key_type(self) -> &'src str {
+        match self {
+            Self::Keyed(Some((written, _))) => written,
+            _ => "",
+        }
+    }
+
+    /// Where the key type was written, when one was — the span a refusal
+    /// ABOUT the argument anchors on (tracker A56). `None` for every other
+    /// exposure, which has no argument to point at.
+    pub fn key_span(self) -> Option<Span> {
+        match self {
+            Self::Keyed(Some((_, span))) => Some(span),
+            _ => None,
+        }
+    }
+}
+
 // One struct field: its name (with the name's own span), optional type
-// annotation, and whether it is `[expose]`d — observable by a service's client
-// as a mirrored `Source` (`proposal/transport-rpc.md` §4.2).
-pub type StructField<'src> = (Spanned<&'src str>, Option<Spanned<Node<'src>>>, bool);
+// annotation, whether (and how) it is `[expose]`d — observable by a service's
+// client as a mirrored `Source` (`proposal/transport-rpc.md` §4.2) — and the
+// `[internal("reason")]` label (E213), which is the case declaration
+// visibility cannot serve at all: vilan has no per-field visibility, so a
+// field that is public on purpose and dangerous on purpose (`Region.anchor`)
+// had no way to say so.
+pub type StructField<'src> = (
+    Spanned<&'src str>,
+    Option<Spanned<Node<'src>>>,
+    Exposure<'src>,
+    Option<&'src str>,
+);
 
 // One field of a struct LITERAL: its name, and the value assigned to it —
 // `None` for the shorthand form, where the name is also the value's binding.
@@ -1137,7 +1645,7 @@ pub enum BinaryOp {
 }
 
 /// Visits every expression position inside a `css` block, at any nesting
-/// depth: each declaration value's holes and each nested rule's head
+/// depth: each declaration's arguments and each nested rule's head
 /// arguments. Free rather than a method so [`Node::for_each_child`]'s
 /// borrow-shaped visitor can recurse through a `CssBody`, which is not a node.
 fn visit_css_body<'a, 'src>(
@@ -1147,10 +1655,8 @@ fn visit_css_body<'a, 'src>(
     for item in &body.items {
         match item {
             CssItem::Declaration(declaration) => {
-                for piece in &declaration.value {
-                    if let CssValuePiece::Hole(expression, _) = piece {
-                        visit(expression);
-                    }
+                for argument in &declaration.arguments {
+                    visit(argument);
                 }
             }
             CssItem::Nested(nested) => {
@@ -1158,6 +1664,11 @@ fn visit_css_body<'a, 'src>(
                     visit(argument);
                 }
                 visit_css_body(&nested.body, visit);
+            }
+            CssItem::Link(link) => {
+                for argument in &link.arguments {
+                    visit(argument);
+                }
             }
         }
     }

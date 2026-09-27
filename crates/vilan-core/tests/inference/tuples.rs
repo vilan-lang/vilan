@@ -1391,7 +1391,7 @@ fn a_mixed_literal_under_a_list_of_any_parameter_is_legitimate() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun describe(values: List<any>): i32 {
+        fun describe(values: List<any>): usize {
             values.len()
         }
         fun main() {
@@ -1698,14 +1698,26 @@ fun main() {}
 }
 
 #[test]
-fn the_pub_steer_names_the_export_form_it_is_not() {
+fn the_pub_steer_names_the_export_marker() {
+    // RENAMED and inverted by B318 (§7.4). The rule used to say `export` is
+    // "a different thing" and the fix is to delete the word; `export` IS the
+    // visibility marker now, so the steer names it — while still keeping the
+    // re-export reading in a parenthetical, because one word does both jobs.
     assert_fails_with(
         r#"
 public fun helper(): i32 { 1 }
 
 fun main() {}
         "#,
-        "`export` exists, but it RE-exports",
+        "the marker is `export`, so write `export fun helper()`",
+    );
+    assert_fails_with(
+        r#"
+public fun helper(): i32 { 1 }
+
+fun main() {}
+        "#,
+        "(`export` also RE-exports something this module imported",
     );
 }
 
@@ -1834,6 +1846,98 @@ fn let_mut_names_the_two_binding_forms() {
         "#,
         "let mut",
         "a mutable binding is spelled `mut x = …`",
+    );
+}
+
+#[test]
+fn a_pattern_binder_names_the_two_binding_forms() {
+    // A80, and [`LET_MUT_IS_ONE_WORD`]'s twin inside a pattern: the declaration
+    // syntax is the pattern syntax, so `let` and `mut` are the two forms there
+    // too and writing both is neither. Its own steer, because the declaration's
+    // (`mut x = …`) names an initializer a pattern cannot carry.
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let mut list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "let mut",
+        "a pattern binds mutably with `mut x`",
+    );
+}
+
+#[test]
+fn a_pattern_binder_names_the_two_binding_forms_in_either_order() {
+    // `mut let` is the same mistake written the other way round, and it used to
+    // fail identically: the pattern backtracked and the payload's own `(` was
+    // reported as "found '(' expected '=>'".
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(mut let list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "mut let",
+        "a pattern binds mutably with `mut x`",
+    );
+}
+
+#[test]
+fn a_pattern_binder_steer_names_the_write_back_its_copy_needs() {
+    // D7: the second half of the steer. `Some(mut list)` is the spelling A80
+    // offers, and a binder is a BINDING — it takes rule 1's copy (grammar.md
+    // §3.10), so `list.push(..)` inside the arm grows the copy and the subject
+    // is untouched. The shape this refusal is reached from is a
+    // `SignalCell::update` growing a wrapped collection, where stopping at
+    // "`mut x`" sends the author one step down a path that ends where they
+    // started.
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let mut list) => print(list.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "let mut",
+        "assign back through it (`held = Some(list)`) or use `take`/`replace`",
+    );
+}
+
+#[test]
+fn a_refused_pattern_binder_no_longer_reports_the_payload_paren() {
+    // The recovery is what makes it ONE diagnostic: the pair is consumed and the
+    // binder taken as mutable, so the arm still parses, the payload's `(` is
+    // never orphaned, and nothing cascades about a binding that cannot be
+    // mutated (diagnostics-standard B5).
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        fun main() {
+            let slot = Some([1]);
+            match slot {
+                Some(let mut list) => {
+                    list.push(9);
+                    print(list.len());
+                }
+                None => print(0),
+            }
+        }
+        "#,
+        "expected '=>'",
     );
 }
 
@@ -3928,6 +4032,65 @@ fn an_async_closure_assigned_into_a_plain_field_is_refused() {
 }
 
 #[test]
+fn a_trait_default_starter_stored_in_a_plain_field_is_not_refused() {
+    // A49's regression, minimal. `sub` is a trait DEFAULT whose body calls the
+    // requirement through `Self` (`GenericDispatch::OnType(None, ..)` — the
+    // re-dispatch that carries no trait), a generic function stores
+    // `|| source.sub(..)` into a plain `|| i32` field, and an UNRELATED struct
+    // spells an inherent async member with the requirement's name. The
+    // candidate scan used to reach that member, color the default async, and
+    // report this store as a field escape — against std's own `rpc.vl`, where
+    // `Source::sub` is the default and the `[service]` macro generates the
+    // async `get`.
+    //
+    // Nothing here awaits, so the store is honest and the starter runs
+    // synchronously. `an_async_closure_into_a_plain_field_is_refused` above is
+    // the other half: a closure that really does await is still refused.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Client { }
+
+        impl Client {
+            async fun get(self): i32 {
+                1
+            }
+        }
+
+        trait Source {
+            fun get(self): i32;
+
+            fun sub(self, observer: |i32| void): i32 {
+                observer(self.get());
+                self.get()
+            }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Source {
+            fun get(self): i32 {
+                self.n
+            }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun expose<S: Source>(source: S): Holder {
+            Holder { start = || source.sub(|value| { print(i"saw {value}") }) }
+        }
+
+        fun main() {
+            let holder = expose(Cell { n = 7 });
+            print((holder.start)());
+        }
+        "#,
+        "saw 7\n7\n",
+    );
+}
+
+#[test]
 fn a_plain_declared_return_of_an_async_closure_is_refused() {
     assert_fails_with(
         r#"
@@ -4173,7 +4336,7 @@ fn adaptation_rides_through_a_forwarding_helper() {
         r#"
         import std::io::print;
         import std::time::sleep;
-        fun helper(urls: List<str>, f: |str| i32): List<i32> {
+        fun helper(urls: List<str>, f: |str| usize): List<usize> {
             urls.map(f)
         }
         fun main() {
@@ -4734,9 +4897,24 @@ fn the_earliest_settled_child_failure_wins_with_origin() {
     }
 }
 
+/// A nursery joins INSIDE OUT: the inner one waits for its own child before
+/// its value is a value, and the outer one waits for both the inner nursery and
+/// its own child before its.
+///
+/// N72: that nesting is what is promised, and it is all this asserts. The two
+/// children are independent TIMERS started one statement apart — 25 ms out
+/// there, 10 ms in here — so "inner-child prints before outer-child" is a claim
+/// about the machine and not about the language: a 15 ms stall between two
+/// adjacent spawns (one loaded box, one scheduler quantum) starts the 10 ms
+/// sleep after the 25 ms one is already due, and the interleaving inverts. It
+/// inverted exactly that way once under full-suite load
+/// (`inner-body/outer-child/inner-child/inner-done`) and passed in isolation,
+/// which is the signature of a pin asserting the machine. Pinning the
+/// interleaving would mean promising it, and nothing does: two sibling children
+/// of two different nurseries have no ordering between them at all. N35's class.
 #[test]
 fn nested_nurseries_join_inside_out() {
-    assert_compiles_and_runs(
+    let stdout = compile_and_run(
         r#"
         import std::io::print;
         import std::time::sleep;
@@ -4761,7 +4939,45 @@ fn nested_nurseries_join_inside_out() {
             print(total);
         }
         "#,
-        "inner-body\ninner-child\ninner-done\nouter-child\n3\n",
+    )
+    .unwrap_or_else(|errors| panic!("expected a clean run, got: {errors:#?}"));
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut printed = lines.clone();
+    printed.sort_unstable();
+    // Every line exactly once: no child dropped, none run twice, and the
+    // nursery's value is the inner one's plus one.
+    assert_eq!(
+        printed,
+        [
+            "3",
+            "inner-body",
+            "inner-child",
+            "inner-done",
+            "outer-child"
+        ],
+        "the nested nurseries printed the wrong set; got:\n{stdout}"
+    );
+
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| *line == needle)
+            .unwrap_or_else(|| panic!("no {needle:?} line in:\n{stdout}"))
+    };
+    assert!(
+        at("inner-body") < at("inner-child"),
+        "the body runs to its own end before a child it spawned resumes; got:\n{stdout}"
+    );
+    assert!(
+        at("inner-child") < at("inner-done"),
+        "the INNER join waits for the inner child: `inner-done` is printed after \
+         the inner nursery returned; got:\n{stdout}"
+    );
+    assert!(
+        at("inner-done") < at("3") && at("outer-child") < at("3"),
+        "the OUTER join waits for the inner nursery AND its own child before its \
+         value is a value; got:\n{stdout}"
     );
 }
 
@@ -5355,5 +5571,1762 @@ fn transitive_adaptation_still_rides_past_a_store_free_body() {
         }
         "#,
         "11\n",
+    );
+}
+
+// --- B177: an array impl's conformance check compared array types by ID ------
+//
+// `impl [i32; 2] with Add<i32>` was refused with "`type`'s `add` returns
+// `[i32; 2]`, but `Add` declares `[i32; 2]`" — the same spelling on both sides,
+// so the message contradicted itself and no array impl could be written at all.
+//
+// `compare_type_rigid` had an arm for every composite shape but the array, so
+// two arrays fell to its `a == b` fallback, which compares `Type::Array`'s
+// element TYPE ID. Ids are minted fresh per spelling and deliberately not
+// interned, so an array type was unequal to itself written twice — while a
+// tuple impl of the identical shape passed, because tuples had an arm.
+//
+// The subject NAME was the other half of the illegible message: a non-struct
+// subject reported as the literal word "type". It now reports its spelling.
+
+#[test]
+fn b177_an_array_impl_of_an_operator_trait_compiles_and_runs() {
+    // The exhibit, end to end: the impl is accepted, the operator DISPATCHES to
+    // it (B170 made a non-nominal left operand reach the lookup), and the body
+    // runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl [i32; 2] with Add<i32> {
+            fun add(self, other: i32): [i32; 2] {
+                [self[0] + other, self[1] + other]
+            }
+        }
+
+        fun main() {
+            let base: [i32; 2] = [1, 2];
+            let shifted = base + 3;
+            print(shifted[0]);
+            print(shifted[1]);
+        }
+        "#,
+        "4\n5\n",
+    );
+}
+
+#[test]
+fn b177_an_array_impl_with_a_wrong_return_length_is_still_refused() {
+    // The check has to keep CHECKING. A length is part of an array's type, so
+    // `[i32; 3]` does not satisfy a `Self` return of `[i32; 2]` — and the
+    // message must name two DIFFERENT types, which is exactly what the bug
+    // made impossible.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        impl [i32; 2] with Add<i32> {
+            fun add(self, other: i32): [i32; 3] {
+                [self[0] + other, self[1] + other, other]
+            }
+        }
+
+        fun main() { print(1); }
+        "#,
+        "`[i32; 2]`'s `add` returns `[i32; 3]`, but `Add` declares `[i32; 2]`",
+    );
+}
+
+#[test]
+fn b177_an_array_impl_with_a_wrong_element_type_is_still_refused() {
+    // The other half of an array's identity: same length, different element.
+    // The fallback compared ids, so this case was "caught" only by accident —
+    // it reported the same self-contradiction as the correct impl did.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        impl [i32; 2] with Add<i32> {
+            fun add(self, other: i32): [str; 2] {
+                ["a", "b"]
+            }
+        }
+
+        fun main() { print(1); }
+        "#,
+        "`[i32; 2]`'s `add` returns `[str; 2]`, but `Add` declares `[i32; 2]`",
+    );
+}
+
+#[test]
+fn b177_a_nested_array_impl_compiles_and_runs() {
+    // The arm recurses, so an array OF arrays is compared element-structurally
+    // too — the shape the flat fix would have missed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl [[i32; 2]; 2] with Add<i32> {
+            fun add(self, other: i32): [[i32; 2]; 2] {
+                [[self[0][0] + other, self[0][1] + other],
+                 [self[1][0] + other, self[1][1] + other]]
+            }
+        }
+
+        fun main() {
+            let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+            let shifted = grid + 10;
+            print(shifted[0][0]);
+            print(shifted[1][1]);
+        }
+        "#,
+        "11\n14\n",
+    );
+}
+
+#[test]
+fn b177_an_array_impl_of_equality_compiles_and_runs() {
+    // Not just `Add`: the conformance check is one path, so every operator
+    // trait was equally unwritable on an array. `==` also exercises the
+    // `bool` return, which never mentions the array at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        impl [i32; 2] with PartialEq {
+            fun eq(self, other: [i32; 2]): bool {
+                self[0] == other[0] && self[1] == other[1]
+            }
+        }
+
+        fun main() {
+            let left: [i32; 2] = [1, 2];
+            let right: [i32; 2] = [1, 2];
+            let other: [i32; 2] = [1, 3];
+            print(left == right);
+            print(left == other);
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b177_a_tuple_impl_of_the_same_shape_still_compiles_and_runs() {
+    // The control the item named: a tuple impl passed all along, because
+    // tuples had the structural arm arrays lacked. It must not move.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl (i32, i32) with Add<i32> {
+            fun add(self, other: i32): (i32, i32) {
+                (self.0 + other, self.1 + other)
+            }
+        }
+
+        fun main() {
+            let base = (1, 2);
+            let shifted = base + 3;
+            print(shifted.0);
+            print(shifted.1);
+        }
+        "#,
+        "4\n5\n",
+    );
+}
+
+// --- B209: `for x in tuple` bound the binder to `any` -----------------------
+//
+// The loop existed, was undocumented, and was unsound three ways. A flat tuple
+// IS a JS array, so the native `for...of` lowering ran; `iterable_element_type`
+// had no `Type::Tuple` arm, so the binder fell to the `Any` give-up default
+// written for an empty, never-pushed list. The spec produces `any` at host
+// boundaries only, and a tuple literal is not one.
+//
+// The fix is the CONSERVATIVE half of the paper's two answers
+// (`tuple-comprehension.md` §R8 Q2): the loop is REFUSED at its head, with a
+// steer to the two spellings that work today. The other answer — UNROLL the
+// body once per element, at that element's own type — is still open, and every
+// program these pins reject is one an unroll would accept, so the refusal can
+// be replaced without a migration.
+
+#[test]
+fn b209_a_heterogeneous_tuple_loop_is_refused() {
+    // Probe R1. `x + 1` over `(1, "two", true)` printed `2`, then `two1`, then
+    // `2`: the same body, three types, no complaint. Not a B174 hit — B174
+    // bounds an unbounded GENERIC left operand, and `any` unifies with
+    // everything in both directions by spec, so no bound check can see it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, "two", true);
+            for x in xs {
+                print(x + 1);
+            }
+        }
+        "#,
+        "cannot iterate `(i32, str, bool)`: a tuple is a fixed sequence of \
+         independently typed elements",
+    );
+}
+
+#[test]
+fn b209_the_refusal_names_the_two_spellings_that_work_and_the_one_that_does_not() {
+    // B4: the steer has to be actionable. Positional access and destructuring
+    // both work today; the comprehension does NOT accept a concrete tuple (it
+    // answers "must be a mapped tuple, got (i32, str)"), so the message says
+    // so rather than sending the reader at a form that refuses them again.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, "two");
+            for x in xs {
+                print(x);
+            }
+        }
+        "#,
+        "Read the elements positionally (`t.0`, `t.1`), or destructure the tuple into \
+         its elements; `(x in t => e)`, the value-level mapping form, is not yet \
+         available over a concrete tuple",
+    );
+}
+
+#[test]
+fn b209_an_annotation_can_no_longer_launder_the_binder_into_a_type() {
+    // Probe R18. `let s: str = x` was ACCEPTED off an `any` binder and printed
+    // `undefined` for the `i32` element — `any` launders into any type through
+    // an ordinary annotation, so the loop handed the body a value of a type it
+    // did not have.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, "two");
+            for x in xs {
+                let s: str = x;
+                print(s.len());
+            }
+        }
+        "#,
+        "cannot iterate `(i32, str)`",
+    );
+}
+
+#[test]
+fn b209_a_lending_walk_over_a_tuple_is_refused() {
+    // Probe R17, the miscompile with no diagnostic at all: `for e in &mut xs`
+    // compiled, emitted `__replace(e, e + 1)` with `e` bound to a JS number,
+    // ran to completion, and DISCARDED every write — `Object.assign` on a
+    // primitive target coerces to a wrapper and the tuple slot is never
+    // touched. `xs.0` was still `1` afterwards.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs = (1, 2, 3);
+            for e in &mut xs {
+                e = e + 1;
+            }
+            print(xs.0);
+        }
+        "#,
+        "cannot iterate `(i32, i32, i32)`",
+    );
+}
+
+#[test]
+fn b209_a_homogeneous_tuple_loop_is_refused_too() {
+    // The rule is about the TYPE, not about whether this particular tuple's
+    // elements happen to agree. `(1, 2, 3)` ran and summed correctly (probe
+    // R12) while `(1, "two", 3)` under the same fold printed `1two3` (R13) —
+    // one form, two outcomes, decided by data the type does not fix. A rule
+    // that fires only on a heterogeneous tuple would leave the fold looking
+    // supported right up until someone changed an element.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs = (1, 2, 3);
+            mut total = 0;
+            for x in xs {
+                total = total + x;
+            }
+            print(total);
+        }
+        "#,
+        "cannot iterate `(i32, i32, i32)`",
+    );
+}
+
+#[test]
+fn b209_a_nested_tuple_loop_is_refused_exactly_once() {
+    // Probe R23, and the reason the binder's give-up type had to change with
+    // the refusal. Field access on `any` was ALREADY refused ("cannot access
+    // field '0' on type any"), so an `any` binder reported this one broken
+    // loop twice — the curated head, then a restatement of it in the body.
+    // `Unresolved` stands down instead, so the reader gets the head alone.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            for pair in ((1, 2), (3, 4)) {
+                print(pair.0);
+            }
+        }
+        "#,
+        "cannot iterate `((i32, i32), (i32, i32))`",
+    );
+    assert_fails_without(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            for pair in ((1, 2), (3, 4)) {
+                print(pair.0);
+            }
+        }
+        "#,
+        "on type any",
+    );
+}
+
+#[test]
+fn b209_a_mapped_tuple_loop_is_refused_and_steered_to_the_comprehension() {
+    // The same defect one type-shape over, and the half a LIBRARY writes: a
+    // mapped tuple `(U in T: F<U>)` is a tuple whose elements are still
+    // symbolic, so it fell through the same wildcard and the loop printed each
+    // element's raw runtime shape (`[ 0, 1 ]`, then `[ 0, 'two' ]`, over a
+    // pack of `Option`s).
+    //
+    // Its STEER is the concrete one's inverted, which is why the two are not
+    // one sentence: a mapped tuple has no positions to read (`items.0` is
+    // refused, "cannot access field '0' on type `(U in T: Option<U>)`") and
+    // the comprehension is the shipped form for exactly this source, where
+    // over a concrete tuple it is the other way round.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::{ Option, Some };
+
+        fun walk<T: (2..)>(items: (U in T: Option<U>)) {
+            for item in items {
+                print(item);
+            }
+        }
+
+        fun main() {
+            walk((Some(1), Some("two")));
+        }
+        "#,
+        "cannot iterate `(U in T: Option<U>)`: a tuple is a fixed sequence of \
+         independently typed elements",
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::{ Option, Some };
+
+        fun walk<T: (2..)>(items: (U in T: Option<U>)) {
+            for item in items {
+                print(item);
+            }
+        }
+
+        fun main() {
+            walk((Some(1), Some("two")));
+        }
+        "#,
+        "A mapped tuple's elements have no positions to read yet, so the element-wise \
+         form here is the comprehension `(x in t => e)`",
+    );
+}
+
+#[test]
+fn b209_the_container_loops_beside_it_are_untouched() {
+    // The control. A `List`, a `Range` and a `[T; n]` all have ONE element
+    // type and must keep iterating — `[T; n]` in particular sat in the same
+    // wildcard arm the tuple fell through, so the refusal had to be added
+    // without catching it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::list;
+        import std::range::Range;
+
+        fun main() {
+            let items: List<i32> = [1, 2];
+            for item in items { print(item); }
+            for index in Range::new(0, 2) { print(index); }
+            let fixed: [i32; 2] = [3, 4];
+            for item in fixed { print(item); }
+        }
+        "#,
+        "1\n2\n0\n1\n3\n4\n",
+    );
+}
+
+#[test]
+fn b209_an_empty_list_loop_still_takes_the_any_give_up_default() {
+    // The give-up default is not deleted, only narrowed. A list that is never
+    // pushed has no knowable element type, its loop runs zero times, and `any`
+    // stays the honest answer there — which is the case the default was
+    // written for in the first place.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::list;
+
+        fun main() {
+            mut items: List<i32> = [];
+            for item in items { print(item); }
+            print("done");
+        }
+        "#,
+        "done\n",
+    );
+}
+
+// --- B210: a tuple receiver resolved no methods at any arity ----------------
+//
+// B170 made a tuple reachable as an impl SUBJECT, and `impl (i32, i32) with
+// Add` has dispatched `(1, 2) + (3, 4)` ever since — through the OPERATOR path
+// only. The method path never looked at a tuple receiver: `resolve_method_call`
+// dispatched on the receiver's shape and its arms were `Struct`/`Enum`,
+// `Trait`, `Generic` and the deferring `Unknown`s, so a tuple fell to
+// `_ => NotCallable` and EVERY spelling was "cannot call method 'X' on
+// (i32, i32)" — an inherent impl, a trait impl, and B170's own `add` by name.
+//
+// Nothing about the LOOKUP needed teaching: the operator path finds a tuple
+// impl by comparing the receiver against each `implementation.subject` with
+// `compare_type`, and the method path's candidate collector compares with the
+// same function over the same table. Only the receiver shape was missing from
+// the dispatch above it. Three more nominal-only sets sat below it on the way
+// to a running program — the emission-side re-dispatch, and the arm that lets
+// a value satisfy a trait-typed slot — and each is pinned by the case that
+// reaches it.
+
+#[test]
+fn b210_an_inherent_method_on_a_tuple_resolves_at_two_arities() {
+    // The plainest spelling, and one of the paper's refused probes (R2).
+    // Arity is part of a tuple's type, so the two impls are two subjects and
+    // each call must reach its own.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        impl (i32, i32) {
+            fun first(self): i32 { self.0 }
+        }
+
+        impl (i32, i32, i32) {
+            fun first(self): i32 { self.0 + 100 }
+        }
+
+        fun main() {
+            print((1, 2).first());
+            print((1, 2, 3).first());
+        }
+        "#,
+        "1\n101\n",
+    );
+}
+
+#[test]
+fn b210_a_trait_method_on_a_tuple_resolves_at_two_arities() {
+    // Probe R5's shape: a trait impl fared no better than an inherent one.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Doubled { fun doubled(self): Self; }
+
+        impl (i32, i32) with Doubled {
+            fun doubled(self): (i32, i32) { (self.0 * 2, self.1 * 2) }
+        }
+
+        impl (i32, i32, i32) with Doubled {
+            fun doubled(self): (i32, i32, i32) { (self.0 * 2, self.1 * 2, self.2 * 2) }
+        }
+
+        fun main() {
+            print((4, 5).doubled().0);
+            print((1, 2, 3).doubled().2);
+        }
+        "#,
+        "8\n6\n",
+    );
+}
+
+#[test]
+fn b210_an_operator_traits_method_resolves_by_name_on_a_tuple() {
+    // Probe R10, the exhibit that named the item: B170's OWN impl, reached by
+    // method name. `(1, 2) + (3, 4)` ran and answered `4` / `6` while
+    // `(1, 2).add((3, 4))` was "cannot call method 'add' on (i32, i32)" — one
+    // impl, two spellings, one of them refused. Both spellings, both arities,
+    // in one program, so the operator control travels with its method twin.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl (i32, i32) with Add {
+            fun add(self, b: (i32, i32)): (i32, i32) { (self.0 + b.0, self.1 + b.1) }
+        }
+
+        impl (i32, i32, i32) with Add {
+            fun add(self, b: (i32, i32, i32)): (i32, i32, i32) {
+                (self.0 + b.0, self.1 + b.1, self.2 + b.2)
+            }
+        }
+
+        fun main() {
+            let summed = (1, 2) + (3, 4);
+            print(summed.0);
+            print((1, 2).add((3, 4)).1);
+            let triple = (1, 2, 3) + (10, 20, 30);
+            print(triple.2);
+            print((1, 2, 3).add((10, 20, 30)).0);
+        }
+        "#,
+        "4\n6\n33\n11\n",
+    );
+}
+
+#[test]
+fn b210_an_inherited_operator_default_resolves_by_name_on_a_tuple() {
+    // The asymmetry one level below the method lookup. `PartialOrd<B = Self>`
+    // declares `lt`'s operand as the trait's own parameter, and an impl that
+    // writes no argument leaves that parameter as the bare trait — which a
+    // struct receiver satisfied (it implements the trait) and a tuple did not,
+    // because the arm admitting a value into a trait-typed slot listed the
+    // nominal shapes only. So `(1, 2) < (3, 4)` ran and `(1, 2).lt((3, 4))`
+    // was "Expected PartialOrd, but got (i32, i32) instead" — the same
+    // operator/method split, surviving the fix above it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialOrd, PartialEq, Ordering };
+        import std::option::{ Option, Some };
+
+        impl (i32, i32) with PartialEq {
+            fun eq(self, b: (i32, i32)): bool { self.0 == b.0 && self.1 == b.1 }
+        }
+
+        impl (i32, i32) with PartialOrd {
+            fun partial_compare(self, b: (i32, i32)): Option<Ordering> {
+                if self.0 < b.0 { Some(Ordering::Less) } else { Some(Ordering::Equal) }
+            }
+        }
+
+        fun main() {
+            print((1, 2) < (3, 4));
+            print((1, 2).lt((3, 4)));
+            print((3, 4).lt((1, 2)));
+        }
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b210_a_trait_default_specialized_for_a_tuple_reaches_the_impls_member() {
+    // Gap E on a tuple receiver, which is the EMISSION half of the item. The
+    // analyzer resolves `label` to the trait's default and records the
+    // concrete receiver for codegen to re-dispatch against; the transformer's
+    // re-dispatch then admitted nominal receivers only, so the default's own
+    // `self.tag()` walked past `impl (i32, i32) with Tagged` to the trait's
+    // BODYLESS requirement. The emitter's never-silent check caught it rather
+    // than shipping an empty function, so the symptom was an `internal:` error
+    // — but the cause is the same missing shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        trait Tagged {
+            fun tag(self): str;
+            fun label(self): str { "<" + self.tag() + ">" }
+        }
+
+        impl (i32, i32) with Tagged {
+            fun tag(self): str { self.0.to_string() }
+        }
+
+        fun main() {
+            print((7, 8).label());
+        }
+        "#,
+        "<7>\n",
+    );
+}
+
+#[test]
+fn b210_a_generic_element_tuple_impl_monomorphizes_and_holds_its_bound() {
+    // `impl (type T: Display, T)` — the impl's binder is bound by reconciling
+    // its subject against the receiver, exactly as `impl List<T>` binds `T`
+    // from a `List<i32>`, so nothing in the arm is shape-specific. Both
+    // instantiations run, and a receiver whose elements do not satisfy the
+    // bound does not reach the member.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        impl (type T: Display, T) {
+            fun shown(self): str { self.0.to_string() + "|" + self.1.to_string() }
+        }
+
+        fun main() {
+            print((1, 2).shown());
+            print(("a", "b").shown());
+        }
+        "#,
+        "1|2\na|b\n",
+    );
+}
+
+#[test]
+fn b210_a_tuple_impls_method_is_not_reachable_at_another_arity() {
+    // The refusal that has to survive the fix. A tuple's arity is part of its
+    // type, so `impl (i32, i32)` says nothing about a 3-tuple — and the
+    // message is the ordinary no-method one, naming the receiver's spelling.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        impl (i32, i32) {
+            fun first(self): i32 { self.0 }
+        }
+
+        fun main() {
+            print((1, 2, 3).first());
+        }
+        "#,
+        "(i32, i32, i32) has no method 'first'",
+    );
+}
+
+#[test]
+fn b210_a_tuple_with_no_impl_at_all_still_has_no_methods() {
+    // Probe R27's control: admitting the receiver shape must not invent a
+    // member surface. A tuple has no built-in methods, `len` included.
+    assert_fails_with(
+        r#"
+        fun main() {
+            print((1, 2).len());
+        }
+        "#,
+        "(i32, i32) has no method 'len'",
+    );
+}
+
+// --- B220: an ARRAY receiver joins the nominal set for USER impls -----------
+//
+// B210 fixed this shape for tuples and deliberately did not widen to arrays,
+// because whether an array gets method resolution at all was a decision rather
+// than a fix: `[T; n]` is STRUCTURAL in `resolve_method_call`, with `len` as its
+// one member. The decision is B210's precedent — an array is an impl subject
+// like any other (spec §5.7), so a user impl on one is reachable by method call
+// exactly as it already was by operator. `len` stays structural: it is a
+// compile-time constant read off the type, no impl provides it, and the arm
+// that folds it runs ahead of the lookup.
+
+#[test]
+fn b220_an_inherited_operator_default_resolves_by_name_on_an_array() {
+    // The exhibit. `PartialOrd<B = Self>` declares `lt`'s operand as the
+    // trait's own parameter; the impl writes no argument, so the operand is the
+    // bare trait, and `a < b` dispatches to the inherited `lt` whose body calls
+    // `self.partial_compare(b)`. With the array outside the nominal receiver
+    // set that inner call could not find the impl's member, and the emitter's
+    // never-silent check fired with an `internal:` error.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialOrd, PartialEq, Ordering };
+        import std::option::{ Option, Some };
+
+        impl [i32; 2] with PartialEq {
+            fun eq(self, b: [i32; 2]): bool { self[0] == b[0] && self[1] == b[1] }
+        }
+
+        impl [i32; 2] with PartialOrd {
+            fun partial_compare(self, b: [i32; 2]): Option<Ordering> {
+                if self[0] < b[0] { Some(Ordering::Less) } else { Some(Ordering::Equal) }
+            }
+        }
+
+        fun main() {
+            let a: [i32; 2] = [1, 2];
+            let b: [i32; 2] = [3, 4];
+            print(a < b);
+            print(a.lt(b));
+            print(b.lt(a));
+        }
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b220_a_trait_default_specialized_for_an_array_reaches_the_impls_member() {
+    // The emission half, which is the site B220 names: the analyzer resolves
+    // `label` to the trait's default and records the concrete receiver for
+    // codegen to re-dispatch against, and the transformer's re-dispatch
+    // admitted nominal receivers only — so the default's own `self.tag()`
+    // walked past `impl [i32; 2] with Tagged` to the trait's BODYLESS
+    // requirement.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::display::Display;
+
+        trait Tagged {
+            fun tag(self): str;
+            fun label(self): str { "<" + self.tag() + ">" }
+        }
+
+        impl [i32; 2] with Tagged {
+            fun tag(self): str { self[0].to_string() }
+        }
+
+        fun main() {
+            let pair: [i32; 2] = [7, 8];
+            print(pair.label());
+        }
+        "#,
+        "<7>\n",
+    );
+}
+
+#[test]
+fn b220_an_array_impls_inherent_method_is_reachable_by_name() {
+    // The lookup arm itself, with no trait in it: an inherent `impl [i32; 2]`
+    // is an impl like any other and its member resolves on the receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        impl [i32; 2] {
+            fun first(self): i32 { self[0] }
+        }
+
+        fun main() {
+            let pair: [i32; 2] = [4, 9];
+            print(pair.first());
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b220_len_stays_structural_on_an_array() {
+    // The control the decision turns on. `len` is the array's ONE structural
+    // member — the compile-time length read off the type, folded to a constant
+    // (fixed-arrays.md §10) — and joining the nominal set must not route it
+    // through impl lookup, where no impl provides it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        impl [i32; 2] {
+            fun first(self): i32 { self[0] }
+        }
+
+        fun main() {
+            let pair: [i32; 2] = [4, 9];
+            print(pair.len());
+            print(pair.len() + pair.first());
+        }
+        "#,
+        "2\n6\n",
+    );
+}
+
+#[test]
+fn b220_an_array_impls_method_is_not_reachable_at_another_length() {
+    // The refusal that has to survive: an array's LENGTH is part of its type,
+    // so `impl [i32; 2]` says nothing about a 3-element array, and the message
+    // is the ordinary no-method one naming the receiver's spelling.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        impl [i32; 2] {
+            fun first(self): i32 { self[0] }
+        }
+
+        fun main() {
+            let triple: [i32; 3] = [1, 2, 3];
+            print(triple.first());
+        }
+        "#,
+        "[i32; 3] has no method 'first'",
+    );
+}
+
+// --- B254: the KNOWN-receiver sibling of a49-async's narrowing ---------------
+//
+// a49-async narrowed `GenericDispatch::OnType(None, member)` — a `self` call
+// inside a trait default body — to the trait's own subjects. The other half of
+// the record, `OnType(Some(receiver), member)`, kept the widest answer: every
+// same-named member in the program, however unrelated its type. Only the `_for`
+// call sites (platform coloring's per-instantiation refinement) narrowed, and
+// that is not the answer every caller gets — `call_graph::successors` and
+// `init_order` read the unrefined set, as does async inference.
+//
+// The argument is the same one. This dispatch is recorded only because the
+// receiver's own impl chain reached a trait declaring `member`, so the receiver
+// implements such a trait and an unrelated type's inherent member is no more
+// selectable here than it was for `Self`.
+
+#[test]
+fn b254_an_inherited_default_on_a_concrete_value_is_not_colored_by_an_unrelated_async_member() {
+    // The exhibit, in `a_trait_default_starter_stored_in_a_plain_field_is_not_
+    // refused`'s own shape one level up: the starter calls the INHERITED
+    // default on a concrete `Cell`, and `Client` — which implements nothing —
+    // spells an async inherent member of that name. Refused as a field escape
+    // before the narrowing, for a program that awaits nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Client { }
+
+        impl Client {
+            async fun doubled(self): i32 { 1 }
+        }
+
+        trait Peek {
+            fun get(self): i32;
+            fun doubled(self): i32 { self.get() * 2 }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Peek {
+            fun get(self): i32 { self.n }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            let holder = Holder { start = || cell.doubled() };
+            print((holder.start)());
+        }
+        "#,
+        "14\n",
+    );
+}
+
+#[test]
+fn b254_a_genuinely_async_override_on_another_implementor_still_colors_the_dispatch() {
+    // The control that keeps it a NARROWING: `Slow` implements the dispatching
+    // trait and overrides the default with an async member, so it is a member
+    // the receiver's dispatch could select at another instantiation — the
+    // over-approximation stands and the store is still refused.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Peek {
+            fun get(self): i32;
+            fun doubled(self): i32 { self.get() * 2 }
+        }
+
+        struct Cell { n: i32 }
+        impl Cell with Peek {
+            fun get(self): i32 { self.n }
+        }
+
+        struct Slow { n: i32 }
+        impl Slow with Peek {
+            fun get(self): i32 { self.n }
+            async fun doubled(self): i32 { self.n }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            let holder = Holder { start = || cell.doubled() };
+            print((holder.start)());
+        }
+        "#,
+        "receives an async closure",
+    );
+}
+
+#[test]
+fn b254_a_blanket_impls_async_member_is_still_a_candidate() {
+    // The second control, on the arm the narrowing deliberately keeps whole: a
+    // blanket subject has no nominal head to test, applies to whatever binds —
+    // this trait's implementors included — and stays a candidate. Still
+    // refused, and it must be.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Marker { fun mark(self): i32; }
+
+        trait Peek {
+            fun get(self): i32;
+            fun doubled(self): i32 { self.get() * 2 }
+        }
+
+        struct Cell { n: i32 }
+        impl Cell with Peek {
+            fun get(self): i32 { self.n }
+        }
+
+        impl type T: Marker {
+            async fun doubled(self): i32 { 1 }
+        }
+
+        struct Holder { start: || i32 }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            let holder = Holder { start = || cell.doubled() };
+            print((holder.start)());
+        }
+        "#,
+        "receives an async closure",
+    );
+}
+
+#[test]
+fn b247_an_operator_in_a_hole_is_a_hole() {
+    // The find's expression, spelled as an i-string: a hole is an EXPRESSION, not
+    // a name, and the value under node proves it interpolated rather than printed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print(i"{1 + 2}");
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b247_a_method_call_in_a_hole_is_a_hole() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Counter { n: i32 }
+        impl Counter {
+            fun doubled(self): i32 { self.n * 2 }
+        }
+        fun main() {
+            let c = Counter { n = 4 };
+            print(i"{c.doubled()}");
+        }
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b247_a_plain_name_hole_is_the_control() {
+    // The shape that always worked, beside a hole that carries an operator: both
+    // are one grammar, so the two interpolate into one literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let x = 7;
+            print(i"{x} then {x + 1}");
+        }
+        "#,
+        "7 then 8\n",
+    );
+}
+
+#[test]
+fn b247_a_hole_that_is_not_an_expression_is_refused_once() {
+    // Red before the fix: SIX diagnostics — `unclosed '('`, `found 'i' expected a
+    // token`, `found '}' expected a token`, `found 'else' expected an expression`,
+    // the LINE BREAK ban about a break nobody wrote, and two missing terminators —
+    // because the hole ended at the nested `{` and the body scan resumed one byte
+    // later, inside the hole. Now one refusal, at the hole's own `{`.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let c = true;
+            print(i"{if c { 1 } else { 2 }}");
+        }
+        "#,
+        "an interpolation hole holds one expression",
+    );
+}
+
+#[test]
+fn b247_a_refused_hole_does_not_report_a_line_break() {
+    // The half of the cascade that pointed at the wrong rule entirely: the literal
+    // used to run off the end of its line, so the author was told a string cannot
+    // span lines.
+    assert_fails_without(
+        r#"
+        import std::io::print;
+        fun main() {
+            print(i"{ a{b} }");
+        }
+        "#,
+        "a string cannot span lines",
+    );
+}
+
+#[test]
+fn b247_a_plain_string_never_interpolates() {
+    // The find's own spelling, and the reason it is not the bug it looked like:
+    // `"…"` has no holes at all (`vilan/test/string-interpolation.vl` pins the
+    // same line). A brace-shaped run in a plain string is TEXT, and stays text.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            print("{1 + 2}");
+        }
+        "#,
+        "{1 + 2}\n",
+    );
+}
+
+// --- B310: the instantiated tuple layout inside a generic body ------------------
+// Tuples store FLAT, and which slots a tuple occupies is decided by its element
+// types. The analyzer walks a generic body ONCE with its parameters abstract, so
+// an element typed `V` looked one slot wide there however wide the instantiation
+// made it — while the concrete caller, which knows `V = (A, B)`, built and read
+// the flat form. `Map<str, (str, str)>` boxed its `(K, V)` inside `insert` and
+// resliced it flat at `entries()`: `let (class, declaration) = slot` read
+// `class = "class,decl"` and `declaration = undefined`, silently.
+//
+// Emission runs per MONOMORPHIZED instance, where the binding is known, so the
+// layout is recomputed there: the splice decision resolves through the
+// substitution, and a positional read's offset and width come from the
+// layout-free path the analyzer records (`tuple_index_paths`) rather than from
+// the offsets it baked. Both halves of every crossing then read one layout.
+
+#[test]
+fn b310_a_map_of_tuple_values_round_trips_through_entries() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+
+        fun main() {
+            mut m: Map<str, (str, str)> = Map::new();
+            m.insert("a", ("class", "decl"));
+            for entry in m.entries() {
+                let (key, slot) = entry;
+                let (class, declaration) = slot;
+                print(key);
+                print(class);
+                print(declaration);
+                print(entry.1.0);
+                print(entry.1.1);
+            }
+        }
+        "#,
+        "a\nclass\ndecl\nclass\ndecl\n",
+    );
+}
+
+#[test]
+fn b310_the_other_map_readers_still_agree_with_entries() {
+    // `keys`, `values` and `get` were RIGHT before the fix — each reads `V` as
+    // one slot and hands the caller the value itself, never the pair — so the
+    // pin that matters is that they still are, on the layout that moved.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::option::Option::{ Some, None };
+
+        fun main() {
+            mut m: Map<str, (str, str)> = Map::new();
+            m.insert("a", ("one", "two"));
+            for key in m.keys() { print(key); }
+            for value in m.values() { let (x, y) = value; print(x); print(y); }
+            match m.get("a") {
+                Some(let got) => { let (x, y) = got; print(x); print(y); }
+                None => print("missing"),
+            }
+        }
+        "#,
+        "a\none\ntwo\none\ntwo\n",
+    );
+}
+
+#[test]
+fn b310_a_generic_function_returns_a_tuple_of_its_parameters_flat() {
+    // The item's second exhibit: nothing to do with `Map`. The tuple is built
+    // in generic land and read at a concrete call.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pair<T>(a: T, b: T): (T, T) {
+            (a, b)
+        }
+
+        fun main() {
+            let p = pair((1, 2), (3, 4));
+            let (x, y) = p;
+            let (x0, x1) = x;
+            let (y0, y1) = y;
+            print(x0);
+            print(x1);
+            print(y0);
+            print(y1);
+        }
+        "#,
+        "1\n2\n3\n4\n",
+    );
+}
+
+#[test]
+fn b310_a_tuple_of_parameters_passed_into_a_generic_body_reads_flat() {
+    // The crossing in the OTHER direction: the caller builds the tuple flat and
+    // the generic body reads it. `p.0` used to read slot 0 — half of the first
+    // element — and everything past it was `undefined`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun first<T>(p: (T, T)): T {
+            p.0
+        }
+
+        fun main() {
+            let got = first(((1, 2), (3, 4)));
+            let (a, b) = got;
+            print(a);
+            print(b);
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b310_a_generic_struct_field_of_tuple_parameters_reads_flat() {
+    // A struct literal written at a concrete site stores the flat form; the
+    // generic method that reads it must use the same layout.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder<T> {
+            p: (T, T),
+        }
+
+        impl Holder<type T> {
+            fun first(self): T {
+                self.p.0
+            }
+
+            fun second(self): T {
+                self.p.1
+            }
+        }
+
+        fun main() {
+            let h = Holder { p = ((1, 2), (3, 4)) };
+            let (a, b) = h.first();
+            let (c, d) = h.second();
+            print(a);
+            print(b);
+            print(c);
+            print(d);
+        }
+        "#,
+        "1\n2\n3\n4\n",
+    );
+}
+
+#[test]
+fn b310_a_nested_tuple_through_a_generic_keeps_every_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun wrap<T>(v: T): (i32, T) {
+            (0, v)
+        }
+
+        fun main() {
+            let w = wrap((1, (2, 3)));
+            let (n, inner) = w;
+            let (a, rest) = inner;
+            let (b, c) = rest;
+            print(n);
+            print(a);
+            print(b);
+            print(c);
+        }
+        "#,
+        "0\n1\n2\n3\n",
+    );
+}
+
+#[test]
+fn b310_a_tuple_of_a_parameter_and_a_concrete_reads_flat() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun tag<T>(v: T): (str, T) {
+            ("t", v)
+        }
+
+        fun main() {
+            let t = tag((1, 2));
+            let (name, inner) = t;
+            let (a, b) = inner;
+            print(name);
+            print(a);
+            print(b);
+            print(t.1.0);
+            print(t.1.1);
+        }
+        "#,
+        "t\n1\n2\n1\n2\n",
+    );
+}
+
+#[test]
+fn b310_a_generic_body_whose_parameter_stays_abstract_is_unchanged() {
+    // The control: a `T` no instantiation binds to a tuple keeps the one-slot
+    // layout the analyzer saw, so the fix is a no-op wherever the two layouts
+    // already agreed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pair<T>(a: T, b: T): (T, T) {
+            (a, b)
+        }
+
+        fun main() {
+            let p = pair(1, 2);
+            let (x, y) = p;
+            print(x);
+            print(y);
+            print(p.0);
+            print(p.1);
+        }
+        "#,
+        "1\n2\n1\n2\n",
+    );
+}
+
+// --- N113: `()` is not the unit, and `void` is not a name -----------------------
+//
+// Two spellings the grammar took and the language has no meaning for.
+//
+// `()` parses as the EMPTY tuple type, and no expression produces one, so
+// every field, parameter or return written at it was uninhabited: the author
+// read "Expected (), but got void instead" about the body they had just
+// written, which names the mistake backwards. The unit type is `void`.
+//
+// `void` is the unit VALUE's spelling, read by the atom production
+// unconditionally (§2.2 lists it contextual, and everywhere else it is — a
+// struct field or a method may be called `void` and reads back through its
+// receiver). A BINDER is the position where "contextual" stops being true:
+// `let void = 3;` bound a name that no later `void` could ever mean, and the
+// read was refused with the unit's type, pointing at the read rather than at
+// the binding. One binder production serves `let`, `for`, a function parameter
+// and a match capture, so all four are the same refusal.
+
+#[test]
+fn n113_the_empty_tuple_type_is_refused_by_name_pointing_at_void() {
+    for source in [
+        "struct Box {\n    slot: (),\n}\n\nfun main() {}\n",
+        "fun nothing(): () {\n}\n\nfun main() {}\n",
+        "fun take(value: ()) {\n}\n\nfun main() {}\n",
+        "fun main() {\n    let held: () = void;\n}\n",
+    ] {
+        assert_fails_with(source, "the unit type is spelled `void`");
+    }
+}
+
+#[test]
+fn n113_a_written_tuple_type_of_two_or_more_still_parses() {
+    // The refusal is the EMPTY case only — the production it lives in is the
+    // ordinary tuple type's, and a one-tuple is deliberately a tuple too.
+    assert_compiles(
+        r#"
+        fun first(pair: (i32, str)): i32 {
+            pair.0
+        }
+
+        fun main() {
+            let _ = first((1, "a"));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn n113_a_binder_named_void_is_refused_in_every_binding_position() {
+    for source in [
+        "fun main() {\n    let void = 3;\n    let _ = void;\n}\n",
+        "fun take(void: i32) {\n}\n\nfun main() {\n    take(1);\n}\n",
+        "fun main() {\n    for void in [1, 2] {\n    }\n}\n",
+        "fun main() {\n    let (void, other) = (1, 2);\n    let _ = other;\n}\n",
+    ] {
+        assert_fails_with(source, "`void` is the unit value's own spelling");
+    }
+}
+
+#[test]
+fn n113_a_field_named_void_is_not_a_binder_and_still_works() {
+    // The line the refusal must not cross: `void` reached through a receiver
+    // is a member name, not an atom, so it reads back exactly as written.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder {
+            void: i32,
+        }
+
+        impl Holder {
+            fun void(self): i32 {
+                self.void
+            }
+        }
+
+        fun main() {
+            let holder = Holder { void = 7 };
+            print(holder.void());
+        }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b377_a_block_element_in_a_discarded_comprehension_still_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_a_block<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => {
+                note(1);
+                value
+            });
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_block((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_a_call_element_in_a_discarded_comprehension_is_unchanged() {
+    // The control: the shape that always worked, so the fix is a no-op here.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_a_call<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => note(1));
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_call((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_an_if_element_in_a_discarded_comprehension_still_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_an_if<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => if tally.read() < 100 { note(1) } else { 0 });
+            tally.read()
+        }
+
+        fun main() {
+            print(over_an_if((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_a_match_element_in_a_discarded_comprehension_still_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_a_match<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => match tally.read() < 100 {
+                true => note(1),
+                false => 0,
+            });
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_match((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_a_pure_element_in_a_discarded_comprehension_is_still_elided() {
+    // The other side of the predicate: a literal element has nothing to run, so
+    // the discarded map is correctly dropped — the fix must not make every
+    // unused binding survive.
+    assert_emits_containing(
+        r#"
+        import std::io::print;
+
+        fun over_a_literal<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => 7);
+            0
+        }
+
+        fun main() {
+            print(over_a_literal((1, 2, 3)));
+        }
+        "#,
+        "function $a(values) {\n\treturn 0;\n}",
+    );
+}
+
+#[test]
+fn b377_a_comprehensions_source_runs_even_when_its_element_is_pure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun source<T: (2..)>(values: (U in T: U)): (U in T: U) {
+            tally.write() = tally.read() + 1;
+            values
+        }
+
+        fun over_a_pure_element<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in source(values) => 7);
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_pure_element((1, 2, 3)));
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b377_an_unused_binding_over_a_block_still_runs_its_statements() {
+    // The predicate is shared, so the class is wider than the comprehension: a
+    // block, an `if` and a `match` as an unused `let`'s initializer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun main() {
+            let _block = {
+                note(1);
+                0
+            };
+            let _if = if tally.read() < 100 { note(10) } else { 0 };
+            let _match = match tally.read() < 100 {
+                true => note(100),
+                false => 0,
+            };
+            print(tally.read());
+        }
+        "#,
+        "111\n",
+    );
+}
+
+#[test]
+fn b377_an_unused_binding_over_a_nested_let_still_runs_it() {
+    // `Expr::Variable` inside the block: the inner `let`'s own initializer is
+    // what carries the effect, and nothing else in the block does.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun main() {
+            let _outer = {
+                let inner = note(5);
+                inner
+            };
+            print(tally.read());
+        }
+        "#,
+        "5\n",
+    );
+}
+
+// --- B397 (MISCOMPILE): a tuple comprehension lowered to a runtime `.map`
+// --- over the FLAT tuple array, so an element that is itself a tuple nested
+// --- in the result (and a multi-slot source element was walked one slot at a
+// --- time). The instance whose layout `.map` gets wrong is emitted unrolled.
+
+/// The item's repro, through shipped `combine`. Red before the fix: `x=1,2
+/// y=c l=undefined`, twice.
+#[test]
+fn b397_combine_over_a_tuple_valued_source_reads_flat() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, combine };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet point = SignalCell::new((1, 2));\n",
+            "\tlet label = SignalCell::new(\"c\");\n",
+            "\tlet both = combine((point, label));\n",
+            "\tlet ((x, y), l) = both.get();\n",
+            "\tprint(i\"{x} {y} {l}\");\n",
+            "\tpoint.set((3, 4));\n",
+            "\tlet ((x2, y2), l2) = both.get();\n",
+            "\tprint(i\"{x2} {y2} {l2}\");\n",
+            "}\n",
+        ),
+        "1 2 c\n3 4 c\n",
+    );
+}
+
+/// A user comprehension whose RESULT elements are tuples (`(7, c.get())`)
+/// splices each one, and one whose element is a tuple reads it whole. Red
+/// before the fix: `a=1,2 b=c c=undefined`, `whole.1=undefined`,
+/// `p.0.1=7,x p.1.0=undefined p.1.1=undefined`.
+#[test]
+fn b397_a_comprehensions_tuple_results_splice_into_the_flat_result() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun reads<T: (2..)>(cells: (U in T: SignalCell<U>)): T {\n",
+            "\t(c in cells => c.get())\n",
+            "}\n",
+            "\n",
+            "fun pairs<T: (2..)>(cells: (U in T: SignalCell<U>)): (U in T: (i32, U)) {\n",
+            "\t(c in cells => (7, c.get()))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet ((a, b), c) = reads((SignalCell::new((1, 2)), SignalCell::new(\"c\")));\n",
+            "\tprint(i\"a={a} b={b} c={c}\");\n",
+            "\tlet whole = reads((SignalCell::new((1, 2)), SignalCell::new(\"c\")));\n",
+            "\tprint(i\"whole.1={whole.1}\");\n",
+            "\tlet p = pairs((SignalCell::new(1), SignalCell::new(\"x\")));\n",
+            "\tprint(i\"p.0.1={p.0.1} p.1.0={p.1.0} p.1.1={p.1.1}\");\n",
+            "}\n",
+        ),
+        "a=1 b=2 c=c\nwhole.1=c\np.0.1=1 p.1.0=7 p.1.1=x\n",
+    );
+}
+
+/// The control: over scalar cells the `.map` lowering was right, and it is
+/// still what is emitted — `combine` of two scalar cells prints as before and
+/// its emitted comprehension is the runtime map (green before and after).
+#[test]
+fn b397_a_comprehension_over_scalar_elements_keeps_the_runtime_map() {
+    let source = concat!(
+        "import std::io::print;\n",
+        "import std::reactive::SignalCell;\n",
+        "\n",
+        "fun reads<T: (2..)>(cells: (U in T: SignalCell<U>)): T {\n",
+        "\t(c in cells => c.get())\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet (a, b) = reads((SignalCell::new(1), SignalCell::new(\"c\")));\n",
+        "\tprint(i\"a={a} b={b}\");\n",
+        "}\n",
+    );
+    assert_compiles_and_runs(source, "a=1 b=c\n");
+    assert_emits_containing(source, ".map((c) =>");
+}
+
+/// A122's grammar alternative (tuple-module.md §4.1): an impl subject's binder
+/// takes a TUPLE-family bound, so `impl type T: (2..) with Arity` is a blanket
+/// over every tuple of arity ≥ 2 — one method, reached from a 2-tuple and a
+/// 3-tuple alike. Before this the binder's `:` read only a trait-bound list and
+/// the head failed at `found '2' expected a type`.
+#[test]
+fn a122_a_tuple_bounded_blanket_reaches_a_two_and_a_three_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "trait Arity {\n",
+            "\tfun arity(self): str;\n",
+            "}\n",
+            "\n",
+            "impl type T: (2..) with Arity {\n",
+            "\tfun arity(self): str {\n",
+            "\t\t\"a tuple\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint((1, \"two\").arity());\n",
+            "\tprint((1, 2, 3).arity());\n",
+            "}\n",
+        ),
+        "a tuple\na tuple\n",
+    );
+}
+
+/// The bound is a bound: a value that is not a tuple of the family is not
+/// reached by the blanket — an `i32` has no `arity`, and neither does a tuple
+/// outside the arity range.
+#[test]
+fn a122_a_tuple_bounded_blanket_does_not_reach_outside_its_family() {
+    let blanket = concat!(
+        "trait Arity {\n",
+        "\tfun arity(self): str;\n",
+        "}\n",
+        "\n",
+        "impl type T: (3..) with Arity {\n",
+        "\tfun arity(self): str {\n",
+        "\t\t\"a tuple\"\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+    );
+    assert_fails_with(
+        &format!("{blanket}fun main() {{\n\tlet _ = 5.arity();\n}}\n"),
+        "'i32' is not a tuple",
+    );
+    assert_fails_with(
+        &format!("{blanket}fun main() {{\n\tlet _ = (1, 2).arity();\n}}\n"),
+        "the bound '(3..)' requires at least 3",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E223 — the mapped-tuple refusal names a tuple-BOUNDED parameter's bound
+// ---------------------------------------------------------------------------
+//
+// A comprehension over a VALUE of type `T: (2..)` was refused "a tuple
+// comprehension's source must be a mapped tuple, got T", which read as though
+// `T` were unbounded or not a tuple at all. It names the bound now and says
+// what the refusal is about (papers-41's probe `a122_02`).
+
+#[test]
+fn e223_a_tuple_bounded_parameter_source_names_its_bound() {
+    assert_fails_with(
+        concat!(
+            "import std::reactive::SignalCell;\n",
+            "fun divorce<T: (2..)>(source: SignalCell<T>): (U in T: SignalCell<U>) {\n",
+            "\t(x in source.get() => SignalCell::new(x))\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet s = SignalCell::new((1, \"one\"));\n",
+            "\tlet _parts = divorce(s);\n",
+            "}\n",
+        ),
+        "a tuple comprehension's source must be a mapped tuple, got T, a type parameter \
+         bounded `(2..)`: the bound makes it a tuple, but a VALUE of a bounded tuple \
+         parameter is not a comprehension source today",
+    );
+}
+
+/// The concrete-tuple refusal keeps its plain sentence.
+#[test]
+fn e223_a_concrete_tuple_source_keeps_the_plain_refusal() {
+    assert_fails_without(
+        concat!(
+            "fun main() {\n",
+            "\tlet t = (1, 2);\n",
+            "\tlet u = (x in t => x + 1);\n",
+            "}\n",
+        ),
+        "a type parameter bounded",
     );
 }

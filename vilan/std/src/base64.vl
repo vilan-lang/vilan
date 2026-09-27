@@ -1,24 +1,30 @@
 // Base64url (RFC 4648 §5, unpadded) over `Bytes` — pure vilan, so it is also
-// available at compile time. The alphabet's `-`/`_` and the absent padding are
-// what JWTs and URL-safe tokens expect.
+// available at compile time. The alphabet's `-`/`_` and the absent padding are what
+// JWTs and URL-safe tokens expect.
 
 import pkg::bytes::Bytes;
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::range::Range;
 
-let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+export let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 fun char_at(value: i32): str {
-	alphabet.substring(value, value + 1)
+	alphabet.substring(value.as_usize(), (value + 1).as_usize())
 }
 
-fun encode_url(bytes: Bytes): str {
+export fun encode_url(bytes: Bytes): str {
 	let total = bytes.len();
 	mut out = "";
-	for group in Range::new(0, total / 3) {
+	for group in Range::new(0, (total / 3).as_i32()) {
 		let base = group * 3;
-		let chunk = (bytes.get(base) << 16) | (bytes.get(base + 1) << 8) | bytes.get(base + 2);
-		out = out + char_at((chunk >> 18) & 63) + char_at((chunk >> 12) & 63) + char_at((chunk >> 6) & 63) + char_at(chunk & 63);
+		let chunk = (bytes.get(base.as_usize()) << 16)
+			| (bytes.get((base + 1).as_usize()) << 8)
+			| bytes.get((base + 2).as_usize());
+		out = out
+			+ char_at((chunk >> 18) & 63)
+			+ char_at((chunk >> 12) & 63)
+			+ char_at((chunk >> 6) & 63)
+			+ char_at(chunk & 63);
 	}
 	let rest = total % 3;
 	if rest == 1 {
@@ -27,7 +33,10 @@ fun encode_url(bytes: Bytes): str {
 	}
 	if rest == 2 {
 		let chunk = (bytes.get(total - 2) << 16) | (bytes.get(total - 1) << 8);
-		out = out + char_at((chunk >> 18) & 63) + char_at((chunk >> 12) & 63) + char_at((chunk >> 6) & 63);
+		out = out
+			+ char_at((chunk >> 18) & 63)
+			+ char_at((chunk >> 12) & 63)
+			+ char_at((chunk >> 6) & 63);
 	}
 	out
 }
@@ -53,7 +62,7 @@ fun digit(code: u32): i32 {
 	0 - 1
 }
 
-fun decode_url(text: str): Option<Bytes> {
+export fun decode_url(text: str): Option<Bytes> {
 	let length = text.len();
 	let rest = length % 4;
 	if rest == 1 {
@@ -66,14 +75,14 @@ fun decode_url(text: str): Option<Bytes> {
 		3 => 2,
 		_ => 0,
 	};
-	mut out = Bytes::alloc(full * 3 + tail_bytes);
+	mut out = Bytes::alloc(full * 3 + tail_bytes.as_usize());
 	mut write = 0;
-	for group in Range::new(0, full) {
+	for group in Range::new(0, full.as_i32()) {
 		let base = group * 4;
-		let a = digit(text.code_at(base));
-		let b = digit(text.code_at(base + 1));
-		let c = digit(text.code_at(base + 2));
-		let d = digit(text.code_at(base + 3));
+		let a = digit(text.code_at(base.as_usize()));
+		let b = digit(text.code_at((base + 1).as_usize()));
+		let c = digit(text.code_at((base + 2).as_usize()));
+		let d = digit(text.code_at((base + 3).as_usize()));
 		if a < 0 || b < 0 || c < 0 || d < 0 {
 			ret None;
 		}

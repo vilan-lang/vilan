@@ -23,11 +23,11 @@
 //! - String ops use UTF-16 code-unit semantics like JS; lone surrogates from
 //!   slicing are replaced (`from_utf16_lossy`) rather than preserved.
 
+use crate::fx::FxHashMap as HashMap;
 use crate::node::BinaryOp;
 use crate::transformer::{ConstSite, JsProgram, js};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::{Rc, Weak};
 
@@ -144,10 +144,34 @@ pub enum ConstValue {
     Array(Vec<ConstValue>),
     Set(Vec<ConstValue>),
     Map(Vec<(ConstValue, ConstValue)>),
+    /// G24's CLOSURE SNAPSHOT — the one result that is not plain data, and is
+    /// admitted only under `const let` (`const-eval.md` §11: "plain data, or a
+    /// closure over plain data"). In the owner's framing it IS plain data: a
+    /// `Callable` record whose fields are the captured compile-time values,
+    /// over a body the emitter already knows how to write.
+    ///
+    /// `body` is the ANALYZER's closure entity, not this world's lowering of
+    /// it. A const site is lowered by a transformer of its own, whose
+    /// generated names are that world's — emitting its arrow into the real
+    /// output would reference declarations the output does not have — so what
+    /// travels is the entity plus the captures, and the real emitter walks the
+    /// closure itself with the captures substituted for its free bindings.
+    ///
+    /// `captures` is keyed by the const world's emitted name for each captured
+    /// binding; `const_eval` hands the emitter the name → binding map it needs
+    /// to finish the translation (`Program::const_snapshot_bindings`).
+    Callable {
+        body: crate::id::Id,
+        captures: Vec<(String, ConstValue)>,
+    },
 }
 
 /// Converts an interpreter value to plain data, or names what blocks it.
-fn value_to_const(value: &Value) -> Result<ConstValue, &'static str> {
+///
+/// `snapshots` admits G24's closure result: a `const let` binding takes one,
+/// every other const site keeps §1's "plain data" rule and the refusal that
+/// steers to `const let`.
+fn value_to_const(value: &Value, snapshots: bool) -> Result<ConstValue, &'static str> {
     Ok(match value {
         Value::Undefined => ConstValue::Undefined,
         Value::Null => ConstValue::Null,
@@ -159,14 +183,14 @@ fn value_to_const(value: &Value) -> Result<ConstValue, &'static str> {
             items
                 .borrow()
                 .iter()
-                .map(value_to_const)
+                .map(|item| value_to_const(item, snapshots))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Set(items) => ConstValue::Set(
             items
                 .borrow()
                 .values()
-                .map(value_to_const)
+                .map(|item| value_to_const(item, snapshots))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Map(entries) => ConstValue::Map(
@@ -174,13 +198,75 @@ fn value_to_const(value: &Value) -> Result<ConstValue, &'static str> {
                 .borrow()
                 .values()
                 .map(|(key, value)| {
-                    Ok::<_, &'static str>((value_to_const(key)?, value_to_const(value)?))
+                    Ok::<_, &'static str>((
+                        value_to_const(key, snapshots)?,
+                        value_to_const(value, snapshots)?,
+                    ))
                 })
                 .collect::<Result<_, _>>()?,
         ),
         Value::Object(_) => return Err("a `Shared` cell"),
-        Value::Closure(_) => return Err("a closure"),
+        Value::Closure(closure) => {
+            if !snapshots {
+                return Err("a closure");
+            }
+            let Some(body) = closure.origin else {
+                // An arrow the EMITTER synthesized (a getter, a thunk), or a
+                // hoisted world declaration: neither is an expression the
+                // program wrote, so neither can be snapshotted.
+                return Err("a closure the compiler synthesized");
+            };
+            ConstValue::Callable {
+                body,
+                captures: closure_captures(closure, snapshots)?,
+            }
+        }
     })
+}
+
+/// The compile-time environment a snapshot closes over: every binding the
+/// closure's body NAMES that its scope chain holds, below the run's root.
+///
+/// The root scope is the const world and this site's prelude — the world's
+/// functions and the module-level bindings, all of which the real emitter
+/// declares for itself — so a name found there is not a capture and is
+/// deliberately skipped. What remains is exactly the frames the evaluation
+/// built: a `const fun`'s parameters, the `let`s of an enclosing block. Those
+/// are the values that must be BAKED, and the ones §11's rule requires to be
+/// plain data.
+fn closure_captures(
+    closure: &ClosureData<'_>,
+    snapshots: bool,
+) -> Result<Vec<(String, ConstValue)>, &'static str> {
+    let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    crate::transformer::collect_references(closure.body, &mut referenced);
+    let mut captures = Vec::new();
+    // Driven by the NAMES the body mentions, in their own sorted order, and
+    // never by walking a scope: `Scope::vars` is `fx`-hashed, so an iteration
+    // taken from it is a stable function of the hash rather than of the
+    // program (`the_scope_map_is_never_iterated` holds exactly this). Looking
+    // each name up instead makes the result's order the source's, which is
+    // what two builds of one program have to agree on.
+    for name in &referenced {
+        let mut scope = Some(closure.env.clone());
+        while let Some(current) = scope {
+            let borrowed = current.borrow();
+            // The root scope (the one with no parent) is the world; a name
+            // bound there is a world declaration the real emitter writes for
+            // itself, not a capture.
+            let Some(parent) = borrowed.parent.clone() else {
+                break;
+            };
+            let found = borrowed.vars.get(name.as_str()).cloned();
+            drop(borrowed);
+            if let Some(value) = found {
+                captures.push((name.clone(), value_to_const(&value, snapshots)?));
+                break;
+            }
+            scope = Some(parent);
+        }
+    }
+    Ok(captures)
 }
 
 impl ConstValue {
@@ -209,6 +295,13 @@ impl ConstValue {
                     5
                 }
             }
+            // G24's snapshot serializes as the closure's own arrow, whose size
+            // is the emitter's to know and not this value's. Answering the
+            // INFERRED cap's ceiling keeps the one caller honest: inference
+            // never admits a closure result (R2 — `const let` is required), so
+            // a snapshot reaching the cap is a bug, and reporting "too large"
+            // makes it a silent decline rather than a wrong fold.
+            ConstValue::Callable { .. } => usize::MAX,
             // The serializer's own special cases, then its shared path.
             ConstValue::Number(number) if number.is_nan() => 3,
             ConstValue::Number(number) if number.is_infinite() => {
@@ -280,6 +373,22 @@ pub trait AssetReader {
     /// as a tracked build input. Returns the digest and the byte count it was
     /// taken over — the interpreter charges the second (const-eval.md §3.1).
     fn digest(&self, path: &str) -> Result<(String, u64), String>;
+
+    /// `asset::stage` (B308) — a contribution held in the pass's REGISTRY
+    /// under a liveness `token`, rather than written to the kind's file. The
+    /// registry spans the whole const pass, which is what a per-site
+    /// interpreter cannot do for itself: each site gets its own scopes, so a
+    /// module has no global of its own to accumulate into and the host holds
+    /// it instead.
+    fn stage(&self, kind: &str, token: &str, line: &str);
+
+    /// `asset::staged` (B308) — the staged lines of `kind` that SURVIVED, in
+    /// `(token, line)` order and deduplicated on that pair, exactly as the
+    /// flush orders a keyed kind. `Err` is the user-facing reason the question
+    /// cannot be answered yet — which it cannot be until evaluation has
+    /// finished, since until then a token may still be named by a site not
+    /// evaluated.
+    fn staged(&self, kind: &str) -> Result<Vec<String>, String>;
 }
 
 /// Everything one const evaluation produced. The result is what the caller
@@ -291,6 +400,9 @@ pub trait AssetReader {
 struct ConstRun {
     value: ConstValue,
     assets: Vec<crate::const_eval::EmittedAsset>,
+    /// The end-of-evaluation finalisers this run requested (G23), by emitted
+    /// name, in registration order.
+    scheduled: Vec<String>,
     stdout: String,
     exited: Option<i32>,
     fuel_used: u64,
@@ -310,10 +422,11 @@ fn run_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
     allow_assets: bool,
+    snapshots: bool,
     reader: Option<&'a dyn AssetReader>,
 ) -> Result<ConstRun, Failure> {
     check_reach(&site.imports, &site.helpers)?;
-    let mut interpreter = Interpreter::new(limits, allow_assets);
+    let mut interpreter = Interpreter::new(limits, allow_assets, snapshots);
     interpreter.reader = reader;
     let value = interpreter.run_const_site(site);
     // Either arm of `value` is owned plain data (`ConstValue` / `Failure`), and
@@ -322,9 +435,15 @@ fn run_const<'a>(
     // on the error paths as much as the success one (leak-soak.md §7.8).
     interpreter.clear_scopes();
     let fuel_used = limits.fuel - interpreter.fuel;
+    let scheduled = interpreter
+        .scheduled
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
     Ok(ConstRun {
         value: value?,
         assets: interpreter.assets,
+        scheduled,
         stdout: interpreter.stdout,
         exited: interpreter.exited,
         fuel_used,
@@ -337,6 +456,9 @@ fn run_const<'a>(
 pub struct ConstOutcome {
     pub value: ConstValue,
     pub assets: Vec<crate::const_eval::EmittedAsset>,
+    /// The end-of-evaluation finalisers this site requested (G23), by the
+    /// EMITTED name of each function, in registration order.
+    pub scheduled: Vec<String>,
     pub fuel_used: u64,
 }
 
@@ -348,12 +470,14 @@ pub struct ConstOutcome {
 pub fn eval_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
+    snapshots: bool,
     reader: Option<&'a dyn AssetReader>,
 ) -> Result<ConstOutcome, Failure> {
-    let run = run_const(site, limits, true, reader)?;
+    let run = run_const(site, limits, true, snapshots, reader)?;
     Ok(ConstOutcome {
         value: run.value,
         assets: run.assets,
+        scheduled: run.scheduled,
         fuel_used: run.fuel_used,
     })
 }
@@ -372,7 +496,7 @@ pub fn eval_inferred<'a>(site: &'a ConstSite<'a>, limits: Limits) -> Result<Cons
     // No reader either: `asset::read` is const-only, so a fold that reaches it
     // was already refused statically — and the closed channel keeps that true
     // by construction even for a path the static check cannot see.
-    let run = run_const(site, limits, false, None)?;
+    let run = run_const(site, limits, false, false, None)?;
     if !run.stdout.is_empty() {
         return Err(Failure::unsupported(
             "output during evaluation (an inferred fold must be observably silent)",
@@ -399,7 +523,7 @@ pub struct RunOutput {
 /// macro expansion (Phase 1) drives the same evaluator per `macro fun` call.
 pub fn run_program<'a>(program: &'a JsProgram<'a>, limits: Limits) -> Result<RunOutput, Failure> {
     check_capabilities(program)?;
-    let mut interpreter = Interpreter::new(limits, false);
+    let mut interpreter = Interpreter::new(limits, false, false);
     let globals = interpreter.root_scope();
     let result = interpreter.exec_body(&program.nodes, &globals);
     // Everything read below — stdout, the exit code, the `Flow` variant, a
@@ -421,6 +545,7 @@ pub fn run_program<'a>(program: &'a JsProgram<'a>, limits: Limits) -> Result<Run
         Ok(Flow::Break | Flow::Continue) => {
             Err(Failure::internal("`break`/`continue` outside a loop"))
         }
+        Ok(Flow::BreakLabel(_)) => Err(Failure::internal("`break <label>` outside its block")),
         Err(failure) => Err(failure),
     }
 }
@@ -575,7 +700,7 @@ pub fn run_entry<'a>(
     limits: Limits,
 ) -> Result<String, Failure> {
     check_capabilities(program)?;
-    let mut interpreter = Interpreter::new(limits, false);
+    let mut interpreter = Interpreter::new(limits, false, false);
     let text = interpreter.run_macro_entry(program, entry, arguments);
     // The expansion is an owned `String` (a `Failure` likewise), and the
     // expansion cache upstream stores only that text — no `Value` from a macro
@@ -654,6 +779,10 @@ struct ClosureData<'a> {
     env: Env<'a>,
     /// The declaration name for named functions (inspect prints it).
     name: Option<&'a str>,
+    /// G24: the analyzer CLOSURE ENTITY this value was made from, carried
+    /// through from the lowered arrow (`js::Closure::origin`) so a const
+    /// result that IS a closure can name the body the real emitter must walk.
+    origin: Option<crate::id::Id>,
 }
 
 // --- Environment ---
@@ -729,6 +858,11 @@ enum Flow<'a> {
     Normal,
     Return(Value<'a>),
     Break,
+    /// `break <label>` — B214's `main` wrapper. It propagates outward through
+    /// every loop and body (each one's `other => return Ok(other)` arm) until
+    /// the [`js::Node::Labeled`] block naming it swallows it, which is what
+    /// makes it leave `main` rather than the loop it was written inside.
+    BreakLabel(&'a str),
     Continue,
 }
 
@@ -747,11 +881,23 @@ struct Interpreter<'a> {
     /// `asset::emit` is live only under `eval_const`; anywhere else it is a
     /// capability miss.
     allow_assets: bool,
+    /// G24: whether this run's RESULT may be a closure snapshot. Set only for
+    /// a `const let` binding's initializer — every other const site keeps §1's
+    /// "a `const` result must be plain data", and inference never admits one
+    /// (R2: the declaration is required).
+    snapshots: bool,
     /// `asset::read`'s host (docs-port.md §3.3) — present only under
     /// `eval_const` with a project to read from. `None` with `allow_assets`
     /// set means the context has no file channel (the wasm playground outside
     /// its overlay); the read then fails as a clean capability miss.
     reader: Option<&'a dyn AssetReader>,
+    /// The end-of-evaluation finalisers this run requested (G23), by the
+    /// EMITTED name of the function each request named, in registration order
+    /// and deduplicated — a set, so three requests for one function are one
+    /// finaliser. The emitted name is the identity because one name generator
+    /// serves the whole const pass, so two reached functions can never share
+    /// one emitted name (`ConstWorld::resolve_trace` rests on the same fact).
+    scheduled: Vec<Rc<str>>,
     /// The per-run scope registry (leak-soak.md §7.8): every scope this run
     /// created, weakly held. A hoisted or expression-position function is a
     /// `Value::Closure` whose `env` is the scope holding it — a reference
@@ -763,10 +909,17 @@ struct Interpreter<'a> {
     /// extends a scope's life: one that died naturally mid-run costs its slot
     /// and nothing else, and the run's liveness is exactly what it was.
     scopes: Vec<Weak<RefCell<Scope<'a>>>>,
+    /// The next `Shared::identity` stamp this run will mint (M66) — the
+    /// interpreter's half of the emitted `__shared_identity_next`. Per RUN, so
+    /// a const evaluation or a macro expansion answers the same numbers
+    /// whatever ran before it; `1` first, because `0 - 1` is the rpc runtime's
+    /// "no cell identity" sentinel and nothing should be able to collide with
+    /// it. A float because every interpreter number is one.
+    next_shared_identity: f64,
 }
 
 impl<'a> Interpreter<'a> {
-    fn new(limits: Limits, allow_assets: bool) -> Self {
+    fn new(limits: Limits, allow_assets: bool, snapshots: bool) -> Self {
         Self {
             fuel: limits.fuel,
             depth_left: limits.call_depth,
@@ -774,8 +927,11 @@ impl<'a> Interpreter<'a> {
             exited: None,
             assets: Vec::new(),
             allow_assets,
+            snapshots,
             reader: None,
+            scheduled: Vec::new(),
             scopes: Vec::new(),
+            next_shared_identity: 1.0,
         }
     }
 
@@ -787,7 +943,7 @@ impl<'a> Interpreter<'a> {
     /// reopen the leak.
     fn root_scope(&mut self) -> Env<'a> {
         self.register(Scope {
-            vars: HashMap::new(),
+            vars: HashMap::default(),
             parent: None,
         })
     }
@@ -795,7 +951,7 @@ impl<'a> Interpreter<'a> {
     /// A child scope over `parent`: a block, a loop iteration, a call frame.
     fn child_scope(&mut self, parent: &Env<'a>) -> Env<'a> {
         self.register(Scope {
-            vars: HashMap::new(),
+            vars: HashMap::default(),
             parent: Some(parent.clone()),
         })
     }
@@ -853,7 +1009,7 @@ impl<'a> Interpreter<'a> {
                 "the const result binding was not emitted",
             ));
         };
-        value_to_const(&result).map_err(|what| {
+        value_to_const(&result, self.snapshots).map_err(|what| {
             Failure::new(
                 FailureKind::Unsupported,
                 format!("a `const` result must be plain data; this evaluates to {what}"),
@@ -953,6 +1109,7 @@ impl<'a> Interpreter<'a> {
                     body: &function.body,
                     env: env.clone(),
                     name: Some(function.name.as_str()),
+                    origin: None,
                 }));
                 env.borrow_mut()
                     .vars
@@ -995,6 +1152,17 @@ impl<'a> Interpreter<'a> {
                 Ok(Flow::Return(value))
             }
             js::Node::Break => Ok(Flow::Break),
+            js::Node::BreakLabel(label) => Ok(Flow::BreakLabel(label.as_str())),
+            // `<label>: { <body> }` (B214). Its own break lands here and
+            // completes normally; anything else — a break for an enclosing
+            // label, a `return`, a loop's `break`/`continue` — passes through.
+            js::Node::Labeled(label, body) => {
+                let scope = self.child_scope(env);
+                match self.exec_body(body, &scope)? {
+                    Flow::BreakLabel(broken) if broken == label.as_str() => Ok(Flow::Normal),
+                    other => Ok(other),
+                }
+            }
             js::Node::Continue => Ok(Flow::Continue),
             js::Node::Throw(value) => {
                 let value = self.eval(value, env)?;
@@ -1163,6 +1331,17 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
+            // A124 R3's vtable, the one producer of an object literal: keys in
+            // written order, values evaluated left to right, exactly as the
+            // emitted JS evaluates them.
+            js::Node::Vtable(entries) => {
+                let mut object: IndexMap<Rc<str>, Value<'a>> = IndexMap::default();
+                for (name, value) in entries {
+                    let value = self.eval(value, env)?;
+                    object.insert(Rc::from(name.as_str()), value);
+                }
+                Ok(Value::Object(Rc::new(RefCell::new(object))))
+            }
             js::Node::Spread(_) => Err(Failure::internal("spread outside an array literal")),
             js::Node::Local(name) => self.eval_local(name, env),
             js::Node::Closure(closure) => {
@@ -1174,6 +1353,7 @@ impl<'a> Interpreter<'a> {
                     body: &closure.body,
                     env: env.clone(),
                     name: None,
+                    origin: closure.origin,
                 })))
             }
             js::Node::Function(function) => {
@@ -1185,6 +1365,7 @@ impl<'a> Interpreter<'a> {
                     body: &function.body,
                     env: env.clone(),
                     name: Some(function.name.as_str()),
+                    origin: None,
                 })))
             }
             js::Node::Await(_) => Err(Failure::unsupported("await (macro bodies are synchronous)")),
@@ -1222,6 +1403,19 @@ impl<'a> Interpreter<'a> {
                 self.read_index(&subject, &index)
             }
             js::Node::Call(subject, arguments) => self.eval_call(subject, arguments, env),
+            // B224's comma sequence: every item is evaluated, left to right,
+            // and the LAST one is the value — which is how a short-circuit
+            // operator's right operand runs the statements it needs without
+            // leaving expression position. An empty sequence cannot be built
+            // (the operand's own value is always its final item), so the
+            // fallback is unreachable rather than meaningful.
+            js::Node::Sequence(items) => {
+                let mut value = Value::Undefined;
+                for item in items {
+                    value = self.eval(item, env)?;
+                }
+                Ok(value)
+            }
             other => Err(Failure::internal(format!(
                 "statement node in expression position: {other:?}"
             ))),
@@ -1326,7 +1520,7 @@ impl<'a> Interpreter<'a> {
         match flow {
             Flow::Return(value) => Ok(value),
             Flow::Normal => Ok(Value::Undefined),
-            Flow::Break | Flow::Continue => {
+            Flow::Break | Flow::Continue | Flow::BreakLabel(_) => {
                 Err(Failure::internal("`break`/`continue` escaped a function"))
             }
         }
@@ -1486,10 +1680,149 @@ impl<'a> Interpreter<'a> {
             // false — keeping the guarded `dev::*` / std hooks inert here, so the
             // equivalence gate holds.
             "__hmr_active" => Ok(Value::Bool(false)),
+            // The reactive core's two exception seams (tracker B292), mirroring
+            // `helper_source`'s JS. Only a vilan `panic` is a THROW here
+            // (`FailureKind::Thrown`); fuel, depth, an unsupported capability
+            // and an internal bug are the expansion environment failing rather
+            // than the program throwing, so they keep unwinding past both.
+            "__with_finally" => {
+                let outcome = self.call_value(&take(0), Vec::new());
+                let after = self.call_value(&take(1), Vec::new());
+                match outcome {
+                    Err(failure) => Err(failure),
+                    Ok(_value) => after.map(|_after| Value::Undefined),
+                }
+            }
+            "__guarded" => match self.call_value(&take(0), Vec::new()) {
+                Ok(_value) => Ok(option_none()),
+                Err(failure) if failure.kind == FailureKind::Thrown => {
+                    Ok(option_some(Value::Str(Rc::from(failure.message.as_str()))))
+                }
+                Err(failure) => Err(failure),
+            },
+            // The async twin has no native form: the expansion environment has
+            // no suspension at all, so a body that reaches it is already
+            // outside what a macro may evaluate. Named here so the answer is
+            // this sentence rather than "unknown host call".
+            "__with_finally_async" => Err(Failure::unsupported("`with_finally_async`")),
+            // `__guarded_async` (B374) has no native form either, and for the
+            // same reason: it guards a body that SUSPENDS, and the expansion
+            // environment has no suspension at all.
+            "__guarded_async" => Err(Failure::unsupported("`guarded_async`")),
+            // A host `fetch` Response cannot exist in the expansion
+            // environment — there is no `fetch` here to have made one.
+            "__response_header" => Err(Failure::unsupported("`response_header`")),
+            // proposal/lazy.md §5's memo cell and its forcing helper, mirroring
+            // `helper_source`'s JS exactly — the equivalence gate the paper
+            // names ("the helper needs its interpreter arm in the same commit").
+            // The cell is the one object shape emitted code already uses, with
+            // the paper's `{ state, value, thunk }` plus the `name` the cycle
+            // and poison messages say.
+            "__lazy" => {
+                let mut cell = IndexMap::new();
+                cell.insert(Rc::from("name"), take(0));
+                cell.insert(Rc::from("state"), Value::Number(0.0));
+                cell.insert(Rc::from("value"), Value::Undefined);
+                cell.insert(Rc::from("thunk"), take(1));
+                Ok(Value::Object(Rc::new(RefCell::new(cell))))
+            }
+            // 0 pending, 1 running, 2 done, 3 poisoned — `running` is the cycle
+            // trap. Only a vilan `panic` POISONS (`FailureKind::Thrown`), for
+            // `__with_finally`'s reason: fuel, depth, an unsupported capability
+            // and an internal bug are the expansion environment failing rather
+            // than the program throwing, and a cell must not remember those as
+            // the program's own failure.
+            "__force" => {
+                let cell_value = take(0);
+                let Value::Object(cell) = &cell_value else {
+                    return Err(Failure::internal("__force on a non-cell".to_string()));
+                };
+                let slot = |key: &str| cell.borrow().get(key).cloned().unwrap_or(Value::Undefined);
+                let state = match slot("state") {
+                    Value::Number(state) => state,
+                    _ => 0.0,
+                };
+                let name = match slot("name") {
+                    Value::Str(name) => name.to_string(),
+                    _ => String::new(),
+                };
+                if state == 2.0 {
+                    return Ok(slot("value"));
+                }
+                if state == 1.0 {
+                    return Err(Failure::new(
+                        FailureKind::Thrown,
+                        format!("lazy initialization cycle: `{name}`"),
+                    ));
+                }
+                if state == 3.0 {
+                    let poison = match slot("value") {
+                        Value::Str(message) => message.to_string(),
+                        _ => String::new(),
+                    };
+                    return Err(Failure::new(
+                        FailureKind::Thrown,
+                        format!("lazy `{name}` is poisoned: its initializer panicked: {poison}"),
+                    ));
+                }
+                cell.borrow_mut()
+                    .insert(Rc::from("state"), Value::Number(1.0));
+                let thunk = slot("thunk");
+                match self.call_value(&thunk, Vec::new()) {
+                    Ok(value) => {
+                        let mut slots = cell.borrow_mut();
+                        slots.insert(Rc::from("value"), value.clone());
+                        slots.insert(Rc::from("state"), Value::Number(2.0));
+                        slots.insert(Rc::from("thunk"), Value::Null);
+                        Ok(value)
+                    }
+                    Err(failure) if failure.kind == FailureKind::Thrown => {
+                        let mut slots = cell.borrow_mut();
+                        slots.insert(
+                            Rc::from("value"),
+                            Value::Str(Rc::from(failure.message.as_str())),
+                        );
+                        slots.insert(Rc::from("state"), Value::Number(3.0));
+                        drop(slots);
+                        Err(failure)
+                    }
+                    Err(failure) => Err(failure),
+                }
+            }
             "__shared_new" => {
                 let mut cell = IndexMap::new();
                 cell.insert(Rc::from("v"), take(0));
                 Ok(Value::Object(Rc::new(RefCell::new(cell))))
+            }
+            // `Shared.identity()` — the JS half is `cell.__id ??= next++`, and
+            // this is the same sentence over an `Object` cell (M66): the stamp
+            // is a property beside `v`, minted on the first ask and read by
+            // every later one, so two handles to one cell answer one number.
+            // The counter is per-EXPANSION rather than per-process: a macro
+            // world is torn down between expansions, and an identity that
+            // outlived one would make the same program answer differently
+            // depending on what ran before it.
+            "__shared_identity" => {
+                let cell = match take(0) {
+                    Value::Object(cell) => cell,
+                    other => {
+                        return Err(Failure::unsupported(format!(
+                            "`Shared::identity` over {}",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                let existing = cell.borrow().get("__id").cloned();
+                match existing {
+                    Some(value) => Ok(value),
+                    None => {
+                        let minted = self.next_shared_identity;
+                        self.next_shared_identity += 1.0;
+                        cell.borrow_mut()
+                            .insert(Rc::from("__id"), Value::Number(minted));
+                        Ok(Value::Number(minted))
+                    }
+                }
             }
             "__list_get" => {
                 let list = expect_array(&take(0))?;
@@ -1620,6 +1953,96 @@ impl<'a> Interpreter<'a> {
                     line: line.to_string(),
                 });
                 Ok(Value::Undefined)
+            }
+            // `asset::schedule_at_end` (G23) — the END-OF-EVALUATION HOOK.
+            // Const-only for the reason `emit` is: a runtime path reaching it
+            // would compile clean and carry a live `__schedule_at_end` call
+            // with no runtime binding.
+            //
+            // The argument must be a NAMED function, and the name is the
+            // identity: a repeat request for the same function is a no-op
+            // (the item's set), and the pass RE-ENTERS the function at the end
+            // of evaluation from a site of its own — which an anonymous
+            // closure could not survive, because its environment belongs to
+            // the run that made it and is torn down with that run
+            // (`clear_scopes`). Refusing it here is what keeps the hook's
+            // contract ("it runs, once, at the end") true rather than
+            // sometimes true.
+            "__schedule_at_end" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::schedule_at_end` outside a `const` expression",
+                    ));
+                }
+                let Value::Closure(closure) = take(0) else {
+                    return Err(Failure::internal(
+                        "`asset::schedule_at_end` took a non-function",
+                    ));
+                };
+                let Some(name) = closure.name else {
+                    return Err(Failure::unsupported(
+                        "`asset::schedule_at_end` on an anonymous closure (it takes a named \
+                         function: the name is the identity that makes a repeat request a \
+                         no-op, and a closure's captured scope does not outlive the \
+                         evaluation that made it)",
+                    ));
+                };
+                if !self.scheduled.iter().any(|already| &**already == name) {
+                    self.scheduled.push(Rc::from(name));
+                }
+                Ok(Value::Undefined)
+            }
+            // `asset::stage` / `asset::staged` (B308) — the channel's REGISTRY,
+            // and the reason G23's hook is worth having: a contribution held
+            // under a liveness TOKEN, and the surviving set read back by the
+            // finaliser that emits it. Const-only for `emit`'s reason, and
+            // host-held for a reason of its own — a const pass gives every
+            // site its own scopes, so no vilan global can span one.
+            "__stage_asset" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::stage` outside a `const` expression",
+                    ));
+                }
+                let kind = expect_str(&take(0))?;
+                let token = expect_str(&take(1))?;
+                let line = expect_str(&take(2))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(
+                        "the build's staging registry (`asset::stage`)",
+                    ));
+                };
+                reader.stage(&kind, &token, &line);
+                Ok(Value::Undefined)
+            }
+            "__staged_assets" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::staged` outside a `const` expression",
+                    ));
+                }
+                let kind = expect_str(&take(0))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(
+                        "the build's staging registry (`asset::staged`)",
+                    ));
+                };
+                match reader.staged(&kind) {
+                    Ok(lines) => {
+                        // Charged like a read: the lines enter the program, so
+                        // the budget bounds how much a finaliser carries
+                        // exactly as it bounds how much a `read` does.
+                        let total: usize = lines.iter().map(String::len).sum();
+                        self.charge_amount(total as u64)?;
+                        Ok(Value::Array(Rc::new(RefCell::new(
+                            lines
+                                .into_iter()
+                                .map(|line| Value::Str(line.into()))
+                                .collect(),
+                        ))))
+                    }
+                    Err(why) => Err(Failure::new(FailureKind::Thrown, why)),
+                }
             }
             // `asset::read` — the channel's input direction (docs-port.md
             // §3.3): live only under `eval_const`, like `emit`; resolution,
@@ -1775,6 +2198,33 @@ impl<'a> Interpreter<'a> {
                     Err(index_out_of_bounds(list.len(), index))
                 }
             }
+            // `List.remove(i)`/`List.insert(i, v)` over the native `.splice`,
+            // with the SAME guard the emitted helpers carry: `splice` reads a
+            // negative index from the end and clamps one past it, so const eval
+            // has to refuse the same indices the runtime refuses or a macro
+            // could compute an answer the program cannot.
+            "__remove_at" => {
+                let list = expect_array(&take(0))?;
+                let index = expect_number(&take(1))?;
+                let mut list = list.borrow_mut();
+                if index >= 0.0 && (index as usize) < list.len() && index.fract() == 0.0 {
+                    Ok(list.remove(index as usize))
+                } else {
+                    Err(index_out_of_bounds(list.len(), index))
+                }
+            }
+            "__insert_at" => {
+                let list = expect_array(&take(0))?;
+                let index = expect_number(&take(1))?;
+                let value = take(2);
+                let mut list = list.borrow_mut();
+                if index >= 0.0 && (index as usize) <= list.len() && index.fract() == 0.0 {
+                    list.insert(index as usize, value);
+                    Ok(Value::Undefined)
+                } else {
+                    Err(index_out_of_bounds(list.len(), index))
+                }
+            }
             "__at_put" => {
                 let list = expect_array(&take(0))?;
                 let index = expect_number(&take(1))?;
@@ -1858,16 +2308,21 @@ impl<'a> Interpreter<'a> {
                     .collect();
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
+            // The externally-tagged enum discriminator (mirrors the
+            // `__json_tag` codegen helper). A116: everything that is neither a
+            // string nor a non-empty object answers `""` — a tag no variant can
+            // be spelled with — so the derived decoder's `_` arm reports
+            // "unknown variant" rather than this evaluator reporting an
+            // internal error over a document the caller did not choose. The
+            // codegen twin threw a `TypeError` out of `Object.keys(null)` for
+            // the same inputs.
             "__json_tag" => match take(0) {
-                Value::Str(s) => Ok(Value::Str(s)),
-                Value::Object(object) => match object.borrow().keys().next() {
-                    Some(key) => Ok(Value::Str(key.clone())),
-                    None => Ok(Value::Undefined),
-                },
-                other => Err(Failure::internal(format!(
-                    "__json_tag on {}",
-                    type_name(&other)
-                ))),
+                Value::Str(text) => Ok(Value::Str(text)),
+                Value::Object(object) => Ok(Value::Str(match object.borrow().keys().next() {
+                    Some(key) => key.clone(),
+                    None => Rc::from(""),
+                })),
+                _ => Ok(Value::Str(Rc::from(""))),
             },
             // The normalized JSON kind: `typeof`, with arrays and null named
             // (mirrors the `__json_kind` codegen helper). Basis for the decode
@@ -1955,7 +2410,14 @@ impl<'a> Interpreter<'a> {
             }
             "String" => Ok(Value::Str(Rc::from(self.to_js_string(&take(0))?.as_str()))),
             "Boolean" => Ok(Value::Bool(truthy(&take(0)))),
-            "Number" => to_number(&take(0)).map(Value::Number),
+            // `Number(x)` is ToNumber everywhere but a BigInt, which the
+            // constructor converts (to the nearest double) where ToNumber
+            // throws — the path `BigInt::as_f64` and every `as_*` out of a
+            // `BigInt` take in the emitted JS.
+            "Number" => match take(0) {
+                Value::BigInt(number) => Ok(Value::Number(number as f64)),
+                other => to_number(&other).map(Value::Number),
+            },
             "Number.isNaN" => Ok(Value::Bool(
                 matches!(take(0), Value::Number(n) if n.is_nan()),
             )),
@@ -2104,6 +2566,16 @@ impl<'a> Interpreter<'a> {
             "fetch" | "setTimeout" | "setInterval" | "structuredClone" | "__timer" => {
                 Err(Failure::unsupported(format!("`{name}`")))
             }
+            // The DOM helpers (`std::dom`, A121 and A59 before it). There is no
+            // document at expansion time and there never will be — a macro body
+            // runs in the compiler — so every one of them is a capability MISS
+            // by design, exactly like `fetch` above, rather than the
+            // "unknown host call" an unlisted name falls to (which reads as a
+            // compiler bug and is the wrong thing to tell an author who wrote
+            // `window()` in a macro). The prefix rather than a list: the table
+            // these mirror is `helper_source`'s `__dom_*` family, and a new
+            // member of it is absent here for the same reason as the rest.
+            _ if name.starts_with("__dom_") => Err(Failure::unsupported(format!("`{name}`"))),
             other => Err(Failure::internal(format!("unknown host call `{other}`"))),
         }
     }
@@ -3326,4 +3798,53 @@ fn json_parse_string(text: &str, bytes: &[u8], position: &mut usize) -> Result<S
         }
     }
     Err("Unterminated JSON string".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    /// M43's order pin, and the reason `Scope::vars` can be a plain
+    /// [`crate::fx::FxHashMap`] rather than an `IndexMap`.
+    ///
+    /// The environment map moved off SipHash because 83M of the 85M Ir left in
+    /// `sip.rs` after M31 was `lookup`/`assign` hashing short `&str` names —
+    /// but a hasher swap is only invisible while nothing WALKS the table, and
+    /// `fx.rs` seeds every table from one constant, so an iteration that
+    /// appeared later would be stably ordered by the hash and nobody would
+    /// notice until the constant changed. There is no runtime assertion that
+    /// can catch that; the shape is the claim, so the shape is what is pinned.
+    ///
+    /// What a const evaluation genuinely iterates — a JS `Map`, `Set` or object
+    /// literal it builds — is an `indexmap::IndexMap` and is untouched by M43.
+    #[test]
+    fn the_scope_map_is_never_iterated() {
+        let source = include_str!("interpreter.rs");
+        // Every use of the field, minus this test's own text.
+        let body = source
+            .split_once("mod tests {")
+            .expect("this test's own module opens the tail")
+            .0;
+        for (number, line) in body.lines().enumerate() {
+            let Some(rest) = line.split_once(".vars").map(|(_, rest)| rest) else {
+                continue;
+            };
+            let walker = ["iter", "keys", "values", "drain", "into_iter", "retain"]
+                .into_iter()
+                .find(|walk| rest.trim_start_matches('.').starts_with(walk));
+            assert!(
+                walker.is_none(),
+                "line {} walks `Scope::vars` ({}): the environment map is hashed by \
+                 `fx`'s CONSTANT-seeded hasher, so an iteration order taken from it is a \
+                 stable function of the hash rather than of the program. Give the table \
+                 an `IndexMap` (as the interpreter's Map/Set/object values have) before \
+                 walking it — see `fx.rs`'s header.",
+                number + 1,
+                line.trim()
+            );
+        }
+        // Non-vacuity: the field IS used, so the scan has something to read.
+        assert!(
+            body.matches(".vars").count() >= 5,
+            "the scan found almost no uses of `Scope::vars` — has the field been renamed?"
+        );
+    }
 }

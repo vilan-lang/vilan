@@ -81,17 +81,6 @@ function $q(self, key2) {
 	}
 	return $s;
 }
-function $t(self, fallback) {
-	const $u = self;
-	let $v = null;
-	if ($u[0] === 0) {
-		const x = __clone($u[1]);
-		$v = x;
-	} else {
-		$v = __clone(fallback);
-	}
-	return $v;
-}
 function $w(self) {
 	let result = [  ];
 	for (const entry2 of __map_values(self[0])) {
@@ -141,8 +130,8 @@ console.log($d(copy, "dave"));
 let names = $a();
 $p(names, 1, "one");
 $p(names, 2, "two");
-console.log($t($q(names, 1), "?"));
-console.log($t($q(names, 9), "?"));
+console.log($h($q(names, 1), "?"));
+console.log($h($q(names, 9), "?"));
 let letters = $a();
 $b(letters, "a", 10);
 $b(letters, "b", 20);

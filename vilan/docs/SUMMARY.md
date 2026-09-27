@@ -28,6 +28,7 @@
 - [Server-side rendering](guide/ssr.md)
 - [A full-stack walkthrough](guide/walkthrough.md)
 - [The dev loop](guide/dev-loop.md)
+- [Native binaries](guide/native.md)
 
 # The std reference
 

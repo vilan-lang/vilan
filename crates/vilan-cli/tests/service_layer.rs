@@ -16,11 +16,137 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A `[expose(keyed)]` service, end to end over a real WebSocket: the keyed
+/// channel the macro mints, the `KeyedSource` mirror the generated client
+/// carries, and a per-key subscription taken through it (A39).
+const KEYED_SERVICE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::rpc_server::Service;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	channel: i32,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(ChatClient)]
+struct Chat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+
+impl Chat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		self.messages.update(|&mut store| {
+			store.insert(id, Message { id, channel, body });
+		});
+		self.messages.get().len().as_i32()
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		match self.messages.get().get(id) {
+			Some(let held) => {
+				self.messages.update(|&mut store| {
+					store.insert(id, Message { id, channel = held.channel, body });
+				});
+				true
+			},
+			None => false,
+		}
+	}
+}
+
+// The same surface with the exposure shape as its ONLY difference — the twin
+// that shows the contract hash moving for the keyed form and only for it.
+[service(PlainChatClient)]
+struct PlainChat {
+	[expose] topic: SignalCell<str>,
+	[expose] messages: SignalCell<Map<str, Message>>,
+}
+
+impl PlainChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+let chat: Chat = Chat { topic = Signal::new("general"), messages = Signal::new(Map::new()) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun render(list: List<Message>): str {
+	mut out = "";
+	for message in list {
+		out = out + message.id + "=" + message.body + " ";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match ChatClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			// Both mirrors are the generated ones: `topic` is a
+			// `RemoteSource<str>`, `messages` a `KeyedSource<str, Message>`.
+			let topic = client.topic.sub(|value| print(i"topic:{value}"));
+			let watch = client.messages.sub_key("m2", |value| match value {
+				Some(let message) => print(i"m2:{message.body}"),
+				None => print("m2:absent"),
+			});
+			print(i"post:{client.post("m1", 0, "hello").unwrap_or(0 - 1)}");
+			print(i"post:{client.post("m2", 0, "world").unwrap_or(0 - 1)}");
+			print(i"edit:{client.edit("m1", "hello again").unwrap_or(false)}");
+			print(i"edit:{client.edit("m2", "world again").unwrap_or(false)}");
+			// The per-key mirror holds ITS message and no other, even though
+			// the service's map holds two.
+			print(i"held:{render(client.messages.get().unwrap_or([]))}");
+			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			print(i"hash:{client.contract_hash()}");
+			print(i"plain-hash:{plain.contract_hash()}");
+			print(i"fault:{client.messages.fault().is_some()}");
+			watch.dispose();
+			topic.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
 mod support;
 
 fn temp_project(tag: &str) -> PathBuf {
     let dir =
-        std::env::temp_dir().join(format!("vilan_service_layer_{tag}_{}", std::process::id()));
+        support::scratch_root().join(format!("vilan_service_layer_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -432,6 +558,17 @@ impl StreamingServer {
         StreamingServer { child, lines }
     }
 
+    /// Whether the server has said `needle` YET — everything on its stdout at
+    /// this instant, and no waiting (N68). For a claim about ORDER: what the
+    /// server had not yet done at the moment something else was observed.
+    fn said_yet(&self, needle: &str) -> bool {
+        let mut said = false;
+        while let Ok(line) = self.lines.try_recv() {
+            said |= line.contains(needle);
+        }
+        said
+    }
+
     fn await_line(&self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         loop {
@@ -568,8 +705,13 @@ fn the_builders_wire_matches_the_bytes_recorded_from_serve_service() {
         port,
         "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // The body is `{}` — an envelope with no `method` — so this is a DECODE
+    // failure, and A120 S3 gives a decode failure its own status (400). The
+    // recorded capture read 200, when every outcome the protocol decided was
+    // 200; the envelope below is the half that did not move, and it is the
+    // half a vilan client reads.
     assert!(
-        rpc_response.starts_with("HTTP/1.1 200 OK\r\n"),
+        rpc_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
         "/rpc status line moved:\n{rpc_response}"
     );
     assert!(
@@ -688,13 +830,6490 @@ fn the_segment_match_lets_rpcs_through_where_starts_with_swallowed_it() {
     // Sanity: the real route is untouched by the fix.
     let real = raw_http_closed(
         port,
-        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // 400 because the body is `{}` (a decode failure, A120 S3's own status);
+    // what this pin is about is that the SERVICE answered rather than the
+    // fallback, which the rpc envelope is the evidence for.
     assert!(
-        real.starts_with("HTTP/1.1 200 OK\r\n") && real.contains("application/json"),
+        real.starts_with("HTTP/1.1 400 Bad Request\r\n")
+            && real.contains("application/json")
+            && real.contains("\"Failure\":{\"Decode\""),
         "the real /rpc route must still be answered by the service: {real}"
     );
 
     drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A38: one service instance per connection (`Service::factory`) -------------
+
+/// The factory server used by the two pins below: `Notes` is built once per
+/// connection, so its counter and its `[expose]`d mirror belong to that client
+/// alone, and `whoami` can answer from the `Connection` the factory closed over
+/// — the identity a method could not learn when one instance served the whole
+/// process (`transport-rpc.md` Q9).
+const FACTORY_SERVER: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+
+[service(NotesClient)]
+struct Notes {
+	who: str,
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.set(self.count.get() + by);
+		self.count.get()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+"#;
+
+#[test]
+fn a_factory_service_builds_one_instance_per_connection() {
+    // A38: `Service::factory(build, codec)` calls `build` once per connection
+    // and every route of that connection's dispatcher captures ITS instance.
+    // Two clients therefore count separately, see their own `[expose]`d
+    // mirror, and read back their own identity — none of which is expressible
+    // when `Service::new`'s single protocol answers every connection.
+    let dir = temp_project("factory");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            "{FACTORY_SERVER}{}",
+            r#"
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = i"conn-{connection.id}",
+			count = Signal::new(0),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let a) => {
+			match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+				Ok(let b) => {
+					let watch_a = a.count.sub(|value| print(i"a-mirror:{value}"));
+					let watch_b = b.count.sub(|value| print(i"b-mirror:{value}"));
+					print(i"a-add:{a.add(2).unwrap_or(0 - 1)}");
+					print(i"a-add:{a.add(2).unwrap_or(0 - 1)}");
+					print(i"b-add:{b.add(5).unwrap_or(0 - 1)}");
+					let a_who = a.whoami().unwrap_or("?");
+					let b_who = b.whoami().unwrap_or("?");
+					print(i"a-who:{a_who}");
+					print(i"b-who:{b_who}");
+					print(i"hash:{a.contract_hash()}");
+					watch_a.dispose();
+					watch_b.dispose();
+				},
+				Err(let error) => print(i"b-err:{error.debug()}"),
+			}
+		},
+		Err(let error) => print(i"a-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#
+        ),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // Each connection counts in its own cell: A reaches 4 while B, adding
+        // 5 to a counter that has never been touched, reaches exactly 5.
+        "a-add:2",
+        "a-add:4",
+        "b-add:5",
+        // Each connection's `[expose]`d mirror is its own instance's cell.
+        "a-mirror:4",
+        "b-mirror:5",
+        // The identity a route closed over — impossible with one instance.
+        "a-who:conn-0",
+        "b-who:conn-1",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "a factory service must build one instance per connection; `{expected}` is \
+             missing:\n{stdout}"
+        );
+    }
+    for forbidden in [
+        "a-mirror:5",
+        "a-mirror:7",
+        "b-mirror:2",
+        "b-mirror:4",
+        "b-add:9",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "`{forbidden}` means the two connections shared one instance's state:\n{stdout}"
+        );
+    }
+    // Contract hash unaffected by the per-connection shape: it hashes methods
+    // and exposures (`add(i32)->i32;whoami()->str;expose:count:i32;`), neither
+    // of which the factory touches. Recorded here so a future change to the
+    // generated surface has to say so out loud.
+    assert!(
+        stdout.contains("hash:d1d5fba0"),
+        "the contract hash moved — the factory shape must not change the hashed \
+         surface:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_factory_services_connectionless_rpc_post_is_refused_in_as_many_words() {
+    // A38's one refusal: the `{mount}rpc` POST leg carries no connection, so a
+    // service that builds one instance per connection has nothing to answer it
+    // with — no instance, no session, no identity. Answering it from some other
+    // client's instance would be worse than refusing, so it refuses (501) and
+    // says why. `Service::new`'s shared protocol still answers the same leg,
+    // which the sibling assertion holds down.
+    let dir = temp_project("factory_post");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            "{FACTORY_SERVER}{}",
+            r#"
+fun main() {
+	let shared = Notes { who = "shared", count = Signal::new(0) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = i"conn-{connection.id}",
+			count = Signal::new(0),
+		}, json_codec()))
+		.with_service(Service::new(shared.dispatcher().into_protocol(json_codec())).at("/shared/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#
+        ),
+    );
+
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    let refused = raw_http_closed(
+        port,
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 501 "),
+        "a factory service's POST rpc leg must be refused, not answered: {refused}"
+    );
+    assert!(
+        refused.contains("Service::factory") && refused.contains("WebSocket"),
+        "the refusal must name the cause and the way out: {refused}"
+    );
+    // A120 S3: the 501 is an ENVELOPE now, so a vilan client meeting it reads
+    // a typed `Remote(..)` instead of `Decode("unrecognized reply envelope")`
+    // about a plain-text sentence — and the media type is what tells its
+    // transport that this IS a reply.
+    assert!(
+        refused.contains("application/json") && refused.contains("{\"Failure\":{\"Remote\":"),
+        "the 501 must be an rpc envelope: {refused}"
+    );
+
+    let answered = raw_http_closed(
+        port,
+        "POST /shared/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    // Same `{}` body, same decode failure, same 400 — the point being that
+    // this mount answered with an rpc envelope where the factory mount above
+    // refused with a 501 one.
+    assert!(
+        answered.starts_with("HTTP/1.1 400 Bad Request\r\n")
+            && answered.contains("application/json")
+            && answered.contains("\"Failure\":{\"Decode\""),
+        "a stateless `Service::new` still answers its POST rpc leg: {answered}"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A40: the pre-upgrade gate, and the subprotocol echo ----------------------
+
+/// One raw WebSocket upgrade request, with `extra` folded in before the blank
+/// line — the 101 (or the refusal) exactly as it arrived. Bounded rather than
+/// read-to-close: an accepted upgrade holds the socket open forever.
+fn raw_upgrade(port: u16, path: &str, extra: &str) -> String {
+    raw_upgrade_within(port, path, extra, Duration::from_millis(1500))
+}
+
+/// How long a raw upgrade may take to be ANSWERED before the server is
+/// considered hung (N68). It is a liveness bound, not a claim: no test asserts
+/// a handshake is fast, and every green run returns the moment the answer
+/// lands. It is sized against the one pin that deliberately races a server-side
+/// timer — a verifier that sleeps 30 s against a 300 ms bound — so that "the
+/// refusal arrived while the hook was still sleeping" is a window no loaded box
+/// closes.
+const VERIFIER_LIVENESS: Duration = Duration::from_secs(30);
+
+/// `raw_upgrade` with the read bound named by the caller (N68). A refused
+/// upgrade closes the socket, so the read returns the moment the answer lands
+/// and a green run never pays the bound — which is what lets a test that must
+/// not race the SERVER's own timer pass a liveness number here instead of a
+/// performance one.
+fn raw_upgrade_within(port: u16, path: &str, extra: &str, bound: Duration) -> String {
+    raw_http_bounded(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n{extra}\r\n"
+        ),
+        bound,
+    )
+}
+
+/// A service that gates its upgrades: `"good"` is `ada`, any other token is
+/// forbidden, no token at all is unauthorized. The mechanism is the app's —
+/// std verifies nothing — so the pin uses the cheapest possible check.
+const AUTHORIZED_SERVER: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+
+[service(NotesClient)]
+struct Notes {
+	who: str,
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Notes {
+			who = connection.session.identity,
+			count = Signal::new(0),
+		}, json_codec())
+			.authorize(|handshake: Handshake| match handshake.token() {
+				Some(let token) => if token == "good" {
+					Result::Ok(Session::of("ada").with_credential(token))
+				} else {
+					Result::Err(Reject::Forbidden)
+				},
+				None => Result::Err(Reject::Unauthorized),
+			}))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// Boot `source` as a long-running server and return `(server, port)`.
+fn spawn_service_server(tag: &str, source: &str) -> (StreamingServer, u16) {
+    let dir = temp_project(tag);
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", source);
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+    (server, port)
+}
+
+#[test]
+fn the_handshake_echoes_the_subprotocol_it_selected() {
+    // RFC 6455 §4.2.2: a client that offered subprotocols must hear the
+    // server's selection back in the 101. This server never read the header
+    // and never echoed one, so a BROWSER — which enforces the rule — closed
+    // every connection a page opened with a subprotocol, silently. The echo is
+    // independent of `authorize` and pinned here on an ungated service, offer
+    // by offer; an offer of nothing must still produce the byte-identical
+    // handshake it always did.
+    let (server, port) = spawn_service_server("echo", BYTE_IDENTICAL_SERVER);
+
+    let selected = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.abc\r\n",
+    );
+    assert!(
+        selected.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "the offer must still be upgraded: {selected}"
+    );
+    assert!(
+        selected.contains("Sec-WebSocket-Protocol: vilan-rpc\r\n"),
+        "the server must echo the subprotocol it selected, or a browser closes the \
+         connection: {selected}"
+    );
+    assert!(
+        !selected.contains("token.abc"),
+        "the credential rides the offer; the server selects the PROTOCOL, never echoes the \
+         token back: {selected}"
+    );
+
+    // Not among the offers it knows: the client's first choice is selected, so
+    // the connection is not closed for want of an echo.
+    let unknown = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: chat, superchat\r\n");
+    assert!(
+        unknown.contains("Sec-WebSocket-Protocol: chat\r\n"),
+        "an offer with no vilan-rpc in it still needs an echo from the list: {unknown}"
+    );
+
+    // A credential is not a protocol: an offer of nothing else selects
+    // nothing, rather than naming `token.…` as the protocol in play and
+    // writing the credential back out in the reply.
+    let credential_only = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: token.secret\r\n");
+    assert!(
+        credential_only.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "an ungated service still upgrades it: {credential_only}"
+    );
+    assert!(
+        !credential_only.contains("Sec-WebSocket-Protocol"),
+        "a `token.` offer must never be selected or echoed: {credential_only}"
+    );
+
+    // No offer, no echo — the handshake byte-for-byte as it was before A40.
+    let silent = raw_upgrade(port, "/", "");
+    assert!(
+        silent.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "a bare handshake must still upgrade: {silent}"
+    );
+    assert!(
+        !silent.contains("Sec-WebSocket-Protocol"),
+        "a client that offered nothing must be sent no selection: {silent}"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn an_unauthorized_handshake_is_refused_before_the_upgrade() {
+    // A40: `authorize` runs on the upgrade REQUEST, and a refusal answers the
+    // raw socket and destroys it — no connection id, no reactive session, no
+    // service instance — which is the whole reason the gate is here and not
+    // inside a method. The three answers are distinct because the app's three
+    // answers are.
+    //
+    // A47 split the ANSWER in two without moving the gate. Everything that
+    // is not a vilan rpc client still gets the HTTP status line — a browser
+    // typing the URL, a probe, `curl`, a scanner — so the HTTP semantics of a
+    // refused handshake are unchanged for everything that speaks HTTP and not
+    // this protocol. A client that offered `vilan-rpc` gets the same refusal
+    // as one frame on an upgraded socket instead, because neither host
+    // WebSocket API shows a client the status of a failed handshake and the
+    // one that used to be lost was the one it needed most.
+    // `a_refused_vilan_client_is_told_its_refusal_in_one_frame` below is that
+    // half; here is the half that did not move.
+    let (server, port) = spawn_service_server("authorize", AUTHORIZED_SERVER);
+
+    let missing = raw_upgrade(port, "/", "");
+    assert!(
+        missing.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "a handshake with no credential must be refused 401: {missing}"
+    );
+    // A credential this app rejects, from something that is not a vilan client
+    // (no `vilan-rpc` in the offer): the status line, as before.
+    let forbidden = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: token.bad\r\n");
+    assert!(
+        forbidden.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "a credential the app rejects must be refused 403: {forbidden}"
+    );
+    for refusal in [&missing, &forbidden] {
+        assert!(
+            !refusal.contains("101 Switching Protocols"),
+            "a refusal to a non-vilan client must never be upgraded: {refusal}"
+        );
+    }
+
+    let admitted = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+    );
+    assert!(
+        admitted.starts_with("HTTP/1.1 101 Switching Protocols\r\n")
+            && admitted.contains("Sec-WebSocket-Protocol: vilan-rpc\r\n"),
+        "the credential the app accepts must be upgraded, echo included: {admitted}"
+    );
+
+    // The connectionless legs carry no handshake to gate, so an authorized
+    // service refuses them rather than leaving them as the open door around
+    // `authorize`. The rpc leg answers in the protocol's own vocabulary —
+    // where `RpcError::Unauthorized`, constructed nowhere in std until now,
+    // gets its producer.
+    let posted = raw_http_closed(
+        port,
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert!(
+        posted.starts_with("HTTP/1.1 401 Unauthorized\r\n") && posted.contains("Unauthorized"),
+        "an authorized service's POST rpc leg must answer a typed Unauthorized failure: {posted}"
+    );
+    let streamed = raw_http_bounded(
+        port,
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(1500),
+    );
+    assert!(
+        streamed.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "an authorized service's SSE leg must be refused too: {streamed}"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn the_connection_ceiling_refuses_the_handshake_over_it() {
+    // The DoS half of A40, and the part that works with `authorize` absent: a
+    // ceiling on live connections, refused at the handshake with 429 rather
+    // than after a socket, a session and an instance already exist. Two
+    // sockets are held open across the third attempt, which is what makes the
+    // count a count.
+    let source = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).max_connections(2))",
+    );
+    assert!(
+        source.contains("max_connections(2)"),
+        "the ceiling must actually be spliced into the server source"
+    );
+    let (server, port) = spawn_service_server("ceiling", &source);
+
+    let mut held = Vec::new();
+    for attempt in 0..2 {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).expect("connect to the reported port");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .expect("set a read timeout");
+        stream
+            .write_all(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+                 Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+                 13\r\n\r\n"
+                    .as_bytes(),
+            )
+            .expect("send the upgrade");
+        let mut buffer = [0u8; 512];
+        let read = stream.read(&mut buffer).expect("read the handshake reply");
+        let reply = String::from_utf8_lossy(&buffer[..read]).into_owned();
+        assert!(
+            reply.starts_with("HTTP/1.1 101 "),
+            "connection {attempt} is under the ceiling and must be upgraded: {reply}"
+        );
+        held.push(stream);
+    }
+
+    let over = raw_upgrade(port, "/", "");
+    assert!(
+        over.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "the handshake over the ceiling must be refused 429, not upgraded: {over}"
+    );
+
+    // A slot released by a closed connection is a slot again.
+    drop(held.pop());
+    let after = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = raw_upgrade(port, "/", "");
+            if reply.starts_with("HTTP/1.1 101 ") || Instant::now() > deadline {
+                break reply;
+            }
+        }
+    };
+    assert!(
+        after.starts_with("HTTP/1.1 101 "),
+        "closing a connection must return its slot to the ceiling: {after}"
+    );
+
+    drop(held);
+    drop(server);
+}
+
+#[test]
+fn an_authorized_client_connects_with_its_credential_and_is_that_identity() {
+    // The whole A40 loop, end to end and in one process: the client offers
+    // `["vilan-rpc", "token.good"]` through `connect_with`, the server selects
+    // and echoes `vilan-rpc`, `authorize` turns the credential into a
+    // `Session`, and A38's factory builds the instance from it — so `whoami`
+    // answers with an identity that arrived on the HANDSHAKE and was never a
+    // parameter of any call.
+    let dir = temp_project("credential");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &(AUTHORIZED_SERVER
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\nimport std::process::exit;\nimport std::rpc::rpc_protocols;\nimport std::result::Result::{ Ok, Err };",
+            )
+            .replace(
+                r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
+                "		.on_start(|server| run(server.port()))",
+            )
+            + r#"
+fun run(port: i32) {
+	match NotesClient::connect_with(i"ws://localhost:{port}/", json_codec(), rpc_protocols("good")) {
+		Ok(let client) => {
+			let who = client.whoami().unwrap_or("?");
+			print(i"who:{who}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("who:ada"),
+        "the credential offered on the handshake must reach the factory as the connection's \
+         identity:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_greeting_bound_destroys_a_silent_socket_and_spares_a_speaking_one() {
+    // The third of A40's cheap limits: a socket that completes the handshake
+    // and then says nothing is destroyed, so a slowloris costs a timer rather
+    // than a connection slot for the life of the process. It is a GREETING
+    // bound, not an idle one — disarmed by the first inbound byte — which is
+    // the half that matters, because a client that connected and is only
+    // watching mirrors sends nothing for hours and must not be touched.
+    let source = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_timeout(500))",
+    );
+    assert!(source.contains("handshake_timeout(500)"));
+    let (server, port) = spawn_service_server("greeting", &source);
+
+    // Silent: the 101 lands, then the server hangs up on its own.
+    let mut quiet = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    quiet
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set a read timeout");
+    quiet
+        .write_all(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n"
+                .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let mut buffer = [0u8; 512];
+    let first = quiet.read(&mut buffer).expect("read the 101");
+    assert!(
+        String::from_utf8_lossy(&buffer[..first]).starts_with("HTTP/1.1 101 "),
+        "the handshake itself is not what the bound refuses"
+    );
+    // Whatever else arrives (the `__conn:` frame), the stream must reach EOF.
+    let closed = loop {
+        match quiet.read(&mut buffer) {
+            Ok(0) => break true,
+            Ok(_more) => {}
+            Err(_timeout) => break false,
+        }
+    };
+    assert!(
+        closed,
+        "a socket that upgraded and then said nothing must be destroyed by the greeting bound"
+    );
+
+    // Speaking: one masked ping is a greeting. The pong proves it was heard,
+    // and the socket must still be there well past the bound.
+    let mut talker = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    talker
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set a read timeout");
+    talker
+        .write_all(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n"
+                .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let handshake = talker.read(&mut buffer).expect("read the 101");
+    assert!(String::from_utf8_lossy(&buffer[..handshake]).starts_with("HTTP/1.1 101 "));
+    // FIN + opcode 0x9 (ping), masked, empty payload.
+    talker
+        .write_all(&[0x89, 0x80, 0x01, 0x02, 0x03, 0x04])
+        .expect("send a ping");
+    let mut saw_pong = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match talker.read(&mut buffer) {
+            Ok(0) => panic!("a socket that greeted the server must not be destroyed by the bound"),
+            Ok(read) => {
+                if buffer[..read].windows(2).any(|pair| pair == [0x8a, 0x00]) {
+                    saw_pong = true;
+                    break;
+                }
+            }
+            Err(_timeout) => break,
+        }
+    }
+    assert!(
+        saw_pong,
+        "the ping must be answered, which is what disarms the bound"
+    );
+    assert!(
+        talker
+            .write_all(&[0x89, 0x80, 0x01, 0x02, 0x03, 0x04])
+            .is_ok(),
+        "the socket must still be live past the greeting bound"
+    );
+
+    drop(server);
+}
+
+// --- A47: a refused client learns it was refused, and stops -------------------
+
+/// The refusal a vilan rpc client can act on, on the wire: the server upgrades
+/// it and writes ONE `__reject:<status>` frame before closing.
+///
+/// The reason this shape exists rather than the obvious one — read the HTTP
+/// status off the failed handshake — is that neither host WebSocket
+/// implementation will show it. Measured on node v24.2.0 (undici's global
+/// `WebSocket`, which is what `std::rpc` binds): a 401, a 403, a 429, a socket
+/// destroyed mid-handshake, a refused TCP connection and a server with no
+/// upgrade handler at all produce byte-for-byte the same error event
+/// ("Received network error or non-101 status code.") and the same close
+/// (code 1002, `wasClean: false`). A47's option (a) — node's `ws` package and
+/// its `unexpected-response` event — is not available here at all: std binds
+/// the host global on every platform and adds no client dependency, and the
+/// browser API exposes strictly less by design.
+///
+/// The DoS trade this pays is bounded by which refusals are eligible.
+/// `Reject::TooMany` never is, and `TooMany` is what `max_connections` and
+/// `handshake_rate` produce — so the refusals a FLOOD produces are exactly the
+/// ones that never upgrade, and an attacker cannot reach the upgrading path
+/// more often than the rate limiter admits. The socket is destroyed in the
+/// same turn either way, so nothing is held open by either shape;
+/// `the_connection_ceiling_refuses_the_handshake_over_it` above is the pin
+/// that the cheap path is still the cheap path.
+#[test]
+fn a_refused_vilan_client_is_told_its_refusal_in_one_frame() {
+    let (server, port) = spawn_service_server("refusal_frame", AUTHORIZED_SERVER);
+
+    let refused = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.bad\r\n",
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "a vilan client must be upgraded so the refusal can be a frame: {refused}"
+    );
+    assert!(
+        refused.contains("Sec-WebSocket-Protocol: vilan-rpc\r\n"),
+        "the refusing handshake is a normal one up to the first frame: {refused}"
+    );
+    assert!(
+        refused.contains("__reject:403"),
+        "the refusal frame must carry the status the socket API will not show: {refused}"
+    );
+    // One frame and then the close — not a connection that lingers.
+    assert!(
+        !refused.contains("__conn:"),
+        "a refused client must never be announced a connection id: {refused}"
+    );
+
+    // …and the same client offering nothing this server accepts is still
+    // refused, with the status that names WHY it is not a judgement about a
+    // credential this server ever saw.
+    let missing = raw_upgrade(port, "/", "Sec-WebSocket-Protocol: vilan-rpc\r\n");
+    assert!(
+        missing.starts_with("HTTP/1.1 101 Switching Protocols\r\n")
+            && missing.contains("__reject:401"),
+        "a vilan client with no credential must hear 401 as a frame: {missing}"
+    );
+
+    drop(server);
+}
+
+/// The whole of A47 from the client's side: `connect_with` on a credential the
+/// server refuses comes back `RpcError::Unauthorized`, AT ONCE.
+///
+/// Both halves are the claim. Before this the client could not tell a refusal
+/// from an unreachable server, so it did what an unreachable server deserves —
+/// ten redials over about 24 seconds of backoff — and then reported
+/// `Transport("could not reach …")`, which is a false statement about a server
+/// that answered. The elapsed bound is the observable half of "stops
+/// retrying": one attempt costs no backoff at all, and the budget it used to
+/// burn is 250+500+1000+2000+4000×6 ms ≈ 27.75 s of sleeping alone, so five
+/// seconds separates the two behaviours by a factor the machine's load cannot
+/// close.
+///
+/// Proven red first by planting the pre-A47 server (no refusal ever takes the
+/// frame path), which is the exact behaviour this item was filed against: the
+/// same program answers
+/// `refused:Transport("could not reach ws://localhost:44659/")`, and the run
+/// takes 34.0 s where the fixed one takes 11.2 s — both figures including the
+/// build.
+#[test]
+fn a_refused_client_reports_unauthorized_without_burning_the_retry_budget() {
+    let dir = temp_project("refused_client");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &(AUTHORIZED_SERVER
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\nimport std::process::exit;\nimport std::rpc::rpc_protocols;\nimport std::result::Result::{ Ok, Err };",
+            )
+            // Every handshake the server sees says so, which is what makes the
+            // retry COUNT observable from outside (tracker N61).
+            .replace(
+                "			.authorize(|handshake: Handshake| match handshake.token() {",
+                "			.authorize(|handshake: Handshake| {\n				print(\"handshake:seen\");\n				match handshake.token() {",
+            )
+            .replace(
+                "				None => Result::Err(Reject::Unauthorized),\n			}))",
+                "				None => Result::Err(Reject::Unauthorized),\n				}\n			}))",
+            )
+            .replace(
+                r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
+                "		.on_start(|server| run(server.port()))",
+            )
+            + r#"
+fun run(port: i32) {
+	match NotesClient::connect_with(i"ws://localhost:{port}/", json_codec(), rpc_protocols("bad")) {
+		Ok(let _client) => print("connected:unexpected"),
+		Err(let error) => print(i"refused:{error.debug()}"),
+	}
+	exit(0);
+}
+"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("run")
+        .arg(".")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the refused-client program");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains("refused:Unauthorized"),
+        "a refused connect must report RpcError::Unauthorized; stdout was:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // "Stops retrying", asserted as the COUNT and not as the clock (tracker
+    // N61). This used to bound a whole `vilan run .` — build included — at 45 s
+    // WALL: 52.56 s at loadavg 184 and 5.88 s at loadavg 59, which is a gate on
+    // the runner rather than on the program (`diagnostics_budget`'s class, M27's
+    // rule). The server announces every handshake it is asked for, so the
+    // redials are countable directly: a burned budget is ten of them, and the
+    // behaviour this pin exists for is one. No clock at all, and it is the
+    // stronger claim — a machine slow enough to sleep through 27.75 s inside 45
+    // could have passed the old bound while redialing.
+    let handshakes = stdout.matches("handshake:seen").count();
+    assert_eq!(
+        handshakes, 1,
+        "a refusal ends the dial loop, so the server must see exactly ONE \
+         handshake; it saw {handshakes}. Pre-A47 the client redialed ten times \
+         over ~27.75 s of backoff. stdout was:\n{stdout}"
+    );
+
+    drop(dir);
+}
+
+// --- A48: bounding the verifier, and the address a limit is keyed on ---------
+
+/// `authorize_timeout`: a verifier that does not answer is refused and the
+/// socket destroyed, rather than held for as long as the verifier hangs — one
+/// held socket per client trying to connect, which is a denial of service the
+/// server inflicts on itself without a single malformed byte from anyone.
+///
+/// The refusal is 429 (`Reject::TooMany`), deliberately: the `Reject` enum
+/// draws judgement (401/403) against LIMIT (429), and a verifier that ran out
+/// of time says nothing about the credential — it is the one refusal a client
+/// SHOULD retry. It is answered on the timeout's own turn, not when the hook
+/// eventually returns, which is the whole point.
+///
+/// N68: the claim is ORDER, and it is asserted as order. It used to be a 2,500
+/// ms wall bound over a 300 ms claim — the last wall bound N61's sweep left
+/// standing, and a gate on the runner rather than on the program (M27's rule):
+/// a box that stalls between the 429 landing and this process reading it fails
+/// a server that did exactly the right thing. So the verifier now SAYS when it
+/// wakes, and the pin reads the 429 and asks the server whether the hook had
+/// answered yet. The hook sleeps 30 s, so "not yet" is a window no healthy run
+/// comes near and a green run never waits for: the refusal closes the socket
+/// at the bound, the read returns there, and the sleeping timer dies with the
+/// child. The read bound is a liveness number for the same reason.
+///
+/// Proven red first by planting `authorize_timeout(0)` (the default, and what
+/// every service had before A48): the socket is held, unanswered, while the
+/// verifier sleeps, and what comes back is the eventual 101 rather than the
+/// refusal — which is the shape of the item.
+#[test]
+fn a_verifier_that_does_not_answer_in_time_is_refused_and_the_socket_destroyed() {
+    let source = AUTHORIZED_SERVER
+        .replace(
+            "import std::io::print;",
+            "import std::io::print;\nimport std::time::{ Duration, sleep_for };",
+        )
+        .replace(
+            "			.authorize(|handshake: Handshake| match handshake.token() {",
+            "			.authorize_timeout(300)\n			.authorize(|handshake: Handshake| {\n				sleep_for(Duration::millis(30000));\n				print(\"verifier:answered\");\n				match handshake.token() {",
+        )
+        .replace(
+            "				None => Result::Err(Reject::Unauthorized),\n			}))",
+            "				None => Result::Err(Reject::Unauthorized),\n				}\n			}))",
+        );
+    assert!(
+        source.contains("authorize_timeout(300)")
+            && source.contains("sleep_for(Duration::millis(30000))")
+            && source.contains("verifier:answered"),
+        "the bound, the slow verifier and its wake marker must all be spliced into the \
+         server source:\n{source}"
+    );
+    let (server, port) = spawn_service_server("verifier_bound", &source);
+
+    let refused = raw_upgrade_within(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+        VERIFIER_LIVENESS,
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "a verifier over its bound must be refused 429: {refused}"
+    );
+    assert!(
+        !server.said_yet("verifier:answered"),
+        "the refusal must land on the BOUND and not when the hook finally answers: the \
+         verifier had already woken by the time the 429 arrived, so this proves nothing \
+         about the bound. Response was: {refused}"
+    );
+    assert!(
+        !refused.contains("101 Switching Protocols") && !refused.contains("__reject:"),
+        "a timed-out verification is a limit, not a judgement, so it takes the cheap path: {refused}"
+    );
+
+    drop(server);
+}
+
+/// `trust_forwarded_for`: behind a proxy every client shares the proxy's
+/// socket address, so a per-address `handshake_rate` degenerates into a global
+/// one that refuses everybody as soon as one client is noisy. With the switch
+/// on, the key is the first entry of `X-Forwarded-For`.
+///
+/// The control is the load-bearing half and it is the DEFAULT: with the switch
+/// OFF the header is not read at all, so a client cannot pick its own bucket
+/// by writing one line — which is exactly what a directly-exposed server that
+/// trusted the header would let anybody do.
+///
+/// Proven red first by planting the old key (`socket.remote_address()`
+/// unconditionally): "client 1 attempt 0 is inside its own budget: HTTP/1.1
+/// 429 Too Many Requests" — the third handshake overall, from the one socket
+/// peer they all share, which is the degeneration the switch exists to undo.
+#[test]
+fn a_trusted_forwarded_header_is_what_the_handshake_rate_keys_on() {
+    let trusting = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_rate(2, 10000.0).trust_forwarded_for(true))",
+    );
+    assert!(trusting.contains("trust_forwarded_for(true)"));
+    let (server, port) = spawn_service_server("forwarded_trusted", &trusting);
+
+    // Three handshakes, three claimed clients: each has its own budget of two.
+    for client in 0..3 {
+        for attempt in 0..2 {
+            let reply = raw_upgrade(
+                port,
+                "/",
+                &format!("X-Forwarded-For: 203.0.113.{client}\r\n"),
+            );
+            assert!(
+                reply.starts_with("HTTP/1.1 101 "),
+                "client {client} attempt {attempt} is inside its own budget: {reply}"
+            );
+        }
+    }
+    // The third from one of them is over that client's budget, and nobody
+    // else's.
+    let over = raw_upgrade(port, "/", "X-Forwarded-For: 203.0.113.1\r\n");
+    assert!(
+        over.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "the third handshake from one forwarded client must be refused: {over}"
+    );
+    let neighbour = raw_upgrade(port, "/", "X-Forwarded-For: 203.0.113.9\r\n");
+    assert!(
+        neighbour.starts_with("HTTP/1.1 101 "),
+        "a different forwarded client must be unaffected by its neighbour: {neighbour}"
+    );
+    drop(server);
+
+    // The control: with the switch off — the default — the header is ignored
+    // and every one of these shares the socket peer's single budget.
+    let plain = BYTE_IDENTICAL_SERVER.replace(
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))",
+        ".with_service(Service::new(counter.dispatcher().into_protocol(json_codec())).handshake_rate(2, 10000.0))",
+    );
+    let (untrusting, plain_port) = spawn_service_server("forwarded_untrusted", &plain);
+    for client in 0..2 {
+        let reply = raw_upgrade(
+            plain_port,
+            "/",
+            &format!("X-Forwarded-For: 203.0.113.{client}\r\n"),
+        );
+        assert!(
+            reply.starts_with("HTTP/1.1 101 "),
+            "the first two share one budget and are inside it: {reply}"
+        );
+    }
+    let spoofed = raw_upgrade(plain_port, "/", "X-Forwarded-For: 203.0.113.77\r\n");
+    assert!(
+        spoofed.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "an untrusting server must not let a header buy a fresh budget: {spoofed}"
+    );
+
+    drop(untrusting);
+}
+
+#[test]
+fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subscribe_per_key() {
+    // The macro half of A39, exercised where it actually has to work: a real
+    // server, a real handshake, the generated `connect`. `topic` is a plain
+    // `[expose]` and mirrors as a `RemoteSource<str>`; `messages` is
+    // `[expose(keyed)]` over a `Map<str, Message>` and mirrors as a
+    // `KeyedSource<str, Message>`, which is what makes `sub_key` reachable
+    // from generated client code at all — the thing A39 recorded as stopping
+    // at the client, because the `ReactiveClient` behind the generated mirrors
+    // is not public (A30) and a hand-wired channel could not be reached.
+    //
+    // The load-bearing line is `held:`: the client leased ONE key, so its
+    // mirror holds exactly that message while the service's map holds two.
+    // Under `[expose]` the same subscription would have carried both, and
+    // every other message the service ever accepts.
+    let dir = temp_project("keyed");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", KEYED_SERVICE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The per-key mirror seeds absent, then follows its own key alone.
+        "m2:absent",
+        "m2:world",
+        "m2:world again",
+        // The plain mirror beside it is untouched by any of this.
+        "topic:general",
+        "topic-held:general",
+        // Two messages posted, one message held.
+        "post:1",
+        "post:2",
+        "edit:true",
+        "held:m2=world again",
+        "fault:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the keyed service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("held:m1="),
+        "a per-key subscription received a message it never asked for:\n{stdout}"
+    );
+    // The contract hash moves for the keyed form and ONLY for it. `PlainChat`
+    // is the same surface with the exposure shape as its only difference, and
+    // it hashes differently — a client built against one cannot connect to the
+    // other, which is exactly right: the frames differ. The plain-`[expose]`
+    // hash pinned in `a_factory_service_builds_one_instance_per_connection`
+    // (`d1d5fba0`) is the other half of the claim: it did not move at all.
+    assert!(
+        stdout.contains("hash:43077e29"),
+        "the keyed service's contract hash moved:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("plain-hash:c63e39e3"),
+        "the plain twin's contract hash moved:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `RpcError` compares (tracker A52). The commonest thing an application does
+/// with a typed error is ask WHICH one it is, and until the derive landed
+/// `error == RpcError::Unauthorized` was a compile error — the answer was a
+/// `match` with an arm per variant, or `debug()` read back as text. No server
+/// here: the claim is about the type, not about a wire.
+///
+/// Red first: with the derive off `vilan run` refuses with "type 'RpcError'
+/// does not implement the `PartialEq` operator" on every one of these lines.
+#[test]
+fn an_rpc_error_compares_by_arm_and_by_payload() {
+    let dir = temp_project("rpc_error_eq");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::rpc::RpcError;
+
+fun main() {
+	let held: RpcError = RpcError::Unauthorized;
+	print(i"same-unit:{held == RpcError::Unauthorized}");
+	print(i"same-payload:{RpcError::Transport("gone") == RpcError::Transport("gone")}");
+	print(i"other-payload:{RpcError::Transport("gone") == RpcError::Transport("here")}");
+	print(i"other-arm:{RpcError::Decode("gone") == RpcError::Transport("gone")}");
+	print(i"unit-vs-payload:{held == RpcError::Contract("drift")}");
+	print(i"ne:{held != RpcError::Unauthorized}");
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "same-unit:true",
+        // A payload arm compares its SENTENCE, which is what a `Transport`
+        // against a literal means.
+        "same-payload:true",
+        "other-payload:false",
+        // Same payload, different arm — the discriminant is part of it.
+        "other-arm:false",
+        "unit-vs-payload:false",
+        "ne:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the comparison run:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A52: the 503 arm — an infrastructure refusal an app can give -----------
+
+/// A service that is up, reads the token fine, and still says no: the
+/// infrastructure behind it is not ready. `AUTHORIZED_SERVER` with its whole
+/// `authorize` body replaced, so the two differ in exactly the refusal.
+fn draining_server() -> String {
+    let refused = AUTHORIZED_SERVER.replace(
+        r#"			.authorize(|handshake: Handshake| match handshake.token() {
+				Some(let token) => if token == "good" {
+					Result::Ok(Session::of("ada").with_credential(token))
+				} else {
+					Result::Err(Reject::Forbidden)
+				},
+				None => Result::Err(Reject::Unauthorized),
+			}))"#,
+        r#"			.authorize(|_handshake: Handshake| Result::Err(Reject::Unavailable)))"#,
+    );
+    assert!(
+        refused.contains("Reject::Unavailable"),
+        "the authorize body to replace moved"
+    );
+    refused
+}
+
+/// The wire half of A52's arm: 503 both ways out of `refuse_upgrade`. A vilan
+/// client (one that offered `vilan-rpc`) is upgraded and told
+/// `__reject:503` as a frame; anything else — a browser, a probe, a health
+/// check — gets the plain status line, `503 Service Unavailable`.
+///
+/// `Unavailable` is eligible for the frame path where `TooMany` is not, and the
+/// DoS bound A47 argued is untouched: eligibility is "the APP decided this",
+/// and the app's `authorize` runs behind `handshake_rate` and
+/// `max_connections`, which produce `TooMany` and nothing else.
+///
+/// Red first: with the arm absent the program does not compile
+/// (`Reject::Unavailable` is not a variant); with the arm present but left out
+/// of `tells_the_client`, the frame leg reads back `HTTP/1.1 503 Service
+/// Unavailable` instead of the 101 and the client cannot see it at all.
+#[test]
+fn an_unavailable_service_refuses_with_503_as_a_frame_and_as_a_status_line() {
+    let (server, port) = spawn_service_server("unavailable", &draining_server());
+
+    let told = raw_upgrade(
+        port,
+        "/",
+        "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+    );
+    assert!(
+        told.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "a vilan client must be upgraded so the 503 can be a frame: {told}"
+    );
+    assert!(
+        told.contains("__reject:503"),
+        "the refusal frame must carry 503: {told}"
+    );
+    assert!(
+        !told.contains("__conn:"),
+        "a refused client must never be announced a connection id: {told}"
+    );
+
+    // Everything that does not speak this protocol keeps plain HTTP semantics.
+    let plain = raw_upgrade(port, "/", "");
+    assert!(
+        plain.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "a non-rpc handshake must get the status line: {plain}"
+    );
+
+    drop(server);
+}
+
+/// The client half, end to end: `connect` against a service whose `authorize`
+/// answers `Reject::Unavailable` comes back `RpcError::Unavailable` — not
+/// `Unauthorized` (the credential is fine), not `Transport` (the server
+/// answered) — and it comes back AT ONCE, because a refusal ends the dial loop
+/// exactly as A47's does.
+///
+/// The comparison is written with `==` rather than a `match`, which is A52's
+/// other half working: the derive and the arm are one surface for an app.
+#[test]
+fn a_client_refused_by_infrastructure_reports_unavailable_and_compares_equal() {
+    let dir = temp_project("unavailable_client");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &(draining_server()
+            // The same handshake announcement N61 gave A47's pin, for the same
+            // reason: the retry count is the claim, not the clock.
+            .replace(
+                "			.authorize(|_handshake: Handshake| Result::Err(Reject::Unavailable)))",
+                "			.authorize(|_handshake: Handshake| {\n				print(\"handshake:seen\");\n				Result::Err(Reject::Unavailable)\n			}))",
+            )
+            .replace(
+                "import std::io::print;",
+                "import std::io::print;\nimport std::process::exit;\nimport std::rpc::RpcError;\nimport std::result::Result::{ Ok, Err };",
+            )
+            .replace(
+                r#"		.on_start(|server| print(i"ready {server.port()}"))"#,
+                "		.on_start(|server| run(server.port()))",
+            )
+            + r#"
+fun run(port: i32) {
+	match NotesClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let _client) => print("connected:unexpected"),
+		Err(let error) => {
+			print(i"refused:{error.debug()}");
+			print(i"is-unavailable:{error == RpcError::Unavailable}");
+			print(i"is-unauthorized:{error == RpcError::Unauthorized}");
+		},
+	}
+	exit(0);
+}
+"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("run")
+        .arg(".")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the unavailable-client program");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    for expected in [
+        "refused:Unavailable",
+        "is-unavailable:true",
+        "is-unauthorized:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing; stdout was:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The same claim A47's pin carries, counted the same way (tracker N61): a
+    // refusal ends the dial loop, so the server is asked for one handshake.
+    let handshakes = stdout.matches("handshake:seen").count();
+    assert_eq!(
+        handshakes, 1,
+        "an infrastructure refusal ends the dial loop too, so the server must \
+         see exactly ONE handshake; it saw {handshakes}. stdout was:\n{stdout}"
+    );
+
+    drop(dir);
+}
+
+/// A52's steer: bare `connect_socket(url)` offers `vilan-rpc`, so the refusal
+/// frame reaches it. The observable is the one A47 built the frame for — a
+/// refused connect answers AT ONCE with the server's status in the sentence,
+/// where an offer-nothing client cannot be told and pays the whole retry
+/// budget for `could not reach …`.
+///
+/// This is the call a first program writes: `connect_socket` + a hand-built
+/// `Client { transport = socket.transport(), … }` is the WebSocket fence in
+/// `guide/services.md` and the shape three pins in this file already use, so
+/// the bare spelling being the blind one was the wrong default. The explicit
+/// list is untouched, which the second half asserts: `connect_socket_with(url,
+/// ["chat.v1"])` offers `chat.v1` and NOT `vilan-rpc`, read back off the
+/// server's own `Handshake::protocols`.
+///
+/// Red first: with `connect_socket_with(url, [])` restored, the refused leg
+/// reads `refused:could not reach ws://localhost:<port>/` after ~24 s of
+/// backoff instead of naming the 401.
+#[test]
+fn a_bare_connect_socket_offers_vilan_rpc_and_an_explicit_list_is_untouched() {
+    let dir = temp_project("bare_offer");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ connect_socket, connect_socket_with };
+import std::rpc_server::{ Handshake, Reject, Service, Session };
+
+[service(NotesClient)]
+struct Notes {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Notes {
+	[rpc]
+	fun ping(self): i32 {
+		1
+	}
+}
+
+let notes: Notes = Notes { count = Signal::new(0) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec()))
+			.authorize(|handshake: Handshake| {
+				print(i"offered:{join(handshake.protocols)}");
+				Result::Err(Reject::Unauthorized)
+			}))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun join(names: List<str>): str {
+	mut out = "";
+	for name in names {
+		out = out + name + "|";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match connect_socket(i"ws://localhost:{port}/") {
+		Ok(let _socket) => print("bare:connected-unexpected"),
+		Err(let reason) => print(i"bare:{reason}"),
+	}
+	match connect_socket_with(i"ws://localhost:{port}/", ["chat.v1"]) {
+		Ok(let _socket) => print("explicit:connected-unexpected"),
+		Err(let reason) => print(i"explicit:{reason}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    // The bare call offered the protocol, so the server's typed refusal frame
+    // reached it and the status is in the sentence.
+    assert!(
+        stdout.contains("offered:vilan-rpc|"),
+        "a bare connect_socket must offer `vilan-rpc`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("bare:refused by the server (401)"),
+        "a bare connect_socket must be TOLD the refusal:\n{stdout}"
+    );
+    // The explicit list is offered exactly as written — no `vilan-rpc` smuggled
+    // in — so that client is refused the old, blind way.
+    assert!(
+        stdout.contains("offered:chat.v1|"),
+        "an explicit protocol list must be offered verbatim:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("explicit:could not reach"),
+        "a client that did not name the protocol is not told the status:\n{stdout}"
+    );
+    // One burned budget, not two — counted rather than timed (tracker N61).
+    // This used to be an 80 s WALL bound over a whole `vilan run .`, build
+    // included, which is the shape M27 rules out; the server already announces
+    // every handshake it is offered, so the two legs' redials can simply be
+    // counted apart. The explicit leg is the non-vacuity control: it DOES burn
+    // its budget (that is what "a client that did not name the protocol is not
+    // told the status" costs), so a count that could not tell one dial from ten
+    // would be green on both legs.
+    let bare = stdout.matches("offered:vilan-rpc|").count();
+    let explicit = stdout.matches("offered:chat.v1|").count();
+    assert_eq!(
+        bare, 1,
+        "the bare leg is TOLD the refusal, so it dials once; the server was \
+         offered `vilan-rpc` {bare} time(s). stdout was:\n{stdout}"
+    );
+    assert!(
+        explicit > 1,
+        "the explicit leg is refused blind and redials, which is what makes the \
+         bare leg's single dial a claim; the server was offered `chat.v1` \
+         {explicit} time(s). stdout was:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A51: `[expose(keyed = K)]` over a `List<T>`, end to end ----------------
+
+/// The `List` keyed service and its `Map` twin in one program, so the contract
+/// hashes can be compared: the two forms differ only in what the SERVER stores,
+/// and the wire, the mirror and the surface entry are the same, so they must
+/// hash the same. `PlainChat` is the control that keeps that from being
+/// vacuous — the same surface with a whole-value exposure hashes differently.
+const KEYED_LIST_SERVICE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::rpc_server::Service;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	channel: i32,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// A51's shape: the collection names only its element, and the KEY comes from
+// the attribute argument.
+[service(ListChatClient)]
+struct ListChat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed = str)] messages: SignalCell<List<Message>>,
+}
+
+impl ListChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		self.messages.update(|&mut list| {
+			list.push(Message { id, channel, body });
+		});
+		self.messages.get().len().as_i32()
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		mut found = false;
+		mut next: List<Message> = [];
+		for message in self.messages.get() {
+			if message.id == id {
+				found = true;
+				next.push(Message { id, channel = message.channel, body });
+			} else {
+				next.push(message);
+			}
+		}
+		self.messages.set(next);
+		found
+	}
+}
+
+// A39's shape, unchanged: the `Map` names both types and takes the bare form.
+[service(MapChatClient)]
+struct MapChat {
+	[expose] topic: SignalCell<str>,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+
+impl MapChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+// The whole-value control.
+[service(PlainChatClient)]
+struct PlainChat {
+	[expose] topic: SignalCell<str>,
+	[expose] messages: SignalCell<Map<str, Message>>,
+}
+
+impl PlainChat {
+	[rpc]
+	fun post(self, id: str, channel: i32, body: str): i32 {
+		0
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+let chat: ListChat = ListChat { topic = Signal::new("general"), messages = Signal::new([]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun render(list: List<Message>): str {
+	mut out = "";
+	for message in list {
+		out = out + message.id + "=" + message.body + " ";
+	}
+	out
+}
+
+fun run(port: i32) {
+	match ListChatClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			// The generated mirror is a `KeyedSource<str, Message>` — the key
+			// type came off the attribute, the element off the `List`.
+			let topic = client.topic.sub(|value| print(i"topic:{value}"));
+			let watch = client.messages.sub_key("m2", |value| match value {
+				Some(let message) => print(i"m2:{message.body}"),
+				None => print("m2:absent"),
+			});
+			print(i"post:{client.post("m1", 0, "hello").unwrap_or(0 - 1)}");
+			print(i"post:{client.post("m2", 0, "world").unwrap_or(0 - 1)}");
+			print(i"edit:{client.edit("m1", "hello again").unwrap_or(false)}");
+			print(i"edit:{client.edit("m2", "world again").unwrap_or(false)}");
+			print(i"held:{render(client.messages.get().unwrap_or([]))}");
+			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
+			let map_twin = MapChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			print(i"list-hash:{client.contract_hash()}");
+			print(i"map-hash:{map_twin.contract_hash()}");
+			print(i"plain-hash:{plain.contract_hash()}");
+			print(i"fault:{client.messages.fault().is_some()}");
+			watch.dispose();
+			topic.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+/// A51's macro form, end to end over a real WebSocket: `[expose(keyed = str)]`
+/// over a `SignalCell<List<Message>>` mints the keyed channel, the generated
+/// client carries a `KeyedSource<str, Message>`, and a per-key subscription
+/// through it holds ITS message and no other — the same claims A39's `Map`
+/// twin makes, on the collection A39 refused.
+///
+/// The hashes are the other half. The two keyed forms hash IDENTICALLY, and
+/// that is the point rather than a coincidence: they differ only in what the
+/// server stores, and a client built against one can connect to the other
+/// because the frames, the mirror and the surface entry are the same. The
+/// whole-value control hashes differently, which keeps the equality from being
+/// a claim that the hash ignores exposure.
+///
+/// Red first: `[expose(keyed = str)]` did not parse before A51 (`expected a
+/// field name`), and with the argument dropped the field is refused —
+/// "nothing names its KEY type".
+#[test]
+fn a_keyed_list_field_mirrors_as_a_keyed_source_and_hashes_as_its_map_twin() {
+    let dir = temp_project("keyed_list_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", KEYED_LIST_SERVICE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "m2:absent",
+        "m2:world",
+        "m2:world again",
+        "topic:general",
+        "topic-held:general",
+        "post:1",
+        "post:2",
+        "edit:true",
+        "held:m2=world again",
+        "fault:false",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the keyed-list service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("held:m1="),
+        "a per-key subscription received a message it never asked for:\n{stdout}"
+    );
+    let hash_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    let list_hash = hash_of("list-hash:");
+    let map_hash = hash_of("map-hash:");
+    let plain_hash = hash_of("plain-hash:");
+    assert_eq!(
+        list_hash, map_hash,
+        "the two keyed forms are one contract — same frames, same mirror, same \
+         surface entry — so they must hash the same:\n{stdout}"
+    );
+    assert_ne!(
+        list_hash, plain_hash,
+        "a whole-value exposure is a different contract:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `[rpc]` method's receiver and per-connection MUTABLE state
+/// (`transport-rpc.md` §9.1, the owner's sketch of 2026-09-07; B272, ruling
+/// R-A38b option (a)).
+///
+/// Q9 ruled `&mut self` "the idiomatic in-place receiver" for a service's
+/// synchronous session state, and the generator now honours it. The generated
+/// `dispatcher()` declares `mut self` (`std/src/rpc.vl`, the `service` macro),
+/// runs once per connection under `Service::factory`, and every route captures
+/// that one binding — so a `&mut self` handler's write reaches it through the
+/// capture (spec §6.9: a closure captures the binding, not a copy), is still
+/// there on the NEXT call over the same socket, and belongs to that connection
+/// alone.
+///
+/// This replaces `a_mut_self_rpc_mutation_is_lost_where_a_shared_field_survives`,
+/// which recorded the three states before the ruling: `&mut self` refused inside
+/// generated code with a struct-span diagnostic recommending `mut self`;
+/// `mut self` compiling and losing the write in silence; only a `Shared<T>`
+/// field surviving. Two of the three are gone — `mut self` is refused at the
+/// attribute now (the pin below) — and the third, the `Shared<T>` field, is
+/// still here as the control: `held` and `is_authenticated` must move together
+/// on one connection and neither on the other.
+///
+/// Both route arities are exercised deliberately, because the generator writes
+/// the call site twice: `login(&mut self, password)` takes the decode-gated arm
+/// and `logout(&mut self)` the bare one.
+///
+/// Red first: with the dispatcher's receiver put back to a plain `self`, this
+/// program does not build at all — it takes the struct-span "cannot mutate
+/// immutable 'self'" error B272 recorded, verbatim.
+#[test]
+fn a_mut_ref_self_rpc_write_survives_the_next_call_on_that_connection_alone() {
+    let dir = temp_project("mut_ref_self");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::shared::Shared;
+import std::rpc_server::{ Connection, Service };
+
+[service(GateClient)]
+struct Gate {
+	who: str,
+	// The owner's sketch, written as the sketch writes it.
+	is_authenticated: bool,
+	// The spelling that already worked, kept as the control.
+	held: Shared<bool>,
+}
+
+impl Gate {
+	// The receiver Q9 ruled idiomatic: the write lands in the instance this
+	// connection's dispatcher holds.
+	[rpc]
+	fun login(&mut self, password: str): bool {
+		if password == "hunter2" {
+			self.is_authenticated = true;
+		}
+		self.is_authenticated
+	}
+
+	// The same receiver on a NO-ARGUMENT method — the generator's other call
+	// site, which skips the decode gate.
+	[rpc]
+	fun logout(&mut self): bool {
+		self.is_authenticated = false;
+		self.is_authenticated
+	}
+
+	[rpc]
+	fun login_held(self, password: str): bool {
+		if password == "hunter2" {
+			self.held.write() = true;
+		}
+		self.held.read()
+	}
+
+	[rpc]
+	fun state(self): str {
+		i"{self.who}/plain:{self.is_authenticated}/held:{self.held.read()}"
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Gate {
+			who = i"conn-{connection.id}",
+			is_authenticated = false,
+			held = Shared::new(false),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match GateClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let a) => {
+			match GateClient::connect(i"ws://localhost:{port}/", json_codec()) {
+				Ok(let b) => {
+					print(i"a-before:{a.state().unwrap_or("?")}");
+					print(i"a-login:{a.login("hunter2").unwrap_or(false)}");
+					print(i"a-login-held:{a.login_held("hunter2").unwrap_or(false)}");
+					print(i"a-after:{a.state().unwrap_or("?")}");
+					print(i"b-after:{b.state().unwrap_or("?")}");
+					print(i"a-logout:{a.logout().unwrap_or(true)}");
+					print(i"a-final:{a.state().unwrap_or("?")}");
+				},
+				Err(let error) => print(i"b-err:{error.debug()}"),
+			}
+		},
+		Err(let error) => print(i"a-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "a-before:conn-0/plain:false/held:false",
+        "a-login:true",
+        "a-login-held:true",
+        // The plain field SURVIVED the call — this is the line B272 was filed
+        // for, and it read `plain:false` before the fix.
+        "a-after:conn-0/plain:true/held:true",
+        // The other connection's instance is untouched by either write: A38's
+        // per-connection guarantee, now covering plain fields too.
+        "b-after:conn-1/plain:false/held:false",
+        // The no-argument route's write lands the same way, and undoes it.
+        "a-logout:false",
+        "a-final:conn-0/plain:false/held:true",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the `&mut self` receiver pin's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("a-after:conn-0/plain:false"),
+        "the `&mut self` write did not survive the call — the generator is back \
+         to handing the handler a copy (B272, ruling R-A38b(a)):\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("b-after:conn-1/plain:true"),
+        "the second connection saw the first connection's session state — one \
+         `self` binding per connection is the whole point:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `mut self` on an `[rpc]` method is REFUSED, at the attribute, naming the
+/// method (B272, ruling R-A38b: the generator honours `&mut self`, and `mut
+/// self` is refused).
+///
+/// `mut self` is a parameter-local copy: the handler mutates it, the reply
+/// carries the new value, and the copy dies with the call — so the next call on
+/// the same connection reads the old field. It compiled, and nothing said so;
+/// the deleted pin measured the loss. There is now no receiver a service admits
+/// that silently discards a write.
+///
+/// The refusal is spanned on the METHOD's name, not on the struct: the receiver
+/// is what has to change. It also stands ALONE — the expansion is skipped, so a
+/// service written this way does not additionally collect the generated client's
+/// own errors, and in particular the old struct-span message ("in code generated
+/// by this attribute: cannot mutate immutable 'self'; declare it `mut self` …",
+/// which recommended the receiver that loses the write) cannot fire for a
+/// service any more.
+#[test]
+fn an_rpc_method_taking_mut_self_is_refused_at_the_attribute_naming_the_method() {
+    let dir = temp_project("mut_self_refused");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(GateClient)]
+struct Gate {
+	is_authenticated: bool,
+}
+
+impl Gate {
+	[rpc]
+	fun login(mut self, password: str): bool {
+		self.is_authenticated = password == "hunter2";
+		self.is_authenticated
+	}
+}
+
+fun main() {}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "`mut self` on an `[rpc]` method must not compile:\n{report}"
+    );
+    for expected in [
+        "`[rpc]` method `login` takes `mut self`",
+        "copy is discarded after the call",
+        "Write `&mut self` to mutate this connection's instance",
+        "hold the state in a `Shared<T>` field",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{report}"
+        );
+    }
+    // One mistake, one message: the expansion is skipped, so nothing downstream
+    // complains about a client the author never wrote.
+    assert_eq!(
+        report.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the run reported:\n{report}"
+    );
+    assert!(
+        !report.contains("cannot mutate immutable 'self'"),
+        "the struct-span diagnostic B272 recorded must be gone — it recommended \
+         `mut self`, the receiver that loses the write:\n{report}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- §9.3 / R1 / R4: client-declared functions, the `s:` lane ----------------
+
+/// The reverse-direction server: `[client_service] struct Handlers` in the
+/// browser half, `[service(.., client = Handlers)]` on the server half, and the
+/// notification that crosses between them. `Quiet` is the "old server" control
+/// — the same OWN surface, no handler surface — mounted beside it so the
+/// compatibility refusal can be taken against a live peer rather than asserted
+/// about one.
+const REVERSE_SERVER: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::RpcError;
+import std::rpc_server::{ Connection, Service };
+import std::time::sleep;
+
+[client_service]
+struct Handlers {
+	seen: SignalCell<str>,
+}
+
+impl Handlers {
+	[rpc]
+	fun session_revoked(self, reason: str) {
+		// TWO writes to ONE signal: the handler runs inside its own turn, so
+		// they settle as ONE wave and `pending` is never published.
+		self.seen.set("pending");
+		self.seen.set(reason);
+	}
+}
+
+[service(StoreClient, client = Handlers)]
+struct Store {
+	client: HandlersProxy,
+}
+
+impl Store {
+	[rpc]
+	fun kick(self, reason: str): i32 {
+		self.client.session_revoked(reason);
+		1
+	}
+}
+
+[service(QuietClient)]
+struct Quiet {
+	label: str,
+}
+
+impl Quiet {
+	[rpc]
+	fun kick(self, reason: str): i32 {
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| {
+			let store = Store { client = connection.client() };
+			print(i"server-hash:{store.contract_hash()}");
+			store
+		}, json_codec()))
+		.with_service(Service::factory(|connection: Connection| Quiet {
+			label = "quiet",
+		}, json_codec()).at("/quiet/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let raw) => {
+			let handlers = Handlers { seen = Signal::new("") };
+			let client = raw.with_handlers(handlers);
+			print(i"client-hash:{client.contract_hash()}");
+			mut waves = 0;
+			let watch = handlers.seen.sub(|value| {
+				waves += 1;
+				print(i"wave:{waves}:{value}");
+			});
+			match client.kick("revoked") {
+				Ok(let count) => print(i"kick:{count}"),
+				Err(let _e) => print("kick-error"),
+			}
+			mut attempts = 0;
+			for attempts < 200 {
+				if handlers.seen.get() == "revoked" {
+					jump break;
+				}
+				sleep(1);
+				attempts += 1;
+			}
+			print(i"seen:{handlers.seen.get()}");
+			print(i"waves:{waves}");
+		},
+		Err(let _error) => print("connect-error"),
+	}
+	// The compatibility hazard, taken live: a client generated against the
+	// handler-declaring surface dialling a server that declares none.
+	match StoreClient::connect(i"ws://localhost:{port}/quiet/", json_codec()) {
+		Ok(let _wrong) => print("mismatch:accepted"),
+		Err(let error) => {
+			match error {
+				RpcError::Contract(let _reason) => print("mismatch:contract"),
+				_ => print("mismatch:other"),
+			}
+		},
+	}
+	exit(0);
+}
+"#;
+
+/// §9.3 (R1, R4): a server calls a function the CLIENT declared.
+///
+/// `[client_service] struct Handlers` generates the same dispatcher the server
+/// half gets (the generator is direction-agnostic) plus `HandlersProxy`;
+/// `[service(.., client = Handlers)]` gives the service a typed proxy through
+/// `connection.client()`; `self.client.session_revoked(reason)` puts one
+/// `s:0:<payload>` frame on the socket; and the client's router runs the handler
+/// under `turn(FlushPolicy::AtEnd, ..)` — which is what the wave count pins,
+/// since the handler writes the same signal twice and only the last value is
+/// ever published.
+#[test]
+fn a_server_calls_a_client_declared_function_and_the_handler_runs_under_a_turn() {
+    let dir = temp_project("reverse_roundtrip");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", REVERSE_SERVER);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("seen:revoked"),
+        "the notification never reached the browser handler:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("kick:1"),
+        "the forward call that triggered the notification did not answer:\n{stdout}"
+    );
+    // One wave for the subscription's own seed, one for the handler — and none
+    // carrying the intermediate value. Two writes inside one turn are one wave.
+    assert!(
+        stdout.contains("waves:2"),
+        "the handler's two writes did not settle as one wave — the `s:` lane's \
+         dispatch must run inside `turn(FlushPolicy::AtEnd, ..)`:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(":pending"),
+        "the handler's intermediate write was published, so it did not run \
+         inside a turn:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §9.3's compatibility answer: the two ends agree about BOTH directions or
+/// they do not connect. A client generated against a service that declares
+/// `client = Handlers` dials a server that declares no handler surface at all —
+/// the shape of an old server meeting a new client — and is refused with
+/// `RpcError::Contract` at `__contract`, which is BEFORE `with_handlers` exists
+/// to be called and therefore before any `s:` frame could be dispatched. The
+/// silent-drop path (`route_socket_frame` ignores unknown prefixes) is the
+/// fallback for a peer this check cannot reach, not the mechanism.
+#[test]
+fn a_contract_that_disagrees_about_the_reverse_direction_refuses_the_connection() {
+    let dir = temp_project("reverse_mismatch");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", REVERSE_SERVER);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("mismatch:contract"),
+        "a server declaring no client surface must refuse a client that declares \
+         one:\n{stdout}"
+    );
+    // Both ends of the LIVE connection computed the same string — the client
+    // stub's baked hash and the server instance's are one value, which is what
+    // makes the check above a check about the surface and not about the build.
+    let hash_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("`{label}` is missing from the run:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        hash_of("server-hash:"),
+        hash_of("client-hash:"),
+        "the two sides of one connection must compute the same contract \
+         surface:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The hash program: a plain service, its `client = Handlers` twin with the SAME
+/// own surface, and the handler struct's own hash. No server — this is about the
+/// string, not the wire.
+const CLIENT_SURFACE_HASHES: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+
+[client_service]
+struct Handlers {
+	seen: SignalCell<str>,
+}
+
+impl Handlers {
+	[rpc]
+	fun session_revoked(self, reason: str) {
+		self.seen.set(reason);
+	}
+}
+
+[service(LedgerClient)]
+struct Ledger {
+	who: str,
+	[expose] count: SignalCell<i32>,
+}
+
+impl Ledger {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.set(self.count.get() + by);
+		self.count.get()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+
+// The same surface with `client = Handlers` as its ONLY difference. The proxy
+// field is not `[expose]`d, so it contributes nothing of its own.
+[service(TalkingLedgerClient, client = Handlers)]
+struct TalkingLedger {
+	who: str,
+	client: HandlersProxy,
+	[expose] count: SignalCell<i32>,
+}
+
+impl TalkingLedger {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.set(self.count.get() + by);
+		self.count.get()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.who
+	}
+}
+
+fun main() {
+	let plain = Ledger { who = "a", count = Signal::new(0) };
+	let talking = TalkingLedger {
+		who = "a",
+		client = HandlersProxy::for_connection(0),
+		count = Signal::new(0),
+	};
+	let handlers = Handlers { seen = Signal::new("") };
+	print(i"plain-hash:{plain.contract_hash()}");
+	print(i"talking-hash:{talking.contract_hash()}");
+	print(i"handlers-hash:{handlers.contract_hash()}");
+}
+"#;
+
+/// §9.4's contract-hash rule, both halves.
+///
+/// `Ledger`'s surface is `add(i32)->i32;whoami()->str;expose:count:i32;` — the
+/// surface `Notes` has in `a_factory_service_builds_one_instance_per_connection`,
+/// whose hash `d1d5fba0` was recorded before this order existed. It must still
+/// be that value: a service that declares no `client = …` hashes BYTE-IDENTICALLY
+/// to what it hashed before the `client:` entries were a thing, which is the
+/// whole reason they are a suffix rather than a field of the envelope.
+///
+/// The twin, whose only difference is `client = Handlers`, must NOT — the two
+/// sides have to agree about both directions, and a hash that ignored the
+/// reverse surface would let them disagree silently.
+#[test]
+fn the_client_surface_moves_the_contract_hash_and_only_for_a_service_that_declares_one() {
+    let dir = temp_project("reverse_hashes");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", CLIENT_SURFACE_HASHES);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("plain-hash:d1d5fba0"),
+        "a service that declares no client surface must hash exactly as it did \
+         before §9.3 — `d1d5fba0` is the value recorded for this surface at \
+         c3ed9239:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("talking-hash:c6c3956e"),
+        "the `client = Handlers` twin's hash moved unexpectedly:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("talking-hash:d1d5fba0"),
+        "declaring a client surface must MOVE the hash — the two ends agree \
+         about both directions or they do not connect:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("handlers-hash:c5156948"),
+        "the handler struct's own contract hash moved:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build that must FAIL: returns the combined output of `vilan build`, having
+/// asserted the build did not succeed.
+fn vilan_build_refusal(dir: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "the build should have failed:\n{text}"
+    );
+    text
+}
+
+/// R4, refused rather than silently truncated: v1 has no reverse reply lane, so
+/// a `[client_service]` method that declares a return type describes a value
+/// that could never come back.
+#[test]
+fn a_client_service_method_that_declares_a_return_type_is_refused() {
+    let dir = temp_project("reverse_returns");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[client_service]
+struct Handlers {
+	who: str,
+}
+
+impl Handlers {
+	[rpc]
+	fun ask(self, question: str): i32 {
+		1
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("notifications only in v1"),
+        "a `[client_service]` method's return type must be refused in the \
+         attribute's own vocabulary:\n{text}"
+    );
+    // The same struct with the return type dropped compiles — the refusal is
+    // about the return, not about the attribute.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[client_service]
+struct Handlers {
+	who: str,
+}
+
+impl Handlers {
+	[rpc]
+	fun ask(self, question: str) {
+		print(question);
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a void `[client_service]` method must compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R1: `client = X` names the struct whose `[rpc]` methods this server may call,
+/// and the reverse surface is read off X's same-module impls AT EXPANSION. An X
+/// the expansion cannot see would fold an EMPTY reverse surface into the hash —
+/// two peers agreeing about nothing — so it is refused at the attribute.
+#[test]
+fn a_client_handler_the_module_does_not_declare_is_refused() {
+    let dir = temp_project("reverse_no_handler");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+struct Handlers {
+	who: str,
+}
+
+[service(StoreClient, client = Handlers)]
+struct Store {
+	who: str,
+}
+
+impl Store {
+	[rpc]
+	fun kick(self): i32 {
+		1
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("no `[client_service] struct Handlers` is declared in this module"),
+        "`client = X` where X carries no `[client_service]` must be refused at \
+         the attribute:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Peer-to-peer (§9.3's "both attributes on one struct is peer-to-peer, and
+/// needs no new spelling"): ONE struct, ONE dispatcher, both halves generated.
+/// `bounce` travels client→server through the generated stub; the server's
+/// handler calls `tell` back through its proxy; the browser instance's own
+/// dispatcher answers it. Both directions, one method set.
+const PEER_SERVER: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::time::sleep;
+
+[service(PeerClient, client = Peer)]
+[client_service]
+struct Peer {
+	label: str,
+	client: PeerProxy,
+	heard: SignalCell<str>,
+}
+
+impl Peer {
+	[rpc]
+	fun tell(self, what: str) {
+		self.heard.set(i"{self.label}:{what}");
+	}
+
+	[rpc]
+	fun bounce(self, what: str) {
+		self.client.tell(i"bounced-{what}");
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Peer {
+			label = "server",
+			client = connection.client(),
+			heard = Signal::new(""),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match PeerClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let raw) => {
+			let browser = Peer {
+				label = "browser",
+				client = PeerProxy::for_connection(0 - 1),
+				heard = Signal::new(""),
+			};
+			let client = raw.with_handlers(browser);
+			print(i"peer-hash:{client.contract_hash()}");
+			client.bounce("ping");
+			mut attempts = 0;
+			for attempts < 200 {
+				if browser.heard.get() != "" {
+					jump break;
+				}
+				sleep(1);
+				attempts += 1;
+			}
+			print(i"heard:{browser.heard.get()}");
+		},
+		Err(let _error) => print("connect-error"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a_peer_to_peer_struct_carries_both_halves_and_both_directions_work() {
+    let dir = temp_project("reverse_peer");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", PEER_SERVER);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("heard:browser:bounced-ping"),
+        "the round trip through both halves of one peer struct did not \
+         complete:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The receive loop, driven by a RAW socket so that the coalescing is the
+/// test's and not the kernel's: two masked text frames in ONE `write_all`, so
+/// the server's `data` handler is called once with a chunk holding both.
+///
+/// `hold` waits for a flag that only `release` sets. Awaiting each event's
+/// `respond` before parsing the next of the same chunk held `release` behind
+/// `hold` — a deadlock on a fast local link, which is where frames coalesce.
+/// The wait is bounded in RETRIES, not in wall time (M27): the red run answers
+/// `-1` after 400 attempts, the green one answers the attempt it saw the flag on.
+const RECEIVE_LOOP_GATE: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(GateClient)]
+struct Gate {
+	flag: Shared<bool>,
+}
+
+impl Gate {
+	[rpc]
+	fun hold(self): i32 {
+		mut attempts = 0;
+		for attempts < 400 {
+			if self.flag.read() {
+				ret attempts;
+			}
+			sleep(1);
+			attempts += 1;
+		}
+		0 - 1
+	}
+
+	[rpc]
+	fun release(self): i32 {
+		self.flag.write() = true;
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Gate {
+			flag = Shared::new(false),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// One masked client text frame — the shape a browser puts on the wire, built
+/// by hand so two of them can share one `write_all`.
+fn masked_text_frame(text: &str) -> Vec<u8> {
+    let payload = text.as_bytes();
+    assert!(
+        payload.len() < 126,
+        "the pin's frames stay inside the 7-bit length"
+    );
+    let mask = [0x01u8, 0x02, 0x03, 0x04];
+    let mut frame = vec![0x81u8, 0x80 | payload.len() as u8];
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % 4]),
+    );
+    frame
+}
+
+#[test]
+fn two_frames_coalesced_into_one_read_are_not_serialized_by_the_receive_loop() {
+    let dir = temp_project("receive_loop");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", RECEIVE_LOOP_GATE);
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set a read timeout");
+    socket
+        .write_all(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: \
+             Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: \
+             13\r\n\r\n"
+                .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let mut buffer = [0u8; 4096];
+    let handshake = socket.read(&mut buffer).expect("read the 101");
+    assert!(
+        String::from_utf8_lossy(&buffer[..handshake]).starts_with("HTTP/1.1 101 "),
+        "the handshake must succeed before the lanes are exercised"
+    );
+
+    // ONE write, TWO frames: the server reads them as one chunk, which is what
+    // TCP does on a fast link and what the old loop serialized.
+    let mut both = masked_text_frame(r#"r:1:{"method":"hold","args":[]}"#);
+    both.extend(masked_text_frame(r#"r:2:{"method":"release","args":[]}"#));
+    socket.write_all(&both).expect("send both frames at once");
+
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        match socket.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                seen.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if seen.contains("r:1:") && seen.contains("r:2:") {
+                    break;
+                }
+            }
+            Err(_timeout) => break,
+        }
+    }
+    drop(server);
+
+    assert!(
+        seen.contains(r#"r:2:{"Success":1}"#),
+        "the second frame of the chunk was never dispatched:\n{seen}"
+    );
+    assert!(
+        seen.contains("r:1:{\"Success\":"),
+        "the first frame of the chunk never answered:\n{seen}"
+    );
+    assert!(
+        !seen.contains(r#"r:1:{"Success":-1}"#),
+        "the first handler exhausted its retry budget waiting for a flag the \
+         SECOND frame of its own chunk sets — the receive loop is awaiting each \
+         handler before parsing the next event (§9.3: the router never blocks on \
+         a handler):\n{seen}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reverse lane's BYTE twin (`0x73`), which is a different arm of a
+/// different router from `s:` and had no pin of its own.
+///
+/// One codec deployment-wide (§6.2, Q6), so the same program under
+/// `binary_codec()` exercises `tag_client_bytes` on the way out and
+/// `route_socket_bytes`' `0x73` arm on the way in. Everything else — the turn,
+/// the wave count, the contract refusal — is the text pin's, and must hold
+/// identically: the lane is a framing choice, not a semantics one.
+#[test]
+fn the_reverse_lane_carries_a_notification_over_the_binary_codec_too() {
+    let dir = temp_project("reverse_binary");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &REVERSE_SERVER
+            .replace(
+                "import std::json::json_codec;",
+                "import std::binary::binary_codec;",
+            )
+            .replace("json_codec()", "binary_codec()"),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("seen:revoked"),
+        "the `0x73` lane did not deliver the notification:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("waves:2") && !stdout.contains(":pending"),
+        "the byte lane's dispatch must run inside a turn, exactly as the text \
+         lane's does:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mismatch:contract"),
+        "the contract check does not depend on the codec:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- §9.2: return-typed signal handles (Order 31, lane handles-31) ----------
+
+/// THE EXHIBIT, in the owner's own words (`transport-rpc.md` §9.2, the sketch
+/// of 2026-09-07): `get_messages(conversation, amount): List<MessageId>` plus
+/// `get_message(id): SignalCell<MessageBody>`, so a client can hold a hundred
+/// ids and subscribe to the handful on screen.
+///
+/// Three services, and the two that are not the exhibit are there for the
+/// hashes. `PlainChat` is the shape measured at `c3ed9239` before any of this
+/// existed; `ValueChat` is `HandleChat` with the one return type written as a
+/// plain value.
+const HANDLE_SERVICE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::wire::Wire;
+
+[derive(Wire, PartialEq, Debug)]
+struct MessageBody {
+	id: str,
+	author: str,
+	body: str,
+}
+
+// The exhibit. `get_message` returns a SOURCE, so the client's stub answers a
+// `RemoteSource<MessageBody>` and the wire carries a channel id.
+[service(HandleChatClient)]
+struct HandleChat {
+	[expose] topic: SignalCell<str>,
+	bodies: Shared<List<(str, SignalCell<MessageBody>)>>,
+}
+
+impl HandleChat {
+	fun cell_for(self, id: str): SignalCell<MessageBody> {
+		for entry in self.bodies.read() {
+			let (key, cell) = entry;
+			if key == id {
+				ret cell;
+			}
+		}
+		let fresh: SignalCell<MessageBody> =
+			Signal::new(MessageBody { id, author = "reed", body = "" });
+		self.bodies.write().push((id, fresh));
+		fresh
+	}
+
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		mut ids: List<str> = [];
+		mut index = 0;
+		for index < amount {
+			ids.push(i"{conversation}-m{index}");
+			index += 1;
+		}
+		ids
+	}
+
+	[rpc]
+	fun get_message(self, id: str): SignalCell<MessageBody> {
+		self.cell_for(id)
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		self.cell_for(id).set(MessageBody { id, author = "reed", body });
+		true
+	}
+}
+
+// The hash control measured at c3ed9239: two methods, one exposed field, and
+// not a source in a return position anywhere.
+[service(PlainChatClient)]
+struct PlainChat {
+	[expose] topic: SignalCell<str>,
+}
+
+impl PlainChat {
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		[]
+	}
+
+	[rpc]
+	fun get_message(self, id: str): MessageBody {
+		MessageBody { id, author = "", body = "" }
+	}
+}
+
+// `HandleChat` with the handle return written as an `Option<SignalCell<..>>`.
+// The client's TYPE is the same (`RemoteSource<MessageBody>` — a `None` reply
+// is `Status::Absent`, not an `Option` to take apart), and the REPLY is not:
+// an `Option<i32>` where the plain form sends an `i32`. So the surface must
+// still tell them apart, or a client generated against one would decode the
+// other's `null` as a channel id.
+[service(OptionChatClient)]
+struct OptionChat {
+	[expose] topic: SignalCell<str>,
+}
+
+impl OptionChat {
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		[]
+	}
+
+	[rpc]
+	fun get_message(self, id: str): Option<SignalCell<MessageBody>> {
+		Option::None
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+// `HandleChat` with the handle return written as a plain value — the twin that
+// says the mapping is what moved the hash, and not the method list.
+[service(ValueChatClient)]
+struct ValueChat {
+	[expose] topic: SignalCell<str>,
+}
+
+impl ValueChat {
+	[rpc]
+	fun get_messages(self, conversation: str, amount: i32): List<str> {
+		[]
+	}
+
+	[rpc]
+	fun get_message(self, id: str): MessageBody {
+		MessageBody { id, author = "", body = "" }
+	}
+
+	[rpc]
+	fun edit(self, id: str, body: str): bool {
+		false
+	}
+}
+
+let chat: HandleChat = HandleChat { topic = Signal::new("general"), bodies = Shared::new([]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(chat.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match HandleChatClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let plain = PlainChat { topic = Signal::new("") };
+			let value = ValueChat { topic = Signal::new("") };
+			let optional = OptionChat { topic = Signal::new("") };
+			print(i"handle-hash:{client.contract_hash()}");
+			print(i"plain-hash:{plain.contract_hash()}");
+			print(i"value-hash:{value.contract_hash()}");
+			print(i"option-hash:{optional.contract_hash()}");
+
+			// A hundred ids, one subscription: the lease rule does the rest.
+			let ids = client.get_messages("general", 100).unwrap_or([]);
+			print(i"ids:{ids.len()}");
+			// SYNC (A92): no `Result`, no await, and no call — the mirror is
+			// minted unleased and the first lease is what asks.
+			let mirror: RemoteSource<MessageBody> = client.get_message(ids[3]);
+			// Passive before anything watches: the mirror holds nothing,
+			// because nothing asked.
+			print(i"before:{mirror.status().get().debug()}");
+			let watch = mirror.sub(|value| print(i"m3:{value.body}"));
+			print(i"edit:{client.edit(ids[3], "hello").unwrap_or(false)}");
+			// One more round trip: the mint the lease issued and the edit were
+			// in flight together, and the seed lands when the channel opens.
+			print(i"settle:{client.edit(ids[4], "other").unwrap_or(false)}");
+			print(i"after:{mirror.status().get().debug()}");
+			let missing = MessageBody { id = "?", author = "?", body = "?" };
+			print(i"held:{mirror.get().unwrap_or(missing).body}");
+			watch.dispose();
+			print("done");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+/// djb2 over a contract surface, as `service_hash` computes it (`std/src/rpc.vl`
+/// — the only place that computes it since N70 retired the analyzer's stale
+/// fallback twin and its disagreeing `service_contract_hash`). Written out so
+/// a hash pin can state the SURFACE it expects rather than a magic number: what
+/// is being pinned is the rendering, and a number alone cannot say which
+/// rendering it came from.
+fn contract_hash_of(surface: &str) -> String {
+    let mut hash: u32 = 5381;
+    for byte in surface.bytes() {
+        hash = hash.wrapping_mul(33) ^ (byte as u32);
+    }
+    format!("{hash:08x}")
+}
+
+/// §9.2's plain half, end to end over a real WebSocket: an `[rpc]` method
+/// returning a `SignalCell<T>` hands the client a live `RemoteSource<T>`, and
+/// the contract hash covers the MAPPED type.
+///
+/// Three claims, and the two hash ones are the reason the other two services
+/// are in the program:
+///
+/// 1. **The round trip.** `get_message(id)` puts a `ChannelId` on the wire —
+///    the reply is an `i32` and the codec sees nothing else — and the stub
+///    mints the mirror from it. The stub is SYNC and makes NO call (A92): the
+///    mirror is minted unleased (`before:Waiting` — a handle nothing watches
+///    has not even asked), and the first lease is what issues the call, opens
+///    the channel and seeds the mirror (`m3:hello`), which then follows every
+///    later write. The `Ready` is read after a SECOND round trip and not
+///    before: the mint the lease issued and the edit were in flight together,
+///    and over a real socket the seeding `Update` is a frame, not a return
+///    value — a status read in the same synchronous extent as the `sub` would
+///    be pinning the transport rather than the mirror.
+/// 2. **A handle-free service's hash did not move.** `PlainChat` is written
+///    exactly as it was measured at `c3ed9239`, before any of this existed, and
+///    `78bdada7` is that measurement frozen. This is the promise the whole
+///    mapping is written around: no shipped service is touched.
+/// 3. **The mapped rendering is what the hash covers.** `HandleChat` hashes as
+///    djb2 of the surface with `get_message(str)->RemoteSource<MessageBody>;`
+///    in it — the CLIENT's type, because the hash exists to protect the client
+///    — and its twin with that one return written as a plain `MessageBody`
+///    hashes differently. A server that turns a handle into a value is refused
+///    at connect instead of feeding a `ChannelId` to a `MessageBody` decoder.
+/// 4. **The two handle FORMS are still told apart (A92).** Since A92 both
+///    `SignalCell<T>` and `Option<SignalCell<T>>` answer the same client type,
+///    `RemoteSource<T>` — a `None` reply is `Status::Absent`, not an `Option`
+///    the caller unwraps — but they do NOT decode alike: the plain form's
+///    reply is an `i32` and the `Option` form's an `Option<i32>`. So the
+///    surface entry carries a `?` on the optional one
+///    (`get_message(str)->RemoteSource<MessageBody>?;`), which moves that
+///    form's hash off what it was and keeps a client generated against one
+///    from reading the other's `null` as a channel id. The plain form's bytes
+///    are untouched, which is claim 2's whole point.
+#[test]
+fn a_handle_returning_method_hands_the_client_a_mirror_and_hashes_as_the_mapped_type() {
+    let dir = temp_project("handle_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", HANDLE_SERVICE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let line_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        line_of("ids:"),
+        "100",
+        "the id list came back short:\n{stdout}"
+    );
+    // Lazy: the handle exists, and nothing is subscribed until something reads
+    // it through a lease.
+    assert_eq!(
+        line_of("before:"),
+        "Waiting",
+        "a minted mirror opened its channel before anything watched it:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("after:"),
+        "Ready",
+        "the lease did not seed the mirror from the server's updates:\n{stdout}"
+    );
+    for expected in ["m3:hello", "edit:true", "held:hello"] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the handle service's run:\n{stdout}"
+        );
+    }
+    // The hash halves.
+    let handle_surface = "get_messages(str,i32)->List<str>;\
+                          get_message(str)->RemoteSource<MessageBody>;\
+                          edit(str,str)->bool;\
+                          expose:topic:str;";
+    let value_surface = "get_messages(str,i32)->List<str>;\
+                         get_message(str)->MessageBody;\
+                         edit(str,str)->bool;\
+                         expose:topic:str;";
+    let option_surface = "get_messages(str,i32)->List<str>;\
+                          get_message(str)->RemoteSource<MessageBody>?;\
+                          edit(str,str)->bool;\
+                          expose:topic:str;";
+    let plain_surface = "get_messages(str,i32)->List<str>;\
+                         get_message(str)->MessageBody;\
+                         expose:topic:str;";
+    assert_eq!(
+        line_of("plain-hash:"),
+        "78bdada7",
+        "a service with no handle return must hash byte-identically to what it \
+         hashed at c3ed9239 — this number was measured there:\n{stdout}"
+    );
+    assert_eq!(
+        contract_hash_of(plain_surface),
+        "78bdada7",
+        "the frozen number and the surface it was measured from disagree"
+    );
+    assert_eq!(
+        line_of("handle-hash:"),
+        contract_hash_of(handle_surface),
+        "the contract surface must name the MAPPED type — the hash protects the \
+         client, so it says what the client will see:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("value-hash:"),
+        contract_hash_of(value_surface),
+        "the plain-value twin's surface is not what it hashed:\n{stdout}"
+    );
+    assert_ne!(
+        line_of("handle-hash:"),
+        line_of("value-hash:"),
+        "turning a handle return into a plain value must move the hash, or a \
+         stale client decodes a ChannelId as a MessageBody:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("option-hash:"),
+        contract_hash_of(option_surface),
+        "the `Option` form's surface entry is the mirror type with a `?`: the \
+         client's TYPE is the same as the plain form's, and its REPLY is \
+         not:\n{stdout}"
+    );
+    assert_ne!(
+        line_of("option-hash:"),
+        line_of("handle-hash:"),
+        "the two written handle forms answer the same client type and decode \
+         differently (`i32` vs `Option<i32>`), so they must not hash alike — a \
+         client generated against one would read the other's `null` as a \
+         channel id:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The demand rules, read off the SERVER's own tables (R3, and the lease rule
+/// `remote-sources.md` states). A `Service::factory` instance knows its
+/// connection id, so a `stats` route can answer with
+/// `[sources.len(), live.len(), getter calls]` — the capability table and the
+/// live forwards, per connection, as the client drives them.
+const HANDLE_DEMAND: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Subscription };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ RemoteSource, session_of };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::wire::Wire;
+
+[derive(Wire, PartialEq, Debug)]
+struct Body {
+	id: str,
+	text: str,
+}
+
+let bodies: Shared<List<(str, SignalCell<Body>)>> = Shared::new([]);
+let getter_calls: Shared<i32> = Shared::new(0);
+
+fun cell_for(id: str): SignalCell<Body> {
+	for entry in bodies.read() {
+		let (key, cell) = entry;
+		if key == id {
+			ret cell;
+		}
+	}
+	let fresh: SignalCell<Body> = Signal::new(Body { id, text = "first" });
+	bodies.write().push((id, fresh));
+	fresh
+}
+
+[service(DemandClient)]
+struct Demand {
+	[expose] topic: SignalCell<str>,
+	connection: i32,
+}
+
+impl Demand {
+	[rpc]
+	fun get_message(self, id: str): SignalCell<Body> {
+		getter_calls.write() = getter_calls.read() + 1;
+		cell_for(id)
+	}
+
+	[rpc]
+	fun edit(self, id: str, text: str): bool {
+		cell_for(id).set(Body { id, text });
+		true
+	}
+
+	// The OPTION form: a handle for a row that may not exist. `None` mints no
+	// channel at all, so an absent row retains nothing.
+	[rpc]
+	fun find(self, id: str): Option<SignalCell<Body>> {
+		for entry in bodies.read() {
+			let (key, cell) = entry;
+			if key == id {
+				ret Option::Some(cell);
+			}
+		}
+		Option::None
+	}
+
+	// This connection's capability table and live forwards, as the server
+	// holds them. `Service::factory` is what makes the id knowable.
+	[rpc]
+	fun stats(self): List<i32> {
+		match session_of(self.connection) {
+			Option::Some(let session) => [
+				session.sources.read().len().as_i32(),
+				session.live.read().len().as_i32(),
+				getter_calls.read(),
+			],
+			Option::None => [0 - 1, 0 - 1, 0 - 1],
+		}
+	}
+}
+
+let topic: SignalCell<str> = Signal::new("general");
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(
+			|connection| Demand { topic, connection = connection.id },
+			json_codec(),
+		))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun body_text(mirror: RemoteSource<Body>): str {
+	let missing = Body { id = "?", text = "?" };
+	mirror.get().unwrap_or(missing).text
+}
+
+fun show(label: str, stats: List<i32>) {
+	print(i"{label}:sources={stats[0]} live={stats[1]} calls={stats[2]}");
+}
+
+fun run(port: i32) {
+	match DemandClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let empty: List<i32> = [0 - 1, 0 - 1, 0 - 1];
+			// One channel, and it is the `[expose]`d field's.
+			show("attached", client.stats().unwrap_or(empty));
+
+			// A HUNDRED handles minted, and not one CALL made: the stub is
+			// sync and the mirror is unleased (A92).
+			mut mirrors: List<RemoteSource<Body>> = [];
+			mut index = 0;
+			for index < 100 {
+				mirrors.push(client.get_message(i"m{index}"));
+				index += 1;
+			}
+			show("minted", client.stats().unwrap_or(empty));
+
+			// TEN of them watched: ten calls, ten capabilities, ten forwards.
+			// Two round trips — the first lets the mints land and their
+			// `Subscribe`s go out, the second reads what the server did with
+			// them.
+			mut leases: List<Subscription> = [];
+			mut watched = 0;
+			for watched < 10 {
+				leases.push(mirrors[watched].sub(|_value| {}));
+				watched += 1;
+			}
+			let _minting = client.stats();
+			show("leased", client.stats().unwrap_or(empty));
+
+			// Every lease released. The `Unsubscribe` rides the turn's settle
+			// and then one microtask; the round trip below is what lets both
+			// happen before the reading call is even sent.
+			for lease in leases {
+				lease.dispose();
+			}
+			let _pause = client.stats();
+			show("released", client.stats().unwrap_or(empty));
+
+			// The source moved while nothing was watching.
+			print(i"edit:{client.edit("m0", "second").unwrap_or(false)}");
+
+			// Demand returns on a mirror whose channel the server withdrew:
+			// the mirror re-issues its own origin call. The cached value is
+			// what it paints until the fresh channel's first `Update` lands.
+			let again = mirrors[0].sub(|_value| {});
+			print(i"seed:{body_text(mirrors[0])}");
+			let _settle = client.stats();
+			show("re-acquired", client.stats().unwrap_or(empty));
+			print(i"fresh:{body_text(mirrors[0])}");
+			again.dispose();
+			let _drain = client.stats();
+			show("re-released", client.stats().unwrap_or(empty));
+
+			// DEDUP by source identity (A92). Two handles for the same row are
+			// two mirrors and two calls, and ONE channel: the second reply
+			// carries the cell the first one already exported. The first
+			// mirror's release does not revoke it under the second.
+			let twin_left: RemoteSource<Body> = client.get_message("m0");
+			let twin_right: RemoteSource<Body> = client.get_message("m0");
+			let hold_left = twin_left.sub(|_value| {});
+			let hold_right = twin_right.sub(|_value| {});
+			let _minting_twins = client.stats();
+			show("deduped", client.stats().unwrap_or(empty));
+			hold_left.dispose();
+			let _half = client.stats();
+			show("half-released", client.stats().unwrap_or(empty));
+			print(i"twin:{body_text(twin_right)}");
+			hold_right.dispose();
+			let _both = client.stats();
+			show("both-released", client.stats().unwrap_or(empty));
+
+			// The CONTROL: a `[expose]`d field channel's `Unsubscribe` is
+			// demand-only. Its capability survives (A41), where a dynamic
+			// one's does not — and a remount finds it on the same id.
+			let field = client.topic.sub(|_value| {});
+			field.dispose();
+			let _quiet = client.stats();
+			show("field-released", client.stats().unwrap_or(empty));
+			let again_field = client.topic.sub(|_value| {});
+			let _seeded = client.stats();
+			print(i"field-remount:{client.topic.get().unwrap_or("?")}");
+			again_field.dispose();
+
+			// The OPTION form, both answers — one mirror type for both (A92).
+			// A `None` reply mints no channel at all and the mirror says so:
+			// `Absent`, with `get()` still `None`. The absence is what the
+			// server knew at the ask, so the next lease asks again.
+			let missing: RemoteSource<Body> = client.find("nobody");
+			let watching_missing = missing.sub(|_value| {});
+			let _asked = client.stats();
+			print(i"find-missing:{missing.status().get().debug()}");
+			print(i"find-missing-held:{missing.get().is_some()}");
+			show("after-missing", client.stats().unwrap_or(empty));
+			watching_missing.dispose();
+			let found: RemoteSource<Body> = client.find("m0");
+			let reading = found.sub(|_value| {});
+			let _flush = client.stats();
+			let _seed = client.stats();
+			print(i"find-found:{body_text(found)}");
+			print(i"find-found-status:{found.status().get().debug()}");
+			reading.dispose();
+			print("done");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+/// R3 as ruled and A92 on top of it, over a real socket and read off the
+/// server's own tables.
+///
+/// - **A hundred handles cost NOTHING until they are watched.** Not one call,
+///   not one capability, not one forward: `minted` reports the same
+///   `sources=1 live=0 calls=0` as `attached`, because the stub is sync and
+///   the mirror is minted unleased (A92). `leased` is where the cost appears
+///   — ten leases, ten calls, ten capabilities, ten forwards — which is the
+///   owner's "a server subscription is only triggered once the client maps the
+///   handle to a local Signal", now true of the CALL as well as the
+///   subscription. Before A92 the same program made a hundred calls and left
+///   ninety-one capabilities standing.
+/// - **Demand decides the channel's life.** The ten leases reach zero, the
+///   `Unsubscribe`s go out past the turn's settle and the microtask hop, and
+///   the server REVOKES: `released` is back to the field's channel alone.
+///   §9.2 proposed a `Release(channel)` frame for this; R3 spends the
+///   `Unsubscribe` instead, because the server already knows which channels it
+///   minted dynamically.
+/// - **Re-acquiring re-mints.** A lease returns on a mirror whose channel is
+///   gone, the mirror re-issues its own `origin` call — the getter runs again,
+///   `calls` 10 → 11 — the capability comes back, and the mirror rebinds. The
+///   `seed` line is the cached value painted before the round trip; `fresh` is
+///   what the fresh channel's first `Update` carried, which is the edit made
+///   while nothing was watching.
+/// - **Dedup by source identity, and the counting it obliges (A92).** Two
+///   handles for the same row are two mirrors and two CALLS — `calls` 11 → 13
+///   — and ONE channel: the second reply carries a cell this connection has
+///   already exported, so `deduped` reports one capability and one forward for
+///   the pair. `half-released` is the obligation: the first mirror's
+///   `Unsubscribe` must NOT revoke the channel under the second, so the table
+///   does not move and the surviving mirror still reads its value (`twin`).
+///   `both-released` is the last hold going, and only then does the channel go.
+/// - **The `Option` form mints on presence only, and says so in `Status`.**
+///   One mirror type for both answers now: `find("nobody")` leases, asks, is
+///   told `None`, mints no channel — the table does not move — and reads
+///   `Absent` with `get()` still `None`. `find("m0")` is an ordinary mirror.
+/// - **The `[expose]` field channel is the control.** Its `Unsubscribe` is
+///   demand-only, its capability survives the release (`sources` does not
+///   move) and the remount finds it on the same id and re-seeds
+///   (`field-remount:general`) — A41's rule, unchanged: a field channel has no
+///   origin to re-issue, so revoking it would make every remount silently
+///   dead. That is the one behavioural difference between the two kinds of
+///   mirror, and it is exactly the difference A41 identified.
+#[test]
+fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_minted() {
+    let dir = temp_project("handle_demand");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", HANDLE_DEMAND);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let line_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        line_of("attached:"),
+        "sources=1 live=0 calls=0",
+        "the attach should mint exactly the exposed field's channel:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("minted:"),
+        "sources=1 live=0 calls=0",
+        "a hundred unleased handles must cost nothing at all — no call, no \
+         capability, no forward (A92):\n{stdout}"
+    );
+    assert_eq!(
+        line_of("leased:"),
+        "sources=11 live=10 calls=10",
+        "ten leases must be ten calls, ten capabilities and ten forwards, and \
+         no more:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("released:"),
+        "sources=1 live=0 calls=10",
+        "a dynamic channel's Unsubscribe must revoke it — the capability, the \
+         starter and the source it captured all go:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("edit:"),
+        "true",
+        "the edit while nothing watched did not land:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("seed:"),
+        "first",
+        "the mirror must paint its cached value while the re-mint is in \
+         flight, not go back to Waiting:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("re-acquired:"),
+        "sources=2 live=1 calls=11",
+        "demand returning must re-issue the origin call — one fresh capability, \
+         one fresh forward, and the getter run a second time:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("fresh:"),
+        "second",
+        "the re-minted channel's first update must carry what the source says \
+         NOW, not what the mirror was holding:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("re-released:"),
+        "sources=1 live=0 calls=11",
+        "the re-minted channel is revoked at its own lease-zero exactly like \
+         the first one:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("deduped:"),
+        "sources=2 live=1 calls=13",
+        "two handles on one source are two calls and ONE channel: the second \
+         reply must answer the channel the first already minted (A92):\n{stdout}"
+    );
+    assert_eq!(
+        line_of("half-released:"),
+        "sources=2 live=1 calls=13",
+        "one mirror letting go of a SHARED channel must revoke nothing — the \
+         other mirror is still watching it:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("twin:"),
+        "second",
+        "the surviving mirror of a deduped channel must still be fed:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("both-released:"),
+        "sources=1 live=0 calls=13",
+        "the LAST hold going is what revokes a deduped channel:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("field-released:"),
+        "sources=1 live=0 calls=13",
+        "an `[expose]`d field channel's Unsubscribe is demand-only: its \
+         capability must survive, or every remount is silently dead (A41):\n{stdout}"
+    );
+    assert_eq!(
+        line_of("field-remount:"),
+        "general",
+        "the field channel's capability survived its Unsubscribe, so the \
+         remount re-subscribes on the same id and re-seeds:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-missing:"),
+        "Absent",
+        "a `None` reply to an Option-written handle method must read as \
+         `Absent`, not as a `Waiting` that never resolves:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-missing-held:"),
+        "false",
+        "an absent mirror must hold nothing — `get()` stays `None`:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("after-missing:"),
+        "sources=1 live=0 calls=13",
+        "a `None` from an Option-returning handle method must mint no channel \
+         at all — the absence is the whole reply:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-found:"),
+        "second",
+        "the Option form's `Some` must be an ordinary mirror:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("find-found-status:"),
+        "Ready",
+        "a present Option-form mirror reads `Ready` like any other:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("mint-err:") && !stdout.contains("find-err:"),
+        "a handle call failed:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B282: an `[rpc]` parameter named `request` must not shadow the route
+/// closure's own handle.
+///
+/// The generated route was `.on("send", |request| { … let request: str =
+/// arg(request, 0); … })`: the author's first parameter rebound the closure's
+/// binding to a decoded `str`, and every later `arg`/`decode_failed` in the
+/// block was handed that `str` instead of the `RpcRequest`. The build stopped
+/// inside generated code — "Expected RpcRequest, but got str", spanned on the
+/// STRUCT — for a parameter name nothing told the author not to use. The
+/// closure is `|__request|` now, the same reservation the `__attach` and
+/// `__contract` routes take.
+///
+/// Three shapes, because the collision was positional: one parameter named
+/// `request` (the single-argument route, whose `decode_failed` guard reads the
+/// handle AFTER the rebind), a multi-parameter route that names `request`
+/// FIRST and then two more arguments off the already-shadowed handle, and a
+/// no-argument route as the control. `reason` and `connection` ride along:
+/// they are the other two identifiers the expansion writes into a block, and
+/// neither was ever a collision (`reason` is bound inside the decode arm,
+/// `connection` only in `__attach`'s own route) — so they are pinned as
+/// admitted, not as fixes.
+#[test]
+fn an_rpc_parameter_named_request_does_not_shadow_the_route_closures_handle() {
+    let dir = temp_project("request_named_parameter");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::shared::Shared;
+import std::result::Result::{ self, Ok, Err };
+import std::json::{ Json, FromJson };
+import std::json::json_codec;
+import std::rpc::local_rpc;
+
+[service(EchoClient)]
+struct Echo {
+	seen: Shared<i32>,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, request: str): str {
+		self.seen.write() = self.seen.read() + 1;
+		"got " + request
+	}
+
+	[rpc]
+	fun tally(self, request: i32, reason: str, connection: i32): str {
+		i"{request}/{reason}/{connection}"
+	}
+
+	[rpc]
+	fun ping(self): str {
+		"pong"
+	}
+}
+
+fun main() {
+	let echo = Echo { seen = Shared::new(0) };
+	let transport = local_rpc(echo.dispatcher().into_protocol(json_codec()));
+	let client = EchoClient { transport, codec = json_codec() };
+	print(i"send = {client.send("hi").unwrap_or("<err>")}");
+	print(i"tally = {client.tally(7, "why", 3).unwrap_or("<err>")}");
+	print(i"ping = {client.ping().unwrap_or("<err>")}");
+	print(i"seen = {echo.seen.read()}");
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("send = got hi"),
+        "a `request`-named parameter must decode like any other:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("tally = 7/why/3"),
+        "every argument after a `request`-named one must decode off the \
+         closure's handle, not off the shadow:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ping = pong"),
+        "the no-argument control route must still answer:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("seen = 1"),
+        "the handler must have run exactly once — a decode that failed \
+         silently would answer without touching the service:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A82's wire face, end to end over a real socket: an `[rpc]` method taking a
+/// `u53` and answering a `Result<i53, str>` — the two things `std::wire` did
+/// not carry, and the exact signature kolt's `store.vl:184` wanted and wrote
+/// `Option<i53>` for instead, with forty lines of hand-written `Result` impl
+/// sitting above it.
+///
+/// What the round trip proves that the codec pins cannot: the generated client
+/// and the generated dispatcher agree about this payload, which means the
+/// `call<T: Wire>` bound resolved to std's impl on both sides, `Ok` and `Err`
+/// survive the frame in both directions, and the unsigned id decodes at its
+/// declared width rather than at `i53`'s. The stub's own `Result<_, RpcError>`
+/// wraps the method's `Result<i53, str>` — two `Result`s nested, which is the
+/// shape every fallible rpc has from here on, so it is what the assertions
+/// read.
+#[test]
+fn an_rpc_answering_a_result_over_a_u53_id_round_trips_both_arms() {
+    let dir = temp_project("wire_result");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+
+[service(StoreClient)]
+struct Store {
+	name: str,
+}
+
+impl Store {
+	// The signature A82 exists for: an unsigned id in, a fallible reply out.
+	[rpc]
+	fun lookup(self, id: u53): Result<i53, str> {
+		if id == 0u53 {
+			Err(i"no row {id} in {self.name}")
+		} else {
+			Ok(id.as_i53() * 2i53)
+		}
+	}
+
+	// The widest id the contract admits, answered at the widest value — the
+	// [0, 2^53] window's top, which is exactly where a narrowing bug shows.
+	[rpc]
+	fun widest(self): u53 {
+		9007199254740992u53
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Store {
+			name = "store",
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun show(outcome: Result<Result<i53, str>, str>): str {
+	match outcome {
+		Ok(let inner) => match inner {
+			Ok(let value) => i"ok:{value}",
+			Err(let reason) => i"err:{reason}",
+		},
+		Err(let reason) => i"call-failed:{reason}",
+	}
+}
+
+fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			print(show(client.lookup(21u53).map_err(|error| error.debug())));
+			print(show(client.lookup(0u53).map_err(|error| error.debug())));
+			print(i"widest:{client.widest().unwrap_or(0u53)}");
+		},
+		Err(let error) => print(i"connect-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The `Ok` arm crossed and carried its payload.
+        "ok:42",
+        // The `Err` arm crossed as an `Err`, not as a transport failure, and
+        // its `str` payload came with it.
+        "err:no row 0 in store",
+        // The unsigned id decoded at its own width at both ends.
+        "widest:9007199254740992",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the result service's run:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("call-failed:"),
+        "a `Result` reply was reported as a transport failure:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("connect-err:"),
+        "the result service refused the connection:\n{stdout}"
+    );
+}
+
+/// A107 (R6), end to end over a real socket: an `[rpc]` method that returns
+/// NOTHING and is still awaited. Both spellings — the omitted return type and
+/// an explicit `: void` — and the ordering that is the whole point.
+///
+/// What this pins that no codec test can: the ack is not a shortcut. The
+/// server's handler runs to COMPLETION before the reply is encoded, so the
+/// print inside `remove` lands before the client's `client-acked-remove`, and
+/// a `count` issued after the await sees the removal. That is the difference
+/// between this and a notification (A75 `notify`, `send_notification`), which
+/// returns as soon as the request is sent and can be overtaken by anything.
+///
+/// The stub answers `Result<void, RpcError>` — every other stub's shape with
+/// the unit value in its `Ok` (B363: `void` IS vilan's unit value; the first
+/// surface was `Option<RpcError>`, chosen on a probe that had tried only the
+/// `()` spelling). `Ok(_)` is the ack.
+///
+/// The wire does not move for this. The reply is the SAME ack envelope
+/// `notified` already sent for a `[client_service]` notification, so nothing
+/// about `Serialize`'s vocabulary or any existing frame changes; what is new is
+/// a client that waits for it. The contract entry is `remove(i53)->void;`, and
+/// no service that compiled before this had a void method to hash.
+#[test]
+fn an_awaited_void_rpc_acks_after_its_handler_ran() {
+    let dir = temp_project("void_rpc");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::option::Option::{ self, None, Some };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+
+[service(StoreClient)]
+struct Store {
+	rows: SignalCell<List<i53>>,
+}
+
+impl Store {
+	// The signature A107 exists for: nothing to report, something to wait for.
+	// kolt's `store.vl` wrote `bool` for exactly this and said so in a FIXME.
+	[rpc]
+	fun remove(self, id: i53) {
+		self.rows.update(|&mut rows| {
+			if rows.index_of(id) is Some(let index) {
+				rows.remove(index);
+			}
+		});
+		print(i"server-removed:{id}");
+	}
+
+	// The explicit spelling of the same declaration.
+	[rpc]
+	fun clear(self): void {
+		self.rows.set([]);
+		print("server-cleared");
+	}
+
+	[rpc]
+	fun count(self): i32 {
+		self.rows.get().len().as_i32()
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Store {
+			rows = SignalCell::new([1i53, 2i53, 3i53]),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			match client.remove(2i53) {
+				Ok(_) => print("client-acked-remove"),
+				Err(let error) => print(i"client-remove-failed:{error.debug()}"),
+			}
+			print(i"count-after-remove:{client.count().unwrap_or(0)}");
+			match client.clear() {
+				Ok(_) => print("client-acked-clear"),
+				Err(let error) => print(i"client-clear-failed:{error.debug()}"),
+			}
+			print(i"count-after-clear:{client.count().unwrap_or(0)}");
+		},
+		Err(let error) => print(i"connect-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The omitted-return spelling crossed and came back acked.
+        "client-acked-remove",
+        // The handler's effect is visible to the NEXT call, which is what the
+        // await bought.
+        "count-after-remove:2",
+        // The explicit `: void` spelling is the same call.
+        "client-acked-clear",
+        "count-after-clear:0",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the void service's run:\n{stdout}"
+        );
+    }
+    // The ORDERING, which is the claim: the handler ran before the ack. A
+    // notification could print these two in either order.
+    let handler = stdout
+        .find("server-removed:2")
+        .unwrap_or_else(|| panic!("the void handler never ran:\n{stdout}"));
+    let ack = stdout
+        .find("client-acked-remove")
+        .expect("the ack was asserted above");
+    assert!(
+        handler < ack,
+        "an awaited void must ack AFTER its handler completed — this is the \
+         only thing that distinguishes it from a notification:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("client-remove-failed:") && !stdout.contains("client-clear-failed:"),
+        "an acked void call was reported as a failure:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("connect-err:"),
+        "the void service refused the connection:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B288, on a GENERATED client: the kolt shape, where the handle's element
+/// type is reachable only through the closure's return (`|T|
+/// Option<RemoteSource<U>>`) and the fallback is an empty `[]`. The wrong
+/// annotation used to be accepted in silence — kolt's `model.vl` carried three
+/// of them behind FIXMEs, one over a `List<i53>` handle annotated as something
+/// else entirely — and dropping the annotation was not possible at all.
+///
+/// A92 made the handle stub SYNC, which retires the bridge as an idiom (the
+/// mirror is in hand; `or([])` is the whole of it). The `Task` is therefore
+/// written here rather than produced by the stub — what is pinned is the
+/// SOLVER's behaviour, that a closure's RETURN binds `U`, and that shape is
+/// exactly as reachable over a handle a caller wrapped itself.
+#[test]
+fn a_handle_bridges_element_type_is_checked_against_the_annotation_at_the_call() {
+    let dir = temp_project("b288_handle_bridge");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    const BRIDGE: &str = r#"import std::reactive::{ Signal, SignalCell };
+import std::rpc::{ RemoteSource, Transport };
+import std::task::Task;
+
+[service(ChatClient)]
+struct Chat {
+	label: str,
+}
+
+impl Chat {
+	[rpc]
+	fun get_messages(self, id: i53): Option<SignalCell<List<i53>>> {
+		None
+	}
+}
+
+// The handle stub is sync (A92), so the `Task` the bridge takes is the
+// caller's own — which is what a `remote_signal`-shaped helper is left with.
+fun handle_of<X: Transport>(client: ChatClient<X>): Task<RemoteSource<List<i53>>> {
+	async { client.get_messages(1i53) }
+}
+
+impl Task<type T> {
+	fun remote_signal<U>(self, fallback: U, transform: |T| Option<RemoteSource<U>>): SignalCell<U> {
+		Signal::new(fallback)
+	}
+}
+"#;
+    let check = |source: &str| {
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+
+    // The wrong annotation is refused, and the refusal names the element type
+    // the handle actually carries.
+    let (ok, report) = check(&format!(
+        "{BRIDGE}
+fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<str>> {{
+	let handle = handle_of(client);
+	let messages: SignalCell<List<str>> = handle.remote_signal([], |x| Option::Some(x));
+	messages
+}}
+
+fun main() {{}}
+"
+    ));
+    assert!(!ok, "the wrong annotation must not compile:\n{report}");
+    assert!(
+        report.contains("Expected SignalCell<List<str>>, but got SignalCell<List<i53>> instead."),
+        "the refusal must name the handle's element type; it said:\n{report}"
+    );
+
+    // The RIGHT annotation compiles — the control that the refusal above is a
+    // disagreement and not a new blanket refusal of the shape.
+    let (ok, report) = check(&format!(
+        "{BRIDGE}
+fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<i53>> {{
+	let handle = handle_of(client);
+	let messages: SignalCell<List<i53>> = handle.remote_signal([], |x| Option::Some(x));
+	messages
+}}
+
+fun main() {{}}
+"
+    ));
+    assert!(ok, "the right annotation must compile:\n{report}");
+
+    // And NO annotation compiles: the closure's return binds `U` now, which is
+    // the half that made the annotation mandatory in the first place.
+    let (ok, report) = check(&format!(
+        "{BRIDGE}
+fun read<X: Transport>(client: ChatClient<X>): SignalCell<List<i53>> {{
+	let handle = handle_of(client);
+	handle.remote_signal([], |x| Option::Some(x))
+}}
+
+fun main() {{}}
+"
+    ));
+    assert!(ok, "the unannotated bridge must compile:\n{report}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B295: an `[rpc]` method may be spelled with any of the names the `[service]`
+/// generator's own bodies call, in BOTH directions.
+///
+/// The generated stub used to call the imported FREE `call(self.transport,
+/// self.codec, ..)` from inside `impl <Name>Client` — which now declares
+/// `fun call` — and the build stopped inside generated code with "`call`
+/// expects 2 arguments, but got 4", spanned on the STRUCT. `notify` did the
+/// same through `<Name>Proxy`, and `arg`, `reply`, `turn` and `notified` were
+/// the same hazard waiting for the author who spells one. The generator writes
+/// `rpc::call(..)` / `reactive::turn(..)` now and imports the two modules
+/// beside the TYPES it names, so no method can shadow one.
+///
+/// Both directions in one program on purpose: the forward stub (`<Name>Client`)
+/// and the reverse proxy (`<Name>Proxy`) are separate emission paths that
+/// shadowed separately, and `kick` drives the reverse one through the service's
+/// own `HandlersProxy` field. The round trip — not a `check` — is what proves
+/// the qualified name resolved to std's function and not to something that
+/// merely compiled.
+#[test]
+fn an_rpc_method_named_for_a_generator_free_function_round_trips_in_both_directions() {
+    let dir = temp_project("generator_name_collisions");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+import std::time::sleep;
+
+[client_service]
+struct Handlers {
+	seen: SignalCell<str>,
+}
+
+impl Handlers {
+	[rpc]
+	fun notify(self, what: str) {
+		self.seen.set(what);
+	}
+}
+
+[service(BusClient, client = Handlers)]
+struct Bus {
+	client: HandlersProxy,
+}
+
+impl Bus {
+	[rpc]
+	fun call(self, what: str): str {
+		"called " + what
+	}
+
+	[rpc]
+	fun arg(self, index: i32): i32 {
+		index + 1
+	}
+
+	[rpc]
+	fun reply(self, what: str): str {
+		"replied " + what
+	}
+
+	[rpc]
+	fun turn(self, degrees: i32): i32 {
+		degrees * 2
+	}
+
+	[rpc]
+	fun notified(self, what: str): str {
+		"notified " + what
+	}
+
+	[rpc]
+	fun kick(self, reason: str): i32 {
+		self.client.notify(reason);
+		1
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Bus {
+			client = connection.client(),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match BusClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let raw) => {
+			let handlers = Handlers { seen = Signal::new("") };
+			let client = raw.with_handlers(handlers);
+			print(i"call:{client.call("hi").unwrap_or("<err>")}");
+			print(i"arg:{client.arg(41).unwrap_or(0)}");
+			print(i"reply:{client.reply("ok").unwrap_or("<err>")}");
+			print(i"turn:{client.turn(21).unwrap_or(0)}");
+			print(i"notified:{client.notified("x").unwrap_or("<err>")}");
+			match client.kick("revoked") {
+				Ok(let count) => print(i"kick:{count}"),
+				Err(let _e) => print("kick-error"),
+			}
+			mut attempts = 0;
+			for attempts < 200 {
+				if handlers.seen.get() == "revoked" {
+					jump break;
+				}
+				sleep(1);
+				attempts += 1;
+			}
+			print(i"seen:{handlers.seen.get()}");
+		},
+		Err(let _error) => print("connect-error"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The forward stub, through `<Name>Client`: the name the item reported.
+        "call:called hi",
+        // `arg`, `reply` and `notified` are the dispatcher's free calls; `turn`
+        // is `std::reactive`'s, written into every route block.
+        "arg:42",
+        "reply:replied ok",
+        "turn:42",
+        "notified:notified x",
+        // The reverse proxy, through `<Name>Proxy`: `notify` is the free
+        // function its body calls AND the method the author declared.
+        "kick:1",
+        "seen:revoked",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "a generator free-function name used as an `[rpc]` method must \
+             round-trip; expected `{expected}` in:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B295's other half: `__` is the generator's prefix, so an `[rpc]` parameter
+/// spelled with it is refused AT THE ATTRIBUTE.
+///
+/// B282 moved the route closure's binding from `request` to `__request`, which
+/// closed the collision an author could stumble into and opened one they cannot
+/// be asked to know about: `fun send(self, __request: str)` rebinds the handle
+/// the route decodes from, and the build stopped inside generated code with
+/// "Expected RpcRequest, but got str", spanned on the STRUCT. Qualifying cannot
+/// help here — the collision is between two BINDINGS in one block, not between
+/// a method and an import — so the prefix is reserved and said so once, on the
+/// parameter. The whole prefix, not the one name: `__attach` and `__contract`
+/// already take it, and a reservation that has to be re-read every time the
+/// generator mints a binding is not a reservation.
+#[test]
+fn an_rpc_parameter_whose_name_starts_with_a_double_underscore_is_refused() {
+    let dir = temp_project("dunder_parameter");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[service(EchoClient)]
+struct Echo {
+	seen: i32,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, __request: str): str {
+		__request
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    for expected in [
+        "parameter `__request` of `[rpc]` method `send` starts with `__`",
+        "the `[service]` expansion reserves for its own bindings",
+        "does not begin with `__`",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    // One mistake, one message: the expansion is skipped, so the generated
+    // client the author never wrote contributes nothing.
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the build reported:\n{text}"
+    );
+    assert!(
+        !text.contains("Expected RpcRequest"),
+        "the generated-code diagnostic B295 recorded must be gone:\n{text}"
+    );
+    // A SINGLE leading underscore is the ordinary unused-binding spelling and
+    // is untouched — the reservation is the generator's prefix, not underscores.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+[service(EchoClient)]
+struct Echo {
+	seen: i32,
+}
+
+impl Echo {
+	[rpc]
+	fun send(self, _request: str): str {
+		_request
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a single leading underscore must still compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B303: a non-Wire `[rpc]` payload reports ONCE — the signature refusal, in
+/// the method's own vocabulary and on the annotation the author wrote.
+///
+/// The generated client's `call<T: Wire>` fails at exactly the type the refusal
+/// has already named, and that failure is anchored over the whole `[service]`
+/// struct as "in code generated by this attribute: 'Password' does not
+/// implement trait 'Wire'" — a second (and, with an argument beside the return,
+/// a third) report of one mistake, at a span the author never wrote and reading
+/// FIRST. `[expose]` has stood its generated bound failures down since B189 and
+/// `[rpc]` had nothing; it does now, keyed on the TYPES the refusal reported
+/// rather than on the bare `Wire` label, which would have silenced sentences
+/// this refusal never said.
+///
+/// Two shapes, because the labels differ: a bare non-Wire return, where the
+/// refusal and the bound failure name the same type, and a `List<Password>`
+/// parameter beside a `Map<str, Password>` return, where the refusal names the
+/// COLLECTION and the bound fails at the element — which is why the recorded
+/// set descends.
+#[test]
+fn a_non_wire_rpc_payload_reports_once_in_the_methods_own_vocabulary() {
+    let dir = temp_project("non_wire_payload_once");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+
+struct Password {
+	hash: str,
+}
+
+[service(VaultClient)]
+struct Vault {
+	seen: i32,
+}
+
+impl Vault {
+	[rpc]
+	fun secret(self, who: str): Password {
+		Password { hash = who }
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("return type of `[rpc]` method `secret` is `Password`, which is not Wire"),
+        "the honest refusal must still fire:\n{text}"
+    );
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "one non-Wire payload is one report; the build said:\n{text}"
+    );
+    assert!(
+        !text.contains("does not implement trait 'Wire'"),
+        "the generated client's bound failure must stand down behind the \
+         signature refusal:\n{text}"
+    );
+    assert!(
+        !text.contains("in code generated by this attribute"),
+        "nothing about generated code may be left for the author to read:\n{text}"
+    );
+
+    // The nesting case: the refusal names the COLLECTION, the generated
+    // `describe`/`call` bound fails at the ELEMENT. Two mistakes here, so two
+    // reports — and neither of them a generated one.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::map::Map;
+
+struct Password {
+	hash: str,
+}
+
+[service(VaultClient)]
+struct Vault {
+	seen: i32,
+}
+
+impl Vault {
+	[rpc]
+	fun store(self, keys: List<Password>): i32 {
+		keys.len().as_i32()
+	}
+
+	[rpc]
+	fun lookup(self, who: str): Map<str, Password> {
+		Map::new()
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("parameter `keys` of `[rpc]` method `store` is `List<Password>`"),
+        "the parameter's refusal must still fire:\n{text}"
+    );
+    assert!(
+        text.contains("return type of `[rpc]` method `lookup` is `Map<str, Password>`"),
+        "the return's refusal must still fire:\n{text}"
+    );
+    assert_eq!(
+        text.matches("Error:").count(),
+        2,
+        "two non-Wire payloads are two reports and no more; the build said:\n{text}"
+    );
+    assert!(
+        !text.contains("does not implement trait 'Wire'"),
+        "the stand-down must reach the element the collection nests:\n{text}"
+    );
+
+    // The CONTROL: a Wire payload compiles, so the stand-down is not a check
+    // that stopped running.
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::wire::Wire;
+
+[derive(Wire)]
+struct Badge {
+	hash: str,
+}
+
+[service(VaultClient)]
+struct Vault {
+	seen: i32,
+}
+
+impl Vault {
+	[rpc]
+	fun secret(self, who: str): Badge {
+		Badge { hash = who }
+	}
+}
+
+fun main() {
+	print("built");
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "a Wire payload must still compile:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Copy a directory tree — the fixture-std machinery below, and nothing else
+/// in this file needs it.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create fixture dir");
+    for entry in std::fs::read_dir(from).expect("read fixture source") {
+        let entry = entry.expect("read fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("fixture entry kind").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy fixture file");
+        }
+    }
+}
+
+/// N70: there is no Rust fallback `[service]` generator any more, and the one
+/// path that reached it is answered with a sentence.
+///
+/// `analyzer::service_impl_source` was a twin of `std/src/rpc.vl`'s `service`
+/// macro and had drifted into a stale one — no `turn` wrapper, no keyed
+/// exposures, still `fun dispatcher(self)`, no `connect_with`, no reconnect
+/// hook, no handle mapping, and a `service_contract_hash` that disagreed with
+/// the macro's for any keyed service, which is to say the two halves it
+/// generated could not have talked to each other. Its only reach was a std with
+/// no `rpc.vl` in it; a silently STALE expansion is the worst answer available
+/// to that reader, so the attribute refuses instead.
+///
+/// The fixture is a real std with exactly one file removed, driven through
+/// `VILAN_STD`, because that is precisely the state the fallback existed for.
+/// The control is the same program against the shipped std: it compiles, which
+/// is what makes the refusal a statement about `rpc.vl` and not about the
+/// attribute.
+#[test]
+fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stale_twin() {
+    let toolchain = temp_project("std_without_rpc");
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    copy_tree(&shipped.join("std"), &toolchain.join("std"));
+    // Macros resolve `macro_std` BESIDE `std`, so the fixture needs the sibling.
+    copy_tree(&shipped.join("macro_std"), &toolchain.join("macro_std"));
+    std::fs::remove_file(toolchain.join("std/src/rpc.vl")).expect("remove rpc.vl");
+
+    let dir = temp_project("service_without_rpc");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        // The `[rpc]` method is not incidental: a `[service]` with an empty
+        // contract surface is refused in its own right (B375), and the control
+        // below has to reach the generator rather than that refusal.
+        "[service(EchoClient)]\nstruct Echo {\n\tseen: i32,\n}\n\nimpl Echo {\n\t[rpc]\n\t\
+         fun seen(self): i32 {\n\t\tself.seen\n\t}\n}\n\nfun main() {}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .env("VILAN_STD", toolchain.join("std"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[service]` over a std with no `rpc.vl` must not compile:\n{text}"
+    );
+    for expected in [
+        "`[service]` needs std's `rpc.vl`",
+        "there is no second generator behind it",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the run reported:\n{text}"
+    );
+
+    // The control: the same program against the SHIPPED std compiles, so what
+    // is being refused is the missing module and not the attribute.
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    assert!(
+        output.status.success(),
+        "the same service must compile against the shipped std:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&toolchain);
+}
+
+/// N79: there is no Rust fallback DERIVE generator any more either, and the one
+/// path that reached it is answered with a sentence.
+///
+/// The twin of the pin above, and it lives beside it because the two are one
+/// mechanism: an annotation whose only expander is a macro a std module
+/// declares. `analyzer::derive_impl_source` was a Rust copy of the
+/// `Json`/`Wire`/`PartialEq`/`Default`/`Debug`/`Hashable` macros — 729 lines of
+/// generator, reachable only from a std missing the module that declares the
+/// macro, pinned by nothing, and free to drift from the macro it stood in for
+/// with nothing in the suite to notice. N70 is what that drift looks like when
+/// it is allowed to run: a contract hash the two halves disagreed about. So the
+/// derive refuses rather than serving a second answer.
+///
+/// The fixture is a real std with exactly one file removed, driven through
+/// `VILAN_STD`, because that is precisely the state the fallback existed for.
+/// The control is the same program against the shipped std: it compiles, which
+/// is what makes the refusal a statement about `json.vl` and not about
+/// `[derive(Json)]`.
+#[test]
+fn a_derive_over_a_std_without_its_macro_is_refused_instead_of_falling_back_to_a_rust_twin() {
+    let toolchain = temp_project("std_without_json");
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    copy_tree(&shipped.join("std"), &toolchain.join("std"));
+    // Macros resolve `macro_std` BESIDE `std`, so the fixture needs the sibling.
+    copy_tree(&shipped.join("macro_std"), &toolchain.join("macro_std"));
+    std::fs::remove_file(toolchain.join("std/src/json.vl")).expect("remove json.vl");
+
+    let dir = temp_project("derive_without_json");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "[derive(Json)]\nstruct Point {\n\tx: i32,\n}\n\nfun main() {}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .env("VILAN_STD", toolchain.join("std"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[derive(Json)]` over a std with no `json.vl` must not compile:\n{text}"
+    );
+    // The message owes an author three things: which derive, which std module
+    // it comes from, and that there is nothing behind it to fall back to.
+    for expected in [
+        "`[derive(Json)]` needs std's `json.vl`",
+        "the `Json` macro that module declares",
+        "there is no second generator behind it",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the refusal must say `{expected}`; it said:\n{text}"
+        );
+    }
+    assert_eq!(
+        text.matches("Error:").count(),
+        1,
+        "the refusal must stand alone; the run reported:\n{text}"
+    );
+
+    // The control: the same program against the SHIPPED std compiles, so what
+    // is being refused is the missing module and not the derive.
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    assert!(
+        output.status.success(),
+        "the same derive must compile against the shipped std:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&toolchain);
+}
+
+/// A79: the KEYED handle return, over a real WebSocket and read off the
+/// server's own tables.
+const KEYED_HANDLE: &str = r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Subscription };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc::{ KeyedCell, KeyedSource, RemoteSource, session_of };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Task {
+	id: i32,
+	title: str,
+}
+
+impl Task with Keyed<i32> {
+	fun key(self): i32 {
+		self.id
+	}
+}
+
+// One board per workspace — the shape the return mapping exists for: a
+// collection the client watches a FRACTION of, and one no `[expose]` field
+// could name (there is one field per exposure, and a workspace is not a set
+// the compiler knows).
+let boards: Shared<List<(str, KeyedCell<i32, Task>)>> = Shared::new([]);
+let asks: Shared<i32> = Shared::new(0);
+
+fun board_for(workspace: str): KeyedCell<i32, Task> {
+	for entry in boards.read() {
+		let (key, cell) = entry;
+		if key == workspace {
+			ret cell;
+		}
+	}
+	let fresh: KeyedCell<i32, Task> = KeyedCell::new([Task { id = 1, title = "first" }]);
+	boards.write().push((workspace, fresh));
+	fresh
+}
+
+[service(BoardClient)]
+struct Board {
+	[expose] name: SignalCell<str>,
+	connection: i32,
+}
+
+impl Board {
+	[rpc]
+	fun tasks_in(self, workspace: str): KeyedCell<i32, Task> {
+		asks.write() = asks.read() + 1;
+		board_for(workspace)
+	}
+
+	// The SAME source, answered as a plain handle: a `KeyedCell`'s `elements`
+	// IS a `SignalCell`, so this method and `tasks_in` offer one cell identity
+	// for two channels that carry different FRAMES.
+	[rpc]
+	fun rows_in(self, workspace: str): SignalCell<List<Task>> {
+		board_for(workspace).elements
+	}
+
+	[rpc]
+	fun add(self, workspace: str, id: i32, title: str): bool {
+		board_for(workspace).insert(Task { id, title });
+		true
+	}
+
+	[rpc]
+	fun stats(self): List<i32> {
+		match session_of(self.connection) {
+			Option::Some(let session) => [
+				session.sources.read().len().as_i32(),
+				session.live.read().len().as_i32(),
+				asks.read(),
+			],
+			Option::None => [0 - 1, 0 - 1, 0 - 1],
+		}
+	}
+}
+
+let name: SignalCell<str> = Signal::new("acme");
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(
+			|connection| Board { name, connection = connection.id },
+			json_codec(),
+		))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let empty: List<i32> = [0 - 1, 0 - 1, 0 - 1];
+			print(i"hash:{client.contract_hash()}");
+			// SYNC and unleased, exactly like the plain form.
+			let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let before = client.stats().unwrap_or(empty);
+			print(i"minted:sources={before[0]} live={before[1]} asks={before[2]} status={tasks.status().get().debug()}");
+			let seen: Shared<i32> = Shared::new(0);
+			let watching = tasks.sub(|rows| {
+				seen.write() = seen.read() + 1;
+				print(i"rows:{rows.len()}");
+			});
+			let _settle = client.stats();
+			let leased = client.stats().unwrap_or(empty);
+			print(i"leased:sources={leased[0]} live={leased[1]} asks={leased[2]} status={tasks.status().get().debug()}");
+			print(i"add:{client.add("alpha", 2, "second").unwrap_or(false)}");
+			let _flush = client.stats();
+			print(i"frames:{seen.read()}");
+			watching.dispose();
+			let _drain = client.stats();
+			let released = client.stats().unwrap_or(empty);
+			print(i"released:sources={released[0]} live={released[1]} asks={released[2]}");
+
+			// A per-KEY lease is a first demand too, and mints the same way.
+			let keyed: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let one = keyed.sub_key(2, |row| match row {
+				Option::Some(let task) => print(i"key:{task.title}"),
+				Option::None => {},
+			});
+			let _asked = client.stats();
+			let keyleased = client.stats().unwrap_or(empty);
+			print(i"keyleased:sources={keyleased[0]} live={keyleased[1]} asks={keyleased[2]}");
+			one.dispose();
+			let _quiet = client.stats();
+			let keyreleased = client.stats().unwrap_or(empty);
+			print(i"keyreleased:sources={keyreleased[0]} live={keyreleased[1]} asks={keyreleased[2]}");
+
+			// Dedup is by source AND frame shape. These two handles name one
+			// cell and must NOT share a channel: one carries `Patch` frames,
+			// the other `Update`s, and a mirror handed the wrong one would
+			// simply never seed.
+			let patched: KeyedSource<i32, Task> = client.tasks_in("alpha");
+			let whole: RemoteSource<List<Task>> = client.rows_in("alpha");
+			let holding_patched = patched.sub(|_rows| {});
+			let holding_whole = whole.sub(|_rows| {});
+			let _both = client.stats();
+			let shapes = client.stats().unwrap_or(empty);
+			print(i"shapes:sources={shapes[0]} live={shapes[1]}");
+			print(i"patched:{patched.get().unwrap_or([]).len()} whole:{whole.get().unwrap_or([]).len()}");
+			holding_patched.dispose();
+			holding_whole.dispose();
+			print("done");
+			exit(0);
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+}
+"#;
+
+/// A79: an `[rpc]` method returning a `KeyedCell<K, T>` hands the client a
+/// `KeyedSource<K, T>` — §9.2's third row, in A92's sync unleased shape.
+///
+/// - **The same shape as the plain form, at the keyed type.** The stub is sync
+///   and answers the mirror; `minted` reports the `[expose]`d field's channel
+///   and nothing else, no ask, `Waiting`. The first lease issues the call, and
+///   `leased` is one ask, one capability, one forward.
+/// - **Element-grained, which is the whole reason the row exists.** The seed
+///   is a `Reset` (`rows:1`) and the `add` is ONE `Patch` carrying one op
+///   (`rows:2`, `frames:2`) — the `KeyedCell`'s op log forwarded rather than
+///   two snapshots diffed, per change per connection. A `RemoteSource<List<T>>`
+///   would resend the collection.
+/// - **Demand decides, per DEMAND rather than per channel.** The whole-
+///   collection lease going away withdraws the channel (`released` back to the
+///   field's alone), and a per-KEY lease on a fresh handle mints again
+///   (`asks` 1 → 2) and withdraws on its own release. That is the keyed half
+///   of the count: a keyed channel carries one forward per demand, so the
+///   capability goes when the last of them does — and no per-key hop, which
+///   stays Order 31's standing default.
+/// - **Dedup is by source AND frame shape.** A `KeyedCell`'s `elements` is a
+///   `SignalCell`, so a service can offer one cell identity for two channels
+///   that carry different frames — `Patch`es on the keyed one, `Update`s on
+///   the plain one. They must not collapse: `shapes` reports three
+///   capabilities and two forwards, and both mirrors are fed.
+/// - **The surface names the mapped type.** `tasks_in(str)->KeyedSource<i32,
+///   Task>;` — the client's type, like every other handle row.
+#[test]
+fn a_keyed_handle_return_hands_the_client_a_patched_mirror_minted_at_its_first_lease() {
+    let dir = temp_project("keyed_handle");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", KEYED_HANDLE);
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let line_of = |label: &str| -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(label).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{label}` is missing from:\n{stdout}"))
+    };
+    assert_eq!(
+        line_of("minted:"),
+        "sources=1 live=0 asks=0 status=Waiting",
+        "a keyed handle nothing watches must cost nothing — no call, no \
+         capability, no forward:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("leased:"),
+        "sources=2 live=1 asks=1 status=Ready",
+        "the first lease must issue the call, mint the channel and seed the \
+         mirror:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("add:"),
+        "true",
+        "the write did not reach the board:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("frames:"),
+        "2",
+        "a keyed handle must be ELEMENT-GRAINED: a seed and one patch per \
+         change, not a whole collection per change:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("released:"),
+        "sources=1 live=0 asks=1",
+        "the whole-collection lease reaching zero must withdraw the dynamic \
+         keyed channel:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("key:"),
+        "second",
+        "a per-key lease must deliver its own element:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("keyleased:"),
+        "sources=2 live=1 asks=2",
+        "a per-KEY lease is a first demand too: it must mint the channel the \
+         same way a whole-collection one does:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("keyreleased:"),
+        "sources=1 live=0 asks=2",
+        "the last per-key hold going is the channel going — a keyed channel \
+         carries one forward per demand:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("shapes:"),
+        "sources=3 live=2",
+        "a keyed and a plain handle over ONE cell must not share a channel: \
+         they carry different frames, and a mirror handed the wrong shape \
+         would silently never seed:\n{stdout}"
+    );
+    assert_eq!(
+        line_of("patched:"),
+        "2 whole:2",
+        "both mirrors of the one source must be fed, each in its own frame \
+         shape:\n{stdout}"
+    );
+    let keyed_surface = "tasks_in(str)->KeyedSource<i32, Task>;\
+                         rows_in(str)->RemoteSource<List<Task>>;\
+                         add(str,i32,str)->bool;\
+                         stats()->List<i32>;\
+                         expose:name:str;";
+    assert_eq!(
+        line_of("hash:"),
+        contract_hash_of(keyed_surface),
+        "the contract surface must name the MAPPED keyed type:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("err:"),
+        "the keyed handle service failed:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B312: an `[rpc]` method whose NAME the expansion generates is refused at the
+/// attribute, in the method's own vocabulary and spanned on the method.
+///
+/// B295's qualification cannot reach this class, because the clash is not a
+/// shadowing but a DUPLICATE DEFINITION: the stub the expansion writes for
+/// `verify` on the client sits beside the `verify` it always writes there, and
+/// what the author saw was "'verify' is already defined for 'EchoClient<T>'"
+/// anchored on the struct — one error for the four client-only names and three
+/// each for `contract_hash` and `dispatcher`, which land on the service too.
+///
+/// The gate follows the generator and the probes confirm it: `dispatcher` and
+/// `contract_hash` go on the SERVICE struct, so they are reserved on a
+/// `[client_service]`-only struct as well, while `connect`, `connect_with`,
+/// `with_handlers` and `verify` exist only where a transport client is
+/// generated. `dispatcher_for` and `for_connection` are the controls and are
+/// NOT reserved: a trait impl is a different declaration site, and both compile
+/// today.
+#[test]
+fn an_rpc_method_named_for_a_generated_member_is_refused_at_the_attribute() {
+    let dir = temp_project("generated_member_name");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    let service = |method: &str| {
+        format!(
+            "import std::io::print;\n\n\
+             [service(EchoClient)]\n\
+             struct Echo {{\n\tseen: i32,\n}}\n\n\
+             impl Echo {{\n\t[rpc]\n\tfun {method}(self, text: str): str {{\n\t\ttext\n\t}}\n}}\n\n\
+             fun main() {{\n\tprint(\"built\");\n}}\n"
+        )
+    };
+    for (method, owner) in [
+        ("verify", "EchoClient"),
+        ("connect", "EchoClient"),
+        ("connect_with", "EchoClient"),
+        ("with_handlers", "EchoClient"),
+        ("contract_hash", "Echo"),
+        ("dispatcher", "Echo"),
+    ] {
+        write(&dir, "src/main.vl", &service(method));
+        let text = vilan_build_refusal(&dir);
+        for expected in [
+            format!("`[rpc]` method `{method}` takes a name the `[service]` expansion generates"),
+            format!("on `{owner}`"),
+            "Rename the method".to_string(),
+        ] {
+            assert!(
+                text.contains(&expected),
+                "the refusal for `{method}` must say `{expected}`; it said:\n{text}"
+            );
+        }
+        // One mistake, one message — and none of the generated-code duplicates
+        // the author used to read instead.
+        assert_eq!(
+            text.matches("Error:").count(),
+            1,
+            "the refusal for `{method}` must stand alone; the build reported:\n{text}"
+        );
+        assert!(
+            !text.contains("is already defined"),
+            "the duplicate-definition error B312 recorded must be gone for `{method}`:\n{text}"
+        );
+        assert!(
+            !text.contains("in code generated by this attribute"),
+            "nothing may report from inside the expansion for `{method}`:\n{text}"
+        );
+    }
+    // The controls: a trait impl's members are a different declaration site,
+    // and a name the generator never writes is nobody's business.
+    for method in ["dispatcher_for", "for_connection", "send"] {
+        write(&dir, "src/main.vl", &service(method));
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["build", dir.to_str().unwrap()])
+            .output()
+            .expect("run vilan build");
+        assert!(
+            output.status.success(),
+            "`{method}` is not a generated member and must still compile:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // A `[client_service]`-only struct generates its dispatcher and no client,
+    // so the reservation is exactly the two service-side names.
+    let handler = |method: &str| {
+        format!(
+            "import std::io::print;\n\n\
+             [client_service]\n\
+             struct Notices {{\n\tseen: i32,\n}}\n\n\
+             impl Notices {{\n\t[rpc]\n\tfun {method}(self, text: str) {{\n\t\tprint(text);\n\t}}\n}}\n\n\
+             fun main() {{\n\tprint(\"built\");\n}}\n"
+        )
+    };
+    write(&dir, "src/main.vl", &handler("dispatcher"));
+    let text = vilan_build_refusal(&dir);
+    assert!(
+        text.contains("takes a name the `[service]` expansion generates on `Notices`"),
+        "a `[client_service]` struct's own dispatcher is reserved too:\n{text}"
+    );
+    for method in ["verify", "connect", "with_handlers"] {
+        write(&dir, "src/main.vl", &handler(method));
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["build", dir.to_str().unwrap()])
+            .output()
+            .expect("run vilan build");
+        assert!(
+            output.status.success(),
+            "`{method}` is a CLIENT member and no client is generated here, so it must \
+             compile:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FIND (papers-39): the JSON reader's type enforcement, at the `[rpc]` face.
+///
+/// The route DOES consult `decode_failed` between the `arg` pulls and the impl
+/// call — the reader just never set it. Reading an `i32` out of a JSON list
+/// went straight through the host coercion, so a short argument list read the
+/// enclosing REQUEST OBJECT as a number (`NaN`), a string argument answered
+/// `NaN`, `null` answered `0`, `true` answered `1` and `1.5` answered `1.5`
+/// typed `i32` — each of them unpoisoned, so the guard passed and the impl ran
+/// on garbage. Over HTTP that is `{"method":"add","args":[]}` answering
+/// `{"Success":NaN}` to a caller who sent nothing. Harmless vilan-to-vilan (the
+/// contract hash refuses a disagreeing client) and not harmless at all for a
+/// plain-HTTP caller, which is what A120 is about.
+///
+/// One row per shape, and the control LAST so a passing run proves the route
+/// still works rather than that it stopped answering.
+#[test]
+fn a_malformed_rpc_argument_answers_a_decode_failure_rather_than_success() {
+    let dir = temp_project("rpc_arg_types");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", BYTE_IDENTICAL_SERVER);
+
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    for (body, expected) in [
+        // No argument at all. This is the row that answered
+        // `{"Success":NaN}`; since B383 it is the ARITY gate that catches it,
+        // ahead of the reader, because the arity gate can name what is wrong
+        // in the caller's own vocabulary.
+        (
+            "{\"method\":\"add\",\"args\":[]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 0\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[\"x\"]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found a string\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[null]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found null\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[true]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found a boolean\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[1.5]}",
+            "{\"Failure\":{\"Decode\":\"expected a whole number, found 1.5\"}}",
+        ),
+        // The args key holding something that is not a list at all.
+        (
+            "{\"method\":\"add\",\"args\":7}",
+            "{\"Failure\":{\"Decode\":\"expected an array, found a number\"}}",
+        ),
+        // The control: a well-formed call still routes and still answers.
+        ("{\"method\":\"add\",\"args\":[2]}", "{\"Success\":2}"),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        // A120 S3: a decode failure carries its own status (400) and the
+        // control row carries 200. The ENVELOPE is what a vilan client reads
+        // and it is the same envelope either way — the two never disagree,
+        // which is the property asserted here by checking both.
+        let status = if expected.contains("\"Failure\"") {
+            "HTTP/1.1 400 Bad Request\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\n"
+        };
+        assert!(
+            response.starts_with(status),
+            "`{body}` should be answered `{status}`: {response}"
+        );
+        assert!(
+            response.ends_with(expected),
+            "`{body}` should answer `{expected}`: {response}"
+        );
+    }
+}
+
+/// B375: `[service]` over an `export impl`.
+///
+/// The attribute's reflection walks the module's inherent impls for `[rpc]`
+/// methods, and it looked for a bare `Impl` node. `export impl Echo { .. }` is
+/// an `Impl` under an `Export` wrapper, so the walk found NOTHING: the
+/// dispatcher was generated with no routes, the contract surface was empty, and
+/// the hash was the empty-set hash `00001505`. Both generated sides agreed
+/// about that empty surface, so the service BUILT, a client CONNECTED, and
+/// every call answered `unknown method` at runtime with nothing said at compile
+/// time. `export` is visibility, not shape.
+///
+/// The pin asserts three things, and the third is what makes it a pin about the
+/// walker rather than about one program: the route answers, the hash is not the
+/// empty-set hash, and the hash is BYTE-IDENTICAL to the same surface written
+/// with a plain `impl`. A walker that read `export impl` as some other surface
+/// would pass the first two.
+#[test]
+fn a_service_over_an_export_impl_finds_its_methods() {
+    let dir = temp_project("export_impl_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+import std::wire::Frame;
+
+[service(ExportedClient)]
+struct Exported {
+	seed: i32,
+}
+
+export impl Exported {
+	[rpc]
+	fun add(self, left: i32, right: i32): i32 {
+		left + right + self.seed
+	}
+}
+
+// The identical surface, written with a plain `impl` reached through the
+// module-level re-export: the control the hash is compared against, and the
+// exact pair the find was minimised to.
+export *;
+
+[service(PlainClient)]
+struct Plain {
+	seed: i32,
+}
+
+impl Plain {
+	[rpc]
+	fun add(self, left: i32, right: i32): i32 {
+		left + right + self.seed
+	}
+}
+
+async fun main() {
+	let exported = Exported { seed = 0 };
+	let protocol = exported.dispatcher().into_protocol(json_codec());
+	let body = "{\"method\":\"add\",\"args\":[1,2]}";
+	match protocol.respond(Frame::Text(body)) {
+		Frame::Text(let reply) => print(i"reply={reply}"),
+		Frame::Binary(let _bytes) => print("binary"),
+	}
+	let plain = Plain { seed = 0 };
+	print(i"exported_hash={exported.contract_hash()}");
+	print(i"plain_hash={plain.contract_hash()}");
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("reply={\"Success\":3}"),
+        "an `export impl`'s `[rpc]` method must route:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("00001505"),
+        "the contract hash must not be the empty-surface hash:\n{stdout}"
+    );
+    let hash_of = |label: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("no `{label}` line:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        hash_of("exported_hash="),
+        hash_of("plain_hash="),
+        "`export` is visibility, not shape: the two surfaces must hash the \
+         same:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B375's other half: a `[service]` whose contract surface is EMPTY is refused
+/// at the attribute.
+///
+/// The empty surface hashes to the empty-set hash on both generated sides, so
+/// the two AGREE — `verify()` answers `true` — and every call the client can
+/// make answers `unknown method` at runtime. Nothing said it at compile time,
+/// and it is never what anyone meant: the whole point of the attribute is the
+/// surface it generates.
+///
+/// Spanned on the STRUCT, because the struct is what carries the attribute, and
+/// naming the struct is what lets the sentence recommend an inherent `impl` for
+/// it.
+#[test]
+fn a_service_with_an_empty_contract_surface_is_refused_at_the_attribute() {
+    let dir = temp_project("empty_service_surface");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(HollowClient)]
+struct Hollow {
+	seed: i32,
+}
+
+impl Hollow {
+	// Not `[rpc]`: an ordinary method contributes nothing to the surface.
+	fun helper(self): i32 {
+		self.seed
+	}
+}
+
+fun main() {}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[service]` with no surface must not compile:\n{report}"
+    );
+    for expected in [
+        "`[service]` on `Hollow` has an empty contract surface",
+        "no `[rpc]` method, no `[expose]`d field and no `client = ..` handler",
+        "Write an `[rpc]` method in an inherent `impl Hollow`",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the refusal should contain `{expected}`:\n{report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B383 (A120 S1's remaining half): the route checks the ARGUMENT LIST.
+///
+/// `open_request` opens the envelope's `args` list, records the arity it
+/// declares, and hands the deserializer to the route to pull from. Nothing read
+/// the arity and nothing closed the list, so a call carrying MORE arguments
+/// than the method takes decoded cleanly, the extras were dropped in silence,
+/// and the handler ran. `{"method":"add","args":[1,2,3]}` answered
+/// `{"Success":…}` on a one-argument method.
+///
+/// The gate is `rpc::decode_args_failed`, which does three things in order, and
+/// every generated route carries it — the NO-ARGUMENT routes included, which
+/// had no decode gate at all. Arity first, because it is the only one that can
+/// say what is wrong in the caller's vocabulary; then `end_list`, which is what
+/// makes a long list a failure rather than a tail nobody reads; then the
+/// reader's sticky error, which still catches everything about the argument
+/// VALUES.
+///
+/// vilan-to-vilan this cannot fire — both sides are generated from one surface
+/// and the contract hash refuses a client that disagrees. For an HTTP API the
+/// caller is arbitrary, which is the whole reason it exists.
+#[test]
+fn an_rpc_call_whose_argument_count_disagrees_with_the_method_is_a_decode_failure() {
+    const ARITY_SERVER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+
+[service(Client)]
+struct Counter {
+	seed: i32,
+}
+
+impl Counter {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+
+	[rpc]
+	fun ping(self): i32 {
+		self.seed
+	}
+}
+
+fun main() {
+	let counter = Counter { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+    let (_server, port) = spawn_service_server("rpc_arity", ARITY_SERVER);
+
+    for (body, expected) in [
+        // TOO MANY: the row B383 is about. The extras were dropped silently.
+        (
+            "{\"method\":\"add\",\"args\":[2,3,4]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 3\"}}",
+        ),
+        // One too many is the same answer — nothing here is about magnitude.
+        (
+            "{\"method\":\"add\",\"args\":[2,3]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 2\"}}",
+        ),
+        // TOO FEW: caught before this by the reader running off the list into
+        // the enclosing object, with a sentence about kinds. The arity gate is
+        // ahead of it now, so the sentence is about the count.
+        (
+            "{\"method\":\"add\",\"args\":[]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 0\"}}",
+        ),
+        // A NO-ARGUMENT method is still a method an arbitrary caller can post
+        // arguments at, and its route had no decode gate whatsoever.
+        (
+            "{\"method\":\"ping\",\"args\":[9]}",
+            "{\"Failure\":{\"Decode\":\"expects 0 argument(s), got 1\"}}",
+        ),
+        // The VALUE gate is untouched: a right-sized list with a wrong-typed
+        // element still answers the reader's own sentence.
+        (
+            "{\"method\":\"add\",\"args\":[\"x\"]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found a string\"}}",
+        ),
+        // The controls, last: both methods still answer.
+        ("{\"method\":\"add\",\"args\":[2]}", "{\"Success\":3}"),
+        ("{\"method\":\"ping\",\"args\":[]}", "{\"Success\":1}"),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        // A120 S3: a decode failure carries its own status (400) and the
+        // control row carries 200. The ENVELOPE is what a vilan client reads
+        // and it is the same envelope either way — the two never disagree,
+        // which is the property asserted here by checking both.
+        let status = if expected.contains("\"Failure\"") {
+            "HTTP/1.1 400 Bad Request\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\n"
+        };
+        assert!(
+            response.starts_with(status),
+            "`{body}` should be answered `{status}`: {response}"
+        );
+        assert!(
+            response.ends_with(expected),
+            "`{body}` should answer `{expected}`: {response}"
+        );
+    }
+}
+
+/// A120 S2 (`transport-rpc.md` §9.7.4): `over_http` — the connectionless
+/// constructor.
+///
+/// The generated client already SPOKE the `POST {mount}rpc` leg: the transport
+/// is a type parameter, and every plain stub plus `verify()` and
+/// `contract_hash()` lives on the unconstrained impl, so a hand-written
+/// `AuthClient<HttpTransport> { transport = .., codec = .. }` worked on the
+/// shipped toolchain with no socket. What was missing was the constructor and
+/// the rule about which services get one. This is that constructor.
+///
+/// It takes the MOUNT, not the endpoint URL, so `connect("/auth/", codec)` and
+/// `over_http("/auth/", codec)` read the same and a service that moves mount
+/// moves one string on each side. It is SYNC and it makes NO CALL — over HTTP
+/// there is no connection, so "once per client value" is an arbitrary unit and
+/// a login form constructs one per mount; `verify()` is reachable for a caller
+/// who wants the check, which this asserts.
+///
+/// Four things are load-bearing here and each was measured in the paper: a
+/// `Result`-returning method round-trips BOTH arms (the outer arm is "did the
+/// call happen", the inner is "what did the server decide"); a plain method
+/// round-trips; an awaited `void` acks after its handler ran, over the POST
+/// leg; and `verify()` reaches `__contract`.
+#[test]
+fn a_service_client_reaches_the_post_leg_through_over_http() {
+    let dir = temp_project("over_http");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::Server;
+import std::rpc_server::Service;
+import std::wire::Wire;
+
+[derive(Wire)]
+struct AccountToken {
+	token: str,
+	user: str,
+}
+
+[service(AuthClient)]
+struct Auth {
+	seed: i32,
+}
+
+impl Auth {
+	[rpc]
+	fun login(self, user: str, password: str): Result<AccountToken, str> {
+		if password == "hunter2" {
+			Ok(AccountToken { token = "tok-ada", user })
+		} else {
+			Err("wrong password")
+		}
+	}
+
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+
+	[rpc]
+	fun touch(self, tag: str) {
+		print(i"handler ran {tag}");
+	}
+}
+
+fun main() {
+	let auth = Auth { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(auth.dispatcher().into_protocol(json_codec())).at("/auth/"))
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+async fun run_client(base: str) {
+	// The MOUNT, exactly as `connect` takes it.
+	let client = AuthClient::over_http(base + "auth/", json_codec());
+	match client.login("ada", "hunter2") {
+		Ok(let outcome) => match outcome {
+			Ok(let token) => print(i"login {token.token} {token.user}"),
+			Err(let message) => print(i"login app error {message}"),
+		},
+		Err(let failure) => print(i"login failure {failure.to_json()}"),
+	}
+	match client.login("ada", "nope") {
+		Ok(let outcome) => match outcome {
+			Ok(let token) => print(i"login {token.token}"),
+			Err(let message) => print(i"login app error {message}"),
+		},
+		Err(let failure) => print(i"login failure {failure.to_json()}"),
+	}
+	match client.echo(40) {
+		Ok(let value) => print(i"echo {value}"),
+		Err(let failure) => print(i"echo failure {failure.to_json()}"),
+	}
+	match client.touch("via-stub") {
+		Ok(let _acked) => print("touch acked"),
+		Err(let failure) => print(i"touch failure {failure.to_json()}"),
+	}
+	match client.verify() {
+		Ok(let same) => print(i"verify {same}"),
+		Err(let failure) => print(i"verify failure {failure.to_json()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "login tok-ada ada",
+        "login app error wrong password",
+        "echo 41",
+        "touch acked",
+        "verify true",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`over_http` should have produced `{expected}`:\n{stdout}"
+        );
+    }
+    // The awaited `void` acks AFTER its handler ran, over the POST leg — the
+    // ordering is the claim, so the two lines are compared by position.
+    let handler = stdout
+        .find("handler ran via-stub")
+        .expect("the touch handler must have printed");
+    let acked = stdout.find("touch acked").expect("touch must have acked");
+    assert!(
+        handler < acked,
+        "an awaited void must ack after its handler ran:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The RULE `over_http` is emitted under (§9.7.5): the client struct has
+/// exactly its two base fields, and the service declares no `client = H`.
+///
+/// For an `[expose]`-bearing or handle-returning service the field list is
+/// already a total refusal — the mirror fields can only be filled by
+/// `connect`'s `__attach`, which over POST answers `unknown connection`. The
+/// `client = H` case is the one the field list does NOT catch, and it is the
+/// one that matters: `with_handlers` is `SocketTransport`-only and the server's
+/// `notify` on the connectionless leg finds no client channel, so a client that
+/// could be built would have a declared second direction that silently does
+/// nothing.
+///
+/// Three programs, one per shape, each refused by name at the call. The CONTROL
+/// is the test above: the same call on a plain service compiles and runs.
+#[test]
+fn over_http_is_not_generated_for_a_client_that_needs_a_connection() {
+    for (tag, source) in [
+        (
+            "expose",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(TallyClient)]
+struct Tally {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Tally {
+	[rpc]
+	fun bump(self): i32 {
+		self.count.get()
+	}
+}
+
+fun main() {
+	let client = TallyClient::over_http("/", json_codec());
+}
+"#,
+        ),
+        (
+            "handle",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(WatchyClient)]
+struct Watchy {
+	seed: i32,
+}
+
+impl Watchy {
+	[rpc]
+	fun watch(self, id: str): SignalCell<i32> {
+		Signal::new(self.seed)
+	}
+}
+
+fun main() {
+	let client = WatchyClient::over_http("/", json_codec());
+}
+"#,
+        ),
+        (
+            "client_handler",
+            r#"import std::json::json_codec;
+
+[client_service]
+struct Peer {
+	seed: i32,
+}
+
+impl Peer {
+	[rpc]
+	fun ping(self, tag: str) {
+	}
+}
+
+[service(HubClient, client = Peer)]
+struct Hub {
+	seed: i32,
+}
+
+impl Hub {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let client = HubClient::over_http("/", json_codec());
+}
+"#,
+        ),
+    ] {
+        let dir = temp_project(&format!("over_http_refused_{tag}"));
+        write(
+            &dir,
+            "vilan.toml",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n",
+        );
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "`over_http` must not exist on the `{tag}` client:\n{report}"
+        );
+        assert!(
+            report.contains("cannot find 'over_http'"),
+            "the `{tag}` client should be refused at the call by name:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A120 S3 (`transport-rpc.md` §9.7.7): the STATUS table.
+///
+/// The leg answered 200 for everything the protocol decided, and the reason it
+/// survived is that `HttpTransport::call` never read `response.status()` — it
+/// read the body and handed it to the codec. So the statuses are the contract
+/// for everything that is NOT a vilan client (curl, a `fetch` in a page, a
+/// proxy, a load balancer, a monitoring probe), and moving them breaks no vilan
+/// client, which is what makes this non-breaking and what makes it worth doing.
+///
+/// **The rule: the ENVELOPE is the vilan client's contract, the STATUS is
+/// everyone else's, and the two never disagree.** Every row below asserts both
+/// halves, because the status alone would pass for a server that stopped
+/// answering and the envelope alone is what was already true.
+///
+/// The `Success` row carries an application `Err` arm on purpose (Q5, RULED
+/// NEVER): a value that crossed successfully is a 200 whatever the value says.
+/// A server answering 401 for "wrong password" would be claiming the CALL was
+/// unauthorized, which is a different fact and the one `authorize` reports.
+#[test]
+fn the_post_legs_status_says_what_the_envelope_says() {
+    const STATUS_SERVER: &str = r#"import std::io::print;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun login(self, password: str): Result<str, str> {
+		if password == "hunter2" {
+			Ok("tok-ada")
+		} else {
+			Err("wrong password")
+		}
+	}
+}
+
+fun main() {
+	let door = Door { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(door.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+    let (_server, port) = spawn_service_server("post_status", STATUS_SERVER);
+    let post = |body: &str| {
+        raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+
+    for (label, body, status, envelope) in [
+        (
+            "a call that happened",
+            "{\"method\":\"login\",\"args\":[\"hunter2\"]}",
+            "HTTP/1.1 200 OK\r\n",
+            "{\"Success\":{\"Ok\":\"tok-ada\"}}",
+        ),
+        (
+            "an APPLICATION error — still 200, because the value crossed",
+            "{\"method\":\"login\",\"args\":[\"nope\"]}",
+            "HTTP/1.1 200 OK\r\n",
+            "{\"Success\":{\"Err\":\"wrong password\"}}",
+        ),
+        (
+            "the caller's bytes were wrong",
+            "not json at all",
+            "HTTP/1.1 400 Bad Request\r\n",
+            "{\"Failure\":{\"Decode\":\"malformed JSON\"}}",
+        ),
+        (
+            "the method is the resource",
+            "{\"method\":\"nosuch\",\"args\":[]}",
+            "HTTP/1.1 404 Not Found\r\n",
+            "{\"Failure\":{\"Remote\":\"unknown method: nosuch\"}}",
+        ),
+    ] {
+        let response = post(body);
+        assert!(
+            response.starts_with(status),
+            "{label}: expected `{status}`, got:\n{response}"
+        );
+        assert!(
+            response.contains("Content-Type: application/json\r\n"),
+            "{label}: every envelope carries the rpc media type, whatever the \
+             status — it is what tells a transport this IS a reply:\n{response}"
+        );
+        assert!(
+            response.ends_with(envelope),
+            "{label}: the envelope must still read `{envelope}`:\n{response}"
+        );
+    }
+
+    // A non-POST on the rpc route. Measured before this: a GET was answered
+    // 200 with a `Decode` envelope, because nothing read `request.method()`.
+    let got = raw_http_closed(
+        port,
+        "GET /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        got.starts_with("HTTP/1.1 405 Method Not Allowed\r\n") && got.contains("Allow: POST\r\n"),
+        "a GET on the rpc route must be 405 with an `Allow`:\n{got}"
+    );
+
+    // §9.7.9: the content-type gate. `text/plain` is one of the three types a
+    // cross-site HTML form can produce, and it is what the host sends by
+    // default for a string body — so a form POST used to be indistinguishable
+    // on the wire from the shipped client. Refusing it is what makes a
+    // cross-site form structurally unable to reach ANY `[service]`.
+    let body = "{\"method\":\"login\",\"args\":[\"hunter2\"]}";
+    for (label, header) in [
+        ("no content type at all", ""),
+        (
+            "the host's default for a string body",
+            "Content-Type: text/plain;charset=UTF-8\r\n",
+        ),
+        (
+            "an HTML form's default",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+        ),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n{header}Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{label} must be refused 400:\n{response}"
+        );
+        assert!(
+            !response.contains("\"Success\""),
+            "{label} must not have reached the handler:\n{response}"
+        );
+    }
+    // The control: the same body with the media type set is answered.
+    let allowed = post(body);
+    assert!(
+        allowed.starts_with("HTTP/1.1 200 OK\r\n") && allowed.contains("\"Success\""),
+        "an `application/json` POST must still be answered:\n{allowed}"
+    );
+}
+
+/// A120 S3's client half: `HttpTransport` tells an rpc envelope from something
+/// else, and says `Transport(..)` rather than blaming the codec.
+///
+/// Measured before this, a stub pointed at four different answers: a 404 (the
+/// app's own fallback text) and a 501 (the factory refusal's plain text) both
+/// arrived as `Decode("unrecognized reply envelope")` — a sentence about the
+/// codec for an infrastructure failure the caller can act on, and the same
+/// sentence a proxy's HTML error page would produce. A 401 arrived correctly,
+/// and only because its body happened to be an envelope.
+///
+/// The discriminator is the reply's `Content-Type` and not its status, and the
+/// reason is in the table above: the leg's own statuses are ordinary ones — its
+/// 404 for an unknown METHOD and an app's 404 for an unclaimed path are the
+/// same number — so a status cannot tell an envelope from a stranger's
+/// document, where the media type can.
+#[test]
+fn an_answer_that_is_not_an_rpc_envelope_is_a_transport_failure() {
+    let dir = temp_project("not_an_envelope");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun main() {
+	let door = Door { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(door.dispatcher().into_protocol(json_codec())).at("/api/"))
+		// Everything else is the app's, and it answers HTML — the shape a
+		// proxy or a load balancer answers with.
+		.on_request(|request| Response::builder()
+			.code(502)
+			.set_header("Content-Type", "text/html")
+			.body("<html>bad gateway</html>")
+			.build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			RpcError::Decode(let reason) => print(i"{label} decode {reason}"),
+			_ => print(i"{label} other {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	// The real mount: an envelope, so the call answers.
+	say("real", Client::over_http(base + "api/", json_codec()).echo(41));
+	// A mount no service claims: the app's own HTML answer.
+	say("stray", Client::over_http(base + "nothing/", json_codec()).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("real ok 42"),
+        "the real mount must still answer:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "stray transport the server answered 502 with something \
+                         that is not an rpc reply"
+        ),
+        "a non-envelope answer must be a transport failure naming the status, \
+         not a decode failure blaming the codec:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A120 S4's server: one `Door` behind each of the four rows of §9.7.6's
+/// composition table, plus a hand-written route that answers the session it
+/// was stamped with, and a factory under `authorize_request`.
+///
+/// The hooks are the app's, so the pin's are the cheapest checks there are:
+/// a socket's `token.good` and a POST's `Bearer good` are `ada`; the other
+/// bearer spellings name the refusal they earn.
+const TWO_HOOK_SERVER: &str = r#"import std::io::print;
+import std::option::Option::{ self, Some, None };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::{ Dispatcher, reply };
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun by_token(handshake: Handshake): Result<Session, Reject> {
+	match handshake.token() {
+		Some(let token) => if token == "good" { Ok(Session::of("ada")) } else { Err(Reject::Forbidden) },
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun by_bearer(request: Request): Result<Session, Reject> {
+	match request.header("authorization") {
+		Some(let value) => if value == "Bearer good" {
+			Ok(Session::of("ada").with_credential("good"))
+		} else if value == "Bearer busy" {
+			Err(Reject::Unavailable)
+		} else if value == "Bearer flood" {
+			Err(Reject::TooMany)
+		} else {
+			Err(Reject::Forbidden)
+		},
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun door(): Service {
+	Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+}
+
+fun main() {
+	let who = Dispatcher::new().on("whoami", |request| reply(request.session.identity));
+	Server::builder()
+		.port(0)
+		.with_service(door().at("/open/"))
+		.with_service(door().at("/sock/").authorize(|handshake| by_token(handshake)))
+		.with_service(door().at("/req/").authorize_request(|request| by_bearer(request)))
+		.with_service(door()
+			.at("/both/")
+			.authorize(|handshake| by_token(handshake))
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::new(who.into_protocol(json_codec()))
+			.at("/who/")
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::factory(|connection: Connection| Door { seed = 1 }, json_codec())
+			.at("/fac/")
+			.authorize_request(|request| by_bearer(request)))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// A120 S4: `authorize_request`, the second hook — §9.7.6's four-row table,
+/// per row, on both legs, with and without a credential.
+///
+/// The row that must NOT move is `authorize` alone: its POST leg answered 401
+/// before this and still does, a good bearer included, because a service that
+/// gated its sockets and said nothing about requests did not ask for its POST
+/// leg to open. That is the no-back-door property, and adding a second hook is
+/// exactly the change that could have weakened it.
+#[test]
+fn the_two_hooks_compose_per_the_table_and_neither_opens_the_others_leg() {
+    let (server, port) = spawn_service_server("two_hooks", TWO_HOOK_SERVER);
+    let post = |path: &str, credential: &str, body: &str| {
+        let authorization = if credential.is_empty() {
+            String::new()
+        } else {
+            format!("Authorization: Bearer {credential}\r\n")
+        };
+        raw_http_closed(
+            port,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 {authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+    let echo = "{\"method\":\"echo\",\"args\":[41]}";
+    let answered = "{\"Success\":42}";
+    let refused = "{\"Failure\":\"Unauthorized\"}";
+
+    // (mount, upgrade with no credential, POST with no credential, POST with a good one)
+    for (mount, bare_upgrade, bare_post, good_post) in [
+        ("/open/", "101", "200", "200"),
+        ("/sock/", "401", "401", "401"),
+        ("/req/", "101", "401", "200"),
+        ("/both/", "401", "401", "200"),
+    ] {
+        let upgrade = raw_upgrade(port, mount, "");
+        assert!(
+            upgrade.starts_with(&format!("HTTP/1.1 {bare_upgrade} ")),
+            "{mount}: an upgrade with no credential must answer {bare_upgrade}:\n{upgrade}"
+        );
+        // The socket's own credential opens every row's socket: the request
+        // hook never gates the upgrade.
+        let admitted = raw_upgrade(
+            port,
+            mount,
+            "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+        );
+        assert!(
+            admitted.starts_with("HTTP/1.1 101 "),
+            "{mount}: an upgrade carrying the socket's credential must be admitted:\n{admitted}"
+        );
+        for (label, credential, status) in [("no", "", bare_post), ("a good", "good", good_post)] {
+            let response = post(&format!("{mount}rpc"), credential, echo);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{mount}: a POST with {label} credential must answer {status}:\n{response}"
+            );
+            let envelope = if status == "200" { answered } else { refused };
+            assert!(
+                response.contains("Content-Type: application/json\r\n")
+                    && response.ends_with(envelope),
+                "{mount}: a POST with {label} credential must carry `{envelope}` — the \
+                 envelope and the status say the same thing:\n{response}"
+            );
+        }
+    }
+
+    // The reject's own status, and the arm a refused SOCKET already reads:
+    // 403 is `Unauthorized` (one arm for both, as the socket client maps it),
+    // 503 is `Unavailable`, and 429 — a limit, not the app's judgement — is a
+    // bare status with no envelope, which a vilan client reads as a transport
+    // failure naming it.
+    for (credential, status, envelope) in [
+        ("nope", "403", Some(refused)),
+        ("busy", "503", Some("{\"Failure\":\"Unavailable\"}")),
+        ("flood", "429", None),
+    ] {
+        let response = post("/req/rpc", credential, echo);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "`Bearer {credential}` must answer {status}:\n{response}"
+        );
+        match envelope {
+            Some(envelope) => assert!(
+                response.contains("Content-Type: application/json\r\n")
+                    && response.ends_with(envelope),
+                "`Bearer {credential}` must carry `{envelope}`:\n{response}"
+            ),
+            None => assert!(
+                !response.contains("Content-Type: application/json")
+                    && !response.contains("\"Failure\""),
+                "`Bearer {credential}` is a limit and must not be an envelope:\n{response}"
+            ),
+        }
+    }
+
+    // The session reaches the handler: on the `RpcRequest`, the only thing a
+    // connectionless request carries.
+    let whoami = "{\"method\":\"whoami\",\"args\":[]}";
+    let proved = post("/who/rpc", "good", whoami);
+    assert!(
+        proved.starts_with("HTTP/1.1 200 ") && proved.ends_with("{\"Success\":\"ada\"}"),
+        "the session `authorize_request` proved must be the request's:\n{proved}"
+    );
+
+    // A factory service stays 501 whatever the hook would say: the instance,
+    // not the identity, is what a POST cannot supply.
+    for credential in ["good", ""] {
+        let factory = post("/fac/rpc", credential, echo);
+        assert!(
+            factory.starts_with("HTTP/1.1 501 ") && factory.contains("Service::factory"),
+            "a factory service's POST leg must stay 501 under `authorize_request` \
+             (credential `{credential}`):\n{factory}"
+        );
+    }
+
+    drop(server);
+}
+
+/// A120 S4's client half: a vilan stub refused by `authorize_request` reads
+/// the SAME arm a refused socket reads — nothing new to match on. The pin runs
+/// the generated `over_http` client against the gate with no credential
+/// (`HttpTransport` carries none), so every call is refused, and each refusal
+/// must arrive typed.
+#[test]
+fn a_vilan_client_refused_per_request_reads_the_arm_a_refused_socket_reads() {
+    let dir = temp_project("request_refused_stub");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun gated(reject: Reject): Service {
+	Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+		.authorize_request(|request: Request| Result::Err(reject))
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(gated(Reject::Unauthorized).at("/who/"))
+		.with_service(gated(Reject::Unavailable).at("/busy/"))
+		.with_service(gated(Reject::TooMany).at("/flood/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			_ => print(i"{label} {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	say("who", Client::over_http(base + "who/", json_codec()).echo(41));
+	say("busy", Client::over_http(base + "busy/", json_codec()).echo(41));
+	say("flood", Client::over_http(base + "flood/", json_codec()).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "who \"Unauthorized\"",
+        "busy \"Unavailable\"",
+        "flood transport the server answered 429 with something that is not an rpc reply",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "expected `{expected}` in:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A127: `over_http_with(mount, codec, headers)` — the S4 table's `/req/` row
+/// (`authorize_request` alone) answers 401 to a client with no credential and
+/// 200 to one with a good bearer, and the generated client can now BE the
+/// second one. Over both codecs, because the text and binary frames take
+/// different POST paths, and with a wrong bearer beside the good one so the
+/// header is shown to be READ rather than merely present. `over_http` beside it
+/// is the unchanged control: no header, refused.
+#[test]
+fn over_http_with_sends_its_headers_on_every_post_and_opens_the_request_gate() {
+    let dir = temp_project("over_http_with");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::option::Option::{ self, Some, None };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::binary::binary_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun by_bearer(request: Request): Result<Session, Reject> {
+	match request.header("authorization") {
+		Some(let value) => if value == "Bearer good" { Ok(Session::of("ada")) } else { Err(Reject::Forbidden) },
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+			.at("/req/")
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::new(Door { seed = 1 }.dispatcher().into_protocol(binary_codec()))
+			.at("/bin/")
+			.authorize_request(|request| by_bearer(request)))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			_ => print(i"{label} {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	say("bare", Client::over_http(base + "req/", json_codec()).echo(41));
+	let good = Client::over_http_with(base + "req/", json_codec(), [("Authorization", "Bearer good")]);
+	say("good", good.echo(41));
+	say("again", good.echo(1));
+	say("wrong", Client::over_http_with(base + "req/", json_codec(), [("Authorization", "Bearer nope")]).echo(41));
+	say("binary bare", Client::over_http(base + "bin/", binary_codec()).echo(41));
+	say("binary good", Client::over_http_with(base + "bin/", binary_codec(), [("X-Trace", "7"), ("Authorization", "Bearer good")]).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "bare \"Unauthorized\"",
+            "good ok 42",
+            "again ok 2",
+            "wrong \"Unauthorized\"",
+            "binary bare \"Unauthorized\"",
+            "binary good ok 42",
+        ],
+        "the 401 row turns 200 with the header, on every POST of the client, over both \
+         codecs; a wrong bearer is still refused (403 reads the Unauthorized arm):\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A120 S5 (`transport-rpc.md` §9.7.5, Q1 RULED: an opt-in MARKER): what
+/// `[service(.., http)]` refuses, each at the member that declared it.
+///
+/// Nothing here is needed for correctness — the generated client's field list
+/// already refuses the first three shapes and `over_http` is simply absent for
+/// the fourth (`over_http_is_not_generated_for_a_client_that_needs_a_connection`
+/// above is that half). What the marker buys is WHERE the author hears it: at
+/// the field, the method or the attribute, instead of at a call site that says
+/// `cannot find 'over_http'` about a client the author never wrote. So each row
+/// asserts the sentence AND its location, and the program calls `over_http`
+/// so that a marker which refused nothing would fail on the far-away message
+/// instead — the thing each row must NOT say.
+#[test]
+fn the_http_marker_refuses_what_the_post_leg_cannot_carry_at_the_member_that_declared_it() {
+    for (tag, source, head, location) in [
+        (
+            "expose",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(TallyClient, http)]
+struct Tally {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Tally {
+	[rpc]
+	fun bump(self): i32 {
+		self.count.get()
+	}
+}
+
+fun main() {
+	let client = TallyClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's field `count` is `[expose]`d",
+            "main.vl:6:11",
+        ),
+        (
+            "handle",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(WatchyClient, http)]
+struct Watchy {
+	seed: i32,
+}
+
+impl Watchy {
+	[rpc]
+	fun watch(self, id: str): SignalCell<i32> {
+		Signal::new(self.seed)
+	}
+}
+
+fun main() {
+	let client = WatchyClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's method `watch` returns a signal handle (`SignalCell<..>`)",
+            "main.vl:11:6",
+        ),
+        (
+            "keyed_handle",
+            r#"import std::reactive::KeyedCell;
+import std::wire::Keyed;
+import std::json::json_codec;
+
+[derive(Wire)]
+struct Row {
+	id: str,
+	label: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(RowsClient, http)]
+struct Rows {
+	seed: i32,
+}
+
+export impl Rows {
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		KeyedCell::new([])
+	}
+}
+
+fun main() {
+	let client = RowsClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's method `rows` returns a signal handle (`KeyedCell<..>`)",
+            "main.vl:24:6",
+        ),
+        (
+            "client_handler",
+            r#"import std::json::json_codec;
+
+[client_service]
+struct Peer {
+	seed: i32,
+}
+
+impl Peer {
+	[rpc]
+	fun ping(self, tag: str) {
+	}
+}
+
+[service(HubClient, http, client = Peer)]
+struct Hub {
+	seed: i32,
+}
+
+impl Hub {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let client = HubClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service cannot name `client = Peer`",
+            "main.vl:14:1",
+        ),
+    ] {
+        let dir = temp_project(&format!("http_marker_{tag}"));
+        write(
+            &dir,
+            "vilan.toml",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n",
+        );
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "the `{tag}` service must be refused under `http`:\n{report}"
+        );
+        assert!(
+            report.contains(head),
+            "the `{tag}` row must be refused in the marker's words:\n{report}"
+        );
+        assert!(
+            report.contains(location),
+            "the `{tag}` refusal must be spanned on the member at {location}:\n{report}"
+        );
+        assert!(
+            !report.contains("cannot find 'over_http'"),
+            "the `{tag}` row must be answered at the member, not at the call:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A120 S5's other half: the marker GENERATES nothing. A service that carries
+/// it hashes exactly as the same surface without it (so marking a shipped
+/// service is invisible to every client already talking to it), `http` is
+/// never read as a client NAME (`[service(http)]` keeps `<Struct>Client`), and
+/// the formatter prints the marker back rather than dropping it — a formatter
+/// that dropped it would silently delete the author's refusals.
+#[test]
+fn the_http_marker_generates_nothing_moves_no_hash_and_survives_the_formatter() {
+    let dir = temp_project("http_marker_inert");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+
+[service(MarkedClient, http)]
+struct Marked {
+	seed: i32,
+}
+
+impl Marked {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+[service(UnmarkedClient)]
+struct Unmarked {
+	seed: i32,
+}
+
+impl Unmarked {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+[service(http)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let marked = Marked { seed = 0 };
+	let unmarked = Unmarked { seed = 0 };
+	let client = MarkedClient::over_http("/", json_codec());
+	let door = DoorClient::over_http("/", json_codec());
+	print(i"marked={marked.contract_hash()}");
+	print(i"unmarked={unmarked.contract_hash()}");
+	print(i"client={client.contract_hash()}");
+	print(i"door={door.contract_hash()}");
+}
+"#,
+    );
+    let formatted = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["fmt", "--check", dir.join("src").to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan fmt --check");
+    assert!(
+        formatted.status.success(),
+        "the formatter must print `http` back where it was written:\n{}{}",
+        String::from_utf8_lossy(&formatted.stdout),
+        String::from_utf8_lossy(&formatted.stderr)
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let hash_of = |label: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("no `{label}` line:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    let unmarked = hash_of("unmarked=");
+    for label in ["marked=", "client=", "door="] {
+        assert_eq!(
+            hash_of(label),
+            unmarked,
+            "`{label}` must hash as the unmarked surface — the marker generates nothing:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B375's other walk. `gather_rpc_methods` learned to read through `export
+/// impl`, but the attribute's method REFUSALS (`service_method_refusals`:
+/// `mut self`, `async` beside `&mut self`, a `__` parameter, a generated
+/// member's name) walked only the bare `Impl` node — so writing `export` on the
+/// block dodged every one of them, and a `mut self` write was lost in silence
+/// again, the very third state B272 refused. Each refusal must fire through
+/// `export impl` exactly as it does through a plain one.
+#[test]
+fn the_service_method_refusals_read_through_export_impl() {
+    let dir = temp_project("export_impl_refusals");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(DoorClient)]
+struct Door {
+	seed: i32,
+}
+
+export impl Door {
+	[rpc]
+	fun bump(mut self): i32 {
+		self.seed = self.seed + 1;
+		self.seed
+	}
+
+	[rpc]
+	fun tag(self, __request: str): str {
+		__request
+	}
+
+	[rpc]
+	fun verify(self): bool {
+		true
+	}
+}
+
+fun main() {
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "an `export impl` must not dodge the service's method refusals:\n{report}"
+    );
+    for head in [
+        "`[rpc]` method `bump` takes `mut self`",
+        "parameter `__request` of `[rpc]` method `tag` starts with `__`",
+        "`[rpc]` method `verify` takes a name the `[service]` expansion generates",
+    ] {
+        assert!(
+            report.contains(head),
+            "`{head}` must be refused through `export impl`:\n{report}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

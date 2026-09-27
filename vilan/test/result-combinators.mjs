@@ -88,17 +88,6 @@ function $s(self, fn) {
 	}
 	return $u;
 }
-function $v(self, fallback) {
-	const $w = self;
-	let $x = null;
-	if ($w[0] === 0) {
-		const x = __clone($w[1]);
-		$x = x;
-	} else {
-		$x = __clone(fallback);
-	}
-	return $x;
-}
 function $y(self, fn) {
 	const $z = self;
 	let $A = null;
@@ -170,17 +159,6 @@ function $P(self, b) {
 	}
 	return $R;
 }
-function $S(self, fallback) {
-	const $T = self;
-	let $U = null;
-	if ($T[0] === 0) {
-		const x = __clone($T[1]);
-		$U = x;
-	} else {
-		$U = __clone(fallback);
-	}
-	return $U;
-}
 function $V(self, b) {
 	const $W = self;
 	let $X = null;
@@ -191,17 +169,6 @@ function $V(self, b) {
 		$X = b;
 	}
 	return $X;
-}
-function $Y(self, fallback) {
-	const $Z = self;
-	let $aa = null;
-	if ($Z[0] === 0) {
-		const x = __clone($Z[1]);
-		$aa = x;
-	} else {
-		$aa = __clone(fallback);
-	}
-	return $aa;
 }
 function $ab(self) {
 	const $ac = self;
@@ -216,10 +183,6 @@ function $ab(self) {
 		$ad = [ 0, [ 1, __clone(e) ] ];
 	}
 	return $ad;
-}
-function $ae(self) {
-	const $af = self;
-	return $af[0] === 0;
 }
 const ok = [ 0, 10 ];
 const err = [ 1, "boom" ];
@@ -238,7 +201,7 @@ console.log($m(err, (e) => {
 console.log($d($p(ok, (n) => {
 	return [ 0, n * 2 ];
 }), 0));
-console.log($v($s(err, (e) => {
+console.log($d($s(err, (e) => {
 	return [ 0, 7 ];
 }), 0));
 console.log($y(err, (e) => {
@@ -247,7 +210,7 @@ console.log($y(err, (e) => {
 console.log($E($B(ok)));
 console.log($J($G(err), "none"));
 console.log($M(err));
-console.log($S($P(ok, [ 0, 5 ]), 0));
-console.log($Y($V(err, [ 0, 3 ]), 0));
+console.log($d($P(ok, [ 0, 5 ]), 0));
+console.log($d($V(err, [ 0, 3 ]), 0));
 const ro = [ 0, [ 0, 42 ] ];
-console.log($ae($ab(ro)));
+console.log($E($ab(ro)));

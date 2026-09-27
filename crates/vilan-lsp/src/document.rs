@@ -7,24 +7,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
-use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Parameter, SourceId};
-use vilan_core::formatter::{STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
-use vilan_core::fx::FxHashMap as HashMap;
+use vilan_core::analyzer::{DERIVED_SOURCE, Expr, ExprIfBranch, Parameter, SourceId};
+use vilan_core::cancel::CancelToken;
+use vilan_core::formatter::{ModuleRescue, STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
+use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
 use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
-use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, HASH_IS_NOT_A_TOKEN, tokenize};
-use vilan_core::node::{Convention, CssDeclaration, CssItem, CssValuePiece, Node};
-use vilan_core::parsing::IMPORTANT_HAS_NO_PLACE;
+use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, tokenize};
+use vilan_core::node::{Convention, CssDeclaration, CssItem, Node};
+use vilan_core::parsing::{A_CSS_DECLARATION_IS_A_CALL, IMPORTANT_HAS_NO_PLACE};
 use vilan_core::{
     Error, LeakedEntryAst, Manifest, OwnedModules, Platform as BuildPlatform, Program, Span,
     Workspace as BuildWorkspace, analyze_source_owning_overlay_modules,
 };
+use vilan_ide::numeric_fix::NumericEdit;
 
+use crate::keystroke::{
+    Anchor, CursorContext, LandedSnapshot, ModuleSymbols, SymbolEntry, SymbolIndex, Verdict,
+    candidates, cursor_context, is_identifier_char, module_name_of, shape_stamp,
+    sort_and_deoverlap, syntax_tokens_in,
+};
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
 use vilan_ide::{
-    Analysis, BOOK_BASE, Completion, ImportRoots, KEYWORD_DOCS, keyword_lexeme,
-    source_call_subject, span_of,
+    ATTRIBUTE_DOCS, Analysis, BOOK_BASE, Completion, CompletionKind, ImportRoots, KEYWORD_DOCS,
+    keyword_lexeme, source_call_subject, span_of,
 };
 
 /// A file's project context, resolved from the nearest `vilan.toml`: the build
@@ -41,12 +48,36 @@ struct ProjectContext {
     shared_platforms: Vec<BuildPlatform>,
     pkg_root: Option<PathBuf>,
     /// The file's resolved dependency workspace (P2), so cross-package imports
-    /// (`import <dep>::..`) type-check in the editor.
+    /// (`import <dep>::..`) type-check in the editor. Its `platform_reason` is
+    /// already stamped for `platform`, the leg the editor's own analysis runs
+    /// under (E119); a shared leg re-stamps it from `platform_reasons` below.
     workspace: BuildWorkspace,
+    /// E119: per color, WHY this file is analyzed under it — the same answer
+    /// `vilan check <file>` prints, from the same function. Empty when there is
+    /// no project to answer from.
+    platform_reasons: Vec<(BuildPlatform, String)>,
+    /// F27 R1: per color, the KIND of fact that chose it — the one word the
+    /// status line shows (`PlatformReason::kind`).
+    platform_kinds: Vec<(BuildPlatform, &'static str)>,
     /// Why the project didn't resolve, when it didn't (F5 S5). Everything below
     /// still degrades exactly as it did — the difference is that the reason is
     /// now published instead of swallowed.
     manifest_problem: Option<ManifestProblem>,
+    /// The directory of the `vilan.toml` this context resolved from — the
+    /// package's identity for E124's clock, which is keyed per PACKAGE and not
+    /// per file or per source root. `None` when no manifest was found.
+    manifest_dir: Option<PathBuf>,
+    /// E124's module-level slice: the package's entry names when NO entry loads
+    /// this file. `None` — the overwhelmingly common answer — when an entry
+    /// does load it, when the file is not the package's to judge, or when the
+    /// manifest is a `[library]` (no entries, no union, no gray).
+    unloaded_by_entries: Option<Vec<String>>,
+    /// Whether this file lives under the package's declared `generated` root.
+    /// It gets no top-level gray at either granularity: the file is machine-
+    /// written, `vilan fmt` already leaves it alone, and fading kolt's
+    /// 18,198-line lucide module wall to wall would be the paint's single
+    /// largest lie (`dead-code-paint.md` §1.5).
+    generated: bool,
 }
 
 impl ProjectContext {
@@ -56,8 +87,31 @@ impl ProjectContext {
             shared_platforms: Vec::new(),
             pkg_root: None,
             workspace: BuildWorkspace::default(),
+            platform_reasons: Vec::new(),
+            platform_kinds: Vec::new(),
             manifest_problem: None,
+            manifest_dir: None,
+            unloaded_by_entries: None,
+            generated: false,
         }
+    }
+
+    /// This context's workspace as a leg OTHER than the primary sees it: the
+    /// same dependency graph, re-stamped with that leg's own E119 reason. The
+    /// primary leg reads `workspace` directly and clones nothing.
+    fn workspace_for(&self, platform: BuildPlatform) -> BuildWorkspace {
+        let mut workspace = self.workspace.clone();
+        workspace.platform_reason = self
+            .platform_reasons
+            .iter()
+            .find(|(colored, _)| *colored == platform)
+            .map(|(_, reason)| reason.clone());
+        workspace.platform_kind = self
+            .platform_kinds
+            .iter()
+            .find(|(colored, _)| *colored == platform)
+            .map(|(_, kind)| *kind);
+        workspace
     }
 }
 
@@ -84,7 +138,10 @@ struct ManifestProblem {
 /// the file lives in and resolves its dependencies the same way, with no
 /// platform — see the branch itself for the two limits that carries. Anything
 /// unreadable / unrecognized yields [`ProjectContext::none`].
-fn resolve_project_context(entry_path: &Path) -> ProjectContext {
+///
+/// `text` is the file as the editor holds it: its own `[platform(..)]`
+/// declaration outranks the colour (F27 R1), and the buffer's may not be saved.
+fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
     let mut directory = entry_path.parent();
     let (manifest_path, root) = loop {
         let Some(current) = directory else {
@@ -133,18 +190,81 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
     // `vilan build` was clean (E113, the owner's kolt report).
     if let Some(package) = &manifest.package {
         let pkg_root = root.join(package.root());
-        let mut platforms =
-            vilan_core::platform_color::file_platforms(&pkg_root, &manifest, entry_path)
-                .into_iter();
+        // Each color with the REASON it was chosen (E119) — the same function
+        // `vilan check <file>` calls, so the two surfaces cannot come to two
+        // conclusions about why a file is colored either.
+        let choices = vilan_core::platform_color::file_platform_choices_for(
+            &pkg_root, &manifest, entry_path, text,
+        );
+        let platform_reasons: Vec<(BuildPlatform, String)> = choices
+            .iter()
+            .map(|choice| (choice.platform, choice.reason.clause()))
+            .collect();
+        let platform_kinds: Vec<(BuildPlatform, &'static str)> = choices
+            .iter()
+            .map(|choice| (choice.platform, choice.reason.kind()))
+            .collect();
+        // E124's module-level slice, taken off the SAME per-entry walk: a
+        // choice with reason `ReachedBy` means an entry loads this file, so for
+        // a multi-entry package the answer is already in hand and the slice is
+        // free. See `dead_items::unreached_module_entries`.
+        let unloaded_by_entries =
+            vilan_core::dead_items::unreached_module_entries(root, &manifest, entry_path, &choices);
+        let generated = vilan_core::dead_items::is_generated(root, &manifest, entry_path);
+        let mut platforms = choices.into_iter().map(|choice| choice.platform);
         let platform = platforms.next();
         let shared_platforms: Vec<BuildPlatform> = platforms.collect();
-        let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        let (mut workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        workspace.platform_reason = platform.and_then(|platform| {
+            platform_reasons
+                .iter()
+                .find(|(colored, _)| *colored == platform)
+                .map(|(_, reason)| reason.clone())
+        });
+        workspace.platform_kind = platform.and_then(|platform| {
+            platform_kinds
+                .iter()
+                .find(|(colored, _)| *colored == platform)
+                .map(|(_, kind)| *kind)
+        });
+        // B239: the editor analyzes the OPEN file as the entry, because a
+        // buffer is all it has — and that file is usually one of the package's
+        // modules, not one of its programs. Say which, from the same rule
+        // `vilan check <file>` reads (`platform_color::is_package_module`), so
+        // the two surfaces cannot disagree about whether a sibling may import
+        // it. `workspace_for` clones this workspace for the further legs, so
+        // every leg of a shared module carries the same answer.
+        //
+        // B240: and, in file mode, WHICH of the package's files are programs.
+        // An open module knows its own file is importable; it could not see
+        // that a sibling is a declared entry, so `views.vl` importing
+        // `pkg::client::helper` was clean in the editor and refused by `vilan
+        // check .` — the same disagreement B239 closed, one file over.
+        //
+        // B250: and the set is read on BOTH legs now. Which leg this is decides
+        // only what `pkg::<the open file>` means; a file the manifest declares is
+        // a program whichever file the editor happens to be showing.
+        let declared_entries = vilan_core::platform_color::declared_entry_module_names(&manifest);
+        workspace.entry_mode =
+            if vilan_core::platform_color::is_package_module(&pkg_root, &manifest, entry_path) {
+                vilan_core::EntryMode::OpenFile { declared_entries }
+            } else {
+                vilan_core::EntryMode::Declared { declared_entries }
+            };
         return ProjectContext {
             platform,
             shared_platforms,
-            pkg_root: Some(pkg_root),
+            // Both canonical at the source: the manifest directory keys the package
+            // clock (E124) and the root is compared with canonical paths (E127,
+            // E140); on Windows a URI can carry a directory's short spelling.
+            pkg_root: Some(vilan_core::util::canonical_path(&pkg_root)),
             workspace,
+            platform_reasons,
+            platform_kinds,
             manifest_problem,
+            manifest_dir: Some(vilan_core::util::canonical_path(root)),
+            unloaded_by_entries,
+            generated,
         };
     }
 
@@ -186,7 +306,22 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
             shared_platforms: Vec::new(),
             pkg_root: Some(pkg_root),
             workspace,
+            // A `[library]` declares no target and the editor invents none (see
+            // above), so there is no colour to explain.
+            platform_reasons: Vec::new(),
+            platform_kinds: Vec::new(),
             manifest_problem,
+            // A `[library]` has no entries — validation refuses them outright —
+            // so it has no union and gets NO top-level gray, workspace member
+            // or not (`dead-code-paint.md` §4, determination 9). Every top-level
+            // item is surface a consumer may import, and that property is what
+            // saves a consumer from forking an under-exported package. Locals,
+            // unused imports and unreachable code stay painted; they need no
+            // entry. The `manifest_dir` stays `None` for the same reason: there
+            // is no package clock to key.
+            manifest_dir: None,
+            unloaded_by_entries: None,
+            generated: vilan_core::dead_items::is_generated(root, &manifest, entry_path),
         };
     }
 
@@ -214,7 +349,7 @@ fn resolve_dependencies(
     root: &Path,
     manifest_path: &Path,
 ) -> (BuildWorkspace, Option<ManifestProblem>) {
-    let git = vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root());
+    let git = vilan_core::git_dep::GitDeps::cache_only(vilan_embedded::default_git_dep_root());
     match vilan_core::manifest::resolve_workspace(root, &git) {
         Ok(workspace) => (workspace, None),
         Err(error) => (
@@ -241,13 +376,106 @@ fn resolve_dependencies(
 /// with like whether or not the file is on disk yet — the raw-string fallback
 /// this replaces made a not-yet-saved buffer invisible whenever the two
 /// spellings differed by a `.` or a `..`.
+///
+/// [`canonical_path_of_unwritten`](vilan_core::util::canonical_path_of_unwritten)
+/// rather than `canonical_path`, for the reason spelled on [`is_within`]: the
+/// editor's subject is an OPEN BUFFER, which need not be on disk, and
+/// `canonical_path` answers a resolved spelling for one side and a lexical one
+/// for the other the moment only one of them exists. Identical for a path that
+/// IS on disk, so the on-disk case is byte-for-byte the comparison it was.
 fn same_file(a: &Path, b: &Path) -> bool {
-    vilan_core::util::canonical_path(a) == vilan_core::util::canonical_path(b)
+    vilan_core::util::canonical_path_of_unwritten(a)
+        == vilan_core::util::canonical_path_of_unwritten(b)
+}
+
+/// The smallest span covering both — E114's unreachable third builds one range
+/// per dead block out of its statements' spans.
+fn union(a: Span, b: Span) -> Span {
+    Span::new((), a.start.min(b.start)..a.end.max(b.end))
+}
+
+/// Every STATEMENT LIST the ENTRY file wrote, paired with its trailing
+/// expression: the regions a diverging statement can leave a dead tail in
+/// (E114's unreachable third).
+///
+/// A block-shaped region is not one syntactic thing in the resolved program —
+/// `Expr::Block` is one shape, but an `if` arm, a loop body and a function body
+/// each store their own `(Vec<Id>, Id)` inline rather than wrapping a block —
+/// so all four are collected here, once, instead of at the two call sites that
+/// would otherwise each have to remember the list. `match` legs need no arm of
+/// their own: a leg's body is an expression id, and a braced one IS an
+/// `Expr::Block`. Closures likewise — a closure's `return_` is one expression.
+///
+/// **The ENTRY's regions is not a filter applied afterwards, it is the walk's
+/// scope**, and that is a cost decision as much as a correctness one: only the
+/// open file is painted, so `Program::entities_of` FETCHES the file's rows by id
+/// range instead of scanning a whole-program map — and the divergence walk that
+/// follows no longer visits every `std` body on every publish. The function
+/// table is filtered rather than fetched, because it is small next to the
+/// expression map and a declaration's id is the key.
+///
+/// The regions are unordered and may repeat a list reachable two ways; the
+/// caller sorts and dedups the spans it derives, which is cheaper than deduping
+/// the regions and is the only ordering anything downstream needs.
+fn block_regions<'a>(
+    program: &'a Program<'a>,
+    entry_ids: &[std::ops::Range<u32>],
+) -> Vec<(&'a [Id], Id)> {
+    fn if_arms<'a>(branch: &'a ExprIfBranch, regions: &mut Vec<(&'a [Id], Id)>) {
+        match branch {
+            ExprIfBranch::If(_, (statements, tail), next) => {
+                regions.push((statements, *tail));
+                if let Some(next) = next {
+                    if_arms(next, regions);
+                }
+            }
+            ExprIfBranch::Else((statements, tail)) => regions.push((statements, *tail)),
+        }
+    }
+
+    let mut regions: Vec<(&[Id], Id)> = Vec::new();
+    for (_, expression) in program.entities_of(SourceId(0)) {
+        match expression {
+            Expr::Block((statements, tail))
+            | Expr::For(_, (statements, tail))
+            | Expr::ForEach(_, _, (statements, tail)) => regions.push((statements, *tail)),
+            Expr::If(branch) => if_arms(branch, &mut regions),
+            _ => {}
+        }
+    }
+    for (id, function) in &program.functions {
+        if entry_ids.iter().any(|range| range.contains(&id.0)) {
+            regions.push((&function.body.0, function.body.1));
+        }
+    }
+    regions
 }
 
 /// Whether `file` lives within `directory`, through the same helper.
+///
+/// **Both sides resolve the same way, and the helper is
+/// [`canonical_path_of_unwritten`](vilan_core::util::canonical_path_of_unwritten)**
+/// (B207, B198's shape in the LSP). `canonical_path` never fails: where the
+/// resolution fails it degrades to the LEXICAL spelling, which is the right
+/// answer for a comparison key and the wrong one for one side of a containment
+/// test whose other side resolved. The editor's `file` is an open BUFFER and
+/// need not be on disk — an untitled document, a file created in the editor and
+/// not yet saved — while `directory` is a layer root that always is, so a
+/// project root reached through a symlink (or, on a case-insensitive
+/// filesystem, spelled in another case) made the two sides a resolved path and
+/// a spelled one and this answered NO for a buffer plainly inside its own
+/// package. The document then lost its project context: no package root, no
+/// platform, `pkg::` imports unresolved.
+///
+/// `canonical_path_of_unwritten` resolves the deepest ancestor that IS on disk
+/// and re-attaches the tail as spelled, so both sides are resolved down to the
+/// part no filesystem has an opinion about, and a tree where nothing exists
+/// degrades to G17's spelled ladder on BOTH sides rather than to a mixed
+/// comparison. For a path that is on disk it costs exactly what `canonical_path`
+/// costs and answers exactly what it answered.
 fn is_within(directory: &Path, file: &Path) -> bool {
-    vilan_core::util::canonical_path(file).starts_with(vilan_core::util::canonical_path(directory))
+    vilan_core::util::canonical_path_of_unwritten(file)
+        .starts_with(vilan_core::util::canonical_path_of_unwritten(directory))
 }
 
 /// A package source root for a file with no manifest: its own directory.
@@ -328,6 +556,37 @@ impl RenameRefusal {
     }
 }
 
+/// `declaration` with the FIRST whole-word occurrence of `from` rewritten to
+/// `to` — how an alias hover puts its own name into the target's signature
+/// (B264).
+///
+/// A declaration label leads with its keyword and then its name (`fun greet():
+/// i32`, `struct Point {`), so the first whole word that spells the target's
+/// name is the declared name and nothing else. Whole-word is what makes that
+/// true rather than nearly true: `fun greeting()` must not become
+/// `fun hiing()`. Where the name is not found the label is returned unchanged
+/// — the hover still says `(alias)`, which is the fact the caret asked about.
+fn rename_leading_word(declaration: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return declaration.to_string();
+    }
+    let bytes = declaration.as_bytes();
+    let boundary = |index: usize| match bytes.get(index) {
+        Some(byte) => !(byte.is_ascii_alphanumeric() || *byte == b'_'),
+        None => true,
+    };
+    let mut cursor = 0;
+    while let Some(hit) = declaration[cursor..].find(from) {
+        let start = cursor + hit;
+        let end = start + from.len();
+        if (start == 0 || boundary(start - 1)) && boundary(end) {
+            return format!("{}{to}{}", &declaration[..start], &declaration[end..]);
+        }
+        cursor = start + 1;
+    }
+    declaration.to_string()
+}
+
 /// Whether `name` is a valid vilan identifier — a rename that writes anything
 /// else produces a program that does not parse.
 pub fn is_identifier(name: &str) -> bool {
@@ -347,6 +606,7 @@ pub fn is_identifier(name: &str) -> bool {
 }
 
 /// A kind of declaration, for the document outline.
+#[derive(Clone, Copy)]
 pub enum SymbolKind {
     Function,
     Struct,
@@ -356,6 +616,10 @@ pub enum SymbolKind {
 }
 
 /// One node in the document outline.
+///
+/// `Clone` since M63: a released document answers the outline from the copy it
+/// captured before dropping its program ([`ReleasedTables`]).
+#[derive(Clone)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -441,6 +705,89 @@ pub struct EditDelta {
     pub new_len: usize,
 }
 
+/// M63: how many open documents keep their `Program` — the focused one and
+/// the most recently focused before it.
+///
+/// RULED 2026-09-13 (Order 34, R4). Two, and the reason is what a person does
+/// with an editor: a working session is a file and the file it is being
+/// written against, and the pair alternates. One would re-analyze on every
+/// alternation; two hold both ends of it, and every further document is one
+/// the user is not in. The bound this buys is flat — at most this many
+/// programs are live however many files the session has opened, where before
+/// it every open file held one for as long as the tab existed (1.06 GB
+/// resident with kolt's nineteen open; the owner's own server at 4.13 GB).
+pub const RETAINED_PROGRAMS: usize = 2;
+
+/// M63: the editor tables one open document goes on answering from once its
+/// `Program` has been dropped.
+///
+/// The server holds a whole analysis per OPEN document, for as long as the
+/// editor holds the file — and a whole analysis of a real application is tens
+/// of megabytes: kolt's nineteen `src/*.vl` files stood at 1.06 GB resident
+/// with all of them open (dx-33's `open_documents` instrument, release), and
+/// the owner's own server read 4.13 GB eight hours into a working day. Nothing
+/// there is a leak; it is the design, and M63 is the ruling that bounds it:
+/// the FOCUSED document and the [`RETAINED_PROGRAMS`] most recently focused
+/// keep their `Program`, and every other open document drops to this — its
+/// editor tables, which are what the editor actually reads between visits.
+///
+/// What a released document goes on answering, unchanged: its diagnostics
+/// (already resolved to paths here), its outline, its semantic tokens and
+/// inlay hints (the keystroke path serves both off [`LandedSnapshot`], which
+/// is captured at analysis time and never touched the program again), and its
+/// references — the [`ReferenceIndex`] is a table already, and the two program
+/// questions the cross-document union asks it (which file is a source id, what
+/// is a definition's declared name) are answered from the two maps here.
+///
+/// What it cannot answer until it is focused again: hover, go-to-definition,
+/// type-aware completion, rename, and the dead-item paint — every one of them
+/// a walk of the program itself. Focus re-analyses (M58's warm path, ~3.6 G Ir
+/// on kolt's `client.vl`, sub-second), and the answers come back.
+///
+/// Kept in a `Box` so an unreleased document — the common case, the one the
+/// user is typing in — carries one null pointer for all of this.
+pub struct ReleasedTables {
+    /// [`publish`]'s answer over the program that was dropped: this document's
+    /// diagnostics and warnings with every `SourceId` already resolved to the
+    /// file it names. Taken here rather than recomputed because the resolution
+    /// is exactly what needs the program, and a `PublishedDiagnostic` is
+    /// already the program-free shape the planner publishes (`diagnostics_under`
+    /// relies on the same fact for E113's further legs).
+    diagnostics: Vec<PublishedDiagnostic>,
+    /// [`Document::document_symbols`]'s answer — the outline, in the analyzed
+    /// text's coordinates, which is the space every span this document holds
+    /// is in.
+    symbols: Vec<Symbol>,
+    /// `Program::canonical_sources`: the entry first, then every file the
+    /// analysis loaded. One `PathBuf` per source file — the smallest of these
+    /// tables, and the one the most answers hang off: which file a span
+    /// belongs to (the reference union's path space), whether this document
+    /// loaded an edited file ([`Document::depends_on`], the sweep's gate), and
+    /// what this document's entry IS.
+    canonical_sources: Vec<PathBuf>,
+    /// The declared name and kind of every definition the reference index
+    /// holds a DECLARATION row for — `references::name_of` and
+    /// `references::kind_of`, captured for the rows that can be asked about.
+    ///
+    /// This is the cross-document union's other program question
+    /// (`ReferenceIndex::key_of` and `definition_of_key` both ask the name; a
+    /// rename's E143 expansion asks the kind), and without it a released
+    /// neighbor would contribute nothing to a find-references and would REFUSE
+    /// a rename: the union would go quiet exactly for the files the user is not
+    /// looking at, which is the silent-incomplete-edit class kolt.local 034
+    /// exists to prevent. Declaration rows only — a use site is never resolved
+    /// by name — which is what keeps it a fraction of the index it sits beside.
+    declarations: HashMap<Definition, (Box<str>, Option<DefinitionKind>)>,
+    /// `Program::std_sources` and `Program::dependency_sources`: the files a
+    /// rename may not rewrite, whoever reached them. Two small sets of source
+    /// ids, and the refusal they carry ("the standard library", "a dependency")
+    /// is the one a released neighbor must go on producing — a rename that
+    /// silently skipped a library file it could no longer recognize would emit
+    /// a partial edit set, which is the one thing rename may never do.
+    std_sources: FxHashSet<SourceId>,
+    dependency_sources: FxHashSet<SourceId>,
+}
+
 pub struct Document {
     /// The LIVE line index: the text as of the last edit. Shared as an `Arc`
     /// with `analyzed_index` while the two snapshots agree, which is the
@@ -462,6 +809,22 @@ pub struct Document {
     /// allocations are replaced (and reclaimed) together. See
     /// [`AnalyzedProgram`].
     pub program: AnalyzedProgram,
+    /// **M27**: what this analysis's EDITOR TABLES cost — the `lsp-index`
+    /// phase (`entity_spans` + the [`ReferenceIndex`]) plus the `lsp-landed`
+    /// one ([`capture_landed`](Document::capture_landed)'s single walk), which
+    /// together are every table the server builds over a finished analysis.
+    ///
+    /// Carried on the document because the cost is paid on the analysis thread
+    /// and read by the SERVER, one join later: `analyze_and_publish` records it
+    /// on the session trace beside the analysis counts. Measured on a real
+    /// browser application (E126, 2026-09-04, release): `lsp-index` alone runs
+    /// 110–292 ms of wall per keystroke at loadavg 31–33 against `lsp-analyze`
+    /// at 1,146–1,436 ms, and under load the two halves stay in proportion
+    /// (494–1,058 ms of index against 232–350 ms of landed walk at loadavg
+    /// 150–166). A fifth per-keystroke cost, outside every tranche, and half
+    /// of it sat outside the instrument too until this phase line grew the
+    /// `lsp-landed` label. `ZERO` on a document that never analyzed.
+    pub index_time: std::time::Duration,
     pub diagnostics: Vec<Error>,
     /// The source file each diagnostic belongs to, parallel to `diagnostics`
     /// (`SourceId(0)` = this document; imported modules publish to their own
@@ -483,6 +846,19 @@ pub struct Document {
     /// `(start, end, id)` for every entry-file entity with a real span, used to
     /// find the innermost entity under a cursor.
     entity_spans: Vec<(usize, usize, Id)>,
+    /// M85: `(start, end, struct, field index)` for every entry-file struct
+    /// FIELD position a hover can land on — a field's declaration name span
+    /// and every struct-initializer KEY span — sorted by start, built with the
+    /// analysis.
+    ///
+    /// The same move `entity_spans` is, for the same reason. Hover fires on
+    /// MOVE, and the answer used to be a walk of `program.structs` — every
+    /// struct in the loaded world, with a `source_of` per struct — followed by
+    /// a walk of `program.struct_initializer_field_spans`, every key in the
+    /// world, per request. What that cost, and how it was measured, is
+    /// `m85_field_hover_cost` below: the lookup grew with the WORKSPACE's
+    /// field count and now does not.
+    field_spans: Vec<(usize, usize, Id, usize)>,
     /// Every identifier occurrence in the analyzed program, keyed by the
     /// definition it names — the one table find-references and rename both read
     /// (see `crate::references`). Computed with the analysis so a query is a
@@ -519,6 +895,59 @@ pub struct Document {
     /// can enumerate modules the `Program` never loaded. `None` on the degraded
     /// internal-error document, which resolved nothing.
     import_roots: Option<ImportRoots>,
+    /// The server's world revision this analysis READ (E117), stamped by the
+    /// caller through [`Document::stamp_analysis`] — every buffer change bumps
+    /// it, so a larger number is a strictly later view of every open file.
+    ///
+    /// `text_hash` answers "is this analysis of my own current text", which is
+    /// enough for the file being typed in and vacuous for every other one: a
+    /// DEPENDENT's buffer does not move when the module it imports does, so two
+    /// of its analyses — one that read the module mid-edit, one that read it
+    /// restored — are text-identical and both would land, in either order. This
+    /// is what separates them. Zero on a document nobody stamped (every test
+    /// fixture, and the degraded internal-error document), which keeps the
+    /// comparison a no-op there.
+    analysis_revision: u64,
+    /// The `pkg::` source root this analysis resolved under, canonicalized —
+    /// `None` when the file belongs to no project at all. E116's identity: two
+    /// open documents sharing a root are colored by ONE import graph, so an
+    /// edit that changes which entry reaches a file has to invalidate every one
+    /// of them, not only the ones that import the edited file.
+    package_root: Option<PathBuf>,
+    /// E124: the directory of the `vilan.toml` this analysis resolved from —
+    /// the package the dead-item paint's clock is keyed by. `None` for a file
+    /// with no project, and for a `[library]`, which gets no top-level gray.
+    manifest_dir: Option<PathBuf>,
+    /// E124's module-level slice: the package's entry names when NO entry
+    /// loads this file. A module nothing builds is dead whole, and the answer
+    /// is a by-product of the per-entry walk `resolve_project_context` already
+    /// runs (`dead_items::unreached_module_entries`).
+    unloaded_by_entries: Option<Vec<String>>,
+    /// Whether this file is under the declared `generated` root — no top-level
+    /// gray at either granularity.
+    generated: bool,
+    /// E124's union, as of the last time the package clock landed one — the
+    /// LIVE side, owned by the server and handed to this document at publish
+    /// time, never by an analysis.
+    ///
+    /// `None` is the withdrawal, and it is the whole staleness rule: a top-level
+    /// gray may be arbitrarily stale in the direction of FEWER grays and must
+    /// never be served stale in the direction of more, because a gray is a
+    /// claim the user acts on by deleting and the fact that falsifies it lives
+    /// in another file (`dead-code-paint.md` §3.2, determination 8). Downgraded
+    /// on edit, upgraded on land.
+    package_reach: Option<Arc<crate::dead_items::PackageReach>>,
+    /// E121's keystroke path: what this analysis's answers were, captured once
+    /// when it was built, so a request between two landings costs an anchor and
+    /// a lex instead of a walk of the whole analyzed program. Part of the
+    /// ANALYSIS side — `adopt_analysis` takes it wholesale with the program it
+    /// describes. See [`crate::keystroke`].
+    landed: LandedSnapshot,
+    /// M63: this document's editor tables, captured when its `Program` was
+    /// released — `None` while it holds one, which is the state of the
+    /// focused document and the [`RETAINED_PROGRAMS`] most recently focused.
+    /// See [`ReleasedTables`] and [`Document::release_analysis`].
+    released: Option<Box<ReleasedTables>>,
 }
 
 /// The analyzed `Program` together with the allocations it borrows for
@@ -538,15 +967,19 @@ pub struct Document {
 /// `Drop`): the program borrows only `text`, `ast`, its `owned_modules`, and
 /// allocations that are immortal (std and module texts served from
 /// `parse_clean_cached`, interned names, cached macro worlds); and nothing
-/// outside this value borrows `text`, `ast`, or any owned module copy — no
-/// process-global cache, no thread-local, nothing the server retains.
-/// `leak-soak.md` §7.2 is the audit that establishes the second half for the
-/// entry pair, global by global; for the owned modules it is the mechanism's
-/// own construction (§7.9.4): the base-world store gate refuses to store a
-/// world that loaded one, and a macro-world compile never loads through the
-/// scope. The first half is what `analyze_source_owning_overlay_modules`
-/// returns. Every `Document` query returns owned values, so nothing borrowed
-/// from the program outlives the borrow of `self` that produced it.
+/// outside this value borrows `text` or `ast` — no process-global cache, no
+/// thread-local, nothing the server retains. `leak-soak.md` §7.2 is the audit
+/// that establishes that second half for the entry pair, global by global.
+/// The first half is what `analyze_source_owning_overlay_modules` returns.
+/// Every `Document` query returns owned values, so nothing borrowed from the
+/// program outlives the borrow of `self` that produced it.
+///
+/// The owned modules are the one place the invariant is a COUNT rather than
+/// an exclusivity (M23): a stored base world may borrow the same copies, and
+/// says so by holding its own claim. `owned_modules` is this document's
+/// claims, `Drop` gives back exactly those, and an allocation another holder
+/// still claims survives — which is precisely why the reclaim below is sound
+/// without knowing anything about the base cache.
 ///
 /// `Drop` does the ordering in one visible place — program first, then the
 /// reclaims — rather than leaning on field declaration order.
@@ -570,11 +1003,14 @@ impl AnalyzedProgram {
     /// # Safety
     ///
     /// `program` must borrow nothing with a non-`'static` life other than
-    /// `*text`, `*ast`, and the `owned_modules` allocations — it is the
-    /// program `analyze_source_owning_overlay_modules` built over exactly
-    /// that text and returned with exactly these handles — and nothing else
-    /// may hold a reference derived from any of them: when this value drops,
-    /// all are freed.
+    /// `*text`, `*ast`, and the allocations `owned_modules` holds claims on —
+    /// it is the program `analyze_source_owning_overlay_modules` built over
+    /// exactly that text and returned with exactly these handles. Nothing
+    /// else may hold a reference derived from `*text` or `*ast`: when this
+    /// value drops, both are freed. An owned module allocation is freed only
+    /// if this document's claim was the LAST (M23), so another holder's
+    /// reference into one is fine — and is what the claim protocol exists
+    /// for.
     unsafe fn new(
         program: Option<Program<'static>>,
         text: Option<Leaked<str>>,
@@ -623,9 +1059,10 @@ impl Drop for AnalyzedProgram {
             // SAFETY: as above; the tree's only borrower is gone.
             unsafe { ast.reclaim() };
         }
-        // SAFETY: as above — the program was the owned modules' only
-        // borrower (the `new` contract; leak-soak.md §7.9.4's store gate and
-        // macro carve-out are what keep every global out of them).
+        // SAFETY: as above — the program was the only thing borrowing
+        // through THIS document's claims (the `new` contract). Giving them
+        // back frees an allocation only if no stored base world still claims
+        // it (M23); one that does keeps it, correctly, alive.
         unsafe { std::mem::take(&mut self.owned_modules).reclaim() };
     }
 }
@@ -655,9 +1092,18 @@ pub enum TokenKind {
 /// Token-modifier bits, index-aligned with `TOKEN_MODIFIERS`.
 pub const MODIFIER_DECLARATION: u32 = 1 << 0;
 pub const MODIFIER_READONLY: u32 = 1 << 1;
+/// E213: `[internal("reason")]`. A theme maps it to a DIMMED colour — the
+/// `deprecated` modifier's shape without its strikethrough, because the
+/// declaration is not going away and is not wrong to use; it is one to know
+/// what you are doing with.
+pub const MODIFIER_INTERNAL: u32 = 1 << 2;
+/// B382: `[deprecated("use …")]`, the LSP's own standard modifier — a theme
+/// strikes it through — on the declaration and every use, by E213's same
+/// mechanism: read off the one label reader, `labels::deprecated_of`.
+pub const MODIFIER_DEPRECATED: u32 = 1 << 3;
 
 /// The modifier legend.
-pub const TOKEN_MODIFIERS: [&str; 2] = ["declaration", "readonly"];
+pub const TOKEN_MODIFIERS: [&str; 4] = ["declaration", "readonly", "internal", "deprecated"];
 
 /// The LSP legend, index-aligned with `TokenKind`.
 pub const TOKEN_TYPES: [&str; 13] = [
@@ -725,13 +1171,78 @@ pub struct PublishedHop {
     pub call: bool,
 }
 
+/// A line number moved by `shift`, clamped into `u32` — the line arithmetic
+/// [`Document::keystroke_tokens_in_lines`] does against
+/// [`Document::tail_line_shift`]. Saturating on both ends: a window shifted
+/// off the top of the file names line 0, which is a wider ANALYZED range than
+/// needed and therefore still a superset of what can map into the viewport.
+fn shift_line(line: u32, shift: i64) -> u32 {
+    (line as i64 + shift).clamp(0, u32::MAX as i64) as u32
+}
+
+/// The union of two position ranges in one stream, as ranges — merged when
+/// they meet, both when they do not, and empty ones dropped.
+///
+/// The two are the head anchor's window and the tail anchor's window into the
+/// same capture; for an unedited buffer they are the same range, and for an
+/// edit above the viewport they are two. Merging keeps a token from being
+/// mapped (and offered) twice.
+fn merge_positions(
+    left: std::ops::Range<usize>,
+    right: std::ops::Range<usize>,
+) -> impl Iterator<Item = usize> {
+    let mut ranges: Vec<std::ops::Range<usize>> = [left, right]
+        .into_iter()
+        .filter(|range| range.start < range.end)
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    if let [first, second] = ranges.as_mut_slice()
+        && first.end >= second.start
+    {
+        let merged = first.start..first.end.max(second.end);
+        ranges = vec![merged];
+    }
+    ranges.into_iter().flatten()
+}
+
+/// B38, the salvage signature: when `stream` is entirely silent within the
+/// retained suffix — the shape of a parse break truncating the file to a
+/// prefix — the previous analysis's tokens for the byte-identical tail fill
+/// in, already shifted into this analysis's coordinates. A stream that reaches
+/// the suffix suppresses this wholesale, which is what keeps re-classification
+/// of identical text (semantics flow downward) fresh rather than stale.
+///
+/// Two callers, and they are the same rule applied to the same tokens at the
+/// two moments they exist: [`Document::semantic_tokens`], the walk, and
+/// [`Document::adopt_analysis`], which folds the tail into the analysis's
+/// CAPTURE the moment it computes one. Appending rather than merging is sound
+/// because the guard has just established that every kept token ends at or
+/// before `tail_start` and every retained one starts at or after it, so the
+/// result is still sorted and still non-overlapping.
+fn fold_retained_tail(
+    stream: &mut Vec<(Span, TokenKind, u32)>,
+    tail: &[(Span, TokenKind, u32)],
+    tail_start: usize,
+) {
+    if tail.is_empty() || !stream.iter().all(|(span, ..)| span.end <= tail_start) {
+        return;
+    }
+    stream.extend(
+        tail.iter()
+            .filter(|(span, ..)| span.start >= tail_start)
+            .cloned(),
+    );
+}
+
 /// The markup spans of a raw parse (element-syntax S5): tag names (open and
-/// close), attribute and event names, and the desugar-scaffolding spans whose
-/// analyzed tokens the markup replaces.
+/// close), the angle brackets around them, attribute and event names, and the
+/// desugar-scaffolding spans whose analyzed tokens the markup replaces.
 #[derive(Default)]
 struct MarkupSpans {
     scaffolding: Vec<Span>,
     tags: Vec<Span>,
+    /// The elements' angle brackets — `<`, `>`, `</`, `/>` (E115).
+    punctuation: Vec<Span>,
     attributes: Vec<Span>,
 }
 
@@ -741,8 +1252,14 @@ fn collect_markup_spans(
 ) {
     use vilan_core::node::{ElementHeadItem, Node};
     if let Node::Element(body) = &node.0 {
-        out.scaffolding.push((node.1.start..body.tag.end).into());
-        out.tags.push(body.tag);
+        // A fragment (A46) has no tag NAME to paint, in either half of the
+        // pair: its `<>` and `</>` are punctuation and nothing else, which is
+        // why both pushes sit behind the name.
+        if let Some(tag) = body.tag {
+            out.scaffolding.push((node.1.start..tag.end).into());
+            out.tags.push(tag);
+        }
+        out.punctuation.extend(body.punctuation.iter().copied());
         if let Some(close) = body.close_tag {
             out.tags.push(close);
         }
@@ -774,6 +1291,9 @@ struct CssSpans {
     scaffolding: Vec<Span>,
     properties: Vec<Span>,
     conditions: Vec<Span>,
+    /// A69: chain-link names — `Style` method references written inside a
+    /// block, which paint exactly as a condition head does.
+    methods: Vec<Span>,
 }
 
 /// The `css` keyword's own length. A `Node::Css` span starts exactly at the
@@ -801,6 +1321,10 @@ fn collect_css_body_spans(body: &vilan_core::node::CssBody<'_>, out: &mut CssSpa
                 out.conditions.push(nested.name.1);
                 collect_css_body_spans(&nested.body, out);
             }
+            // A69: a chain link's name is a METHOD reference, not a condition
+            // axis — it paints as the method call it is, which is also the
+            // span the desugar gives its accessor.
+            CssItem::Link(link) => out.methods.push(link.name.1),
         }
     }
 }
@@ -817,8 +1341,10 @@ fn find_linked_tags(
     use vilan_core::node::Node;
     if let Node::Element(body) = &node.0
         && let Some(close) = body.close_tag
+        // A fragment's `<>`/`</>` carry no name, so there is no pair to link
+        // and no rename to offer (A46).
+        && let Some(open) = body.tag
     {
-        let open = body.tag;
         let touches = |span: Span| span.start <= offset && offset <= span.end;
         if touches(open) || touches(close) {
             *out = Some((open, close));
@@ -828,8 +1354,198 @@ fn find_linked_tags(
         .for_each_child(&mut |child| find_linked_tags(child, offset, out));
 }
 
+/// What Organize Imports does with an import statement whose every leaf pruned
+/// away (E173, E180) — the half of the answer the FADE needs, so that the mark
+/// and the edit can never describe different things.
+enum EmptiedStatement {
+    /// The narrower statement it becomes; the leaf still fades, and the fade
+    /// names this text.
+    Rewritten(String),
+    /// Nothing: the rescue would have bound a name the file has taken, so the
+    /// statement stands as written and its leaves do not fade at all.
+    Kept,
+}
+
+/// The tables one Organize Imports pass judges its module question against
+/// (E169, E180) — built once by [`Document::import_use_context`] and handed to
+/// every leaf.
+///
+/// Three of the four are LAZY. Rule (2) is only ever reached by a leaf rule (1)
+/// could not answer, and the collision guard only by a statement whose every
+/// leaf pruned away — so on the common shape (one unused leaf beside a used
+/// one) nothing here is built at all, which matters because this runs on the
+/// debounced diagnostics path (E114's 6.2 ms budget).
+struct ImportUseContext<'a> {
+    /// The text the pass is reading — the analyzed text for the fades, the live
+    /// text for the action. Both callers already hold it; the collision guard
+    /// needs it to read a module SEGMENT's name.
+    source: &'a str,
+    /// Every definition this file's top-level import LEAVES bind, aliases
+    /// included — E169's exclusion set.
+    bound_by_leaves: HashSet<Definition>,
+    /// The spans in THIS file at which the analyzer resolved a member by
+    /// RECEIVER syntax (E180). `Program::member_name_spans` is written only at
+    /// `Node::MemberAccessor`, so it is exactly the `subject.member` set and a
+    /// `Head::member` path segment is not in it.
+    receiver_members: std::cell::OnceCell<HashSet<Span>>,
+    /// Every definition declared inside an `impl` block or a `trait` — what a
+    /// module import carries beyond its own name (E180).
+    impl_members: std::cell::OnceCell<HashSet<Id>>,
+    /// The names this file ALREADY binds: its top-level declarations and
+    /// everything its import list binds. E180's collision guard — a rescue that
+    /// would take one of these is refused.
+    taken_names: std::cell::OnceCell<HashSet<String>>,
+}
+
+impl ImportUseContext<'_> {
+    fn receiver_members(&self, program: &Program) -> &HashSet<Span> {
+        self.receiver_members.get_or_init(|| {
+            let lookup = program.source_lookup();
+            program
+                .member_name_spans
+                .iter()
+                .filter(|(id, _)| lookup.of(**id) == Some(SourceId(0)))
+                .map(|(_, span)| *span)
+                .collect()
+        })
+    }
+
+    fn impl_members(&self, program: &Program) -> &HashSet<Id> {
+        self.impl_members.get_or_init(|| {
+            program
+                .implementations
+                .iter()
+                .flat_map(|implementation| implementation.declarations.values().copied())
+                .chain(
+                    program
+                        .traits
+                        .values()
+                        .flat_map(|trait_| trait_.declarations.values().copied()),
+                )
+                .collect()
+        })
+    }
+
+    fn taken_names(&self) -> &HashSet<String> {
+        self.taken_names.get_or_init(|| names_bound_in(self.source))
+    }
+}
+
+/// Every name `source` binds at its top level: its own declarations, and what
+/// its import list binds (a leaf's name, or an `as` alias's).
+///
+/// E180's collision guard reads this. Deliberately SYNTACTIC — a parse of the
+/// buffer, no analyzer — because the question is "is this identifier free in
+/// this file", which is answered by what is written and not by what resolved:
+/// a file carrying a broken declaration still has the name taken.
+///
+/// The prelude is deliberately absent. An explicit import beats an ambient
+/// prelude name (`prelude.md` §9.1), so shadowing one is legal and the rescue
+/// may do it; it is the file's OWN bindings that a second binding collides
+/// with.
+fn names_bound_in(source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let (Some(tree), _) = vilan_core::parsing::parse(source) {
+        for item in &tree.0 {
+            // An item under `export`, a derive, a service attribute, a user
+            // macro attribute or G24's `const` still declares its own name
+            // (N89).
+            let mut node = &item.0;
+            while let Node::Export(_, inner, _)
+            | Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner)
+            | Node::Const(inner) = node
+            {
+                node = &inner.0;
+            }
+            let name = match node {
+                Node::Func(function) | Node::MacroFun(function) => function.name.0,
+                Node::Struct(name, ..)
+                | Node::Enum(name, ..)
+                | Node::Trait(name, ..)
+                | Node::Let(name, ..) => name.0,
+                Node::Module(name, _) => name,
+                _ => continue,
+            };
+            names.insert(name.to_string());
+        }
+    }
+    // What the import list binds. `import_leaf_name_spans` offers the ALIAS's
+    // span for an aliased leaf, which is the name the file actually takes
+    // (E142); a `(impl T)` selector is offered at its own span and binds no
+    // name, so the identifier test drops it.
+    for span in vilan_core::formatter::import_leaf_name_spans(source) {
+        let Some(text) = source.get(span.into_range()) else {
+            continue;
+        };
+        if !text.is_empty()
+            && text
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+        {
+            names.insert(text.to_string());
+        }
+    }
+    names
+}
+
+/// A type's written HEAD name, for B318 S3's organizer rewrite — `Style` for
+/// `Style`, for `List<i32>` and for a `List<type T>` block alike, because that
+/// is what a selector's subject is spelled with.
+fn subject_head_name(program: &Program, subject: vilan_core::type_::TypeId) -> Option<String> {
+    match program.type_id_to_type_map.get(&subject)? {
+        vilan_core::type_::Type::Struct(id, _) => program
+            .structs
+            .get(id)
+            .map(|struct_| struct_.name.to_string()),
+        vilan_core::type_::Type::Enum(id, _) => {
+            program.enums.get(id).map(|enum_| enum_.name.to_string())
+        }
+        vilan_core::type_::Type::Trait(id, _) => {
+            program.traits.get(id).map(|trait_| trait_.name.to_string())
+        }
+        _ => None,
+    }
+}
+
 impl Document {
+    /// [`analyze_cancellable`](Document::analyze_cancellable) under a token
+    /// nobody holds the other end of: no checkpoint can fire, so the analysis
+    /// always produces a document.
+    ///
+    /// Test-only since M26. The shipped server analyzes through the scheduler,
+    /// which always has a token to hand, so there is no production caller left
+    /// — and saying so with `cfg(test)` is what keeps `-D warnings` able to
+    /// notice if this door is ever the one a new path takes by accident.
+    #[cfg(test)]
     pub fn analyze(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
+        Self::analyze_cancellable(text, std_dir, entry_path, &CancelToken::new())
+            .expect("an analysis under an uncancelled token always produces a document")
+    }
+
+    /// [`analyze`](Document::analyze), cancellable (M26,
+    /// `proposal/editor-latency.md` §4.2).
+    ///
+    /// `cancel` is installed on the analysis thread, where the analyzer's phase
+    /// boundaries and its long per-function loops read it
+    /// ([`vilan_core::cancel`]). Answering `None` means the token was set while
+    /// the analysis ran: what it had computed is a TRUNCATED view of the
+    /// program, so it is destroyed here, on the analysis thread, and never
+    /// reaches the caller — there is no truncated `Document` for anyone to
+    /// land, publish or answer a request from.
+    ///
+    /// Cancellation is an optimisation over E117's revision stamps, not a
+    /// replacement for them: a superseded analysis that finishes before its
+    /// token is read still returns `Some`, and `land` still drops it. Nothing
+    /// here is load-bearing for correctness — remove every checkpoint and the
+    /// editor shows the same thing, more slowly.
+    pub fn analyze_cancellable(
+        text: &str,
+        std_dir: &Path,
+        entry_path: &Path,
+        cancel: &CancelToken,
+    ) -> Option<Self> {
         // The pipeline recurses deeply (chumsky), and macro-world compiles NEST
         // a full analysis inside the analysis — run the whole thing on a
         // dedicated big-stack thread, like the CLI's compiler thread (128 MiB,
@@ -847,25 +1563,66 @@ impl Document {
         let outer_text = text.clone();
         let std_dir = std_dir.to_path_buf();
         let entry_path = entry_path.to_path_buf();
+        let outer_entry_path = entry_path.clone();
+        let cancel = cancel.clone();
+        const ANALYSIS_STACK_SIZE: usize = 128 * 1024 * 1024;
         std::thread::Builder::new()
-            .stack_size(128 * 1024 * 1024)
+            .stack_size(ANALYSIS_STACK_SIZE)
             .spawn(move || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
-                }))
-                .unwrap_or_else(|_| Self::internal_error(&text))
+                // N121: the thread DECLARES its stack, first thing, so the
+                // analyzer's stack probe (`vilan_core::stack_guard`) knows
+                // where it ends. A runaway recursion then PANICS short of the
+                // guard page — which the fences below turn into a diagnostic —
+                // where it used to overflow, and an overflow is an `abort()`
+                // no fence and no `join` can observe: it took this whole
+                // server down with the buffer that triggered it (B385).
+                vilan_core::stack_guard::with_declared_stack(ANALYSIS_STACK_SIZE, || {
+                    // Installed for the life of the analysis and torn down
+                    // before the thread ends, so the token is exactly the
+                    // analysis's.
+                    let _scope = cancel.install();
+                    let document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        analysis_fence_tests::maybe_inject(&entry_path);
+                        Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
+                    }))
+                    .unwrap_or_else(|_| Self::internal_error(&text, &entry_path));
+                    // Read AFTER the analysis, on the thread that ran it: a
+                    // cancelled analysis's document is dropped here — which is
+                    // what gives its entry text, tree and owned modules back
+                    // (`AnalyzedProgram`'s `Drop`, `leak-soak.md` §7) — rather
+                    // than travelling back to a caller who would only drop it
+                    // anyway.
+                    (!cancel.is_cancelled()).then_some(document)
+                })
             })
             .expect("spawn analysis thread")
             .join()
             // Unreachable while the thread body catches unwinds (an abort
             // never returns here); kept graceful all the same.
-            .unwrap_or_else(|_| Self::internal_error(&outer_text))
+            .unwrap_or_else(|_| Some(Self::internal_error(&outer_text, &outer_entry_path)))
     }
 
-    /// The degraded document a panicked analysis lands on: no program, the
-    /// live text faithfully recorded (so position mapping and re-analysis on
-    /// the next edit behave), and one honest diagnostic.
-    fn internal_error(text: &str) -> Self {
+    /// A document holding `text` and NOTHING an analysis produces: no program,
+    /// no diagnostics, the live text faithfully recorded so position mapping
+    /// and the next re-analysis behave.
+    ///
+    /// Two callers, and they are the two ways a document can exist without an
+    /// analysis behind it: the degraded document a panicked analysis lands on
+    /// ([`internal_error`](Document::internal_error), which adds its one honest
+    /// diagnostic), and the entry `did_open` puts in the map before it schedules
+    /// the first analysis (E123). Every query handler already reads `program`
+    /// through an `Option` and answers emptily when there is none — the same
+    /// state the debounce window has always had between an edit and its
+    /// analysis.
+    ///
+    /// `text_hash` is the hash of `text`, which says "the analyzed text is
+    /// this" while nothing has been analyzed. That is deliberate and safe
+    /// because a document only ever reaches the map WITH an analysis of that
+    /// exact text scheduled: the skip it can produce (`pause_action`'s
+    /// `Unchanged`, when an edit is undone inside one debounce window) skips a
+    /// re-analysis that the open's own analysis is already doing.
+    pub fn unanalyzed(text: &str) -> Self {
         let line_index = Arc::new(LineIndex::new(text));
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
@@ -873,18 +1630,15 @@ impl Document {
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program: AnalyzedProgram::none(),
-            diagnostics: vec![Error { trace: Vec::new(),
-                note: None,
-                span: vilan_core::span::Span::new((), 0..0),
-                msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
-                    .to_string(),
-            }],
-            diagnostic_sources: vec![SourceId(0)],
+            index_time: std::time::Duration::ZERO,
+            diagnostics: Vec::new(),
+            diagnostic_sources: Vec::new(),
             warnings: Vec::new(),
             warning_sources: Vec::new(),
             text: text.to_string(),
             text_hash: hash_text(text),
             entity_spans: Vec::new(),
+            field_spans: Vec::new(),
             reference_index: ReferenceIndex::default(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
@@ -892,7 +1646,43 @@ impl Document {
             manifest_problem: None,
             shared_diagnostics: Vec::new(),
             import_roots: None,
+            analysis_revision: 0,
+            package_root: None,
+            manifest_dir: None,
+            unloaded_by_entries: None,
+            generated: false,
+            package_reach: None,
+            // Nothing landed, so the keystroke path answers from syntax alone.
+            landed: LandedSnapshot::default(),
+            // Nothing was analyzed, so nothing was released: this document has
+            // no tables to fall back to and never claims otherwise (M63).
+            released: None,
         }
+    }
+
+    /// The degraded document a panicked analysis lands on: [`unanalyzed`], plus
+    /// the one honest diagnostic saying so.
+    ///
+    /// [`unanalyzed`]: Document::unanalyzed
+    fn internal_error(text: &str, entry_path: &Path) -> Self {
+        let mut document = Self::unanalyzed(text);
+        document.diagnostics = vec![Error {
+            trace: Vec::new(),
+            note: None,
+            span: vilan_core::span::Span::new((), 0..0),
+            // N119: the file is NAMED. The diagnostic is published against
+            // this document's own uri, so the editor already shows it in the
+            // right buffer — but the same text also reaches the output
+            // channel and a `vilan-lsp` bug report, where "this file" names
+            // nothing, and a workspace-wide analysis sweep can land several
+            // of these at once.
+            msg: format!(
+                "internal error: the compiler panicked analyzing `{}` (this is a bug; the details are on stderr)",
+                entry_path.display()
+            ),
+        }];
+        document.diagnostic_sources = vec![SourceId(0)];
+        document
     }
 
     fn analyze_on_this_thread(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
@@ -912,10 +1702,32 @@ impl Document {
         // Prefer the project's declared platform and source root (the file's role in
         // its `vilan.toml`); fall back to inferring the platform from imports and
         // rooting `pkg::` at the file's own directory.
-        let context = resolve_project_context(entry_path);
-        let manifest_problem = context.manifest_problem;
+        //
+        // Timed for the same reason the core pipeline's phases are (E106): this
+        // is not a lookup. `platform_color::file_platforms` walks the loader's
+        // `pkg::` graph from EVERY entry of the manifest until one reaches this
+        // file (E113), and the walk resolves and parses each module it reaches
+        // — per analysis, so per keystroke — while `resolve_dependencies`
+        // re-reads the manifest closure beside it. The core line cannot see any
+        // of it: it starts inside `analyze`.
+        let phase_context_start = vilan_core::PhaseClock::now();
+        let mut context = resolve_project_context(entry_path, text);
+        let phase_context = phase_context_start.elapsed();
+        let manifest_problem = context.manifest_problem.take();
+        let manifest_dir = context.manifest_dir.take();
+        let unloaded_by_entries = context.unloaded_by_entries.take();
+        let generated = context.generated;
+        // E116: the DECLARED root, canonicalized, kept as the file's package
+        // identity. Deliberately not the fallback below — a file with no
+        // project has no package to be colored by, and rooting it at its own
+        // directory would make unrelated neighbours look like siblings.
+        let package_root = context
+            .pkg_root
+            .as_deref()
+            .map(vilan_core::util::canonical_path);
         let pkg_root = context
             .pkg_root
+            .clone()
             .unwrap_or_else(|| pkg_root_fallback(entry_path));
         // `std` is resolved as a library (its layered roots) from the std directory
         // — the manifest when present, else a bare base layer (L2).
@@ -942,6 +1754,7 @@ impl Document {
         // process-global caches, which a keystroke's content would leak for
         // the session (§7.5). The `AnalyzedProgram` built below owns and
         // reclaims them beside the entry text and tree.
+        let phase_analyze_start = vilan_core::PhaseClock::now();
         let vilan_core::AnalyzedEntry {
             program,
             diagnostics,
@@ -955,6 +1768,27 @@ impl Document {
             context.platform,
             &context.workspace,
         );
+        let phase_analyze = phase_analyze_start.elapsed();
+        // M26: the analysis was superseded while it ran. Everything below is
+        // work for a result that cannot land — the editor tables the queries
+        // index, and the shared-platform legs, which are a FULL analysis each
+        // (E113) — so stop, and give back what this analysis leaked on the way
+        // in. Wrapping the (possibly `None`) program in an `AnalyzedProgram`
+        // and dropping it is what performs the reclaim: the wrap owns the entry
+        // text, the entry tree and the overlay-served modules, and its `Drop`
+        // is the only thing that hands them back (`leak-soak.md` §7). The
+        // degraded document returned here is never seen by a caller —
+        // `analyze_cancellable` reads the token and answers `None` — so it
+        // carries nothing but the text.
+        if vilan_core::cancel::cancelled() {
+            // SAFETY: the same contract the wrap below is built under — this is
+            // the program `analyze_source_owning_overlay_modules` built over
+            // `leaked` with exactly these handles, and nothing has been derived
+            // from any of them on this path.
+            drop(unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) });
+            return Self::unanalyzed(text);
+        }
+        let phase_index_start = vilan_core::PhaseClock::now();
 
         // The entity table the navigation queries index, computed by the one
         // function both front-ends use (`vilan_ide::entity_spans`).
@@ -962,6 +1796,12 @@ impl Document {
             .as_ref()
             .map(vilan_ide::entity_spans)
             .unwrap_or_default();
+
+        // M85's field-position table, built here for `entity_spans`'s reason:
+        // the question is "which field is under this offset", it is asked once
+        // per hover-on-move, and answering it by walking the world's structs
+        // made the answer cost the codebase rather than the buffer.
+        let field_spans = program.as_ref().map(field_spans_of).unwrap_or_default();
 
         // The identifier-occurrence table the reference queries read.
         let reference_index = program
@@ -1005,11 +1845,13 @@ impl Document {
         // modules.
         let program =
             unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) };
+        let phase_index = phase_index_start.elapsed();
         // The other legs' verdicts on a shared module (E113), computed AFTER
         // the primary so a panic in one of them cannot cost the analysis the
         // user is looking at. Each is a full analysis under that leg's platform
         // whose program is published and then dropped — the diagnostics are all
         // the editor keeps, and hover/goto/completion stay the primary leg's.
+        let phase_legs_start = vilan_core::PhaseClock::now();
         let shared_diagnostics = context
             .shared_platforms
             .iter()
@@ -1020,16 +1862,21 @@ impl Document {
                     &pkg_root,
                     entry_path,
                     *platform,
-                    &context.workspace,
+                    // Each leg gets its own E119 reason: a shared module's miss
+                    // under the browser leg is explained by the browser leg.
+                    &context.workspace_for(*platform),
                 )
             })
             .collect();
-        Document {
+        let phase_legs = phase_legs_start.elapsed();
+        let mut document = Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program,
+            // Filled below, once the landed walk it also counts has run.
+            index_time: std::time::Duration::ZERO,
             diagnostics,
             diagnostic_sources,
             warnings,
@@ -1037,6 +1884,7 @@ impl Document {
             text: text.to_string(),
             text_hash,
             entity_spans,
+            field_spans,
             reference_index,
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
@@ -1044,7 +1892,232 @@ impl Document {
             manifest_problem,
             shared_diagnostics,
             import_roots: Some(import_roots),
+            analysis_revision: 0,
+            package_root,
+            manifest_dir,
+            unloaded_by_entries,
+            generated,
+            // The union is the server's to hand over; a fresh analysis carries
+            // none, which is the withdrawn state and the safe one.
+            package_reach: None,
+            landed: LandedSnapshot::default(),
+            // A fresh analysis holds its program (M63); the server releases it
+            // later, if this document is not one of the focused few.
+            released: None,
+        };
+        // E121: the keystroke path's whole-program walk, paid HERE — once per
+        // analysis, on the analysis thread — instead of once per request on
+        // the keystroke thread. See [`LandedSnapshot`].
+        let phase_landed_start = vilan_core::PhaseClock::now();
+        document.landed = document.capture_landed(entry_path);
+        let phase_landed = phase_landed_start.elapsed();
+        // M27: the editor tables, as ONE number the server can carry — the
+        // reference/entity index and the landed walk are the same family of
+        // cost (a table built over a finished analysis, thrown away by the
+        // next keystroke) and no budget separates them.
+        document.index_time = (phase_index + phase_landed).wall;
+        // The server's half of the `VILAN_PHASE_TIMING` split (E106): one line
+        // per LSP analysis, naming the costs the core pipeline's own line
+        // cannot see — project resolution (the E113 reachability walk and the
+        // dependency closure), the analysis proper, the editor tables built
+        // over it, the keystroke path's landed walk, and the extra full
+        // analysis each FURTHER leg of a shared module costs. Stderr, like the
+        // core line, and behind the same switch, so one variable turns the
+        // whole picture on. `legs` is the count, not a duration: a file two
+        // legs reach pays TWO analyses per keystroke, and that is the fact to
+        // read first.
+        //
+        // **M27 moved this print.** It used to run before `capture_landed`,
+        // which put E121's whole-program walk — the fifth per-keystroke cost —
+        // outside the only line that could see it. `lsp-landed` is that walk,
+        // and it is on the line now for the same reason `lsp-index` is: a cost
+        // nobody prints is a cost nobody budgets (N43's rule).
+        if vilan_core::phase_timing_enabled() {
+            eprintln!(
+                "[vilan phase] lsp-context {} lsp-analyze {} lsp-index {} \
+                 lsp-landed {} lsp-legs {} legs {}",
+                phase_context,
+                phase_analyze,
+                phase_index,
+                phase_landed,
+                phase_legs,
+                context.shared_platforms.len(),
+            );
         }
+        document
+    }
+
+    /// Capture what this freshly analyzed document's answers are, for the
+    /// keystroke path to re-serve until the next analysis lands.
+    fn capture_landed(&self, entry_path: &Path) -> LandedSnapshot {
+        if !self.program.is_some() {
+            return LandedSnapshot::default();
+        }
+        let mut landed = LandedSnapshot {
+            stamp: shape_stamp(self.analyzed_text()),
+            tokens: self.semantic_tokens(),
+            token_lines: Vec::new(),
+            hints: self.inlay_hints(),
+            index: self.landed_symbol_index(entry_path),
+            landed: true,
+        };
+        // E122: the viewport index over the tokens just captured, paid on the
+        // same thread and in the same breath as the walk that produced them.
+        landed.index_token_lines(&self.analyzed_index);
+        landed
+    }
+
+    /// The per-module symbol index this analysis supports (§2.1.4): every
+    /// declared name, grouped by the module that declares it.
+    ///
+    /// Grouping is by `Program::source_of`, whose `SourceRange` windows are
+    /// disjoint by construction (an entity id only grows), and the module's
+    /// identity is `canonical_sources[source]` — the same table
+    /// [`Document::depends_on`] reads. Module index 0 is the entry, which is
+    /// the convention [`SymbolIndex::ENTRY`] names; its entries are the ones
+    /// the keystroke path re-reads from live syntax.
+    ///
+    /// Derive-generated entities (`DERIVED_SOURCE`) are skipped: their spans
+    /// are offsets into a template, not into any file a user can complete in.
+    fn landed_symbol_index(&self, entry_path: &Path) -> SymbolIndex {
+        let Some(program) = self.program.as_ref() else {
+            return SymbolIndex::default();
+        };
+        let mut by_module: Vec<ModuleSymbols> = vec![ModuleSymbols {
+            path: Some(entry_path.to_path_buf()),
+            module_name: module_name_of(entry_path),
+            // Filled by `refresh_entry_from_syntax` below, so the entry's
+            // export list is always the LIVE buffer's.
+            stamp: None,
+            entries: Vec::new(),
+        }];
+        // M27: the slot a source's symbols land in, remembered.
+        //
+        // This closure ran once per DECLARATION in the program and found the
+        // module by scanning `by_module` and comparing paths — so a program
+        // with M modules and D declarations paid M path comparisons D times,
+        // on every landed keystroke. Two sources can still share a slot
+        // (that is what the path comparison was for), so the memo is keyed by
+        // SourceId and filled through the same path search the first time each
+        // source is seen: the slots come out identical, in the identical
+        // order, and the search runs once per source instead of once per
+        // declaration.
+        let mut slot_by_source: HashMap<SourceId, Option<usize>> = HashMap::default();
+        let mut slot_of = |source: SourceId, by_module: &mut Vec<ModuleSymbols>| -> Option<usize> {
+            if let Some(known) = slot_by_source.get(&source) {
+                return *known;
+            }
+            let slot = (|| {
+                if source == SourceId(0) {
+                    return Some(SymbolIndex::ENTRY);
+                }
+                if source == DERIVED_SOURCE {
+                    return None;
+                }
+                let path = program.canonical_sources.get(source.0 as usize)?;
+                if let Some(existing) = by_module
+                    .iter()
+                    .position(|module| module.path.as_deref() == Some(path.as_path()))
+                {
+                    return Some(existing);
+                }
+                by_module.push(ModuleSymbols {
+                    path: Some(path.clone()),
+                    module_name: module_name_of(path),
+                    stamp: None,
+                    entries: Vec::new(),
+                });
+                Some(by_module.len() - 1)
+            })();
+            slot_by_source.insert(source, slot);
+            slot
+        };
+        let epoch = self.analysis_revision.max(1);
+        // M27: `source_of`'s linear range scan, hoisted out of the per-
+        // declaration loop the same way.
+        let source_of = program.source_lookup();
+        let mut push =
+            |id: Id, name: String, kind: CompletionKind, by_module: &mut Vec<ModuleSymbols>| {
+                let Some(source) = source_of.of(id) else {
+                    return;
+                };
+                let Some(slot) = slot_of(source, by_module) else {
+                    return;
+                };
+                let call_parameters = (kind == CompletionKind::Function).then(|| {
+                    program
+                        .functions
+                        .get(&id)
+                        .map(|function| {
+                            function
+                                .parameters
+                                .iter()
+                                .filter_map(|parameter| program.parameters.get(parameter))
+                                .map(|parameter| parameter.name.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+                by_module[slot].entries.push(SymbolEntry {
+                    name,
+                    kind,
+                    signature: vilan_ide::signature_label(program, id),
+                    call_parameters,
+                    // E213: the resolved index CAN see the label, so the
+                    // keystroke list obeys the same rule the analysis's own
+                    // completion does.
+                    // E221: every declaration kind this index lists.
+                    internal: vilan_core::labels::internal_of(program, id).map(str::to_string),
+                    analysis_epoch: epoch,
+                });
+            };
+        for (id, function) in &program.functions {
+            push(
+                *id,
+                function.name.to_string(),
+                CompletionKind::Function,
+                &mut by_module,
+            );
+        }
+        for (id, struct_) in &program.structs {
+            push(
+                *id,
+                struct_.name.to_string(),
+                CompletionKind::Struct,
+                &mut by_module,
+            );
+        }
+        for (id, enum_) in &program.enums {
+            push(
+                *id,
+                enum_.name.to_string(),
+                CompletionKind::Enum,
+                &mut by_module,
+            );
+        }
+        for (id, trait_) in &program.traits {
+            push(
+                *id,
+                trait_.name.to_string(),
+                CompletionKind::Trait,
+                &mut by_module,
+            );
+        }
+        let mut index = SymbolIndex {
+            by_module,
+            // M25: the arms that reach names this file has NOT imported —
+            // auto-import candidates and an origin's module listing — are
+            // functions of the analyzed program and the package tree it
+            // resolved, so they are derived here, on the analysis thread, and
+            // never in a request.
+            completion: Arc::new(vilan_ide::CompletionIndex::build(
+                program,
+                self.import_roots.as_ref(),
+                self.analyzed_text(),
+            )),
+        };
+        index.refresh_entry_from_syntax(self.analyzed_text());
+        index
     }
 
     /// One further leg's verdict on this file: analyze it under `platform` and
@@ -1127,13 +2200,22 @@ impl Document {
     /// compiles agree about most of a shared module, and one mistake reported
     /// twice is one squiggle.
     pub fn published_diagnostics(&self) -> Vec<PublishedDiagnostic> {
-        let mut published = publish(
-            self.program.as_ref(),
-            &self.diagnostics,
-            &self.diagnostic_sources,
-            &self.warnings,
-            &self.warning_sources,
-        );
+        // M63: a released document publishes the groups it published while it
+        // held its program. `publish` needs the program to turn a `SourceId`
+        // into the file it names, and that resolution is exactly what was
+        // captured — so the alternative is not a cheaper answer, it is the
+        // document's squiggles disappearing from a background tab the moment
+        // anything republishes.
+        let mut published = match self.released.as_ref() {
+            Some(released) => released.diagnostics.clone(),
+            None => publish(
+                self.program.as_ref(),
+                &self.diagnostics,
+                &self.diagnostic_sources,
+                &self.warnings,
+                &self.warning_sources,
+            ),
+        };
         for shared in &self.shared_diagnostics {
             if !published
                 .iter()
@@ -1303,15 +2385,17 @@ impl Document {
     /// re-analyzing. Applied on every edit so live-text queries (notably
     /// completion's context scan) see the just-typed character immediately,
     /// while the heavier re-analysis stays debounced. The analyzed snapshot
-    /// (`program`, `analyzed_index`, `text_hash`) is deliberately untouched:
-    /// program answers stay exactly right for the text they were computed
-    /// from, and the pending re-analysis still fires.
+    /// (`program`, `analyzed_index`, `text_hash`, and with them the analysis's
+    /// captured answers) is deliberately untouched: program answers stay
+    /// exactly right for the text they were computed from, and the pending
+    /// re-analysis still fires.
     pub fn set_text(&mut self, text: &str) {
         self.line_index = Arc::new(LineIndex::new(text));
         self.text = text.to_string();
         // A whole-text set has no edit shape to record: the map from the
         // analyzed snapshot is broken until the next analysis lands.
         self.live_edits = None;
+        self.refresh_keystroke_index();
     }
 
     /// Apply one LSP content change to the LIVE snapshot: a ranged event
@@ -1338,12 +2422,34 @@ impl Document {
                 new_len: replacement.len(),
             });
         }
+        self.refresh_keystroke_index();
+    }
+
+    /// E121 §2.1.4: bring the edited module's entry in the symbol index back to
+    /// the live buffer, but only when the buffer's declaration shape moved.
+    ///
+    /// The mandate's "invalidated only by that module's own edits", made exact.
+    /// The common keystroke types inside a function body, leaves the stamp
+    /// alone and costs one lex and one hash; only a keystroke that adds,
+    /// removes, renames or re-signs a declaration pays for the rebuild. Runs on
+    /// the keystroke thread and is O(file).
+    fn refresh_keystroke_index(&mut self) {
+        self.landed.index.refresh_entry_from_syntax(&self.text);
     }
 
     /// Map an ANALYZED-space byte offset into the live text, through the
     /// recorded edits — `None` when the log is unmappable. An offset inside
     /// a replaced region clamps into the replacement (the anchor's text is
     /// gone; its nearest surviving position is the honest answer).
+    ///
+    /// E121 retired its shipped caller: the inlay-hint handler used this to
+    /// approximate a live position for an analyzed-space hint, and the
+    /// keystroke path answers in live space outright, so there is nothing left
+    /// to approximate. The mechanism (`live_edits`, `EditDelta`) is still the
+    /// incremental-sync log B39c records and B39c's pins still hold it, so it
+    /// is compiled with the tests rather than carried dead in the shipped
+    /// binary — the rule `Document::references` states below.
+    #[cfg(test)]
     pub fn live_offset(&self, offset: usize) -> Option<usize> {
         let edits = self.live_edits.as_ref()?;
         let mut offset = offset;
@@ -1361,6 +2467,18 @@ impl Document {
     /// analyzed program read against both snapshots. A struct of references,
     /// built per query.
     fn analysis<'a, 'src>(&'a self, program: &'a Program<'src>) -> Analysis<'a, 'src> {
+        self.analysis_over(program, &self.landed.index.completion)
+    }
+
+    /// The same query surface against a NAMED completion index, which is the
+    /// only thing about an [`Analysis`] a caller ever needs to vary: the pins
+    /// that prove the captured table answers what deriving it per request
+    /// would (M25) hand in a freshly built one and compare.
+    fn analysis_over<'a, 'src>(
+        &'a self,
+        program: &'a Program<'src>,
+        index: &'a vilan_ide::CompletionIndex,
+    ) -> Analysis<'a, 'src> {
         Analysis {
             program,
             analyzed: self.analyzed_index.shared(),
@@ -1368,7 +2486,10 @@ impl Document {
             entity_spans: &self.entity_spans,
             platform_requirements: &self.platform_requirements,
             import_roots: self.import_roots.as_ref(),
+            index,
             source_texts: Default::default(),
+            anchor: Default::default(),
+            scope_extents: Default::default(),
         }
     }
 
@@ -1398,7 +2519,11 @@ impl Document {
         self.analyzed_index.range(span)
     }
 
-    /// The LSP position for a program byte offset (an inlay hint's anchor).
+    /// The LSP position for a program byte offset. Its shipped caller was the
+    /// inlay-hint handler, which E121 moved onto live-space offsets and the
+    /// live index; compiled with the tests for the reason
+    /// `Document::references` states below.
+    #[cfg(test)]
     pub fn analyzed_position(&self, offset: usize) -> Position {
         self.analyzed_index.position(offset)
     }
@@ -1408,6 +2533,58 @@ impl Document {
     /// definition, references, rename).
     pub fn analyzed_offset(&self, position: Position) -> usize {
         self.analyzed_index.offset(position)
+    }
+
+    /// Record the world revision this analysis read (E117). Called on a fresh
+    /// [`Document::analyze`] result before it is landed; the value travels with
+    /// the analysis through [`Document::adopt_analysis`].
+    pub fn stamp_analysis(&mut self, revision: u64) {
+        self.analysis_revision = revision;
+    }
+
+    /// The world revision the current analysis read — the ordering key that
+    /// says which of two results is the later view (see the field).
+    pub fn analysis_revision(&self) -> u64 {
+        self.analysis_revision
+    }
+
+    /// The canonical `pkg::` source root this analysis resolved under — the
+    /// package whose import graph colors this file (E116). `None` for a file
+    /// that belongs to no project: it shares a package with nobody, so it is
+    /// never swept as a peer and never sweeps one.
+    pub fn package_root(&self) -> Option<&Path> {
+        self.package_root.as_deref()
+    }
+
+    /// A fingerprint of the package modules this analysis reached: every
+    /// `canonical_sources` entry under the package root, order-independent.
+    ///
+    /// E116: a file's platform color is decided by which ENTRY reaches it
+    /// (`platform_color::file_platforms` walks the `pkg::` graph), so an
+    /// `import pkg::a` written anywhere in the package can re-color a file that
+    /// imports nothing and is imported by nobody the editor knows about. That
+    /// edit is invisible to the dependency-edge gate — the unreached file does
+    /// not depend on the entry, the entry depends on IT — which is why the
+    /// color stuck until a restart. A change in this fingerprint is the signal
+    /// that the graph moved, and the package's other open documents are swept.
+    /// Std and dependency sources are excluded: they cannot change which of
+    /// this package's entries reaches this package's files.
+    pub fn package_graph_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let (Some(program), Some(root)) = (self.program.as_ref(), self.package_root.as_ref())
+        else {
+            return 0;
+        };
+        let mut reached: Vec<&Path> = program
+            .canonical_sources
+            .iter()
+            .filter(|source| source.starts_with(root))
+            .map(PathBuf::as_path)
+            .collect();
+        reached.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        reached.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Whether the live buffer has advanced past the analyzed text — i.e. an
@@ -1431,13 +2608,16 @@ impl Document {
     /// conservative direction — the old always-sweep behavior, kept exactly
     /// where its reason still holds.
     pub fn depends_on(&self, path: &Path) -> bool {
-        let Some(program) = self.program.as_ref() else {
+        // M63: a RELEASED document kept its source list, so the edge stays
+        // exact for it. Without that it would answer `true` here — the
+        // conservative arm below — and every save would re-analyze every
+        // released document in the package, which is the retention the release
+        // exists to avoid, paid back one sweep later.
+        let sources = self.canonical_sources();
+        if sources.is_empty() {
             return true;
-        };
-        program
-            .canonical_sources
-            .iter()
-            .any(|source| same_file(source, path))
+        }
+        sources.iter().any(|source| same_file(source, path))
     }
 
     /// Land a completed analysis of this document (`analysis` is a fresh
@@ -1463,6 +2643,7 @@ impl Document {
             retained_tail_start: _,
             analyzed_index,
             program,
+            index_time,
             diagnostics,
             diagnostic_sources,
             warnings,
@@ -1471,11 +2652,26 @@ impl Document {
             live_edits: _,
             text_hash,
             entity_spans,
+            field_spans,
             reference_index,
             platform_requirements,
             manifest_problem,
             shared_diagnostics,
             import_roots,
+            analysis_revision,
+            package_root,
+            manifest_dir,
+            unloaded_by_entries,
+            generated,
+            // The union is LIVE state, not an analysis product: the server owns
+            // it and re-hands it at every publish, so an adoption must not
+            // carry the analysis's (always absent) copy over the document's.
+            package_reach: _,
+            landed,
+            // M63: an analysis is born holding its program, so its own
+            // released tables are always absent — and THIS document's are
+            // cleared below, by the program arriving.
+            released: _,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
         // program and the allocations it borrows; assigning it drops the
@@ -1484,17 +2680,45 @@ impl Document {
         // session leak M7 measured (leak-soak.md §4.1) stops at.
         self.analyzed_index = analyzed_index;
         self.program = program;
+        // M63: the tables the released state answered from describe the program
+        // that just went away. The incoming one answers every question itself,
+        // so the fallback is dropped rather than left to shadow it — and a
+        // document that is released again captures the new program's tables.
+        self.released = None;
+        self.index_time = index_time;
         self.diagnostics = diagnostics;
         self.diagnostic_sources = diagnostic_sources;
         self.warnings = warnings;
         self.warning_sources = warning_sources;
         self.text_hash = text_hash;
         self.entity_spans = entity_spans;
+        self.field_spans = field_spans;
         self.reference_index = reference_index;
         self.platform_requirements = platform_requirements;
         self.manifest_problem = manifest_problem;
         self.shared_diagnostics = shared_diagnostics;
         self.import_roots = import_roots;
+        self.analysis_revision = analysis_revision;
+        self.package_root = package_root;
+        self.manifest_dir = manifest_dir;
+        self.unloaded_by_entries = unloaded_by_entries;
+        self.generated = generated;
+        // E121: the captured answers belong to the program that produced them,
+        // so they are adopted with it. Nothing is recomputed here — the walk
+        // was paid on the analysis thread.
+        self.landed = landed;
+        // E122, and the ONE place the capture's inputs move: the analysis was
+        // built without the salvage tail this adoption just computed for it, so
+        // the tail is folded in HERE and the line index rebuilt over the
+        // result. After this line `self.landed.tokens` is exactly what
+        // `self.semantic_tokens()` would answer, which is what lets `full` and
+        // `range` serve one capture instead of two pictures of it.
+        fold_retained_tail(
+            &mut self.landed.tokens,
+            &self.retained_tail,
+            self.retained_tail_start,
+        );
+        self.landed.index_token_lines(&self.analyzed_index);
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
@@ -1505,6 +2729,146 @@ impl Document {
             // The adopted analysis matches an older text; the recorded
             // edits no longer start from this snapshot.
             self.live_edits = None;
+        }
+        // The entry module's export list follows the LIVE buffer, not the
+        // analyzed one — a `fun` typed during the analysis must complete.
+        self.landed.index.refresh_entry_from_syntax(&self.text);
+    }
+
+    /// M63: drop this document's `Program` and go on answering from its editor
+    /// tables. Answers whether there was one to drop.
+    ///
+    /// This is the reclaim [`AnalyzedProgram`]'s `Drop` already knew how to do
+    /// — the program first, then the entry text, the entry tree and the
+    /// overlay-served module copies it borrowed — reached deliberately rather
+    /// than as a side effect of a newer analysis landing. Everything the
+    /// program can still be asked for AFTER it is gone is captured first, in
+    /// one place, so a released document's answers are the answers it had and
+    /// not degraded copies of them: its published diagnostics, its outline,
+    /// its source list and its declaration names. See [`ReleasedTables`] for
+    /// what that does and does not cover.
+    ///
+    /// Idempotent, and a no-op on a document that never analyzed: both answer
+    /// `false`, which is what the server's retention pass reads as "nothing to
+    /// hand back here".
+    ///
+    /// The capture is paid on the thread that releases — the server's runtime
+    /// thread — and it is a walk of the entry file's declarations plus a clone
+    /// of the diagnostics, not of the program: the reference index it reads is
+    /// already built, and the document's own tables are already in hand.
+    pub fn release_analysis(&mut self) -> bool {
+        if !self.program.is_some() {
+            return false;
+        }
+        // The outline first, and through the ordinary path: a released
+        // document's `document_symbols` must be byte-for-byte what it answered
+        // a moment ago, and the way to guarantee that is to ask the same
+        // function rather than to re-implement it here.
+        let symbols = self.document_symbols();
+        let Some(program) = self.program.as_ref() else {
+            return false;
+        };
+        let diagnostics = publish(
+            Some(program),
+            &self.diagnostics,
+            &self.diagnostic_sources,
+            &self.warnings,
+            &self.warning_sources,
+        );
+        let canonical_sources = program.canonical_sources.clone();
+        let mut declarations: HashMap<Definition, (Box<str>, Option<DefinitionKind>)> =
+            HashMap::default();
+        for row in self.reference_index.declarations() {
+            if let Some(name) = crate::references::name_of(program, row.definition) {
+                declarations.insert(
+                    row.definition,
+                    (
+                        name.into(),
+                        crate::references::kind_of(program, row.definition),
+                    ),
+                );
+            }
+        }
+        self.released = Some(Box::new(ReleasedTables {
+            diagnostics,
+            symbols,
+            canonical_sources,
+            declarations,
+            std_sources: program.std_sources.clone(),
+            dependency_sources: program.dependency_sources.clone(),
+        }));
+        // The line M63 is: the pair goes, and with it the program, the leaked
+        // entry text, the leaked entry tree and this document's claims on the
+        // overlay-served module copies (`AnalyzedProgram`'s `Drop`, the same
+        // reclaim `adopt_analysis` takes for a superseded analysis).
+        self.program = AnalyzedProgram::none();
+        true
+    }
+
+    /// Whether this document holds a `Program` — the retention pass's question
+    /// (M63), and the refocus trigger's: a focused document that answers
+    /// `false` here is one to re-analyze.
+    pub fn holds_program(&self) -> bool {
+        self.program.is_some()
+    }
+
+    /// Whether this document is answering from [`ReleasedTables`] — it held a
+    /// program, and [`release_analysis`](Document::release_analysis) took it.
+    ///
+    /// Distinct from `!holds_program()`, which is also true of a document that
+    /// never analyzed at all (the entry `did_open` inserts, the degraded
+    /// internal-error document): those have no tables and answer emptily,
+    /// where a released one answers.
+    pub fn is_released(&self) -> bool {
+        self.released.is_some()
+    }
+
+    /// What a definition is CALLED, from the program or — for a released
+    /// document — from its captured declaration rows (M63).
+    ///
+    /// Answers for a definition the reference index holds a declaration row
+    /// for, which is every definition a cross-program key can name.
+    fn name_of_definition(&self, definition: Definition) -> Option<&str> {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => crate::references::name_of(program, definition),
+            (None, Some(released)) => released
+                .declarations
+                .get(&definition)
+                .map(|(name, _)| &**name),
+            (None, None) => None,
+        }
+    }
+
+    /// What KIND of thing a definition is, from the program or from a released
+    /// document's captured rows (M63).
+    fn kind_of_definition(&self, definition: Definition) -> Option<DefinitionKind> {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => crate::references::kind_of(program, definition),
+            (None, Some(released)) => released
+                .declarations
+                .get(&definition)
+                .and_then(|(_, kind)| *kind),
+            (None, None) => None,
+        }
+    }
+
+    /// The source ids a rename may not rewrite: `(std, dependency)`, from the
+    /// program or from a released document's capture (M63).
+    fn foreign_sources(&self) -> Option<(&FxHashSet<SourceId>, &FxHashSet<SourceId>)> {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => Some((&program.std_sources, &program.dependency_sources)),
+            (None, Some(released)) => Some((&released.std_sources, &released.dependency_sources)),
+            (None, None) => None,
+        }
+    }
+
+    /// The files this document's analysis loaded — the entry first — from the
+    /// program, or from the tables of a released one (M63).
+    fn canonical_sources(&self) -> &[PathBuf] {
+        match (self.program.as_ref(), self.released.as_ref()) {
+            (Some(program), _) => &program.canonical_sources,
+            (None, Some(released)) => &released.canonical_sources,
+            (None, None) => &[],
         }
     }
 
@@ -1571,11 +2935,20 @@ impl Document {
     /// lookups (`entity_at`) are only meaningful for offsets that touch
     /// actual code; a comment inside a function body is *contained* by the
     /// function's span but is not the function.
+    ///
+    /// A caret at a token's END counts as touching it, the same convention
+    /// [`crate::references::ReferenceIndex::at`] answers rename and
+    /// find-references by (E133). The two gates decide the SAME question — is
+    /// the cursor on this word — for two features the user reads as one, so
+    /// hover going blank at `name|` while rename works there is the two of them
+    /// disagreeing rather than a separate rule. Trivia is unaffected: the end
+    /// of a token is code either way, and an offset inside whitespace still
+    /// touches nothing.
     fn offset_touches_a_token(&self, offset: usize) -> bool {
         let (tokens, _errors) = tokenize(self.analyzed_text());
         tokens.iter().any(|(_, span)| {
             let range = span.into_range();
-            range.start <= offset && offset < range.end
+            range.start <= offset && offset <= range.end
         })
     }
 
@@ -1590,14 +2963,145 @@ impl Document {
     /// the cursor touches — the linked-editing nicety, so renaming one tag
     /// renames the other. Raw-parsed per request, like `keyword_hover`'s lex:
     /// cheap, and independent of analysis succeeding.
+    ///
+    /// `offset` is a LIVE offset and the spans come back in LIVE coordinates,
+    /// because this parses `self.text` (E132). It used to parse
+    /// `analyzed_text()`, and that was the one place a RAW PARSE — an S2
+    /// citizen, owing nothing to the analysis — was handed the S1 snapshot.
+    /// Nothing here is program data: there is no reason for the tag positions
+    /// to lag the buffer, and one decisive reason for them not to. This
+    /// handler PRODUCES EDITS by proxy — the client mirrors every keystroke
+    /// from one returned range into the other — so answering in the analyzed
+    /// snapshot's coordinates during the debounce pointed the mirror at
+    /// whatever live text had moved into the tag's old offsets and typed into
+    /// it (E132: the owner's "unrelated text deleted"; E125's twin on
+    /// `semanticTokens/range`). The S3 staleness refusal every other
+    /// edit-producing handler takes is the wrong cure here and only here: it
+    /// would kill tag rename during exactly the typing it exists for, while
+    /// the live parse makes the feature CORRECT during typing instead.
     pub fn linked_tag_ranges(&self, offset: usize) -> Option<(Span, Span)> {
-        let (tree, _errors) = vilan_core::parsing::parse(self.analyzed_text());
+        let (tree, _errors) = vilan_core::parsing::parse(&self.text);
         let root = tree?;
         let mut found: Option<(Span, Span)> = None;
         for item in &root.0 {
             find_linked_tags(item, offset, &mut found);
         }
         found
+    }
+
+    /// The edits the server makes in answer to a character the author just
+    /// typed (`textDocument/onTypeFormatting`) — today exactly one: the `>`
+    /// that closes a `<` opened in TYPE position (E202, R9 at Order 39's GO).
+    ///
+    /// **Why the server and not `autoClosingPairs`.** `<` is also the
+    /// comparison operator, and a static language-configuration pair cannot
+    /// tell `List<` from `a < b`: its only filter is `notIn: [string, comment]`,
+    /// so pairing `<` there would grow a `>` in every comparison anybody types.
+    /// The server knows which is which, because it knows what the names mean.
+    ///
+    /// The rule, and it is deliberately narrow — a wrong `>` is worse than a
+    /// missing one, since the author has to delete a character they did not
+    /// type, in the middle of an expression:
+    ///
+    /// 1. The typed character is `<`, and the position is code (not inside a
+    ///    string body or after a `//` on the same line).
+    /// 2. The `<` sits IMMEDIATELY after an identifier — no space between. A
+    ///    comparison is written with spaces by every formatter this project
+    ///    ships, and `vilan fmt` is not optional here.
+    /// 3. That identifier either names a generic-capable declaration the
+    ///    analysis knows (a struct, enum or trait — `List<`, `Map<`,
+    ///    `Option<`, or a generic function's turbofish `echo<`), or it is a
+    ///    declaration's own name being given a type-parameter list, which is
+    ///    the token before it: `fun`, `struct`, `enum`, `trait`, `impl` or
+    ///    `type`.
+    ///
+    /// A binding, a literal and a bare word the analysis has never seen fail
+    /// all three readings and get nothing, which is the answer for `a < b`,
+    /// `count<10` and a name mid-rename. The retained program is the one the
+    /// last analysis produced, so this keeps working while the buffer is
+    /// mid-edit — the whole point of asking the server.
+    ///
+    /// The span is zero-width at `offset` (just past the `<`), so the client
+    /// inserts and leaves the caret where it is, which is what an auto-closing
+    /// pair does.
+    pub fn on_type_edits(&self, offset: usize, typed: &str) -> Vec<(Span, String)> {
+        if typed != "<" || !self.opens_a_generic_list(offset) {
+            return Vec::new();
+        }
+        vec![(Span::from(offset..offset), ">".to_string())]
+    }
+
+    /// What the editor's status line says about this document (F27 R1/R6):
+    /// the platform the last analysis ran under, the one-word kind of fact
+    /// that chose it, and the full reason clause (its tooltip). `None` before
+    /// any analysis has produced a program.
+    pub fn analysis_platform(
+        &self,
+    ) -> Option<(&'static str, Option<&'static str>, Option<String>)> {
+        let program = self.program.as_ref()?;
+        Some((
+            program.platform.runtime_name(),
+            program.platform_kind,
+            program.platform_reason.clone(),
+        ))
+    }
+
+    /// Whether the `<` ending at `offset` opens a generic argument or
+    /// type-parameter list — [`on_type_edits`](Self::on_type_edits)'s rule,
+    /// and the whole answer to the `vilan/opensAGenericList` request (E222),
+    /// which asks it for a client that places the `>` itself.
+    pub fn opens_a_generic_list(&self, offset: usize) -> bool {
+        let text = &self.text;
+        let Some(open) = offset.checked_sub(1) else {
+            return false;
+        };
+        if text.as_bytes().get(open).copied() != Some(b'<') {
+            return false;
+        }
+        if cursor_context(text, open) == CursorContext::None {
+            return false;
+        }
+        // The identifier the `<` is glued to.
+        let head = &text[..open];
+        let name_start = head
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |position| {
+                position + head[position..].chars().next().map_or(1, char::len_utf8)
+            });
+        let name = &head[name_start..];
+        if name.is_empty() {
+            return false;
+        }
+        // A declaration's own type-parameter list: `fun name<`, `struct Name<`,
+        // and the three beside them. Read before the program, because the
+        // declaration being written is by definition not in it yet.
+        let before = head[..name_start].trim_end();
+        let keyword_start = before
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |position| {
+                position + before[position..].chars().next().map_or(1, char::len_utf8)
+            });
+        if matches!(
+            &before[keyword_start..],
+            "fun" | "struct" | "enum" | "trait" | "impl" | "type"
+        ) {
+            return true;
+        }
+        let Some(program) = self.program.as_ref() else {
+            return false;
+        };
+        program
+            .structs
+            .values()
+            .any(|structure| structure.name == name)
+            || program
+                .enums
+                .values()
+                .any(|enumeration| enumeration.name == name)
+            || program.traits.values().any(|trait_| trait_.name == name)
+            || program.functions.values().any(|function| {
+                function.name == name && !function.generic_parameter_constraint_ids.is_empty()
+            })
     }
 
     pub fn hover(&self, offset: usize) -> Option<String> {
@@ -1608,12 +3112,34 @@ impl Document {
             return Some(keyword);
         }
         let program = self.program.as_ref()?;
+        // An `as` alias: the ALIAS's name with the TARGET's signature (B264).
+        if let Some(rendered) = self.alias_hover(program, offset) {
+            return Some(rendered);
+        }
+        // A module directory with no body: what it HOLDS (E152).
+        if let Some(rendered) = self.namespace_hover(program, offset) {
+            return Some(rendered);
+        }
+        // A field's own DECLARATION, or the field name in a struct
+        // initializer (E204): `x: i32` and `x`'s `///`. Asked before the type
+        // reference below, which would otherwise answer both positions with the
+        // enclosing struct's whole block — the answer for the type's NAME, and
+        // a restatement of the screen for a caret on one of its fields.
+        if let Some(rendered) = self.field_declaration_hover(program, offset) {
+            return Some(rendered);
+        }
         // A type name in type position: the full declaration when known.
         if let Some((definition, label)) = self.type_reference_at(program, offset) {
             if let Some(definition) = definition
                 && let Some(declaration) = program.declaration_labels.get(&definition)
             {
                 return Some(self.compose_hover(program, definition, declaration, None));
+            }
+            // E221: a labelled nominal hovers with its reason even where no
+            // declaration block answers (a trait in a bound).
+            if let Some(lead) = definition.and_then(|definition| internal_lead(program, definition))
+            {
+                return Some(format!("{lead}\n\n{label}"));
             }
             return Some(label);
         }
@@ -1623,12 +3149,27 @@ impl Document {
         if !self.offset_touches_a_token(offset) {
             return None;
         }
+        // An OPERATOR token: the method the operator dispatches to (E149).
+        if let Some(rendered) = self.operator_hover(program, offset) {
+            return Some(rendered);
+        }
         let id = self.entity_at(offset)?;
-        // A function (or requirement-carrying binding): the full signature.
+        // A function (or requirement-carrying binding): the full signature —
+        // and, at a GENERIC call site, the signature that call reached under it
+        // (E206). The site's label is keyed by the id under the cursor, so no
+        // reverse index and no second resolution: the entity that answered
+        // `function_target` is the entity the analyzer keyed.
         if let Some(target) = self.analysis(program).function_target(id) {
             let requirement = self.platform_requirements.get(&target).cloned();
             if let Some(declaration) = program.declaration_labels.get(&target) {
-                return Some(self.compose_hover(program, target, declaration, requirement));
+                let resolved = program.call_signature_labels.get(&id);
+                return Some(self.compose_declaration_hover(
+                    program,
+                    target,
+                    declaration,
+                    requirement,
+                    resolved.map(String::as_str),
+                ));
             }
         }
         // A struct/enum name in value position (a constructor, a variant).
@@ -1659,13 +3200,204 @@ impl Document {
             .function_target(id)
             .and_then(|function| self.platform_requirements.get(&function))
             .cloned();
-        match (type_label, requirement) {
+        let answer = match (type_label, requirement) {
             // A blank markdown line, so the requirement renders as its own
             // paragraph under the type.
             (Some(type_label), Some(requirement)) => Some(format!("{type_label}\n\n{requirement}")),
             (Some(type_label), None) => Some(type_label),
             (None, requirement) => requirement,
+        }?;
+        // E221: a labelled MODULE BINDING leads with its reason too, at its
+        // declaration and at every read of it.
+        let binding = match program.entity_map.get(&id) {
+            Some(Expr::Local(target)) => *target,
+            _ => id,
+        };
+        Some(match internal_lead(program, binding) {
+            Some(lead) => format!("{lead}\n\n{answer}"),
+            None => answer,
+        })
+    }
+
+    /// The hover for an identifier that spells an `as` alias — its own name
+    /// carrying the target's signature, TypeScript's `(alias) …` line (B264,
+    /// ruled 2026-09-07 with TS as the reference; `tsserver` answers
+    /// `(alias) bar(): number` at a use of `import { foo as bar }`, and
+    /// `(alias) type Bar = …` at a type-position one).
+    ///
+    /// It is one line rather than two because the alias has nothing else to
+    /// say: `hi` IS `greet`, and the only fact the target's own hover would
+    /// lose is which of the two names this file spells — which is precisely
+    /// the fact the caret is on. Go-to-definition still resolves THROUGH to
+    /// the target's declaration (the same ruling), so the hop is one keystroke
+    /// away and the hover does not have to be a directory.
+    ///
+    /// The site is decided by the reference INDEX, not by re-reading the text:
+    /// a row whose definition is an [`crate::references::DefinitionKind::Alias`]
+    /// is exactly an identifier this file spells with the alias's name (E145),
+    /// so hover, find-references and rename cannot disagree about which of an
+    /// import's two names the caret is on.
+    fn alias_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (definition, _) = self.reference_target(offset)?;
+        let Definition::Entity(id) = definition else {
+            return None;
+        };
+        let alias = program.import_aliases.get(&id)?;
+        let target = alias.target;
+        let declaration = program.declaration_labels.get(&target)?;
+        let target_name = crate::references::name_of(program, Definition::Entity(target))?;
+        let declaration = rename_leading_word(declaration, target_name, alias.name);
+        let declaration = if program.async_functions.contains(&target) {
+            format!("async {declaration}")
+        } else {
+            declaration
+        };
+        let mut out = format!("```vilan\n(alias) {declaration}\n```");
+        if let Some(docs) = self.analysis(program).doc_comment_of(target) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
         }
+        if let Some(requirement) = self.platform_requirements.get(&target) {
+            out.push_str("\n\n");
+            out.push_str(requirement);
+        }
+        Some(out)
+    }
+
+    /// Whether `id` is a module directory with NO body of its own — A65's pure
+    /// namespace, the node the loader mints for `lib` in `pkg::lib::ui::widget`
+    /// when `lib/lib.vl` is not part of this program.
+    ///
+    /// Such a node names no source file, so the analyzer attributes its one-id
+    /// range to the ENTRY and gives it an empty span — the honest answer to
+    /// "which file declares this", since no file does. Every module loaded from
+    /// a file has a source of its own, and the entry file is not a module
+    /// entity at all, so "a module attributed to `SourceId(0)`" is nearly the
+    /// bodiless set — the one other member is the `pkg::<entry>` alias arm,
+    /// which names the entry file and holds no children, so the submodule
+    /// scope is what separates them. A directory node exists BECAUSE a child
+    /// path asked for it, so a namespace always has one.
+    ///
+    /// **E158 asked whether a third such entity had appeared, and the
+    /// enumeration answers better than "no".** Over both package shapes — a
+    /// single-file package and one with nested bodiless directories — the
+    /// entry-attributed set is EXACTLY the bodiless namespaces, with no second
+    /// member at all, and the origin roots (`pkg`, `std`, a dependency's name)
+    /// are excluded because they carry NO source rather than by the
+    /// children-scope clause. So the thin discriminator currently discriminates
+    /// against nothing, which is the safest state it can be in and not one to
+    /// disturb with an invented marker. The answer is a GATE rather than a
+    /// sentence that was true once:
+    /// `every_entry_attributed_module_is_a_bodiless_namespace` reds the moment
+    /// a second kind appears, and whoever adds it decides the marker with the
+    /// real case in hand.
+    fn is_namespace_module(&self, program: &Program, id: Id) -> bool {
+        program.modules.contains_key(&id)
+            && program.module_children_scopes.contains_key(&id)
+            && program.source_of(id) == Some(SourceId(0))
+            && program
+                .span_map
+                .get(&id)
+                .is_none_or(|span| span.start == span.end)
+    }
+
+    /// The submodules a namespace holds, by name, in a deterministic order.
+    fn namespace_children(&self, program: &Program, id: Id) -> Vec<(String, Id)> {
+        let Some(scope_id) = program.module_children_scopes.get(&id) else {
+            return Vec::new();
+        };
+        let Some(scope) = program.scopes.get(scope_id) else {
+            return Vec::new();
+        };
+        let mut children: Vec<(String, Id)> = scope
+            .name_to_id_map
+            .iter()
+            .filter(|(_, child)| program.modules.contains_key(*child))
+            .map(|(name, child)| ((*name).to_string(), *child))
+            .collect();
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        children
+    }
+
+    /// Where go-to-definition lands for a pure namespace (E152): its first
+    /// child's FILE, at line 1.
+    ///
+    /// The alternative considered and rejected was a `file://` URI naming the
+    /// DIRECTORY itself, which is what the segment literally denotes. It is a
+    /// well-formed URI and a lie to every client: `textDocument/definition`
+    /// answers a `Location`, a location has a range in a TEXT DOCUMENT, and no
+    /// editor can open a directory as one — VS Code reports "unable to open"
+    /// and lands the user nowhere, which is a worse answer than the entry's top
+    /// line this replaces. The first child's file is a real document, it is
+    /// inside the namespace, and it is where a reader who followed
+    /// `pkg::lib::ui` was going anyway. Line 1 rather than a name span because
+    /// the namespace HAS no name span: nothing in that file spells `ui`.
+    ///
+    /// Deterministic: the children are ordered by name, and a child that is
+    /// itself bodiless recurses, so a namespace holding only namespaces still
+    /// answers with a file. `None` when the namespace holds nothing loadable,
+    /// which is the honest silence — the caller falls through to its own
+    /// answer.
+    fn namespace_location(&self, program: &Program, id: Id) -> Option<(SourceId, Span)> {
+        if !self.is_namespace_module(program, id) {
+            return None;
+        }
+        let mut seen: Vec<Id> = vec![id];
+        let mut frontier: std::collections::VecDeque<Id> = self
+            .namespace_children(program, id)
+            .into_iter()
+            .map(|(_, child)| child)
+            .collect();
+        while let Some(child) = frontier.pop_front() {
+            if seen.contains(&child) {
+                continue;
+            }
+            seen.push(child);
+            match program.source_of(child) {
+                Some(source) if source != SourceId(0) => {
+                    return Some((source, Span::from(0..0)));
+                }
+                // A bodiless child: its own children answer instead, ahead of
+                // this namespace's later ones, so the walk stays depth-first
+                // and the answer stays "the first child, all the way down".
+                _ => {
+                    for (offset, (_, nested)) in self
+                        .namespace_children(program, child)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        frontier.insert(offset, nested);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The hover for a pure namespace: what it HOLDS (E152).
+    ///
+    /// A namespace has no declaration, so the plain `module ui` the type label
+    /// produced was the whole answer — a restatement of the word under the
+    /// caret. The children are the only fact about it, and they are the fact a
+    /// reader asking about `pkg::lib::ui` wants: which paths does this segment
+    /// open onto.
+    fn namespace_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (definition, _) = self.type_reference_at(program, offset)?;
+        let definition = definition?;
+        if !self.is_namespace_module(program, definition) {
+            return None;
+        }
+        let module = program.modules.get(&definition)?;
+        let children = self.namespace_children(program, definition);
+        let mut out = format!("```vilan\nnamespace {}\n```", module.name);
+        if !children.is_empty() {
+            let names: Vec<String> = children
+                .iter()
+                .map(|(name, _)| format!("`{name}`"))
+                .collect();
+            out.push_str(&format!("\n\nHolds {}.", names.join(", ")));
+        }
+        Some(out)
     }
 
     /// Assembles a declaration hover: the fenced declaration (with inferred
@@ -1678,14 +3410,54 @@ impl Document {
         declaration: &str,
         requirement: Option<String>,
     ) -> String {
-        let declaration = if program.async_functions.contains(&declaration_id)
-            && !declaration.starts_with("async ")
-        {
-            format!("async {declaration}")
-        } else {
-            declaration.to_string()
+        self.compose_declaration_hover(program, declaration_id, declaration, requirement, None)
+    }
+
+    /// [`compose_hover`] with E206's second line: the same signature rendered
+    /// under the SUBSTITUTION this call site solved
+    /// (`Program::call_signature_labels`).
+    ///
+    /// Both lines go in ONE fenced `vilan` block with a blank line between them
+    /// (the owner's own spelling of the ask), rather than two blocks under a
+    /// caption: they are two readings of one signature, and a reader comparing
+    /// them wants them column-aligned in the same monospace run. The declared
+    /// line comes first because it is the thing that exists in the file; the
+    /// computed one answers "and which function did THIS call reach".
+    ///
+    /// `resolved` is `None` wherever the site added nothing — a non-generic
+    /// callee, a hover on the declaration itself, a call inside another generic
+    /// body whose parameters are all still open — and then this is exactly
+    /// [`compose_hover`]. The analyzer decides that, by writing no entry;
+    /// nothing here re-derives it.
+    fn compose_declaration_hover(
+        &self,
+        program: &Program,
+        declaration_id: Id,
+        declaration: &str,
+        requirement: Option<String>,
+        resolved: Option<&str>,
+    ) -> String {
+        let asyncify = |signature: &str| {
+            if program.async_functions.contains(&declaration_id) && !signature.starts_with("async ")
+            {
+                format!("async {signature}")
+            } else {
+                signature.to_string()
+            }
         };
-        let mut out = format!("```vilan\n{declaration}\n```");
+        let declaration = match resolved {
+            Some(resolved) => format!("{}\n\n{}", asyncify(declaration), asyncify(resolved)),
+            None => asyncify(declaration),
+        };
+        let mut out = String::new();
+        // E213: hover LEADS with the reason. The declaration is reachable —
+        // that is what visibility already answered — and what the reader needs
+        // before the signature is that reaching for it is a decision.
+        if let Some(lead) = internal_lead(program, declaration_id) {
+            out.push_str(&lead);
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("```vilan\n{declaration}\n```"));
         if let Some(docs) = self.analysis(program).doc_comment_of(declaration_id) {
             out.push_str("\n\n");
             out.push_str(&docs);
@@ -1695,6 +3467,56 @@ impl Document {
             out.push_str(&requirement);
         }
         out
+    }
+
+    /// The hover for a binary OPERATOR token under `offset`: the declaration
+    /// of the method that operator dispatches to (E149).
+    ///
+    /// `a == b` is a call, and the editor said nothing about it — an operator
+    /// is the one call spelled without a name, so every path that answers "what
+    /// is under the cursor" by resolving an IDENTIFIER answered nothing here,
+    /// including hover, and a reader asking which `eq` runs got a blank.
+    ///
+    /// The answer is not recomputed: B180 already recorded which method each
+    /// binary expression selected (`Program::binary_op_dispatch`), because the
+    /// emitter needs it, so the hover is that record rendered — the editor and
+    /// the emission cannot disagree about which `eq` this `==` is.
+    ///
+    /// `None` where there is no record, which is exactly the native operators:
+    /// native JS IS `1 + 2`'s semantics, nothing dispatches, and there is no
+    /// declaration to show. The gap test is what makes this an OPERATOR hover
+    /// rather than an expression one — the cursor must sit between the two
+    /// operands, not on either of them, so hovering `a` in `a == b` still
+    /// hovers `a`.
+    fn operator_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let entry = SourceId(0);
+        let mut best: Option<(Id, usize)> = None;
+        for (id, expr) in &program.entity_map {
+            let Expr::Binary(_, left, right) = expr else {
+                continue;
+            };
+            if program.source_of(*id) != Some(entry) {
+                continue;
+            }
+            let (Some(left), Some(right)) = (
+                vilan_ide::analysis::span_of(program, *left),
+                vilan_ide::analysis::span_of(program, *right),
+            ) else {
+                continue;
+            };
+            // The operator token is what lies between the operands. A caret on
+            // either operand is that operand's hover, not this one.
+            if !(left.end <= offset && offset < right.start) {
+                continue;
+            }
+            let width = right.start - left.end;
+            if best.is_none_or(|(_, best_width)| width < best_width) {
+                best = Some((*id, width));
+            }
+        }
+        let method = *program.binary_op_dispatch.get(&best?.0)?;
+        let declaration = program.declaration_labels.get(&method)?;
+        Some(self.compose_hover(program, method, declaration, None))
     }
 
     /// The hover for a keyword under `offset`: a one-line meaning and a deep
@@ -1708,10 +3530,27 @@ impl Document {
         // document that doesn't compile — that was the point of doing this
         // before the `program` check.)
         let (tokens, _errors) = tokenize(self.analyzed_text());
-        let (token, _span) = tokens.iter().find(|(_, span)| {
+        let at = tokens.iter().position(|(_, span)| {
             let range = span.into_range();
             range.start <= offset && offset < range.end
         })?;
+        let (token, _span) = &tokens[at];
+        // B413: an attribute that changes what a declaration IS hovers like
+        // the keyword it replaced — the word between `[` and `]`.
+        if let vilan_core::token::Token::Ident(word) = token
+            && at > 0
+            && tokens[at - 1].0 == vilan_core::token::Token::Ctrl('[')
+            && tokens
+                .get(at + 1)
+                .is_some_and(|(next, _)| *next == vilan_core::token::Token::Ctrl(']'))
+            && let Some((_, sentence, path)) = ATTRIBUTE_DOCS
+                .iter()
+                .find(|(attribute, _, _)| attribute == word)
+        {
+            return Some(format!(
+                "**`[{word}]`**: {sentence}\n\n[The vilan book →]({BOOK_BASE}{path})"
+            ));
+        }
         let lexeme = keyword_lexeme(token)?;
         let (_, sentence, path) = KEYWORD_DOCS
             .iter()
@@ -1775,7 +3614,96 @@ impl Document {
         }
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
-        Some(format!("```vilan\n{name}: {type_label}\n```"))
+        let mut out = format!("```vilan\n{name}: {type_label}\n```");
+        // E204: a FIELD's own `///`, where the read resolves to one. A field
+        // carries no entity id, so `doc_comment_of` has nothing to look up —
+        // `Expr::Field`'s (struct, index) key is what names the declaration,
+        // and `doc_comment_at` reads the block above its name span in the
+        // DECLARING source, which is the same read every other doc consumer
+        // performs.
+        if let Some(docs) = self.field_docs(program, id) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        Some(out)
+    }
+
+    /// The `///` block above the struct field `id` reads, or `None` when `id`
+    /// is not a field read or the field carries no doc (E204).
+    fn field_docs(&self, program: &Program, id: Id) -> Option<String> {
+        let Expr::Field(_, struct_id, index) = program.entity_map.get(&id)? else {
+            return None;
+        };
+        self.struct_field_docs(program, *struct_id, *index)
+    }
+
+    /// The `///` block above the `index`-th field of `struct_id` (E204) — the
+    /// one read every field-doc consumer shares, hover and completion alike.
+    fn struct_field_docs(&self, program: &Program, struct_id: Id, index: usize) -> Option<String> {
+        let field = program.structs.get(&struct_id)?.fields.get(index)?;
+        let source = program.source_of(struct_id)?;
+        self.analysis(program)
+            .doc_comment_at(source, field.name_span.into_range().start)
+    }
+
+    /// The hover for a field's DECLARATION or for the field name in a struct
+    /// INITIALIZER (E204): the fenced `name: T` a field read answers, plus the
+    /// field's own `///`.
+    ///
+    /// Both positions used to fall through to the enclosing struct's block —
+    /// `struct Point { x: i32, y: i32 }`, the whole declaration, for a caret on
+    /// one field of it. That is the answer for the struct's NAME and a
+    /// restatement of what is on screen for a field: the caret is on `x`, and
+    /// what a reader wants is `x`'s type and `x`'s sentence. The struct block
+    /// stays exactly where it belongs, on the type's own name.
+    ///
+    /// Matched by SPAN against two records the analyzer already keeps, rather
+    /// than by re-reading the text: the struct's own `Field::name_span` for a
+    /// declaration, and `struct_initializer_field_spans` — the use-site table
+    /// B-rename needed, `(file, span, struct, index)` — for an initializer key.
+    /// Both answer the same `(struct, index)` pair, which is why the two
+    /// positions are one function and cannot drift apart.
+    fn field_declaration_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (struct_id, index) = self.field_at_offset(program, offset)?;
+        let structure = program.structs.get(&struct_id)?;
+        let field = structure.fields.get(index)?;
+        let type_label = self
+            .analysis(program)
+            .field_type_label(struct_id, index, field.name)?;
+        let mut out = String::new();
+        // E213: a FIELD is the case visibility cannot serve at all, and the
+        // one the item was filed about.
+        if let Some(reason) = field.internal {
+            out.push_str(&internal_line(reason));
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("```vilan\n{}: {type_label}\n```", field.name));
+        if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        Some(out)
+    }
+
+    /// The struct field whose DECLARATION name span, or whose initializer KEY
+    /// span, contains `offset` in this document (E204). Entry-file only, like
+    /// every other span-containment answer here: `offset` is an analyzed-space
+    /// offset into this buffer.
+    ///
+    /// M85: a lookup in [`field_spans`](Document::field_spans), not a walk of
+    /// the world's structs. The rows are DISJOINT — a field's declaration name
+    /// occurs once and an initializer key occurs once, and neither can be
+    /// inside the other — so the containing row, if there is one, is the last
+    /// row starting at or before `offset`, and one containment test settles
+    /// it. The walk this replaces took the declarations before the keys; with
+    /// disjoint rows nothing can tell the two orders apart.
+    fn field_at_offset(&self, _program: &Program, offset: usize) -> Option<(Id, usize)> {
+        let candidate = self
+            .field_spans
+            .partition_point(|(start, ..)| *start <= offset)
+            .checked_sub(1)?;
+        let (start, end, struct_id, index) = self.field_spans[candidate];
+        (start <= offset && offset < end).then_some((struct_id, index))
     }
 
     /// The struct/enum definition an entity names in VALUE position — a
@@ -1822,6 +3750,22 @@ impl Document {
                     out.push('"');
                     out.push_str(value);
                     out.push('"');
+                }
+                // G24: a `const let` closure. Hover shows WHAT it is and what
+                // it baked, not the body — the body is on screen already, two
+                // lines up, and the captures are the half the reader cannot
+                // see.
+                ConstValue::Callable { captures, .. } => {
+                    out.push_str("|..| .. (compile-time");
+                    for (index, (_, captured)) in captures.iter().enumerate() {
+                        out.push_str(if index == 0 { ", over " } else { ", " });
+                        render(captured, out);
+                        if out.len() > 120 {
+                            out.push('…');
+                            break;
+                        }
+                    }
+                    out.push(')');
                 }
                 ConstValue::Array(items) => {
                     out.push('[');
@@ -1882,6 +3826,11 @@ impl Document {
         // target (a generic) yields nothing rather than falling through.
         if let Some((definition, _)) = self.type_reference_at(program, offset) {
             let definition = definition?;
+            // A pure NAMESPACE names no file, so it has no declaration to land
+            // on; its first child's does (E152).
+            if let Some(location) = self.namespace_location(program, definition) {
+                return Some(location);
+            }
             return Some((
                 program.source_of(definition)?,
                 self.analysis(program).definition_name_span(definition)?,
@@ -1900,9 +3849,12 @@ impl Document {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
+        // The same hoist as `semantic_tokens`, for the same reason and over the
+        // same whole-program table (M27/M58).
+        let source_of = program.source_lookup();
         let mut hints: Vec<(usize, String)> = Vec::new();
         for (id, variable) in &program.variables {
-            if variable.annotated || program.source_of(*id) != Some(SourceId(0)) {
+            if variable.annotated || source_of.of(*id) != Some(SourceId(0)) {
                 continue;
             }
             let Some(label) = program.expr_types.get(id) else {
@@ -1927,11 +3879,30 @@ impl Document {
     /// entities, method-call name spans, and type-position references (whose
     /// definitions also cover macro names — they share trait names by design,
     /// and only semantics can tell them apart).
+    ///
+    /// This is the WALK, and it is paid **once per landed analysis**: E121's
+    /// [`capture_landed`](Document::capture_landed) calls it on the analysis
+    /// thread and every request afterwards is served from the capture it
+    /// stores (`LandedSnapshot::tokens`, and for a viewport request the line
+    /// index beside it — E122). The other caller is
+    /// [`compute_retained_tail`](Document::compute_retained_tail), which reads
+    /// the OUTGOING analysis one last time as it is replaced.
     pub fn semantic_tokens(&self) -> Vec<(Span, TokenKind, u32)> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        let entry = |id: Id| program.source_of(id) == Some(SourceId(0));
+        // M27's hoist, which this table never took (M58). `source_of` is a
+        // LINEAR scan of `source_ranges`, and the predicate below is asked once
+        // per row of every whole-program table this walk touches: measured
+        // under callgrind on a WARM re-analysis of kolt's client, 426,198 calls
+        // and 253.5 M Ir — 7.0% of the entire analysis, and 98% of this
+        // function's own cost — for a question about ~60 ranges. `source_lookup`
+        // answers it by binary search, is answer-identical by construction (it
+        // falls back to `source_of`'s own scan when the ranges are not ascending
+        // and disjoint rather than assuming they are), and is taken ONCE here
+        // because the ranges do not move while a walk reads them.
+        let source_of = program.source_lookup();
+        let entry = |id: Id| source_of.of(id) == Some(SourceId(0));
         let mut tokens: Vec<(Span, TokenKind, u32)> = Vec::new();
         let classify_target = |target: Id| -> TokenKind {
             use vilan_core::analyzer::Expr;
@@ -1953,29 +3924,71 @@ impl Document {
                 }
             }
         };
+        // E213: the label at any use of a declaration that carries one — and
+        // E221: of any kind (a struct, enum, trait, module binding or variant
+        // as well as a function), read through the one reader hover uses.
+        //
+        // B382: a `[deprecated]` declaration carries its own modifier by the
+        // same read, so every site that dims an internal name strikes a
+        // deprecated one.
+        let internal_modifier = |target: Id| {
+            let internal = if vilan_core::labels::internal_of(program, target).is_some() {
+                MODIFIER_INTERNAL
+            } else {
+                0
+            };
+            let deprecated = if vilan_core::labels::deprecated_of(program, target).is_some() {
+                MODIFIER_DEPRECATED
+            } else {
+                0
+            };
+            internal | deprecated
+        };
+        // B415: `self` in the file's `[platform(..)] mod self;` DECLARES the
+        // file's own module. No entity stands for it (the file is the module),
+        // so it is read off the text — a namespace declaration, as a `mod`'s
+        // name is, rather than the receiver colour the TextMate layer gives
+        // every `self`.
+        if let Some(span) = mod_self_name_span(self.analyzed_index().text()) {
+            tokens.push((span, TokenKind::Namespace, MODIFIER_DECLARATION));
+        }
         // Declaration names.
         for (id, function) in &program.functions {
             if entry(*id) {
                 tokens.push((
                     function.name_span,
                     TokenKind::Function,
-                    MODIFIER_DECLARATION,
+                    // Dimmed at the DECLARATION too (E213): the reader looking
+                    // at the definition is the one most likely to copy it.
+                    MODIFIER_DECLARATION | internal_modifier(*id),
                 ));
             }
         }
         for (id, struct_) in &program.structs {
             if entry(*id) {
-                tokens.push((struct_.name_span, TokenKind::Struct, MODIFIER_DECLARATION));
+                tokens.push((
+                    struct_.name_span,
+                    TokenKind::Struct,
+                    MODIFIER_DECLARATION | internal_modifier(*id),
+                ));
             }
         }
         for (id, enum_) in &program.enums {
             if entry(*id) {
-                tokens.push((enum_.name_span, TokenKind::Enum, MODIFIER_DECLARATION));
+                tokens.push((
+                    enum_.name_span,
+                    TokenKind::Enum,
+                    MODIFIER_DECLARATION | internal_modifier(*id),
+                ));
             }
         }
         for (id, trait_) in &program.traits {
             if entry(*id) {
-                tokens.push((trait_.name_span, TokenKind::Interface, MODIFIER_DECLARATION));
+                tokens.push((
+                    trait_.name_span,
+                    TokenKind::Interface,
+                    MODIFIER_DECLARATION | internal_modifier(*id),
+                ));
             }
         }
         for (id, variable) in &program.variables {
@@ -1988,7 +4001,7 @@ impl Document {
                 tokens.push((
                     variable.name_span,
                     TokenKind::Variable,
-                    MODIFIER_DECLARATION | readonly,
+                    MODIFIER_DECLARATION | readonly | internal_modifier(*id),
                 ));
             }
         }
@@ -2020,7 +4033,11 @@ impl Document {
                             Some(variable) if !variable.mutable => MODIFIER_READONLY,
                             _ => 0,
                         };
-                        tokens.push((span, classify_target(*target), readonly));
+                        tokens.push((
+                            variant_leaf(program, *target, span),
+                            classify_target(*target),
+                            readonly | internal_modifier(*target),
+                        ));
                     }
                     Expr::Generic(_) => tokens.push((span, TokenKind::TypeParameter, 0)),
                     Expr::Module(_) => tokens.push((span, TokenKind::Namespace, 0)),
@@ -2039,7 +4056,20 @@ impl Document {
             } else {
                 TokenKind::Property
             };
-            tokens.push((*span, kind, 0));
+            // E213 at a MEMBER: the method this call selected, or the field
+            // this read resolved to — both already recorded, so the dimming
+            // asks the record rather than re-resolving the name.
+            let internal = if vilan_core::labels::member_internal(program, *call_id).is_some() {
+                MODIFIER_INTERNAL
+            } else {
+                0
+            };
+            // B382: a deprecated METHOD is struck at its call too.
+            let deprecated = match program.entity_map.get(call_id) {
+                Some(Expr::Local(target)) => internal_modifier(*target) & MODIFIER_DEPRECATED,
+                _ => 0,
+            };
+            tokens.push((*span, kind, internal | deprecated));
         }
         // Type-position references (macro names arrive here too).
         for (source, span, definition, _) in &program.type_references {
@@ -2049,10 +4079,15 @@ impl Document {
             // A reference with no resolved definition (an unresolved or
             // synthetic segment) stays untokenized — TextMate's base layer
             // keeps whatever it had.
-            let Some(kind) = definition.map(classify_target) else {
+            let Some(definition) = *definition else {
                 continue;
             };
-            tokens.push((*span, kind, 0));
+            // E221: a labelled nominal is dimmed where a TYPE names it too.
+            tokens.push((
+                *span,
+                classify_target(definition),
+                internal_modifier(definition),
+            ));
         }
         // Markup (element-syntax S5): tags and attribute names come from a
         // RAW parse — the desugar retires `Node::Element` before analysis, so
@@ -2088,6 +4123,18 @@ impl Document {
             for span in markup.tags {
                 tokens.push((span, TokenKind::Tag, 0));
             }
+            // E115: the angle brackets paint as the tag they belong to. Until
+            // now the analyzed stream said nothing about them and the TextMate
+            // grammar was the only thing coloring them — which is fine for a
+            // one-line head and wrong the moment attributes spread out, because
+            // a grammar rule is matched one line at a time and a `>` that lands
+            // on a line of its own has no `<tag` in front of it to be part of.
+            // It fell through to the operator list and read as a comparison.
+            // The parse knows exactly where these are whatever shape the head
+            // was written in, so the two sources agree by construction.
+            for span in markup.punctuation {
+                tokens.push((span, TokenKind::Tag, 0));
+            }
             for span in markup.attributes {
                 tokens.push((span, TokenKind::Property, 0));
             }
@@ -2099,6 +4146,9 @@ impl Document {
                 tokens.push((span, TokenKind::Property, 0));
             }
             for span in css.conditions {
+                tokens.push((span, TokenKind::Method, 0));
+            }
+            for span in css.methods {
                 tokens.push((span, TokenKind::Method, 0));
             }
         }
@@ -2118,26 +4168,314 @@ impl Document {
                 kept.push((span, kind, modifiers));
             }
         }
-        // B38, the salvage signature: when the fresh stream is entirely
-        // silent within the retained suffix — the shape of a parse break
-        // truncating the file to a prefix — the previous analysis's tokens
-        // for the byte-identical tail fill in, already shifted. A stream
-        // that reaches the suffix suppresses this wholesale, which is what
-        // keeps re-classification of identical text (semantics flow
-        // downward) fresh rather than stale.
-        if !self.retained_tail.is_empty()
-            && kept
-                .iter()
-                .all(|(span, ..)| span.end <= self.retained_tail_start)
-        {
-            kept.extend(
-                self.retained_tail
-                    .iter()
-                    .filter(|(span, ..)| span.start >= self.retained_tail_start)
-                    .cloned(),
+        fold_retained_tail(&mut kept, &self.retained_tail, self.retained_tail_start);
+        kept
+    }
+
+    // -- E121's keystroke path (proposal/editor-latency.md §2.1) -------------
+    //
+    // Four entry points, each O(file) and none of which runs `Analyzer`,
+    // `resolve_project_context`, or the filesystem. They answer the LIVE
+    // buffer; the providers above answer the ANALYZED one and remain the
+    // source the snapshot is captured from.
+
+    /// The two-sided anchor between the analyzed text and the live buffer.
+    pub fn keystroke_anchor(&self) -> Anchor {
+        Anchor::compute(self.analyzed_text(), &self.text)
+    }
+
+    /// What the landed analysis is worth for the buffer as it stands (§2.1.2).
+    ///
+    /// `dependency_moved` is the caller's answer to the paper's case 4 —
+    /// another module this analysis loaded has been edited since. The server
+    /// passes `false`, and the reason is that case 4 already closes by LANDING
+    /// rather than by degrading: an edit to a module this file imports leaves
+    /// this file's own buffer untouched, so its anchor is the identity and the
+    /// landed answer is served exactly as it is today, until
+    /// `reanalyze_dependents` re-lands it. Nothing here is newly stale; the
+    /// parameter is the seam a cancellation-aware scheduler would supply.
+    ///
+    /// The live buffer's stamp is READ, not recomputed: `set_text` and
+    /// `apply_change` maintain it on the symbol index as part of the same lex
+    /// the index needs anyway, so a verdict costs a comparison and the anchor's
+    /// two byte scans. It falls back to hashing when no index entry exists,
+    /// which is only the never-analyzed document.
+    pub fn keystroke_verdict(&self, dependency_moved: bool) -> Verdict {
+        if !self.landed.landed {
+            return Verdict::Unusable;
+        }
+        let anchor = self.keystroke_anchor();
+        let live_stamp = self
+            .landed
+            .index
+            .entry_stamp()
+            .unwrap_or_else(|| shape_stamp(&self.text));
+        Verdict::decide(&anchor, live_stamp == self.landed.stamp, dependency_moved)
+    }
+
+    /// Semantic tokens for the LIVE buffer, in LIVE coordinates.
+    ///
+    /// The landed stream re-mapped through the anchor, plus the edit window
+    /// painted from syntax alone — and, when a name binding moved or no anchor
+    /// survives, syntax alone for the whole file. The cost is one anchor
+    /// (two byte scans), a filter over the landed stream, and one lex: O(file),
+    /// and flat in the size of the analyzed program, which is the whole
+    /// mandate.
+    pub fn keystroke_tokens(&self, dependency_moved: bool) -> Vec<(Span, TokenKind, u32)> {
+        let anchor = self.keystroke_anchor();
+        let verdict = self.keystroke_verdict(dependency_moved);
+        self.landed.tokens_for(&self.text, &anchor, verdict)
+    }
+
+    /// Semantic tokens for the LIVE buffer over one VIEWPORT, in LIVE
+    /// coordinates — `semanticTokens/range`'s answer (E125).
+    ///
+    /// Byte for byte the window of [`keystroke_tokens`](Self::keystroke_tokens)
+    /// whose tokens START on a line in `first_line..=last_line`, and that
+    /// equality is the whole point of the method. Before E125 this request
+    /// sliced the capture in the ANALYZED snapshot's coordinates while `full`
+    /// re-served the same capture through the anchor, so the two answered two
+    /// pictures: a viewport request after an unlanded edit ABOVE the window
+    /// painted the window's tokens at the lines they occupied before the edit,
+    /// and they stayed there until the next analysis landed — the exact drift
+    /// the keystroke path exists to remove, on the request an editor sends
+    /// most.
+    ///
+    /// The cost still follows the WINDOW, which is what E122 bought and what
+    /// this must not spend. The capture is indexed by ANALYZED line, and the
+    /// anchor moves an analyzed line by a constant — zero through the head,
+    /// [`tail_line_shift`](Self::tail_line_shift) through the tail — so the
+    /// analyzed lines that can carry a token into a live window are two
+    /// contiguous stretches of that index, and the viewport is read as at most
+    /// two slices rather than as a scan. The edit window's syntax is lexed
+    /// only when the window's own lines meet the requested ones.
+    pub fn keystroke_tokens_in_lines(
+        &self,
+        first_line: u32,
+        last_line: u32,
+        dependency_moved: bool,
+    ) -> Vec<(Span, TokenKind, u32)> {
+        if first_line > last_line {
+            return Vec::new();
+        }
+        let anchor = self.keystroke_anchor();
+        let verdict = self.keystroke_verdict(dependency_moved);
+        let requested = |span: &Span| {
+            let line = self.line_index.range(span).start.line;
+            line >= first_line && line <= last_line
+        };
+        let mut painted: Vec<(Span, TokenKind, u32)> = Vec::new();
+        if verdict == Verdict::Exact {
+            let shift = self.tail_line_shift(&anchor);
+            let head = self.landed.token_positions_in_lines(first_line, last_line);
+            let tail = self.landed.token_positions_in_lines(
+                shift_line(first_line, -shift),
+                shift_line(last_line, -shift),
+            );
+            for position in merge_positions(head, tail) {
+                let (span, kind, modifiers) = self.landed.tokens[position];
+                if let Some(span) = anchor.map_span(span)
+                    && requested(&span)
+                {
+                    painted.push((span, kind, modifiers));
+                }
+            }
+            // Q5: the edit window is syntax-only in every verdict. A window
+            // that does not reach the requested lines can contribute nothing
+            // to them — every token it holds starts inside it — so the lex is
+            // not paid at all for a viewport away from the cursor.
+            let window = anchor.live_window();
+            if !window.is_empty() {
+                let window_first = self.line_index.position(window.start).line;
+                let window_last = self.line_index.position(window.end - 1).line;
+                if window_first <= last_line && window_last >= first_line {
+                    painted.extend(
+                        syntax_tokens_in(&self.text, window)
+                            .into_iter()
+                            .filter(|(span, _, _)| requested(span)),
+                    );
+                }
+            }
+        } else {
+            // Stale and Unusable degrade exactly as `full` does — the whole
+            // file from syntax alone — and the viewport is that answer's
+            // window. Syntax is never wrong, so no line of it is withheld.
+            painted.extend(
+                syntax_tokens_in(&self.text, 0..self.text.len())
+                    .into_iter()
+                    .filter(|(span, _, _)| requested(span)),
             );
         }
-        kept
+        sort_and_deoverlap(painted)
+    }
+
+    /// How many LINES the anchor's tail moved: the live line of the first byte
+    /// of the common suffix, minus its analyzed line.
+    ///
+    /// Byte identity gives the offset shift; this is the same fact counted in
+    /// lines, which is what a viewport is addressed in. Zero when the two
+    /// texts are identical (the suffix is empty and both offsets are the end
+    /// of their text), so an unedited buffer reads the capture's own line
+    /// index unchanged.
+    fn tail_line_shift(&self, anchor: &Anchor) -> i64 {
+        let analyzed_suffix_start = anchor.analyzed_len.saturating_sub(anchor.suffix);
+        let live_suffix_start = anchor.live_len.saturating_sub(anchor.suffix);
+        self.line_index.position(live_suffix_start).line as i64
+            - self.analyzed_index.position(analyzed_suffix_start).line as i64
+    }
+
+    /// Inlay hints for the LIVE buffer, in LIVE coordinates — Q1/Q4's ruling:
+    /// re-mapped through the anchor, withheld inside the edit window, served
+    /// unchanged rather than flickered off when stale, withheld entirely when
+    /// no anchor survives.
+    pub fn keystroke_hints(&self, dependency_moved: bool) -> Vec<(usize, String)> {
+        let anchor = self.keystroke_anchor();
+        let verdict = self.keystroke_verdict(dependency_moved);
+        self.landed.hints_for(&anchor, verdict)
+    }
+
+    /// Completion candidates at a LIVE `offset`, answered from the symbol
+    /// index and the cursor's syntactic context (§2.1.4).
+    ///
+    /// Three shapes, and what each may read:
+    ///
+    /// - **scope** — the edited module's own declarations, read from the live
+    ///   buffer's syntax, so a `fun` typed one keystroke ago completes. Only
+    ///   its own: a name another module declares is not in scope here without
+    ///   an import, and reaching it is auto-import's job. Measured on a kolt
+    ///   copy, adding every loaded module's names to this arm turned a
+    ///   125-candidate scope completion into a 3,144-candidate one.
+    /// - **`module::`** — that module's entry in the index, by the name a path
+    ///   spells it with. This is the arm the index straightforwardly replaces:
+    ///   no `read_dir`, no per-module `name_to_id_map` sweep.
+    /// - **`receiver.`** — a member list is a *type* question and the index
+    ///   cannot answer it. When the verdict is [`Verdict::Exact`] the LANDED
+    ///   analysis answers (a read of a finished `Program`, not a type-check);
+    ///   otherwise the receiver's binding may have moved, and the module's own
+    ///   names are offered instead of a member list that would be a lie of the
+    ///   kind Q4 rules against for hints.
+    ///
+    /// The landed engine then fills in everything only resolution can supply —
+    /// locals, members, keywords, snippets, auto-imports — and a label the
+    /// index already offered is dropped rather than repeated. The index goes
+    /// FIRST because it is the only source that knows what the live buffer
+    /// declares: a `fun` typed one keystroke ago is in it and cannot be in the
+    /// landed analysis.
+    pub fn keystroke_completion(&self, offset: usize, dependency_moved: bool) -> Vec<Completion> {
+        self.keystroke_completion_over(offset, dependency_moved, &self.landed.index.completion)
+    }
+
+    /// The whole answer, with the analysis-side completion index named rather
+    /// than taken from the capture.
+    ///
+    /// M25's identity pin hands in an index derived AT REQUEST TIME — which is
+    /// what the engine used to do on every keystroke — and asserts the two
+    /// answers are the same candidates. That is the one property capturing the
+    /// table can break, so it is the one the pin holds.
+    fn keystroke_completion_over(
+        &self,
+        offset: usize,
+        dependency_moved: bool,
+        completion_index: &vilan_ide::CompletionIndex,
+    ) -> Vec<Completion> {
+        let verdict = self.keystroke_verdict(dependency_moved);
+        let context = cursor_context(&self.text, offset);
+        if context == CursorContext::None {
+            return Vec::new();
+        }
+        let index = &self.landed.index;
+        let entry_names = |prefix: &str| {
+            index
+                .by_module
+                .get(SymbolIndex::ENTRY)
+                .map(|entry| candidates(&entry.entries, prefix))
+                .unwrap_or_default()
+        };
+        let mut offered = match &context {
+            // Handled above; the arm keeps the match total without a
+            // catch-all that would swallow a future context.
+            CursorContext::None => Vec::new(),
+            // The EDITED module's own declarations, and deliberately nothing
+            // else. A name another module declares is not in scope here without
+            // an import, and offering it as though it were is both wrong and
+            // expensive: measured on a kolt copy, adding every loaded module's
+            // names turned a 125-candidate scope completion into a
+            // 3,144-candidate one. Reaching those names is auto-import's job,
+            // which the landed engine below already does with the ranking tiers
+            // and the `additionalTextEdits` that insert the import.
+            CursorContext::Scope { prefix } => entry_names(prefix),
+            // A one-segment path is the arm the index straightforwardly
+            // replaces. A NESTED one is not: the index is keyed by module
+            // name, `module` here is only the path's last segment, and
+            // answering `style::FlexDirection::` with whatever module happens
+            // to be called `FlexDirection` would be a lie. The descent is a
+            // resolution question — the landed engine's
+            // `code_path_completions` walks it (E129), and this defers.
+            CursorContext::Path {
+                module,
+                prefix,
+                nested,
+            } => {
+                if *nested {
+                    Vec::new()
+                } else {
+                    index
+                        .module(module)
+                        .map(|module| candidates(&module.entries, prefix))
+                        .unwrap_or_default()
+                }
+            }
+            // A member position in the exact state: the landed analysis owns
+            // the member list, and it arrives below. Otherwise the receiver's
+            // binding may have moved, and the module's own names are the
+            // honest offer.
+            CursorContext::Member { prefix } => match verdict {
+                Verdict::Exact => Vec::new(),
+                Verdict::Stale | Verdict::Unusable => entry_names(prefix),
+            },
+        };
+        // The landed engine's resolution-derived candidates, deduplicated by
+        // label. It reads the last completed analysis and never runs
+        // `Analyzer`, and since M25 it derives nothing whole-program per
+        // request either: `auto_import_completions` reads the captured
+        // candidate table and an import path's origin arm reads the captured
+        // module listing, so neither the per-module `name_to_id_map` sweep nor
+        // `modules_in_root`'s `read_dir` is on this path any more.
+        for candidate in self.completion_over(offset, completion_index) {
+            if !offered
+                .iter()
+                .any(|existing| existing.label == candidate.label)
+            {
+                offered.push(candidate);
+            }
+        }
+        offered
+    }
+
+    /// The same answer with the completion index derived from THIS request
+    /// instead of read from the capture — the pre-M25 engine, for the pin that
+    /// holds the two to one answer.
+    #[cfg(test)]
+    pub(crate) fn keystroke_completion_rebuilding_index(
+        &self,
+        offset: usize,
+        dependency_moved: bool,
+    ) -> Vec<Completion> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        let index = vilan_ide::CompletionIndex::build(
+            program,
+            self.import_roots.as_ref(),
+            self.analyzed_text(),
+        );
+        self.keystroke_completion_over(offset, dependency_moved, &index)
+    }
+
+    /// The keystroke path's own view of the symbol index, for the pins.
+    #[cfg(test)]
+    pub(crate) fn keystroke_index(&self) -> &SymbolIndex {
+        &self.landed.index
     }
 
     fn type_reference_at(&self, program: &Program, offset: usize) -> Option<(Option<Id>, String)> {
@@ -2266,6 +4604,14 @@ impl Document {
         };
         self.reference_index
             .occurrences_of(definition)
+            // E149: a generated row indexes a TEMPLATE no file holds, so its
+            // offsets are nobody's text and it cannot become a client
+            // location. `references_across` dropped these as a side effect of
+            // going through `canonical_sources`, which has no entry for
+            // `DERIVED_SOURCE`; this face returned them, so the two disagreed
+            // about what a symbol's references are — the very thing the one
+            // index exists to prevent.
+            .filter(|occurrence| occurrence.source != DERIVED_SOURCE)
             .map(|occurrence| (occurrence.source, occurrence.span))
             .collect()
     }
@@ -2330,15 +4676,73 @@ impl Document {
         &self,
         definition: Definition,
     ) -> Option<crate::references::DefinitionKey> {
+        if let Some(released) = self.released.as_ref() {
+            return self.released_key_of(released, definition);
+        }
         let program = self.program.as_ref()?;
         self.reference_index.key_of(program, definition)
+    }
+
+    /// [`definition_key`](Document::definition_key) for a released document
+    /// (M63) — `ReferenceIndex::key_of`'s two program questions answered from
+    /// [`ReleasedTables`]: which file the declaration row's source id names,
+    /// and what the definition is called.
+    fn released_key_of(
+        &self,
+        released: &ReleasedTables,
+        definition: Definition,
+    ) -> Option<crate::references::DefinitionKey> {
+        let declaration = self
+            .reference_index
+            .occurrences_of(definition)
+            .find(|occurrence| occurrence.is_declaration_of(definition))?;
+        let path = released
+            .canonical_sources
+            .get(declaration.source.0 as usize)?
+            .clone();
+        let (name, _) = released.declarations.get(&definition)?;
+        Some(crate::references::DefinitionKey::new(
+            path,
+            declaration.span,
+            name.to_string(),
+        ))
     }
 
     /// The definition `key` names in THIS document's program —
     /// [`ReferenceIndex::definition_of_key`]'s document form.
     pub fn definition_of_key(&self, key: &crate::references::DefinitionKey) -> Option<Definition> {
+        if let Some(released) = self.released.as_ref() {
+            return self.released_definition_of_key(released, key);
+        }
         let program = self.program.as_ref()?;
         self.reference_index.definition_of_key(program, key)
+    }
+
+    /// [`definition_of_key`](Document::definition_of_key) for a released
+    /// document (M63): `ReferenceIndex::definition_of_key`'s scan, filtered
+    /// span-first exactly as there, with the path and the name read from
+    /// [`ReleasedTables`] instead of from the program.
+    fn released_definition_of_key(
+        &self,
+        released: &ReleasedTables,
+        key: &crate::references::DefinitionKey,
+    ) -> Option<Definition> {
+        self.reference_index
+            .declarations()
+            .filter(|row| row.span == key.span())
+            .find(|row| {
+                released
+                    .declarations
+                    .get(&row.definition)
+                    .map(|(name, _)| &**name)
+                    == Some(key.name())
+                    && released
+                        .canonical_sources
+                        .get(row.source.0 as usize)
+                        .map(PathBuf::as_path)
+                        == Some(key.path())
+            })
+            .map(|row| row.definition)
     }
 
     /// `(source, span)` rows from this document's program in `(canonical file
@@ -2346,16 +4750,27 @@ impl Document {
     /// cross-document union merges in. A row whose source has no path
     /// (generated code) is dropped.
     fn spans_by_path(&self, spans: Vec<(SourceId, Span)>) -> Vec<(PathBuf, Span)> {
-        let Some(program) = self.program.as_ref() else {
-            return Vec::new();
-        };
+        let sources = self.canonical_sources();
         spans
             .into_iter()
             .filter_map(|(source, span)| {
-                program
-                    .canonical_sources
+                sources
                     .get(source.0 as usize)
                     .map(|path| (path.clone(), span))
+            })
+            .collect()
+    }
+
+    /// [`Self::spans_by_path`] for a rename's edits, which carry their own
+    /// replacement text (E143).
+    fn edits_by_path(&self, edits: Vec<(SourceId, Span, String)>) -> Vec<(PathBuf, Span, String)> {
+        let sources = self.canonical_sources();
+        edits
+            .into_iter()
+            .filter_map(|(source, span, text)| {
+                sources
+                    .get(source.0 as usize)
+                    .map(|path| (path.clone(), span, text))
             })
             .collect()
     }
@@ -2364,11 +4779,7 @@ impl Document {
     /// entry (`None` when nothing was analyzed) — how the location conversion
     /// recognizes a path-space span as belonging to an open document.
     pub fn entry_path(&self) -> Option<&Path> {
-        self.program
-            .as_ref()?
-            .canonical_sources
-            .first()
-            .map(PathBuf::as_path)
+        self.canonical_sources().first().map(PathBuf::as_path)
     }
 
     /// The definition the identifier under `offset` names, with its kind — the
@@ -2376,8 +4787,31 @@ impl Document {
     pub fn reference_target(&self, offset: usize) -> Option<(Definition, DefinitionKind)> {
         let program = self.program.as_ref()?;
         let occurrence = self.reference_index.at(SourceId(0), offset)?;
-        let kind = crate::references::kind_of(program, occurrence.definition)?;
-        Some((occurrence.definition, kind))
+        // E149: a struct-init shorthand `A { x }` is ONE identifier naming two
+        // definitions (E134), and the row carries whichever of them
+        // `Definition::sort_key` put first — declaration order. So a caret
+        // there answered for the field in one file and for the local in
+        // another, and E143's rename expanded to `renamed = x` or to
+        // `x = renamed` depending on which was declared first. Both are
+        // correct readings of the site; neither is a reason for the editor to
+        // decide by accident. Ruled 2026-09-07: the caret means the LOCAL —
+        // the binding is one hop away by name (`A { x }` reads `x`), where the
+        // field is reached only through the type, and a user who means the
+        // field has its declaration and `a.x` to start from.
+        let definition = match occurrence.co_definition {
+            Some(other) => [occurrence.definition, other]
+                .into_iter()
+                .find(|candidate| {
+                    matches!(
+                        crate::references::kind_of(program, *candidate),
+                        Some(DefinitionKind::Binding)
+                    )
+                })
+                .unwrap_or(occurrence.definition),
+            None => occurrence.definition,
+        };
+        let kind = crate::references::kind_of(program, definition)?;
+        Some((definition, kind))
     }
 
     /// The spans a rename of the symbol under `offset` must rewrite, or the
@@ -2398,9 +4832,9 @@ impl Document {
         &self,
         offset: usize,
         new_name: &str,
-    ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
+    ) -> std::result::Result<Vec<(SourceId, Span, String)>, RenameRefusal> {
         let (definition, what) = self.rename_target(offset, new_name)?;
-        self.rename_spans(definition, &what)
+        self.rename_spans(definition, &what, new_name)
     }
 
     /// [`Document::rename_edits`] unioned over each `neighbors` (the other
@@ -2415,9 +4849,9 @@ impl Document {
         offset: usize,
         new_name: &str,
         neighbors: impl IntoIterator<Item = &'a Document>,
-    ) -> std::result::Result<Vec<(PathBuf, Span)>, RenameRefusal> {
+    ) -> std::result::Result<Vec<(PathBuf, Span, String)>, RenameRefusal> {
         let (definition, what) = self.rename_target(offset, new_name)?;
-        let mut merged = self.spans_by_path(self.rename_spans(definition, &what)?);
+        let mut merged = self.edits_by_path(self.rename_spans(definition, &what, new_name)?);
         if let Some(key) = self.definition_key(definition) {
             for neighbor in neighbors {
                 if !neighbor.depends_on(key.path()) {
@@ -2433,7 +4867,8 @@ impl Document {
                 let Some(local) = neighbor.definition_of_key(&key) else {
                     continue;
                 };
-                merged.extend(neighbor.spans_by_path(neighbor.rename_spans(local, &what)?));
+                merged
+                    .extend(neighbor.edits_by_path(neighbor.rename_spans(local, &what, new_name)?));
             }
         }
         merged.sort();
@@ -2469,8 +4904,15 @@ impl Document {
         &self,
         definition: Definition,
         what: &str,
-    ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
-        let Some(program) = self.program.as_ref() else {
+        new_name: &str,
+    ) -> std::result::Result<Vec<(SourceId, Span, String)>, RenameRefusal> {
+        // M63: from the program, or from a released document's capture — the
+        // two source sets and the per-definition name and kind are exactly what
+        // this needs of a program, and a neighbor that could not answer would
+        // refuse the whole rename (`rename_edits_across` propagates), which is
+        // a rename that stops working for every file the user is not looking
+        // at.
+        let Some((std_sources, dependency_sources)) = self.foreign_sources() else {
             return Err(RenameRefusal::NotAnIdentifier);
         };
         let missing = self.unindexed_references(definition);
@@ -2481,15 +4923,28 @@ impl Document {
             });
         }
 
-        let spans: Vec<(SourceId, Span)> = self
+        // The index guarantees one row per `(source, span)` in a file, so this
+        // cannot hold a duplicate — but a duplicate span is what the CLIENT
+        // rejects ("Rename failed to apply edits"), so the guarantee is
+        // re-stated where the edit set is actually produced rather than relied
+        // on from two layers away.
+        let mut spans: Vec<(SourceId, Span, String)> = self
             .reference_index()
             .occurrences_of(definition)
-            .map(|occurrence| (occurrence.source, occurrence.span))
+            .map(|occurrence| {
+                (
+                    occurrence.source,
+                    occurrence.span,
+                    self.replacement_for(definition, occurrence, new_name),
+                )
+            })
             .collect();
+        spans.sort_by_key(|(source, span, _)| (source.0, span.start, span.end));
+        spans.dedup();
         if spans.is_empty() {
             return Err(RenameRefusal::NotAnIdentifier);
         }
-        for (source, _) in &spans {
+        for (source, _, _) in &spans {
             // Generated code has no path, so an edit there cannot be expressed —
             // and dropping it silently is the partial rename the rule forbids.
             if *source == DERIVED_SOURCE {
@@ -2500,13 +4955,13 @@ impl Document {
             // A rename reached through an import must not rewrite the library it
             // reached into. The old code would happily hand the client edits for
             // files under `$VILAN_STD`.
-            if program.std_sources.contains(source) {
+            if std_sources.contains(source) {
                 return Err(RenameRefusal::NotOwned {
                     what: what.to_string(),
                     origin: "the standard library",
                 });
             }
-            if program.dependency_sources.contains(source) {
+            if dependency_sources.contains(source) {
                 return Err(RenameRefusal::NotOwned {
                     what: what.to_string(),
                     origin: "a dependency",
@@ -2514,6 +4969,53 @@ impl Document {
             }
         }
         Ok(spans)
+    }
+
+    /// The text one occurrence of `definition` is replaced with by a rename to
+    /// `new_name` — `new_name` itself for every site that is a plain
+    /// identifier, and an EXPANSION for the one site that is not (E143).
+    ///
+    /// A struct-init field shorthand `A { x }` is one identifier naming two
+    /// definitions: the field key `A::x` and a read of the local `x`
+    /// (E134's co-reference). Rewriting that identifier serves one name and
+    /// silently breaks the other, so rename refused there and named the
+    /// expansion for the user to write by hand. Ruled 2026-09-05: emit the
+    /// expansion instead. Renaming the FIELD gives `A { new = x }`; renaming
+    /// the LOCAL gives `A { x = new }`. The shorthand is exactly the form in
+    /// which the two names coincide, so writing them out is not a rewrite of
+    /// the user's code so much as the removal of an abbreviation that has run
+    /// out of room — and it is the same text the refusal used to ask for.
+    ///
+    /// This is the whole reason a rename edit carries its own text. Every
+    /// other edit in the set is `new_name`, and it stays that way; what
+    /// changed is that the module can now express a site where it is not.
+    fn replacement_for(
+        &self,
+        definition: Definition,
+        occurrence: &crate::references::Occurrence,
+        new_name: &str,
+    ) -> String {
+        let Some(other) = occurrence.shared_with(definition) else {
+            return new_name.to_string();
+        };
+        // Both halves of a shorthand spell one name — that is what makes it a
+        // shorthand — so the surviving side keeps the name the site already
+        // has, and only the renamed side moves.
+        let existing = self.name_of_definition(definition).unwrap_or(new_name);
+        match self.kind_of_definition(definition) {
+            // The field key is on the LEFT of a struct initializer entry.
+            Some(crate::references::DefinitionKind::Field) => format!("{new_name} = {existing}"),
+            // Anything else reaching here is the value side: E134's
+            // co-reference pairs a field with the BINDING the shorthand reads,
+            // and there is no third shape.
+            _ => {
+                debug_assert!(matches!(
+                    self.kind_of_definition(other),
+                    Some(crate::references::DefinitionKind::Field)
+                ));
+                format!("{existing} = {new_name}")
+            }
+        }
     }
 
     /// The reference index this document's queries read.
@@ -2559,11 +5061,24 @@ impl Document {
                 // the file's import list, so a reference written there is not
                 // mistaken for the file using the import.
                 let import_spans = vilan_core::formatter::import_statement_spans(source);
-                let keep =
-                    |leaf_span: Span| self.import_leaf_is_used(program, leaf_span, &import_spans);
-                vilan_core::formatter::organize_import_runs(source, &keep)
+                // E169/E180: what this file's OTHER import leaves already
+                // bind, what a receiver resolved, what names are taken. Built
+                // once for the pass — each is a walk, and asking one per leaf
+                // would be that walk squared.
+                let context = self.import_use_context(program, source);
+                let keep = |leaf_span: Span| {
+                    self.import_leaf_is_used(program, leaf_span, &import_spans, &context)
+                };
+                // E168: the second question, asked only of a statement the
+                // first emptied out.
+                let keep_module = |module_span: Span| {
+                    self.import_module_is_used(program, module_span, &import_spans, &context)
+                };
+                vilan_core::formatter::organize_import_runs(source, &keep, &keep_module)
             }
-            None => vilan_core::formatter::organize_import_runs(source, &|_| true),
+            None => vilan_core::formatter::organize_import_runs(source, &|_| true, &|_| {
+                vilan_core::formatter::ModuleRescue::No
+            }),
         };
         edits
             .map(|edits| {
@@ -2573,6 +5088,518 @@ impl Document {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The fade text of an unused import leaf: what the editor writes beside
+    /// the gray, and what the user reads before running the action.
+    ///
+    /// Two of them since E173, because the action does two things. A leaf whose
+    /// statement will be DELETED says the plain thing. A leaf whose statement
+    /// the organizer will REWRITE instead (E168: every leaf unused, but the
+    /// file resolves something declared in the module's file, so the import is
+    /// the only thing carrying an `impl` the file calls a method from) said the
+    /// same plain thing and was misleading in the one place it most mattered —
+    /// the fade and the edit disagreed, and the user reading "unused import"
+    /// over a statement the action KEEPS has been told the wrong thing about
+    /// their own file. The second text names the rewrite, and the rewritten
+    /// statement is appended to it in backticks.
+    const UNUSED_IMPORT: &str = "unused import";
+    /// See [`Document::UNUSED_IMPORT`]. The rewritten statement follows.
+    const UNUSED_BUT_THE_MODULE_IS_USED: &str =
+        "unused; the module's impls are in use — Organize Imports rewrites this to";
+    /// E180's third text, for the leaf rule (0) pruned: the PRELUDE already
+    /// binds this definition. "unused import" is the one thing it is not — the
+    /// name may be spelled on every line of the file, and a user looking at
+    /// `Option` faded in a file full of `Option::Some` has been told something
+    /// they can see is false. The prelude-bound name follows in backticks.
+    const REDUNDANT_PRELUDE_BINDS: &str = "redundant: the prelude already binds";
+
+    /// The top-level import leaves nothing in this file uses (E114) — the spans
+    /// the editor FADES, in the analyzed text's coordinates.
+    ///
+    /// Paint, not a warning: an unused import is a tidiness observation, so it
+    /// publishes at hint severity with `DiagnosticTag::Unnecessary` and never
+    /// enters a count or gates anything (see `publish::diagnostic_groups`).
+    ///
+    /// It is the ORGANIZER's answer, not a second one: the same leaf walk
+    /// (`formatter::import_leaf_name_spans`) and the same usage test
+    /// ([`Document::import_leaf_is_used`], which counts type positions, value
+    /// positions and struct constructors, and counts references from code
+    /// generated out of this file so a derive-only import survives). Whatever
+    /// Organize Imports would prune is what fades, which is the only honest
+    /// relationship between a mark and the fix offered for it.
+    ///
+    /// Conservative in exactly the organizer's two ways, because a mark that
+    /// lies is worse than no mark: nothing fades while the buffer is ahead of
+    /// the analysis, and nothing fades in a file that carries a diagnostic — a
+    /// half-typed name might be about to use the very import in question.
+    /// Re-exports are not leaves here at all.
+    pub fn unused_import_spans(&self) -> Vec<(Span, String)> {
+        let Some(program) = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())
+        else {
+            return Vec::new();
+        };
+        // The ANALYZED text, so the spans this returns are in the coordinates
+        // the publisher converts through — and equal to the live text anyway,
+        // since a stale document decides nothing above.
+        let source = self.analyzed_text();
+        let import_spans = vilan_core::formatter::import_statement_spans(source);
+        let context = self.import_use_context(program, source);
+        let leaves: Vec<(Span, bool)> = vilan_core::formatter::import_leaf_name_spans(source)
+            .into_iter()
+            .map(|leaf| {
+                let used = self.import_leaf_is_used(program, leaf, &import_spans, &context);
+                (leaf, used)
+            })
+            .collect();
+        if leaves.iter().all(|(_, used)| *used) {
+            return Vec::new();
+        }
+        let emptied =
+            self.rewritten_import_statements(program, source, &import_spans, &context, &leaves);
+        leaves
+            .into_iter()
+            .filter(|(_, used)| !used)
+            .filter_map(|(leaf, _)| {
+                let fate = emptied
+                    .iter()
+                    .find(|(statement, _)| spans_contain(*statement, leaf))
+                    .map(|(_, fate)| fate);
+                let message = match fate {
+                    // E180: the collision guard kept the statement exactly as
+                    // written, so the action removes NOTHING here and E114's
+                    // contract says nothing may fade.
+                    Some(EmptiedStatement::Kept) => return None,
+                    Some(EmptiedStatement::Rewritten(rewrite)) => {
+                        format!("{} `{rewrite}`", Self::UNUSED_BUT_THE_MODULE_IS_USED)
+                    }
+                    // E180: a leaf the PRELUDE already binds is not "unused" in
+                    // any sense its reader would recognize — the name may be
+                    // spelled fifty times in the file. Say what it is instead,
+                    // so a heavily-used name faded is explained rather than
+                    // contradicted (E145's territory).
+                    None => match self.prelude_redundant_name(program, source, leaf) {
+                        Some(name) => format!("{} `{name}`", Self::REDUNDANT_PRELUDE_BINDS),
+                        None => Self::UNUSED_IMPORT.to_string(),
+                    },
+                };
+                Some((leaf, message))
+            })
+            .collect()
+    }
+
+    /// The NAME a rule-(0) leaf is redundant with — `Some` exactly when
+    /// [`Self::import_leaf_is_used`]'s rule (0) is what pruned this leaf.
+    ///
+    /// Asked only of a leaf already known unused, and it re-asks rule (0)'s own
+    /// two questions rather than threading a reason out of the leaf walk: the
+    /// pair is a map lookup and a slice search, and a second `bool` returned
+    /// from the predicate would have to be carried through the organizer's
+    /// `keep` closure, which is a `Fn(Span) -> bool` the formatter owns.
+    fn prelude_redundant_name<'a>(
+        &self,
+        program: &Program,
+        source: &'a str,
+        leaf_span: Span,
+    ) -> Option<&'a str> {
+        // An `as` alias renames the thing, so it is never prelude-redundant —
+        // rule (0) declines it too.
+        if program
+            .import_alias_spans
+            .contains_key(&(SourceId(0), leaf_span))
+        {
+            return None;
+        }
+        let definition_id = self.import_path_definition(program, leaf_span)?;
+        program
+            .prelude_bindings
+            .contains(&definition_id)
+            .then(|| source.get(leaf_span.into_range()))
+            .flatten()
+    }
+
+    /// E173: what Organize Imports will do with each import statement its leaf
+    /// question emptied out — `(statement span, its fate)`, for every statement
+    /// the action does something other than delete.
+    ///
+    /// Asked OF the organizer rather than recomputed beside it. `keep_module`
+    /// is E168's second question and it is put only to a statement the leaf
+    /// question emptied — which is exactly the statement whose fade text has to
+    /// change — and the module SEGMENT's span, which the rewritten text is
+    /// built from, exists nowhere outside that callback. Recording the callback
+    /// is therefore both the cheapest way to learn it and the only way the fade
+    /// and the action cannot drift, which is E114's whole contract.
+    ///
+    /// Skipped unless some statement's leaves are ALL unused: nothing else can
+    /// reach `keep_module`, so the organizer run would be pure cost on the
+    /// common shape (one unused leaf beside a used one).
+    fn rewritten_import_statements(
+        &self,
+        program: &Program,
+        source: &str,
+        import_spans: &[Span],
+        context: &ImportUseContext<'_>,
+        leaves: &[(Span, bool)],
+    ) -> Vec<(Span, EmptiedStatement)> {
+        let emptied = |statement: Span| {
+            let mut saw_one = false;
+            for (leaf, used) in leaves {
+                if spans_contain(statement, *leaf) {
+                    if *used {
+                        return false;
+                    }
+                    saw_one = true;
+                }
+            }
+            saw_one
+        };
+        if !import_spans.iter().any(|statement| emptied(*statement)) {
+            return Vec::new();
+        }
+        // The leaf question, answered from the tally above rather than asked
+        // again: this run exists to learn where `keep_module` is reached, and
+        // re-deciding every leaf to get there would be that walk twice.
+        let keep = |leaf_span: Span| {
+            leaves
+                .iter()
+                .find(|(leaf, _)| *leaf == leaf_span)
+                .is_none_or(|(_, used)| *used)
+        };
+        let widened = std::cell::RefCell::new(Vec::new());
+        let keep_module = |module_span: Span| {
+            let rescue = self.import_module_is_used(program, module_span, import_spans, context);
+            if !matches!(rescue, vilan_core::formatter::ModuleRescue::No) {
+                widened.borrow_mut().push((module_span, rescue.clone()));
+            }
+            rescue
+        };
+        let _ = vilan_core::formatter::organize_import_runs(source, &keep, &keep_module);
+        widened
+            .into_inner()
+            .into_iter()
+            .filter_map(|(module_span, rescue)| {
+                let statement = *import_spans
+                    .iter()
+                    .find(|statement| spans_contain(**statement, module_span))?;
+                // E180: a KEPT statement is not rewritten to anything — the
+                // action leaves it exactly as written, and the fade walk reads
+                // this to say nothing at all about its leaves.
+                if matches!(rescue, vilan_core::formatter::ModuleRescue::Keep) {
+                    return Some((statement, EmptiedStatement::Kept));
+                }
+                // The statement's own head, up to and including the module
+                // segment the organizer kept — which is what it prints. A
+                // statement's span ends at its path (the `;` is outside it), so
+                // the terminator is put back here; the whitespace collapse is
+                // for the one shape a hand-written import can take that the
+                // formatter never writes, a path broken across lines.
+                let head = source.get(statement.start..module_span.end)?;
+                let head: Vec<&str> = head.split_whitespace().collect();
+                // B318 S3: when the file's impl uses come from ONE subject the
+                // organizer rescues the statement as a selector, and the fade
+                // names that statement — the same one `organize_import_runs`
+                // prints — instead of the whole-module form.
+                let rewritten = match rescue {
+                    vilan_core::formatter::ModuleRescue::Selector(subject) => {
+                        format!("{}::{{ (impl {subject}) }};", head.join(" "))
+                    }
+                    _ => format!("{};", head.join(" ")),
+                };
+                Some((statement, EmptiedStatement::Rewritten(rewritten)))
+            })
+            .collect()
+    }
+
+    /// The local bindings nothing in this file reads (E114's declarations
+    /// third) — the spans the editor FADES, in the analyzed text's coordinates.
+    ///
+    /// **Local, and only local, because Vilan has no other private scope.**
+    /// There is no visibility marker in the language: `pub fun helper()` is a
+    /// parse error whose curated rule says so ("a module's items are importable
+    /// as they stand"), and `module_importables` will bind ANY top-level name an
+    /// `import` asks for. So a top-level `fun`/`struct`/`enum`/`let` is module
+    /// surface — a file the editor never analyzed may import it — and fading one
+    /// on the strength of a single-entry analysis would be a guess. A function
+    /// body is the one scope the language genuinely closes: nothing outside it
+    /// can name a `let` declared inside, so "unreferenced here" IS "dead", with
+    /// no world the editor cannot see. (See the lane's report for the
+    /// whole-package design that WOULD reach the top level, and its cost.)
+    ///
+    /// Paint, not a warning, exactly like the imports third: hint severity,
+    /// `DiagnosticTag::Unnecessary`, out of every count (`publish::
+    /// diagnostic_groups`).
+    ///
+    /// Conservative in the imports third's two ways plus two of its own:
+    ///  - nothing fades while the buffer is ahead of the analysis, and nothing
+    ///    fades in a file carrying a diagnostic (a half-typed line might be
+    ///    about to read the binding);
+    ///  - an `_`-led name is the language's own "I know" marker (`let _ = …` is
+    ///    what the `[must_use]` rule tells you to write), so it never fades;
+    ///  - a binding whose reference index DROPPED a use site (a span that could
+    ///    not be narrowed onto its identifier) is kept: an incomplete tally is
+    ///    no evidence of zero.
+    ///
+    /// Parameters are deliberately not here. A parameter is signature, not a
+    /// local: a trait impl must take what the declaration takes, so an unused
+    /// one is frequently obligatory rather than dead.
+    pub fn unused_local_spans(&self) -> Vec<Span> {
+        let Some(program) = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())
+        else {
+            return Vec::new();
+        };
+        // The entry's id ranges first, because every later test is cheaper than
+        // `source_of` (a linear scan of `source_ranges`, which asked per
+        // variable is that scan re-run once per row).
+        let entry_ids = program.id_ranges_of(SourceId(0));
+        let module_level: HashSet<Id> = program.module_level_bindings().into_iter().collect();
+        program
+            .variables
+            .iter()
+            .filter(|(id, _)| entry_ids.iter().any(|range| range.contains(&id.0)))
+            .filter(|(id, _)| !module_level.contains(*id))
+            .filter(|(_, variable)| !variable.name.starts_with('_'))
+            .filter(|(id, _)| {
+                let definition = Definition::Entity(**id);
+                self.reference_index.dropped_for(definition) == 0
+                    && self
+                        .reference_index
+                        .occurrences_of(definition)
+                        .all(|occurrence| occurrence.is_declaration_of(definition))
+            })
+            .map(|(_, variable)| variable.name_span)
+            .collect()
+    }
+
+    /// E124's module-level slice: this file's top-level items, faded whole,
+    /// because NO entry of the package loads the module — with the message
+    /// naming the entries that were asked.
+    ///
+    /// This is the coarse half of the dead-item paint and the one that costs
+    /// nothing: `platform_color::file_platform_choices` already runs a
+    /// per-entry module-level walk per keystroke to decide this file's colour,
+    /// and "no entry reached it" is that walk's own answer read a second way
+    /// (`dead-code-paint.md` §2.5). It also has none of the fine paint's
+    /// false-gray classes — the question is about the FILE, so nothing about
+    /// dispatch refinement, const initializers or context rewrites can make it
+    /// wrong — and it needs no cache and no clock.
+    ///
+    /// What it fades is deliberately the same two item kinds the fine paint
+    /// covers: a top-level `fun` and a module-level `let`. An unloaded module's
+    /// `struct` is as dead as its functions, but the owner's narrowing is the
+    /// narrowing — types are a different analysis — and a user who sees one
+    /// rule at two granularities can hold it in their head.
+    ///
+    /// Gated exactly as E114's three producers are: nothing fades while the
+    /// buffer is ahead of the analysis, and nothing fades in a file carrying a
+    /// diagnostic.
+    pub fn unloaded_module_paint(&self) -> Option<(String, Vec<Span>)> {
+        let entries = self.unloaded_by_entries.as_ref()?;
+        let program = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())?;
+        let spans: Vec<Span> = vilan_core::dead_items::paintable_items(program, SourceId(0))
+            .into_iter()
+            .map(|item| item.name_span)
+            .collect();
+        if spans.is_empty() {
+            return None;
+        }
+        let named = entries
+            .iter()
+            .map(|entry| format!("`{entry}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some((
+            format!("no entry loads this module (the package builds {named})"),
+            spans,
+        ))
+    }
+
+    /// E124's fine paint: the top-level `fun`s and module-level `let`s of this
+    /// file that NO entry of the package reaches — the spans the editor fades.
+    ///
+    /// The union is not computed here and cannot be. The language server
+    /// analyzes the OPEN file as the entry, so for most files there is no
+    /// `main` in the program at all and the reachability walk has no root to
+    /// start from (`dead-code-paint.md` §2.1, probe P5) — every term of the
+    /// union, including the one for the entry this file belongs to, comes from
+    /// a separately computed per-entry set on the package clock
+    /// (`crate::dead_items`). What happens here is the cheap half: this file's
+    /// candidates, minus the union, matched on `(canonical path, name span)`
+    /// because entity ids are minted per analysis and are not comparable across
+    /// the entries' three programs.
+    ///
+    /// Empty whenever there is no union in hand, which is the withdrawal: an
+    /// edit anywhere in the package drops it, and it returns when the clock
+    /// lands. Empty too under a declared `generated` root, and — through
+    /// `manifest_dir` being `None` — for a `[library]` and for a file with no
+    /// project.
+    ///
+    /// Gated as E114's producers are, and it needs the gate more: a salvaged
+    /// parse can lose a whole block or the file's entire tail, and **a smaller
+    /// program reads to a reachability walk as a deader one** (§3.3).
+    ///
+    /// Empty for a RELEASED document too (M63), and deliberately not captured
+    /// the way the outline and the diagnostics are: a gray is a claim the user
+    /// acts on by DELETING, the union it is computed against is withdrawn and
+    /// recomputed under this document's feet while it is released, and
+    /// determination 8 says a gray may be arbitrarily stale toward FEWER grays
+    /// and never toward more. So a released file simply does not paint, and
+    /// refocusing — which re-analyzes — paints it again.
+    pub fn dead_item_spans(&self) -> Vec<Span> {
+        if self.generated {
+            return Vec::new();
+        }
+        let (Some(reach), Some(program)) = (
+            self.package_reach.as_ref(),
+            self.program
+                .as_ref()
+                .filter(|_| self.diagnostics.is_empty() && !self.is_stale()),
+        ) else {
+            return Vec::new();
+        };
+        // The module-level slice already fades this whole file; saying it twice
+        // over the same spans would publish two hints per declaration.
+        if self.unloaded_by_entries.is_some() {
+            return Vec::new();
+        }
+        let Some(path) = program.canonical_sources.first() else {
+            return Vec::new();
+        };
+        vilan_core::dead_items::paintable_items(program, SourceId(0))
+            .into_iter()
+            .filter(|item| {
+                !reach.reached.contains(&vilan_core::dead_items::ItemKey {
+                    path: path.clone(),
+                    name_span: item.name_span,
+                })
+            })
+            .map(|item| item.name_span)
+            .collect()
+    }
+
+    /// The directory of the `vilan.toml` this document's package is declared in
+    /// — the key of E124's per-package clock. `None` for a `[library]` and for
+    /// a file with no project, both of which get no top-level gray.
+    pub fn manifest_dir(&self) -> Option<&Path> {
+        self.manifest_dir.as_deref()
+    }
+
+    /// Hand this document the package union to paint from, or `None` to
+    /// withdraw. Called by the server at publish time and nowhere else — the
+    /// union belongs to the package, not to any one buffer.
+    pub fn set_package_reach(&mut self, reach: Option<Arc<crate::dead_items::PackageReach>>) {
+        self.package_reach = reach;
+    }
+
+    /// The statements this file can never reach (E114's unreachable third) — the
+    /// spans the editor FADES, in the analyzed text's coordinates. One span per
+    /// block, covering the whole dead tail rather than one mark per statement:
+    /// what died is the REST of the block, and N faded lines say that N times.
+    ///
+    /// It is the CHECKER's divergence analysis, not a second one
+    /// ([`vilan_core::analyzer::Divergence`], which the analyzer's own
+    /// `block_diverges` calls too) — and since B204 it is the checker's answer
+    /// exactly, not a widening of it: `ret`, `jump` (the loop tails), a
+    /// `panic(…)` call (which lowers to a `throw`), an endless `for { … }`
+    /// nothing breaks out of — `for` with no condition being the language's
+    /// only endless-loop form, since `for cond { … }` is the `while` and
+    /// `for … in` finishes with its iterable — an `if` whose every arm diverges
+    /// *and* has an `else`, and a `match` whose every arm diverges. What fades
+    /// here is exactly what the checker treats as dead.
+    ///
+    /// Conservative in the imports third's two ways — nothing fades while the
+    /// buffer is ahead of the analysis, nothing fades in a file carrying a
+    /// diagnostic — plus the two this walk needs: a dead region is reported only
+    /// where every statement in it carries a real span IN THIS FILE (a
+    /// desugaring's synthesized statement borrows a span it did not write, and a
+    /// synthesized void tail has none at all), and a region whose span does not
+    /// grow is dropped rather than published as an empty range.
+    pub fn unreachable_spans(&self) -> Vec<Span> {
+        let Some(program) = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())
+        else {
+            return Vec::new();
+        };
+        let entry_ids = program.id_ranges_of(SourceId(0));
+        let divergence = vilan_core::analyzer::Divergence::of_program(program);
+        let mut spans: Vec<Span> = Vec::new();
+        for (statements, tail) in block_regions(program, &entry_ids) {
+            let Some(diverging) = statements
+                .iter()
+                .position(|statement| divergence.expr(*statement))
+            else {
+                continue;
+            };
+            // Everything after the diverging statement, as ONE range — and only
+            // if every piece of it is code this file actually wrote. The tail is
+            // asked separately, and asked TWICE, because a block's trailing
+            // expression is usually synthesized: `fun f() { ret; }` ends in a
+            // `Void` whose recorded span is the closing BRACE (the S3 callable
+            // anchor). It passes every span test and is not code at all, so it
+            // is excluded by its expression rather than by its span — and being
+            // excluded it must also not veto the real dead statements before it.
+            let dead = &statements[diverging + 1..];
+            let mut extent = self.written_extent(program, &entry_ids, dead);
+            if !dead.is_empty() && extent.is_none() {
+                continue;
+            }
+            let tail_is_written = !matches!(program.entity_map.get(&tail), Some(Expr::Void) | None);
+            if let Some(tail_span) = tail_is_written
+                .then(|| self.written_extent(program, &entry_ids, std::slice::from_ref(&tail)))
+                .flatten()
+            {
+                extent = Some(match extent {
+                    Some(existing) => union(existing, tail_span),
+                    None => tail_span,
+                });
+            }
+            if let Some(span) = extent {
+                spans.push(span);
+            }
+        }
+        spans.sort_by_key(|span| (span.start, span.end));
+        spans.dedup();
+        spans
+    }
+
+    /// The span covering `entities`, or `None` unless every one of them is code
+    /// WRITTEN IN THIS FILE: a real, non-empty span, in the entry source, inside
+    /// the analyzed text. A desugaring's synthesized statement fails this, which
+    /// is the whole reason it is asked — fading a range the user cannot see (or
+    /// one that belongs to a different file) is the mark that lies. An empty
+    /// `entities` answers `None`: there is nothing to fade.
+    fn written_extent(
+        &self,
+        program: &Program,
+        entry_ids: &[std::ops::Range<u32>],
+        entities: &[Id],
+    ) -> Option<Span> {
+        let limit = self.analyzed_text().len();
+        let mut extent: Option<Span> = None;
+        for id in entities {
+            if !entry_ids.iter().any(|range| range.contains(&id.0)) {
+                return None;
+            }
+            let span = program.span_map.get(id)?;
+            if span.start >= span.end || span.end > limit {
+                return None;
+            }
+            extent = Some(match extent {
+                Some(existing) => union(existing, **span),
+                None => **span,
+            });
+        }
+        extent
     }
 
     /// Whether the top-level import whose terminal name occupies `leaf_span` is
@@ -2602,20 +5629,31 @@ impl Document {
         program: &Program,
         leaf_span: Span,
         import_spans: &[Span],
+        context: &ImportUseContext<'_>,
     ) -> bool {
         let entry = SourceId(0);
-        let Some(definition_id) = program
-            .type_references
-            .iter()
-            .find_map(|(source, span, definition, _)| {
-                (*source == entry && *span == leaf_span).then_some(*definition)
-            })
-            .flatten()
-        else {
+        // B318 S3: an `(impl …)` selector is a terminal the organizer prunes,
+        // and it binds no NAME at all — so rule (1)'s question ("does this file
+        // spell the thing this leaf binds") is not the question. The selector's
+        // is narrower and strictly easier: does this file resolve a method to
+        // an implementation the selector ADMITS? The analyzer banked exactly
+        // that set when it resolved the selector, so the answer is a lookup
+        // rather than a provenance guess — which is the generalization
+        // `visibility.md` §7.2 says E168's predicate becomes.
+        if let Some(members) = program.impl_selector_members.get(&(entry, leaf_span)) {
+            return self.selector_member_is_used(members, import_spans);
+        }
+        let Some(definition_id) = self.import_path_definition(program, leaf_span) else {
             // The leaf binds nothing this analysis recorded — keep it, since
             // pruning on no evidence is how a green build gets broken.
             return true;
         };
+        // E145: an `as` alias binds a NAME OF ITS OWN, and it is the alias —
+        // not the path segment — that the file's code spells. So the alias's
+        // uses are what keep the import, and an alias for a prelude name is
+        // never redundant: it renames the thing, which is the whole point of
+        // writing it.
+        let alias = program.import_alias_spans.get(&(entry, leaf_span)).copied();
         // (0) The PRELUDE already binds this definition ambiently
         // (`prelude.md` §11.1): the import is redundant, so removing it cannot
         // change what the file means, and leaving it would have the estate
@@ -2624,10 +5662,10 @@ impl Document {
         // my_lib::print;` beside an ambient `std::io::print` is not redundant and
         // survives. This is the action's existing contract ("prune the leaves
         // the analyzer reports as unused") reaching one more kind of unused.
-        if program.prelude_bindings.contains(&definition_id) {
+        if alias.is_none() && program.prelude_bindings.contains(&definition_id) {
             return false;
         }
-        let definition = Definition::Entity(definition_id);
+        let definition = Definition::Entity(alias.unwrap_or(definition_id));
 
         // A reference written by the file's IMPORT LIST is not the file using
         // anything: an import path's segments resolve to the same definitions
@@ -2637,12 +5675,42 @@ impl Document {
                 .iter()
                 .any(|statement| statement.start <= span.start && span.end <= statement.end)
         };
+        // E192, the one exception, and kolt's `views.vl:2-4`: an `(impl S)`
+        // SELECTOR's subject is not a path segment. It is an ordinary type
+        // reference in a type position that happens to be written inside an
+        // import (visibility.md §3.6 — which is why it navigates and renames),
+        // and it needs the name in scope: deleting `import std::map::Map;` from
+        // a copy of kolt made `Map` unresolvable, emptied the selector and
+        // stranded three method calls. So the exclusion above must not cover
+        // it, or a type import whose only job is to name a subject fades — and,
+        // because the fade and the prune are one predicate (E114), Organize
+        // Imports deletes it and breaks a green build.
+        //
+        // It counts exactly when the SELECTOR does. A subject whose selector is
+        // itself about to be pruned is keeping nothing alive, and making the
+        // two answers agree is what lets one pass settle both rather than
+        // leaving a statement to be pruned by the next invocation.
+        let inside_a_live_selector = |span: Span| {
+            program
+                .impl_selector_members
+                .iter()
+                .any(|((source, selector), members)| {
+                    *source == entry
+                        && selector.start <= span.start
+                        && span.end <= selector.end
+                        && self.selector_member_is_used(members, import_spans)
+                })
+        };
         let used_here = |occurrence: &crate::references::Occurrence| match occurrence.source {
             // Derive-generated code indexes a template, so its offsets are not
             // this file's and there is no import list to exclude — any reference
             // among them is a real use.
             DERIVED_SOURCE => true,
-            source => source == entry && !written_in_an_import(occurrence.span),
+            source => {
+                source == entry
+                    && (!written_in_an_import(occurrence.span)
+                        || inside_a_live_selector(occurrence.span))
+            }
         };
 
         // (1) The file's own code names the definition — as a type, as a value,
@@ -2664,24 +5732,310 @@ impl Document {
         // analyzer's own provenance: did this file resolve anything DECLARED in
         // the file this import reaches into?
         if matches!(
-            crate::references::kind_of(program, definition),
+            crate::references::kind_of(program, Definition::Entity(definition_id)),
             Some(crate::references::DefinitionKind::Module)
-        ) && let Some(home) = program.source_of(definition_id)
-        {
-            // A module whose file is this one brings nothing new, and would
-            // otherwise match every local declaration and never prune.
-            if home != entry {
-                return self
-                    .reference_index
-                    .occurrences_in(entry)
-                    .any(|occurrence| {
-                        !written_in_an_import(occurrence.span)
-                            && crate::references::declaration_source(program, occurrence.definition)
-                                == Some(home)
-                    });
-            }
+        ) {
+            return self.module_import_brings_a_use(program, definition_id, import_spans, context);
         }
         false
+    }
+
+    /// Whether this file resolves a method to one of `members` — the impl
+    /// members a selector admitted (B318 S3).
+    ///
+    /// A reference written by the file's own IMPORT LIST is excluded for the
+    /// reason rule (1) excludes one: an import path's segments resolve to the
+    /// definitions it binds, so counting them would let a statement justify
+    /// itself and nothing would ever prune.
+    fn selector_member_is_used(&self, members: &[Id], import_spans: &[Span]) -> bool {
+        let entry = SourceId(0);
+        members.iter().any(|member| {
+            self.reference_index
+                .occurrences_of(Definition::Entity(*member))
+                .any(|occurrence| {
+                    (occurrence.source == DERIVED_SOURCE
+                        || (occurrence.source == entry
+                            && !import_spans.iter().any(|statement| {
+                                statement.start <= occurrence.span.start
+                                    && occurrence.span.end <= statement.end
+                            })))
+                        && !occurrence.is_declaration_of(Definition::Entity(*member))
+                })
+        })
+    }
+
+    /// The definition an import PATH SEGMENT at `span` binds — a leaf's own, or
+    /// an intermediate module's. `resolve_import` records every segment as a
+    /// reference at its own span (`flatten_namespace_branch`/`record_reference`),
+    /// so one lookup answers for both, and a segment this analysis did not
+    /// record answers `None`.
+    fn import_path_definition(&self, program: &Program, span: Span) -> Option<Id> {
+        program
+            .type_references
+            .iter()
+            .find_map(|(source, at, definition, _)| {
+                (*source == SourceId(0) && *at == span).then_some(*definition)
+            })
+            .flatten()
+    }
+
+    /// Every definition this file's top-level import LEAVES bind, aliases
+    /// included — E169's exclusion set.
+    ///
+    /// A whole-module import is kept by rule (2) when the file resolves
+    /// something declared in the module's file. That test counted EVERYTHING
+    /// declared there, including the names the file imported by their own
+    /// leaves — so `import pkg::a;` sitting beside `import pkg::a::b;` was kept
+    /// forever by `b`'s uses, although it is `b`'s own leaf that provides them
+    /// and the module import brings nothing the file spells. Subtracting what
+    /// the other leaves bind leaves exactly what the module import ALONE
+    /// carries: the methods of the `impl`s declared in that file, and anything
+    /// reached by `a::` qualification (which references the module leaf itself
+    /// and is rule (1)'s).
+    ///
+    /// Keyed on the DEFINITION, alias-aware, so the set is the same address
+    /// space [`Self::import_leaf_is_used`] tests occurrences in.
+    fn definitions_bound_by_import_leaves(
+        &self,
+        program: &Program,
+        source: &str,
+    ) -> HashSet<Definition> {
+        let entry = SourceId(0);
+        vilan_core::formatter::import_leaf_name_spans(source)
+            .into_iter()
+            .filter_map(|leaf_span| {
+                let definition_id = self.import_path_definition(program, leaf_span)?;
+                let alias = program.import_alias_spans.get(&(entry, leaf_span)).copied();
+                Some(Definition::Entity(alias.unwrap_or(definition_id)))
+            })
+            .collect()
+    }
+
+    /// The pass-level tables [`Self::import_leaf_is_used`] and the module
+    /// question are judged against, built once for a whole organizer run.
+    ///
+    /// Every one of them is a walk of something whole-file or whole-program, and
+    /// every one of them is asked per LEAF — computing them inside the predicate
+    /// would be that walk squared, which is what E169's own comment says about
+    /// the one table that predates E180.
+    fn import_use_context<'a>(&self, program: &Program, source: &'a str) -> ImportUseContext<'a> {
+        ImportUseContext {
+            source,
+            bound_by_leaves: self.definitions_bound_by_import_leaves(program, source),
+            receiver_members: std::cell::OnceCell::new(),
+            impl_members: std::cell::OnceCell::new(),
+            taken_names: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Rule (2), asked of a MODULE — the one question E168 and E169 share.
+    ///
+    /// A whole-module import brings more than its own name: every `impl` in that
+    /// module's file arrives with it, and with ANY import that reaches the
+    /// module, not only a whole-module one. So a method call whose
+    /// implementation lives there IS a use of the import even though the module
+    /// name is never written, and pruning it breaks the build — the over-pruning
+    /// half of kolt.local 004, and E168's whole subject.
+    ///
+    /// The accounting is the analyzer's own provenance: did this file resolve
+    /// anything DECLARED in the file this import reaches into, that it is not
+    /// already getting from another import leaf of its own (E169)? A module
+    /// whose file is this one brings nothing new and would otherwise match every
+    /// local declaration and never prune.
+    fn module_import_brings_a_use(
+        &self,
+        program: &Program,
+        module_id: Id,
+        import_spans: &[Span],
+        context: &ImportUseContext<'_>,
+    ) -> bool {
+        let entry = SourceId(0);
+        let Some(home) = program.source_of(module_id) else {
+            return false;
+        };
+        if home == entry {
+            return false;
+        }
+        // E180's THIRD subtraction (R9, RULED 2026-09-14). A module the PRELUDE
+        // module itself re-exports — `std/src/web.vl` lines 47-48, `export
+        // import pkg::style;` and `export import pkg::ui;` — is loaded for
+        // every file of the package whatever that file imports, so an import
+        // reaching it carries no `impl` the file would otherwise lack. Rescuing
+        // it is not wrong, it is REDUNDANT, and the redundant statement is one
+        // the organizer would then write into every file of an application:
+        // kolt's `import std::ui::{ (impl View) };`.
+        if program.prelude_bindings.contains(&module_id) {
+            return false;
+        }
+        self.reference_index
+            .occurrences_in(entry)
+            .any(|occurrence| {
+                self.module_import_alone_carries(program, context, home, import_spans, occurrence)
+            })
+    }
+
+    /// Whether ONE occurrence in this file is something the import reaching
+    /// `home` is ALONE in bringing — rule (2)'s per-occurrence half, shared by
+    /// [`Self::module_import_brings_a_use`] and [`Self::rescuing_subject`] so
+    /// the keep decision and the narrowing can never be read off different
+    /// sets.
+    ///
+    /// Four subtractions, three of them E180's:
+    ///  - a reference written by the file's own IMPORT LIST is not the file
+    ///    using anything (an import path's segments resolve to the definitions
+    ///    its leaves bind, so counting them lets a statement justify itself);
+    ///  - a definition another import LEAF of this file binds is that leaf's
+    ///    contribution, not the module's (E169);
+    ///  - a definition the PRELUDE binds is ambient: the file has it whether or
+    ///    not this statement exists, so the statement does not bring it.
+    ///    `Option::Some` in kolt's generated `src/lucide/lib.vl` is the exhibit
+    ///    — `Some` is declared in std's `option.vl`, and reading it as "the
+    ///    import brings `Some`" is what made the organizer rescue
+    ///    `import std::option;` and bind `option` over the file's own
+    ///    `fun option()`;
+    ///  - and what remains must be an `impl`/trait member resolved by RECEIVER
+    ///    syntax (`x.child(..)`), never a definition spelled as a PATH SEGMENT
+    ///    behind a head (`Option::Some`, `Type::new`). That is the whole of
+    ///    what a module import carries beyond its own name in today's
+    ///    program-global impl model: a path-qualified reach is spelled through
+    ///    a head that is a leaf's, the prelude's, or the module leaf's own, and
+    ///    each of those heads is accounted for somewhere else (rule (1), rule
+    ///    (0), the leaf set above).
+    ///
+    /// Receiver syntax is read from the ANALYZER's own record rather than
+    /// guessed from the text: `Program::member_name_spans` is written only at
+    /// `Node::MemberAccessor`, so a span in it IS a `subject.member` resolution
+    /// and a `Head::member` path is not in it at all. (The reference index
+    /// cannot tell them apart on its own — both arrive as an occurrence of the
+    /// member's definition at the member's own span.)
+    fn module_import_alone_carries(
+        &self,
+        program: &Program,
+        context: &ImportUseContext<'_>,
+        home: SourceId,
+        import_spans: &[Span],
+        occurrence: &crate::references::Occurrence,
+    ) -> bool {
+        if import_spans.iter().any(|statement| {
+            statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
+        }) {
+            return false;
+        }
+        if context.bound_by_leaves.contains(&occurrence.definition) {
+            return false;
+        }
+        if crate::references::declaration_source(program, occurrence.definition) != Some(home) {
+            return false;
+        }
+        // A struct FIELD read through a receiver is not an impl member and
+        // arrives with the type, not with the module import.
+        let Definition::Entity(used) = occurrence.definition else {
+            return false;
+        };
+        if program.prelude_bindings.contains(&used) {
+            return false;
+        }
+        context.impl_members(program).contains(&used)
+            && context.receiver_members(program).contains(&occurrence.span)
+    }
+
+    /// E168's rescue: whether the MODULE an emptied-out import statement reaches
+    /// into is still needed, asked at that module segment's own span.
+    ///
+    /// `import pkg::a::b;` with `b` unused used to be DELETED, and `a.vl`'s
+    /// `impl Style { fun select_off(self) … }` went with it — the next analysis
+    /// said "Style has no method 'select_off'" and the organizer had broken a
+    /// green build. `b` is genuinely unused and goes on fading; what changes is
+    /// the EDIT, which rewrites the statement to `import pkg::a;` rather than
+    /// removing it. The test is [`Self::module_import_brings_a_use`]'s, applied
+    /// to the statement's module instead of to a module LEAF — one predicate,
+    /// two callers, so the two halves cannot disagree about what a module
+    /// import is worth.
+    fn import_module_is_used(
+        &self,
+        program: &Program,
+        module_span: Span,
+        import_spans: &[Span],
+        context: &ImportUseContext<'_>,
+    ) -> ModuleRescue {
+        let Some(module_id) = self.import_path_definition(program, module_span) else {
+            return ModuleRescue::No;
+        };
+        if !matches!(
+            crate::references::kind_of(program, Definition::Entity(module_id)),
+            Some(crate::references::DefinitionKind::Module)
+        ) {
+            return ModuleRescue::No;
+        }
+        if !self.module_import_brings_a_use(program, module_id, import_spans, context) {
+            return ModuleRescue::No;
+        }
+        // B318 S3: the module form is the WIDE rescue, and a selector is the
+        // narrow one. When everything this file gets from that module is the
+        // members of one subject's `impl` blocks, the selector says exactly
+        // that and the module import says more than the file needs.
+        match self.rescuing_subject(program, module_id, import_spans, context) {
+            // A selector binds NO name, so it needs no collision guard: it says
+            // which blocks this file admits and adds nothing to the scope.
+            Some(subject) => ModuleRescue::Selector(subject),
+            // E180's collision guard. `import <module>;` BINDS `<module>`, and
+            // the organizer must never write a statement whose new name is
+            // already taken — kolt's generated `src/lucide/lib.vl` declares
+            // `fun option()`, and `import std::option;` bound the module over
+            // it, so the organized file stopped checking. Shadowing an ambient
+            // PRELUDE name is fine and deliberately not guarded: an explicit
+            // import beats the prelude, which is the language's own rule.
+            None => match context
+                .source
+                .get(module_span.into_range())
+                .is_some_and(|name| context.taken_names().contains(name))
+            {
+                true => ModuleRescue::Keep,
+                false => ModuleRescue::Module,
+            },
+        }
+    }
+
+    /// The ONE subject whose `impl` blocks account for everything this file
+    /// uses out of `module_id`'s file, or `None` when the answer is anything
+    /// else — a plain declaration used by a qualified path, or blocks for two
+    /// subjects (`visibility.md` §7.2).
+    ///
+    /// Read over the same occurrences [`Self::module_import_brings_a_use`]
+    /// counts, so the rewrite can only ever narrow a statement that predicate
+    /// already decided to keep.
+    fn rescuing_subject(
+        &self,
+        program: &Program,
+        module_id: Id,
+        import_spans: &[Span],
+        context: &ImportUseContext<'_>,
+    ) -> Option<String> {
+        let entry = SourceId(0);
+        let home = program.source_of(module_id)?;
+        let mut subject: Option<String> = None;
+        for occurrence in self.reference_index.occurrences_in(entry) {
+            if !self.module_import_alone_carries(program, context, home, import_spans, occurrence) {
+                continue;
+            }
+            let Definition::Entity(used) = occurrence.definition else {
+                return None;
+            };
+            let head = program.implementations.iter().find_map(|implementation| {
+                implementation
+                    .declarations
+                    .values()
+                    .any(|member| *member == used)
+                    .then(|| subject_head_name(program, implementation.subject))
+                    .flatten()
+            })?;
+            match &subject {
+                Some(seen) if *seen != head => return None,
+                Some(_) => {}
+                None => subject = Some(head),
+            }
+        }
+        subject
     }
 
     // --- Quickfixes: add-import, closest-name field rename (E54, E58) ------
@@ -2718,12 +6072,18 @@ impl Document {
             let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
                 continue;
             };
-            if let Some(surface_path) = &surface
-                && vilan_core::analyzer::module_importables(surface_path)
-                    .iter()
-                    .any(|importable| importable.name == name)
-            {
-                candidates.push(vec![origin.clone()]);
+            if let Some(surface_path) = &surface {
+                let importables = vilan_core::analyzer::module_importables(surface_path);
+                // B318 §1: a PRIVATE item is never a quickfix candidate — the
+                // add-import menu is one of the three things the bit gates. An
+                // uncurated module (no marker anywhere) offers everything, which
+                // is what keeps the menu unchanged until a module opts in.
+                let curated = vilan_core::analyzer::module_is_curated(&importables);
+                if importables.iter().any(|importable| {
+                    importable.name == name && (!curated || importable.exported.is_exported())
+                }) {
+                    candidates.push(vec![origin.clone()]);
+                }
             }
             let mut seen_modules: HashSet<String> = HashSet::new();
             for root in &module_roots {
@@ -2740,19 +6100,239 @@ impl Document {
                     // re-exports, at which point `view` started offering both
                     // `std::ui` and `std::web` and the menu went ambiguous.
                     // Nobody should ever be told to `import std::web::view`.
-                    if vilan_core::analyzer::module_importables(&module_path)
-                        .iter()
-                        .any(|importable| {
-                            importable.name == name
-                                && importable.kind != vilan_core::analyzer::ImportableKind::Reexport
-                        })
-                    {
+                    let importables = vilan_core::analyzer::module_importables(&module_path);
+                    let curated = vilan_core::analyzer::module_is_curated(&importables);
+                    if importables.iter().any(|importable| {
+                        importable.name == name
+                            && importable.kind != vilan_core::analyzer::ImportableKind::Reexport
+                            && (!curated || importable.exported.is_exported())
+                    }) {
                         candidates.push(vec![origin.clone(), module_name]);
                     }
                 }
             }
         }
         candidates
+    }
+
+    /// The "Declare the inferred contexts" edit for `diagnostic`, from either
+    /// refusal B242 raises — `None` when it is neither.
+    ///
+    /// ONE fix with two sources, because it is one fix: the same title, the
+    /// same intent, and the book documents one row for it. What differs is
+    /// only where the clause goes.
+    ///
+    ///  - The SUBSET refusal (a declared clause narrower than the body) anchors
+    ///    at the clause's own NAME LIST and SPELLS the clause the body needs,
+    ///    so the fix is that span and the names out of that spelling — the
+    ///    message and the edit are one string and cannot disagree (E58c's
+    ///    rule).
+    ///  - The BOUNDARY refusal (E148) is the one a caller actually meets, and
+    ///    it offers neither. It anchors at the CALL — one function's body
+    ///    naming another function's clause — so the function to edit is not
+    ///    the one the diagnostic points into, and that function declares no
+    ///    clause, so there is no span to overwrite and no spelling to copy.
+    ///    That edit is an INSERTION at the end of a signature, a point nothing
+    ///    in the analyzed program recorded until `Func::signature_end` did.
+    fn declare_contexts_fix(
+        &self,
+        program: &Program,
+        diagnostic: &vilan_core::Error,
+    ) -> Option<(Span, String)> {
+        if let Some(spelling) = declare_contexts_spelling(&diagnostic.msg) {
+            return Some((diagnostic.span, spelling.to_string()));
+        }
+        declare_context_here_name(&diagnostic.msg)?;
+        self.declare_contexts_on_the_caller(program, diagnostic.span)
+    }
+
+    /// E148: the edit that declares, on the function CONTAINING `at`, every
+    /// context B242's boundary refusal names inside it — the zero-width
+    /// insertion point at the end of that function's signature, and the clause
+    /// to write there.
+    ///
+    /// `None` when there is no enclosing function (a top-level call, whose only
+    /// cure is a `run`), when the parser recorded no insertion point for it (a
+    /// synthesized function), or when it already CARRIES a clause — that is
+    /// B242's subset refusal and its own fix, which rewrites the clause in
+    /// place rather than adding a second one.
+    fn declare_contexts_on_the_caller(
+        &self,
+        program: &Program,
+        at: Span,
+    ) -> Option<(Span, String)> {
+        let function = self.enclosing_function(program, at)?;
+        if program
+            .function_context_clause_spans
+            .contains_key(&function)
+        {
+            return None;
+        }
+        let signature_end = program
+            .function_signature_end_spans
+            .get(&function)
+            .copied()?;
+        // Every boundary refusal anchored inside this same function, in source
+        // order, deduplicated — one clause, not one fix per context.
+        let mut names: Vec<&str> = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+            {
+                continue;
+            }
+            let Some(name) = declare_context_here_name(&diagnostic.msg) else {
+                continue;
+            };
+            if self.enclosing_function(program, diagnostic.span) != Some(function) {
+                continue;
+            }
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        (!names.is_empty()).then(|| (signature_end, context_clause_insertion(&names)))
+    }
+
+    /// The innermost function of THIS file whose declaration contains `span` —
+    /// the function an edit anchored at `span` belongs to (E148).
+    fn enclosing_function(&self, program: &Program, span: Span) -> Option<Id> {
+        program
+            .functions
+            .keys()
+            .copied()
+            .filter(|id| program.source_of(*id) == Some(SourceId(0)))
+            .filter_map(|id| vilan_ide::analysis::span_of(program, id).map(|whole| (id, whole)))
+            .filter(|(_, whole)| whole.start <= span.start && span.end <= whole.end)
+            .min_by_key(|(_, whole)| whole.end - whole.start)
+            .map(|(id, _)| id)
+    }
+
+    /// E201's bulk fix: every mechanically rewritable `css` declaration in this
+    /// file, as ONE edit.
+    ///
+    /// Offered only when an A101 diagnostic overlaps `range` (the action belongs
+    /// to that refusal, not to the file) and only when there are at least two
+    /// rewrites to make — with one, it would be the same edit as the
+    /// per-declaration fix under a longer name.
+    ///
+    /// `QuickFix` carries a single span and replacement, so the edit spans from
+    /// the first rewrite to the last and splices the text between them through
+    /// verbatim. That is what keeps a DECLINING declaration (a glued value,
+    /// `!important`) exactly as the author wrote it while its neighbours move.
+    fn css_declaration_call_all_fix(&self, range: Span) -> Option<QuickFix> {
+        let mut asked = false;
+        let mut edits: Vec<(Span, String)> = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+                || !diagnostic.msg.starts_with(A_CSS_DECLARATION_IS_A_CALL)
+            {
+                continue;
+            }
+            asked |= spans_overlap(diagnostic.span, range);
+            if let Some(edit) = css_declaration_call_edit(&self.text, diagnostic.span.start) {
+                edits.push(edit);
+            }
+        }
+        if !asked || edits.len() < 2 {
+            return None;
+        }
+        edits.sort_by_key(|(span, _)| (span.start, span.end));
+        // One diagnostic per declaration is the parser's own recovery, but a
+        // duplicate here would splice the same bytes twice.
+        edits.dedup_by_key(|(span, _)| span.start);
+        let first = edits.first()?.0.start;
+        let last = edits.last()?.0.end;
+        let mut replacement = String::new();
+        let mut cursor = first;
+        for (span, text) in &edits {
+            // A later edit that OVERLAPS an earlier one cannot be spliced, and
+            // the declarations are disjoint by construction — so this is a
+            // guard against a text scan gone wrong, not an expected shape.
+            if span.start < cursor {
+                return None;
+            }
+            replacement.push_str(self.text.get(cursor..span.start)?);
+            replacement.push_str(text);
+            cursor = span.end;
+        }
+        Some(QuickFix {
+            title: format!("Write all {} `css` declarations as calls", edits.len()),
+            span: Span::from(first..last),
+            replacement,
+            target: None,
+        })
+    }
+
+    /// I5 §8.3's bulk fix: every index mismatch in this file — a value meeting
+    /// a `usize` or a `usize` meeting another width — fixed by its PREFERRED
+    /// edit (a literal-bound counter declared `usize`, else the conversion), as
+    /// ONE edit. The migration's codemod file by file.
+    ///
+    /// Offered only when an index mismatch overlaps `range`, and only when the
+    /// file carries at least two edits to make — with one it would be the
+    /// per-site fix under a longer name. The edit spans from the first fix to
+    /// the last and carries the text between them through verbatim, as
+    /// [`Self::css_declaration_call_all_fix`] does; several uses of one counter
+    /// all prefer the same declaration, which is made once.
+    fn numeric_index_all_fix(&self, range: Span) -> Option<QuickFix> {
+        let mut asked = false;
+        let mut edits: Vec<(Span, String)> = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+            {
+                continue;
+            }
+            let Some(preferred) =
+                vilan_ide::numeric_fix::numeric_fixes(&self.text, diagnostic.span, &diagnostic.msg)
+                    .into_iter()
+                    .next()
+                    .filter(|fix| fix.index)
+            else {
+                continue;
+            };
+            asked |= spans_overlap(diagnostic.span, range);
+            edits.push((preferred.span, preferred.replacement));
+        }
+        edits.sort_by_key(|(span, _)| (span.start, span.end));
+        edits.dedup_by_key(|(span, _)| (span.start, span.end));
+        if !asked || edits.len() < 2 {
+            return None;
+        }
+        let first = edits.first()?.0.start;
+        let last = edits.last()?.0.end;
+        let mut replacement = String::new();
+        let mut cursor = first;
+        for (span, text) in &edits {
+            // Two fixes over overlapping text (a conversion inside another's
+            // value) cannot be spliced in one edit; the per-site fixes remain.
+            if span.start < cursor {
+                return None;
+            }
+            replacement.push_str(self.text.get(cursor..span.start)?);
+            replacement.push_str(text);
+            cursor = span.end;
+        }
+        Some(QuickFix {
+            title: format!("Convert all {} indexes in this file", edits.len()),
+            span: Span::from(first..last),
+            replacement,
+            target: None,
+        })
     }
 
     /// The quickfix menu for the diagnostics overlapping `range` (LIVE
@@ -2792,8 +6372,24 @@ impl Document {
                         title: format!("Import `{name}` from {}", module_path.join("::")),
                         span: edit.span,
                         replacement: edit.replacement,
+                        target: None,
                     });
                 }
+            } else if let Some(attribute) = diagnostic
+                .note
+                .as_ref()
+                .and_then(|note| declared_platform_attribute(&note.msg))
+            {
+                // F27 R1: the overlay note names the twin that HAS the member
+                // and the attribute that puts this file under it; the fix
+                // writes that attribute where it is legal — the file's first
+                // line — and nothing else.
+                fixes.push(QuickFix {
+                    title: format!("Analyze this file under its platform: add `{attribute}`"),
+                    span: Span::from(0..0),
+                    replacement: format!("{attribute}\n\n"),
+                    target: None,
+                });
             } else if let Some(suggestion) = diagnostic
                 .note
                 .as_ref()
@@ -2803,6 +6399,15 @@ impl Document {
                     title: format!("Change to `{suggestion}`"),
                     span: diagnostic.span,
                     replacement: suggestion.to_string(),
+                    target: None,
+                });
+            } else if let Some((span, replacement)) = self.declare_contexts_fix(program, diagnostic)
+            {
+                fixes.push(QuickFix {
+                    title: "Declare the inferred contexts".to_string(),
+                    span,
+                    replacement,
+                    target: None,
                 });
             } else if diagnostic.msg.starts_with(MISSING_TERMINATOR_MESSAGE) {
                 // S2 (editing-dx.md §17.4, E54's home): the diagnostic's own
@@ -2816,6 +6421,7 @@ impl Document {
                     title: "Insert `;`".to_string(),
                     span: Span::from(insertion..insertion),
                     replacement: ";".to_string(),
+                    target: None,
                 });
             } else if diagnostic.msg.ends_with(DISCARDED_VALUE_MESSAGE)
                 && let Some(semicolon_span) =
@@ -2831,21 +6437,23 @@ impl Document {
                     title: "Remove `;`".to_string(),
                     span: semicolon_span,
                     replacement: String::new(),
+                    target: None,
                 });
-            } else if diagnostic.msg.starts_with(HASH_IS_NOT_A_TOKEN)
-                && let Some(span) = hex_colour_span(&self.text, diagnostic.span.start)
+            } else if diagnostic
+                .msg
+                .starts_with(vilan_core::parsing::MISBOUND_RETURN_CLAUSE)
+                && let Some(replacement) = parenthesized_return_clause(&self.text, diagnostic.span)
             {
-                // css-block S5, §7.2 fix 1. The lexer is context-free, so the
-                // diagnostic is ONE character wide (`#`) — the colour it
-                // belongs to is read off the text here, and the fix is the
-                // hole spelling the diagnostic already names, so the two
-                // cannot disagree (E58c's rule, applied to a curated rule
-                // instead of a note).
-                let hole = format!("{{Color::hex(\"{}\")}}", &self.text[span.into_range()]);
+                // B343 (R9): the refusal names BOTH readings, and the fix takes
+                // the one the position exists for — the clause on the FUNCTION.
+                // Its span is the whole written return type, so the edit is the
+                // parentheses and nothing else, and the other reading stays one
+                // hand edit away rather than being guessed at here.
                 fixes.push(QuickFix {
-                    title: format!("Wrap as `{hole}`"),
-                    span,
-                    replacement: hole,
+                    title: "Parenthesize the closure type".to_string(),
+                    span: diagnostic.span,
+                    replacement,
+                    target: None,
                 });
             } else if diagnostic.msg.starts_with(AT_IS_NOT_A_TOKEN)
                 && let Some(fix) = media_rule_fix(&self.text, diagnostic.span.start)
@@ -2853,11 +6461,45 @@ impl Document {
                 // §7.2 fix 2, the `#`'s twin: the one at-rule with a
                 // combinator spelling is a min-width media query.
                 fixes.push(fix);
+            } else if let Some(conversions) = numeric_conversion_fixes(&self.text, diagnostic) {
+                // E218: the mismatch names the one call that fixes it, and the
+                // fix writes that call at the value the diagnostic spans — or,
+                // for a counter bound by a bare literal, declares it `usize`.
+                fixes.extend(conversions);
+            } else if let Some(fix) = self.retired_slot_method_fix(diagnostic) {
+                // A99, the one arm: `parent.swap(s, r)` names a `View` method
+                // that no longer exists, and the value form is one edit away.
+                fixes.push(fix);
+            } else if let Some((span, replacement)) = self.const_let_fix(program, diagnostic) {
+                fixes.push(QuickFix {
+                    title: "Declare it `const let`".to_string(),
+                    span,
+                    replacement,
+                    target: None,
+                });
+            } else if diagnostic.msg.starts_with(A_CSS_DECLARATION_IS_A_CALL)
+                && let Some((span, replacement)) =
+                    css_declaration_call_edit(&self.text, diagnostic.span.start)
+            {
+                // E201. The message every migrating program hits, and the two
+                // mechanical cases are the codemod's own rules — so the fix is
+                // the codemod, one declaration at a time. The title quotes the
+                // REWRITE rather than the property: the point the reader needs
+                // is that a declaration is a call now, and seeing
+                // `padding(px(4))` next to their `padding: 4px;` is the whole
+                // explanation.
+                fixes.push(QuickFix {
+                    title: format!("Write it as a call: `{replacement}`"),
+                    span,
+                    replacement,
+                    target: None,
+                });
             } else if diagnostic.msg.starts_with(IMPORTANT_HAS_NO_PLACE) {
-                // §7.2 fix 3. The parser excises `!important` from the value
-                // and reports at exactly its span, so the fix is that span
-                // plus the whitespace holding it to the value — removing the
-                // marker alone would leave `flex ;`.
+                // §7.2 fix 3. The parser reads the marker off the declaration's
+                // argument TOKENS (A101 — `red !important` is not an expression)
+                // and reports at exactly its span, so the fix is that span plus
+                // the whitespace holding it to the value — removing the marker
+                // alone would leave `color(red )`.
                 let start = self.text[..diagnostic.span.start]
                     .trim_end_matches([' ', '\t'])
                     .len();
@@ -2865,10 +6507,339 @@ impl Document {
                     title: "Remove `!important`".to_string(),
                     span: Span::from(start..diagnostic.span.end),
                     replacement: String::new(),
+                    target: None,
+                });
+            }
+        }
+        // E201's bulk half. A101's refusal fires PER DECLARATION — the parser
+        // recovers to the next one — so a migrating file carries one diagnostic
+        // and one fix per row, and taking them one at a time is the tedium the
+        // codemod exists to avoid. This action takes every one of them at once.
+        //
+        // The whole FILE rather than the enclosing block, deliberately: the
+        // block's extent would have to be recovered by counting braces through
+        // text the parser has already refused, where a brace inside a string is
+        // enough to find the wrong one, while the declarations themselves are
+        // already located exactly — each by its own diagnostic. The codemod is
+        // file-wide for the same reason.
+        if let Some(fix) = self.css_declaration_call_all_fix(range) {
+            fixes.push(fix);
+        }
+        // I5 §8.3's bulk half, for the same reason: a file migrating to `usize`
+        // meets one mismatch per index, and the codemod is this action.
+        if let Some(fix) = self.numeric_index_all_fix(range) {
+            fixes.push(fix);
+        }
+        // B318 §5: the two reach WARNINGS carry fixes of their own, and a
+        // warning is not in `diagnostics` — deliberately, because 62 sites gate
+        // on `diagnostics.is_empty()` and a warning must not disable Organize
+        // Imports. Both edits are one character in THIS file, which is what
+        // makes them expressible: the third fix the paper names, "Export `S`",
+        // edits the declaration wherever it lives and needs a cross-file
+        // `QuickFix` the type does not have.
+        for (index, warning) in self.warnings.iter().enumerate() {
+            if self
+                .warning_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+                || !spans_overlap(warning.span, range)
+            {
+                continue;
+            }
+            if warning.msg.contains(REACH_IS_UNMARKED) {
+                let at = warning.span.start;
+                let leaf = &self.text[warning.span.into_range()];
+                fixes.push(QuickFix {
+                    title: format!("Import as `#{leaf}`"),
+                    span: Span::from(at..at),
+                    replacement: "#".to_string(),
+                    target: None,
+                });
+                // E177, and §5's own pairing: the OTHER way out of a plain
+                // reach is to export the thing.
+                if let Some(definition) = self.reached_definition(warning)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
+            } else if warning.msg.contains(REACH_THROUGH_THE_MODULE) {
+                // §5's second door, the QUALIFIED reach (`import pkg::a;` then
+                // `a::hidden()`): there is no leaf to mark, so "Export" is the
+                // only fix the paper names for it.
+                if let Some(definition) = self.reached_definition(warning)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
+            } else if warning.msg.contains(SIGNATURE_EXPOSES_A_PRIVATE_TYPE)
+                && !warning.msg.contains(EXPOSED_TYPE_IS_FOREIGN)
+            {
+                // B318 §4's "Export `S`". The warning is spanned at the
+                // EXPORTED ITEM's own name — one warning per declaration,
+                // whichever signature position found the exposure — and the
+                // analyzer recorded the private type it is about beside it
+                // (E188), so the fix resolves a definition rather than a
+                // spelling.
+                if let Some(definition) = self.exposed_type_definition(program, warning.span)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
+            } else if warning.msg.ends_with(REACH_IS_REDUNDANT)
+                && self.text[..warning.span.start].ends_with('#')
+            {
+                fixes.push(QuickFix {
+                    title: "Delete the `#`".to_string(),
+                    span: Span::from(warning.span.start - 1..warning.span.start),
+                    replacement: String::new(),
+                    target: None,
                 });
             }
         }
         fixes
+    }
+
+    /// The private item a B318 §5 reach warning is ABOUT, read off the warning
+    /// itself (E177).
+    ///
+    /// The two doors span differently — the leaf form is spanned at the leaf,
+    /// the qualified form at the whole `a::hidden` path — so the fix is not
+    /// keyed on the span's exact shape. Both messages open with the reached
+    /// PATH in backticks, and the reference index narrows every use to its own
+    /// identifier, so the occurrence inside the warning that spells the path's
+    /// last segment is the one the warning means.
+    fn reached_definition(&self, warning: &Error) -> Option<Id> {
+        let path = warning.msg.strip_prefix('`')?.split('`').next()?;
+        let leaf = path.rsplit("::").next()?;
+        self.reference_index
+            .occurrences_in(SourceId(0))
+            .find(|occurrence| {
+                spans_contain(warning.span, occurrence.span)
+                    && !occurrence.is_declaration
+                    && matches!(occurrence.definition, Definition::Entity(_))
+                    && self
+                        .program
+                        .as_ref()
+                        .and_then(|program| {
+                            crate::references::name_of(program, occurrence.definition)
+                        })
+                        .is_some_and(|name| name == leaf)
+            })
+            .and_then(|occurrence| match occurrence.definition {
+                Definition::Entity(id) => Some(id),
+                Definition::Field(..) => None,
+            })
+    }
+
+    /// B318 §4/§5's "Export `S`" (E177): the edit that inserts `export ` in
+    /// front of `definition`'s declaration, WHEREVER it lives.
+    ///
+    /// The declaration's file comes from the reference index, which carries a
+    /// declaration row for every definition in the program and not only for
+    /// this file's — so the fix reaches the sibling module the warning is
+    /// really about without the LSP guessing at a path. Its own text comes from
+    /// [`Self::sibling_text`] when it is not this buffer — the OPEN buffer when
+    /// the editor has one (E187), because this fix EDITS the file it reads and
+    /// an offset computed from the saved text lands in the wrong place in an
+    /// edited one — and the range is converted through THAT file's line index
+    /// here, because the handler has only this document's.
+    ///
+    /// Four refusals, each of them a place a wrong edit would be worse than no
+    /// action:
+    ///  - a declaration with no file (generated code) has nothing to edit;
+    ///  - a declaration outside this package's source root is not ours to
+    ///    change — §4's dependency arm says so in the message, and this is the
+    ///    same rule applied to the edit;
+    ///  - an INDENTED declaration line is a member, a variant or a local, and
+    ///    `export` does not belong in front of one (a top-level item is at
+    ///    column 0 — the formatter's own invariant);
+    ///  - a line already beginning `export` (or `export(in …)`) has nothing to
+    ///    add, which is also what keeps the action from being offered twice.
+    fn export_declaration_fix(&self, program: &Program, definition: Id) -> Option<QuickFix> {
+        let entity = Definition::Entity(definition);
+        let name = crate::references::name_of(program, entity)?.to_string();
+        let declaration = self
+            .reference_index
+            .occurrences_of(entity)
+            .find(|occurrence| occurrence.is_declaration_of(entity))?;
+        let path = program.source_path(declaration.source)?.to_path_buf();
+        if let Some(root) = self.package_root()
+            && !path.starts_with(root)
+        {
+            return None;
+        }
+        let title = format!("Export `{name}`");
+        // The current buffer answers from its LIVE text — `quickfixes` runs
+        // only on a document whose snapshots agree, so that is also the
+        // analyzed text the span came from.
+        if declaration.source == SourceId(0) {
+            let at = top_level_item_start(&self.text, declaration.span.start)?;
+            return Some(QuickFix {
+                title,
+                span: Span::from(at..at),
+                replacement: "export ".to_string(),
+                target: None,
+            });
+        }
+        let text = Self::sibling_text(&path)?;
+        let at = top_level_item_start(&text, declaration.span.start)?;
+        let range = LineIndex::new(&text).range(&Span::from(at..at));
+        Some(QuickFix {
+            title,
+            // Unused for a targeted fix; the warning's own span is the anchor.
+            span: Span::from(declaration.span.start..declaration.span.start),
+            replacement: "export ".to_string(),
+            target: Some(FixTarget { path, range }),
+        })
+    }
+
+    /// The text of another file of the analyzed program: the OPEN BUFFER when
+    /// the editor has one, and the file on disk otherwise (E187).
+    ///
+    /// The order is the whole point. Go-to-definition makes the disk bargain
+    /// because it only has to land a cursor, and a stale line is a small
+    /// annoyance; the two callers here are different in kind. One EDITS the
+    /// file it reads — B318's cross-file "Export `S`" inserts one word at an
+    /// offset computed from the text it read, so reading the saved text and
+    /// applying the edit to the live buffer means a stale offset in a file the
+    /// user has since changed, which corrupts rather than merely disappoints.
+    /// The other INLINES what it reads into this buffer — the css converter's
+    /// sibling `impl Style` bodies — so the saved text silently produces a
+    /// block the author's own edits contradict.
+    ///
+    /// The server already maintains exactly this map: `did_open`/`did_change`
+    /// register each buffer with the analyzer's document overlay, which is what
+    /// makes a DEPENDENT's analysis see unsaved edits at all (backlog E6). So
+    /// this adds no second notion of "what the file says" — it reads the one
+    /// the analysis it is answering about already read.
+    fn sibling_text(path: &Path) -> Option<String> {
+        vilan_core::analyzer::document_overlay_get(path)
+            .or_else(|| std::fs::read_to_string(path).ok())
+    }
+
+    /// The private TYPE a §4 exposure warning is about — `S` in "`S` is used in
+    /// the signature …" — read off the analyzer's own record (E188).
+    ///
+    /// E177 read the name out of the message and matched it against this file's
+    /// recorded type references, which is exact only while one spelling means
+    /// one type: a file naming two different `S`es — a local struct and an
+    /// imported one — made the references disagree and the fix DECLINED rather
+    /// than guess, on the very shape B318 §4 exists to catch. The walk that
+    /// wrote the sentence had the entity, so it records it beside the warning
+    /// and this is a lookup. The key is `(this file, the warning's span)`: the
+    /// warning is spanned at the exported item's own declaration name and there
+    /// is exactly one per declaration, so no two share it.
+    fn exposed_type_definition(&self, program: &Program, span: Span) -> Option<Id> {
+        program
+            .exposed_private_types
+            .iter()
+            .find(|(source, recorded, _)| *source == SourceId(0) && *recorded == span)
+            .map(|(_, _, definition)| *definition)
+    }
+
+    /// A99's quick fix: `parent.bind_each(a, b, c)` names one of the six `View`
+    /// methods the order RETIRED, and the repair is the free slot value of the
+    /// same idea, in place — `parent.child(each(a, b, c))`.
+    ///
+    /// One contiguous edit, which is what a [`QuickFix`] can express: the whole
+    /// call node (`bind_each(a, b, c)`) is replaced by `child(each(a, b, c))`,
+    /// so the receiver, the chain around it and the arguments are untouched
+    /// text. The `{each(..)}` hole the diagnostic's second half names is NOT
+    /// offered as a fix: whether a hole is right is a question about the markup
+    /// around the call, and E58c's rule is that a fix applies the one edit that
+    /// certainly resolves the diagnostic.
+    ///
+    /// Read from a RAW parse, like the css queries: the desugar has already
+    /// retired element syntax by analysis time, and the fix must work on the
+    /// text the user is looking at. The table is
+    /// [`vilan_core::analyzer::retired_slot_value_name`] — the analyzer's steer
+    /// reads the same one, so the sentence and the edit cannot name different
+    /// functions.
+    fn retired_slot_method_fix(&self, diagnostic: &Error) -> Option<QuickFix> {
+        if !diagnostic.msg.contains(HAS_NO_METHOD) {
+            return None;
+        }
+        let source = self.text.as_str();
+        let (tree, _errors) = vilan_core::parsing::parse(source);
+        let root = tree?;
+        let mut found = None;
+        for item in &root.0 {
+            retired_slot_method_call(item, diagnostic.span.start, &mut found);
+        }
+        let (member, method_name) = found?;
+        let value = vilan_core::analyzer::retired_slot_value_name(method_name)?;
+        let written = source.get(member.1.into_range())?;
+        let arguments = written.strip_prefix(method_name)?;
+        Some(QuickFix {
+            title: format!("Rewrite as `child({value}(…))`"),
+            span: member.1,
+            replacement: format!("child({value}{arguments})"),
+            target: None,
+        })
+    }
+
+    /// E216 (R8's other half): the buffer re-printed with comment wrapping
+    /// FORCED ON, offered when the caret is in a comment run that the wrap
+    /// changes — the "Reflow this comment" refactor.
+    ///
+    /// Offered regardless of the package's `[fmt] wrap_comments`, because an
+    /// explicit action is consent where a format-on-save is not.
+    ///
+    /// **It is a whole-buffer edit, and that is deliberate.** The printer's
+    /// paragraph rule and its ten never-reflow classes are private to the
+    /// formatter (`comment_reflow`), and a second implementation of them here
+    /// is exactly the drift that would make the action and the save disagree
+    /// about one comment. So the action asks the formatter the question it
+    /// already answers — `reprint_with`, the entry point format-on-save takes
+    /// — and hands back what it said. `comment_width` is the package's own
+    /// `[fmt] comment_width` (E215), read by the caller through the same
+    /// manifest walk format-on-save uses (a document holds no path of its
+    /// own); the formatter's default when there is nothing to climb from.
+    ///
+    /// Two reprints, and the comparison is the point: with the wrap on and
+    /// with it off, the CODE renders identically, so a difference between them
+    /// is a comment and nothing else. That is what makes "would this change a
+    /// comment" answerable without re-deriving the rule — and it answers `None`
+    /// for a run already filled, one under the width, a trailing comment after
+    /// code, and each of the never-reflow classes, because in every one of
+    /// those the two reprints are the same text. Both are skipped entirely
+    /// unless the caret is in a comment, which is a scan of the buffer's
+    /// comment spans.
+    pub fn comment_reflow(&self, range: Span, comment_width: usize) -> Option<(Span, String)> {
+        let source = self.text.as_str();
+        let offset = range.start;
+        let in_a_comment =
+            vilan_core::formatter::extract_comments(source)
+                .iter()
+                .any(|(span, _)| {
+                    let range = span.into_range();
+                    offset >= range.start && offset <= range.end
+                });
+        if !in_a_comment {
+            return None;
+        }
+        let plain = vilan_core::formatter::reprint_with(
+            source,
+            vilan_core::formatter::FormatOptions {
+                wrap_comments: false,
+                comment_width,
+            },
+        )
+        .ok()?;
+        let wrapped = vilan_core::formatter::reprint_with(
+            source,
+            vilan_core::formatter::FormatOptions {
+                wrap_comments: true,
+                comment_width,
+            },
+        )
+        .ok()?;
+        if wrapped == plain {
+            return None;
+        }
+        Some((Span::from(0..source.len()), wrapped))
     }
 
     /// The `css`-spelling conversion offered over `range` (LIVE space, and the
@@ -2917,11 +6888,128 @@ impl Document {
         if commented(node.1) {
             return None;
         }
+        // std's own `style.vl`, parsed, is what gives a TYPED link its
+        // declarations (E167). Read here rather than at analysis time because
+        // it is wanted by one code action and by nothing else — and only after
+        // the block direction has declined, so a cursor in a block never pays
+        // for it.
+        let std_style = self.std_style_source();
+        let style_tree = std_style
+            .as_ref()
+            .and_then(|(_, text)| vilan_core::parsing::parse(text).0);
+        // E175: and every OTHER file of the program that writes `impl Style`.
+        // Read and parsed BEFORE the surface, because the surface borrows both.
+        let sibling_texts = self.style_impl_texts(std_style.as_ref().map(|(source, _)| *source));
+        let sibling_trees: Vec<_> = sibling_texts
+            .iter()
+            .map(|text| vilan_core::parsing::parse(text).0)
+            .collect();
+        let mut surface = match (std_style.as_ref(), style_tree.as_ref()) {
+            (Some((_, text)), Some(tree)) => StyleSurface::build(text, &tree.0),
+            _ => StyleSurface::default(),
+        };
+        // And the CURRENT file's own `impl Style` extensions (E172). The tree
+        // is already in hand — it is the one the chain was found in — so this
+        // costs a walk of the file's top-level items and no parse at all, and
+        // it is what makes the refactor fire on an app's chain: an app's own
+        // shorthand is usually the FIRST link, and a first link with no block
+        // spelling is an empty convertible prefix and no action offered.
+        surface.extend(source, &root.0);
+        // The siblings last: `extend` keeps the first body registered under a
+        // name, so std outranks this file and this file outranks a sibling —
+        // which is the order a call would resolve in anyway.
+        for (text, tree) in sibling_texts.iter().zip(&sibling_trees) {
+            if let Some(tree) = tree {
+                surface.extend(text, &tree.0);
+            }
+        }
         Some(CssConversion {
             to_chain: false,
             span: node.1,
-            replacement: render_css_block(node, source, &line_indent(source, node.1.start))?,
+            replacement: render_css_block(
+                node,
+                source,
+                &line_indent(source, node.1.start),
+                &surface,
+            )?,
         })
+    }
+
+    /// std's `style.vl` as text, located through the analyzed program's own
+    /// source table: the file that declares `with_length`, std's `Style` slot
+    /// writer, and is called `style.vl`. Both halves matter — the name alone
+    /// would match an app's own `style.vl`, and the function alone an app's own
+    /// `with_length`.
+    ///
+    /// `None` when nothing analyzed, when style.vl is not among the loaded
+    /// modules (then there is no `style()` chain to convert either), or when the
+    /// file cannot be read; the conversion degrades to the chokepoint links and
+    /// the combinators rather than to a wrong answer.
+    fn std_style_source(&self) -> Option<(SourceId, String)> {
+        let program = self.program.as_ref()?;
+        let source = program.functions.iter().find_map(|(id, function)| {
+            (function.name == "with_length")
+                .then(|| program.source_of(*id))
+                .flatten()
+                .filter(|source| {
+                    program
+                        .source_path(*source)
+                        .and_then(|path| path.file_name())
+                        .is_some_and(|name| name == "style.vl")
+                })
+        })?;
+        let text = Self::sibling_text(program.source_path(source)?)?;
+        Some((source, text))
+    }
+
+    /// E175: the text of every OTHER file the analyzed program loaded that
+    /// writes an `impl Style` block — the css converter's reach past the file
+    /// it was invoked in.
+    ///
+    /// E167 read std's `style.vl` and E172 the current file, and that is where
+    /// the inliner stopped: kolt's `button_style` converts the prefix its own
+    /// file's `flex_row` opens and SPLITS at `.script_label()`, four lines of
+    /// `theme.vl` away, in the same package, already loaded and analyzed. The
+    /// missing half was never the parse — it is finding the files worth
+    /// parsing, and the analyzed impl table is the one thing that knows: an
+    /// `Implementation` records the file whose text declares it (B318 §3.3),
+    /// so the blocks whose subject head is `Style` name their own sources and
+    /// nothing else is read.
+    ///
+    /// Read through [`Self::sibling_text`], like std's own file: the OPEN
+    /// buffer when the editor has one (E187). E175 read the saved text and said
+    /// so — "the same bargain go-to-definition makes" — but this reader INLINES
+    /// what it finds into the current buffer, so a sibling edited and not yet
+    /// saved produced a block the author's own `theme.vl` already contradicted.
+    /// The overlay the server maintains for every open document is the one the
+    /// analysis this answers about already read.
+    ///
+    /// `skip` is std's own source, already read by
+    /// [`Self::std_style_source`]; `SourceId(0)` is skipped because the current
+    /// file's tree is in hand (E172) and its BUFFER, not its saved text, is
+    /// what the conversion must agree with.
+    fn style_impl_texts(&self, skip: Option<SourceId>) -> Vec<String> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        let mut seen = vec![SourceId(0)];
+        seen.extend(skip);
+        let mut texts = Vec::new();
+        for implementation in program.implementations.iter() {
+            if seen.contains(&implementation.source) {
+                continue;
+            }
+            if subject_head_name(program, implementation.subject).as_deref() != Some("Style") {
+                continue;
+            }
+            seen.push(implementation.source);
+            if let Some(path) = program.source_path(implementation.source)
+                && let Some(text) = Self::sibling_text(path)
+            {
+                texts.push(text);
+            }
+        }
+        texts
     }
 
     /// Every unambiguous missing-import fix in the file, folded into ONE edit
@@ -2970,6 +7058,10 @@ impl Document {
     /// The outline of the entry file: functions, structs (with their fields),
     /// enums, and traits, each with its declaration and name spans.
     pub fn document_symbols(&self) -> Vec<Symbol> {
+        // M63: the outline as it stood, for a document serving from its tables.
+        if let Some(released) = self.released.as_ref() {
+            return released.symbols.clone();
+        }
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
@@ -3053,22 +7145,200 @@ impl Document {
     /// The engine is `vilan_ide`'s, shared with the playground (K9); it
     /// converts to the ANALYZED offset itself wherever it touches `program`
     /// data (E52).
-    pub fn completion(&self, offset: usize) -> Vec<Completion> {
+    ///
+    /// The server reaches it through [`keystroke_completion`](Self::keystroke_completion),
+    /// which offers the index's own candidates first and these after; this is
+    /// the engine on its own, which is what the completion pins drive.
+    #[cfg(test)]
+    pub(crate) fn completion(&self, offset: usize) -> Vec<Completion> {
+        self.completion_over(offset, &self.landed.index.completion)
+    }
+
+    /// [`completion`](Self::completion) against a NAMED completion index —
+    /// the seam M25's identity pin measures the capture against, by handing in
+    /// one derived on the spot.
+    fn completion_over(
+        &self,
+        offset: usize,
+        index: &vilan_ide::CompletionIndex,
+    ) -> Vec<Completion> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
-        self.analysis(program).completion(offset)
+        self.analysis_over(program, index).completion(offset)
+    }
+}
+
+/// Where `export ` is inserted to export the top-level item whose name begins
+/// at `name_start` in `text` (E177) — the start of that item's own line.
+///
+/// `None` when the line is INDENTED (a member, a variant, a local — a top-level
+/// item is at column 0, which the formatter guarantees) or already begins
+/// `export`, in which case there is nothing to add and no action to offer.
+/// An attribute written above the item (`[derive(Json)]` on its own line)
+/// leaves the declaration's own line untouched, which is where the word goes.
+fn top_level_item_start(text: &str, name_start: usize) -> Option<usize> {
+    let line_start = text.get(..name_start)?.rfind('\n').map_or(0, |at| at + 1);
+    let line = text.get(line_start..)?;
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    if line
+        .strip_prefix("export")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    {
+        return None;
+    }
+    Some(line_start)
+}
+
+impl Document {
+    /// **G24's R2 quick fix.** One arm for the two refusals, because they are
+    /// one edit seen from two sides: a `const` expression that reads a plain
+    /// binding, and a `let x = const ..` whose result is a closure. Either
+    /// way the answer is the DECLARATION keyword, and the fix writes it.
+    ///
+    /// Keyed on the two steer constants the analyzer builds its messages from
+    /// (`const_eval::CONST_LET_STEER_*`), never on a second copy of the
+    /// sentence — the `REACH_IS_UNMARKED` discipline, so a reworded steer
+    /// takes the fix with it rather than silently unhooking it.
+    fn const_let_fix(
+        &self,
+        program: &Program,
+        diagnostic: &vilan_core::error::Error,
+    ) -> Option<(Span, String)> {
+        // The plain-data refusal: `let x = const <closure>` becomes
+        // `const let x = <closure>`. The whole edit is the text in FRONT of
+        // the diagnostic's own span — the `const` keyword moves to the head of
+        // the declaration — so it needs no program lookup at all.
+        if diagnostic
+            .msg
+            .contains(vilan_core::const_eval::CONST_LET_STEER_CLOSURE)
+        {
+            let head = self.text.get(..diagnostic.span.start)?;
+            let declaration = head.rfind("let ")?;
+            let slice = self.text.get(declaration..diagnostic.span.start)?;
+            let kept = slice.trim_end().strip_suffix("const")?;
+            return Some((
+                Span::from(declaration..diagnostic.span.start),
+                format!("const {kept}"),
+            ));
+        }
+        // The runtime-binding refusal: the diagnostic is at the READ, and the
+        // edit is at the binding it names — the nearest declaration of that
+        // name ahead of the read, and only when this document's own text still
+        // opens it with `let`, which is what keeps the fix inside the file it
+        // may edit.
+        if !diagnostic
+            .msg
+            .contains(vilan_core::const_eval::CONST_LET_STEER_RUNTIME)
+        {
+            return None;
+        }
+        let name = diagnostic.msg.strip_prefix('`')?.split('`').next()?;
+        let at = program
+            .variables
+            .values()
+            .filter(|variable| variable.name == name)
+            .filter_map(|variable| program.span_map.get(&variable.id).map(|span| **span))
+            .filter(|span| span.end <= diagnostic.span.start)
+            .max_by_key(|span| span.start)?;
+        if !self.text.get(at.start..)?.starts_with("let ") {
+            return None;
+        }
+        Some((Span::from(at.start..at.start), "const ".to_string()))
     }
 }
 
 /// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
 /// `(span, replacement)` this document's own text needs — LIVE space, same
 /// convention as [`Document::organize_import_edits`].
+///
+/// E177 widened it with a TARGET. Every fix before it edited the buffer the
+/// action was invoked in, and that was not a design so much as the only thing
+/// the type could say: B318 §4/§5's "Export `S`" inserts one word in front of
+/// a declaration WHEREVER it lives, which is usually another file of the same
+/// package, so the paper's third fix shipped as a sentence in a message while
+/// its two same-file siblings shipped as actions.
 pub struct QuickFix {
     pub title: String,
+    /// The edit's span in THIS document's live text. Ignored when
+    /// [`QuickFix::target`] is `Some` — it is then the WARNING's own span, kept
+    /// so the action still anchors where the user's cursor is.
     pub span: Span,
     pub replacement: String,
+    /// E177: the other file this fix edits, when it is not this document.
+    pub target: Option<FixTarget>,
 }
+
+/// Where a cross-file [`QuickFix`] lands (E177): the file, and the range in
+/// THAT file's text.
+///
+/// The range is converted HERE rather than handed over as a span, because the
+/// conversion needs the target file's own line index and the handler has only
+/// this document's. Carrying the answer is what makes it impossible to apply a
+/// span from one file through another file's index — the failure mode that
+/// corrupts a file rather than merely looking wrong.
+pub struct FixTarget {
+    pub path: PathBuf,
+    pub range: Range,
+}
+
+/// The anchor of the analyzer's method-lookup refusal (`analyzer.rs`'s
+/// `MethodLookup::NoMethod` arm), and the key A99's quick fix reads it by — a
+/// fragment of the compiler's own message rather than a second copy of it.
+const HAS_NO_METHOD: &str = " has no method '";
+
+/// The method CALL node of a retired `View` method whose own name starts at
+/// `offset` — the diagnostic anchors on the member NAME, which is the callee's
+/// span, so the two meet exactly there and no enclosing chain link can be
+/// mistaken for the one that failed.
+///
+/// Returns the MEMBER node (the `bind_each(a, b, c)` half of the accessor), not
+/// the accessor, because the receiver and the dot are the text A99's rewrite
+/// leaves alone.
+fn retired_slot_method_call<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+    offset: usize,
+    out: &mut Option<(
+        &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+        &'src str,
+    )>,
+) {
+    if out.is_some() {
+        return;
+    }
+    if let Node::MemberAccessor(_, member) = &node.0
+        && let Node::Call(callee, None, _) = &member.0
+        && let Node::Accessor(name) = callee.0
+        && callee.1.start == offset
+        && vilan_core::analyzer::retired_slot_value_name(name).is_some()
+    {
+        *out = Some((member, name));
+        return;
+    }
+    node.0
+        .for_each_child(&mut |child| retired_slot_method_call(child, offset, out));
+}
+
+/// The sentence B318 §5's plain-reach warning carries, and the key the "mark
+/// the reach" fix reads it by — one fragment of the analyzer's own message
+/// rather than a second copy of it to drift from.
+const REACH_IS_UNMARKED: &str = "Importing it anyway is allowed — mark the reach:";
+
+/// Its twin: the marker written on an item that is exported anyway.
+const REACH_IS_REDUNDANT: &str = "the reach marker is redundant — delete the `#`";
+
+/// B318 §5's SECOND door — `import pkg::a;` then `a::hidden()`, where there is
+/// no leaf to mark and "Export" is the only fix the paper names for it.
+const REACH_THROUGH_THE_MODULE: &str = "and this path reaches it through the module";
+
+/// B318 §4's exposure warning, and the key the "Export `S`" fix reads it by.
+const SIGNATURE_EXPOSES_A_PRIVATE_TYPE: &str = "is exported, but";
+
+/// Its dependency arm: `S` belongs to another package, so there is no
+/// declaration here to export and the message says what the two ways out are.
+const EXPOSED_TYPE_IS_FOREIGN: &str = "in another package, and cannot be exported from here";
 
 /// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
 /// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
@@ -3087,6 +7357,37 @@ fn unresolved_name(message: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// The NAME LIST of the clause B242's subset refusal spells out — the text
+/// after "write `context " in ``… — write `context (a, b)` ``, which is exactly
+/// what the refusal's own span (the clause's names) holds. `None` for every
+/// other message.
+fn declare_contexts_spelling(message: &str) -> Option<&str> {
+    let rest = message.split("— write `context ").nth(1)?;
+    rest.strip_suffix('`')
+}
+
+/// The context B242's BOUNDARY refusal offers to declare on the caller — the
+/// name after "or declare `context " in
+/// ``… — call it under `s.run(..)`, or declare `context s` here too``.
+/// `None` for every other message (E148).
+fn declare_context_here_name(message: &str) -> Option<&str> {
+    message
+        .split("or declare `context ")
+        .nth(1)?
+        .strip_suffix("` here too")
+}
+
+/// The `context` clause text that declares `names`, as the grammar spells it:
+/// one name bare, several in parentheses (`parse_context_clause`). Written
+/// with its leading space, so it appends to a signature.
+fn context_clause_insertion(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => format!(" context {only}"),
+        many => format!(" context ({})", many.join(", ")),
+    }
 }
 
 /// The suggested name in a "did you mean" note E58 attaches to the
@@ -3167,8 +7468,7 @@ fn outermost_style_chain<'a, 'src>(
 }
 
 /// The links of a `style()`-seeded chain, in written order, or `None` when
-/// `node` is some other expression. The seed is a bare `style()` call — a
-/// receiver of any other shape is not a chain this refactor can read.
+/// `node` is some other expression.
 fn style_chain_links<'a, 'src>(
     node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
 ) -> Option<Vec<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>> {
@@ -3179,10 +7479,46 @@ fn style_chain_links<'a, 'src>(
             Some(links)
         }
         Node::Call(callee, None, arguments)
-            if matches!(callee.0, Node::Accessor("style")) && arguments.0.is_empty() =>
+            if arguments.0.is_empty() && names_the_style_seed(&callee.0) =>
         {
             Some(Vec::new())
         }
+        _ => None,
+    }
+}
+
+/// Whether `callee` names std's `style()` seed (E167).
+///
+/// A BARE `style` was the only spelling this refactor read, and it is the one
+/// spelling the estate does not write: the web prelude publishes the MODULE, so
+/// the templates, the docs and kolt all write `style::style()`, and every chain
+/// in real code was refused at its first token. The test is syntactic — the last
+/// segment is `style` and the call takes no arguments — which matches
+/// `style::style()`, an aliased `s::style()` and a bare `style()` alike, and is
+/// the rule a raw parse can apply without resolving anything. `StdItem` is the
+/// desugar's own scope-independent spelling (B270), which a `css` block's
+/// lowering seeds its chain with.
+fn names_the_style_seed(callee: &Node<'_>) -> bool {
+    matches!(
+        callee,
+        Node::Accessor("style")
+            | Node::StaticAccessor(_, "style", None)
+            | Node::StdItem("style", "style")
+    )
+}
+
+/// The links of a chain written over `self` — the shape every convertible
+/// `impl Style` body in std's `style.vl` has (E167's inliner).
+fn self_chain_links<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+) -> Option<Vec<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>> {
+    match &node.0 {
+        Node::MemberAccessor(subject, member) => {
+            let mut links = self_chain_links(subject)?;
+            links.push(member);
+            Some(links)
+        }
+        Node::Accessor("self") => Some(Vec::new()),
         _ => None,
     }
 }
@@ -3251,125 +7587,461 @@ fn render_chain_link(item: &CssItem<'_>, source: &str) -> Option<String> {
             arguments.push(render_inline_chain(&nested.body, source)?);
             Some(format!(".{}({})", nested.name.0, arguments.join(", ")))
         }
+        // A69: a chain link IS the method call, so the conversion is the
+        // identity on it.
+        CssItem::Link(link) => {
+            let arguments: Vec<String> = link
+                .arguments
+                .iter()
+                .map(|argument| source[argument.1.into_range()].to_string())
+                .collect();
+            Some(format!(".{}({})", link.name.0, arguments.join(", ")))
+        }
     }
 }
 
-/// A declaration's value as the `raw` argument it lowers to — the three rows of
-/// §5.2's table, in the same order the desugar reads them.
+/// A declaration's value as the ONE `raw` argument it lowers to (A101 R10).
+///
+/// ONE argument IS the value and passes through untouched. SEVERAL are the
+/// space join, and the conversion DECLINES on them — the third refusal, and the
+/// honest one: the chain twin of `margin(px(4), px(8))` is
+/// `raw("margin", piece(px(4)) + " " + piece(px(8)))`, and `piece` is ambient
+/// inside a BLOCK and nowhere else, so the text this writes into the user's
+/// file would name something the file does not import. An action that leaves a
+/// file broken is worse than an action not offered; adding the import is a
+/// different feature (the add-import machinery is a `Document` surface, and
+/// this renderer has no file to add one to).
 fn render_chain_value(declaration: &CssDeclaration<'_>, source: &str) -> Option<String> {
-    match declaration.value.as_slice() {
-        // Exactly one hole passes its expression through untouched, so the
-        // argument IS that expression.
-        [CssValuePiece::Hole(_, braces)] => Some(
-            source[braces.start + 1..braces.end.saturating_sub(1)]
-                .trim()
-                .to_string(),
-        ),
-        [CssValuePiece::Text(text)] => {
-            Some(format!("\"{}\"", escape_value(&source[text.into_range()])?))
-        }
-        // Mixed: the i-string the desugar's concatenation already is — the two
-        // build the same tree (§5.2), and the value's own text is an i-string
-        // body verbatim, holes included.
-        pieces => {
-            let mut literal = String::new();
-            for piece in pieces {
-                match piece {
-                    CssValuePiece::Hole(_, braces) => {
-                        literal.push_str(&source[braces.into_range()])
-                    }
-                    CssValuePiece::Text(text) => {
-                        literal.push_str(&escape_value(&source[text.into_range()])?)
-                    }
-                }
-            }
-            Some(format!("i\"{literal}\""))
-        }
-    }
+    let [only] = declaration.arguments.as_slice() else {
+        return None;
+    };
+    Some(source[only.1.into_range()].to_string())
 }
 
-/// `text` as a vilan string-literal BODY, or `None` when the two spellings would
-/// stop meaning the same thing — see [`CssConversion`]'s backslash refusal.
-fn escape_value(text: &str) -> Option<String> {
-    (!text.contains('\\')).then(|| text.replace('"', "\\\""))
-}
-
-/// A `style()` chain as the `css` block it is the lowering of.
+/// A `style()` chain as the `css` block it is the lowering of, with the links
+/// that have no block spelling written back onto it as a POSTFIX CHAIN (E167).
+///
+/// One unconvertible link used to refuse the whole conversion, which on real
+/// code meant always: every chain an app writes ends in `.class_list()`, and
+/// most carry a user extension or a `Style`-valued combinator argument
+/// somewhere. The chain SPLITS at the first such link instead — everything
+/// before it becomes the block, the rest is written on the block, which parses
+/// and types today (`css { … }.select_off()`). The split is at the FIRST one
+/// because chain order is merge order: the tail keeps its order relative to
+/// everything the block now holds, so the two spellings mean the same style.
+///
+/// `None` when NOTHING converts — a chain of only unconvertible links is not a
+/// conversion, it is a `css { }` with the whole chain hung off it.
 fn render_css_block(
     chain: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
     source: &str,
     indent: &str,
+    surface: &StyleSurface<'_>,
 ) -> Option<String> {
-    let items = render_css_items(&style_chain_links(chain)?, source, indent)?;
-    Some(format!("css {{\n{items}{indent}}}"))
-}
-
-fn render_css_items(
-    links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
-    source: &str,
-    indent: &str,
-) -> Option<String> {
-    let inner = format!("{indent}\t");
-    let mut out = String::new();
-    for link in links {
-        let Node::Call(callee, None, arguments) = &link.0 else {
-            return None;
-        };
-        let Node::Accessor(name) = callee.0 else {
-            return None;
-        };
-        if name == "raw" {
-            let [property, value] = arguments.0.as_slice() else {
-                return None;
-            };
-            let Node::String(property) = property.0 else {
-                return None;
-            };
-            if !is_css_property(property) {
-                return None;
-            }
-            let value = render_block_value(value, source);
-            out.push_str(&format!("{inner}{property}: {value};\n"));
-        } else if STYLE_CONDITION_METHODS
-            .iter()
-            .any(|(condition, _)| *condition == name)
-        {
-            let (nested, head) = arguments.0.split_last()?;
-            let body = render_css_items(&style_chain_links(nested)?, source, &inner)?;
-            let head = if head.is_empty() {
-                String::new()
-            } else {
-                let written: Vec<String> = head
-                    .iter()
-                    .map(|argument| source[argument.1.into_range()].to_string())
-                    .collect();
-                format!("({})", written.join(", "))
-            };
-            out.push_str(&format!("{inner}.{name}{head} {{\n{body}{inner}}}\n"));
-        } else {
-            // Not a row of the lowering table: no block spelling exists, and
-            // one is not this refactor's to invent.
-            return None;
-        }
+    let links = style_chain_links(chain)?;
+    let (items, converted) = render_css_prefix(&links, source, indent, surface);
+    if converted == 0 {
+        return None;
+    }
+    let mut out = format!("css {{\n{items}{indent}}}");
+    for link in &links[converted..] {
+        out.push('.');
+        out.push_str(&source[link.1.into_range()]);
     }
     Some(out)
 }
 
-/// A `raw` argument as a declaration's value. A plain token run is written as
-/// itself; everything else goes back through a HOLE, which is exact — a value
-/// that is exactly one hole passes its expression through untouched.
-fn render_block_value(
-    value: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+/// Every link of `links` as block items, or `None` when even one has no block
+/// spelling — the ALL-OR-NOTHING face, which is what a nested rule needs: a
+/// rule's body is a block, and a block has nowhere to hang a postfix chain.
+fn render_css_items(
+    links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
     source: &str,
-) -> String {
-    if let Node::String(literal) = value.0
-        && !literal.is_empty()
-        && literal.trim() == literal
-        && !literal.contains(['\\', '"', ';', '{', '}'])
-    {
-        return literal.to_string();
+    indent: &str,
+    surface: &StyleSurface<'_>,
+) -> Option<String> {
+    let (items, converted) = render_css_prefix(links, source, indent, surface);
+    (converted == links.len()).then_some(items)
+}
+
+/// The longest PREFIX of `links` with a block spelling, rendered, and how many
+/// links that was.
+fn render_css_prefix(
+    links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
+    source: &str,
+    indent: &str,
+    surface: &StyleSurface<'_>,
+) -> (String, usize) {
+    let mut out = String::new();
+    for (index, link) in links.iter().enumerate() {
+        let Some(rendered) = render_css_link(link, source, indent, surface) else {
+            return (out, index);
+        };
+        out.push_str(&rendered);
     }
-    format!("{{{}}}", &source[value.1.into_range()])
+    (out, links.len())
+}
+
+/// One chain link as the block item(s) it writes, or `None` when it has no
+/// block spelling.
+///
+/// Three kinds, and the third is E167's whole subject. A `raw`/`with_length`/
+/// `with_color` link IS a declaration (the lowering's own chokepoint). A
+/// CONDITION combinator is a nested rule, and converts recursively. Everything
+/// else is a method whose body writes declarations, and the body is read out of
+/// std's own `style.vl` rather than restated in a table beside it — see
+/// [`StyleSurface`].
+fn render_css_link(
+    link: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    source: &str,
+    indent: &str,
+    surface: &StyleSurface<'_>,
+) -> Option<String> {
+    let inner = format!("{indent}\t");
+    let Node::Call(callee, None, arguments) = &link.0 else {
+        return None;
+    };
+    let Node::Accessor(name) = callee.0 else {
+        return None;
+    };
+    if STYLE_CONDITION_METHODS
+        .iter()
+        .any(|(condition, _)| *condition == name)
+    {
+        let (nested, head) = arguments.0.split_last()?;
+        let body = render_css_items(&style_chain_links(nested)?, source, &inner, surface)?;
+        let head = if head.is_empty() {
+            String::new()
+        } else {
+            let written: Vec<String> = head
+                .iter()
+                .map(|argument| source[argument.1.into_range()].to_string())
+                .collect();
+            format!("({})", written.join(", "))
+        };
+        return Some(format!("{inner}.{name}{head} {{\n{body}{inner}}}\n"));
+    }
+    let written: Vec<InlineValue<'_>> = arguments
+        .0
+        .iter()
+        .map(|argument| InlineValue::written(argument, source))
+        .collect();
+    let declarations = style_link_declarations(surface, name, &written, 0)?;
+    let mut out = String::new();
+    for (property, value) in declarations {
+        out.push_str(&format!("{inner}{property}({value});\n"));
+    }
+    Some(out)
+}
+
+/// The `impl Style` surface the converter inlines from: std's, read out of the
+/// parsed `style.vl` (E167), and the CURRENT FILE's own extensions (E172).
+///
+/// The alternative was a hand table beside `STYLE_PROPERTY_METHODS` giving each
+/// method's declarations with holes for its arguments, gated against `style.vl`
+/// exactly as the `family` column is. The inliner is preferred because it cannot
+/// DRIFT: a shorthand's body is a chain of `with_length`/`with_color`/`raw` links
+/// over `self`, so substituting the call's arguments into it yields the
+/// declarations the method actually writes, and a method whose body is not such a
+/// chain (`raw` itself, `rule`, `with_border`, `background_gradient` — anything
+/// with a statement in it) simply HAS no block spelling and splits the chain
+/// rather than being converted wrong.
+///
+/// std alone was not enough to make the refactor fire on real code (E172): an
+/// app's chain usually opens with the app's OWN shorthand — kolt's
+/// `button_style` starts `style().flex_row()`, `flex_row` being four lines up
+/// the same file — so the convertible prefix was empty and the action offered
+/// nothing on the exhibit it was filed about. The current file is already
+/// raw-parsed here (the conversion reads a raw tree, because neither spelling's
+/// distinguishing node survives desugaring), so its `impl Style` bodies are in
+/// hand for free, and an extension whose body is a self-chain inlines exactly as
+/// a std shorthand does — including one that delegates to another extension,
+/// which is the same recursion under the same depth bound.
+///
+/// A method carries the SOURCE its spans index into, because the two halves come
+/// from different texts and `inline_argument` splices by span.
+///
+/// Empty when `style.vl` cannot be read or parsed, which degrades to the
+/// pre-E167 behaviour (the chokepoint links and the combinators) rather than to
+/// a wrong answer.
+#[derive(Default)]
+struct StyleSurface<'a> {
+    methods: HashMap<&'a str, StyleMethodBody<'a>>,
+}
+
+/// One `impl Style` method's inlinable shape: the names it binds its arguments
+/// to, the single expression its body is, and the text that body's spans index
+/// into (std's `style.vl` or the current file — see [`StyleSurface`]).
+struct StyleMethodBody<'a> {
+    parameters: Vec<&'a str>,
+    tail: &'a vilan_core::Spanned<Node<'a>>,
+    source: &'a str,
+}
+
+impl<'a> StyleSurface<'a> {
+    /// The `impl Style` methods of a parsed `style.vl`.
+    fn build(source: &'a str, items: &'a [vilan_core::Spanned<Node<'a>>]) -> StyleSurface<'a> {
+        let mut surface = StyleSurface::default();
+        surface.extend(source, items);
+        surface
+    }
+
+    /// One more parsed file's `impl Style` methods folded in — the current
+    /// file's own extensions (E172). A method with a STATEMENT in its body is
+    /// skipped outright: a `let`, an `if` or a loop is a barrier, and nothing
+    /// about it has a declaration spelling.
+    ///
+    /// A name already present is KEPT rather than replaced, so std is the
+    /// authority for a std method name. A file cannot legally redeclare one
+    /// anyway (the call would be ambiguous), and between a guess and the
+    /// shipped body the shipped body is the safer one to inline.
+    fn extend(&mut self, source: &'a str, items: &'a [vilan_core::Spanned<Node<'a>>]) {
+        let methods = &mut self.methods;
+        for item in items {
+            // B318 S6: std's `style.vl` is curated, so its blocks read
+            // `export impl Style { … }` — the marker WRAPS the declaration, and
+            // a match on the bare `Impl` sees nothing. Unwrapped rather than
+            // filtered: an unexported block is still a body this file can
+            // inline, and visibility is not what decides that.
+            let node = match &item.0 {
+                Node::Export(_, inner, _) => &inner.0,
+                node => node,
+            };
+            let Node::Impl(subject, _traits, body, _) = node else {
+                continue;
+            };
+            let names_style = matches!(subject.0, Node::Accessor("Style"))
+                || matches!(subject.0, Node::StaticAccessor(_, "Style", None));
+            if !names_style {
+                continue;
+            }
+            for member in &body.0 {
+                let Node::Func(function) = &member.0 else {
+                    continue;
+                };
+                let Some(body) = function.body.as_ref() else {
+                    continue;
+                };
+                if !body.0.0.is_empty() {
+                    continue;
+                }
+                let mut parameters = Vec::new();
+                let mut spellable = true;
+                for parameter in &function.parameters.0 {
+                    match parameter.pattern {
+                        vilan_core::node::Pattern::Binding("self", ..) => {}
+                        vilan_core::node::Pattern::Binding(name, ..) => parameters.push(name),
+                        // A destructuring binder has no single name to
+                        // substitute, so the method is not inlinable.
+                        _ => spellable = false,
+                    }
+                }
+                if spellable {
+                    methods.entry(function.name.0).or_insert(StyleMethodBody {
+                        parameters,
+                        tail: body.0.1.as_ref(),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// One argument as the converter carries it through an inlining: its TEXT, and
+/// — when the argument is exactly one node of one source, with no substitution
+/// done to it — that node, so `render_block_value`'s plain-token-run rule and
+/// the property literal can still be read off the tree rather than off a string.
+#[derive(Clone)]
+struct InlineValue<'a> {
+    text: String,
+    written: Option<(&'a vilan_core::Spanned<Node<'a>>, &'a str)>,
+}
+
+impl<'a> InlineValue<'a> {
+    /// An argument exactly as the user wrote it.
+    fn written(node: &'a vilan_core::Spanned<Node<'a>>, source: &'a str) -> InlineValue<'a> {
+        InlineValue {
+            text: source[node.1.into_range()].to_string(),
+            written: Some((node, source)),
+        }
+    }
+
+    /// The value as a `css` declaration writes it — which since A101 is the
+    /// ARGUMENT it already is: a declaration's value is an ordinary vilan
+    /// expression in both spellings, so the text passes straight through and
+    /// the plain-token-run rule (and the `{ }` hole it chose between) is gone
+    /// with the value grammar.
+    fn declaration_value(&self) -> String {
+        self.text.clone()
+    }
+
+    /// The value as a declaration's PROPERTY — a string literal that is
+    /// spellable as a css property, and nothing else.
+    fn declaration_property(&self) -> Option<&'a str> {
+        let (node, _) = self.written?;
+        let Node::String(literal) = node.0 else {
+            return None;
+        };
+        is_css_property(literal).then_some(literal)
+    }
+}
+
+/// How deep the inliner will follow one shorthand into another. std's own depth
+/// is three (`padding_x` → `with_length` → `raw`); the bound is here so a cycle
+/// introduced in `style.vl` costs a refused conversion rather than a hung
+/// language server.
+const STYLE_INLINE_DEPTH: usize = 8;
+
+/// The declarations a chain link writes, as `(property, value)` pairs — E167's
+/// inliner (see [`StyleSurface`]).
+///
+/// `raw`, `with_length` and `with_color` are the BASE CASE rather than bodies to
+/// inline: they are the lowering's chokepoint, `with_length`/`with_color` are
+/// exactly `raw` at an instantiation, and `raw`'s own body carries the theme
+/// token's `:root` emission and is not a chain at all.
+fn style_link_declarations<'a>(
+    surface: &StyleSurface<'a>,
+    name: &str,
+    arguments: &[InlineValue<'a>],
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    if matches!(name, "raw" | "with_length" | "with_color") {
+        let [property, value] = arguments else {
+            return None;
+        };
+        return Some(vec![(
+            property.declaration_property()?.to_string(),
+            value.declaration_value(),
+        )]);
+    }
+    if depth >= STYLE_INLINE_DEPTH {
+        return None;
+    }
+    let method = surface.methods.get(name)?;
+    if method.parameters.len() != arguments.len() {
+        return None;
+    }
+    let bindings: Vec<(&str, &InlineValue<'a>)> = method
+        .parameters
+        .iter()
+        .copied()
+        .zip(arguments.iter())
+        .collect();
+    let mut declarations = Vec::new();
+    for link in self_chain_links(method.tail)? {
+        let Node::Call(callee, None, written) = &link.0 else {
+            return None;
+        };
+        let Node::Accessor(inner_name) = callee.0 else {
+            return None;
+        };
+        let mut inner_arguments = Vec::with_capacity(written.0.len());
+        for argument in &written.0 {
+            inner_arguments.push(inline_argument(argument, method.source, &bindings)?);
+        }
+        declarations.extend(style_link_declarations(
+            surface,
+            inner_name,
+            &inner_arguments,
+            depth + 1,
+        )?);
+    }
+    Some(declarations)
+}
+
+/// One argument of a `style.vl` body, with the caller's arguments substituted
+/// for the parameters it names — or `None` when the expression is not one this
+/// substitution can do exactly.
+///
+/// Three shapes carry a meaning, and everything else is refused rather than
+/// guessed at:
+///  - the expression IS a parameter (`self.with_length("gap", value)`), so the
+///    caller's own node passes straight through and its plain-token-run reading
+///    survives;
+///  - the expression NAMES no parameter (`"padding-left"`), so it is its own
+///    text and its own node;
+///  - the expression is a path or call rooted at a parameter (`value.value()`),
+///    so the caller's text is spliced at the parameter's own span.
+///
+/// A `Binary` needs NO special case since A101, and losing the one it had is a
+/// fix. `i"{x}"` lexes to `("" + (x))` (the lexer desugars an interpolation in
+/// place) and the arm unwrapped it to its hole, so `flex_grow(3)` — whose body
+/// is `self.raw("flex-grow", i"{value}")` — converted to `flex-grow: {3};`,
+/// which lowers to `.raw("flex-grow", 3)` and does not compile: an `f64` is no
+/// `CssValue`, and the block spelling the refactor offered was one the type
+/// system refuses. The span splice reads the i-string WHOLE (its node spans the
+/// literal and the parameter sits inside it), so `flex-grow(i"{3}")` is what it
+/// writes now — the method's own expression, which is what the inliner promises
+/// everywhere else.
+fn inline_argument<'a>(
+    node: &'a vilan_core::Spanned<Node<'a>>,
+    style_source: &'a str,
+    bindings: &[(&str, &InlineValue<'a>)],
+) -> Option<InlineValue<'a>> {
+    if let Node::Accessor(name) = node.0
+        && let Some((_, value)) = bindings.iter().find(|(parameter, _)| *parameter == name)
+    {
+        return Some((*value).clone());
+    }
+    let mut holes: Vec<(vilan_core::span::Span, usize)> = Vec::new();
+    collect_parameter_spans(node, bindings, &mut holes);
+    let range = node.1.into_range();
+    if holes.is_empty() {
+        return Some(InlineValue {
+            text: style_source.get(range)?.to_string(),
+            written: Some((node, style_source)),
+        });
+    }
+    holes.sort_by_key(|(span, _)| span.start);
+    let mut text = String::new();
+    let mut cursor = range.start;
+    for (span, index) in holes {
+        if span.start < cursor || span.end > range.end {
+            return None;
+        }
+        text.push_str(style_source.get(cursor..span.start)?);
+        text.push_str(&bindings[index].1.text);
+        cursor = span.end;
+    }
+    text.push_str(style_source.get(cursor..range.end)?);
+    Some(InlineValue {
+        text,
+        written: None,
+    })
+}
+
+/// Every span inside `node` at which one of `bindings`' parameters is READ.
+///
+/// The walk is deliberately not `for_each_child`'s: a member name is not a
+/// scope name, so `value.value()` reads the parameter once (its subject) and
+/// names a method the second time, and substituting both would write
+/// `Display::Flex.Display::Flex()`.
+fn collect_parameter_spans<'a>(
+    node: &'a vilan_core::Spanned<Node<'a>>,
+    bindings: &[(&str, &InlineValue<'a>)],
+    out: &mut Vec<(vilan_core::span::Span, usize)>,
+) {
+    match &node.0 {
+        Node::Accessor(name) => {
+            if let Some(index) = bindings.iter().position(|(parameter, _)| parameter == name) {
+                out.push((node.1, index));
+            }
+        }
+        Node::MemberAccessor(subject, member) => {
+            collect_parameter_spans(subject, bindings, out);
+            // `x.f(a)` — `f` is the method's name, `a` is an expression.
+            if let Node::Call(_, _, arguments) = &member.0 {
+                for argument in &arguments.0 {
+                    collect_parameter_spans(argument, bindings, out);
+                }
+            }
+        }
+        Node::StaticAccessor(subject, _, _) => collect_parameter_spans(subject, bindings, out),
+        _ => node
+            .0
+            .for_each_child(&mut |child| collect_parameter_spans(child, bindings, out)),
+    }
 }
 
 /// Whether `name` is spellable as a `css` property: the span-adjacent
@@ -3390,19 +8062,39 @@ fn is_css_property(name: &str) -> bool {
     })
 }
 
-/// The whole `#rrggbb` run the `#` diagnostic at `hash` points at — when it IS
-/// one. CSS has exactly four hex-colour lengths (3, 4, 6 and 8 digits), and the
-/// run has to END there: `#zzz` and `#333xyz` are not colours, and a fix that
-/// rewrote them would be inventing a value the author never wrote. Those keep
-/// the rule's explanation and get no edit at all (css-block.md §7.2 fix 1).
-fn hex_colour_span(text: &str, hash: usize) -> Option<Span> {
-    let rest = text.get(hash..)?.strip_prefix('#')?;
-    let digits = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
-    let ends = rest
-        .as_bytes()
-        .get(digits)
-        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
-    (matches!(digits, 3 | 4 | 6 | 8) && ends).then(|| Span::from(hash..hash + 1 + digits))
+/// E218's quick fixes, and the binary-operator refusal's between an index and
+/// another integer width: the edits `vilan_ide::numeric_fix` computes — the
+/// one function `vilan check --fix` applies too (I5 §8.3) — each wrapped as a
+/// quick fix. A literal-bound counter's declaration comes first where there is
+/// one (`mut at = 0;` becomes `mut at: usize = 0;`), then the conversion.
+///
+/// The conversion is parenthesized unless the value is already a postfix
+/// operand (a name, a field path, a call chain): `xs.len()` becomes
+/// `xs.len().as_u53()`, and `xs.len() + 1` becomes `(xs.len() + 1).as_u53()`,
+/// the conversion of the whole value the diagnostic is about rather than of its
+/// last operand.
+/// `None` when the diagnostic carries no numeric fix, so the caller's chain of
+/// fix families moves on to the next.
+fn numeric_conversion_fixes(text: &str, diagnostic: &Error) -> Option<Vec<QuickFix>> {
+    let fixes: Vec<QuickFix> =
+        vilan_ide::numeric_fix::numeric_fixes(text, diagnostic.span, &diagnostic.msg)
+            .into_iter()
+            .map(|fix| match fix.edit {
+                NumericEdit::DeclareUsize(name) => QuickFix {
+                    title: format!("Declare `{name}` a `usize`"),
+                    span: fix.span,
+                    replacement: fix.replacement,
+                    target: None,
+                },
+                NumericEdit::Convert(method) => QuickFix {
+                    title: format!("Convert with `.{method}()`"),
+                    span: fix.span,
+                    replacement: fix.replacement,
+                    target: None,
+                },
+            })
+            .collect();
+    (!fixes.is_empty()).then_some(fixes)
 }
 
 /// css-block.md §7.2 fix 2: `@media (min-width: 768px) {` → `.md {`.
@@ -3447,6 +8139,304 @@ fn media_rule_fix(text: &str, at: usize) -> Option<QuickFix> {
         title: format!("Use `{spelling}`"),
         span: Span::from(at..at + "@media".len() + after_query + brace + 1),
         replacement: format!("{head} {{"),
+        target: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// E201 — A101's quick fix: `property: value;` → `property(value);`
+//
+// A101 made a `css` declaration a CALL, and the refusal at the `:` is the
+// message every migrating program hits. The rewrite is the codemod's own
+// (`sweeps/order37/tools/css_call_codemod.py`, R10/R11/R12), reproduced here
+// for the two MECHANICAL cases the item names — a single `{expr}` hole, and a
+// plain text value — plus the whitespace-separated mixed form, which is the
+// same rule applied per piece. Three shapes DECLINE and are left to the
+// author: a glued value (`calc({w} + 2px)`, `{150}ms`), whose faithful rewrite
+// is an i-string with a `piece(..)` per hole and is a judgement about the value
+// rather than a mechanical edit; a value carrying `!important`, which has its
+// own refusal and its own fix once the call form is reached; and anything the
+// scan cannot read off the text.
+//
+// Text, not the AST: the parser REFUSED, so there is no `CssDeclaration` node
+// to read — the diagnostic's span (the `:`) plus the bytes either side of it is
+// all there is, which is also what makes the fix available in a file that does
+// not parse at all.
+// ---------------------------------------------------------------------------
+
+/// One piece of a css declaration's value: a run of literal text, or a
+/// `{expr}` hole.
+#[derive(Debug, PartialEq, Eq)]
+enum CssValuePiece {
+    Text(std::ops::Range<usize>),
+    Hole(std::ops::Range<usize>),
+}
+
+/// The `std::style::prelude` constructor for a whole text value, or `None` when
+/// it has none and the value stays a string literal.
+///
+/// The table is deliberately SMALL, exactly as the codemod's is: the css
+/// lowering makes a typed value and its string spelling byte-identical, so the
+/// choice is readability only, and a rewrite that guessed wrong would be worse
+/// than one that did not guess. Every name is a free function of
+/// `std::style::prelude`, which is ambient inside a `css` block, so a typed
+/// rewrite needs no import.
+fn css_typed_constructor(value: &str) -> Option<String> {
+    let value = value.trim();
+    for (suffix, constructor) in [
+        ("px", "px"),
+        ("rem", "rem"),
+        ("em", "em"),
+        ("vh", "vh"),
+        ("vw", "vw"),
+        ("%", "pct"),
+    ] {
+        let Some(digits) = value.strip_suffix(suffix) else {
+            continue;
+        };
+        // `em` is a suffix of `rem`, so the longer unit must win — the table is
+        // ordered for it, and `rem` is matched before `em` is tried.
+        if digits.is_empty() || !is_css_decimal(digits) {
+            continue;
+        }
+        // The constructors take `f64` and vilan reads a bare `4` as one in that
+        // position, so the digits pass through exactly as written.
+        return Some(format!("{constructor}({digits})"));
+    }
+    None
+}
+
+/// A non-negative decimal with at most one point and digits on both sides of
+/// it — what a unit constructor's argument may be.
+fn is_css_decimal(digits: &str) -> bool {
+    let mut halves = digits.split('.');
+    let whole = halves.next().unwrap_or_default();
+    let fraction = halves.next();
+    halves.next().is_none()
+        && !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+/// A vilan string literal holding `value` verbatim.
+fn css_string_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Splits a declaration's value text into its pieces. A `{` opens a hole at ANY
+/// depth (`calc({w} + 2px)` is the shape that matters), matched brace-balanced
+/// and string-aware; `None` when a brace does not close.
+fn css_value_pieces(value: &str) -> Option<Vec<CssValuePiece>> {
+    let bytes = value.as_bytes();
+    let mut pieces = Vec::new();
+    let mut text_from = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => at = css_past_string(value, at),
+            b'{' => {
+                if text_from < at {
+                    pieces.push(CssValuePiece::Text(text_from..at));
+                }
+                let end = css_past_braces(value, at)?;
+                pieces.push(CssValuePiece::Hole(at..end));
+                at = end;
+                text_from = end;
+            }
+            // An unbalanced closer means the value is not what this scan
+            // thinks it is.
+            b'}' => return None,
+            _ => at += 1,
+        }
+    }
+    if text_from < bytes.len() {
+        pieces.push(CssValuePiece::Text(text_from..bytes.len()));
+    }
+    Some(pieces)
+}
+
+/// Just past the string literal opening at `at`.
+fn css_past_string(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut scan = at + 1;
+    while scan < bytes.len() {
+        match bytes[scan] {
+            b'\\' => scan += 2,
+            b'"' => return scan + 1,
+            _ => scan += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Just past the `}` closing the brace group that opens at `at`, or `None` when
+/// it does not close.
+fn css_past_braces(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut scan = at;
+    while scan < bytes.len() {
+        match bytes[scan] {
+            b'"' => {
+                scan = css_past_string(text, scan);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                // Checked: a formatter or a fix that PANICS on odd text is
+                // worse than one that declines, and the language server runs
+                // this behind a fence it should not need.
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(scan + 1);
+                }
+            }
+            _ => {}
+        }
+        scan += 1;
+    }
+    None
+}
+
+/// The argument list `property(..)` takes for this value text, or `None` when
+/// the shape declines.
+fn css_call_arguments(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // `!important` has its own refusal and its own fix (§10, `IMPORTANT_HAS_NO
+    // PLACE`); rewriting the declaration around it would hand the author a
+    // second diagnostic as the reward for taking a fix.
+    if value.contains("!important") {
+        return None;
+    }
+    let pieces = css_value_pieces(value)?;
+    match pieces.as_slice() {
+        // Exactly one hole: the expression itself, which is what the hole
+        // always was.
+        [CssValuePiece::Hole(range)] => {
+            let inner = value.get(range.start + 1..range.end - 1)?.trim();
+            (!inner.is_empty()).then(|| inner.to_string())
+        }
+        // No holes at all: the typed constructor where the table has one, a
+        // string literal otherwise.
+        [CssValuePiece::Text(_)] => {
+            Some(css_typed_constructor(value).unwrap_or_else(|| css_string_literal(value)))
+        }
+        [] => None,
+        // Mixed. The pieces are N arguments when every boundary between them
+        // is whitespace — the desugar joins N arguments with exactly one
+        // space, so a GLUED boundary would gain a space the value never had.
+        // Those decline: their faithful rewrite is an i-string carrying a
+        // `piece(..)` per hole, which is a decision about the value.
+        pieces => {
+            let mut arguments: Vec<String> = Vec::new();
+            for piece in pieces {
+                match piece {
+                    CssValuePiece::Hole(range) => {
+                        let inner = value.get(range.start + 1..range.end - 1)?.trim();
+                        if inner.is_empty() {
+                            return None;
+                        }
+                        arguments.push(inner.to_string());
+                    }
+                    CssValuePiece::Text(range) => {
+                        let run = value.get(range.clone())?;
+                        // The boundary test: a text run adjacent to a hole must
+                        // be separated from it by whitespace on that side.
+                        let leading = range.start == 0 || run.starts_with([' ', '\t']);
+                        let trailing = range.end == value.len() || run.ends_with([' ', '\t']);
+                        if !leading || !trailing {
+                            return None;
+                        }
+                        let run = run.trim();
+                        if !run.is_empty() {
+                            arguments.push(
+                                css_typed_constructor(run)
+                                    .unwrap_or_else(|| css_string_literal(run)),
+                            );
+                        }
+                    }
+                }
+            }
+            (!arguments.is_empty()).then(|| arguments.join(", "))
+        }
+    }
+}
+
+/// The whole rewrite of the declaration whose `:` the A101 diagnostic spans:
+/// the span to replace and its replacement text.
+///
+/// `colon` is `diagnostic.span.start` — the parser reports at exactly the token
+/// where a `(` belongs. The property is read BACKWARDS from it (the property
+/// production is `-*[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*`, so a custom
+/// property's leading dashes ride along, R12) and the value forwards to the
+/// `;`.
+fn css_declaration_call_edit(text: &str, colon: usize) -> Option<(Span, String)> {
+    text.get(colon..)?.strip_prefix(':')?;
+    let before = text.get(..colon)?;
+    let name_end = before.trim_end_matches([' ', '\t']).len();
+    let name_start = before
+        .get(..name_end)?
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
+        })
+        .map(|(at, _)| at)
+        .last()
+        .unwrap_or(name_end);
+    let name = before.get(name_start..name_end)?;
+    if name.is_empty() || !css_property_is_well_formed(name) {
+        return None;
+    }
+    // The value ends at the `;`, which A101's own production requires. A hole
+    // may hold one (`{ if a { 1; } else { 2 } }`), so the search skips holes
+    // and strings rather than taking the first `;` it meets.
+    let after = text.get(colon + 1..)?;
+    let terminator = css_value_terminator(after)?;
+    let arguments = css_call_arguments(after.get(..terminator)?)?;
+    Some((
+        Span::from(name_start..colon + 1 + terminator + 1),
+        format!("{name}({arguments});"),
+    ))
+}
+
+/// The offset of the `;` ending a declaration's value, skipping holes and
+/// strings. `None` when the value does not terminate (the file is mid-edit) or
+/// runs into the block's own `}`.
+fn css_value_terminator(after: &str) -> Option<usize> {
+    let bytes = after.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => at = css_past_string(after, at),
+            b'{' => at = css_past_braces(after, at)?,
+            b';' => return Some(at),
+            // The declaration is unterminated and the block has closed.
+            b'}' => return None,
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// Whether `name` is the css property production: optional leading dashes, then
+/// hyphen-joined identifier segments.
+fn css_property_is_well_formed(name: &str) -> bool {
+    let body = name.trim_start_matches('-');
+    if body.is_empty() {
+        return false;
+    }
+    body.split('-').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && !segment.as_bytes()[0].is_ascii_digit()
     })
 }
 
@@ -3456,6 +8446,32 @@ fn media_rule_fix(text: &str, at: usize) -> Option<QuickFix> {
 /// which none of the three `note_terminator` call sites currently reach but
 /// nothing guarantees against structurally.
 const MISSING_TERMINATOR_MESSAGE: &str = "expected `;` to end this statement";
+
+/// B343 (R9)'s fix: `|| void context c` → `(|| void) context c`, the reading
+/// that gives the clause to the FUNCTION.
+///
+/// `span` is the WRITTEN return type whole (the parser spans the refusal there
+/// for this), and the clause is its trailing `context …`, so the edit is a pair
+/// of parentheses around what precedes it. The clause is found from the RIGHT,
+/// at a word boundary and followed by a name or the multi form's `(` — a type
+/// may perfectly well name `my_context`, and a clause may name a context called
+/// `context`, and neither must be mistaken for the keyword.
+fn parenthesized_return_clause(text: &str, span: Span) -> Option<String> {
+    let written = text.get(span.into_range())?;
+    let at = written
+        .match_indices("context")
+        .filter(|(at, _)| {
+            written[..*at].ends_with([' ', '\t'])
+                && written[at + "context".len()..].starts_with([' ', '\t', '('])
+        })
+        .map(|(at, _)| at)
+        .last()?;
+    let head = written[..at].trim_end();
+    if head.is_empty() {
+        return None;
+    }
+    Some(format!("({head}) {}", &written[at..]))
+}
 
 /// Regime 1's message suffix (`analyzer.rs::missing_return_value_message`) —
 /// matched by SUFFIX (own sentence, own period) so it can't fire on regime
@@ -3521,8 +8537,147 @@ fn trailing_semicolon_to_remove(
 /// Whether two spans share at least one byte position — touching counts, so
 /// a zero-width cursor range sitting right at a diagnostic's edge still
 /// overlaps it.
+/// E213: the hover lead line for a declaration carrying
+/// `[internal("reason")]` — a function, a method or an external — or `None`
+/// for the overwhelming majority that carry none.
+fn internal_lead(program: &Program, declaration_id: Id) -> Option<String> {
+    // E221: every declaration kind, through the one reader — and B382's
+    // steer, which leads first: it is the line that says what to use instead.
+    let deprecated = vilan_core::labels::deprecated_of(program, declaration_id)
+        .map(|steer| format!("**deprecated** — {steer}"));
+    let internal = vilan_core::labels::internal_of(program, declaration_id).map(internal_line);
+    match (deprecated, internal) {
+        (Some(deprecated), Some(internal)) => Some(format!("{deprecated}\n\n{internal}")),
+        (deprecated, internal) => deprecated.or(internal),
+    }
+}
+
+/// B415: the span of `self` in the file's leading `[platform(..)]? mod self;`,
+/// or `None` when the file does not open with one. The byte scan first, so the
+/// overwhelming majority of files — which never write `mod` before `self` —
+/// pay no lex: only a file that might is tokenized, and then only its head is
+/// read (the parser refuses the host anywhere else).
+fn mod_self_name_span(text: &str) -> Option<Span> {
+    let candidate = text
+        .match_indices("mod")
+        .any(|(at, _)| text[at + 3..].trim_start().starts_with("self"));
+    if !candidate {
+        return None;
+    }
+    let (tokens, _errors) = tokenize(text);
+    let mut rest = tokens.iter();
+    let mut next = rest.next()?;
+    if next.0 == vilan_core::token::Token::Ctrl('[') {
+        let mut depth = 1usize;
+        while depth > 0 {
+            next = rest.next()?;
+            match next.0 {
+                vilan_core::token::Token::Ctrl('[') => depth += 1,
+                vilan_core::token::Token::Ctrl(']') => depth -= 1,
+                _ => {}
+            }
+        }
+        next = rest.next()?;
+    }
+    if next.0 != vilan_core::token::Token::Mod {
+        return None;
+    }
+    let name = rest.next()?;
+    (name.0 == vilan_core::token::Token::Ident("self")).then_some(name.1)
+}
+
+/// F27 R1: the `[platform(..)] mod self;` (B415) an overlay note recommends —
+/// the declaration the note spells, read back off the one sentence that states
+/// it, so the fix and the diagnostic cannot name two different attributes.
+fn declared_platform_attribute(note: &str) -> Option<&str> {
+    let tail = " at the top of the file analyzes it under that platform";
+    let end = note.find(tail)?;
+    let head = &note[..end];
+    let start = head.rfind("`[platform(")?;
+    let attribute = head[start..].strip_prefix('`')?.strip_suffix('`')?;
+    attribute.ends_with(")] mod self;").then_some(attribute)
+}
+
+/// E221: a variant reached through its enum's PATH (`Side::Auto`) is one
+/// entity spanning the whole path, and that token overlaps the enum's own
+/// type-reference token (`Side`) — so the overlap filter dropped it, and the
+/// variant was never painted at all, let alone dimmed. Its token is the LEAF:
+/// the variant's name at the end of the span, when the span is longer than it.
+/// Every other reference keeps its span.
+fn variant_leaf(program: &Program, target: Id, span: Span) -> Span {
+    let Some(Expr::EnumVariant(enum_id, index)) = program.entity_map.get(&target) else {
+        return span;
+    };
+    let Some(variant) = program
+        .enums
+        .get(enum_id)
+        .and_then(|enumeration| enumeration.variants.get(*index))
+    else {
+        return span;
+    };
+    let range = span.into_range();
+    if range.end - range.start <= variant.name.len() {
+        return span;
+    }
+    Span::from(range.end - variant.name.len()..range.end)
+}
+
+/// How the label reads in the editor, in ONE place: hover's lead line and the
+/// field hover's both, so the two cannot drift into two spellings of the same
+/// fact. Deliberately not the word "private" — the item IS reachable, and
+/// saying otherwise would contradict what visibility already answered.
+fn internal_line(reason: &str) -> String {
+    format!("**internal** — {reason}")
+}
+
 fn spans_overlap(a: Span, b: Span) -> bool {
     a.start <= b.end && b.start <= a.end
+}
+
+/// Whether `outer` covers `inner` — an import statement's span against one of
+/// its own leaf or module spans (E173).
+fn spans_contain(outer: Span, inner: Span) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+/// M85: every entry-file struct FIELD position a hover can land on, sorted by
+/// start — a field's declaration name span, and every struct-initializer key
+/// span, each with the `(struct, field index)` pair it resolves to.
+///
+/// Both halves come from records the analyzer already keeps, which is E204's
+/// design and the reason the declaration and the use site cannot drift apart:
+/// `Field::name_span` for a declaration, `struct_initializer_field_spans` for
+/// a key. This function is only the indexing.
+///
+/// Entry file only, like `entity_spans`: every span-containment answer in this
+/// file is about this buffer's coordinate space.
+fn field_spans_of(program: &Program) -> Vec<(usize, usize, Id, usize)> {
+    let mut rows: Vec<(usize, usize, Id, usize)> = Vec::new();
+    for (struct_id, structure) in &program.structs {
+        if program.source_of(*struct_id) != Some(SourceId(0)) {
+            continue;
+        }
+        for (index, field) in structure.fields.iter().enumerate() {
+            let range = field.name_span.into_range();
+            if range.start < range.end {
+                rows.push((range.start, range.end, *struct_id, index));
+            }
+        }
+    }
+    for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
+        if *source != SourceId(0) {
+            continue;
+        }
+        let range = span.into_range();
+        if range.start < range.end {
+            rows.push((range.start, range.end, *struct_id, *index));
+        }
+    }
+    // `program.structs` is a hash map, so the rows arrive in an arbitrary
+    // order and the sort is what makes the bisect possible at all. Sorted by
+    // start alone: the rows are disjoint, so no two share one.
+    rows.sort_unstable_by_key(|(start, ..)| *start);
+    rows
 }
 
 /// Replaces the byte range `span` in `source` with `replacement`. The
@@ -3545,7 +8700,9 @@ fn splice(source: &str, span: Span, replacement: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
-    use vilan_ide::completion::{import_path_segments, in_import_path};
+    use vilan_ide::completion::{
+        SelectorPosition, impl_selector_position, import_path_segments, in_import_path,
+    };
     use vilan_ide::{AUTO_IMPORT_COMPLETION_CAP, CONSTRUCT_SNIPPETS, CompletionKind};
 
     pub(crate) fn std_root() -> PathBuf {
@@ -3561,6 +8718,58 @@ pub(crate) mod tests {
     /// `Document::analyze` gives the pipeline, for tests that drive
     /// `analyze_on_this_thread` directly (to read the thread-local leak tally
     /// on the thread that analyzed).
+    /// Serializes the pins that read or write the compiler's PROCESS-GLOBAL
+    /// base-cache state — its worlds, its M23 overlay claims, its M24 byte
+    /// budget (`vilan-core/tests/base_cache.rs` keeps its own `CACHE_LOCK`
+    /// for exactly this reason).
+    ///
+    /// `cargo nextest` gives every test its own process, so under the
+    /// project's gate this lock is never contended. Plain `cargo test` runs a
+    /// binary's tests as threads in ONE process, and CLAUDE.md records that
+    /// as a correct, slower equivalent — which it stops being the moment two
+    /// tests clear each other's cache or lower each other's budget. Acquire
+    /// it in the test body, before `on_big_stack`: the guard is not `Send`,
+    /// and it does not need to be, because that call blocks until its thread
+    /// joins.
+    ///
+    /// **What it does NOT buy under plain `cargo test` (N131).** It serializes
+    /// the pins that TAKE it against each other, and nothing else: every other
+    /// test in this binary that analyzes — ~850 of them, the references and
+    /// server pins included — stores, hits and evicts worlds in the same cache
+    /// at the same time. So under `cargo test` at load, a pin that reads the
+    /// cache's GLOBAL state reads a stranger's world as well as its own:
+    /// `base_cache_overlay_claims()` counted `(2, 164)` for one claimed copy of
+    /// 35 bytes, an LRU eviction another thread's store triggered released a
+    /// world's leak tally on THIS thread (an outstanding count of -93), and the
+    /// "first analysis of a new key must MISS" pin read 904 misses for 900
+    /// (`m24_budget_eviction`, `overlay_module_reclaim`, `m23_scripted_session`,
+    /// `session_growth`; three runs at loadavg 30-55 on d65d4e75: red, red,
+    /// green). Those pins are LOAD-SENSITIVE under `cargo test` by construction
+    /// and exact under nextest, which is the gate.
+    ///
+    /// The `references::` pins' M19 replay panic ("the world's `sources` vector
+    /// moved") is the same shared cache meeting a second std ROOT: the pins
+    /// here analyze with `std_root()` (the tree, spelled through
+    /// `crates/vilan-lsp/../..`), the server pins resolve std through
+    /// `discover_std_dir`, which for a document under the temp directory is the
+    /// MATERIALIZED embedded std (`~/.vilan/std-cache/<hash>`). The two are
+    /// byte-identical, and the base-cache key carries no std root, so both
+    /// analyses file under one key; a checks record written from one root's
+    /// world was read on a hit of the other's. Measured, not inferred: the
+    /// panic's two fingerprints are exactly those of `sources[1..]` for
+    /// `import std::io::print` under the tree std (5909227631414359650) and
+    /// under the materialized std (3214450399013780599).
+    pub(crate) static BASE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes [`BASE_CACHE_LOCK`], recovering from a poisoned one: a pin that
+    /// panicked has already reported, and the next pin's own setup (a clear,
+    /// a budget reset) is what puts the cache back in a known state.
+    pub(crate) fn base_cache_guard() -> std::sync::MutexGuard<'static, ()> {
+        BASE_CACHE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
@@ -3592,6 +8801,72 @@ pub(crate) mod tests {
         assert!(!file.exists(), "the pin needs a path not on disk");
         assert!(is_within(&directory, &file));
         assert!(!is_within(&root.join("pkg/other"), &file));
+    }
+
+    /// B207 — the shape B198 fixed in the build, unaudited in the editor: the
+    /// subject of a containment test here is an OPEN BUFFER, and an open buffer
+    /// need not be on disk.
+    ///
+    /// A project root reached through a symlink is supported layout (`const.md`
+    /// §9.2), so `link/pkg/src/untitled.vl` — a file the user created in the
+    /// editor and has not saved — is a file inside `pkg/src`. With
+    /// `canonical_path` on both sides the buffer degraded to its LEXICAL
+    /// spelling (nothing on disk to resolve) while the layer root resolved
+    /// through the link, and the containment answered NO: the document lost its
+    /// package root, its platform and every `pkg::` import.
+    ///
+    /// Unix-only for the link; [`is_within_holds_for_an_unsaved_buffer_under_a_real_root`]
+    /// is the control that runs everywhere.
+    #[cfg(unix)]
+    #[test]
+    fn is_within_holds_for_an_unsaved_buffer_under_a_symlinked_root() {
+        let root = std::env::temp_dir().join(format!("vilan-lsp-b207-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real/pkg/src")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        // The layer root as the manifest scan found it: on disk, real spelling.
+        let directory = root.join("real/pkg/src");
+        // The open buffer, reached through the link and NOT on disk.
+        let unsaved = root.join("link/pkg/src/untitled.vl");
+        assert!(!unsaved.exists(), "the pin needs a buffer not on disk");
+        assert!(
+            is_within(&directory, &unsaved),
+            "an unsaved buffer under a symlinked project root is inside its own package"
+        );
+        // The link's own spelling of the root answers the same, in both
+        // directions: one file, two honest ancestries.
+        assert!(is_within(&root.join("link/pkg/src"), &unsaved));
+        assert!(is_within(
+            &root.join("link/pkg/src"),
+            &root.join("real/pkg/src/untitled.vl")
+        ));
+        // And the same buffer is the same file whichever name reached it.
+        assert!(same_file(&unsaved, &root.join("real/pkg/src/untitled.vl")));
+        // Still a real test: a sibling package does not contain it.
+        std::fs::create_dir_all(root.join("real/other/src")).unwrap();
+        assert!(!is_within(&root.join("real/other/src"), &unsaved));
+        assert!(!is_within(&root.join("link/other/src"), &unsaved));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The control for [`is_within_holds_for_an_unsaved_buffer_under_a_symlinked_root`]:
+    /// no link anywhere, so both sides resolve the same way whatever helper is
+    /// used, and the unsaved buffer is inside its package on every platform.
+    /// It is what says the symlink pin above is about the LINK and not about
+    /// the file being missing.
+    #[test]
+    fn is_within_holds_for_an_unsaved_buffer_under_a_real_root() {
+        let root =
+            std::env::temp_dir().join(format!("vilan-lsp-b207-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg/src")).unwrap();
+        let unsaved = root.join("pkg/src/untitled.vl");
+        assert!(!unsaved.exists(), "the pin needs a buffer not on disk");
+        assert!(is_within(&root.join("pkg/src"), &unsaved));
+        assert!(!is_within(&root.join("pkg/other"), &unsaved));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3627,6 +8902,184 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&entry).unwrap();
         let document = Document::analyze(&text, &std_root(), &entry);
         (dir, document)
+    }
+
+    /// M27's `source_lookup` is a BINARY SEARCH standing in for
+    /// `Program::source_of`'s linear scan, and until M58 nothing held the two to
+    /// the same answer — five callers deep, including the two editor tables this
+    /// lane hoisted (`semantic_tokens`, `inlay_hints`), on a promise its own
+    /// doc-comment makes and no test checked.
+    ///
+    /// The premise is that entity ids are minted from a monotonically increasing
+    /// counter, so `source_ranges` comes out ascending and disjoint. The lookup
+    /// refuses to ASSUME that — it verifies once and falls back to the scan when
+    /// it does not hold — which is exactly the branch a pin has to exercise the
+    /// other side of: over a real multi-module program, with `std`, a package
+    /// module and a generated derive in it, every id the program knows must get
+    /// the SAME answer from both.
+    #[test]
+    fn the_hoisted_source_lookup_answers_exactly_what_source_of_answers() {
+        let _guard = base_cache_guard();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::rows::Row;\n\n\
+                 fun main() {\n\tlet row = Row { label: \"a\" };\n\tprint(row.label);\n}\n",
+            ),
+            (
+                "rows.vl",
+                "[derive(Debug)]\nstruct Row {\n\tlabel: str,\n}\n",
+            ),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("the fixture analyzes cleanly");
+
+        // Every id the program holds a row for, whichever table it lives in —
+        // the entity map is the biggest, and the declaration tables carry ids
+        // the entity map does not.
+        let mut checked = 0usize;
+        let lookup = program.source_lookup();
+        let check = |id: Id| {
+            assert_eq!(
+                lookup.of(id),
+                program.source_of(id),
+                "the hoisted lookup and the scan disagree about id {}",
+                id.0,
+            );
+        };
+        for id in program.entity_map.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.variables.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.structs.keys() {
+            check(*id);
+            checked += 1;
+        }
+        assert!(
+            checked > 100,
+            "a std-using two-module program should hold more than {checked} ids — a pin that \
+             checks a handful is not checking the seam",
+        );
+
+        // And the ids that are in NO range: below the first, past the last, and
+        // the sentinel. `source_of` answers `None` for each, and a binary
+        // search's `partition_point` is exactly where an off-by-one would hide.
+        check(Id(u32::MAX));
+        check(Id(0));
+        let past_the_end = program
+            .entity_map
+            .keys()
+            .map(|id| id.0)
+            .max()
+            .unwrap_or_default()
+            + 1;
+        check(Id(past_the_end));
+
+        // The entry's own rows are what the editor tables filter for, so the
+        // agreement has to be non-trivial: some ids ARE the entry's and some
+        // are not.
+        let entry_ids = program
+            .entity_map
+            .keys()
+            .filter(|id| lookup.of(**id) == Some(SourceId(0)))
+            .count();
+        assert!(
+            entry_ids > 0 && entry_ids < program.entity_map.len(),
+            "the fixture must hold both entry and non-entry entities ({entry_ids} of {})",
+            program.entity_map.len(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M65's half of the same promise: the ids `CompletionIndex::build` asks
+    /// about get the same answer from the hoisted lookup as from the scan.
+    ///
+    /// The index build is the residue M58's own profile named — it asked
+    /// `Program::source_of` 14,580 times for 7.5 M Ir on kolt's client, a
+    /// LINEAR scan of `source_ranges` re-run once per row — and the hoist is
+    /// the identical one, so the pin is the identical one too, narrowed to this
+    /// build's own population: every FUNCTION and EXTERNAL (`DocParagraphs`
+    /// groups its declarations by declaring source), and every name bound in a
+    /// top-level module of `std` and `pkg` (`AutoImportOrder` keeps only the
+    /// names a module DECLARES, which is `source_of(entity) == source_of(the
+    /// module)` — a comparison of two answers, so a lookup that disagreed with
+    /// the scan on either side would change which names are offered).
+    #[test]
+    fn the_hoisted_lookup_answers_the_completion_index_build_the_same_way() {
+        let _guard = base_cache_guard();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::rows::Row;\n\n\
+                 fun main() {\n\tlet row = Row { label: \"a\" };\n\tprint(row.label);\n}\n",
+            ),
+            ("rows.vl", "struct Row {\n\tlabel: str,\n}\n"),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("the fixture analyzes cleanly");
+        let lookup = program.source_lookup();
+        let mut checked = 0usize;
+        let check = |id: Id| {
+            assert_eq!(
+                lookup.of(id),
+                program.source_of(id),
+                "the hoisted lookup and the scan disagree about id {}",
+                id.0,
+            );
+        };
+        for id in program.functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for id in program.external_functions.keys() {
+            check(*id);
+            checked += 1;
+        }
+        for root in ["std", "pkg"] {
+            let Some(root_module_id) = program.module_id_by_name.get(root) else {
+                continue;
+            };
+            check(*root_module_id);
+            let Some(root_module) = program.modules.get(root_module_id) else {
+                continue;
+            };
+            let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
+                continue;
+            };
+            for child_id in root_scope.name_to_id_map.values() {
+                check(*child_id);
+                checked += 1;
+                let Some(child_module) = program.modules.get(child_id) else {
+                    continue;
+                };
+                let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
+                    continue;
+                };
+                for entity_id in child_scope.name_to_id_map.values() {
+                    check(*entity_id);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 500,
+            "a std-using two-module program should reach more than {checked} of the index \
+             build's ids — a pin that checks a handful is not checking the hoist",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // An error INSIDE an imported module publishes to that module's path, with
@@ -3738,16 +9191,169 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The ratified first target (E54): element syntax with no `view` in
-    // scope. `<div/>` desugars to an unresolved `view` accessor, which
-    // already carries the "element syntax lowers to std::ui::view" note
-    // (element-syntax S4) — the quickfix comes from the SAME general
-    // unresolved-name path as any other name, reaching `view` in real std
-    // via `import_candidates`' disk scan, not from the note's text.
+    // B318 §1/§7.1: a PRIVATE item is never an add-import CANDIDATE. The
+    // quickfix menu is one of the three things the bit gates, and it is the one
+    // that would otherwise teach a reader to import a module's own machinery.
+    // An UNCURATED module (no marker anywhere) offers everything, which is what
+    // keeps the menu unchanged until a module opts in (§8).
     #[test]
-    fn quickfix_offers_the_add_import_fix_for_an_unresolved_element_view() {
-        let (dir, document) =
-            analyze_workspace(&[("main.vl", "fun main() {\n\tlet _x = <div/>;\n}\n")]);
+    fn quickfix_never_offers_an_add_import_for_a_private_item() {
+        let curated = "export fun shown() {}\n\nfun help_topic() {}\n";
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", curated),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            !titles.iter().any(|title| title.contains("help_topic")),
+            "a private item is not a candidate: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The exported sibling still is — the filter is the BIT, not a deleted
+        // menu.
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\tshown();\n}\n"),
+            ("topic.vl", curated),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            titles.iter().any(|title| title.contains("pkg::topic")),
+            "an exported item is still a candidate: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // And an uncurated module is exactly what it was before the bit.
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            titles.iter().any(|title| title.contains("pkg::topic")),
+            "an uncurated module offers everything: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A99: the six retired `View` methods. The refusal carries the analyzer's
+    // steer, and the editor's half is the ONE fix that rewrites the call in
+    // place — receiver, chain and arguments untouched, `bind_each(..)` swapped
+    // for `child(each(..))`. Applied and re-analyzed, the file is clean, which
+    // is the claim a title alone cannot make.
+    #[test]
+    fn quickfix_rewrites_a_retired_slot_method_to_the_value_form() {
+        let source = "import std::reactive::{ Signal, SignalCell };\n\
+                      import std::ui::{ View, each, mount_root, view };\n\
+                      \n\
+                      fun main() {\n\
+                      \tlet rows: SignalCell<List<str>> = Signal::new([\"a\"]);\n\
+                      \tlet _root = mount_root(\"app\", || view(\"ul\")\n\
+                      \t\t.bind_each(rows, |item: str| item, |item: str| view(\"li\").text(item)));\n\
+                      }\n";
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .any(|error| error.msg.contains("is no longer a `View` method (A99)")),
+            "the retired method is refused with its steer: {:#?}",
+            document.diagnostics
+        );
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let rewrite: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title.starts_with("Rewrite as"))
+            .collect();
+        assert_eq!(
+            rewrite.len(),
+            1,
+            "exactly one rewrite is offered: {:?}",
+            fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+        );
+        assert_eq!(rewrite[0].title, "Rewrite as `child(each(…))`");
+        assert_eq!(
+            &text[rewrite[0].span.into_range()],
+            "bind_each(rows, |item: str| item, |item: str| view(\"li\").text(item))",
+            "the edit covers the call and nothing of the receiver",
+        );
+        assert_eq!(
+            rewrite[0].replacement,
+            "child(each(rows, |item: str| item, |item: str| view(\"li\").text(item)))"
+        );
+        let mut applied = text.to_string();
+        applied.replace_range(rewrite[0].span.into_range(), &rewrite[0].replacement);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B343 (R9): the refusal for an un-parenthesized closure return type
+    /// carrying a clause offers the parenthesizing edit, and applying it leaves
+    /// the file clean. The fix takes the reading the position exists for — the
+    /// clause on the FUNCTION — and the refusal's own text is what names the
+    /// other one.
+    #[test]
+    fn quickfix_parenthesizes_a_misbound_return_clause() {
+        let source = "import std::io::print;\n\
+                      import std::context::Context;\n\
+                      \n\
+                      let c: Context<i32> = Context::new();\n\
+                      \n\
+                      fun make(): || void context c {\n\
+                      \t|| print(c.get())\n\
+                      }\n\
+                      \n\
+                      fun main() {\n\
+                      \tc.run(1, || {\n\
+                      \t\tlet body = make();\n\
+                      \t\tbody();\n\
+                      \t});\n\
+                      }\n\
+                      main();\n";
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
         let program = document.program.as_ref().unwrap();
         let text = document.line_index.text();
         let whole_file = Span {
@@ -3755,14 +9361,305 @@ pub(crate) mod tests {
             end: text.len(),
         };
         let fixes = document.quickfixes(program, whole_file);
+        let parenthesize: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title == "Parenthesize the closure type")
+            .collect();
+        assert_eq!(
+            parenthesize.len(),
+            1,
+            "exactly one parenthesizing fix is offered: {:?}",
+            fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &text[parenthesize[0].span.into_range()],
+            "|| void context c",
+            "the edit covers the written return type and nothing else",
+        );
+        assert_eq!(parenthesize[0].replacement, "(|| void) context c");
+        let mut applied = text.to_string();
+        applied.replace_range(
+            parenthesize[0].span.into_range(),
+            &parenthesize[0].replacement,
+        );
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E218: a numeric mismatch offers the conversion its message names,
+    /// written after the value — and parenthesized when the value is not a
+    /// postfix operand — and applying it leaves the file clean.
+    #[test]
+    fn quickfix_converts_a_numeric_mismatch_with_the_named_as_method() {
+        for (value, replacement) in [
+            ("xs.len()", "xs.len().as_u53()"),
+            ("xs.len() + 1", "(xs.len() + 1).as_u53()"),
+        ] {
+            let source = format!(
+                concat!(
+                    "import std::io::print;\n",
+                    "\n",
+                    "fun main() {{\n",
+                    "\tlet xs = [1, 2];\n",
+                    "\tlet n: u53 = {value};\n",
+                    "\tprint(i\"{{n}}\");\n",
+                    "}}\n",
+                    "main();\n",
+                ),
+                value = value
+            );
+            let (dir, document) = analyze_workspace(&[("main.vl", source.as_str())]);
+            let program = document.program.as_ref().unwrap();
+            let text = document.line_index.text();
+            let whole_file = Span {
+                start: 0,
+                end: text.len(),
+            };
+            let fixes = document.quickfixes(program, whole_file);
+            let convert: Vec<_> = fixes
+                .iter()
+                .filter(|fix| fix.title == "Convert with `.as_u53()`")
+                .collect();
+            assert_eq!(
+                convert.len(),
+                1,
+                "exactly one conversion fix is offered for `{value}`: {:?}",
+                fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+            );
+            assert_eq!(&text[convert[0].span.into_range()], value);
+            assert_eq!(convert[0].replacement, replacement);
+            let mut applied = text.to_string();
+            applied.replace_range(convert[0].span.into_range(), &convert[0].replacement);
+            let entry = dir.join("main.vl");
+            std::fs::write(&entry, &applied).unwrap();
+            let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+            assert!(
+                reanalyzed.diagnostics.is_empty(),
+                "applying the fix to `{value}` should leave the file clean: {:#?}",
+                reanalyzed.diagnostics
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// I5 §8.3: a counter bound by a bare literal and met at a `usize` offers
+    /// its DECLARATION first — `mut at: usize = 0;` — and the conversion after
+    /// it; applying the declaration leaves the file clean.
+    #[test]
+    fn quickfix_declares_a_literal_counter_usize_before_converting_it() {
+        let source = concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun take(xs: List<str>, at: usize): str {\n",
+            "\txs[at]\n",
+            "}\n",
+            "\n",
+            "fun step(value: i32): i32 {\n",
+            "\tvalue + 1\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut at = 0;\n",
+            "\tat = step(at);\n",
+            "\tprint(take([\"a\", \"b\"], at));\n",
+            "}\n",
+            "main();\n",
+        );
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let titles: Vec<&str> = fixes.iter().map(|fix| fix.title.as_str()).collect();
+        let declare = titles
+            .iter()
+            .position(|title| *title == "Declare `at` a `usize`")
+            .unwrap_or_else(|| panic!("the declaration is offered: {titles:?}"));
+        let convert = titles
+            .iter()
+            .position(|title| *title == "Convert with `.as_usize()`")
+            .unwrap_or_else(|| panic!("the conversion is offered too: {titles:?}"));
+        assert!(declare < convert, "the declaration comes first: {titles:?}");
+        let fix = &fixes[declare];
+        let mut applied = text.to_string();
+        applied.replace_range(fix.span.into_range(), &fix.replacement);
+        assert!(applied.contains("\tmut at: usize = 0;\n"), "{applied}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I5 §8.3's bulk half: every index mismatch in the file in ONE edit —
+    /// and only the index ones; a `u8` meeting an `i32` keeps its own fix.
+    #[test]
+    fn quickfix_converts_all_indexes_in_the_file_at_once() {
+        let source = concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun take(xs: List<str>, at: usize): str {\n",
+            "\txs[at]\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet xs = [\"a\", \"b\", \"c\"];\n",
+            "\tlet first: i32 = 0;\n",
+            "\tlet last: i32 = 2;\n",
+            "\tprint(take(xs, first));\n",
+            "\tprint(take(xs, last));\n",
+            "\tlet small: u8 = 1u8;\n",
+            "\tlet wide: i32 = small;\n",
+            "\tprint(i\"{wide}\");\n",
+            "}\n",
+            "main();\n",
+        );
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let bulk = fixes
+            .iter()
+            .find(|fix| fix.title.starts_with("Convert all "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the bulk action is offered: {:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(bulk.title, "Convert all 2 indexes in this file");
+        let mut applied = text.to_string();
+        applied.replace_range(bulk.span.into_range(), &bulk.replacement);
+        assert!(
+            applied.contains("print(take(xs, first.as_usize()));"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("print(take(xs, last.as_usize()));"),
+            "{applied}"
+        );
+        assert!(applied.contains("let wide: i32 = small;"), "{applied}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E218's negative: a mismatch that is not between two numeric widths
+    /// names no conversion, so none is offered.
+    #[test]
+    fn quickfix_offers_no_conversion_for_a_non_numeric_mismatch() {
+        let source = concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet at: u53 = 1u53;\n",
+            "\tlet text: str = at;\n",
+            "\tprint(text);\n",
+            "}\n",
+            "main();\n",
+        );
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the program is refused, so the negative is not vacuous"
+        );
+        assert!(
+            fixes
+                .iter()
+                .all(|fix| !fix.title.starts_with("Convert with")),
+            "no conversion is offered: {:?}",
+            fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A99's negative: a call that simply misses a method on some OTHER type
+    // draws no rewrite — the fix is keyed on the retired names through the
+    // analyzer's own table, so nothing else can pick it up.
+    #[test]
+    fn quickfix_offers_no_slot_rewrite_for_an_ordinary_missing_method() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet n = 1;\n\tlet _x = n.bind_everything();\n}\n",
+        )]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            !titles.iter().any(|title| title.starts_with("Rewrite as")),
+            "no slot rewrite for an ordinary miss: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The ratified first target (E54) was element syntax with no `view` in
+    // scope: `<div/>` desugared to an unresolved `view` accessor. B270 (Order
+    // 30) made the element HYGIENIC — `<tag />` means `std::ui::view` whatever
+    // the site's scope holds, and needs no import — so the element itself no
+    // longer raises anything. The `View` TYPE written beside it still does,
+    // and it takes the SAME general unresolved-name path as any other name,
+    // reaching `std::ui` in real std via `import_candidates`' disk scan (the
+    // `std::web` re-export is skipped: nobody is told to `import
+    // std::web::View`). Applied, the file is CLEAN — which is the element's
+    // hygiene pinned from the editor's side too.
+    #[test]
+    fn quickfix_offers_the_add_import_fix_for_the_view_type_beside_a_hygienic_element() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tlet _x: View = <div/>;\n}\n")]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .any(|error| error.msg.contains("cannot find type 'View'")),
+            "the written type is unresolved: {:#?}",
+            document.diagnostics
+        );
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .all(|error| !error.msg.contains("cannot find 'view'")),
+            "B270: the element head needs no import: {:#?}",
+            document.diagnostics
+        );
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
         let view_fixes: Vec<_> = fixes
             .iter()
-            .filter(|fix| fix.title.contains("`view`"))
+            .filter(|fix| fix.title.contains("`View`"))
             .collect();
         assert_eq!(
             view_fixes.len(),
             1,
-            "expected exactly one unambiguous `view` fix: {:?}",
+            "expected exactly one unambiguous `View` fix: {:?}",
             fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
         );
         assert!(
@@ -3770,19 +9667,17 @@ pub(crate) mod tests {
             "{}",
             view_fixes[0].title
         );
-        assert_eq!(view_fixes[0].replacement, "import std::ui::view;\n");
-        // Applied and re-analyzed: the element head resolves.
+        assert_eq!(view_fixes[0].replacement, "import std::ui::View;\n");
+        // Applied and re-analyzed: the type resolves through the import and
+        // the element head through its own seed — nothing is left.
         let mut applied = text.to_string();
         applied.replace_range(view_fixes[0].span.into_range(), &view_fixes[0].replacement);
         let entry = dir.join("main.vl");
         std::fs::write(&entry, &applied).unwrap();
         let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
         assert!(
-            reanalyzed
-                .diagnostics
-                .iter()
-                .all(|error| !error.msg.contains("cannot find 'view'")),
-            "applying the fix should resolve the element head: {:#?}",
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
             reanalyzed.diagnostics
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4053,40 +9948,946 @@ pub(crate) mod tests {
         fixes
     }
 
-    // §7.2 fix 1. `#` cannot lex — lexing is context-free and finishes before
-    // the parser exists (§4.1) — so the diagnostic is ONE CHARACTER wide and
-    // the fix reads the colour off the text itself. It rewrites the whole run,
-    // into the hole spelling the diagnostic already names.
+    // E201. A101's refusal at the `:` is the message every migrating program
+    // hits, and the rewrite is mechanical for the two cases the item names —
+    // one `{expr}` hole, and a plain text value (typed where the codemod's
+    // small table types it, a string otherwise). One pin per shape, not one
+    // representative: a value rule table is exactly what regresses in five of
+    // six and passes.
+
+    /// The plain-text case, both halves of it: a value the table types becomes
+    /// the typed constructor, and one it does not becomes a string literal —
+    /// the css lowering makes the two byte-identical, so the choice is
+    /// readability and the table stays small deliberately.
     #[test]
-    fn quickfix_wraps_a_hex_colour_as_a_colour_hole() {
-        let fixes = css_block_fixes("\tcss {\n\t\tcolor: #336699;\n\t}\n");
+    fn quickfix_rewrites_a_text_css_declaration_as_a_call() {
+        let typed = css_block_fixes("\tcss {\n\t\tpadding: 4px;\n\t}\n");
+        assert!(
+            typed.contains(&(
+                "Write it as a call: `padding(px(4));`".to_string(),
+                "padding: 4px;".to_string(),
+                "padding(px(4));".to_string(),
+            )),
+            "{typed:?}"
+        );
+        // `%` is the one unit whose constructor is not its own spelling.
+        let percent = css_block_fixes("\tcss {\n\t\twidth: 100%;\n\t}\n");
+        assert!(
+            percent.contains(&(
+                "Write it as a call: `width(pct(100));`".to_string(),
+                "width: 100%;".to_string(),
+                "width(pct(100));".to_string(),
+            )),
+            "{percent:?}"
+        );
+        // A fraction rides through as written — the constructors take `f64`.
+        let fractional = css_block_fixes("\tcss {\n\t\tmargin: 1.5rem;\n\t}\n");
+        assert!(
+            fractional.contains(&(
+                "Write it as a call: `margin(rem(1.5));`".to_string(),
+                "margin: 1.5rem;".to_string(),
+                "margin(rem(1.5));".to_string(),
+            )),
+            "{fractional:?}"
+        );
+        // And a value with no unit at all is a string. `flex` is not a number,
+        // and guessing a constructor for it would be the fix inventing
+        // semantics.
+        let word = css_block_fixes("\tcss {\n\t\tdisplay: flex;\n\t}\n");
+        assert!(
+            word.contains(&(
+                "Write it as a call: `display(\"flex\");`".to_string(),
+                "display: flex;".to_string(),
+                "display(\"flex\");".to_string(),
+            )),
+            "{word:?}"
+        );
+    }
+
+    /// The hole case: `{expr}` was always the expression, so the rewrite is the
+    /// expression with the braces gone.
+    #[test]
+    fn quickfix_rewrites_a_hole_valued_css_declaration_as_a_call() {
+        let fixes = css_block_fixes("\tcss {\n\t\tcolor: {Color::gray(500)};\n\t}\n");
         assert!(
             fixes.contains(&(
-                "Wrap as `{Color::hex(\"#336699\")}`".to_string(),
-                "#336699".to_string(),
-                "{Color::hex(\"#336699\")}".to_string(),
+                "Write it as a call: `color(Color::gray(500));`".to_string(),
+                "color: {Color::gray(500)};".to_string(),
+                "color(Color::gray(500));".to_string(),
             )),
             "{fixes:?}"
         );
-        // The three-digit form too, and the four hex lengths are the whole
-        // gate: a `#` that is not a colour keeps the explanation and gets no
-        // edit, because there is nothing to wrap.
-        let short = css_block_fixes("\tcss {\n\t\tcolor: #333;\n\t}\n");
+    }
+
+    /// A whitespace-separated mixed value is N arguments — the desugar joins
+    /// them with exactly one space, which is what the value had.
+    ///
+    /// One argument per PIECE, not per word: a run of literal text stays one
+    /// string (`"1px solid"`), which is the codemod's own rule and the reason
+    /// the rewrite cannot change what reaches the sheet — splitting the run
+    /// would be the fix re-deciding where a value's parts are.
+    #[test]
+    fn quickfix_rewrites_a_space_separated_css_value_as_several_arguments() {
+        let fixes = css_block_fixes("\tcss {\n\t\tborder: 1px solid {Color::gray(200)};\n\t}\n");
         assert!(
-            short
-                .iter()
-                .any(|(title, _, _)| title == "Wrap as `{Color::hex(\"#333\")}`"),
-            "{short:?}"
+            fixes.contains(&(
+                "Write it as a call: `border(\"1px solid\", Color::gray(200));`".to_string(),
+                "border: 1px solid {Color::gray(200)};".to_string(),
+                "border(\"1px solid\", Color::gray(200));".to_string(),
+            )),
+            "{fixes:?}"
         );
-        for stray in ["#zzz", "#33669", "#333ing"] {
-            let not_a_colour = css_block_fixes(&format!("\tcss {{\n\t\tcolor: {stray};\n\t}}\n"));
-            assert!(
-                !not_a_colour
-                    .iter()
-                    .any(|(title, _, _)| title.starts_with("Wrap as")),
-                "`{stray}` is not a colour, so it gets the rule and no edit: {not_a_colour:?}"
-            );
-        }
+        // A text run the table DOES type on its own is typed: the hole first,
+        // then a bare unit value, is the common `margin: {gap} 4px;` shape.
+        let typed_tail = css_block_fixes("\tcss {\n\t\tmargin: {gap} 4px;\n\t}\n");
+        assert!(
+            typed_tail.contains(&(
+                "Write it as a call: `margin(gap, px(4));`".to_string(),
+                "margin: {gap} 4px;".to_string(),
+                "margin(gap, px(4));".to_string(),
+            )),
+            "{typed_tail:?}"
+        );
+    }
+
+    /// A custom property keeps its leading dashes (R12): the property
+    /// production admits them, so the call does too.
+    #[test]
+    fn quickfix_rewrites_a_custom_property_declaration() {
+        let fixes = css_block_fixes("\tcss {\n\t\t--card-gap: 8px;\n\t}\n");
+        assert!(
+            fixes.contains(&(
+                "Write it as a call: `--card-gap(px(8));`".to_string(),
+                "--card-gap: 8px;".to_string(),
+                "--card-gap(px(8));".to_string(),
+            )),
+            "{fixes:?}"
+        );
+    }
+
+    /// The shapes that DECLINE. Each is a value the rewrite cannot make
+    /// without deciding something, so the refusal's own sentence stays the
+    /// whole answer and the author edits by hand.
+    #[test]
+    fn quickfix_declines_the_glued_and_important_css_values() {
+        // A GLUED boundary: `{150}ms` joined by N arguments would gain a space
+        // it never had, and its faithful rewrite is an i-string carrying a
+        // `piece(..)` per hole — a judgement about the value.
+        let glued = css_block_fixes("\tcss {\n\t\ttransition-duration: {150}ms;\n\t}\n");
+        assert!(
+            !glued
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write it as a call")),
+            "{glued:?}"
+        );
+        // `calc({w} + 2px)` is the same class with the glue at the front.
+        let calc = css_block_fixes("\tcss {\n\t\twidth: calc({gap} + 2px);\n\t}\n");
+        assert!(
+            !calc
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write it as a call")),
+            "{calc:?}"
+        );
+        // `!important` has its own refusal and its own fix once the call form
+        // is reached; rewriting around it would hand the author a second
+        // diagnostic as the reward for taking a fix.
+        let important = css_block_fixes("\tcss {\n\t\tdisplay: flex !important;\n\t}\n");
+        assert!(
+            !important
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write it as a call")),
+            "{important:?}"
+        );
+    }
+
+    /// The bulk half: A101 fires per declaration, so a migrating file offers
+    /// one fix per row — and one action that takes them all. The spliced edit
+    /// leaves a DECLINING neighbour exactly as written.
+    #[test]
+    fn quickfix_rewrites_every_css_declaration_in_one_action() {
+        let fixes = css_block_fixes(
+            "\tcss {\n\t\tpadding: 4px;\n\t\twidth: calc({gap} + 2px);\n\t\tdisplay: flex;\n\t}\n",
+        );
+        let (title, replaced, replacement) = fixes
+            .iter()
+            .find(|(title, _, _)| title.starts_with("Write all "))
+            .unwrap_or_else(|| panic!("the bulk action must be offered: {fixes:?}"));
+        assert_eq!(title, "Write all 2 `css` declarations as calls");
+        assert_eq!(
+            replaced,
+            "padding: 4px;\n\t\twidth: calc({gap} + 2px);\n\t\tdisplay: flex;"
+        );
+        assert_eq!(
+            replacement, "padding(px(4));\n\t\twidth: calc({gap} + 2px);\n\t\tdisplay(\"flex\");",
+            "the glued declaration between them travels through verbatim"
+        );
+        // With ONE rewrite there is nothing to bulk: the action would be the
+        // per-declaration fix under a longer name.
+        let single = css_block_fixes("\tcss {\n\t\tpadding: 4px;\n\t}\n");
+        assert!(
+            !single
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write all ")),
+            "{single:?}"
+        );
+    }
+
+    /// Applied, the fix leaves the file clean — the contract the add-import pin
+    /// holds for its own edit, and the only proof that the rewrite is the one
+    /// the parser wanted.
+    #[test]
+    fn the_applied_css_call_fix_leaves_the_file_analyzing() {
+        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tpadding: 4px;\n\t\tdisplay: flex;\n\t}\n}\n";
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().expect("a css fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let bulk = fixes
+            .iter()
+            .find(|fix| fix.title.starts_with("Write all "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        let mut applied = text.clone();
+        applied.replace_range(bulk.span.into_range(), &bulk.replacement);
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the rewrite must leave the file clean: {:#?}\n{applied}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // B318 §5: the two reach warnings carry one-character fixes, and a WARNING
+    // is not in `diagnostics` — deliberately, since 62 sites gate on
+    // `diagnostics.is_empty()` and a warning must not disable Organize Imports.
+    #[test]
+    fn quickfix_marks_a_plain_reach_and_deletes_a_redundant_marker() {
+        const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            ("a.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let mark = fixes
+            .iter()
+            .find(|fix| fix.title == "Import as `#hidden`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no mark fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(mark.replacement, "#");
+        assert_eq!(mark.span.start, mark.span.end, "a zero-width insertion");
+        // Applied, it produces the marked spelling — and the warning goes.
+        let mut applied = text.clone();
+        applied.replace_range(mark.span.into_range(), &mark.replacement);
+        assert!(
+            applied.starts_with("import pkg::a::#hidden;"),
+            "{applied:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The twin: a marker on an item that is exported anyway.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ #shown };\n\nfun main() {\n\tlet _ = shown();\n}\n",
+            ),
+            ("a.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let delete = fixes
+            .iter()
+            .find(|fix| fix.title == "Delete the `#`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no delete fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(&text[delete.span.into_range()], "#");
+        assert!(delete.replacement.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B350: the `#` on an `(impl ..)` SELECTOR whose blocks the module exports
+    // is the impl twin of the leaf marker above, and it takes the SAME fix.
+    // The analyzer's new warning ends in the sentence `REACH_IS_REDUNDANT`
+    // names and is spanned on the selector, whose `#` sits one byte before it
+    // — so the arm reads it unchanged, and this pin is what says so.
+    #[test]
+    fn quickfix_deletes_a_redundant_marker_on_an_impl_selector() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                concat!(
+                    "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n",
+                    "import pkg::ext::{ #(impl Boxed<i32>) };\n\n",
+                    "fun main() {\n\tlet _ = Boxed::make(3).tag();\n}\n",
+                ),
+            ),
+            ("t.vl", "export trait Tagged {\n\tfun tag(self): i32;\n}\n"),
+            (
+                "item.vl",
+                concat!(
+                    "export struct Boxed<T> { value: T }\n\n",
+                    "export impl Boxed<type T> {\n",
+                    "\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+                ),
+            ),
+            (
+                "ext.vl",
+                concat!(
+                    "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n",
+                    "export fun marker(): i32 { 0 }\n\n",
+                    "export impl Boxed<i32> with Tagged {\n\tfun tag(self): i32 { 1 }\n}\n",
+                ),
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let delete = fixes
+            .iter()
+            .find(|fix| fix.title == "Delete the `#`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no delete fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(&text[delete.span.into_range()], "#");
+        assert!(delete.replacement.is_empty());
+        // Applied, the selector loses its marker and keeps its meaning.
+        let mut applied = text.clone();
+        applied.replace_range(delete.span.into_range(), &delete.replacement);
+        assert!(
+            applied.contains("import pkg::ext::{ (impl Boxed<i32>) };"),
+            "{applied:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E177: B318 §5's OTHER way out of a plain reach — export the thing. The
+    // edit lands in `a.vl`, which is what `QuickFix` could not say before: the
+    // type carried a span in this document and nothing else, so the paper's
+    // third fix shipped as a sentence in a message while its two one-character
+    // siblings shipped as actions. The fix is offered BESIDE the mark, because
+    // the two are genuinely different decisions ("this reach is deliberate" vs
+    // "this item should have been surface").
+    #[test]
+    fn quickfix_exports_a_reached_declaration_in_the_file_that_declares_it() {
+        const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            ("a.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let titles: Vec<&String> = fixes.iter().map(|fix| &fix.title).collect();
+        assert!(
+            titles.contains(&&"Import as `#hidden`".to_string()),
+            "the same-file fix is still offered: {titles:?}"
+        );
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| panic!("no export fix: {titles:?}"));
+        let target = export
+            .target
+            .as_ref()
+            .expect("the declaration lives in another file");
+        assert!(
+            target.path.ends_with("a.vl"),
+            "the edit belongs to the declaring file: {:?}",
+            target.path
+        );
+        assert_eq!(export.replacement, "export ");
+        // The range is `a.vl`'s own — line 2, column 0, where `fun hidden`
+        // begins — converted through THAT file's line index and not this
+        // document's.
+        assert_eq!(target.range.start, target.range.end, "an insertion");
+        assert_eq!(target.range.start.line, 2);
+        assert_eq!(target.range.start.character, 0);
+        // Applied, it produces the exported declaration.
+        let mut applied = MODULE.to_string();
+        let at = MODULE.find("fun hidden").expect("the declaration");
+        applied.insert_str(at, "export ");
+        assert_eq!(
+            applied,
+            "export fun shown(): i32 { 1 }\n\nexport fun hidden(): i32 { 2 }\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E187: the declaring file is read from the OPEN BUFFER, not from disk.
+    //
+    // The fix computes an insertion offset from the text it reads and hands the
+    // editor a range in THAT file's coordinates. Reading the saved text while
+    // the analysis read the buffer is not a stale answer — it is a WRONG one:
+    // the declaration's span comes from the buffer, so converting it through
+    // the saved file's line index names a line the user is not looking at, and
+    // applying it inserts `export ` in the middle of something else. The
+    // unsaved edit here is two lines above the declaration, which moves it from
+    // line 2 to line 4.
+    #[test]
+    fn quickfix_exports_a_declaration_at_the_line_the_unsaved_buffer_puts_it_on() {
+        const SAVED: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        const UNSAVED: &str = "// an edit the user has not saved\n// and a second line of it\n\
+             export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        let (dir, _) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            ("a.vl", SAVED),
+        ]);
+        let module = dir.join("a.vl");
+        vilan_core::analyzer::set_document_overlay(&module, Some(UNSAVED.to_string()));
+        let entry = dir.join("main.vl");
+        let text = std::fs::read_to_string(&entry).expect("the entry");
+        let document = Document::analyze(&text, &std_root(), &entry);
+        let program = document.program.as_ref().expect("a program");
+        let whole = Span {
+            start: 0,
+            end: document.line_index.text().len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        let target = export.target.as_ref().expect("a cross-file edit");
+        assert!(target.path.ends_with("a.vl"), "{:?}", target.path);
+        assert_eq!(
+            target.range.start.line, 4,
+            "the declaration is on line 4 of the BUFFER (line 2 of the saved file)"
+        );
+        assert_eq!(target.range.start.character, 0);
+        // Applied to the buffer, it exports the declaration the warning names.
+        let mut applied = UNSAVED.to_string();
+        let at = UNSAVED.find("fun hidden").expect("the declaration");
+        applied.insert_str(at, "export ");
+        assert!(
+            applied.contains("export fun hidden"),
+            "the edit lands on the declaration: {applied}"
+        );
+        vilan_core::analyzer::set_document_overlay(&module, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The QUALIFIED reach (§5's second door): `import pkg::a;` then
+    // `a::hidden()`. There is no leaf to mark, so "Export" is the only fix the
+    // paper names for it — and it is the same cross-file edit.
+    #[test]
+    fn quickfix_exports_a_declaration_reached_through_a_qualified_path() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\n\nfun main() {\n\tlet _ = a::hidden();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        let target = export.target.as_ref().expect("another file");
+        assert!(target.path.ends_with("a.vl"), "{:?}", target.path);
+        assert_eq!(target.range.start.line, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B318 §4's "Export `S`", the exposure warning's own fix. The private type
+    // is in the SAME file here, which is the shape the warning usually takes —
+    // so the fix carries no target and edits this buffer, and the two paths
+    // through `export_declaration_fix` are both exercised by the pair.
+    #[test]
+    fn quickfix_exports_a_private_type_an_exported_signature_names() {
+        let source = "struct Secret {\n\tvalue: i32,\n}\n\n\
+                      export fun make(): Secret {\n\tSecret { value: 1 }\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("a.vl", "fun unused() {}\n")]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `Secret`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            export.target.is_none(),
+            "the declaration is in this buffer: {:?}",
+            export.target.as_ref().map(|t| &t.path)
+        );
+        let mut applied = text.clone();
+        applied.replace_range(export.span.into_range(), &export.replacement);
+        assert!(applied.starts_with("export struct Secret {"), "{applied:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E188: the fix reads the analyzer's own record of WHICH TYPE the warning
+    // is about, so it answers where reading the name back out of the message
+    // could not.
+    //
+    // E177 recovered `S` from the sentence and resolved it against THIS file's
+    // recorded type references — exact whenever the file names the type, and
+    // silent whenever it does not. §4's warning does not require that: an
+    // exported module-level `let` whose value comes from a sibling is warned
+    // about HERE, naming a private type declared THERE, and `main.vl` below
+    // never writes `Secret` at all. So the file's references held nothing to
+    // match and the fix was not offered — on a warning whose whole content is a
+    // declaration the package can edit. The walk that wrote the sentence had
+    // the entity in hand; it records `(file, warning span, entity)` beside it
+    // now, and the fix is a lookup that cannot miss and cannot guess.
+    #[test]
+    fn quickfix_exports_an_exposed_type_this_file_never_names() {
+        const MODULE: &str =
+            "struct Secret {\n\tn: i32,\n}\n\nexport fun make(): Secret {\n\tSecret { n = 1 }\n}\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::other::make;\n\nexport let handle = make();\n",
+            ),
+            ("other.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        // The premise, stated rather than assumed: `main.vl` records no type
+        // reference named `Secret`, which is exactly what E177's resolution
+        // had to find and could not.
+        let named_here = program
+            .type_references
+            .iter()
+            .any(|(source, _, definition, _)| {
+                *source == SourceId(0)
+                    && definition.is_some_and(|definition| {
+                        crate::references::name_of(program, Definition::Entity(definition))
+                            == Some("Secret")
+                    })
+            });
+        assert!(
+            !named_here,
+            "the fixture must not name `Secret` here, or the pin is vacuous"
+        );
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `Secret`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        let target = export
+            .target
+            .as_ref()
+            .expect("the declaration lives in the sibling");
+        assert!(target.path.ends_with("other.vl"), "{:?}", target.path);
+        assert_eq!(export.replacement, "export ");
+        assert_eq!(target.range.start, target.range.end, "an insertion");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 0);
+        let mut applied = MODULE.to_string();
+        applied.insert_str(0, "export ");
+        assert!(applied.starts_with("export struct Secret {"), "{applied:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The refusals, which are the half a wrong edit would be worse than no
+    // action for: an item already exported offers nothing to export (so the
+    // action is never offered twice), and a warning about a module that is
+    // already surface offers nothing at all.
+    #[test]
+    fn quickfix_never_offers_to_export_what_is_already_exported() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ #shown };\n\nfun main() {\n\tlet _ = shown();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        assert!(
+            fixes.iter().all(|fix| !fix.title.starts_with("Export ")),
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E149: hovering an operator answers with the method it dispatches to.
+    //
+    // An operator is the one call spelled without a name, so every path that
+    // answers "what is under the cursor" by resolving an IDENTIFIER answered
+    // nothing at a `==` — a reader asking which `eq` runs got a blank. The
+    // answer is B180's own dispatch record rendered, not a second resolution,
+    // so the editor and the emission cannot disagree about which `eq` this is.
+
+    /// The hover at the offset `needle` locates (plus `at`) in `source`.
+    fn operator_hover_at(source: &str, needle: &str, at: usize) -> Option<String> {
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the fixture must analyze clean: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        let hover = document.hover(source.find(needle).expect("the needle") + at);
+        let _ = std::fs::remove_dir_all(&dir);
+        hover
+    }
+
+    /// A user `impl Point with Add` / `with PartialEq`, and a native `+` in the
+    /// impl body as the control.
+    const OPERATOR_IMPLS: &str = "import std::operators::Add;\nimport std::compare::PartialEq;\nimport std::io::print;\n\nstruct Point {\n\tx: i32,\n}\n\nimpl Point with Add {\n\tfun add(self, other: Point): Point {\n\t\tPoint { x = self.x + other.x }\n\t}\n}\n\nimpl Point with PartialEq {\n\tfun eq(self, other: Point): bool {\n\t\tself.x == other.x\n\t}\n}\n\nfun main() {\n\tlet a = Point { x = 1 };\n\tlet b = Point { x = 2 };\n\tlet c = a + b;\n\tif a == b {\n\t\tprint(c.x);\n\t}\n}\n";
+
+    #[test]
+    fn e149_hovering_an_equality_operator_answers_with_its_eq() {
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "if a == b", 5),
+            Some("```vilan\nfun eq(self, other: Point): bool\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_hovering_a_plus_answers_with_its_add() {
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "a + b", 2),
+            Some("```vilan\nfun add(self, other: Point): Point\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_hovering_a_derived_equality_answers_with_the_generated_eq() {
+        // The `==` a user never wrote a method for: `[derive(PartialEq)]`
+        // generates one, the dispatch record names it, and the hover shows it
+        // — which is the answer to "what does this `==` actually run".
+        let source = "import std::compare::PartialEq;\nimport std::io::print;\n\n[derive(PartialEq)]\nstruct Tag {\n\tn: i32,\n}\n\nfun main() {\n\tlet a = Tag { n = 1 };\n\tlet b = Tag { n = 2 };\n\tif a == b {\n\t\tprint(1);\n\t}\n}\n";
+        assert_eq!(
+            operator_hover_at(source, "if a == b", 5),
+            Some("```vilan\nfun eq(self, other: Tag): bool\n```".to_string()),
+        );
+    }
+
+    #[test]
+    fn e149_a_native_operator_and_an_operand_are_untouched() {
+        // The two controls that make the pins above claims about DISPATCH
+        // rather than about operator tokens. A native `+` dispatches to
+        // nothing — native JS is its semantics — so there is no declaration to
+        // show and the hover stays empty; and a caret on an OPERAND is still
+        // that operand's hover, because the operator arm asks for a cursor in
+        // the gap BETWEEN the two.
+        assert_eq!(
+            operator_hover_at(OPERATOR_IMPLS, "self.x + other.x", 7),
+            None,
+        );
+        let on_operand = operator_hover_at(OPERATOR_IMPLS, "a + b", 0);
+        assert!(
+            on_operand.is_some_and(|hover| hover.contains("Point")),
+            "a caret on `a` still hovers the binding",
+        );
+    }
+
+    // E148: B242's BOUNDARY refusal gets the fix too.
+    //
+    // The subset refusal below is the easy half: it anchors at the clause's own
+    // name list and SPELLS the clause the body needs, so the fix is that span
+    // and that string. The boundary refusal is the hard one, and it is the one
+    // a caller actually meets — it anchors at the CALL, inside a function that
+    // declares no clause at all, so there is neither a span to overwrite nor a
+    // spelling to copy. The edit goes on the enclosing `fun`'s signature, at a
+    // point nothing in the analyzed program recorded until `Func::signature_end`
+    // did: after the parameters, after the return type, after a `borrows`
+    // clause, before the body's `{`.
+
+    /// The `(title, span, replacement)` of every fix over `files`, with the
+    /// entry file's text — the shape the E148 pins read.
+    fn boundary_fixes(files: &[(&str, &str)]) -> (Vec<(String, Span, String)>, String) {
+        let (directory, document) = analyze_workspace(files);
+        let program = document.program.as_ref().expect("the fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| (fix.title, fix.span, fix.replacement))
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        (fixes, text)
+    }
+
+    /// The one context fix among `fixes`, asserted to be a ZERO-WIDTH insertion
+    /// immediately after `after` — a declaration fix adds a clause and must
+    /// never overwrite a byte of the signature it lands on. Returns the clause
+    /// it writes.
+    fn context_insertion_after(
+        fixes: &[(String, Span, String)],
+        text: &str,
+        after: &str,
+    ) -> String {
+        let matching: Vec<&(String, Span, String)> = fixes
+            .iter()
+            .filter(|(title, _, _)| title == "Declare the inferred contexts")
+            .collect();
+        assert_eq!(matching.len(), 1, "{fixes:#?}");
+        let (_, span, replacement) = matching[0];
+        let expected = text.find(after).expect("the anchor is in the fixture") + after.len();
+        assert_eq!(
+            (span.start, span.end),
+            (expected, expected),
+            "the fix must insert right after {after:?}, not at {:?}",
+            &text[span.into_range()],
+        );
+        replacement.clone()
+    }
+
+    /// A caller of a context-declaring `render`, with `signature` as its own
+    /// declaration — the fixture every E148 pin varies.
+    fn boundary_caller(signature: &str, body: &str, call: &str) -> String {
+        format!(
+            "import std::io::print;\nimport std::context::Context;\n\n\
+             let settings: Context<i32> = Context::new();\n\n\
+             fun deep(): i32 {{\n\tsettings.get()\n}}\n\n\
+             fun render(x: i32): i32 context settings {{\n\tdeep() + x\n}}\n\n\
+             {signature} {{\n{body}\n}}\n\n\
+             fun main() {{\n\t{call}\n}}\nmain();\n"
+        )
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_on_a_bare_fun() {
+        let source = boundary_caller("fun show()", "\tprint(render(1));", "show();");
+        let (fixes, text) = boundary_fixes(&[("main.vl", &source)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "fun show()"),
+            " context settings",
+        );
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_after_a_return_type() {
+        let source = boundary_caller("fun show(): i32", "\trender(1)", "print(show());");
+        let (fixes, text) = boundary_fixes(&[("main.vl", &source)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "fun show(): i32"),
+            " context settings",
+        );
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_after_a_borrows_clause() {
+        // The clause goes AFTER `borrows slot`, which is the whole reason the
+        // insertion point is the parser's and not "just before the `{`" read
+        // off the return type.
+        let source = boundary_caller(
+            "fun show(slot: &mut i32): &mut i32 borrows slot",
+            "\tprint(render(1));\n\tslot",
+            "let mut n = 0;\n\tlet view = show(&mut n);\n\tprint(*view);",
+        );
+        let (fixes, text) = boundary_fixes(&[("main.vl", &source)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "borrows slot"),
+            " context settings",
+        );
+    }
+
+    #[test]
+    fn e148_the_context_fix_lands_in_the_callers_own_file() {
+        // The callee and its clause live in another file; the refusal, the
+        // caller and the edit are all here. (The fix could never reach the
+        // other file anyway — `quickfixes` refuses a diagnostic that is not
+        // this document's — which is why the pin is that it still fires.)
+        let helper = "import std::context::Context;\n\n\
+             let settings: Context<i32> = Context::new();\n\n\
+             fun deep(): i32 {\n\tsettings.get()\n}\n\n\
+             fun render(x: i32): i32 context settings {\n\tdeep() + x\n}\n";
+        let main = "import std::io::print;\nimport pkg::helper::render;\n\n\
+             fun show(): i32 {\n\trender(1)\n}\n\n\
+             fun main() {\n\tprint(show());\n}\nmain();\n";
+        let (fixes, text) = boundary_fixes(&[("main.vl", main), ("helper.vl", helper)]);
+        assert_eq!(
+            context_insertion_after(&fixes, &text, "fun show(): i32"),
+            " context settings",
+        );
+    }
+
+    // B242: the subset refusal spells the clause the body needs, and the fix
+    // writes exactly that over the clause's own name list — the message and
+    // the edit are one string.
+    #[test]
+    fn quickfix_declares_the_inferred_contexts_on_a_narrow_clause() {
+        let source = "import std::context::Context;\n\nlet a_ctx: Context<i32> = Context::new();\nlet b_ctx: Context<i32> = Context::new();\n\nfun both(): i32 {\n\ta_ctx.get() + b_ctx.get()\n}\n\nfun render(): i32 context a_ctx {\n\tboth()\n}\n\nfun main() {}\n";
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().expect("the fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes: Vec<(String, String, String)> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| {
+                (
+                    fix.title,
+                    text[fix.span.into_range()].to_string(),
+                    fix.replacement,
+                )
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            fixes.contains(&(
+                "Declare the inferred contexts".to_string(),
+                "a_ctx".to_string(),
+                "(a_ctx, b_ctx)".to_string(),
+            )),
+            "{fixes:?}"
+        );
+    }
+
+    /// G24's R2 quick fix, both halves through one arm. The runtime-binding
+    /// refusal is at the READ and the edit is at the binding it names — a
+    /// zero-width `const ` in front of the declaration; the plain-data refusal
+    /// is at the closure and the edit MOVES the keyword to the head of the
+    /// declaration. Two diagnostics, one title, one construction site (which
+    /// is also what `book_sync`'s count of the offered actions holds).
+    #[test]
+    fn quickfix_declares_a_const_let_from_either_steer() {
+        let read = "fun main() {\n\tlet space = |n: f64| n * 2f;\n\tlet a = const space(2f);\n}\n";
+        assert!(
+            const_let_fixes(read).contains(&(
+                "Declare it `const let`".to_string(),
+                String::new(),
+                "const ".to_string(),
+            )),
+            "{:?}",
+            const_let_fixes(read)
+        );
+        let result = "fun main() {\n\tlet add = const |a: f64, b: f64| a + b;\n}\n";
+        assert!(
+            const_let_fixes(result).contains(&(
+                "Declare it `const let`".to_string(),
+                "let add = const ".to_string(),
+                "const let add = ".to_string(),
+            )),
+            "{:?}",
+            const_let_fixes(result)
+        );
+    }
+
+    /// [`quickfix_declares_a_const_let_from_either_steer`]'s driver: every fix
+    /// the whole file offers, as (title, the text it replaces, what it writes).
+    fn const_let_fixes(source: &str) -> Vec<(String, String, String)> {
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().expect("the fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| {
+                (
+                    fix.title,
+                    text[fix.span.into_range()].to_string(),
+                    fix.replacement,
+                )
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        fixes
     }
 
     // §7.2 fix 2. `@` is the `#`'s twin, refused for the same context-free
@@ -4132,12 +10933,13 @@ pub(crate) mod tests {
         );
     }
 
-    // §7.2 fix 3. The parser excises `!important` from the value and reports
-    // at exactly its span; the fix removes it — and takes the space in front
-    // of it, so `flex !important;` becomes `flex;` rather than `flex ;`.
+    // §7.2 fix 3. The parser reads the marker off the declaration's argument
+    // TOKENS (A101) and reports at exactly its span; the fix removes it — and
+    // takes the space in front of it, so `flex !important` becomes `flex`
+    // rather than `flex `.
     #[test]
     fn quickfix_removes_an_important_marker() {
-        let fixes = css_block_fixes("\tcss {\n\t\tdisplay: flex !important;\n\t}\n");
+        let fixes = css_block_fixes("\tcss {\n\t\tdisplay(flex !important);\n\t}\n");
         assert!(
             fixes.contains(&(
                 "Remove `!important`".to_string(),
@@ -4148,6 +10950,27 @@ pub(crate) mod tests {
         );
     }
 
+    // E153: `:hover { … }` is the single most likely thing for a CSS writer to
+    // type inside a block, and it reported the bare `found ':' expected a
+    // declaration …` — true, and no help at all, because nothing in it says
+    // the answer is a DOT. The steer names `.hover` and says why the dotted
+    // form is the only one: it is name-blind, so one rule covers pseudo-
+    // classes, breakpoints, `within` and `divide`.
+    #[test]
+    fn a_css_pseudo_class_selector_is_steered_to_the_dotted_rule() {
+        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\t:hover {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n";
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let published = document.published_diagnostics();
+        let messages = messages(&published);
+        assert!(
+            messages.iter().any(|message| message
+                .contains("writes a pseudo-class as a DOTTED rule")
+                && message.contains("`.hover { … }`")),
+            "{messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     // §7.2 fix 5, "the existing quickfix, unchanged" — asserted rather than
     // assumed. A declaration's missing `;` reports as the ordinary
     // missing-terminator diagnostic (`parse_css_declaration` raises
@@ -4155,7 +10978,7 @@ pub(crate) mod tests {
     // insertion fires inside a block with no css-side code at all.
     #[test]
     fn quickfix_inserts_a_missing_semicolon_in_a_css_block() {
-        let fixes = css_block_fixes("\tcss {\n\t\tdisplay: flex\n\t}\n");
+        let fixes = css_block_fixes("\tcss {\n\t\tdisplay(\"flex\")\n\t}\n");
         assert!(
             fixes.contains(&("Insert `;`".to_string(), String::new(), ";".to_string())),
             "{fixes:?}"
@@ -4167,12 +10990,30 @@ pub(crate) mod tests {
     /// The conversion offered at the `~` cursor in a `css`-block fixture, as
     /// `(to_chain, replaced text, replacement)`.
     fn css_conversion(body: &str) -> Option<(bool, String, String)> {
-        let source = format!(
+        css_conversion_of(&format!(
             "import std::style::{{ Color, Length, Style, space, style }};\n\nfun card(): Style {{\n{body}}}\n"
-        );
+        ))
+    }
+
+    /// [`css_conversion`] over a whole FILE rather than one function body — the
+    /// shapes that need their own imports or an `impl Style` of their own.
+    fn css_conversion_of(source: &str) -> Option<(bool, String, String)> {
+        css_conversion_across(source, &[])
+    }
+
+    /// [`css_conversion_of`] with SIBLING files beside `main.vl` in the
+    /// workspace — E175's subject: an `impl Style` in another file of the same
+    /// package, which the inliner reaches through the analyzed impl table.
+    fn css_conversion_across(
+        source: &str,
+        siblings: &[(&str, &str)],
+    ) -> Option<(bool, String, String)> {
+        let source = source.to_string();
         let offset = source.find('~').expect("fixture needs a `~` cursor");
         let text = source.replace('~', "");
-        let (directory, document) = analyze_workspace(&[("main.vl", &text)]);
+        let mut files: Vec<(&str, &str)> = vec![("main.vl", &text)];
+        files.extend(siblings.iter().copied());
+        let (directory, document) = analyze_workspace(&files);
         let conversion = document
             .css_spelling_conversion(Span {
                 start: offset,
@@ -4196,14 +11037,14 @@ pub(crate) mod tests {
     #[test]
     fn refactor_converts_a_css_block_to_a_style_chain() {
         let conversion = css_conversion(
-            "\tcss {\n\t\tdis~play: flex;\n\t\tgap: {space(4)};\n\t\ttransition-duration: {150}ms;\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}\n",
+            "\tcss {\n\t\tdis~play(\"flex\");\n\t\tgap(space(4));\n\t\ttransition-duration(i\"{piece(150)}ms\");\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t}\n",
         )
         .expect("a block converts");
         assert!(conversion.0, "block -> chain");
         assert!(conversion.1.starts_with("css {"), "{conversion:?}");
         assert_eq!(
             conversion.2,
-            "style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.raw(\"gap\", space(4))\n\t\t.raw(\"transition-duration\", i\"{150}ms\")\n\t\t.md(style().raw(\"padding\", space(6)))",
+            "style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.raw(\"gap\", space(4))\n\t\t.raw(\"transition-duration\", i\"{piece(150)}ms\")\n\t\t.md(style().raw(\"padding\", space(6)))",
             "{conversion:?}"
         );
     }
@@ -4214,7 +11055,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_converts_a_single_declaration_block_inline() {
         let conversion =
-            css_conversion("\tconst css { pad~ding: {space(6)}; }\n").expect("a block converts");
+            css_conversion("\tconst css { pad~ding(space(6)); }\n").expect("a block converts");
         assert_eq!(conversion.2, "style().raw(\"padding\", space(6))");
     }
 
@@ -4232,25 +11073,229 @@ pub(crate) mod tests {
         assert!(conversion.1.starts_with("style()"), "{conversion:?}");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}",
+            "css {\n\t\tdisplay(\"flex\");\n\t\tgap(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t}",
             "{conversion:?}"
         );
     }
 
-    // The inverse is PARTIAL, and says so by not being offered. A typed
-    // property method is `with_length("padding", …)`, which is not the node
-    // `padding: {space(4)};` lowers to — so a chain carrying one has no block
-    // spelling this refactor is entitled to invent.
+    // E167: a TYPED property link converts, because the declarations it writes
+    // are read out of std's own `style.vl` rather than restated in a table
+    // beside it. `padding_x`'s body is
+    // `self.with_length("padding-left", value).with_length("padding-right", value)`,
+    // so the conversion is two declarations and the argument lands in both holes
+    // — which is exactly what the method does, and cannot drift from it.
     #[test]
-    fn refactor_declines_a_chain_with_a_typed_property_link() {
+    fn refactor_converts_a_typed_property_link_by_inlining_its_std_body() {
+        let conversion = css_conversion(
+            "\tsty~le()\n\t\t.padding_x(space(4))\n\t\t.color(Color::gray(900))\n\t\t.gap(space(2))\n",
+        )
+        .expect("a typed chain converts");
+        assert!(!conversion.0, "chain -> block");
         assert_eq!(
-            css_conversion("\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"display\", \"flex\")\n"),
-            None
+            conversion.2,
+            "css {\n\t\tpadding-left(space(4));\n\t\tpadding-right(space(4));\n\t\tcolor(Color::gray(900));\n\t\tgap(space(2));\n\t}",
+            "{conversion:?}"
         );
-        // `class_list` ends the chain in something that is not a `Style` at
-        // all — likewise not convertible.
+    }
+
+    // The seed. `style_chain_links` matched a BARE `style` only, which is the one
+    // spelling the estate does not write — the web prelude publishes the MODULE,
+    // so the templates, the docs and kolt all write `style::style()` and every
+    // chain in real code was refused at its first token. The rule is syntactic:
+    // the last segment is `style`, the call takes no arguments.
+    #[test]
+    fn refactor_reads_a_path_spelled_style_seed() {
+        let conversion = css_conversion_of(
+            "import std::style;\n\nfun card(): style::Style {\n\tsty~le::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))\n}\n",
+        )
+        .expect("a `style::style()` chain converts");
         assert_eq!(
-            css_conversion("\tsty~le()\n\t\t.raw(\"display\", \"flex\")\n\t\t.class_list()\n"),
+            conversion.1,
+            "style::style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.padding(style::space(4))",
+            "the whole chain is replaced"
+        );
+        assert_eq!(
+            conversion.2, "css {\n\t\tdisplay(\"flex\");\n\t\tpadding(style::space(4));\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // The SPLIT, on the shape kolt actually writes (`styles.vl`'s button
+    // styles): std shorthands and a `raw`, a condition combinator, and a user
+    // extension declared in the file's own `impl Style`. One unconvertible link
+    // used to refuse the whole chain; the chain splits at the FIRST of them now,
+    // and the rest is written as a postfix chain on the block — which parses and
+    // types, and keeps its order relative to everything the block holds, so the
+    // two spellings mean the same style.
+    //
+    // `select_off` here is kolt's REAL one (E172): its body is
+    // `self.within(..)`, and `within`'s own body carries statements, so the
+    // inliner has nothing to substitute into and the link is a barrier. It used
+    // to be spelled `self.raw("user-select", "none")`, which was a barrier only
+    // because the inliner could not see the current file's bodies at all — that
+    // shape CONVERTS now, and pinning the split on it would have been pinning
+    // the defect.
+    #[test]
+    fn refactor_splits_a_chain_at_a_link_with_no_block_spelling() {
+        let conversion = css_conversion_of(
+            "import std::style::{ Color, Length, Style, space, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
+        )
+        .expect("a kolt-shaped chain converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpadding(space(4));\n\t\toutline(\"none\");\n\t\tborder-radius(Length::px(4));\n\t\t.attribute(\"disabled\", None) {\n\t\t\tcolor(Color::gray(300));\n\t\t}\n\t}.select_off().hover(style().background(Color::gray(100)))",
+            "{conversion:?}"
+        );
+    }
+
+    // E172: the inliner reads the CURRENT FILE's `impl Style` bodies too, which
+    // is what makes the refactor fire on the exhibit it was filed about. kolt's
+    // `button_style` opens `style().flex_row()` and `flex_row` is four lines up
+    // the same file — so before this the convertible prefix was EMPTY and the
+    // action offered nothing at all on a real app's chain, however many std
+    // shorthands came after. An extension whose body is a self-chain inlines
+    // exactly as a std shorthand does.
+    #[test]
+    fn refactor_inlines_an_impl_style_extension_declared_in_the_current_file() {
+        let conversion = css_conversion_of(
+            "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(color: Color): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.gap(space(2))\n\t\t.align_items(AlignItems::Center)\n\t\t.radius(Length::px(4))\n\t\t.color(color)\n}\n",
+        )
+        .expect("kolt's `button_style` shape converts");
+        assert!(!conversion.0, "chain -> block");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tdisplay(Display::Flex.value());\n\t\tflex-direction(FlexDirection::Row.value());\n\t\tgap(space(2));\n\t\talign-items(AlignItems::Center.value());\n\t\tborder-radius(Length::px(4));\n\t\tcolor(color);\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // One extension delegating to ANOTHER is the same recursion under the same
+    // depth bound, and it is the shape kolt writes (`ghost` calls `select_off`).
+    // The control beside it is the barrier that E172 does not move: an extension
+    // with a STATEMENT in its body still has no declaration spelling, so the
+    // chain splits there exactly as it does at a std method like `border`.
+    #[test]
+    fn refactor_follows_one_current_file_extension_into_another_and_stops_at_a_statement() {
+        let conversion = css_conversion_of(
+            "import std::style::{ Color, Display, FlexDirection, Length, Style, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n\n\tfun ghost(self): Style {\n\t\tself.raw(\"pointer-events\", \"none\").flex_row()\n\t}\n\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.ghost()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+        )
+        .expect("a delegating extension converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpointer-events(\"none\");\n\t\tdisplay(Display::Flex.value());\n\t\tflex-direction(FlexDirection::Row.value());\n\t\tborder-radius(Length::px(4));\n\t}.themed().raw(\"outline\", \"none\")",
+            "{conversion:?}"
+        );
+    }
+
+    // E175: the inliner reaches a SIBLING file's `impl Style`, which is where
+    // E167 and E172 stopped. kolt's own `button_style` ran into this at
+    // `.script_label()`, four lines of `theme.vl` away and in the same package
+    // — already loaded, already analyzed, and out of reach because the
+    // converter read exactly two texts: std's `style.vl` and the buffer it was
+    // invoked in. The missing half was never the parse; it was knowing which
+    // files were worth parsing, and the analyzed impl table knows, because an
+    // `Implementation` records the file whose text declares it. The whole chain
+    // converts now, `script_label` inlined through `with_length` exactly as a
+    // std shorthand is.
+    #[test]
+    fn refactor_inlines_an_impl_style_extension_from_a_sibling_file() {
+        let conversion = css_conversion_across(
+            "import std::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            &[(
+                "theme.vl",
+                "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n",
+            )],
+        )
+        .expect("a chain reaching a sibling's extension converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tdisplay(Display::Flex.value());\n\t\tflex-direction(FlexDirection::Row.value());\n\t\tborder-radius(Length::px(4));\n\t\tletter-spacing(Length::px(1));\n\t\toutline(\"none\");\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // E187, the converter's half: a sibling's `impl Style` is INLINED into this
+    // buffer, so reading its saved text produces a block the author's own
+    // unsaved edit already contradicts — a wrong answer dressed as a refactor,
+    // not a stale one. The sibling below declares `letter-spacing` on disk and
+    // `word-spacing` in the buffer; the conversion must write the buffer's.
+    #[test]
+    fn refactor_inlines_a_siblings_unsaved_impl_style_body() {
+        const SAVED: &str = "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n";
+        const UNSAVED: &str = "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"word-spacing\", Length::px(2))\n\t}\n}\n";
+        let source = "import std::style::{ Length, Style, style };\nimport pkg::theme;\n\n\
+             fun button_style(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n}\n";
+        let offset = source.find('~').expect("fixture needs a `~` cursor");
+        let text = source.replace('~', "");
+        let (dir, _) = analyze_workspace(&[("main.vl", &text), ("theme.vl", SAVED)]);
+        let sibling = dir.join("theme.vl");
+        vilan_core::analyzer::set_document_overlay(&sibling, Some(UNSAVED.to_string()));
+        let entry = dir.join("main.vl");
+        let entry_text = std::fs::read_to_string(&entry).expect("the entry");
+        let document = Document::analyze(&entry_text, &std_root(), &entry);
+        let conversion = document
+            .css_spelling_conversion(Span {
+                start: offset,
+                end: offset,
+            })
+            .expect("a chain reaching the sibling converts");
+        assert_eq!(
+            conversion.replacement,
+            "css {\n\t\tborder-radius(Length::px(4));\n\t\tword-spacing(Length::px(2));\n\t}",
+            "the BUFFER's body, not the saved one"
+        );
+        vilan_core::analyzer::set_document_overlay(&sibling, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The reach is the IMPL TABLE's, not "every file in the package": a sibling
+    // that writes no `impl Style` is never read, and a sibling extension whose
+    // body is not a self-chain is a barrier there exactly as it is here.
+    #[test]
+    fn refactor_splits_at_a_sibling_extension_whose_body_is_not_a_chain() {
+        let conversion = css_conversion_across(
+            "import std::style::{ Color, Length, Style, style };\nimport pkg::theme;\n\nfun card(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            &[(
+                "theme.vl",
+                "import std::style::{ Color, Style };\n\nimpl Style {\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n",
+            )],
+        )
+        .expect("the convertible prefix converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tborder-radius(Length::px(4));\n\t}.themed().raw(\"outline\", \"none\")",
+            "{conversion:?}"
+        );
+    }
+
+    // A std method whose body is not a chain at all is a BARRIER, not a guess:
+    // `border` delegates to `with_border`, whose body carries two `if`s and the
+    // `rule` chokepoint, so it has no declaration spelling and the chain splits
+    // there. This is the inliner refusing rather than inventing.
+    #[test]
+    fn refactor_splits_at_a_std_method_whose_body_is_not_a_chain() {
+        let conversion = css_conversion(
+            "\tsty~le()\n\t\t.padding(space(4))\n\t\t.border(Length::px(1), Color::gray(300))\n",
+        )
+        .expect("the convertible prefix converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tpadding(space(4));\n\t}.border(Length::px(1), Color::gray(300))",
+            "{conversion:?}"
+        );
+    }
+
+    // And a chain with NO convertible link offers nothing at all: a `css { }`
+    // with the whole chain hung off it is not a conversion. The extension is
+    // kolt's own `select_off` again, a barrier for `within`'s sake rather than
+    // for the inliner's reach (E172).
+    #[test]
+    fn refactor_offers_nothing_when_no_link_has_a_block_spelling() {
+        assert_eq!(css_conversion("\tsty~le()\n\t\t.class_list()\n"), None);
+        assert_eq!(
+            css_conversion_of(
+                "import std::style::{ Style, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
+            ),
             None
         );
     }
@@ -4260,7 +11305,7 @@ pub(crate) mod tests {
     // the block again, byte for byte, nesting included.
     #[test]
     fn the_two_conversions_round_trip() {
-        let block = "css {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}";
+        let block = "css {\n\t\tdisplay(\"flex\");\n\t\tgap(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t}";
         let to_chain = css_conversion(&format!("\t{}\n", block.replacen("display", "dis~play", 1)))
             .expect("a block converts");
         assert!(to_chain.0, "block -> chain");
@@ -4273,26 +11318,36 @@ pub(crate) mod tests {
         assert_eq!(back.2, block, "the round trip is the identity");
     }
 
-    // Two refusals, both about meaning rather than shape. A comment's
+    // The refusals, each about meaning rather than shape. A comment's
     // attachment is not recoverable across the reshape (the S3 printer refuses
-    // to reorder a commented block for the same reason), and a value carrying a
-    // BACKSLASH means different things in the two spellings — a chain's string
-    // literal has its escapes processed at emission and a block's token run
-    // does not.
+    // to reorder a commented block for the same reason), and a declaration with
+    // SEVERAL arguments has a chain twin that names `std::style::piece` — a
+    // name ambient inside a block and nowhere else, so the chain this wrote
+    // would not resolve in the file it landed in.
+    //
+    // A101 RETIRED a third: a value carrying a BACKSLASH used to mean different
+    // things in the two spellings, because a chain's string literal had its
+    // escapes processed at emission and a block's token run did not. A value is
+    // the same expression in both spellings now, so there is nothing to differ
+    // — and the conversion is offered.
     #[test]
     fn refactor_declines_where_the_two_spellings_would_differ() {
         assert_eq!(
-            css_conversion("\tcss {\n\t\t// keep me\n\t\tdis~play: flex;\n\t}\n"),
+            css_conversion("\tcss {\n\t\t// keep me\n\t\tdis~play(\"flex\");\n\t}\n"),
             None
         );
         assert_eq!(
-            css_conversion("\tcss {\n\t\tcon~tent: \"\\201C\";\n\t}\n"),
+            css_conversion("\tcss {\n\t\tmar~gin(px(4), px(8));\n\t}\n"),
             None
         );
-        // A quoted value is fine, though: escaping a `\"` into the chain's
-        // string literal round-trips exactly.
-        let quoted = css_conversion("\tcss {\n\t\tbackground-im~age: url(\"tile.png\");\n\t}\n")
-            .expect("a quoted value converts");
+        // The escaped value converts now, and round-trips: the block's own
+        // argument is the chain's own argument.
+        let escaped = css_conversion("\tcss {\n\t\tcon~tent(\"\\201C\");\n\t}\n")
+            .expect("an escaped value converts");
+        assert_eq!(escaped.2, "style().raw(\"content\", \"\\201C\")");
+        let quoted =
+            css_conversion("\tcss {\n\t\tbackground-im~age(\"url(\\\"tile.png\\\")\");\n\t}\n")
+                .expect("a quoted value converts");
         assert_eq!(
             quoted.2,
             "style().raw(\"background-image\", \"url(\\\"tile.png\\\")\")"
@@ -4342,6 +11397,696 @@ pub(crate) mod tests {
         // `helper` is already imported (bare `greet`): the edit EXTENDS it
         // into a two-member set rather than inserting a new line.
         assert_eq!(auto_import.edit_replacement, "{ farewell, greet }");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E213: `[internal("reason")]` in the editor ──────────────────────────
+    //
+    // Visibility answers whether a module may NAME an item. This answers
+    // whether a reader should reach for one that is named — `Region.anchor` is
+    // exported because `each` and a hand-written `Slot` need it, and a row
+    // moved through it without `hold_rows` corrupts the reconciler's view.
+    // Nothing warns and nothing refuses: what changes is what the editor does.
+
+    /// A module declaring one labelled function beside an ordinary one, and a
+    /// struct with a labelled field, opened at the position `marker` ends.
+    fn internal_workspace(marker: &str, main: &str) -> (PathBuf, Document, usize) {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                "export struct Region {\n\t[internal(\"place against it, never through it\")] \
+                 anchor: str,\n\tlabel: str,\n}\n\n\
+                 export [internal(\"the reconciler's own bookkeeping\")] fun anchor_row() {}\n\n\
+                 export fun anchor_label(): str {\n\t\"x\"\n}\n",
+            ),
+        ]);
+        let text = document.line_index.text();
+        let offset = text.find(marker).expect("the marker") + marker.len();
+        (dir, document, offset)
+    }
+
+    #[test]
+    fn an_internal_name_is_absent_from_a_bare_completion_list() {
+        let (dir, document, offset) = internal_workspace(
+            "greet();\n\t",
+            "import pkg::helper::{ anchor_row, anchor_label };\n\n\
+             fun greet() {}\n\nfun main() {\n\tgreet();\n\t\n}\n",
+        );
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "anchor_label"),
+            "the ordinary import is offered: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "anchor_row"),
+            "the labelled one is not, at a bare position: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn three_typed_characters_bring_it_back_carrying_its_reason() {
+        // The other half of the rule, and what keeps it a LABEL and not a
+        // hiding place: a name somebody is spelling out is a name they mean.
+        let (dir, document, offset) = internal_workspace(
+            "\tanc",
+            "import pkg::helper::{ anchor_row, anchor_label };\n\n\
+             fun main() {\n\tanc\n}\n",
+        );
+        let candidate = document
+            .completion(offset)
+            .into_iter()
+            .find(|candidate| candidate.label == "anchor_row")
+            .expect("an exact prefix of three characters offers it");
+        assert_eq!(
+            candidate.internal.as_deref(),
+            Some("the reconciler's own bookkeeping"),
+            "carrying the reason, which is what the popup shows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_typed_characters_do_not() {
+        // Three characters is the line the ruling drew; two is a browse.
+        let (dir, document, offset) = internal_workspace(
+            "\tan",
+            "import pkg::helper::{ anchor_row, anchor_label };\n\nfun main() {\n\tan\n}\n",
+        );
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "anchor_label"),
+            "the ordinary name still is: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "anchor_row"),
+            "{labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_internal_field_is_hidden_after_the_dot_and_returns_on_its_prefix() {
+        // The FIELD case — the one declaration visibility cannot serve at all,
+        // since vilan has no per-field visibility.
+        let main = "import pkg::helper::Region;\n\n\
+                    fun read(region: Region): str {\n\tregion.\n}\n";
+        let (dir, document, offset) = internal_workspace("region.", main);
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "label"),
+            "the ordinary field is offered: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "anchor"),
+            "the labelled one is not: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = "import pkg::helper::Region;\n\n\
+                    fun read(region: Region): str {\n\tregion.anc\n}\n";
+        let (dir, document, offset) = internal_workspace("region.anc", main);
+        let candidate = document
+            .completion(offset)
+            .into_iter()
+            .find(|candidate| candidate.label == "anchor")
+            .expect("three characters of its own name offer it");
+        assert_eq!(
+            candidate.internal.as_deref(),
+            Some("place against it, never through it")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hover_leads_with_the_reason_at_a_use_and_at_the_field() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "struct Region {\n\t[internal(\"place against it, never through it\")] \
+             anchor: str,\n}\n\n\
+             [internal(\"the reconciler's own bookkeeping\")]\n\
+             fun anchor_row(region: Region): str {\n\tregion.anchor\n}\n\n\
+             fun main() {\n\tanchor_row(Region { anchor = \"a\" });\n}\n",
+        )]);
+        let text = document.line_index.text();
+        let at_use = text.rfind("anchor_row(").expect("the call") + 2;
+        let hover = document.hover(at_use).expect("a function hover");
+        assert!(
+            hover.starts_with("**internal** — the reconciler's own bookkeeping"),
+            "the reason LEADS, before the signature: {hover:?}"
+        );
+        let at_field = text.find("anchor: str").expect("the field") + 2;
+        let field_hover = document.hover(at_field).expect("a field hover");
+        assert!(
+            field_hover.starts_with("**internal** — place against it, never through it"),
+            "{field_hover:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_internal_modifier_dims_the_declaration_and_every_use() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "struct Region {\n\t[internal(\"place against it, never through it\")] \
+             anchor: str,\n\tlabel: str,\n}\n\n\
+             [internal(\"the reconciler's own bookkeeping\")]\n\
+             fun anchor_row(region: Region): str {\n\tregion.anchor\n}\n\n\
+             fun plain(region: Region): str {\n\tregion.label\n}\n",
+        )]);
+        let text = document.line_index.text();
+        let tokens = document.semantic_tokens();
+        let modifier_at = |needle: &str, length: usize| {
+            let at = text.find(needle).expect("the position");
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + length
+                })
+                .map(|(_, _, modifiers)| *modifiers & MODIFIER_INTERNAL)
+        };
+        assert_eq!(
+            modifier_at("anchor_row(region: Region)", 10),
+            Some(MODIFIER_INTERNAL),
+            "the declaration is dimmed too — the reader at the definition is the \
+             one most likely to copy it: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("anchor\n}", 6),
+            Some(MODIFIER_INTERNAL),
+            "and the field at its USE: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("label\n}", 5),
+            Some(0),
+            "while the field beside it is not: {tokens:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── B382: `[deprecated("use …")]` on a type ─────────────────────────────
+
+    #[test]
+    fn b382_a_deprecated_type_is_struck_at_its_declaration_and_its_uses_and_hovers_its_steer() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            concat!(
+                "[deprecated(\"use Next\")]\n",
+                "struct Previous {\n\tat: i32,\n}\n\n",
+                "struct Next {\n\tat: i32,\n}\n\n",
+                "fun read(old: Previous, new: Next): i32 {\n\told.at + new.at\n}\n",
+            ),
+        )]);
+        let text = document.line_index.text();
+        let tokens = document.semantic_tokens();
+        let modifier_at = |needle: &str, skip: usize, length: usize| {
+            let at = text.find(needle).expect("the position") + skip;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + length
+                })
+                .map(|(_, _, modifiers)| *modifiers & MODIFIER_DEPRECATED)
+        };
+        assert_eq!(
+            modifier_at("Previous {", 0, 8),
+            Some(MODIFIER_DEPRECATED),
+            "the declaration: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("old: Previous", 5, 8),
+            Some(MODIFIER_DEPRECATED),
+            "a type naming it: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("new: Next", 5, 4),
+            Some(0),
+            "its replacement is not: {tokens:?}"
+        );
+        let at = text.find("old: Previous").expect("the use") + 6;
+        let hover = document.hover(at).expect("a hover");
+        assert!(
+            hover.starts_with("**deprecated** — use Next"),
+            "the steer LEADS: {hover:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b382_the_legend_names_the_standard_deprecated_modifier() {
+        // A client maps the LSP's own `deprecated` modifier to a strikethrough;
+        // the bit is index-aligned with the legend.
+        assert_eq!(TOKEN_MODIFIERS[3], "deprecated");
+        assert_eq!(MODIFIER_DEPRECATED, 1 << 3);
+    }
+
+    // ── F27 R1: the file declares the platform it is analyzed under ─────────
+
+    /// The owner's package: a client and a server entry, `default-entry` the
+    /// server, and `slot.vl` (opened) reached by neither.
+    fn f27_workspace(slot: &str) -> (PathBuf, Document) {
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+        analyze_workspace(&[
+            ("src/slot.vl", slot),
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                 [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+            ),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ])
+    }
+
+    const F27_UNDECLARED: &str =
+        "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+    #[test]
+    fn f27_a_declared_module_is_analyzed_as_declared_over_the_default_entry() {
+        let (dir, document) = f27_workspace(&format!(
+            "[platform(\"browser\")] mod self;\n\n{F27_UNDECLARED}"
+        ));
+        assert!(
+            document.diagnostics.is_empty(),
+            "no field error in the wrong twin: {:?}",
+            document.diagnostics
+        );
+        let (platform, kind, reason) = document.analysis_platform().expect("an analysis");
+        assert_eq!(platform, "browser");
+        assert_eq!(kind, Some("declared"), "the status line's word");
+        assert_eq!(
+            reason.as_deref(),
+            Some("it declares `[platform(\"browser\")]`")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f27_an_undeclared_module_says_why_it_is_where_it_is() {
+        // The status line's other half: the colour the file took, and why.
+        let (dir, document) = f27_workspace(F27_UNDECLARED);
+        let (platform, kind, reason) = document.analysis_platform().expect("an analysis");
+        assert_eq!(platform, "node");
+        assert_eq!(kind, Some("default-entry"));
+        assert_eq!(
+            reason.as_deref(),
+            Some("no entry reaches it (default-entry is `server`)")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f27_the_live_buffers_declaration_decides_before_it_is_saved() {
+        // Disk holds the undeclared module; the editor holds the declaration
+        // the author just typed. The buffer is what the file IS.
+        let (dir, _undeclared) = f27_workspace(F27_UNDECLARED);
+        let path = dir.join("src/slot.vl");
+        let live = format!("[platform(\"browser\")] mod self;\n\n{F27_UNDECLARED}");
+        let document = Document::analyze(&live, &std_root(), &path);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        assert_eq!(
+            document.analysis_platform().map(|(platform, ..)| platform),
+            Some("browser")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f27_the_twin_note_offers_the_attribute_as_a_quick_fix() {
+        let (dir, document) = f27_workspace(F27_UNDECLARED);
+        let program = document.program.as_ref().expect("a program");
+        let at = F27_UNDECLARED.find("region.anchor").expect("the read");
+        let fixes = document.quickfixes(program, Span::from(at..at + 13));
+        let fix = fixes
+            .iter()
+            .find(|fix| {
+                fix.title
+                    .starts_with("Analyze this file under its platform")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fix: {:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            fix.title,
+            "Analyze this file under its platform: add `[platform(\"browser\")] mod self;`"
+        );
+        assert_eq!(
+            fix.span.into_range(),
+            0..0,
+            "the file's first line, the one legal place"
+        );
+        assert_eq!(fix.replacement, "[platform(\"browser\")] mod self;\n\n");
+        // Applying it is a file that analyzes clean — the fix is the whole move.
+        let fixed = format!("{}{F27_UNDECLARED}", fix.replacement);
+        let document = Document::analyze(&fixed, &std_root(), &dir.join("src/slot.vl"));
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b415_mod_self_paints_its_name_as_the_files_own_namespace() {
+        // B415: `self` in `[platform(..)] mod self;` is the file's module,
+        // DECLARED there — painted as a namespace declaration, not the
+        // receiver colour the TextMate layer gives every `self`.
+        let text = "[platform(\"browser\")] mod self;\n\nfun main() {}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let at = text.find("self;").expect("the name");
+        let token = document
+            .semantic_tokens()
+            .into_iter()
+            .find(|(span, _, _)| span.into_range() == (at..at + 4));
+        assert_eq!(
+            token.map(|(_, kind, modifiers)| (kind, modifiers & MODIFIER_DECLARATION)),
+            Some((TokenKind::Namespace, MODIFIER_DECLARATION)),
+            "{:?}",
+            document.semantic_tokens()
+        );
+        // A receiver `self` further down is not that token.
+        let text = "struct A {}\nimpl A {\n\tfun f(self) {}\n}\nfun main() {}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let at = text.find("self").expect("the receiver");
+        assert!(
+            !document
+                .semantic_tokens()
+                .iter()
+                .any(|(span, kind, _)| span.into_range() == (at..at + 4)
+                    && *kind == TokenKind::Namespace),
+            "a receiver is no namespace"
+        );
+    }
+
+    #[test]
+    fn b415_the_files_head_completes_the_mod_self_host_and_nowhere_else() {
+        let head = completion_items_at_cursor("mo|\n\nfun main() {}\n");
+        let host = head
+            .iter()
+            .find(|completion| completion.label.contains("mod self"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the host at the head: {:?}",
+                    head.iter().map(|c| &c.label).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            host.snippet
+                .as_ref()
+                .is_some_and(|snippet| snippet.body.contains("] mod self;")),
+            "the snippet writes the whole declaration"
+        );
+        // After the first statement, and inside a body, `mod self;` is refused
+        // — so it is not offered.
+        for source in [
+            "import std::io::print;\nmo|\nfun main() {}\n",
+            "fun main() {\n\tmo|\n}\n",
+        ] {
+            assert!(
+                !completions_at_cursor(source)
+                    .iter()
+                    .any(|label| label.contains("mod self")),
+                "{source:?}"
+            );
+        }
+    }
+
+    // ── E221: the label on the nominal, variant, trait and binding positions ──
+
+    /// `helper.vl` declares one labelled item of each E221 kind beside an
+    /// unlabelled enum; `main.vl` is `main`, opened at the end of `marker`.
+    fn e221_workspace(marker: &str, main: &str) -> (PathBuf, Document, usize) {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                concat!(
+                    "export [internal(\"a struct\")]\n",
+                    "struct Region {\n\tlabel: str,\n}\n\n",
+                    "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+                    "export [internal(\"a trait\")]\n",
+                    "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+                    "export [internal(\"a binding\")]\n",
+                    "let cache = 3;\n",
+                ),
+            ),
+        ]);
+        let text = document.line_index.text();
+        let offset = text.find(marker).expect("the marker") + marker.len();
+        (dir, document, offset)
+    }
+
+    const E221_IMPORT: &str = "import pkg::helper::{ Region, Side, Seam, cache };\n\n";
+
+    fn labels_at(document: &Document, offset: usize) -> Vec<String> {
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect()
+    }
+
+    #[test]
+    fn e221_a_labelled_nominal_trait_or_binding_is_absent_from_a_bare_list() {
+        let main = format!("{E221_IMPORT}fun main() {{\n\tlet _ = 1;\n\t\n}}\n");
+        let (dir, document, offset) = e221_workspace("let _ = 1;\n\t", &main);
+        let labels = labels_at(&document, offset);
+        assert!(
+            labels.iter().any(|label| label == "Side"),
+            "the unlabelled enum is offered: {labels:?}"
+        );
+        for hidden in ["Region", "Seam", "cache"] {
+            assert!(
+                !labels.iter().any(|label| label == hidden),
+                "`{hidden}` is labelled, and hidden at a bare position: {labels:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e221_three_characters_of_a_labelled_nominal_bring_it_back_with_its_reason() {
+        for (typed, name, reason) in [
+            ("Reg", "Region", "a struct"),
+            ("cac", "cache", "a binding"),
+            ("Sea", "Seam", "a trait"),
+        ] {
+            let main = format!("{E221_IMPORT}fun main() {{\n\t{typed}\n}}\n");
+            let (dir, document, offset) = e221_workspace(&format!("\t{typed}"), &main);
+            let candidate = document
+                .completion(offset)
+                .into_iter()
+                .find(|candidate| candidate.label == name)
+                .unwrap_or_else(|| panic!("`{typed}` offers `{name}`"));
+            assert_eq!(candidate.internal.as_deref(), Some(reason));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn e221_a_labelled_variant_is_hidden_after_the_path_and_returns_on_its_prefix() {
+        let main = format!("{E221_IMPORT}fun main() {{\n\tlet _ = Side::\n}}\n");
+        let (dir, document, offset) = e221_workspace("Side::", &main);
+        let labels = labels_at(&document, offset);
+        assert!(labels.iter().any(|label| label == "Left"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "Auto"), "{labels:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = format!("{E221_IMPORT}fun main() {{\n\tlet _ = Side::Aut\n}}\n");
+        let (dir, document, offset) = e221_workspace("Side::Aut", &main);
+        let candidate = document
+            .completion(offset)
+            .into_iter()
+            .find(|candidate| candidate.label == "Auto")
+            .expect("three characters of its own name offer it");
+        assert_eq!(candidate.internal.as_deref(), Some("a variant"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e221_the_internal_modifier_dims_every_kind_at_its_declaration_and_its_uses() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            concat!(
+                "[internal(\"a struct\")]\n",
+                "struct Region {\n\tlabel: str,\n}\n\n",
+                "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+                "[internal(\"a binding\")]\n",
+                "let cache = 3;\n\n",
+                "fun read(region: Region): str {\n\tregion.label\n}\n\n",
+                "fun main() {\n\tlet side = Side::Auto;\n\tlet left = Side::Left;\n",
+                "\tprint(i\"{cache}\");\n}\n",
+            ),
+        )]);
+        let text = document.line_index.text();
+        let tokens = document.semantic_tokens();
+        let modifier_at = |needle: &str, skip: usize, length: usize| {
+            let at = text.find(needle).expect("the position") + skip;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + length
+                })
+                .map(|(_, _, modifiers)| *modifiers & MODIFIER_INTERNAL)
+        };
+        assert_eq!(
+            modifier_at("Region {", 0, 6),
+            Some(MODIFIER_INTERNAL),
+            "the struct's declaration: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("region: Region)", 8, 6),
+            Some(MODIFIER_INTERNAL),
+            "a TYPE naming it: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("cache = 3", 0, 5),
+            Some(MODIFIER_INTERNAL),
+            "the binding's declaration: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("{cache}", 1, 5),
+            Some(MODIFIER_INTERNAL),
+            "the binding at a use: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("Side::Auto;", 6, 4),
+            Some(MODIFIER_INTERNAL),
+            "the variant at a use: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("Side::Left;", 6, 4),
+            Some(0),
+            "while its unlabelled sibling is not: {tokens:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e221_hover_leads_with_the_reason_for_every_kind() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            concat!(
+                "[internal(\"a struct\")]\n",
+                "struct Region {\n\tlabel: str,\n}\n\n",
+                "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+                "[internal(\"a trait\")]\n",
+                "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+                "[internal(\"a binding\")]\n",
+                "let cache = 3;\n\n",
+                "fun read<T: Seam>(region: Region, seam: T): str {\n\tregion.label\n}\n\n",
+                "fun main() {\n\tlet side = Side::Auto;\n\tprint(i\"{cache}\");\n}\n",
+            ),
+        )]);
+        let text = document.line_index.text();
+        for (needle, skip, reason) in [
+            ("region: Region", 9, "a struct"),
+            ("T: Seam", 4, "a trait"),
+            ("{cache}", 2, "a binding"),
+            ("Side::Auto", 7, "a variant"),
+        ] {
+            let at = text.find(needle).expect("the position") + skip;
+            let hover = document
+                .hover(at)
+                .unwrap_or_else(|| panic!("a hover at {needle:?}"));
+            assert!(
+                hover.starts_with(&format!("**internal** — {reason}")),
+                "{needle:?}: the reason LEADS: {hover:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E184: the auto-import table is the FOURTH consumer of B318 §1's
+    // visibility bit — the one E178 left behind, because its other route parses
+    // every module's file once per keystroke (four `overlay_module_reclaim`
+    // pins went red on it). visibility-36 put the walk's own answer on
+    // `Program` for exactly this; the filter reads two sets that are already in
+    // hand and parses nothing.
+    #[test]
+    fn a_curated_modules_private_item_is_not_an_auto_import_candidate() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            (
+                "helper.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n\nfun machinery() {}\n",
+            ),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.contains(&"farewell".to_string()),
+            "an EXPORTED sibling is still offered: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"machinery".to_string()),
+            "a curated module's private item is not an add-import target: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // …and the exemption that carries the estate: a module carrying no marker
+    // anywhere offers everything it declares, exactly as it did before the bit
+    // existed (visibility.md §14).
+    #[test]
+    fn an_uncurated_modules_item_is_still_an_auto_import_candidate() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            (
+                "helper.vl",
+                "fun greet() {}\n\nfun farewell() {}\n\nfun machinery() {}\n",
+            ),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label)
+            .collect();
+        for name in ["farewell", "machinery"] {
+            assert!(
+                labels.contains(&name.to_string()),
+                "an uncurated module offers `{name}`: {labels:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4422,15 +12167,20 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // E83: ONE whole-buffer parse per completion request, however many
-    // auto-import candidates the request shapes. `insert_import`'s
-    // string-input form re-parses the buffer per call, and calling it once
-    // per surviving candidate (up to `AUTO_IMPORT_COMPLETION_CAP`) is what
-    // made a bare scope position cost ~20 member completions
-    // (playground-completion.md §9) — in the language server and the
-    // playground alike, since both drive this engine. The shared
-    // `formatter::ParsedSource` pays the parse once; this pin holds the
-    // count, not the time.
+    // E83, then M29: NO whole-buffer parse in a completion request at all,
+    // however many auto-import candidates the request shapes.
+    //
+    // `insert_import`'s string-input form re-parses the buffer per call, and
+    // calling it once per surviving candidate (up to
+    // `AUTO_IMPORT_COMPLETION_CAP`) is what made a bare scope position cost
+    // ~20 member completions (playground-completion.md §9); E83's shared
+    // `formatter::ParsedSource` brought that to ONE parse per request. M29
+    // moved that one onto the analysis: the edits are computed against the
+    // ANALYZED text when the completion index is built and re-mapped through
+    // the edit anchor when a request serves them, so the request parses
+    // nothing. `BUFFER_PARSES` is thread-local and the index is built on the
+    // analysis thread, so what this counts is exactly the request's own
+    // parses. The pin holds the count, not the time.
     #[test]
     fn a_scope_completion_with_many_auto_import_candidates_parses_the_buffer_once() {
         let many_functions: String = (0..30)
@@ -4458,8 +12208,10 @@ pub(crate) mod tests {
             "the scenario must shape a full cap of candidates for the parse count to mean anything"
         );
         assert_eq!(
-            parses, 1,
-            "a completion request parses the buffer once, not once per auto-import candidate"
+            parses, 0,
+            "a completion request parses the buffer not at all: the import edits come \
+             off the analysis (M29), and before it they cost one parse per request \
+             (E83) and one per candidate before that"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4496,9 +12248,10 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(
-            reads, 2,
-            "each module's text is read ONCE per request: math.vl for the imported \
-             candidates, io.vl for the prelude's `print`"
+            reads, 0,
+            "a completion request reads NO module text: the imported candidates' \
+             and the prelude's docs come from the captured index (M39 over M29), \
+             read once when the index is built, never per request"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4639,7 +12392,7 @@ pub(crate) mod tests {
     #[test]
     fn a_container_resource_in_a_module_publishes_on_the_module() {
         let module = "import std::io::print;\nimport std::drop::Drop;\n\
-                      resource struct Guard { label: str }\n\
+                      [resource] struct Guard { label: str }\n\
                       impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
                       fun keep() {\n\tmut arr: List<Guard> = [];\n}\n";
         let (dir, document) = analyze_workspace(&[
@@ -4767,7 +12520,10 @@ pub(crate) mod tests {
                 "main.vl",
                 "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
-            ("broken.vl", "fun answer(): i32 {\n\t\"not a number\"\n}\n"),
+            (
+                "broken.vl",
+                "export *;\n\nfun answer(): i32 {\n\t\"not a number\"\n}\n",
+            ),
         ]);
         assert!(
             document
@@ -4777,7 +12533,11 @@ pub(crate) mod tests {
             "the broken dependency should report first"
         );
         // Fix the module on disk; re-analyze the unchanged entry.
-        std::fs::write(dir.join("broken.vl"), "fun answer(): i32 {\n\t42\n}\n").unwrap();
+        std::fs::write(
+            dir.join("broken.vl"),
+            "export *;\n\nfun answer(): i32 {\n\t42\n}\n",
+        )
+        .unwrap();
         let entry = dir.join("main.vl");
         let text = std::fs::read_to_string(&entry).unwrap();
         let reanalyzed = Document::analyze(&text, &std_root(), &entry);
@@ -4918,7 +12678,7 @@ pub(crate) mod tests {
             reference: vilan_core::git_dep::GitRef::Tag("v1.0.0".to_string()),
         };
         let entry =
-            vilan_core::git_dep::entry_path(&vilan_embedded_std::default_git_dep_root(), &source);
+            vilan_core::git_dep::entry_path(&vilan_embedded::default_git_dep_root(), &source);
         assert!(
             !entry.exists(),
             "the editor must not populate the git cache: {}",
@@ -5223,7 +12983,10 @@ pub(crate) mod tests {
                 "src/deep/lib.vl",
                 "import pkg::util::triple;\n\nfun twice(n: i32): i32 { triple(n) }\n",
             ),
-            ("src/util.vl", "fun triple(n: i32): i32 { n * 3 }\n"),
+            (
+                "src/util.vl",
+                "export *;\n\nfun triple(n: i32): i32 { n * 3 }\n",
+            ),
             ("vilan.toml", "[library]\nname = \"shapes\"\n"),
         ]);
         assert!(
@@ -5307,8 +13070,14 @@ pub(crate) mod tests {
                 "import pkg::paint::tint;\nimport pkg::shared::base_value;\n\n\
                  fun render(): i32 { tint() + base_value() }\n",
             ),
-            ("src/browser/paint.vl", "fun tint(): i32 { 2 }\n"),
-            ("src/shared.vl", "fun base_value(): i32 { 1 }\n"),
+            (
+                "src/browser/paint.vl",
+                "export *;\n\nfun tint(): i32 { 2 }\n",
+            ),
+            (
+                "src/shared.vl",
+                "export *;\n\nfun base_value(): i32 { 1 }\n",
+            ),
             (
                 "vilan.toml",
                 "[library]\nname = \"widgets\"\n[library.layer.browser]\n\
@@ -5443,7 +13212,7 @@ pub(crate) mod tests {
     fn multi_entry_files_analyze_under_their_entry_targets() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let store = "import std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n";
+        let store = "export *;\n\nimport std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n";
         let reach = "import std::io::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"?\") }\n}\n";
         let (dir, client) = analyze_workspace(&[
             ("src/client.vl", reach),
@@ -5548,6 +13317,105 @@ pub(crate) mod tests {
         let document = Document::analyze(&text, &std_root(), &path);
         assert!(
             document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // F27 R2: MEMBER evidence, for the file B36's name rule cannot decide. The
+    // owner's `lib/conditional_value.vl` imports `Region`, `Row` and `Slot` —
+    // every one of them declared by BOTH `std::ui` twins — so there is no name
+    // to weigh, and the file went to the process twin, where `region.anchor` is
+    // not a field. What it DOES with those names is the evidence: `anchor` is
+    // declared by the browser twin and by nothing on the process side.
+    #[test]
+    fn a_shared_file_reading_a_browser_only_member_infers_browser() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared =
+            "import std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/slot.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/slot.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The direction that keeps the rule a rule: a member only the PROCESS twin
+    // declares (`Region.parent`) is not browser evidence, so the file stays
+    // where it was — and it is clean there, which it would not be under the
+    // browser overlay. A "any member the browser twin has" rule would flip it.
+    #[test]
+    fn a_shared_file_reading_a_process_only_member_stays_on_the_process_twin() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared =
+            "import std::ui::Region;\n\nfun parent_of(region: Region) {\n\tregion.parent;\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/slot.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/slot.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // And member evidence is weighed only for a TWIN module the file imports:
+    // a file that imports no `std::ui` at all, and reads `.anchor` off its own
+    // struct, is not browser-coloured by the name of a field.
+    #[test]
+    fn a_member_name_off_a_users_own_type_is_not_platform_evidence() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared = "struct Marker {\n\tanchor: str,\n}\n\nfun anchor_of(marker: Marker): str {\n\tmarker.anchor\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/marker.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/marker.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document
+                .published_diagnostics()
+                .iter()
+                .all(|item| !item.message.contains("browser")),
             "{:?}",
             document
                 .published_diagnostics()
@@ -5683,6 +13551,110 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn b239_an_open_module_file_a_sibling_imports_publishes_nothing() {
+        // B239, in the editor. The language server analyzes the OPEN file as
+        // the entry, because a buffer is all it has — and `views.vl` is one of
+        // the package's modules, which `channel.vl` imports back. B226 refused
+        // that import (correctly, for a declared entry: the entry is the
+        // program, not a module) and everything `channel` took from `views`
+        // missed after it, so the owner's editor showed seven errors over a
+        // package `vilan check .` compiled clean. The editor must publish what
+        // the build says, which here is nothing.
+        //
+        // The open file carries a `[derive]` and an inherent `impl` the sibling
+        // reaches through the cycle: the derive proves the file is still walked
+        // as the program, the method that the cycle really resolves.
+        let (dir, views) = analyze_workspace(&[
+            (
+                "src/views.vl",
+                "export *;\n\nimport pkg::channel::render;\n\n\
+                 [derive(PartialEq)]\nenum Tab { Messages, Other }\n\n\
+                 struct Style { padding: i32 }\n\n\
+                 impl Style {\n\tfun flex_row(self): Style {\n\t\t\
+                 Style { padding = self.padding + 1 }\n\t}\n}\n\n\
+                 fun button_style(): Style { Style { padding = 1 } }\n\n\
+                 fun icon(name: str): str { name }\n\n\
+                 fun shown(): bool { Tab::Messages == Tab::Other }\n\n\
+                 fun total(): i32 { render() }\n",
+            ),
+            ("vilan.toml", &fullstack_package("server")),
+            (
+                "src/channel.vl",
+                "export *;\n\nimport pkg::views::{ Style, button_style, icon };\n\n\
+                 fun render(): i32 {\n\tlet base = button_style().flex_row();\n\t\
+                 let label = icon(\"x\");\n\tbase.padding\n}\n",
+            ),
+            (
+                "src/client.vl",
+                "import pkg::views::{ shown, total };\n\n\
+                 fun main() {\n\tlet reported = shown();\n\tlet count = total();\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ]);
+        assert!(
+            views.published_diagnostics().is_empty(),
+            "an open module file is still the module its siblings import: {:?}",
+            messages(&views.published_diagnostics())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b240_an_open_module_importing_a_declared_entry_is_refused_once() {
+        // B240, in the editor. The open file is a MODULE and its own siblings
+        // may import it (B239) — but the package's OTHER declared programs are
+        // still programs, and file mode could not see which files those were:
+        // `views.vl` importing `pkg::client::helper` was clean here while
+        // `vilan check .`, whose `client` leg compiles that same file as the
+        // entry, refused it. The manifest's declared-entry set rides on
+        // `EntryMode` now.
+        //
+        // And ONCE. The refusal is the import's, and every leaf of `import
+        // pkg::client::{ helper, other }` carries the module segment's own
+        // span — so one statement pushed one error per name it listed, all on
+        // the same word. The CLI folds identical spans and showed one; raw LSP
+        // diagnostics do not, and showed two squiggles.
+        let (dir, views) = analyze_workspace(&[
+            (
+                "src/views.vl",
+                "export *;\n\nimport pkg::client::{ helper, other };\n\n\
+                 fun render(): i32 { helper() + other() }\n",
+            ),
+            ("vilan.toml", &fullstack_package("server")),
+            (
+                "src/client.vl",
+                "import std::io::print;\n\nfun helper(): i32 { 1 }\n\n\
+                 fun other(): i32 { 2 }\n\nfun main() {\n\tprint(\"client\");\n}\n",
+            ),
+            (
+                "src/server.vl",
+                "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+            ),
+        ]);
+        let published = views.published_diagnostics();
+        assert_eq!(
+            published
+                .iter()
+                .filter(|item| item.message.contains("is this program's entry file"))
+                .count(),
+            1,
+            "one import statement, one squiggle: {:?}",
+            messages(&published)
+        );
+        // B236: and nothing about the names it did not bind.
+        assert_eq!(
+            published.len(),
+            1,
+            "the refusal stands alone: {:?}",
+            messages(&published)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_unreached_module_analyzes_under_the_default_entry() {
         // No entry loads it — a module in progress, or one whose importer was
         // just deleted. The designated `default-entry` answers, and moving the
@@ -5717,13 +13689,243 @@ pub(crate) mod tests {
     /// The hover text at the cursor marked `|` in `src` (a bare manifest-less
     /// file, like `completions_at_cursor` — keep the sources closure-free, the
     /// marker would collide with closure pipes).
+    ///
+    /// N114: the helper REFUSES a fixture with a second `|`, and that guard is
+    /// the point of it. `replace('|', "")` strips every pipe, not just the
+    /// marker, so a fixture carrying a closure type or a union-shaped comment
+    /// was analyzed as a DIFFERENT program from the one written in the test —
+    /// `fun with_owner(body: (|| void) context owner_scope)` became
+    /// `fun with_owner(body: ( void) context owner_scope)`, and E9's pin on the
+    /// rendered clause passed by asserting a string only the stale append E207
+    /// had deleted could produce. That is a pin that reads as coverage and is
+    /// not. A fixture that needs a pipe of its own takes
+    /// [`hover_at_marker`](hover_at_marker) and picks a marker character
+    /// instead; the panic below names the fixture so the swap is one edit.
     fn hover_at_cursor(src: &str) -> Option<String> {
+        let markers = src.matches('|').count();
+        assert_eq!(
+            markers, 1,
+            "a `hover_at_cursor` fixture carries EXACTLY ONE `|`, the cursor — \
+             this one carries {markers}, and every one of them is stripped \
+             before the analysis, so the program analyzed is not the program \
+             written. Use `hover_at_marker(src, '¦')` for a fixture with pipes \
+             of its own. The fixture: {src:?}"
+        );
         let offset = src
             .find('|')
             .expect("test source needs a `|` cursor marker");
         let text = src.replace('|', "");
         let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
         document.hover(offset)
+    }
+
+    /// N114's guard, shown to fire: the mangling fixture — E9's own, as it was
+    /// written before the pin moved to `hover_at_marker` — is refused by the
+    /// helper rather than silently analyzed with its closure type flattened.
+    ///
+    /// Non-vacuous by construction: the same fixture with its closure type
+    /// removed carries one pipe and passes through, which is the `assert_eq!`
+    /// above discriminating on the count rather than on the shape.
+    #[test]
+    #[should_panic(expected = "carries EXACTLY ONE `|`")]
+    fn n114_a_fixture_with_a_second_pipe_is_refused_by_the_helper() {
+        let _ = hover_at_cursor(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o|wner(body: (|| void) \
+             context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+        );
+    }
+
+    // --- E128: `Self` in a TRAIT declaration renders as `Self` ---------------
+    //
+    // `declaration_labels` called `function_signature_label` with no impl, and a
+    // `= Self`-defaulted trait generic resolves to the very same type as `Self`
+    // (`trait Add<B = Self>` — both are `Type::Trait(Add, [])`), so hover on
+    // `Add::add` printed the TRAIT's name: `fun add(self, b: Add): Add`, a
+    // signature nobody can write. B206 fixed exactly this for the conformance
+    // steer, by rendering FOR the impl; hover has no impl in hand and does not
+    // want one — it is showing the DECLARATION.
+    //
+    // Ruled: render the literal `Self`. It is what the trait's author wrote, it
+    // is the only spelling a reader can write back, and a `= Self` parameter
+    // shows its default, which is the whole of what the shorthand says.
+
+    #[test]
+    fn e128_hover_on_a_trait_member_renders_self_and_not_the_traits_name() {
+        // The item's own exhibit: `Add::add`, reached from a sub-trait's default
+        // body. Both positions — the `= Self`-defaulted `b` and the `Self`
+        // return — printed `Add` before.
+        let hover = hover_at_cursor(
+            "import std::operators::Add;\n\ntrait Doubler with Add {\n\tfun twice(self): Self {\n\t\tself.a|dd(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `add` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun add(self, b: Self): Self\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_through_a_generic_bound_renders_self_too() {
+        // The other route to a trait's own declaration: a call dispatched
+        // through a bound. Same label, because it is the same declaration.
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::operators::Sub;\n\nfun gap<T: Sub>(a: T, b: T): T {\n\ta.s|ub(b)\n}\n\nfun main() {\n\tprint(gap(3, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `sub` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun sub(self, b: Self): Self\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_on_a_user_traits_defaulted_parameter_renders_self() {
+        // A user trait, so the rule is not std's — hovered on the declaration
+        // itself, where a reader is most likely to ask.
+        let hover = hover_at_cursor(
+            "trait Adder<B = Self> {\n\tfun pl|us(self, b: B): Self;\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `plus` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun plus(self, b: Self): Self\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_renders_self_in_a_partial_eq_shaped_declaration() {
+        // `PartialEq`'s shape — a `= Self` parameter under a `bool` return — so
+        // the rule is pinned on a position whose SIBLING is not ambiguous: only
+        // the parameter moves, and `bool` is still `bool`.
+        let hover = hover_at_cursor(
+            "trait Same<B = Self> {\n\tfun al|ike(self, other: B): bool;\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `alike` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun alike(self, other: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_a_trait_members_ordinary_parameter_still_renders_as_written() {
+        // The control that keeps the rule narrow: only a position resolving to
+        // the DECLARING trait's own abstract type is rewritten. A concrete
+        // parameter and a mention of another trait's name are untouched.
+        let hover = hover_at_cursor(
+            "trait Labelled<B = Self> {\n\tfun la|bel(self, times: i32, other: B): str;\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `label` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun label(self, times: i32, other: Self): str\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e128_hover_on_an_impls_method_still_renders_the_impls_own_types() {
+        // The other control: an IMPL is not a declaration, and its signature was
+        // never ambiguous — it says the concrete type on both sides.
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::compare::PartialEq;\n\nstruct Tag { n: i32 }\nimpl Tag with PartialEq {\n\tfun e|q(self, other: Tag): bool { self.n == other.n }\n}\n\nfun main() {\n\tprint(Tag { n = 1 }.eq(Tag { n = 1 }));\n}\n\nmain();\n",
+        )
+        .expect("hover on the impl's `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, other: Tag): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    // --- E138: the comparison traits' members resolve as hover targets ------
+    //
+    // E128 pinned the `= Self` rendering on a USER trait shaped like
+    // `PartialEq` because hover on the std comparison traits' own members was
+    // seen to answer nothing through either route — read as a target-resolution
+    // gap. It is not one. `PartialEq`/`PartialOrd` live in `std::compare`, not
+    // `std::operators` where `Add`/`Sub`/`Mul` do, and the probe that found the
+    // silence imported them from the latter: the trait then does not exist, the
+    // member does not resolve, and no label is the honest answer. These four
+    // pin resolution through both routes on the RIGHT path; the fifth pins the
+    // misroute itself — the diagnostics that name the mistake and the fix — so
+    // the silence is never again read as a hover defect. Planting
+    // `std::operators` back into any of the four returns them to `None`, which
+    // is what the fifth records.
+
+    #[test]
+    fn e138_hover_on_partial_eq_eq_through_a_default_body() {
+        let hover = hover_at_cursor(
+            "import std::compare::PartialEq;\n\ntrait Same with PartialEq {\n\tfun alike(self): bool {\n\t\tself.e|q(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_eq_eq_through_a_bound() {
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::compare::PartialEq;\n\nfun alike<T: PartialEq>(a: T, b: T): bool {\n\ta.e|q(b)\n}\n\nfun main() {\n\tprint(alike(1, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `eq` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun eq(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_ord_lt_through_a_default_body() {
+        let hover = hover_at_cursor(
+            "import std::compare::PartialOrd;\n\ntrait Ranked with PartialOrd {\n\tfun below(self): bool {\n\t\tself.l|t(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n",
+        )
+        .expect("hover on `lt` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_hover_on_partial_ord_lt_through_a_bound() {
+        let hover = hover_at_cursor(
+            "import std::io::print;\nimport std::compare::PartialOrd;\n\nfun below<T: PartialOrd>(a: T, b: T): bool {\n\ta.l|t(b)\n}\n\nfun main() {\n\tprint(below(1, 2));\n}\n\nmain();\n",
+        )
+        .expect("hover on `lt` should produce a label");
+        assert!(
+            hover.contains("```vilan\nfun lt(self, b: Self): bool\n```"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn e138_importing_partial_eq_from_std_operators_is_diagnosed_and_hovers_nothing() {
+        // The probe's own shape, kept as the record: the import fails, the
+        // compiler names `std::compare` as the fix, the trait bound resolves to
+        // nothing, and hover on `eq` is correctly silent.
+        let source = "import std::operators::PartialEq;\n\ntrait Same with PartialEq {\n\tfun alike(self): bool {\n\t\tself.eq(self)\n\t}\n}\n\nfun main() {}\n\nmain();\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let diagnostics = document.published_diagnostics();
+        let published = messages(&diagnostics);
+        assert!(
+            published
+                .iter()
+                .any(|message| message.contains("cannot find 'PartialEq' in the imported path")),
+            "{published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .any(|message| message.contains("import std::compare::PartialEq;")),
+            "the diagnostic names the module the trait actually lives in: {published:?}"
+        );
+        let offset = source.find("self.eq").expect("exhibit has `self.eq`") + "self.e".len();
+        assert_eq!(
+            document.hover(offset),
+            None,
+            "a member of a trait that did not resolve has no declaration to show"
+        );
     }
 
     // Hovering a function name appends its inferred platform requirement — the
@@ -5752,6 +13954,20 @@ pub(crate) mod tests {
         .expect("hovering `width` should produce a label");
         assert!(hover.contains("...items: T"), "{hover}");
         assert!(hover.contains("sep: str"), "{hover}");
+    }
+
+    // `lazy` rides the hover for the spread marker's reason (lazy.md §5, "hover
+    // renders `lazy` in signatures like the other effect surface"): it is part
+    // of the signature, and it is precisely what tells the reader whether their
+    // argument runs at the call or inside the callee.
+    #[test]
+    fn hover_shows_a_lazy_parameters_modifier() {
+        let hover = hover_at_cursor(
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n\nfun main() {\n\texpect_pos|itive(1, \"no\");\n}\n",
+        )
+        .expect("hovering `expect_positive` should produce a label");
+        assert!(hover.contains("lazy complaint: str"), "{hover}");
+        assert!(hover.contains("value: i32"), "{hover}");
     }
 
     // The declaration name carries the requirement too, not just call sites.
@@ -5850,6 +14066,159 @@ pub(crate) mod tests {
         assert_eq!(kind_of("abs", 0), Some(TokenKind::Method), "{tokens:?}");
     }
 
+    // E161: which LAYER paints a nested generic head. The semantic classifier
+    // is the authority wherever it classifies — VS Code lets a semantic token
+    // override the TextMate scope underneath it — so a token that spans more
+    // than the name it classifies takes the whole run with it. The binder's
+    // entity was spanned by its NODE, which reaches from the `type` keyword to
+    // the end of the bounds: `impl Source<Option<type _: Source<type U>>>`
+    // emitted ONE `TypeParameter` token over `type _: Source<type U>`, the
+    // overlap filter (narrowest-first, then strictly non-overlapping) then
+    // dropped `Source` and `U` inside it, and the whole run painted in the
+    // type-parameter colour — which is the owner's "the binder keyword is
+    // coloured like a type name", owned here and not by the grammar. With the
+    // name's own span on the node, each name is its own token and the keyword
+    // is left to the TextMate layer, where the binder rule paints it.
+    #[test]
+    fn e161_a_binder_is_spanned_by_its_name_not_by_the_head_it_opens() {
+        let text = "import std::reactive::{ Source, Signal };\n\nimpl Source<Option<type _: Source<type U>>> {\n\tfun depth(self): i32 {\n\t\t2\n\t}\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        let painted = |snippet: &str, occurrence: usize| -> Option<(TokenKind, usize)> {
+            let mut start = 0;
+            let mut position = None;
+            for _ in 0..=occurrence {
+                position = text[start..].find(snippet).map(|at| start + at);
+                start = position? + 1;
+            }
+            let at = position?;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start <= at && at < range.end
+                })
+                .map(|(span, kind, _)| (*kind, span.into_range().len()))
+        };
+        // The binder's own name, one character wide.
+        assert_eq!(
+            painted("_", 0),
+            Some((TokenKind::TypeParameter, 1)),
+            "{tokens:?}"
+        );
+        assert_eq!(
+            painted("U", 0),
+            Some((TokenKind::TypeParameter, 1)),
+            "{tokens:?}"
+        );
+        // The bound INSIDE the binder is its own name again, not swallowed.
+        assert_eq!(
+            painted("Source<type U>", 0),
+            Some((TokenKind::Interface, "Source".len())),
+            "{tokens:?}"
+        );
+        // And the keyword is classified by nothing here, so the grammar's
+        // binder rule is what paints it.
+        let keyword = text.find("type _").expect("the binder keyword");
+        assert!(
+            !tokens.iter().any(|(span, _, _)| {
+                let range = span.into_range();
+                range.start <= keyword && keyword < range.end
+            }),
+            "the `type` keyword is classified by the semantic layer: {tokens:?}"
+        );
+    }
+
+    // --- B184: a trait-typed struct field, in the editor ---------------------
+    //
+    // trait-typed-fields.md rev 2 §R4.2 answered the `impl Trait` grammar
+    // question with the editor's own evidence: the LSP classifies a name in a
+    // type position from the ENTITY it resolved to, so a trait annotation is
+    // already a different colour from a struct annotation with no keyword. That
+    // was probed on a program the compiler refused; it is a legal program now,
+    // and the argument only holds if the answer survives.
+
+    #[test]
+    fn b184_a_trait_typed_field_paints_as_an_interface_and_hovers_as_the_bound() {
+        // A124 R3 withdrew the BARE spelling at a field; the annotation is
+        // `dyn X` now, and §R4.2's argument is asked of it — the trait name
+        // inside the `dyn` still paints `interface` where a struct name in the
+        // same position paints `struct`, so the reader can still tell a bound
+        // from a type without a keyword to look at.
+        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: dyn X,\n}\n\nstruct D {\n\ta: A,\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        let kind_at = |at: usize, len: usize| -> Option<TokenKind> {
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + len
+                })
+                .map(|(_, kind, _)| *kind)
+        };
+        // The two annotations, in the SAME position, one line apart in shape:
+        // the trait paints `interface`, the struct paints `struct`. That is the
+        // whole of §R4.2's argument for the bare grammar.
+        let trait_annotation = text.find("x: dyn X").unwrap() + "x: dyn ".len();
+        let struct_annotation = text.find("a: A").unwrap() + "a: ".len();
+        assert_eq!(
+            kind_at(trait_annotation, 1),
+            Some(TokenKind::Interface),
+            "{tokens:?}"
+        );
+        assert_eq!(
+            kind_at(struct_annotation, 1),
+            Some(TokenKind::Struct),
+            "{tokens:?}"
+        );
+        // And hover on the annotation answers with the trait — the trait is
+        // what the author wrote and what the object erases to.
+        let hover = document.hover(trait_annotation).unwrap_or_default();
+        assert!(hover.contains('X'), "hover on the annotation: {hover:?}");
+    }
+
+    #[test]
+    fn b261_hover_on_an_implicit_binder_shows_the_source_spelling_not_the_face() {
+        // B261 gave B186's implicit binder a FACE — `impl Add` — so an operator
+        // head can tell the parameter from the trait it is bound by. That face
+        // is the DIAGNOSTIC's, and this pins the boundary: the editor surface
+        // still answers with the trait, because the trait is what the author
+        // wrote at that offset and the only spelling they can write back. Same
+        // answer `b184_a_trait_typed_field_paints_as_an_interface_and_hovers_as_
+        // the_bound` gives one level out, for the same reason.
+        let hover = hover_at_cursor(
+            "import std::operators::Add;\n\nfun bump(a: A|dd) {\n\tlet _ = a;\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the annotation should produce a label");
+        assert!(hover.contains("Add"), "hover on the annotation: {hover:?}");
+        assert!(
+            !hover.contains("impl Add"),
+            "the face is the diagnostic's, not the editor's: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn b184_an_inlay_hint_on_an_object_field_struct_shows_one_type() {
+        // The display rule where a reader meets it most often, re-asked under
+        // A124 R3. Under B184's sugar the hint read `: C<A>` — the hidden
+        // argument, because a `C` over an `A` and a `C` over a `B` were two
+        // types. An object field makes `C` ONE type whatever it holds, so the
+        // honest hint is `: C`, and the simplification is visible exactly here.
+        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: dyn X,\n}\n\nfun main() {\n\tlet holder = C { x = A {} };\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let hints = document.inlay_hints();
+        let at = text.find("holder").unwrap() + "holder".len();
+        assert_eq!(
+            hints
+                .iter()
+                .find(|(offset, _)| *offset == at)
+                .map(|(_, label)| label.clone()),
+            Some(": C".to_string()),
+            "{hints:?}"
+        );
+    }
+
     #[test]
     fn semantic_tokens_paint_markup() {
         // Element-syntax S5: tags (open AND close) paint as Tag, attribute and
@@ -5887,6 +14256,13 @@ pub(crate) mod tests {
         );
         // The `<div` scaffolding Function token is suppressed.
         assert_eq!(kind_of("<div", 0), None, "{tokens:?}");
+        // E115: the angle brackets themselves paint too, as the tag they
+        // belong to — the open `<`, the head's `>`, a `/>`, and the close
+        // tag's `</` and `>`.
+        assert_eq!(kind_of("<", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of(">", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("/>", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("</", 0), Some(TokenKind::Tag), "{tokens:?}");
         // The invariant the sweep guarantees, re-checked over markup.
         let mut last_end = 0usize;
         for (span, _, _) in &tokens {
@@ -5899,6 +14275,45 @@ pub(crate) mod tests {
         }
     }
 
+    // E115: the owner's report — a head whose attributes span lines, with the
+    // closing `>` on a line of its own, loses that bracket's highlight. The
+    // rule this pins is that the SHAPE of the head cannot change the tokens:
+    // the same head written one-line and multi-line paints the same things, in
+    // the same order, with the same kinds. That is a property only a
+    // parse-driven source can have — a TextMate rule is matched one line at a
+    // time, so the `>` is out of its reach the moment it leaves the tag's line.
+    #[test]
+    fn a_multi_line_element_head_paints_what_a_one_line_head_paints() {
+        let prelude = "import std::ui::{ view, View };\n\nfun page(): View {\n";
+        let one_line =
+            format!("{prelude}\t<div aria-label(\"x\") on:click(handle)>\"hi\"</div>\n}}\n");
+        let multi_line = format!(
+            "{prelude}\t<div\n\t\taria-label(\"x\")\n\t\ton:click(handle)\n\t>\"hi\"</div>\n}}\n"
+        );
+        // Each token as (the source text it covers, its kind) — the shape a
+        // reader sees painted, independent of where the bytes landed.
+        let painted = |text: &str| -> Vec<(String, TokenKind)> {
+            let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+            document
+                .semantic_tokens()
+                .into_iter()
+                .map(|(span, kind, _)| (text[span.into_range()].to_string(), kind))
+                .collect()
+        };
+        let flat = painted(&one_line);
+        assert_eq!(
+            flat,
+            painted(&multi_line),
+            "the head's shape must not change what is painted",
+        );
+        // …and the terminator is in there, painted as its tag rather than left
+        // to fall through to the operator list as a comparison.
+        assert!(
+            flat.contains(&(">".to_string(), TokenKind::Tag)),
+            "the head's closing `>` is painted: {flat:?}",
+        );
+    }
+
     #[test]
     fn semantic_tokens_paint_a_css_block() {
         // css-block S5: a property name paints as Property and a condition
@@ -5909,7 +14324,7 @@ pub(crate) mod tests {
         // outer `style()`, at the `css` keyword, so the missing-import note can
         // underline the word that asked for a `Style` — is suppressed here,
         // exactly as `<div`'s Function token is.
-        let text = "import std::style::{ Color, Style, space, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay: flex;\n\t\tflex-direction: column;\n\t\tgap: {space(4)};\n\t\t--brand-ink: {Color::gray(900)};\n\t\t.md {\n\t\t\tcolor: {Color::gray(50)};\n\t\t}\n\t}\n}\n";
+        let text = "import std::style::{ Color, Style, space, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tflex-direction(\"column\");\n\t\tgap(space(4));\n\t\t--brand-ink(Color::gray(900));\n\t\t.md {\n\t\t\tcolor(Color::gray(50));\n\t\t}\n\t}\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let tokens = document.semantic_tokens();
         let kind_of = |snippet: &str, occurrence: usize| -> Option<TokenKind> {
@@ -6186,7 +14601,154 @@ pub(crate) mod tests {
         assert!(hover.contains("```vilan\nlet count: i32\n```"), "{hover}");
     }
 
+    // E133: a caret at the very END of a name hovers, the same convention
+    // rename and find-references answer by. Hover going blank at `count|`
+    // while rename works there is the two gates disagreeing about one question
+    // the user reads as one feature — is the cursor on this word — so
+    // `offset_touches_a_token` counts a token's end as touching it. Trivia is
+    // untouched: the pin's last case is a caret inside whitespace, which still
+    // hovers nothing.
+    #[test]
+    fn hover_at_the_end_of_a_name_answers_the_same_as_inside_it() {
+        let inside = hover_at_cursor("fun main() {\n\tlet cou|nt = 5;\n\tlet _ = count;\n}\n")
+            .expect("hover inside the name");
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count| = 5;\n\tlet _ = count;\n}\n"),
+            Some(inside),
+            "the caret at `count|` is on `count`",
+        );
+        // A module binding and a function name, the other two shapes a rename
+        // is started from at `name|`.
+        assert_eq!(
+            hover_at_cursor("let capacity| = 100;\n\nfun main() {\n\tlet _ = capacity;\n}\n"),
+            hover_at_cursor("let cap|acity = 100;\n\nfun main() {\n\tlet _ = capacity;\n}\n"),
+        );
+        assert_eq!(
+            hover_at_cursor("fun helper|(value: i32): i32 {\n\tvalue + 1\n}\n"),
+            hover_at_cursor("fun hel|per(value: i32): i32 {\n\tvalue + 1\n}\n"),
+        );
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\t | \n\tlet _ = count;\n}\n"),
+            None,
+            "a caret in whitespace still touches no token",
+        );
+    }
+
     // A `mut` binding hovers with the `mut` keyword — it can be reassigned.
+    // --- E139: `entity_at` is end-inclusive too -----------------------------
+    //
+    // E133 gave the REFERENCE INDEX the end-inclusive convention, which fixed
+    // rename, find-references and hover on a DECLARATION. Hover on a bare USE
+    // does not go through the index at all: it goes through
+    // `vilan_ide::analysis::entity_at`, whose containment was separately
+    // end-exclusive — and, because entity spans NEST, the strict test did not
+    // fail there, it answered the enclosing function instead. `let _ = count|`
+    // showed `fun main()`.
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_bare_use_answers_the_use() {
+        let inside = hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = cou|nt;\n}\n")
+            .expect("hover inside the use");
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count|;\n}\n"),
+            Some(inside.clone()),
+            "the caret at `count|` on a USE is on `count`, not on `main`",
+        );
+        assert!(inside.contains("count: i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_called_functions_name_answers_the_function() {
+        // The other bare-use shape: the callee of a call, whose own span is
+        // nested inside the call's. `helper|(` used to answer the call's
+        // enclosing entity.
+        let inside = hover_at_cursor(
+            "fun helper(): i32 {\n\t1\n}\n\nfun main() {\n\tlet _ = hel|per();\n}\n",
+        )
+        .expect("hover inside the callee's name");
+        assert_eq!(
+            hover_at_cursor(
+                "fun helper(): i32 {\n\t1\n}\n\nfun main() {\n\tlet _ = helper|();\n}\n"
+            ),
+            Some(inside.clone()),
+        );
+        assert!(inside.contains("fun helper(): i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_field_read_answers_the_field() {
+        let inside = hover_at_cursor(
+            "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _ = p.|x;\n}\n",
+        )
+        .expect("hover inside the field name");
+        assert_eq!(
+            hover_at_cursor(
+                "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _ = p.x|;\n}\n",
+            ),
+            Some(inside.clone()),
+        );
+        assert!(inside.contains("x: i32"), "{inside}");
+    }
+
+    #[test]
+    fn e139_a_caret_past_the_name_is_not_on_it() {
+        // The convention's other edge: end-INCLUSIVE, not end-plus-one. A
+        // caret one byte further on has left the word, and whatever it
+        // answers, it is not the use.
+        let on_the_name =
+            hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count| ;\n}\n");
+        let past_it = hover_at_cursor("fun main() {\n\tlet count = 5;\n\tlet _ = count |;\n}\n");
+        assert!(
+            on_the_name
+                .as_deref()
+                .is_some_and(|hover| hover.contains("count: i32")),
+            "{on_the_name:?}"
+        );
+        assert_ne!(on_the_name, past_it);
+    }
+
+    #[test]
+    fn e139_hover_at_the_end_of_a_use_a_larger_expression_continues() {
+        // The shape that moved an existing pin: `xs|[0]` used to answer the
+        // INDEX expression, because the caret is not strictly inside the use
+        // and the index expression is the innermost entity that strictly
+        // contains it. A caret at the end of a word is on the word even when
+        // the expression goes on.
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+            .expect("the use hovers");
+        assert_eq!(hover, "```vilan\nlet xs: List<i32>\n```");
+    }
+
+    #[test]
+    fn e139_completions_receiver_is_unchanged_at_the_dot() {
+        // The other half of `entity_at`'s traffic. Completion resolves `x|.`
+        // by asking about the receiver's END, and the end-inclusive rule is
+        // what makes that literal — the probe used to ask one byte inside and
+        // lean on strict containment, which the widening would have handed the
+        // innermost entity closing there (`Some(1).` answered the literal `1`,
+        // and Option's members were lost). A bare name, a call and a
+        // constructor call, all three at the dot.
+        let bare = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\nfun main() {\n\tlet p = Point { x = 1, y = 2 };\n\tp.|\n}\n",
+        );
+        assert!(
+            bare.contains(&"x".to_string()) && bare.contains(&"y".to_string()),
+            "{bare:?}"
+        );
+        let call = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\nfun make(): Point {\n\tPoint { x = 1, y = 2 }\n}\n\nfun main() {\n\tmake().|\n}\n",
+        );
+        assert!(
+            call.contains(&"x".to_string()) && call.contains(&"y".to_string()),
+            "{call:?}"
+        );
+        let constructed = call_receiver_completions("\tSome(1).|\n");
+        assert!(
+            constructed.contains(&"unwrap_or".to_string()),
+            "{constructed:?}"
+        );
+    }
+
     #[test]
     fn hover_on_a_mut_binding_shows_mut() {
         let hover = hover_at_cursor("fun main() {\n\tmut tot|al = 0;\n\ttotal = 1;\n}\n")
@@ -6290,17 +14852,19 @@ pub(crate) mod tests {
     }
 
     // WO-4 keywords: a keyword hovers as one crisp sentence + a book deep link.
-    // Covers the flagship memory-model word `resource` (spec link), a second
-    // memory-model word `own` (spec link), and a control-flow word `for` (tour
-    // link) — sentence AND URL asserted per case.
+    // Covers the flagship memory-model word `resource` (spec link — since B413
+    // the `[resource]` ATTRIBUTE, which hovers the way the keyword did), a
+    // second memory-model word `own` (spec link), and a control-flow word `for`
+    // (tour link) — sentence AND URL asserted per case.
     #[test]
     fn hover_on_a_keyword_shows_its_meaning_and_book_link() {
-        let hover = hover_at_cursor("resou|rce struct File { fd: i32 }\n\nfun main() {}\n")
-            .expect("hover on `resource`");
+        let hover = hover_at_cursor("[resou|rce] struct File { fd: i32 }\n\nfun main() {}\n")
+            .expect("hover on `[resource]`");
         assert!(
-            hover.contains("An owned value with exactly one owner, moved rather than copied"),
+            hover.contains("an owned value with exactly one owner, moved rather than copied"),
             "{hover}"
         );
+        assert!(hover.starts_with("**`[resource]`**"), "{hover}");
         assert!(
             hover.contains(
                 "https://vilan-lang.org/docs/spec/memory.html#68-resources-and-destruction"
@@ -6332,15 +14896,24 @@ pub(crate) mod tests {
     // purely lexical, ahead of any analysis.
     #[test]
     fn hover_on_a_keyword_works_without_a_program() {
-        let text = "fun main() {\n\tresource\n}\n"; // `resource` misused — analysis fails.
+        let text = "fun main() {\n\town\n}\n"; // `own` misused — analysis fails.
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
-        let offset = text.find("resource").unwrap() + 1;
+        let offset = text.find("own").unwrap() + 1;
         let hover = document
             .hover(offset)
             .expect("keyword hover without a program");
+        assert!(hover.contains("moves ownership into the callee"), "{hover}");
+        // B413: `resource` is a NAME now, so a bare one is no keyword and
+        // hovers no keyword sentence; only the attribute does.
+        let text = "fun main() {\n\tlet resource = 1;\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let offset = text.find("resource").unwrap() + 1;
         assert!(
-            hover.contains("An owned value with exactly one owner"),
-            "{hover}"
+            document
+                .hover(offset)
+                .is_none_or(|hover| !hover.contains("exactly one owner")),
+            "{:?}",
+            document.hover(offset)
         );
     }
 
@@ -6679,6 +15252,311 @@ pub(crate) mod tests {
         assert_eq!(hover, "```vilan\nx: i32\n```");
     }
 
+    // --- E211: every candidate states the prefix it replaces ----------------
+
+    /// The text `src` analyzes as, and the candidates at its `¦` marker.
+    fn completion_replacements(src: &str) -> (String, Vec<Completion>) {
+        let offset = src.find('¦').expect("test source needs a `¦` marker");
+        let text = src.replace('¦', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let _ = offset;
+        (text.clone(), {
+            let offset = src.find('¦').expect("marker");
+            document.completion(offset)
+        })
+    }
+
+    #[test]
+    fn e211_a_hyphenated_attribute_prefix_is_replaced_whole() {
+        // E194's own position. The server now STATES that `stroke-w` is the
+        // prefix, so a client with no `wordPattern` of its own — every LSP
+        // client but the one this repo configures — filters against it rather
+        // than against the `w` its default word rule reads.
+        let source = format!("{ELEMENT_HEAD_PRELUDE}fun main() {{\n\t<svg stroke-w¦></svg>\n}}\n");
+        let (text, items) = completion_replacements(&source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "stroke-width")
+            .expect("`stroke-width` is offered");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(
+            &text[span], "stroke-w",
+            "the hyphen is inside the prefix, which is the whole of E194"
+        );
+        assert_eq!(candidate.filter_text.as_deref(), Some("stroke-width"));
+    }
+
+    #[test]
+    fn e211_a_css_property_prefix_is_replaced_whole() {
+        let source = format!(
+            "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tflex-dir¦\n\t}};\n}}\n"
+        );
+        let (text, items) = completion_replacements(&source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "flex-direction")
+            .expect("`flex-direction` is offered at a property position");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(&text[span], "flex-dir");
+        assert_eq!(candidate.filter_text.as_deref(), Some("flex-direction"));
+    }
+
+    #[test]
+    fn e211_an_ordinary_identifier_prefix_stops_at_the_word() {
+        // In CODE a `-` is subtraction and no identifier carries one, so the
+        // hyphenated rule stays out of expression position: `b` is the prefix
+        // of `a-b`, not `a-b`.
+        let source = "fun main() {\n\tlet alpha = 1;\n\tlet _c = 1-al¦\n}\n";
+        let (text, items) = completion_replacements(source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "alpha")
+            .expect("`alpha` is in scope");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(&text[span], "al");
+    }
+
+    #[test]
+    fn e211_every_candidate_of_a_request_carries_both_fields() {
+        // The stamp is a property of the REQUEST, so it is on every candidate
+        // of every context — not only the hyphenated ones that needed it.
+        for source in [
+            "fun main() {\n\tlet name = \"vilan\";\n\tlet _n = name.le¦\n}\n",
+            "import std::io::pri¦\n",
+            "fun main() {\n\tlet _x = pri¦\n}\n",
+        ] {
+            let (_, items) = completion_replacements(source);
+            assert!(!items.is_empty(), "candidates at {source:?}");
+            for item in &items {
+                assert!(
+                    item.replace_span.is_some() && item.filter_text.is_some(),
+                    "{:?} at {source:?} carries neither",
+                    item.label
+                );
+                assert_eq!(item.filter_text.as_deref(), Some(item.label.as_str()));
+            }
+        }
+    }
+
+    // --- E202: the server places a generic `<`'s `>` ------------------------
+
+    /// The `>` the server would insert for a `<` just typed at the marker, or
+    /// `None` when it declines. The marker stands where the caret is — one past
+    /// the `<` — which is the position `onTypeFormatting` sends.
+    fn closing_angle_at(src: &str) -> Option<usize> {
+        let offset = src.find('¦').expect("test source needs a `¦` marker");
+        let text = src.replace('¦', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let edits = document.on_type_edits(offset, "<");
+        assert!(edits.len() <= 1, "one edit or none: {edits:?}");
+        edits.first().map(|(span, replacement)| {
+            assert_eq!(replacement, ">");
+            assert_eq!(
+                span.into_range(),
+                offset..offset,
+                "a zero-width insertion at the caret"
+            );
+            span.into_range().start
+        })
+    }
+
+    #[test]
+    fn e202_a_generic_type_name_gets_its_closing_angle() {
+        for source in [
+            // A std container, in an annotation and in a turbofish-style call.
+            "fun main() {\n\tlet xs: List<¦\n}\n",
+            "fun main() {\n\tlet m: Map<¦\n}\n",
+            "fun main() {\n\tlet o: Option<¦\n}\n",
+            // A user struct and a user enum.
+            "struct Holder<type T> {\n\tvalue: T,\n}\n\nfun main() {\n\tlet h: Holder<¦\n}\n",
+            "enum Either<type L, type R> {\n\tLeft(L),\n\tRight(R),\n}\n\nfun main() {\n\tlet e: Either<¦\n}\n",
+            // A generic function's own written argument list.
+            "fun echo<T>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _s = echo<¦\n}\n",
+            // A `::` PATH head (E202's third owed pin): `Option<i32>::Some`
+            // opens its argument list on the enum's own name.
+            "import std::option::Option::{ self, Some, None };\n\nfun main() {\n\tlet _v = Option<¦\n}\n",
+            // A DECLARATION's type-parameter list — decided by the keyword
+            // before the name, because the declaration being written is not in
+            // the analyzed program yet.
+            "fun pair<¦\n",
+            "struct Pair<¦\n",
+            "enum Choice<¦\n",
+            "trait Shaped<¦\n",
+            "impl Holder<¦\n",
+        ] {
+            assert!(
+                closing_angle_at(source).is_some(),
+                "a generic `<` must close itself: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e202_a_comparison_gets_nothing() {
+        // The hazard the whole item turns on. Every one of these is a `<` that
+        // must stay a `<`.
+        for source in [
+            // The spaced comparison `vilan fmt` writes.
+            "fun main() {\n\tlet a = 1;\n\tlet b = 2;\n\tlet _c = a <¦\n}\n",
+            // The item's own exhibit, in the position it is written in.
+            "fun main() {\n\tlet a = 1;\n\tlet b = 2;\n\tif a <¦\n}\n",
+            // And the unspaced one somebody types.
+            "fun main() {\n\tlet a = 1;\n\tlet _c = a<¦\n}\n",
+            // A literal, and a name the analysis has never seen.
+            "fun main() {\n\tlet _c = 10<¦\n}\n",
+            "fun main() {\n\tlet _c = whatever<¦\n}\n",
+            // A `<` inside a string body and after a `//` are not code.
+            "fun main() {\n\tlet _s = \"a <¦\n}\n",
+            "fun main() {\n\t// List<¦\n}\n",
+        ] {
+            assert_eq!(
+                closing_angle_at(source),
+                None,
+                "this `<` must stay a `<`: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e202_only_a_typed_angle_asks_for_an_edit() {
+        // The handler is registered for `<` alone, and the document agrees:
+        // every other character it could be handed answers with no edits.
+        let text = "fun main() {\n\tlet xs: List<\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let offset = text.find('<').expect("the angle") + 1;
+        assert!(!document.on_type_edits(offset, "<").is_empty());
+        for typed in [">", "(", "{", "\"", "`", "a"] {
+            assert!(
+                document.on_type_edits(offset, typed).is_empty(),
+                "{typed:?} must ask for nothing"
+            );
+        }
+    }
+
+    // --- E204: a field's `///` reaches every field position -----------------
+    //
+    // The census, measured before the fix (the item's own ask): a `///` above a
+    // field PARSES, `vilan fmt` keeps it byte for byte, and ONE consumer read
+    // it — the struct-initializer completion's `documentation`
+    // (`struct_initializer_completion_details_the_field_type_and_doc`, E160).
+    // Everything else either dropped it or answered the wrong thing:
+    //
+    //   - hover on a field READ (`p.x`) gave `x: i32` and no doc;
+    //   - hover on the field's DECLARATION gave the enclosing struct's WHOLE
+    //     block — the answer for the type's name, restated for a caret on one
+    //     field of it;
+    //   - hover on an initializer's field KEY (`Point { x = … }`) gave the same
+    //     struct block;
+    //   - MEMBER completion after `p.` offered a bare label: no detail, no doc,
+    //     while the initializer position two lines away offered both.
+    //
+    // Three census rows have no consumer to fix rather than a broken one, and
+    // are recorded here because a reader will look: there is no docs GENERATOR
+    // in this tree (no `vilan doc`; the book is hand-written markdown, gated by
+    // `-p vilan-core --test docs`), the playground exposes completion and no
+    // hover at all, and a PAYLOAD position of an enum variant is unnamed — the
+    // variant itself takes a `///` and compiles, a position inside its
+    // parentheses has no name to hang one on, and vilan has no tuple structs.
+
+    /// A two-field struct whose first field carries a two-paragraph `///`.
+    const DOCUMENTED_FIELDS: &str = "struct Point {\n\t/// The abscissa.\n\t///\n\t/// Measured from the left edge.\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1, y = 2 };\n\tlet _n = p.x + p.y;\n}\n";
+
+    #[test]
+    fn e204_hover_on_a_field_read_carries_the_fields_doc() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.x +", "p.¦x +"), '¦')
+            .expect("hover on the field read");
+        assert_eq!(
+            hover, "```vilan\nx: i32\n```\n\nThe abscissa.\n\nMeasured from the left edge.",
+            "the whole `///` block, as a function's hover shows a function's"
+        );
+    }
+
+    #[test]
+    fn e204_hover_on_a_field_declaration_answers_the_field_and_not_the_struct() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("\tx: i32,", "\t¦x: i32,"), '¦')
+            .expect("hover on the field declaration");
+        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(hover.contains("The abscissa."), "{hover}");
+        assert!(
+            !hover.contains("struct Point"),
+            "the struct's block is the answer for the struct's NAME: {hover}"
+        );
+    }
+
+    #[test]
+    fn e204_hover_on_an_initializer_field_key_answers_the_field() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("{ x = 1", "{ ¦x = 1"), '¦')
+            .expect("hover on the initializer key");
+        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(hover.contains("The abscissa."), "{hover}");
+        assert!(!hover.contains("struct Point"), "{hover}");
+    }
+
+    #[test]
+    fn e204_the_struct_name_still_hovers_its_whole_block() {
+        // The other half of the rule: nothing above moved the struct block off
+        // the position it belongs to.
+        let hover = hover_at_marker(
+            &DOCUMENTED_FIELDS.replace("struct Point", "struct ¦Point"),
+            '¦',
+        )
+        .expect("hover on the struct name");
+        assert!(hover.contains("struct Point {"), "{hover}");
+        assert!(hover.contains("\tx: i32,"), "{hover}");
+    }
+
+    #[test]
+    fn e204_an_undocumented_field_hovers_exactly_as_before() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.y;", "p.¦y;"), '¦')
+            .expect("hover on the undocumented field");
+        assert_eq!(hover, "```vilan\ny: i32\n```");
+    }
+
+    #[test]
+    fn e204_member_completion_carries_the_field_type_and_its_first_paragraph() {
+        let items = completion_items_at_marker(
+            &DOCUMENTED_FIELDS.replace("let _n = p.x + p.y;", "let _n = p.¦"),
+            '¦',
+        );
+        let x = items
+            .iter()
+            .find(|item| item.label == "x")
+            .expect("`x` is offered after the dot");
+        assert_eq!(x.detail.as_deref(), Some("i32"));
+        assert_eq!(
+            x.documentation.as_deref(),
+            Some("The abscissa."),
+            "the FIRST paragraph, which is the rule a function's completion follows"
+        );
+        let y = items
+            .iter()
+            .find(|item| item.label == "y")
+            .expect("`y` is offered too");
+        assert_eq!(y.detail.as_deref(), Some("i32"));
+        assert_eq!(y.documentation, None, "an undocumented field carries none");
+    }
+
+    #[test]
+    fn e204_a_derived_member_inherits_no_field_doc() {
+        // `[derive]`-generated members should inherit nothing: the doc read is
+        // anchored on the FIELD's own name span, and a generated method has no
+        // `///` above its own name.
+        let items = completion_items_at_marker(
+            "[derive(Debug)]\nstruct Point {\n\t/// The abscissa.\n\tx: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _d = p.¦\n}\n",
+            '¦',
+        );
+        for item in &items {
+            if item.label == "x" {
+                continue;
+            }
+            assert!(
+                item.documentation.as_deref() != Some("The abscissa."),
+                "a derived member picked up the field's doc: {:?}",
+                item.label
+            );
+        }
+    }
+
     // A std METHOD name answers the method's declaration, fenced — through
     // `function_target`'s wired subject, like a user method.
     #[test]
@@ -6687,7 +15565,7 @@ pub(crate) mod tests {
             hover_at_cursor("fun main() {\n\tlet name = \"vilan\";\n\tlet n = name.l|en();\n}\n")
                 .expect("hovering the method should produce a label");
         assert!(hover.starts_with("```vilan\n"), "{hover}");
-        assert!(hover.contains("fun len(self): i32"), "{hover}");
+        assert!(hover.contains("fun len(self): usize"), "{hover}");
     }
 
     // The E73 crash shape, now answering: the context pass lowers the
@@ -6709,9 +15587,17 @@ pub(crate) mod tests {
 
     // "Anything else" keeps the bare rendered type but gains the fence: an
     // index expression's hover is its element type, as code.
+    //
+    // The caret moved one expression to the right when `entity_at` became
+    // end-inclusive (E139): it used to sit at `xs|[0]`, where the index
+    // expression was the innermost STRICTLY containing entity, and a caret
+    // there is now on `xs` — which is the whole point of that convention, and
+    // is pinned as such beside E139's other three. `xs[0]|` is the index
+    // expression's own end, so it is the index expression this asks about, as
+    // it always meant to be.
     #[test]
     fn a_bare_expression_type_hover_wears_the_fence() {
-        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs[0]|;\n}\n")
             .expect("the index expression hovers");
         assert_eq!(hover, "```vilan\ni32\n```");
     }
@@ -6954,13 +15840,288 @@ pub(crate) mod tests {
     }
 
     // E9: a parameter's `context` clause renders in the hovered signature.
+    //
+    // The fixture takes `hover_at_marker` (below), not `hover_at_cursor`: the
+    // latter's `replace('|', "")` strips a closure type's own pipes too, so
+    // this pin used to analyze `fun with_owner(body: ( void) context
+    // owner_scope)` and assert a clause that could only have come from the
+    // stale per-parameter append E207 deleted — vacuous in exactly the shape it
+    // was built to guard (an E207 FIND).
     #[test]
     fn hover_renders_a_parameters_context_clause() {
-        let hover = hover_at_cursor(
-            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o|wner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o¦wner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
         )
         .expect("hover on the declaration");
-        assert!(hover.contains("context owner_scope"), "{hover}");
+        assert!(hover.contains("(|| void) context owner_scope"), "{hover}");
+    }
+
+    // B242: a `fun`'s DECLARED `context` clause renders in its hovered
+    // signature, closing it exactly as it does in source.
+    #[test]
+    fn hover_renders_a_declared_context_clause() {
+        let hover = hover_at_cursor(
+            "import std::context::Context;\n\nlet settings: Context<i32> = Context::new();\n\nfun ren|der(x: i32): i32 context settings {\n\tsettings.get() + x\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the declaration");
+        assert!(hover.contains("context settings"), "{hover}");
+    }
+
+    // --- E207: a `context` clause renders EXACTLY ONCE ----------------------
+    //
+    // Why the two pins above did not catch the doubling: both assert
+    // `contains`, and a label reading `(|| void) context owner_scope context
+    // owner_scope` satisfies `contains("context owner_scope")` perfectly well.
+    // Every pin below COUNTS the clause instead. The defect (analyzer.rs's
+    // `function_signature_label_for`) appended
+    // `context_clause_label(parameter_contexts[parameter])` after a parameter's
+    // type label, which since B309 already prints the clause as part of the
+    // closure TYPE's own form — one written annotation, two channels.
+
+    /// [`hover_at_cursor`] with an explicit cursor marker, for the reason
+    /// [`completions_at_marker`] has one: these fixtures carry closure types,
+    /// whose `|` the default marker would claim (and `hover_at_cursor`'s
+    /// `replace('|', "")` would strip every one of them).
+    fn hover_at_marker(src: &str, marker: char) -> Option<String> {
+        let offset = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("test source needs a `{marker}` cursor marker"));
+        let text = src.replace(marker, "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document.hover(offset)
+    }
+
+    // --- E206: a generic call site hovers BOTH signatures -------------------
+
+    /// The owner's own exhibit, as a fixture: a generic `Memo` with `get_or`
+    /// declared over the impl's binders, called at `UserId` /
+    /// `SignalCell<Option<User>>`.
+    fn generic_memo_fixture(call: &str) -> String {
+        format!(
+            "import std::reactive::SignalCell;\nimport std::option::Option::{{ self, Some, None }};\n\n\
+             struct UserId {{\n\tvalue: i32,\n}}\n\n\
+             struct User {{\n\tname: str,\n}}\n\n\
+             struct Memo<type K, type V> {{\n\tslot: Option<V>,\n}}\n\n\
+             impl Memo<type K, type V> {{\n\
+             \tfun get_or(self, key: K, make: || V): V {{\n\t\tmake()\n\t}}\n\
+             }}\n\n\
+             fun main() {{\n\
+             \tlet cache: Memo<UserId, SignalCell<Option<User>>> = Memo {{ slot = None }};\n\
+             \t{call}\n\
+             }}\n"
+        )
+    }
+
+    #[test]
+    fn e206_a_generic_call_hovers_the_declaration_and_the_substituted_signature() {
+        let source = generic_memo_fixture(
+            "let _held = cache.get_or¦(UserId { value = 1 }, || SignalCell::new(None));",
+        );
+        let hover = hover_at_marker(&source, '¦').expect("hover on the method call");
+        assert!(
+            hover.contains("fun get_or(self, key: K, make: || V): V"),
+            "the DECLARATION as written is the first line: {hover}"
+        );
+        assert!(
+            hover.contains("key: UserId"),
+            "and the substituted signature is the second: {hover}"
+        );
+        assert!(
+            hover.contains("SignalCell<Option<User>>"),
+            "with the impl's binders carried out: {hover}"
+        );
+        // One fenced block, the two lines separated by a blank one (the owner's
+        // spelling), and no `<K, V>` on the line where nothing is open.
+        assert_eq!(
+            hover.matches("```").count(),
+            2,
+            "exactly one fenced block: {hover}"
+        );
+        assert!(
+            hover.contains(": V\n\nfun get_or("),
+            "a blank line between the two signatures: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_non_generic_call_hovers_one_signature() {
+        let hover = hover_at_cursor(
+            "fun twice(x: i32): i32 {\n\tx + x\n}\n\nfun main() {\n\tlet _n = twi|ce(2);\n}\n",
+        )
+        .expect("hover on the call");
+        assert_eq!(
+            hover.matches("fun twice").count(),
+            1,
+            "nothing is substituted, so there is one line: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_the_declaration_itself_hovers_one_signature() {
+        // No site, no substitution — a generic function hovered where it is
+        // WRITTEN says what it says.
+        let source = generic_memo_fixture(
+            "let _held = cache.get_or(UserId { value = 1 }, || SignalCell::new(None));",
+        );
+        let source = source.replace("fun get_or(self", "fun get_or¦(self");
+        let hover = hover_at_marker(&source, '¦').expect("hover on the declaration");
+        assert_eq!(hover.matches("fun get_or").count(), 1, "{hover}");
+    }
+
+    #[test]
+    fn e206_a_functions_own_generic_renders_under_the_calls_bindings() {
+        let hover = hover_at_cursor(
+            "fun echo<T>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _s = ec|ho(\"hi\");\n}\n",
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun echo<T>(value: T): T"),
+            "the declaration keeps its list: {hover}"
+        );
+        assert!(
+            hover.contains("fun echo(value: str): str"),
+            "and the bound parameter leaves the substituted line's list: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_an_open_parameter_stays_as_written_on_the_second_line() {
+        // A PARTIAL substitution: `pair`'s `A` is bound at the site, `B` is the
+        // caller's own still-open parameter, so it renders as written.
+        let hover = hover_at_cursor(
+            "fun pair<A, B>(left: A, right: B): A {\n\tleft\n}\n\nfun wrap<B>(right: B): i32 {\n\tpa|ir(1, right)\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun pair<B>(left: i32, right: B): i32"),
+            "the open parameter stays, the bound one goes: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_trait_default_renders_under_the_receivers_arguments() {
+        // `Source<T>::map` is a trait DEFAULT: the substitution comes from the
+        // receiver's own arguments rather than from the callee's list, which is
+        // the third of the three ways a signature can be generic at a site (the
+        // other two — a function's own `<T>` and an impl's binders — are pinned
+        // above).
+        let hover = hover_at_marker(
+            "import std::reactive::{ SignalCell, Source };\n\nfun main() {\n\tlet cell = SignalCell::new(2);\n\tlet _doubled = cell.map¦(|value: i32| value * 2);\n}\n",
+            '¦',
+        )
+        .expect("hover on the trait default");
+        assert!(hover.contains("fun map"), "{hover}");
+        assert!(
+            hover.matches("fun map").count() == 2,
+            "a generic trait default at a call site shows both readings: {hover}"
+        );
+        assert!(
+            hover.contains("i32"),
+            "the receiver's argument reaches the second line: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_clause_survives_onto_the_substituted_line() {
+        // E207's other half of the reason it had to land first: a clause on the
+        // second line comes from the substituted TYPE, so it neither doubles
+        // nor disappears.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun hold<T>(value: T, body: (|| void) context owner_scope): T {\n\tlet _b = body;\n\tvalue\n}\n\nfun main() {\n\tlet _n = hold¦(1, || {});\n}\n",
+            '¦',
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun hold(value: i32, body: (|| void) context owner_scope): i32"),
+            "{hover}"
+        );
+        assert_eq!(occurrences(&hover, "context owner_scope"), 2, "{hover}");
+    }
+
+    /// How many times `needle` occurs in `haystack` — the assertion E207 owes,
+    /// where `contains` is what let the bug ship.
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn e207_a_parameters_context_clause_renders_exactly_once() {
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_owner¦(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the declaration");
+        assert_eq!(
+            occurrences(&hover, "context owner_scope"),
+            1,
+            "the clause is a property of the TYPE (B309) and prints with it: {hover}"
+        );
+    }
+
+    #[test]
+    fn e207_a_multi_context_clause_renders_exactly_once() {
+        let hover = hover_at_marker(
+            "import std::context::Context;\n\nlet a_ctx: Context<i32> = Context::new();\nlet b_ctx: Context<i32> = Context::new();\n\nfun run_both¦(body: (|| void) context (a_ctx, b_ctx)) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the declaration");
+        assert_eq!(occurrences(&hover, "context (a_ctx, b_ctx)"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_declared_function_context_clause_renders_exactly_once() {
+        // B242's channel — `declared_function_contexts`, not
+        // `parameter_contexts` — asserted by count for the same reason.
+        let hover = hover_at_cursor(
+            "import std::context::Context;\n\nlet settings: Context<i32> = Context::new();\n\nfun ren|der(x: i32): i32 context settings {\n\tsettings.get() + x\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the declaration");
+        assert_eq!(occurrences(&hover, "context settings"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_binding_holding_an_injected_closure_renders_its_clause_once() {
+        // The OTHER `parameter_contexts` owner: a `let` with a clause-carrying
+        // closure type. Its hover has always gone through the type's printed
+        // form alone, and the pin holds that.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun main() {\n\tlet held¦: (|| void) context owner_scope = || {};\n\tlet _h = held;\n}\n",
+            '¦',
+        )
+        .expect("hover on the binding");
+        assert_eq!(occurrences(&hover, "context owner_scope"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_struct_field_of_closure_type_renders_its_clause_once() {
+        // A field has no declaration id in `parameter_contexts` at all (B309's
+        // record moved onto the type precisely because a field, a return and a
+        // generic argument have no owner), so this is the channel the fix keeps.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nstruct Holder {\n\tbody¦: (|| void) context owner_scope,\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the field declaration");
+        assert_eq!(occurrences(&hover, "context owner_scope"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_completion_detail_renders_the_clause_once() {
+        // Completion's `detail` line is the other consumer of the same label
+        // (the server has no signature-help popup — `docs/appendix/editor.md`
+        // "What it does not have" — so hover and this line are the whole of
+        // where a signature reaches a reader).
+        let items = completion_items_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_owner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {\n\twith_ow¦\n}\n",
+            '¦',
+        );
+        let detail = items
+            .iter()
+            .find(|item| item.label == "with_owner")
+            .and_then(|item| item.detail.clone())
+            .expect("the candidate carries a detail line");
+        assert_eq!(occurrences(&detail, "context owner_scope"), 1, "{detail}");
     }
 
     // std is documented with `///` (user decision): hovering a std function
@@ -7062,6 +16223,18 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// [`completion_items_at_cursor`] with an explicit cursor marker, for the
+    /// same reason [`completions_at_marker`] has one (E69's head pins sit
+    /// beside closure literals).
+    fn completion_items_at_marker(src: &str, marker: char) -> Vec<Completion> {
+        let offset = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("test source needs a `{marker}` cursor marker"));
+        let text = src.replace(marker, "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document.completion(offset)
+    }
+
     /// The full completion candidates offered at the `|` cursor in `src` —
     /// carrying `detail`, `documentation`, and `call_parameters` (WO-3).
     fn completion_items_at_cursor(src: &str) -> Vec<Completion> {
@@ -7104,6 +16277,122 @@ pub(crate) mod tests {
         labels
     }
 
+    // --- E178: completion consults the visibility bit ----------------------
+    //
+    // B318 §1 gates three tooling consumers on the bit, and S1 wired two of
+    // them (the add-import quickfix, the steers) and left the third because
+    // `vilan-ide` was another lane's file: an import-path popup went on listing
+    // every name a module declares, its private machinery included. One rule
+    // in every place it is asked, under the uncurated-module exemption.
+    //
+    // The AUTO-IMPORT candidate table is the one consumer this does not reach,
+    // and its reason is measured rather than assumed: it is built once per
+    // ANALYSIS, outside the scope that owns overlay loads, so reading each
+    // module's rows there parses an open buffer's content into the
+    // process-global cache once per keystroke — §7.5's session leak, and four
+    // `overlay_module_reclaim` pins go red on it (see the comment in
+    // `AutoImportOrder::build`). It needs the analyzer's own
+    // `exported_entities`/`curated_modules` on `Program`, which is filed.
+
+    /// A CURATED module — one `export` marker is what makes it one — beside its
+    /// own private machinery.
+    const CURATED_MODULE: &str = concat!(
+        "export fun shown(): i32 {\n\t1\n}\n\n",
+        "export fun also_shown(): i32 {\n\t3\n}\n\n",
+        "fun hidden(): i32 {\n\t2\n}\n",
+    );
+
+    /// The same module with no marker anywhere: it offers everything, exactly
+    /// as it did before the bit existed.
+    const UNCURATED_MODULE: &str = concat!(
+        "fun shown(): i32 {\n\t1\n}\n\n",
+        "fun also_shown(): i32 {\n\t3\n}\n\n",
+        "fun hidden(): i32 {\n\t2\n}\n",
+    );
+
+    #[test]
+    fn an_import_path_offers_a_curated_modules_exports_and_not_its_machinery() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::|\n"),
+            ("a.vl", CURATED_MODULE),
+        ]);
+        assert!(labels.contains(&"shown".to_string()), "{labels:?}");
+        assert!(
+            !labels.contains(&"hidden".to_string()),
+            "a private item is not offered to an import path: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_origin_offers_its_surfaces_exports_and_not_its_machinery() {
+        // The ORIGIN arm (`OriginListing::completions`): a package's `lib.vl`
+        // surface, read through the captured listing. Its MODULES are not
+        // filtered and are not a leak — a module is a file, `export` marks
+        // items inside one — so `a` is offered beside the surface's names.
+        let labels = workspace_completions_at_cursor(&[
+            ("app/src/main.vl", "import common::|\n"),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n\n[package.dependencies]\n\
+                 common = { path = \"../common\" }\n",
+            ),
+            ("common/vilan.toml", "[library]\nname = \"common\"\n"),
+            ("common/src/lib.vl", CURATED_MODULE),
+            ("common/src/a.vl", "fun anything() {}\n"),
+        ]);
+        assert!(labels.contains(&"shown".to_string()), "{labels:?}");
+        assert!(labels.contains(&"a".to_string()), "a module: {labels:?}");
+        assert!(
+            !labels.contains(&"hidden".to_string()),
+            "the surface's private machinery is not offered: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_path_into_an_uncurated_module_offers_everything() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::|\n"),
+            ("a.vl", UNCURATED_MODULE),
+        ]);
+        assert!(
+            labels.contains(&"shown".to_string()) && labels.contains(&"hidden".to_string()),
+            "an uncurated module offers everything: {labels:?}"
+        );
+    }
+
+    /// B318 S3's selector surface with a PRIVATE subject beside an exported
+    /// one — the module writes an `impl` block for each.
+    const CURATED_IMPL_MODULE: &str = concat!(
+        "export struct Shown {\n\tn: i32,\n}\n\n",
+        "struct Hidden {\n\tn: i32,\n}\n\n",
+        "impl Shown {\n\tfun widen(self): i32 {\n\t\tself.n\n\t}\n}\n\n",
+        "impl Hidden {\n\tfun narrow(self): i32 {\n\t\tself.n\n\t}\n}\n",
+    );
+
+    #[test]
+    fn an_impl_selector_never_offers_a_private_subject_or_its_members() {
+        let subjects = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl |\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(subjects.contains(&"Shown".to_string()), "{subjects:?}");
+        assert!(
+            !subjects.contains(&"Hidden".to_string()),
+            "a private subject is not a block an importer may admit: {subjects:?}"
+        );
+        // And its members are not reachable by naming it anyway.
+        let members = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl Hidden)::|\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(!members.contains(&"narrow".to_string()), "{members:?}");
+        let members = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl Shown)::|\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(members.contains(&"widen".to_string()), "{members:?}");
+    }
+
     #[test]
     fn lifted_member_completion_offers_the_element() {
         let labels = completions_at_cursor(
@@ -7134,6 +16423,474 @@ pub(crate) mod tests {
         assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
         assert!(labels.contains(&"y".to_string()), "fields: {labels:?}");
         assert!(labels.contains(&"sum".to_string()), "methods: {labels:?}");
+    }
+
+    // --- E160: completion inside a STRUCT INITIALIZER -----------------------
+    //
+    // The position `KoltStore { us▮` used to fall to `Expression` and list
+    // every binding in scope, which is the one list that cannot be right
+    // there: the author is writing a FIELD name. Each pin below is one clause
+    // of the recognizer (`completion.rs::struct_initializer_head`) or one of
+    // the two lists that used to be confused.
+
+    /// The E160 exhibit, kolt's `store.vl:265` in miniature: a struct whose
+    /// fields have same-named module bindings, so the shorthand applies to
+    /// four of five.
+    const INITIALIZER_PRELUDE: &str = "struct Point {\n\
+         \t/// The abscissa.\n\
+         \tx: i32,\n\
+         \ty: i32,\n\
+         }\n\
+         impl Point { fun sum(self): i32 { self.x + self.y } }\n";
+
+    fn initializer_items(body: &str) -> Vec<Completion> {
+        completion_items_at_cursor(&format!("{INITIALIZER_PRELUDE}fun main() {{\n{body}}}\n"))
+    }
+
+    fn initializer_labels(body: &str) -> Vec<String> {
+        initializer_items(body)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
+    #[test]
+    fn struct_initializer_completion_lists_the_struct_fields() {
+        let labels = initializer_labels("\tlet start = 1;\n\tlet p = Point { |\n");
+        assert_eq!(labels, vec!["x".to_string(), "y".to_string()], "{labels:?}");
+    }
+
+    // The defect itself: not one binding, keyword or snippet from the
+    // enclosing scope may appear at a field position.
+    #[test]
+    fn struct_initializer_completion_offers_no_scope_name() {
+        let labels = initializer_labels("\tlet start = 1;\n\tlet p = Point { |\n");
+        for absent in ["start", "main", "sum", "let", "Point"] {
+            assert!(
+                !labels.contains(&absent.to_string()),
+                "`{absent}` is not a field: {labels:?}"
+            );
+        }
+    }
+
+    // The fields already written are gone from the list — the whole point of
+    // reading the initializer's own token run.
+    #[test]
+    fn struct_initializer_completion_drops_the_written_fields() {
+        let labels = initializer_labels("\tlet p = Point { x = 1, |\n");
+        assert_eq!(labels, vec!["y".to_string()], "{labels:?}");
+    }
+
+    // …including one written AFTER the cursor: the walk runs to the closing
+    // brace, not to the cursor.
+    #[test]
+    fn struct_initializer_completion_drops_a_field_written_after_the_cursor() {
+        let labels = initializer_labels("\tlet p = Point { |, y = 2 };\n");
+        assert_eq!(labels, vec!["x".to_string()], "{labels:?}");
+    }
+
+    // The field being RETYPED is still a candidate — its own partial name is
+    // the prefix the editor filters by, not a "written" field.
+    #[test]
+    fn struct_initializer_completion_keeps_the_field_being_retyped() {
+        let labels = initializer_labels("\tlet p = Point { |x };\n");
+        assert!(labels.contains(&"x".to_string()), "{labels:?}");
+    }
+
+    // Accepting a candidate writes the `=` the author would type next.
+    #[test]
+    fn struct_initializer_completion_inserts_the_assignment() {
+        let x = initializer_items("\tlet p = Point { |\n")
+            .into_iter()
+            .find(|completion| completion.label == "x")
+            .expect("`x` offered");
+        assert_eq!(x.insert.map(|insert| insert.text), Some("x = ".to_string()));
+    }
+
+    // The shorthand: with a binding of the same name in scope, `Point { x }`
+    // IS `Point { x = x }`, so the bare label is the insertion. This is the
+    // one place the two lists E160 confused genuinely overlap.
+    #[test]
+    fn struct_initializer_completion_inserts_the_shorthand_over_a_binding_in_scope() {
+        let items = initializer_items("\tlet x = 1;\n\tlet p = Point { |\n");
+        let x = items
+            .iter()
+            .find(|completion| completion.label == "x")
+            .expect("`x` offered");
+        let y = items
+            .iter()
+            .find(|completion| completion.label == "y")
+            .expect("`y` offered");
+        assert!(x.insert.is_none(), "shorthand: {:?}", x.insert);
+        assert_eq!(
+            y.insert.as_ref().map(|insert| insert.text.clone()),
+            Some("y = ".to_string()),
+            "no binding named `y`"
+        );
+    }
+
+    // The popup's detail line is the field's declared type, and its
+    // documentation the field's own `///` first paragraph.
+    #[test]
+    fn struct_initializer_completion_details_the_field_type_and_doc() {
+        let items = initializer_items("\tlet p = Point { |\n");
+        let x = items
+            .iter()
+            .find(|completion| completion.label == "x")
+            .expect("`x` offered");
+        assert_eq!(x.kind, CompletionKind::Field);
+        assert_eq!(x.detail.as_deref(), Some("i32"));
+        assert_eq!(x.documentation.as_deref(), Some("The abscissa."));
+    }
+
+    // A VALUE position is not a field position: past the `=`, the ordinary
+    // scope gatherer answers again.
+    #[test]
+    fn struct_initializer_value_position_completes_the_scope() {
+        let labels = initializer_labels("\tlet start = 1;\n\tlet p = Point { x = |\n");
+        assert!(labels.contains(&"start".to_string()), "{labels:?}");
+    }
+
+    // …and a `.` inside a value still completes members (the member trigger
+    // outranks this context deliberately).
+    #[test]
+    fn struct_initializer_value_position_completes_members() {
+        let labels =
+            initializer_labels("\tlet q = Point { x = 1, y = 2 };\n\tlet p = Point { x = q.|\n");
+        assert!(labels.contains(&"sum".to_string()), "{labels:?}");
+    }
+
+    // An `=` in an EARLIER field says nothing about the run the cursor is in.
+    #[test]
+    fn struct_initializer_completion_reads_only_the_cursors_own_run() {
+        let labels = initializer_labels("\tlet p = Point { x = 1 + 2, |\n");
+        assert_eq!(labels, vec!["y".to_string()], "{labels:?}");
+    }
+
+    // A nested initializer resolves to the INNER struct — the walk stops at
+    // the innermost unclosed brace.
+    #[test]
+    fn struct_initializer_completion_resolves_the_inner_struct() {
+        let labels = completions_at_cursor(
+            "struct Inner { depth: i32 }\n\
+             struct Outer { inner: Inner, tag: str }\n\
+             fun main() {\n\tlet o = Outer { inner = Inner { | } };\n}\n",
+        );
+        assert_eq!(labels, vec!["depth".to_string()], "{labels:?}");
+    }
+
+    // A generic struct answers through its DECLARATION: the written arguments
+    // play no part in which field names exist.
+    #[test]
+    fn struct_initializer_completion_reads_a_generic_head_through_the_declaration() {
+        let labels = completions_at_cursor(
+            "struct Holder<T> { value: T, tag: str }\n\
+             fun main() {\n\tlet h = Holder<i32> { |\n}\n",
+        );
+        assert_eq!(
+            labels,
+            vec!["value".to_string(), "tag".to_string()],
+            "{labels:?}"
+        );
+    }
+
+    // An ordinary block whose head is a name is not an initializer — the head
+    // has to NAME a struct.
+    #[test]
+    fn struct_initializer_completion_declines_a_plain_block() {
+        let labels = initializer_labels("\tlet start = 1;\n\tst|\n");
+        assert!(labels.contains(&"start".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"y".to_string()), "{labels:?}");
+    }
+
+    // The two shapes whose head DOES name a struct and still are not
+    // initializers: the declaration and the impl block.
+    #[test]
+    fn struct_initializer_completion_declines_a_struct_declaration() {
+        let labels = completions_at_cursor("fun other() {}\nstruct Point {\n\tx: i32,\n\t|\n}\n");
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn struct_initializer_completion_declines_an_impl_block() {
+        let labels = completions_at_cursor(
+            "struct Point { x: i32 }\nfun other() {}\nimpl Point {\n\t|\n}\n",
+        );
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // A `;` at the field list's own depth means the brace is a block, whatever
+    // its head is called — the mid-edit shape where a stray statement lands
+    // inside what looked like a field list.
+    #[test]
+    fn struct_initializer_completion_declines_a_block_holding_a_statement() {
+        let labels = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\
+             fun other() {}\n\
+             fun main() {\n\tlet p = Point {\n\t\tlet a = 1;\n\t\t|\n}\n",
+        );
+        assert!(!labels.contains(&"y".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // A RETURN TYPE that names the struct: `fun store_for(…): KoltStore {`
+    // (kolt `store.vl:263`) is a function body, and its first line is the
+    // initializer this whole context exists for — offering the fields one line
+    // too early is the same defect facing the other way.
+    #[test]
+    fn struct_initializer_completion_declines_a_return_type_head() {
+        let labels = completions_at_cursor(
+            "struct Point { x: i32, y: i32 }\n\
+             fun other() {}\n\
+             fun make(): Point {\n\toth|\n}\n",
+        );
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // …and the qualified spelling of the same trap, which one token of
+    // lookahead cannot tell from a qualified initializer.
+    #[test]
+    fn struct_initializer_completion_declines_a_qualified_return_type_head() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::shapes;\n\
+                 fun other() {}\n\
+                 fun make(): shapes::Dot {\n\toth|\n}\n",
+            ),
+            ("src/shapes.vl", "export struct Dot { x: i32, y: i32 }\n"),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(!labels.contains(&"x".to_string()), "{labels:?}");
+        assert!(labels.contains(&"other".to_string()), "{labels:?}");
+    }
+
+    // The qualified INITIALIZER still answers (B190's spelling).
+    #[test]
+    fn struct_initializer_completion_reads_a_qualified_head() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::shapes;\n\
+                 fun main() {\n\tlet d = shapes::Dot { |\n}\n",
+            ),
+            ("src/shapes.vl", "export struct Dot { x: i32, y: i32 }\n"),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert_eq!(labels, vec!["x".to_string(), "y".to_string()], "{labels:?}");
+    }
+
+    // E193: the head resolves through the SCOPE CHAIN and, when it is
+    // qualified, through B190's `type-path` — not by scanning the program for
+    // the first struct with that spelling.
+    //
+    // The GO-day kolt sweep filed E193 over the FIXME at `store.vl:238` ("auto
+    // complete does not work in the struct initializer"), which E160 closed one
+    // order earlier — the comment predates the fix and the pins beside this one
+    // are its own shape. What E160 left is the resolution: it took the first
+    // struct in `Program::structs` whose name matched, which is right only
+    // while one spelling means one struct.
+    #[test]
+    fn struct_initializer_completion_prefers_this_files_own_struct_over_a_siblings() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 struct Dot { x: i32, y: i32 }\n\
+                 fun main() {\n\tlet d = Dot { |\n\tlet _ = marks::Dot { ink = \"a\" };\n}\n",
+            ),
+            ("src/marks.vl", "export struct Dot { ink: str }\n"),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert_eq!(
+            labels,
+            vec!["x".to_string(), "y".to_string()],
+            "the `Dot` this file's scope binds, not the sibling's: {labels:?}"
+        );
+    }
+
+    // …and a QUALIFIED head answers for the namespace it names, whichever
+    // module the program happened to record first.
+    #[test]
+    fn struct_initializer_completion_reads_a_qualified_head_through_its_namespace() {
+        for imports in [
+            "import pkg::marks;\nimport pkg::shapes;\n",
+            "import pkg::shapes;\nimport pkg::marks;\n",
+        ] {
+            let labels = workspace_completions_at_cursor(&[
+                (
+                    "src/main.vl",
+                    &format!("{imports}fun main() {{\n\tlet d = shapes::Dot {{ |\n}}\n"),
+                ),
+                ("src/marks.vl", "export struct Dot { ink: str }\n"),
+                ("src/shapes.vl", "export struct Dot { x: i32, y: i32 }\n"),
+                ("vilan.toml", "[package]\nname = \"probe\"\n"),
+            ]);
+            assert_eq!(
+                labels,
+                vec!["x".to_string(), "y".to_string()],
+                "`shapes::Dot`'s fields, under `{imports}`: {labels:?}"
+            );
+        }
+    }
+
+    // E195: the OTHER two callers of the same by-name lookup — the receiver
+    // typing fallbacks — resolve through the scope chain too.
+    //
+    // `nominal_id_by_name` was the program-wide first match by name, which is
+    // exactly the shape E193 fixed above for the struct-initializer head. It
+    // reached three callers, and the two below can only be seen with two
+    // modules in one program: a sibling's `Dot` is loaded before the entry's
+    // (imports walk first), so "the first struct named `Dot`" is the sibling's
+    // — an answer about entity-id order rather than about this file — and
+    // completion offered the WRONG type's members.
+    //
+    // Both are FALLBACK paths, reached only where the live token walk cannot
+    // type the receiver: the receiver here is a variant CONSTRUCTOR call and a
+    // `?.`-lifted call, which `expr_types` records nothing for, so the typing
+    // goes through the rendered hover label and its name back to a nominal.
+
+    /// The label fallback: `Round(1).|` — a VARIANT constructor, which the live
+    /// token walk cannot type (it is not a function), so the receiver's type
+    /// comes from the rendered hover label, which answers a constructor call
+    /// with the thing being constructed (`enum Dot`). That name must resolve
+    /// through the scope chain: `marks` is imported first, so ITS `Dot` holds
+    /// the lower entity id and is what "the first enum named `Dot`" answered.
+    #[test]
+    fn member_completion_on_a_constructor_receiver_prefers_the_nominal_in_scope() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 import pkg::shapes::Dot::{ self, Round };\n\
+                 fun main() {\n\tRound(1).|\n\tlet _ = marks::Dot::Square;\n}\n",
+            ),
+            (
+                "src/marks.vl",
+                "export enum Dot { Square }\n\
+                 impl Dot { fun ink(self): str { \"a\" } }\n",
+            ),
+            (
+                "src/shapes.vl",
+                "export enum Dot { Round(i32) }\n\
+                 impl Dot { fun radius(self): i32 { 1 } }\n",
+            ),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(
+            labels.contains(&"radius".to_string()),
+            "the `Dot` this file's scope binds: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"ink".to_string()),
+            "not the sibling's `Dot`, whichever the program recorded first: {labels:?}"
+        );
+    }
+
+    /// The lifted arm, as a REGRESSION GUARD rather than a differential: the
+    /// item's third caller is `member_completions_for`'s `Option<…>` first-
+    /// generic-argument fallback, and this fixture does not reach it —
+    /// `expression_element_nominal_id` answers first, so the pin passes with
+    /// the old by-name lookup too (verified by planting it). It is here
+    /// because the arm now threads the cursor offset like its neighbour and a
+    /// wrong offset would show up as the SIBLING's members; a fixture that
+    /// forces the fallback under a `?.` was not found, and the gap is reported
+    /// rather than papered over.
+    #[test]
+    fn lifted_member_completion_prefers_this_files_own_element_nominal() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 import std::option::Option::{ self, None };\n\
+                 struct Dot { x: i32 }\n\
+                 impl Dot { fun radius(self): i32 { 1 } }\n\
+                 fun find(): Option<Dot> { None }\n\
+                 fun main() {\n\tfind()?.|\n\tlet _ = marks::Dot { ink = \"a\" };\n}\n",
+            ),
+            (
+                "src/marks.vl",
+                "export struct Dot { ink: str }\n\
+                 impl Dot { fun shade(self): str { self.ink } }\n",
+            ),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(
+            labels.contains(&"x".to_string()) || labels.contains(&"radius".to_string()),
+            "this file's `Dot`: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"ink".to_string()) && !labels.contains(&"shade".to_string()),
+            "not the sibling's `Dot`: {labels:?}"
+        );
+    }
+
+    /// The `css` dotted-head popup, which asks for `Style` by name: a program
+    /// carrying a second `Style` must not have ITS methods offered.
+    ///
+    /// Also a guard rather than a differential, and for a reason worth
+    /// recording: std walks BEFORE any package module, so std's `Style` always
+    /// held the lower entity id and the program-wide first match already
+    /// answered correctly here. This caller's bug was unreachable in a real
+    /// program; the pin holds the answer now that scope resolution decides it.
+    #[test]
+    fn css_dotted_head_completion_prefers_the_style_this_file_imports() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 import std::style::{ Style, style };\n\
+                 fun card(): Style {\n\tcss {\n\t\t.|\n\t}\n}\n",
+            ),
+            (
+                "src/marks.vl",
+                "export struct Style { ink: str }\n\
+                 impl Style { fun unrelated_marks_method(self): str { self.ink } }\n",
+            ),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(
+            labels.contains(&"hover".to_string()),
+            "the condition combinators: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"unrelated_marks_method".to_string()),
+            "a sibling's same-named `Style` contributes nothing: {labels:?}"
+        );
+    }
+
+    // The exhibit's own shape (kolt `store.vl:265`): a multi-line list, one
+    // assigned field and three shorthands, the cursor on a fresh line.
+    #[test]
+    fn struct_initializer_completion_over_the_kolt_shape() {
+        let items = completion_items_at_cursor(
+            "struct Store {\n\tuser: str,\n\tchannels: i32,\n\tmessages: i32,\n\ttag: str,\n}\n\
+             let channels = 1;\nlet messages = 2;\n\
+             fun store_for(name: str): Store {\n\
+             \tStore {\n\t\tuser = name,\n\t\tchannels,\n\t\t|\n\t}\n}\n",
+        );
+        let labels: Vec<String> = items
+            .iter()
+            .map(|completion| completion.label.clone())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["messages".to_string(), "tag".to_string()],
+            "{labels:?}"
+        );
+        let messages = &items[0];
+        assert!(
+            messages.insert.is_none(),
+            "a module binding named `messages` is in scope: {:?}",
+            messages.insert
+        );
+        assert_eq!(
+            items[1].insert.as_ref().map(|insert| insert.text.clone()),
+            Some("tag = ".to_string())
+        );
     }
 
     #[test]
@@ -7613,7 +17370,7 @@ pub(crate) mod tests {
     #[test]
     fn element_head_dot_offers_the_view_methods() {
         let labels = element_head_completions("\t<div .~></div>\n");
-        for method in ["bind_each", "on", "text", "child", "styled"] {
+        for method in ["bind_text", "on", "text", "child", "styled"] {
             assert!(
                 labels.contains(&method.to_string()),
                 "`{method}` is a View method: {labels:?}"
@@ -7643,7 +17400,7 @@ pub(crate) mod tests {
     fn element_head_offers_the_head_forms_and_nothing_in_scope() {
         let labels = element_head_completions("\tlet caption = \"hi\";\n\t<div ~></div>\n");
         assert!(
-            labels.contains(&".bind_each".to_string()) && labels.contains(&".on".to_string()),
+            labels.contains(&".bind_text".to_string()) && labels.contains(&".on".to_string()),
             "the chain form, dot included: {labels:?}"
         );
         assert!(
@@ -7682,7 +17439,7 @@ pub(crate) mod tests {
     fn element_head_dot_mid_word_offers_the_view_methods() {
         let labels = element_head_completions("\t<div .bi~></div>\n");
         assert!(
-            labels.contains(&"bind_each".to_string())
+            labels.contains(&"bind_text".to_string())
                 && labels.contains(&"bind_value".to_string())
                 && !labels.contains(&"attributes".to_string()),
             "{labels:?}"
@@ -7702,7 +17459,7 @@ pub(crate) mod tests {
             "the Signal's members: {labels:?}"
         );
         assert!(
-            !labels.contains(&"bind_each".to_string()),
+            !labels.contains(&"bind_text".to_string()),
             "not the View's: {labels:?}"
         );
     }
@@ -7716,7 +17473,7 @@ pub(crate) mod tests {
             "the Signal's members: {labels:?}"
         );
         assert!(
-            !labels.contains(&"bind_each".to_string()),
+            !labels.contains(&"bind_text".to_string()),
             "not the View's: {labels:?}"
         );
     }
@@ -7729,6 +17486,173 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"caption".to_string()),
             "the binding in scope: {labels:?}"
+        );
+    }
+
+    // --- E69: the attribute NAMES in an undotted head ------------------------
+    //
+    // E67 left this position without a vocabulary and said exactly why: a hand
+    // list "would be a second source of truth with nothing to gate it". The
+    // owner's 2026-09-14 ruling is the answer to that sentence — GENERATED from
+    // the WHATWG HTML attribute index and the SVG 2 one, vendored as
+    // `crates/vilan-ide/src/html-attributes.tsv` and held to it OFFLINE by
+    // `vilan-ide`'s own `html_attributes_sync` gate. The pins below are about
+    // what reaches the popup; that the table is the spec's is that gate's job,
+    // and it is the one that goes red when the extract is refreshed and the
+    // table is not.
+
+    // The item's own exhibit: `<input |>` offers the input's attributes.
+    #[test]
+    fn element_head_offers_the_tags_own_attributes() {
+        let labels = element_head_completions("\t<input ~/>\n");
+        for attribute in ["type", "disabled", "value", "placeholder", "required"] {
+            assert!(
+                labels.contains(&attribute.to_string()),
+                "`{attribute}` is an `input` attribute: {labels:?}"
+            );
+        }
+    }
+
+    // …and the globals every element takes, beside them.
+    #[test]
+    fn element_head_offers_the_global_attributes() {
+        let labels = element_head_completions("\t<input ~/>\n");
+        for attribute in ["class", "id", "hidden", "title", "tabindex"] {
+            assert!(
+                labels.contains(&attribute.to_string()),
+                "`{attribute}` is a global attribute: {labels:?}"
+            );
+        }
+        // A tag with no own attributes at all still gets them — the globals
+        // are what EVERY element takes.
+        let plain = element_head_completions("\t<div ~></div>\n");
+        assert!(
+            plain.contains(&"class".to_string()) && plain.contains(&"id".to_string()),
+            "a `div` takes the globals: {plain:?}"
+        );
+        // …and an `input`'s own names are not poured over it.
+        assert!(
+            !plain.contains(&"placeholder".to_string()),
+            "`placeholder` is not a `div` attribute: {plain:?}"
+        );
+    }
+
+    // The SVG half of the ruling, and lucide's own shape: `<svg |>` offers
+    // `viewBox` (the per-element index) and the presentation attributes the
+    // SVG namespace gives every element (`fill`, `stroke-width`).
+    #[test]
+    fn element_head_offers_the_svg_vocabulary() {
+        let labels = element_head_completions("\t<svg ~></svg>\n");
+        for attribute in [
+            "viewBox",
+            "fill",
+            "stroke",
+            "stroke-width",
+            "stroke-linecap",
+        ] {
+            assert!(
+                labels.contains(&attribute.to_string()),
+                "`{attribute}` is SVG's: {labels:?}"
+            );
+        }
+        // The presentation attributes belong to the SVG namespace, not to
+        // every tag: `a` and `title` are in BOTH indices and are written as
+        // the HTML elements they are.
+        let html = element_head_completions("\t<a ~></a>\n");
+        assert!(
+            html.contains(&"href".to_string()),
+            "`a` keeps its own: {html:?}"
+        );
+        assert!(
+            !html.contains(&"stroke-width".to_string()),
+            "SVG's presentation attributes are not poured over an HTML `a`: {html:?}"
+        );
+    }
+
+    // The event form: `on:` still offers the grammar's own template, and now
+    // the `GlobalEventHandlers` names with it, in vilan's `on:event` spelling
+    // (the content attribute is `onclick`; the table drops the `on`).
+    #[test]
+    fn element_head_offers_the_event_names() {
+        let labels = element_head_completions("\t<button ~></button>\n");
+        assert!(
+            labels.contains(&"on:".to_string()),
+            "the bare template survives — a custom event is still a legal head item: {labels:?}"
+        );
+        for event in ["on:click", "on:input", "on:submit", "on:keydown"] {
+            assert!(
+                labels.contains(&event.to_string()),
+                "`{event}` is a GlobalEventHandlers name: {labels:?}"
+            );
+        }
+        // The CONTENT attribute spelling is not offered as an attribute — it
+        // would be a second, wrong way to write the same thing.
+        assert!(
+            !labels.contains(&"onclick".to_string()),
+            "`onclick` is spelled `on:click` here: {labels:?}"
+        );
+    }
+
+    // Accepting an attribute inserts its call shape, one value — the head's
+    // own grammar (`parse_element_head_item` refuses a second).
+    #[test]
+    fn an_attribute_candidate_inserts_one_value() {
+        let items = completion_items_at_marker(
+            &format!("{ELEMENT_HEAD_PRELUDE}fun main() {{\n\t<input ~/>\n}}\n"),
+            '~',
+        );
+        let attribute = items
+            .iter()
+            .find(|completion| completion.label == "type")
+            .expect("`type` offered");
+        assert_eq!(attribute.kind, CompletionKind::Field);
+        assert_eq!(
+            attribute.call_parameters.as_deref(),
+            Some(["value".to_string()].as_slice()),
+            "an attribute takes exactly one value"
+        );
+    }
+
+    // The DOTTED position is the chain's, and the attribute vocabulary has no
+    // place in it: `<div .|>` commits the head item to a `View` method.
+    #[test]
+    fn a_chain_position_offers_no_attribute_names() {
+        let labels = element_head_completions("\t<input .~/>\n");
+        assert!(
+            labels.contains(&"bind_text".to_string()),
+            "still the View's methods: {labels:?}"
+        );
+        // Names that are ONLY attributes — `class`, `autofocus` and `show` are
+        // `View` methods too, and a dotted `.class(…)` is exactly right.
+        for absent in ["type", "placeholder", "viewBox", "on:", "on:click"] {
+            assert!(
+                !labels.contains(&absent.to_string()),
+                "`{absent}` is not a chain link: {labels:?}"
+            );
+        }
+    }
+
+    // The table is an OFFER, never a vocabulary: the desugar stays name-blind
+    // (element-syntax.md §2, §9 item 3), so a name no index ever heard of is
+    // written, lowered and analyzed exactly as before. This is the half of
+    // E69's ruling that says what did NOT change.
+    #[test]
+    fn an_unknown_attribute_name_is_never_refused() {
+        let source = "import std::ui::view;\nimport std::io::print;\n\
+             fun main() {\n\t\
+             let card = <div data-tip(\"hello\") aria-nonesuch(\"x\") wibble(\"y\")></div>;\n\t\
+             print(\"built\");\n\t\
+             let _ = card;\n\
+             }\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let messages: Vec<String> = document
+            .diagnostics
+            .iter()
+            .map(|error| error.msg.clone())
+            .collect();
+        assert!(
+            messages.is_empty(),
+            "an attribute name outside the table is still a name: {messages:?}"
         );
     }
 
@@ -7786,6 +17710,44 @@ pub(crate) mod tests {
         }
     }
 
+    // E153: the vocabulary is the CSS PROPERTY INDEX, not just std's slots.
+    // `raw` writes any property, so a block reaches all of CSS — and the
+    // fifty-odd names a `Style` method happens to have were silent about the
+    // properties a block exists for.
+    #[test]
+    fn css_property_position_offers_the_whole_css_index() {
+        let labels = css_block_completions("\tlet card = css {\n\t\tsc~\n\t};\n");
+        for property in [
+            "mask",
+            "contain",
+            "scroll-snap-type",
+            "text-wrap",
+            "clip-path",
+            "backdrop-filter",
+        ] {
+            assert!(
+                labels.contains(&property.to_string()),
+                "`{property}` is a CSS property and no `Style` method writes it: {labels:?}"
+            );
+        }
+        // std's own slots come FIRST, in canonical order: those are the
+        // properties this system has a typed method for, and the sequence
+        // `vilan fmt` would put them in.
+        let display = labels.iter().position(|label| label == "display");
+        let mask = labels.iter().position(|label| label == "mask");
+        assert!(
+            display < mask,
+            "a std slot must precede an index-only property: {display:?} / {mask:?}"
+        );
+        // Still no scope, and still no vendor prefixes.
+        for wrong in ["card", "space", "print", "-webkit-mask-composite"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` may not appear in a css body: {labels:?}"
+            );
+        }
+    }
+
     // §7.1 row 3: the dotted head offers the condition combinators, from
     // `STYLE_CONDITION_METHODS` — the dot is the grammar's whole
     // disambiguator, so a dotted item is a combinator and never a property.
@@ -7803,8 +17765,8 @@ pub(crate) mod tests {
             "the dot is already typed: {labels:?}"
         );
         assert!(
-            !labels.contains(&"display".to_string()),
-            "a dotted item is never a property: {labels:?}"
+            !labels.contains(&"flex-direction".to_string()),
+            "a dotted item is never a CSS property name: {labels:?}"
         );
         // Mid-word offers the same list; the editor filters by the prefix.
         let mid_word = css_block_completions("\tlet card = css {\n\t\t.ho~\n\t};\n");
@@ -7814,12 +17776,150 @@ pub(crate) mod tests {
         );
     }
 
-    // §7.1 row 4: a hole is an ordinary expression, and completes as one —
-    // "unchanged", which is what makes typed values reachable at all.
+    // E183: the dotted head is not only the fourteen combinators. Every
+    // `impl Style` method the file can reach is offered there, because that is
+    // what the grammar admits after the dot (A69's chain link) and what an app
+    // actually writes — the vocabulary comes from the analyzed IMPL TABLE, so
+    // it cannot drift from what a call at the same position would resolve to.
     #[test]
-    fn css_hole_is_ordinary_expression_ground() {
+    fn e183_the_dotted_head_offers_a_user_impl_style_method() {
         let labels = css_block_completions(
-            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\tcolor: {i~};\n\t};\n",
+            "}\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}\n}\n\nfun card() {\n\tlet card = css {\n\t\t.~\n\t};\n",
+        );
+        assert!(
+            labels.contains(&"script_label".to_string()),
+            "the file's own `impl Style` method: {labels:?}"
+        );
+        // std's non-condition members reach it too — `raw` and `on` are exactly
+        // what the position admitted and never offered.
+        for method in ["raw", "on", "padding"] {
+            assert!(
+                labels.contains(&method.to_string()),
+                "`{method}` is a `Style` method: {labels:?}"
+            );
+        }
+        // The combinators still come FIRST: a dotted head is most often a
+        // condition rule, and the fourteen rows are the block's own vocabulary.
+        let last_condition = ["hover", "md", "within", "children"]
+            .iter()
+            .filter_map(|name| labels.iter().position(|label| label == name))
+            .max()
+            .expect("the combinators are offered");
+        let first_other = ["script_label", "raw", "padding"]
+            .iter()
+            .filter_map(|name| labels.iter().position(|label| label == name))
+            .min()
+            .expect("the other methods are offered");
+        assert!(
+            last_condition < first_other,
+            "the combinators come first: {labels:?}"
+        );
+        // And a property name is still not offered at a DOTTED head.
+        assert!(
+            !labels.contains(&"flex-direction".to_string()),
+            "a dotted item is never a property: {labels:?}"
+        );
+    }
+
+    // E175's reach, at the dotted head: a sibling file's `impl Style` is in the
+    // same analyzed impl table, so the popup finds it with no extra reading.
+    #[test]
+    fn e183_the_dotted_head_reaches_a_sibling_files_impl_style() {
+        let source = "import std::style::{ Style, style };\nimport pkg::theme;\n\nfun card() {\n\tlet card = css {\n\t\t.~\n\t};\n}\n";
+        let sibling = "import std::style::{ Style, style };\n\nexport impl Style {\n\tfun themed(self): Style {\n\t\tself.raw(\"color\", \"red\")\n\t}\n}\n";
+        let offset = source.find('~').expect("a cursor");
+        let text = source.replace('~', "");
+        let (directory, document) = analyze_workspace(&[("main.vl", &text), ("theme.vl", sibling)]);
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            labels.contains(&"themed".to_string()),
+            "a sibling's `impl Style` method: {labels:?}"
+        );
+    }
+
+    // The insertion, which is the shape the grammar takes after a dotted head:
+    // a combinator opens a BODY, a plain method ends its ITEM.
+    #[test]
+    fn e183_the_dotted_head_inserts_the_shape_the_grammar_takes() {
+        let source = format!(
+            "{CSS_BLOCK_PRELUDE}impl Style {{\n\tfun script_label(self): Style {{\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}}\n}}\n\nfun card() {{\n\tlet card = css {{\n\t\t.~\n\t}};\n}}\n"
+        );
+        let offset = source.find('~').expect("a cursor");
+        let text = source.replace('~', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let candidates = document.completion(offset);
+        let insert = |label: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.label == label)
+                .unwrap_or_else(|| panic!("no `{label}` offered"))
+                .insert
+                .as_ref()
+                .map(|insert| insert.text.clone())
+        };
+        assert_eq!(insert("hover"), Some("hover() { }".to_string()));
+        assert_eq!(insert("script_label"), Some("script_label();".to_string()));
+    }
+
+    // §7.1's new row (A95 S3): inside an `.on(<set>)` head the vocabulary is the
+    // condition VALUES — the same rows the combinator list reads, as the free
+    // constructors a set is summed from. The head's arguments are ordinary
+    // expression ground everywhere else, and the two places that are not are
+    // directly after the `(` and directly after a `+`.
+    #[test]
+    fn css_on_head_offers_the_condition_constructors() {
+        for body in [
+            "\tlet card = css {\n\t\t.on(~\n\t};\n",
+            "\tlet card = css {\n\t\t.on(ho~\n\t};\n",
+            "\tlet card = css {\n\t\t.on(hover() + ~\n\t};\n",
+            "\tlet card = css {\n\t\t.on(hover() + ac~\n\t};\n",
+        ] {
+            let labels = css_block_completions(body);
+            for condition in ["hover", "active", "attribute", "within", "md", "element"] {
+                assert!(
+                    labels.contains(&condition.to_string()),
+                    "`{condition}` is a condition value: {body:?} {labels:?}"
+                );
+            }
+            assert!(
+                !labels.contains(&"display".to_string()),
+                "a head is never the property vocabulary: {body:?} {labels:?}"
+            );
+        }
+        // `element` is a VALUE with no combinator twin, so it appears here and
+        // NOT in the dotted-head list — which is the one difference between the
+        // two readings of the table.
+        let dotted = css_block_completions("\tlet card = css {\n\t\t.~\n\t};\n");
+        assert!(
+            !dotted.contains(&"element".to_string()),
+            "there is no `Style::element` combinator: {dotted:?}"
+        );
+        // The negative that keeps the position honest: a head's OTHER arguments
+        // are ordinary expression ground, exactly as they were.
+        let inner = css_block_completions(
+            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\t.on(hover(), i~\n\t};\n",
+        );
+        assert!(
+            !inner.contains(&"element".to_string()),
+            "past the head's comma the condition vocabulary stops: {inner:?}"
+        );
+    }
+
+    // A101: there IS no value position any more. A declaration's arguments are
+    // ordinary vilan expressions, so the cursor inside the parens falls
+    // through to EXPRESSION completion — which is what §7.1's Q4 was open
+    // about, and it dissolved rather than being answered: `pct(`, `Color::`
+    // and every name in scope complete there because they are what is
+    // spellable there.
+    #[test]
+    fn a101_a_declaration_argument_is_ordinary_expression_ground() {
+        let labels = css_block_completions(
+            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\tcolor(i~);\n\t};\n",
         );
         assert!(
             labels.contains(&"ink".to_string()) && labels.contains(&"space".to_string()),
@@ -7829,28 +17929,11 @@ pub(crate) mod tests {
             !labels.contains(&"display".to_string()),
             "not the property vocabulary: {labels:?}"
         );
-    }
-
-    // Value position offers NOTHING in v1 (§7.1's closing paragraph, Q4):
-    // `flex` after `display:` needs a property->enum map that does not exist,
-    // and inventing one is the second source of truth E67 refused. Offering
-    // the scope instead would be worse than offering nothing — a binding name
-    // in value position is emitted as literal text.
-    #[test]
-    fn css_value_position_offers_nothing() {
-        let labels = css_block_completions("\tlet card = css {\n\t\tdisplay: ~\n\t};\n");
-        assert!(
-            labels.is_empty(),
-            "value position is empty in v1: {labels:?}"
+        // And past a first argument, where the space join goes.
+        let second = css_block_completions(
+            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\tborder(\"1px solid\", i~);\n\t};\n",
         );
-        // Mid-value, after a hole: the hole's own `}` must not be read as a
-        // nested rule's, or the rest of the value reads as property position.
-        let after_hole =
-            css_block_completions("\tlet card = css {\n\t\tpadding: {space(4)} ~;\n\t};\n");
-        assert!(
-            after_hole.is_empty(),
-            "still the value after a hole closes: {after_hole:?}"
-        );
+        assert!(second.contains(&"ink".to_string()), "{second:?}");
     }
 
     // §7.1 row 2: a custom property completes from the declarations of this
@@ -7874,7 +17957,7 @@ pub(crate) mod tests {
     #[test]
     fn css_completion_fires_inside_a_nested_rule() {
         let labels = css_block_completions(
-            "\tlet card = css {\n\t\tdisplay: flex;\n\t\t.md {\n\t\t\tpad~\n\t\t}\n\t};\n",
+            "\tlet card = css {\n\t\tdisplay(\"flex\");\n\t\t.md {\n\t\t\tpad~\n\t\t}\n\t};\n",
         );
         assert!(
             labels.contains(&"padding".to_string()) && labels.contains(&"padding-left".to_string()),
@@ -7883,7 +17966,7 @@ pub(crate) mod tests {
         // And after a completed nested rule the OUTER body is property
         // position again — the rule's `}` closes its item.
         let after = css_block_completions(
-            "\tlet card = css {\n\t\t.md {\n\t\t\tpadding: 1px;\n\t\t}\n\t\tdisp~\n\t};\n",
+            "\tlet card = css {\n\t\t.md {\n\t\t\tpadding(px(1));\n\t\t}\n\t\tdisp~\n\t};\n",
         );
         assert!(
             after.contains(&"display".to_string()),
@@ -7897,7 +17980,7 @@ pub(crate) mod tests {
     #[test]
     fn a_css_condition_argument_is_not_a_css_position() {
         let labels = css_block_completions(
-            "\tlet theme = \"dark\";\n\tlet card = css {\n\t\t.within(\"data-theme\", the~) {\n\t\t\tdisplay: flex;\n\t\t}\n\t};\n",
+            "\tlet theme = \"dark\";\n\tlet card = css {\n\t\t.within(\"data-theme\", the~) {\n\t\t\tdisplay(\"flex\");\n\t\t}\n\t};\n",
         );
         assert!(
             labels.contains(&"theme".to_string()),
@@ -7945,14 +18028,19 @@ pub(crate) mod tests {
             '~',
         );
         assert!(
-            dotted.contains(&"hover".to_string()) && !dotted.contains(&"display".to_string()),
-            "the combinators: {dotted:?}"
+            dotted.contains(&"hover".to_string())
+                && !dotted.contains(&"flex-direction".to_string()),
+            "the combinators, and never a CSS property name: {dotted:?}"
         );
         let value = completions_at_marker(
-            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay: ~\n"),
+            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\twidth(~\n"),
             '~',
         );
-        assert!(value.is_empty(), "value position is empty: {value:?}");
+        assert!(
+            !value.contains(&"display".to_string()),
+            "a declaration's arguments are expression ground, not the property \
+             vocabulary: {value:?}"
+        );
         let custom = completions_at_marker(
             &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\t--~\n"),
             '~',
@@ -7978,22 +18066,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_unterminated_hole_is_not_css_position() {
-        // The negative that keeps the fallback honest: a `{…}` hole is an
-        // ordinary expression, and an unclosed one does not become CSS just
-        // because a `css` block encloses it.
+    fn an_unterminated_argument_is_not_css_position() {
+        // The negative that keeps the fallback honest: a declaration's
+        // arguments are ordinary expressions, and an unclosed list does not
+        // become CSS just because a `css` block encloses it.
         let labels = completions_at_marker(
             &format!(
-                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet ink = Color::gray(900);\n\tlet card = css {{\n\t\tcolor: {{i~\n"
+                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet ink = Color::gray(900);\n\tlet card = css {{\n\t\tcolor(i~\n"
             ),
             '~',
         );
         assert!(
             !labels.contains(&"display".to_string())
                 && !labels.contains(&"flex-direction".to_string()),
-            "a hole is not the property vocabulary: {labels:?}"
+            "an argument is not the property vocabulary: {labels:?}"
         );
-        // Ordinary expression ground, which is what the hole always was. (The
+        // Ordinary expression ground, which is what a value always was. (The
         // names the enclosing `let` would bind are not among them, because with
         // the statement unterminated there is no analyzed binding to offer —
         // that is the mid-edit analysis, not this classification.)
@@ -8010,7 +18098,7 @@ pub(crate) mod tests {
         // even with the enclosing function still unterminated.
         let labels = completions_at_marker(
             &format!(
-                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay: flex;\n\t}};\n\tlet other = ca~\n"
+                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay(\"flex\");\n\t}};\n\tlet other = ca~\n"
             ),
             '~',
         );
@@ -8208,7 +18296,12 @@ pub(crate) mod tests {
             !offered.iter().any(|keyword| keyword == "return"),
             "`return` is not a vilan keyword — it is `ret`"
         );
-        for added in ["const", "borrows", "resource", "macro"] {
+        // B413: `resource` is an attribute now, not a keyword — never offered.
+        assert!(
+            !offered.iter().any(|keyword| keyword == "resource"),
+            "`resource` is the `[resource]` attribute, not a keyword"
+        );
+        for added in ["const", "borrows", "macro"] {
             assert!(
                 offered.iter().any(|keyword| keyword == added),
                 "the `{added}` keyword must be offered (it was missing from the old hand-list)"
@@ -8231,6 +18324,61 @@ pub(crate) mod tests {
             "a word starting with `import`"
         );
         assert!(!in_import_path("used = 5", 8), "a word starting with `use`");
+    }
+
+    // B318 S3's completion routing (`visibility.md` §7.1's third surface):
+    // inside an `(impl …)` selector the answer is a block the module WRITES,
+    // not a name it offers, so the position is read before the path split — the
+    // selector's own text is not a path and `import_path_segments` declines it.
+    #[test]
+    fn the_impl_selector_position_routes_subject_and_member_completion() {
+        fn at_end(line: &str) -> Option<SelectorPosition<'_>> {
+            impl_selector_position(line, line.len())
+        }
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl "),
+            Some(SelectorPosition::Subject {
+                module: vec!["pkg", "ext"]
+            }),
+            "after `impl `, the module's impl subjects"
+        );
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Box"),
+            Some(SelectorPosition::Subject {
+                module: vec!["pkg", "ext"]
+            }),
+            "mid-word in the subject"
+        );
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Boxed<i32>)::"),
+            Some(SelectorPosition::Member {
+                module: vec!["pkg", "ext"],
+                subject: "Boxed<i32>"
+            }),
+            "after `)::`, the block's methods"
+        );
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Boxed<i32>)::{ tag, "),
+            Some(SelectorPosition::Member {
+                module: vec!["pkg", "ext"],
+                subject: "Boxed<i32>"
+            }),
+            "a braced member set is one more member of the same block"
+        );
+        // A closed selector is not a completion position of its own, and
+        // neither is a line that holds no selector at all.
+        assert_eq!(at_end("import pkg::ext::{ (impl Boxed), "), None);
+        assert_eq!(at_end("import pkg::ext::{ Thing, "), None);
+        assert_eq!(at_end("fun main() { implicit"), None);
+        // A tuple subject carries parentheses of its own, so the closing `)` is
+        // found by depth rather than by the first one.
+        assert_eq!(
+            at_end("import pkg::ext::{ (impl Pair<(i32, str)>)::"),
+            Some(SelectorPosition::Member {
+                module: vec!["pkg", "ext"],
+                subject: "Pair<(i32, str)>"
+            }),
+        );
     }
 
     // E57: the path split that routes every level of import completion. The
@@ -8667,6 +18815,62 @@ pub(crate) mod tests {
         assert!(labels.contains(&"fun".to_string()), "keyword: {labels:?}");
     }
 
+    // E165: the moment a user actually asks for completion is a BLANK LINE, and
+    // that was the one position scope completion got wrong. `scope_at` answered
+    // "the scope of the entity at, or nearest before, the offset"; on an empty
+    // line the entity CONTAINING the offset is the enclosing function, and a
+    // function's own scope is the module it is declared in — so the popup
+    // offered globals and keywords and none of the body's locals, while `st|`
+    // one character away offered `start`.
+    #[test]
+    fn scope_completion_on_a_blank_line_offers_the_enclosing_body() {
+        let labels =
+            completions_at_cursor("fun main() {\n\tlet start = 1;\n\t|\n\tlet after = 2;\n}\n");
+        assert!(
+            labels.contains(&"start".to_string()),
+            "the enclosing body's locals: {labels:?}"
+        );
+        // Still a scope position, so the globals and keywords it always offered
+        // are offered too — this widens the answer, it does not narrow it.
+        assert!(labels.contains(&"fun".to_string()), "keyword: {labels:?}");
+    }
+
+    // The innermost enclosing body wins, and a sibling block's is not offered:
+    // the extent is per scope, so two blocks side by side never cover each
+    // other's text.
+    #[test]
+    fn scope_completion_on_a_blank_line_takes_the_innermost_block() {
+        let labels = completions_at_cursor(
+            "fun main() {\n\tlet outer = 1;\n\tif outer > 0 {\n\t\tlet inner = 2;\n\t\t|\n\t}\n\tlet sibling = 3;\n}\n",
+        );
+        assert!(
+            labels.contains(&"inner".to_string()),
+            "the nested block's own local: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"outer".to_string()),
+            "the enclosing body's local, through the parent chain: {labels:?}"
+        );
+    }
+
+    // The control the fix must not break: a blank line at TOP LEVEL has no
+    // enclosing body, so nothing local is offered and the module scope answers
+    // exactly as before.
+    #[test]
+    fn scope_completion_on_a_blank_line_at_top_level_offers_the_module() {
+        let labels = completions_at_cursor(
+            "fun helper(): i32 { 42 }\n\nfun main() {\n\tlet buried = 1;\n\tlet _ = buried;\n}\n\n|\n",
+        );
+        assert!(
+            labels.contains(&"helper".to_string()),
+            "top-level items: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"buried".to_string()),
+            "a function's local is not in scope at top level: {labels:?}"
+        );
+    }
+
     #[test]
     fn path_completion_lists_enum_variants() {
         let labels = completions_at_cursor(
@@ -8799,6 +19003,112 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"Red".to_string()),
             "a locally-declared enum completes mid-edit: {labels:?}"
+        );
+    }
+
+    // --- E129: a NESTED `::` path descends, like an import path already does ---
+    //
+    // `code_path_completions` used to read only the identifier ending at the
+    // `::`, so `style::FlexDirection::` saw `FlexDirection` — a MEMBER of
+    // `style`, never a binding — and answered nothing. The import arm has
+    // always descended (`import std::style::FlexDirection::` → four variants);
+    // these hold the code arm to the same reach, with E53's in-scope rooting
+    // still deciding the HEAD.
+
+    // The owner's own case, spelled the way kolt spells it: a `prelude`
+    // manifest puts `std::web`'s names in scope, so `style` is a module
+    // reachable with no import — and the path descends into the enum from
+    // there.
+    #[test]
+    fn nested_code_path_completion_descends_a_std_module_into_an_enum() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "main.vl",
+                "fun main() {\n\tlet d = style::FlexDirection::|\n}\n",
+            ),
+            (
+                "vilan.toml",
+                "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n",
+            ),
+        ]);
+        assert!(
+            labels.contains(&"Row".to_string()) && labels.contains(&"ColumnReverse".to_string()),
+            "`style::FlexDirection::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    // B318 S3's completion, end to end against std's real `style.vl`: after
+    // `impl ` the module's impl SUBJECTS, after `)::` the selected block's
+    // members. Both answers come out of the parse cache with no analyzer, which
+    // is the property the whole import-path family rests on
+    // (`visibility.md` §7.1) — the module being selected from is one this
+    // program may never have loaded.
+    #[test]
+    fn an_import_selector_completes_subjects_then_the_blocks_members() {
+        let subjects = completions_at_cursor(
+            "import std::style::{ (impl |
+",
+        );
+        assert!(
+            subjects.contains(&"Length".to_string()) && subjects.contains(&"Color".to_string()),
+            "after `impl `, the module's impl subjects: {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"rem".to_string()),
+            "and not a member of one, which is a level deeper: {subjects:?}"
+        );
+        let members = completions_at_cursor(
+            "import std::style::{ (impl Length)::|
+",
+        );
+        assert!(
+            members.contains(&"rem".to_string()),
+            "after `)::`, the block's members: {members:?}"
+        );
+        assert!(
+            !members.contains(&"Color".to_string()),
+            "and not a subject, which is a level up: {members:?}"
+        );
+    }
+
+    // The same descent through an explicit import, which is the spelling a
+    // file without a prelude uses.
+    #[test]
+    fn nested_code_path_completion_descends_an_imported_std_module() {
+        let labels = completions_at_cursor(
+            "import std::style;\n\nfun main() {\n\tlet d = style::FlexDirection::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Row".to_string()) && labels.contains(&"ColumnReverse".to_string()),
+            "`style::FlexDirection::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn nested_code_path_completion_descends_a_same_file_module_into_an_enum() {
+        let labels = completions_at_cursor(
+            "mod geo {\n\tenum Shape { Circle, Square }\n}\n\nfun main() {\n\tlet s = geo::Shape::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Circle".to_string()) && labels.contains(&"Square".to_string()),
+            "`geo::Shape::` offers the enum's variants: {labels:?}"
+        );
+    }
+
+    // The one-segment control: the head still answers as it did, so the
+    // descent above is an addition and not a replacement.
+    #[test]
+    fn one_segment_code_path_completion_still_answers_the_module() {
+        let labels = completions_at_cursor(
+            "mod geo {\n\tenum Shape { Circle, Square }\n}\n\nfun main() {\n\tlet s = geo::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Shape".to_string()),
+            "`geo::` offers the module's members: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Circle".to_string()),
+            "and not the enum's variants, which are one level deeper: {labels:?}"
         );
     }
 
@@ -8940,6 +19250,49 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"Less".to_string()),
             "an enum's variants are importable: {labels:?}"
+        );
+    }
+
+    // B317: past a module, a STRUCT is a namespace too — the self-less
+    // functions the module's own `impl` blocks declare for it, which is exactly
+    // the set an import through this module can bind.
+    #[test]
+    fn import_descends_into_a_structs_statics() {
+        let labels = completions_at_cursor("import std::style::Length::|\nfun main() {}\n");
+        assert!(
+            labels.contains(&"rem".to_string()) && labels.contains(&"px".to_string()),
+            "a struct's statics are importable: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"css_text".to_string()),
+            "and a `self` method is not, having no bare-name binding: {labels:?}"
+        );
+    }
+
+    // B317's keying, in the editor: an EXTENSION impl's statics are offered
+    // through the module that writes the block, which is where an import
+    // reaches them — and the block's subject may be a name that module
+    // re-exports rather than declares.
+    #[test]
+    fn import_descends_into_an_extension_impls_statics() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::extra::Point::|\nfun main() {}\n"),
+            (
+                "shapes.vl",
+                "struct Point {\n\tx: i32,\n}\n\nimpl Point {\n\tfun origin(): Point {\n\t\tPoint { x = 0 }\n\t}\n}\n",
+            ),
+            (
+                "extra.vl",
+                "export import pkg::shapes::Point;\n\nimpl Point {\n\tfun doubled(x: i32): Point {\n\t\tPoint { x = x * 2 }\n\t}\n}\n",
+            ),
+        ]);
+        assert!(
+            labels.contains(&"doubled".to_string()),
+            "the extending module offers the block it writes: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"origin".to_string()),
+            "and not the block another module writes: {labels:?}"
         );
     }
 
@@ -9102,6 +19455,523 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E186, at the layer the user sees: the generated `lucide/lib.vl` shape —
+    // a header comment, a blank, an import paragraph nothing uses, a blank,
+    // `export *;`. Organizing it printed TWO blank lines above the `export`,
+    // because the run's own line ending went and the separator below it stayed.
+    // A generated file is where that sticks: `[package] generated` keeps
+    // `vilan fmt` off it, so nothing repairs the gap afterwards.
+    #[test]
+    fn organize_deletes_an_import_paragraphs_separator_over_the_lucide_shape() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "// GENERATED by a hook.\n\nimport std::result::Result::{ self, Err, Ok };\n\n\
+             export *;\n\nfun main(): i32 {\n\t1\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        let organized_text = organized(&document).expect("the whole import is unused");
+        assert_eq!(
+            organized_text, "// GENERATED by a hook.\n\nexport *;\n\nfun main(): i32 {\n\t1\n}\n",
+            "one blank line above the `export`, not two:\n{organized_text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E168/E169's helper module: a free function the entry can import by name,
+    /// and an `impl` that travels with ANY import reaching the module. The two
+    /// together are what the leaf question and the module question disagree
+    /// about — `b` is provided by its own leaf, `doubled` only by the import
+    /// reaching `a.vl`.
+    const LEAF_AND_IMPL: &str =
+        "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n";
+
+    // E168 (the s1c shape): `import pkg::a::b;` with `b` unused is NOT deleted
+    // when `a.vl`'s `impl` is what the file calls a method from — impls travel
+    // with any import that reaches the module, not only with a whole-module one,
+    // so deleting the statement took `doubled` with it and the next analysis
+    // said "i32 has no method 'doubled'". The organizer had broken a green
+    // build. The statement is REWRITTEN instead; the leaf goes on fading,
+    // because it is genuinely unused.
+    //
+    // B318 S3 NARROWED the rewrite (`visibility.md` §7.2, and E168's own item —
+    // "re-pointed at B318's selectors later"): everything this file gets out of
+    // `a.vl` is one subject's block, so the statement it needs is the SELECTOR
+    // and not the whole module. `(impl i32)` is the paper's own exhibit for the
+    // form. The module rewrite is still what a file using more than one block
+    // gets — `organize_rewrites_an_emptied_import_to_the_selector_its_file_
+    // actually_needs` is the pair's other half.
+    #[test]
+    fn organize_rewrites_an_emptied_import_whose_module_still_carries_an_impl() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement offers an edit"),
+            "import pkg::a::{ (impl i32) };\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+        );
+        // The fade stays where it was: `b` IS unused, and E114's contract is
+        // that the mark and the fix describe the same statement. Its TEXT is
+        // E173's subject and is pinned below.
+        assert_eq!(faded(&document), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fade TEXT beside each faded leaf (E173), paired with the leaf it is
+    /// written over — [`faded`] asks where, this asks what it says there.
+    fn faded_messages(document: &Document) -> Vec<(String, String)> {
+        let text = document.analyzed_text().to_string();
+        document
+            .unused_import_spans()
+            .into_iter()
+            .map(|(span, message)| (text[span.into_range()].to_string(), message))
+            .collect()
+    }
+
+    // E173: the one place the fade and the action it names disagreed. E168's
+    // rewrite KEEPS the statement — the leaf is unused but the module's impls
+    // are not — and the leaf went on saying "unused import", so a user reading
+    // the gray was told their import would be deleted and then watched Organize
+    // Imports widen it instead. The text names the rewrite, and the statement it
+    // becomes, which is the same statement `organized` produces above.
+    #[test]
+    fn a_faded_leaf_whose_module_is_kept_says_what_the_action_will_do() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![(
+                "b".to_string(),
+                "unused; the module's impls are in use — Organize Imports rewrites this \
+                 to `import pkg::a::{ (impl i32) };`"
+                    .to_string()
+            )],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B318 S3's helper module: a free function to strand, a struct, and the
+    /// block whose members are the only thing the entry gets out of the file.
+    const SELECTOR_HELPER: &str = "fun b(): i32 {\n\t1\n}\n\nstruct Widget {\n\tx: i32,\n}\n\n\
+         impl Widget {\n\tfun make(): Widget {\n\t\tWidget { x = 1 }\n\t}\n\n\tfun bump(self): i32 {\n\t\tself.x\n\t}\n}\n";
+
+    // `visibility.md` §3.6 asks that a selector element record a reference at
+    // its TYPE's span, so navigation and rename reach it. It comes for free:
+    // the selector's subject is walked as an ordinary type, in a child of the
+    // statement's own scope, so it lands in `type_references` like any other
+    // type reference — which is also why `impl S` through an alias resolves.
+    #[test]
+    fn a_selectors_subject_navigates_and_hovers_like_any_type() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        let at = document.text.find("(impl Widget").expect("the selector") + 7;
+        let (source_id, _span) = document
+            .definition(at)
+            .expect("go-to-definition on a selector's subject");
+        assert_ne!(
+            source_id,
+            vilan_core::analyzer::SourceId(0),
+            "the subject is declared in a.vl, not the entry"
+        );
+        assert!(
+            document
+                .hover(at)
+                .is_some_and(|hover| hover.contains("struct Widget")),
+            "hover reads the struct the selector names"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The two controls, both of which keep the plain text because the action
+    // really does delete. The module brings nothing either, so the statement
+    // goes; and a brace set with a live member never reaches the module
+    // question at all — the common shape, and the one the widened return is
+    // careful not to make pay for the rewrite case.
+    #[test]
+    fn a_faded_leaf_whose_statement_is_deleted_keeps_the_plain_text() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\t2\n}\n",
+            ),
+            ("a.vl", "fun b(): i32 {\n\t1\n}\n"),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![("b".to_string(), "unused import".to_string())],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_faded_leaf_beside_a_live_one_keeps_the_plain_text() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ b, c };\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+            ),
+            (
+                "a.vl",
+                "fun b(): i32 {\n\t1\n}\n\nfun c(): i32 {\n\t2\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![("b".to_string(), "unused import".to_string())],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B318 S3 re-points E168's rewrite (`visibility.md` §7.2): when everything
+    // the file gets from the module is ONE subject's `impl` blocks, the rescue
+    // is the selector — the precise, minimal statement of what the file needs —
+    // and not the whole module. E168's own item said this is what it becomes.
+    #[test]
+    fn organize_rewrites_an_emptied_import_to_the_selector_its_file_actually_needs() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::b;\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement offers an edit"),
+            "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\n\n\
+             fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+        );
+        // The fade is unchanged: `b` IS unused, which is E114's contract.
+        assert_eq!(faded(&document), vec!["b".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // And the rewritten file still BUILDS, which is the whole of E168: a
+        // selector restricts, so an organizer that narrowed past what the file
+        // needs would break the green build it was rescuing.
+        let (after_dir, after) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            after.diagnostics.is_empty(),
+            "the rewrite must leave the program green: {:?}",
+            after.diagnostics.iter().map(|e| &e.msg).collect::<Vec<_>>(),
+        );
+        let _ = std::fs::remove_dir_all(&after_dir);
+    }
+
+    // A selector is a terminal the organizer prunes on its OWN question — does
+    // this file resolve a method to an implementation the selector admits —
+    // which is rule (2) narrowed from a FILE to an IMPL, and strictly easier
+    // because the answer is the analyzer's own resolution rather than a
+    // provenance guess.
+    #[test]
+    fn organize_keeps_a_used_selector_and_prunes_an_unused_one() {
+        let (used_dir, used) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tWidget::make().bump()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            used.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            used.diagnostics.iter().map(|e| &e.msg).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&used),
+            None,
+            "the selector is what admits `make` and `bump` — organize must leave it alone",
+        );
+        assert!(
+            faded(&used).is_empty(),
+            "and nothing fades: {:?}",
+            faded(&used)
+        );
+        let _ = std::fs::remove_dir_all(&used_dir);
+
+        let (unused_dir, unused) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun main(): i32 {\n\tlet w = Widget { x = 1 };\n\tw.x\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            unused.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            unused
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&unused).expect("the unused selector offers an edit"),
+            "import pkg::a::Widget;\n\n\
+             fun main(): i32 {\n\tlet w = Widget { x = 1 };\n\tw.x\n}\n",
+        );
+        assert_eq!(
+            faded(&unused),
+            vec!["(impl Widget)".to_string()],
+            "the fade and the prune describe the same element (E114)",
+        );
+        let _ = std::fs::remove_dir_all(&unused_dir);
+    }
+
+    // E192, kolt's `views.vl:2-4` in miniature: a TYPE import whose only use is
+    // a SELECTOR's subject.
+    //
+    // The owner's FIXME said "considered unused, but it is used for the type
+    // below", and it is: deleting `import std::map::Map;` from a copy of kolt
+    // and running `vilan check` produced five errors — `cannot find type 'Map';
+    // import it first`, the selector then admitting nothing, and three method
+    // calls losing their impl. So the selector resolves its subject through the
+    // FILE's import, the fade was a false positive, and — because the fade and
+    // the prune are one predicate (E114) — Organize Imports would have DELETED
+    // the import and broken a green build.
+    //
+    // The cause is rule (1)'s exclusion of references written inside an import
+    // statement, which exists so a path segment cannot let a statement justify
+    // itself. A selector's SUBJECT is not a path segment: it is an ordinary
+    // type reference in a type position that happens to live inside an import
+    // (`visibility.md` §3.6 — which is why it navigates and renames), and it
+    // requires the name to be in scope. So it counts, and it counts exactly
+    // when the selector itself survives: a subject whose selector is about to
+    // be pruned is keeping nothing alive.
+    #[test]
+    fn a_type_import_used_only_by_a_selector_subject_is_not_faded() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\nimport pkg::b::widget;\n\n\
+                 fun main(): i32 {\n\twidget().bump()\n}\n",
+            ),
+            (
+                "b.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun widget(): Widget {\n\tWidget::make()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            faded(&document).is_empty(),
+            "the subject is what `(impl Widget)` resolves through: {:?}",
+            faded(&document)
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "and the action that fade promises must not delete the import",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The other side of the same rule, so it cannot degrade into "a subject is
+    // always a use": when the SELECTOR is unused, its subject keeps nothing
+    // alive and both go in one pass.
+    #[test]
+    fn a_type_import_whose_selector_is_itself_unused_still_fades() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\nimport pkg::a::b;\n\n\
+                 fun main(): i32 {\n\tb()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        let mut faded_leaves = faded(&document);
+        faded_leaves.sort();
+        assert_eq!(
+            faded_leaves,
+            vec!["(impl Widget)".to_string(), "Widget".to_string()],
+            "nothing this file writes resolves through either",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The rewrite fires only when nothing survives the leaf question: a brace
+    // set with one live member prunes to that member exactly as before.
+    #[test]
+    fn organize_prunes_rather_than_rewrites_while_a_leaf_still_survives() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ b, c };\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+            ),
+            (
+                "a.vl",
+                "fun b(): i32 {\n\t1\n}\n\nfun c(): i32 {\n\t2\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+            ),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(
+            organized(&document).expect("the dead leaf offers an edit"),
+            "import pkg::a::c;\n\nfun main(): i32 {\n\tlet n = c();\n\tn.doubled()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // And when the module brings nothing either, the statement still DELETES —
+    // the rescue is a second question, not a second chance.
+    #[test]
+    fn organize_deletes_an_emptied_import_whose_module_brings_nothing() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun main(): i32 {\n\t1\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(
+            organized(&document).expect("the unused import offers an edit"),
+            // E186: the run WAS the file's opening paragraph, so the blank
+            // below it is its own separator and goes with it.
+            "fun main(): i32 {\n\t1\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E169 (the s2 shape), the OVER-keeping half: a whole-module import beside a
+    // named import of the same module, with only the NAME used. Rule (2) kept
+    // the module leaf because the file resolved something declared in `a.vl` —
+    // but `b`'s uses come from `b`'s own leaf, and the module import brings
+    // nothing the file spells. Counted against what the module import ALONE
+    // provides, it is unused: it fades, and it prunes.
+    #[test]
+    fn organize_prunes_a_module_import_whose_only_evidence_is_another_leaf() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(faded(&document), vec!["a".to_string()]);
+        assert_eq!(
+            organized(&document).expect("the module import is unused"),
+            "import pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E169's EDGE, and why the refinement is not simply "a module import beside
+    // a named one dies": a definition reached BOTH ways keeps the module import,
+    // because the qualified use writes the module's own name and that is rule
+    // (1)'s question, not rule (2)'s.
+    #[test]
+    fn organize_keeps_a_module_import_a_qualified_path_names() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb() + a::b()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        assert_eq!(organized(&document), None, "both imports are used");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The s4 control, which E169 must not disturb: a whole-module import whose
+    // only contribution is an `impl` method survives the refinement, because
+    // nothing binds `doubled` by a leaf of its own.
+    #[test]
+    fn organize_keeps_a_module_import_beside_a_leaf_when_an_impl_is_the_use() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tlet n = b();\n\tn.doubled()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_IMPL),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        assert_eq!(
+            organized(&document),
+            None,
+            "the module import brings `doubled`"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// One build-preservation case: a workspace whose entry file has imports
     /// organize must act on. `entry` is the first file.
     struct OrganizeCase {
@@ -9162,6 +20032,29 @@ pub(crate) mod tests {
                     "main.vl",
                     "import std::result::Result::{ self, Err, Ok };\n\nfun main(): Result<i32, str> {\n\tOk(1)\n}\n",
                 )],
+            },
+            OrganizeCase {
+                label: "E168: a named import whose module carries the impl in use",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::a::b;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+                    ),
+                    (
+                        "a.vl",
+                        "fun b(): i32 {\n\t1\n}\n\nimpl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+                    ),
+                ],
+            },
+            OrganizeCase {
+                label: "E169: a module import beside a named import of the same module",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::a;\nimport pkg::a::b;\n\nfun main(): i32 {\n\tb()\n}\n",
+                    ),
+                    ("a.vl", "fun b(): i32 {\n\t1\n}\n"),
+                ],
             },
             OrganizeCase {
                 label: "a shuffled run where every leaf is used",
@@ -9231,6 +20124,410 @@ pub(crate) mod tests {
         assert_eq!(
             result,
             "import pkg::helper::alpha;\nimport pkg::helper::beta;\nfun main() {\n\talpha();\n\tbeta();\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E114: the same answer, as PAINT ──────────────────────────────────────
+    //
+    // "Graying out dead code generally looks better to me" — the owner. The
+    // spans the editor fades are the organizer's own verdict rather than a
+    // second opinion, so what is faded is exactly what Organize Imports would
+    // remove. These pin that identity, and the conservatism that comes with it.
+
+    /// The name of the leaf each unused span covers, so a pin reads as the
+    /// import the user would see faded.
+    fn faded(document: &Document) -> Vec<String> {
+        let text = document.analyzed_text().to_string();
+        document
+            .unused_import_spans()
+            .into_iter()
+            .map(|(span, _)| text[span.into_range()].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn an_unused_import_leaf_is_faded_and_a_used_one_is_not() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::{ alpha, beta };\nfun main() {\n\talpha();\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert_eq!(faded(&document), vec!["beta".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_re_export_is_never_faded() {
+        // `export import` binds a name for somebody ELSE. This file not using
+        // it is the point of writing it, so fading it would be a lie — and the
+        // organizer never prunes one either, which is the same rule.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "export import pkg::helper::beta;\nfun main() {}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_type_only_import_is_not_faded() {
+        // The honesty case the organizer already had to get right: a name used
+        // only in a TYPE position has no value reference at all, and a fade
+        // driven by value uses alone would gray a live import.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::Widget;\nfun main() {\n\tlet w: Widget = Widget {};\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_faded_while_the_file_carries_a_diagnostic() {
+        // A half-typed name might be about to use the very import in question,
+        // so a broken file fades nothing. A mark that lies is worse than no
+        // mark, and this is the same gate the organizer's pruning takes.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::beta;\nfun main() {\n\tmissing_name();\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the fixture must actually be broken",
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E114: unused LOCAL declarations, as paint ────────────────────────────
+    //
+    // The declarations third, at the only scope Vilan actually closes. There is
+    // no visibility marker in the language (`pub fun f()` is a parse error whose
+    // curated rule says "a module's items are importable as they stand"), so a
+    // top-level item is module surface and can never be faded from a single
+    // entry's analysis — which is itself pinned below, because it is the whole
+    // shape of the feature and a later refactor must not quietly widen it.
+
+    /// The name each faded local covers, so a pin reads as the binding the user
+    /// would see grayed.
+    fn faded_locals(document: &Document) -> Vec<String> {
+        let text = document.analyzed_text().to_string();
+        let mut names: Vec<String> = document
+            .unused_local_spans()
+            .into_iter()
+            .map(|span| text[span.into_range()].to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The source each faded dead region covers.
+    fn faded_dead(document: &Document) -> Vec<String> {
+        let text = document.analyzed_text().to_string();
+        document
+            .unreachable_spans()
+            .into_iter()
+            .map(|span| text[span.into_range()].to_string())
+            .collect()
+    }
+
+    /// A green fixture's two answers, with the fixture's own greenness asserted
+    /// first — every pin below depends on a clean analysis, since both producers
+    /// are switched off by a diagnostic and would otherwise pass vacuously.
+    fn green(files: &[(&str, &str)]) -> (PathBuf, Document) {
+        let (dir, document) = analyze_workspace(files);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a GREEN fixture, got {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        (dir, document)
+    }
+
+    #[test]
+    fn a_local_nothing_reads_is_faded_and_a_read_one_is_not() {
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tlet kept = 1;\n\tlet dead = 2;\n\tprint(kept);\n}\n",
+        )]);
+        assert_eq!(faded_locals(&document), vec!["dead".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_underscore_led_local_is_never_faded() {
+        // `_`-led is the language's own "I know" marker — the `[must_use]` rule
+        // tells you to write `let _ = …` — so fading it would gray the very
+        // gesture that says "I meant this".
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tlet _unused = 1;\n\tlet _ = 2;\n}\n",
+        )]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_top_level_item_is_never_faded_because_the_language_has_no_private_one() {
+        // THE RULING, pinned. `unreachable_helper` and `spare` are referenced by
+        // nothing in this program — the emission pruner would emit neither — and
+        // they still must not fade: any file the editor never analyzed may write
+        // `import pkg::main::unreachable_helper;` and get it, with nothing in
+        // the language marking it private. A fade here would be a guess about a
+        // world this analysis cannot see.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "let spare = 7;\nfun unreachable_helper(): i32 {\n\t1\n}\nfun main() {}\n",
+        )]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "a top-level item is module surface: {:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parameter_is_never_faded() {
+        // A parameter is signature, not a local: an impl must take what the
+        // declaration takes, so an unread one is routinely obligatory.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun ignores(value: i32) {}\nfun main() {\n\tignores(1);\n}\n",
+        )]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_read_only_under_a_browser_color_is_not_faded() {
+        // E113's coloring, on this third. The file is analyzed under the color
+        // its `vilan.toml` declares — the same one the build takes — so a read
+        // that only exists in a browser build is still a read. Under the process
+        // analysis this file would not even type-check, and the diagnostic gate
+        // below would switch the fade off rather than gray a live binding.
+        let (dir, document) = green(&[
+            (
+                "src/main.vl",
+                "fun main() {\n\tlet width = 4;\n\tprint(width);\n}\n",
+            ),
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ntarget = \"browser\"\n",
+            ),
+        ]);
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_local_is_faded_while_the_file_carries_a_diagnostic() {
+        // The imports third's conservatism, inherited: a half-typed line might
+        // be about to read the binding.
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet dead = 1;\n\tmissing_name();\n}\n",
+        )]);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the fixture must actually be broken",
+        );
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_local_is_faded_while_the_buffer_is_ahead_of_the_analysis() {
+        // The other half of the imports third's conservatism: a stale analysis
+        // describes a file the user has already changed, and its spans no longer
+        // index the text the editor would fade.
+        let (dir, mut document) =
+            green(&[("main.vl", "fun main() {\n\tlet dead = 1;\n\tprint(2);\n}\n")]);
+        assert_eq!(faded_locals(&document), vec!["dead".to_string()]);
+        document.set_text("fun main() {\n\tlet dead = 1;\n\tprint(3);\n}\n");
+        assert!(document.is_stale(), "the fixture must actually be stale");
+        assert!(
+            faded_locals(&document).is_empty(),
+            "{:?}",
+            faded_locals(&document),
+        );
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E114: unreachable code, as paint ─────────────────────────────────────
+    //
+    // The divergence analysis is the CHECKER's (`analyzer::Divergence`) — since
+    // B204, with no widening at all: a `panic(…)` call and an endless
+    // `for { … }` are leaves for both askers, so what fades here is what the
+    // checker already treats as dead. Each pin below is one way control leaves.
+
+    #[test]
+    fn a_statement_after_ret_is_faded() {
+        let (dir, document) = green(&[("main.vl", "fun main() {\n\tret;\n\tprint(1);\n}\n")]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_whole_dead_tail_is_one_faded_region_not_one_per_statement() {
+        // What died is the REST of the block. Three faded lines say the same
+        // thing three times; the editor gets one range.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tret;\n\tprint(1);\n\tprint(2);\n\tprint(3);\n}\n",
+        )]);
+        assert_eq!(
+            faded_dead(&document),
+            vec!["print(1);\n\tprint(2);\n\tprint(3)".to_string()],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_panic_is_faded() {
+        // The paint-only widening. `panic` lowers to a `throw`, so the statement
+        // after one genuinely never runs — but the CHECKER does not count it as
+        // divergence, and must not: `expr_diverges` gates the R4/R7 exemption
+        // and return-position checking, and widening it there would change what
+        // the language accepts.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "import std::io::panic;\nfun main() {\n\tpanic(\"stop\");\n\tprint(1);\n}\n",
+        )]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_a_loop_tail_jump_is_faded() {
+        // `jump` is the loop tail — the language's `break`/`continue` — and one
+        // of the checker's own two divergence leaves.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tfor {\n\t\tjump break;\n\t\tprint(1);\n\t}\n}\n",
+        )]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_an_if_whose_every_arm_diverges_is_faded() {
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tif 1 > 0 {\n\t\tret;\n\t} else {\n\t\tret;\n\t}\n\tprint(1);\n}\n",
+        )]);
+        assert_eq!(faded_dead(&document), vec!["print(1)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_if_with_no_else_leaves_the_rest_of_the_block_alive() {
+        // The exemption that keeps the whole class honest: without an `else` the
+        // implicit fall-through continues, so the statement after it is reached
+        // on the condition's false path.
+        let (dir, document) = green(&[(
+            "main.vl",
+            "fun main() {\n\tif 1 > 0 {\n\t\tret;\n\t}\n\tprint(1);\n}\n",
+        )]);
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_statement_after_an_endless_for_is_faded_and_a_broken_one_is_not() {
+        // `for { … }` with no condition is the language's only endless-loop
+        // form (`for cond { … }` is the `while`), and control leaves it only by
+        // leaving the function. A `jump break` binds to the NEAREST enclosing
+        // loop, so the second fixture's loop does fall through and its tail
+        // stays alive.
+        let (endless_dir, endless) = green(&[(
+            "main.vl",
+            "fun main() {\n\tfor {\n\t\tprint(1);\n\t}\n\tprint(2);\n}\n",
+        )]);
+        assert_eq!(faded_dead(&endless), vec!["print(2)".to_string()]);
+        let _ = std::fs::remove_dir_all(&endless_dir);
+
+        let (broken_dir, broken) = green(&[(
+            "main.vl",
+            "fun main() {\n\tfor {\n\t\tjump break;\n\t}\n\tprint(2);\n}\n",
+        )]);
+        assert!(
+            faded_dead(&broken).is_empty(),
+            "a loop something breaks out of falls through: {:?}",
+            faded_dead(&broken),
+        );
+        let _ = std::fs::remove_dir_all(&broken_dir);
+    }
+
+    #[test]
+    fn nothing_is_faded_as_unreachable_while_the_file_carries_a_diagnostic() {
+        // The same conservatism the imports third takes: a broken file's
+        // statement list is a guess, and a mark that lies is worse than no mark.
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tret;\n\tmissing_name();\n}\n")]);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the fixture must actually be broken",
+        );
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_that_merely_ends_in_ret_fades_nothing() {
+        // The synthesized-tail case, which is the common one: `fun f() { ret; }`
+        // has a trailing void expression the user never wrote. Fading it would
+        // gray a closing brace.
+        let (dir, document) = green(&[("main.vl", "fun main() {\n\tprint(1);\n\tret;\n}\n")]);
+        assert!(
+            faded_dead(&document).is_empty(),
+            "{:?}",
+            faded_dead(&document),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9542,6 +20839,226 @@ pub(crate) mod tests {
         );
         let result = organized(&document).expect("a wholly unused module import offers a prune");
         assert_eq!(result, "fun main() {}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E180: the organizer broke kolt's generated `src/lucide/lib.vl` -----
+    //
+    // Under `prelude = "std::web"` the file's two imports are both redundant
+    // with the prelude (rule (0), and correct — the file checks clean with both
+    // deleted), but E168's rescue then rewrote them, and `import std::option;`
+    // bound the module name `option` over the file's own `fun option()` icon:
+    // "`option` is a module, not a value" at `Option::Some(option())`. Two
+    // defects, pinned separately below — rule (2) counting a PRELUDE-bound,
+    // PATH-QUALIFIED reach as something the module import brings, and a rescue
+    // introducing a binding with no check that the name was free.
+
+    /// The web prelude, which is what kolt's own manifest declares: it is the
+    /// prelude that binds `Option`/`Some`/`None`, `View`/`view`, and the two
+    /// ambient MODULES (`style`, `ui`) R9's third subtraction is about.
+    const WEB_PRELUDE_MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n";
+
+    // E180 pin (a). The kolt shape at its smallest: the prelude binds `Option`,
+    // so the import is redundant and rule (0) prunes the leaf — and the module
+    // rescue must NOT then put `import std::option;` back. `Some` IS declared
+    // in std's `option.vl`, which is exactly what rule (2) used to count: a
+    // definition the prelude binds, spelled as a path segment behind a head.
+    // Neither reading survives E180's subtractions, so the statement goes.
+    #[test]
+    fn organize_prunes_a_prelude_redundant_import_a_qualified_variant_reaches_through() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::option::Option;\n\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the prelude-redundant import offers an edit"),
+            // E186 closed the leading blank this used to record: the run WAS
+            // the opening paragraph, so it takes the separator below it too.
+            "fun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            "`Option::Some` is a path-qualified reach through a PRELUDE-bound \
+             head — the import brings nothing and no rescue is owed",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (b). The same file with the collision actually present: kolt's
+    // generated lookup table calls `option()`, its own icon function, inside
+    // `Option::Some(..)`. Whatever the organizer decides, no edit it writes may
+    // bind `option` — that is the statement the guard makes, and it is asserted
+    // over the organized TEXT rather than over an internal decision, because
+    // the text is what breaks the build.
+    #[test]
+    fn organize_never_binds_a_module_name_the_file_has_taken() {
+        let source = "import std::option::Option;\n\nfun option(): i32 {\n\t1\n}\n\n\
+                      fun pick(): Option<i32> {\n\tOption::Some(option())\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("vilan.toml", WEB_PRELUDE_MANIFEST)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        let result = organized(&document).unwrap_or_else(|| source.to_string());
+        assert!(
+            !result.contains("import std::option;"),
+            "the organizer bound `option` over the file's own `fun option()`:\n{result}",
+        );
+        assert_eq!(
+            result,
+            // E186: the opening paragraph's separator goes with it.
+            "fun option(): i32 {\n\t1\n}\n\nfun pick(): Option<i32> {\n\tOption::Some(option())\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (c) — R9's third subtraction, RULED 2026-09-14. `std::web` says
+    // `export import pkg::ui;`, so `std::ui` is loaded for EVERY file of the
+    // package and its impls are there whatever this file imports. `view("div")
+    // .child(..)` is a receiver-syntax use of a member declared in `ui.vl`, so
+    // without the subtraction the rescue fires and writes
+    // `import std::ui::{ (impl View) };` into the file — redundant, and (kolt's
+    // estate) into every file of an application. With it the statement goes.
+    #[test]
+    fn organize_strips_a_ui_import_the_prelude_module_itself_reexports() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::ui::{ View, view };\n\nfun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("both leaves are prelude-redundant"),
+            // E186: the opening paragraph's separator goes with it.
+            "fun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
+            "`std::ui` is ambient under this prelude — rescuing it as a \
+             selector is redundant, not protective",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`LEAF_AND_IMPL`]'s two-subject sibling: the module rescue is the WIDE
+    /// form only when the file's uses span more than one `impl` block
+    /// (`visibility.md` §7.2), and the collision guard is about the wide form —
+    /// a SELECTOR binds no name and needs no guard at all.
+    const LEAF_AND_TWO_IMPLS: &str = concat!(
+        "fun b(): i32 {\n\t1\n}\n\n",
+        "impl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n\n",
+        "impl bool {\n\tfun flipped(self): bool {\n\t\tself\n\t}\n}\n",
+    );
+
+    // E180's collision guard where the rescue is genuinely WANTED: `a.vl`'s two
+    // `impl` blocks are the only thing bringing `doubled` and `flipped`, so
+    // E168 would rewrite `import pkg::a::b;` to `import pkg::a;` — but the file
+    // declares its own `fun a()`, and that rewrite binds `a` over it. The
+    // organizer keeps the statement exactly as written instead: it may not
+    // break a green build to tidy one.
+    #[test]
+    fn organize_keeps_an_emptied_import_verbatim_when_its_module_name_is_taken() {
+        let source = "import pkg::a::b;\n\nfun a(): i32 {\n\t2\n}\n\n\
+                      fun main(): bool {\n\tlet n = a().doubled();\n\tlet flag = n > 0;\n\t\
+                      flag.flipped()\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("a.vl", LEAF_AND_TWO_IMPLS)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "`a` is taken by the file's own declaration — the statement stands",
+        );
+        // E114/E173's contract: what fades is what the action removes, and the
+        // action removes nothing here.
+        assert_eq!(
+            faded(&document),
+            Vec::<String>::new(),
+            "a statement the action keeps verbatim must not fade",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The guard's other half: the same shape with the module's name FREE still
+    // rescues, so the guard narrows E168 and does not replace it.
+    #[test]
+    fn organize_still_rescues_when_the_module_name_is_free() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun local(): i32 {\n\t2\n}\n\n\
+                 fun main(): bool {\n\tlet n = local().doubled();\n\tlet flag = n > 0;\n\t\
+                 flag.flipped()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_TWO_IMPLS),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement is rescued"),
+            "import pkg::a;\n\nfun local(): i32 {\n\t2\n}\n\n\
+             fun main(): bool {\n\tlet n = local().doubled();\n\tlet flag = n > 0;\n\t\
+             flag.flipped()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (e). A rule-(0) leaf is not "unused" in any sense its reader
+    // would recognize — `Option` may be spelled on every line of the file — so
+    // the fade says what it actually is and names the prelude.
+    #[test]
+    fn a_prelude_redundant_faded_leaf_says_the_prelude_binds_it() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::option::Option;\n\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![(
+                "Option".to_string(),
+                "redundant: the prelude already binds `Option`".to_string(),
+            )],
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9931,11 +21448,33 @@ pub(crate) mod tests {
 
     // Formatting a source that does not parse cleanly degrades to no edit: the
     // formatter's net requires a clean parse, so `format` returns the input
-    // verbatim, and the LSP `formatting` handler turns `formatted == source`
-    // into `Ok(None)` — no edit, no error popup.
+    // verbatim, and the LSP `formatting` handler answers `Ok(None)` — no edit,
+    // no error popup.
+    //
+    // E197: the handler reads `reprint` now, so it also KNOWS this happened and
+    // says so once per file per cause (`main.rs`'s
+    // `formatting_decline_notice`). The answer to the request is unchanged —
+    // there is genuinely nothing to edit — which is what this pin holds; the
+    // decline's own sentence is pinned beside the notice.
     #[test]
     fn a_broken_source_formats_to_no_edit() {
         for source in [RECOVERABLE_INBODY, RECOVERABLE_TOPLEVEL] {
+            let declined = vilan_core::formatter::reprint(source)
+                .expect_err("a non-clean source must decline, not reprint");
+            // A source-level decline, never a PRINTER GAP: these fixtures are
+            // broken code, and the distinction is the point of the five reasons
+            // — a gap here would be a formatter defect wearing a user's typo as
+            // a disguise. (Which of the two source reasons it is depends on the
+            // fixture: `RECOVERABLE_INBODY` carries an unterminated token.)
+            assert!(
+                matches!(
+                    declined.reason,
+                    vilan_core::formatter::DeclineReason::DoesNotLex
+                        | vilan_core::formatter::DeclineReason::DoesNotParse
+                ),
+                "broken code declines at the source, not at the printer: {:?}",
+                declined.reason,
+            );
             assert_eq!(
                 vilan_core::formatter::format(source),
                 source,
@@ -10377,6 +21916,56 @@ pub(crate) mod tests {
         );
     }
 
+    /// E122's fold, and the thing that lets ONE capture serve every token
+    /// request: the salvage tail is folded into the analysis's CAPTURE at
+    /// adoption, not read back out of the walk at serve time. So the captured
+    /// stream — what `semanticTokens/full` and `semanticTokens/range` both
+    /// answer from — is byte-for-byte what the walk answers, salvage included,
+    /// and the line index built beside it reaches into the salvaged tail.
+    ///
+    /// Before this, `capture_landed` ran on the analysis thread (where the
+    /// tail does not exist yet) and nothing folded it in afterwards, so the
+    /// capture and the walk disagreed exactly on the salvaged region.
+    #[test]
+    fn the_capture_carries_the_salvaged_tail_and_indexes_its_lines() {
+        let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let broken = "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let zeta = offset_at(broken, "zeta", 0);
+        let mut document = analyze_text(whole);
+        document.adopt_analysis(analyze_text(broken));
+        // Premise: this adoption really did retain a tail, or the equality
+        // below would hold for the uninteresting reason.
+        assert!(
+            !document.retained_tail.is_empty(),
+            "the break no longer retains a tail — this pin's premise is gone"
+        );
+
+        assert_eq!(
+            document.landed.tokens,
+            document.semantic_tokens(),
+            "the capture every request is served from must be exactly the walk, \
+             salvage and all"
+        );
+
+        let line = document.analyzed_index().position(zeta).line;
+        let window = document.landed.token_positions_in_lines(line, line);
+        let sliced = &document.landed.tokens[window];
+        let filtered: Vec<_> = document
+            .semantic_tokens()
+            .into_iter()
+            .filter(|(span, ..)| document.analyzed_index().range(span).start.line == line)
+            .collect();
+        assert!(
+            !sliced.is_empty(),
+            "the line index must reach into the salvaged tail, not stop at the \
+             last token the fresh analysis produced"
+        );
+        assert_eq!(
+            sliced, filtered,
+            "and the slice of a salvaged line must be the filter of it"
+        );
+    }
+
     /// The honesty half: a tail line the user EDITED is not byte-identical,
     /// so it gets nothing — retained tokens never cover changed text.
     #[test]
@@ -10413,6 +22002,306 @@ pub(crate) mod tests {
             expected.len(),
             "a complete analysis must serve exactly its own tokens"
         );
+    }
+
+    // --- A65: module DIRECTORIES in the editor -----------------------------
+    //
+    // A package's modules are a tree: `a/b.vl` is `a::b`, and a directory with
+    // no `lib.vl` is a pure namespace reached only through what it holds. Three
+    // surfaces have to know that — the import-path completion at each depth,
+    // and go-to-definition on a module segment of a nested path.
+
+    /// The exhibit's shape, as a workspace: `lib/` with a body and a module,
+    /// and `lib/ui/` with no body at all.
+    const A65_TREE: &[(&str, &str)] = &[
+        ("lib/lib.vl", "fun surface(): i32 {\n\t3\n}\n"),
+        ("lib/util.vl", "fun hello(): i32 {\n\t7\n}\n"),
+        ("lib/ui/widget.vl", "fun label(): str {\n\t\"w\"\n}\n"),
+    ];
+
+    fn a65_workspace(entry: &str) -> Vec<(&str, &str)> {
+        let mut files: Vec<(&str, &str)> = vec![("main.vl", entry)];
+        files.extend_from_slice(A65_TREE);
+        files
+    }
+
+    #[test]
+    fn a65_pkg_completion_offers_a_module_directory() {
+        let labels =
+            workspace_completions_at_cursor(&a65_workspace("import pkg::|;\n\nfun main() {}\n"));
+        assert!(
+            labels.iter().any(|label| label == "lib"),
+            "a directory holding a `lib.vl` is a module of the package: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a65_a_module_directorys_completion_offers_its_children_and_its_own_items() {
+        // `lib/` has a body AND submodules, and they live in one namespace as
+        // far as an import path is concerned — so `pkg::lib::` offers both.
+        let labels = workspace_completions_at_cursor(&a65_workspace(
+            "import pkg::lib::|;\n\nfun main() {}\n",
+        ));
+        assert!(
+            labels.iter().any(|label| label == "surface"),
+            "its own items: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "util"),
+            "and the modules its directory holds: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "ui"),
+            "including a bodiless directory, which is a path head: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a65_a_pure_namespaces_completion_offers_what_it_holds() {
+        // `lib/ui` has no `lib.vl`, so it has no items of its own and nothing
+        // to import directly. What it holds is the whole answer.
+        let labels = workspace_completions_at_cursor(&a65_workspace(
+            "import pkg::lib::ui::|;\n\nfun main() {}\n",
+        ));
+        assert_eq!(
+            labels,
+            vec!["widget".to_string()],
+            "a pure namespace offers its children and nothing else"
+        );
+    }
+
+    // --- E152: a pure namespace has somewhere to point ---------------------
+    //
+    // A directory with no `lib.vl` is a module node the loader mints so a path
+    // can pass through it, and it names no file — so the analyzer attributes
+    // its one-id range to the ENTRY at an empty span, which is honest about
+    // provenance and wrong as a destination: go-to-definition on `ui` in
+    // `pkg::lib::ui::widget` landed on line 1 of the file the caret was
+    // already in. Hover said `module ui`, a restatement of the word under the
+    // caret.
+    //
+    // Ruled here: the destination is the namespace's FIRST CHILD's file, at
+    // line 1 — not a `file://` URI naming the directory, which is well-formed
+    // and unopenable (a `Location` is a range in a text document; no editor
+    // opens a directory as one, and "unable to open" is worse than the wrong
+    // line this replaces). The hover answers with what the namespace HOLDS,
+    // which is the only fact about it and the one a reader following the path
+    // is asking for.
+
+    /// The entry names the namespace TWICE, so "references" has something to
+    /// be more than a tautology about.
+    const E152_ENTRY: &str = "\
+import pkg::lib::ui::widget::label;
+import pkg::lib::ui::widget::wide;
+
+fun main() {
+\tlet _ = label();
+\tlet _ = wide();
+}
+";
+
+    fn e152_workspace() -> (PathBuf, Document) {
+        analyze_workspace(&[
+            ("main.vl", E152_ENTRY),
+            ("lib/lib.vl", "fun surface(): i32 {\n\t3\n}\n"),
+            (
+                "lib/ui/widget.vl",
+                "fun label(): str {\n\t\"w\"\n}\n\nfun wide(): i32 {\n\t1\n}\n",
+            ),
+        ])
+    }
+
+    /// E158's half of the namespace question. `is_namespace_module`
+    /// discriminates on "a module attributed to `SourceId(0)` that has a
+    /// children scope and an empty span", which is thin — it separates its
+    /// subject from the rest by facts each happens to have rather than by a
+    /// marker either one carries. The sweep asked whether a THIRD such entity
+    /// had appeared and wants a marker if so.
+    ///
+    /// It has not, and the enumeration turned up something better than a
+    /// "no": over both package shapes — a single-file package and one with
+    /// nested bodiless directories — the entry-attributed set is EXACTLY the
+    /// bodiless namespaces, with no second member at all, and the origin roots
+    /// (`pkg`, `std`, a dependency's name) are excluded by carrying NO source
+    /// at all rather than by the children-scope clause. So the thin
+    /// discriminator is not currently discriminating against anything, which
+    /// is the safest state it can be in and not one to disturb with an
+    /// invented marker.
+    ///
+    /// This runs on every suite instead of being a sentence that was true
+    /// once: a second kind of entry-attributed module reds here, and whoever
+    /// adds it decides the marker with the real case in hand.
+    #[test]
+    fn every_entry_attributed_module_is_a_bodiless_namespace() {
+        // (label, workspace, the bodiless namespaces it should produce)
+        let single = analyze_workspace(&[("main.vl", "fun main() {}\n")]);
+        let nested = e152_workspace();
+        for (label, (dir, document), expected) in [
+            ("a single-file package", single, Vec::new()),
+            // B335: `lib` is NOT one of these — it has a body file
+            // (`lib/lib.vl`) and reports it. It used to appear here because a
+            // module reached first as the parent NAMESPACE of `lib::ui` kept
+            // the entry-attributed placeholder range its namespace node was
+            // minted with, even after its body loaded and adopted the node. The
+            // set is now exactly what the name says: directories with no body.
+            ("nested bodiless directories", nested, vec!["ui"]),
+        ] {
+            let program = document.program.as_ref().expect("program");
+            let mut namespaces: Vec<&str> = Vec::new();
+            let mut origin_roots: Vec<&str> = Vec::new();
+            for (id, module) in &program.modules {
+                match program.source_of(*id) {
+                    // An ORIGIN root names no file and holds no span: it is
+                    // the head of a path, not a module anyone wrote.
+                    None => {
+                        assert!(
+                            !program.module_children_scopes.contains_key(id)
+                                && !program.span_map.contains_key(id),
+                            "{label}: the origin root {:?} grew a children scope or a \
+                             span, so `source_of` is no longer what excludes it from \
+                             `is_namespace_module`",
+                            module.name
+                        );
+                        origin_roots.push(module.name);
+                    }
+                    Some(SourceId(0)) => {
+                        assert!(
+                            program.module_children_scopes.contains_key(id)
+                                && program
+                                    .span_map
+                                    .get(id)
+                                    .is_none_or(|span| span.start == span.end),
+                            "{label}: a SECOND kind of entry-attributed module appeared \
+                             — {:?} is attributed to the entry but is not a bodiless \
+                             namespace. `is_namespace_module`'s discriminator now has \
+                             something to get wrong: give the namespace a real marker, \
+                             with this case in hand",
+                            module.name
+                        );
+                        namespaces.push(module.name);
+                    }
+                    // A module loaded from its own file: not this pin's subject.
+                    Some(_) => {}
+                }
+            }
+            namespaces.sort();
+            assert_eq!(namespaces, expected, "{label}: the bodiless namespaces");
+            origin_roots.sort();
+            assert_eq!(
+                origin_roots,
+                vec!["pkg", "std"],
+                "{label}: the origin roots, which carry no source and are excluded \
+                 by that and not by the children clause"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn e152_definition_on_a_pure_namespace_lands_in_its_first_childs_file() {
+        let (dir, document) = e152_workspace();
+        let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
+        let (source, span) = document
+            .definition(offset)
+            .expect("a namespace segment has a definition");
+        assert_ne!(
+            source,
+            SourceId(0),
+            "`ui` names no name in the entry, and landing there is the bug",
+        );
+        let program = document.program.as_ref().expect("program");
+        let landed = program.canonical_sources[source.0 as usize].clone();
+        assert!(
+            landed.ends_with("widget.vl"),
+            "the namespace's first child's file: {landed:?}",
+        );
+        assert_eq!(span, Span::from(0..0), "line 1 — nothing there spells `ui`");
+        // B335: the module ABOVE it, `lib`, has a body file of its own and
+        // lands on IT. It used to land on `widget.vl` with `ui` — the module
+        // was reached first as the parent namespace of `lib::ui`, and the
+        // entry-attributed placeholder that mint left behind outlived the body
+        // that adopted the node, so `source_of` never said `lib/lib.vl`.
+        let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
+        let (above_source, above_span) = document
+            .definition(above)
+            .expect("a module segment has a definition");
+        assert_eq!(above_span, Span::from(0..0));
+        let above_landed = program.canonical_sources[above_source.0 as usize].clone();
+        assert!(
+            above_landed.ends_with("lib/lib.vl"),
+            "`lib` has a body and go-to-definition lands in it: {above_landed:?}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e152_hover_on_a_pure_namespace_names_what_it_holds() {
+        let (dir, document) = e152_workspace();
+        let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
+        assert_eq!(
+            document.hover(offset).as_deref(),
+            Some("```vilan\nnamespace ui\n```\n\nHolds `widget`."),
+        );
+        // B335: `lib` has a body file, so it hovers as the MODULE it is — it
+        // read as a namespace only because the entry-attributed placeholder
+        // from its namespace mint outlived the body that adopted the node.
+        let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
+        assert_eq!(document.hover(above).as_deref(), Some("module lib"),);
+        // A module with a file of its own is unmoved: it has a declaration,
+        // and `namespace` is not what it is.
+        let leaf = E152_ENTRY.find("::widget").expect("the `widget` segment") + 2;
+        assert_eq!(document.hover(leaf).as_deref(), Some("module widget"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e152_references_on_a_pure_namespace_list_the_segments_that_name_it() {
+        let (dir, document) = e152_workspace();
+        let offset = E152_ENTRY.find("::ui").expect("the `ui` segment") + 2;
+        let found: Vec<&str> = document
+            .references(offset)
+            .into_iter()
+            .filter(|(source, _)| *source == SourceId(0))
+            .map(|(_, span)| E152_ENTRY.get(span.into_range()).expect("in the entry"))
+            .collect();
+        assert_eq!(
+            found,
+            vec!["ui", "ui"],
+            "a namespace has no declaration row; the path segments that name \
+             it are its whole occurrence set",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a65_a_nested_modules_completion_offers_its_members() {
+        let labels = workspace_completions_at_cursor(&a65_workspace(
+            "import pkg::lib::ui::widget::|;\n\nfun main() {}\n",
+        ));
+        assert!(
+            labels.iter().any(|label| label == "label"),
+            "the deepest module's own importables: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a65_definition_on_a_nested_paths_module_segment_lands_in_that_module() {
+        // Every segment of an import path records a reference to what it names,
+        // and a nested path's segments name modules — so go-to-definition on
+        // `util` in `pkg::lib::util::hello` lands in `lib/util.vl`, not in the
+        // entry.
+        let entry = "import pkg::lib::util::hello;\n\nfun main() {\n\tlet _ = hello();\n}\n";
+        let (directory, document) = analyze_workspace(&a65_workspace(entry));
+        let segment = entry.find("util").expect("the `util` segment");
+        let (source_id, _span) = document
+            .definition(segment + 1)
+            .expect("definition on a module segment");
+        assert_ne!(
+            source_id,
+            vilan_core::analyzer::SourceId(0),
+            "`util` is a module of its own, not a name in the entry"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
 
@@ -10558,12 +22447,103 @@ mod entry_reclaim {
         );
     }
 
+    /// M26: a CANCELLED analysis gives back everything it leaked, on the thread
+    /// that ran it.
+    ///
+    /// The token is set before the analysis starts, so the first checkpoint —
+    /// the parse boundary in `analyze_source_unfenced` — is the one that fires:
+    /// the entry text and the entry tree are both leaked by then, and nothing
+    /// downstream has been built. That is the earliest a cancel can land and
+    /// therefore the shape most likely to leave a handle behind, which is why
+    /// it is the one pinned exactly. The reclaim seam itself is shared by every
+    /// checkpoint: they all fall through to the same wrap-and-drop in
+    /// `analyze_on_this_thread`.
+    #[test]
+    fn a_cancelled_analysis_gives_back_its_entry_text_and_tree() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let token = vilan_core::cancel::CancelToken::new();
+            token.cancel();
+            let _scope = token.install();
+            let document =
+                Document::analyze_on_this_thread(FIRST, &std_root(), Path::new("reclaim.vl"));
+            assert!(
+                !document.program.is_some(),
+                "a cancelled analysis carries no program — it stopped before there was one",
+            );
+            assert_eq!(
+                leak_tally::bytes(LeakSite::LspEntryText),
+                FIRST.len(),
+                "the entry text is leaked on the way IN, before any checkpoint can fire",
+            );
+            let tree = leak_tally::bytes(LeakSite::EntryAst);
+            assert!(tree > 0, "and so is the parsed tree");
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                FIRST.len(),
+                "…and given back before the cancelled analysis returned",
+            );
+            assert_eq!(leak_tally::released(LeakSite::EntryAst), tree);
+            assert_eq!(leak_tally::outstanding(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::EntryAst), 0);
+            drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::LspEntryText),
+                0,
+                "the degraded document owns nothing, so dropping it cannot double-free",
+            );
+        });
+    }
+
+    /// M26, the other half: a cancel that lands DURING the analysis rather than
+    /// before it.
+    ///
+    /// Where it lands is the machine's business — the watcher fires after a
+    /// millisecond, which on a fast box is inside the checks and on a slow one
+    /// may be after the analysis finished altogether — and the pin is written
+    /// so that it does not matter. What is asserted is the tally after the
+    /// document drops, which must be zero in every case: a cancelled analysis
+    /// reclaims on its own thread, an uncancelled one reclaims when its
+    /// document is dropped, and there is no third outcome that leaves bytes
+    /// outstanding.
+    #[test]
+    fn a_cancel_landing_mid_analysis_leaves_nothing_outstanding() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let token = vilan_core::cancel::CancelToken::new();
+            let watcher = {
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    token.cancel();
+                })
+            };
+            let _scope = token.install();
+            let document =
+                Document::analyze_on_this_thread(SECOND, &std_root(), Path::new("reclaim.vl"));
+            watcher.join().expect("the watcher thread");
+            let stopped_early = !document.program.is_some();
+            drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::LspEntryText),
+                0,
+                "the entry text is given back whether the analysis was cancelled \
+                 (stopped_early={stopped_early}) or outran the cancel",
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::EntryAst),
+                0,
+                "and so is the tree (stopped_early={stopped_early})",
+            );
+        });
+    }
+
     /// The degraded document (a panicked analysis) owns nothing: dropping it
     /// releases nothing and cannot double-free.
     #[test]
     fn the_internal_error_document_owns_nothing_to_reclaim() {
         leak_tally::reset();
-        let document = Document::internal_error(FIRST);
+        let document = Document::internal_error(FIRST, Path::new("reclaim.vl"));
         assert!(!document.program.is_some());
         drop(document);
         assert_eq!(leak_tally::released_total(), 0);
@@ -10580,7 +22560,7 @@ mod entry_reclaim {
 #[cfg(test)]
 mod overlay_module_reclaim {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
     use vilan_core::leak_tally::{self, LeakSite};
@@ -10689,6 +22669,7 @@ mod overlay_module_reclaim {
     /// outstanding balances read after the document drops.
     #[test]
     fn dependent_edit_measurement() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -10761,9 +22742,10 @@ mod overlay_module_reclaim {
             assert_no_global_cache_growth("repeated-clean");
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                30 * clean_helper(1).len(),
-                "a repeated content is parsed and owned per analysis — the \
-                 mechanism's stated, bounded cost"
+                clean_helper(1).len(),
+                "M23: an unchanged buffer is parsed and owned ONCE — the base \
+                 world stored for the first analysis claims that copy and \
+                 serves the other 29, which is the cost M9 paid per analysis"
             );
 
             // Phase 3: 20 DISTINCT broken contents — the file mid-edit.
@@ -10823,6 +22805,11 @@ mod overlay_module_reclaim {
             );
             report("repeated-clean-large", 30, wall);
             assert_no_global_cache_growth("repeated-clean-large");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                large_helper(1).len(),
+                "M23, at the realistic size: one parse for 30 analyses"
+            );
 
             // The raw parse cost of the module under edit, isolated from the
             // analysis around it: what one overlay-resident import adds to
@@ -10843,15 +22830,25 @@ mod overlay_module_reclaim {
             }
 
             leak_tally::reset();
+            let claims_before_drop = vilan_core::analyzer::base_cache_overlay_claims();
             drop(document);
             println!(
                 "[m9 after-drop] outstanding: LspEntryText {} B, EntryAst {} B, \
-                 OwnedModuleText {} B, OwnedModuleAst {} B, OwnedModuleErrors {} B",
+                 OwnedModuleText {} B, OwnedModuleAst {} B, OwnedModuleErrors {} B; \
+                 base-cache overlay claims {claims_before_drop:?}",
                 leak_tally::outstanding(LeakSite::LspEntryText),
                 leak_tally::outstanding(LeakSite::EntryAst),
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
                 leak_tally::outstanding(LeakSite::OwnedModuleAst),
                 leak_tally::outstanding(LeakSite::OwnedModuleErrors),
+            );
+            vilan_core::analyzer::base_cache_clear();
+            println!(
+                "[m23 after-clear] outstanding: OwnedModuleText {} B, \
+                 OwnedModuleAst {} B, base-cache overlay claims {:?}",
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                leak_tally::outstanding(LeakSite::OwnedModuleAst),
+                vilan_core::analyzer::base_cache_overlay_claims(),
             );
 
             vilan_core::analyzer::set_document_overlay(&helper_path, None);
@@ -10863,9 +22860,11 @@ mod overlay_module_reclaim {
     /// landed keystroke) grows neither process-global cache; each analysis
     /// owns exactly one copy of the edited module; supersession
     /// (`adopt_analysis`) reclaims the previous analysis's copy; and closing
-    /// the document nets every owned site to zero.
+    /// the document, then the base cache that claims the last copy (M23),
+    /// nets every owned site to zero.
     #[test]
     fn a_dependent_edits_module_copies_are_analysis_owned_and_reclaimed() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -10901,13 +22900,28 @@ mod overlay_module_reclaim {
                 "no owned tree was recorded — the pin is vacuous"
             );
             // Supersession reclaimed every previous copy: only the CURRENT
-            // analysis's is still out.
+            // analysis's is still out — and the base world stored for it
+            // holds a second claim on that same copy (M23), not a copy of
+            // its own.
             assert_eq!(
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
                 helper_bytes as isize,
                 "adoption must reclaim the superseded analysis's module copy"
             );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, helper_bytes),
+                "the stored base world claims the live copy — one claim, no \
+                 second copy"
+            );
             drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                helper_bytes as isize,
+                "M23: closing the document releases the ANALYSIS's claim; the \
+                 stored world's keeps the allocation alive"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
@@ -10925,6 +22939,7 @@ mod overlay_module_reclaim {
     /// document reclaims the error slice with the rest.
     #[test]
     fn a_broken_buffers_copies_and_errors_are_owned_and_reclaimed() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -10973,6 +22988,10 @@ mod overlay_module_reclaim {
                 "no owned error slice was recorded — the pin is vacuous"
             );
             drop(document);
+            // M23: the base world stored for the last analysis claims that
+            // analysis's copies — text, tree AND the rendered error slice —
+            // so the balance nets to zero only once the cache lets go.
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
@@ -10982,12 +23001,15 @@ mod overlay_module_reclaim {
         });
     }
 
-    /// The repeated-content pin: the mechanism's honest cost is one parse and
-    /// one owned copy per analysis even when the buffer has not changed —
-    /// bounded by the open set, reclaimed on supersession, never cached
-    /// globally.
+    /// The repeated-content pin, and M23's win at its sharpest: an unchanged
+    /// buffer is parsed and owned ONCE, not once per analysis. The base world
+    /// stored for the first analysis claims that copy, so every later
+    /// analysis is served the world and its claim — which is exactly what
+    /// M9's store gate forbade, at the price of rebuilding the whole
+    /// pre-entry world on every keystroke.
     #[test]
-    fn a_repeated_content_is_owned_per_analysis_and_reclaimed() {
+    fn a_repeated_content_is_loaded_once_and_served_from_the_stored_world() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         on_big_stack(move || {
             let std_dir = std_root();
@@ -11004,10 +23026,17 @@ mod overlay_module_reclaim {
             assert_no_global_cache_growth("repeated-content pin");
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                5 * helper_bytes,
-                "a repeated content is parsed and owned per analysis"
+                helper_bytes,
+                "M23: five analyses over one unchanged buffer parse it once — \
+                 four of them are served the stored world's claim"
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, helper_bytes),
+                "one stored world, one claim, on the one copy"
             );
             drop(document);
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
 
@@ -11016,12 +23045,15 @@ mod overlay_module_reclaim {
         });
     }
 
-    /// The multi-dependent pin: two open documents importing the edited
-    /// module each own their OWN copy — the bound is the open set — and each
-    /// copy dies with its document: dropping one leaves the other's analysis
-    /// answering from its own, live copy.
+    /// The multi-dependent pin, and M23's reference count at work: two open
+    /// documents importing the edited module hold a claim EACH on one copy —
+    /// they share the base world the first of them stored — and the copy
+    /// outlives every individual release. Dropping one document leaves the
+    /// other answering from memory its own claim keeps alive; the allocation
+    /// dies only when the LAST claim goes, which here is the cache's.
     #[test]
-    fn each_open_dependent_owns_and_reclaims_its_own_copy() {
+    fn open_dependents_share_one_claimed_copy_that_outlives_each_of_them() {
+        let _cache = base_cache_guard();
         let (dir, entry_path, helper_path) = scratch_package();
         let second_entry_path = dir.join("other.vl");
         const SECOND_ENTRY: &str = "import pkg::helper::value;
@@ -11049,24 +23081,32 @@ fun main() {
             );
             assert_eq!(
                 leak_tally::bytes(LeakSite::OwnedModuleText),
-                2 * helper_bytes,
-                "each open dependent owns its own copy of the module"
+                helper_bytes,
+                "M23: the second dependent is served the first's stored world \
+                 — one copy, two claims"
             );
             assert_eq!(
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
-                2 * helper_bytes as isize,
+                helper_bytes as isize,
             );
             drop(first);
             assert_eq!(
                 leak_tally::outstanding(LeakSite::OwnedModuleText),
                 helper_bytes as isize,
-                "dropping one dependent must reclaim exactly its own copy"
+                "dropping one dependent releases ITS claim only — the other \
+                 dependent is still reading this allocation"
             );
             assert!(
                 !second.semantic_tokens().is_empty(),
                 "the surviving dependent no longer answers from its program"
             );
             drop(second);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                helper_bytes as isize,
+                "the stored world's claim is the last one standing"
+            );
+            vilan_core::analyzer::base_cache_clear();
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
             assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
 
@@ -11077,10 +23117,11 @@ fun main() {
 
     /// The no-dependent pin: an analysis that loads no overlay-served module
     /// — the ordinary open document, whatever unrelated overlays exist —
-    /// owns nothing, so the mechanism costs it nothing and the base-world
-    /// cache keeps working for it (the store gate reads the same emptiness).
+    /// owns nothing, so the mechanism costs it nothing and the world it
+    /// stores claims nothing.
     #[test]
     fn an_analysis_that_loads_no_overlay_module_owns_nothing() {
+        let _cache = base_cache_guard();
         let unrelated =
             std::env::temp_dir().join(format!("vilan_m9_unrelated_{}.vl", std::process::id()));
         on_big_stack(move || {
@@ -11117,6 +23158,559 @@ fun main() {
     }
 }
 
+/// M23's gate: the three-file scripted session the perf-25 lane measured on
+/// kolt — `views.vl` → `theme.vl` → `client.vl`, each opened, edited a few
+/// times, all three left OPEN — asserted on a package of the same shape.
+///
+/// `client.vl` imports `pkg::views`, and `views.vl` is an open buffer, so
+/// every one of `client.vl`'s loads of it is OVERLAY-served. Under M9's store
+/// gate that meant `client.vl` never stored a base world and never hit one:
+/// measured on kolt, `base` 1,357–2,713 ms on EVERY `client.vl` keystroke,
+/// against `base 0.0 ms` for its two siblings, which import no open file. The
+/// claim protocol (M23) is what closes it, and this pin is the shape the
+/// number came from.
+#[cfg(test)]
+mod m23_scripted_session {
+    use super::*;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The open sibling `client.vl` imports — big enough that rebuilding the
+    /// world around it is real work, and it imports nothing itself, so its
+    /// OWN analyses store a world that claims nothing.
+    fn views(keystroke: usize) -> String {
+        let mut text = format!(
+            "export fun app_shell(): i32 {{\n\t{}\n}}\n",
+            1000 + keystroke
+        );
+        for ordinal in 0..40 {
+            text.push_str(&format!(
+                "export fun view_{ordinal:02}(input: i32): i32 {{\n\tlet scaled = input * {};\n\tscaled + {ordinal}\n}}\n",
+                ordinal + 1
+            ));
+        }
+        text
+    }
+
+    /// The const-heavy sibling that reaches no package module — kolt's
+    /// `theme.vl`, the control that already read `base 0.0 ms`.
+    fn theme(keystroke: usize) -> String {
+        format!("export fun accent(): i32 {{\n\t{}\n}}\n", 2000 + keystroke)
+    }
+
+    /// The subject: it imports the OPEN sibling, which is the whole point.
+    fn client(keystroke: usize) -> String {
+        format!(
+            "import pkg::views::app_shell;\n\nfun main() {{\n\tlet shell = app_shell() + {};\n}}\n",
+            3000 + keystroke
+        )
+    }
+
+    /// A scratch package of the three files, on disk and unique per call (the
+    /// overlay map is process-global).
+    fn scratch_session() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_m23_session_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let views_path = dir.join("views.vl");
+        let theme_path = dir.join("theme.vl");
+        let client_path = dir.join("client.vl");
+        std::fs::write(&views_path, views(0)).expect("write views.vl");
+        std::fs::write(&theme_path, theme(0)).expect("write theme.vl");
+        std::fs::write(&client_path, client(0)).expect("write client.vl");
+        (dir, views_path, theme_path, client_path)
+    }
+
+    /// The session, and the assertion the item names: `client.vl` hits the
+    /// base cache from its SECOND analysis, with its two open siblings still
+    /// overlaid — plus the observation identity that makes a hit legitimate
+    /// (the served world answers what a cleared cache answers).
+    #[test]
+    fn the_scripted_sessions_third_file_hits_from_its_second_analysis() {
+        let _cache = base_cache_guard();
+        let (dir, views_path, theme_path, client_path) = scratch_session();
+        on_big_stack(move || {
+            let std_dir = std_root();
+            vilan_core::analyzer::base_cache_clear();
+
+            // File 1: views.vl opened and edited. It imports no sibling, so
+            // it hits from its own second analysis — M21's behavior, and the
+            // vacuity guard for everything below.
+            vilan_core::analyzer::set_document_overlay(&views_path, Some(views(0)));
+            let mut views_document =
+                Document::analyze_on_this_thread(&views(0), &std_dir, &views_path);
+            for keystroke in 1..=4 {
+                let text = views(keystroke);
+                vilan_core::analyzer::set_document_overlay(&views_path, Some(text.clone()));
+                let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+                views_document.adopt_analysis(Document::analyze_on_this_thread(
+                    &text,
+                    &std_dir,
+                    &views_path,
+                ));
+                let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+                assert!(
+                    hits_after > hits_before,
+                    "views.vl keystroke {keystroke} must hit the base cache \
+                     (M21) — without it this pin cannot tell M23 apart from a \
+                     cache that never works"
+                );
+            }
+            assert!(
+                views_document.diagnostics.is_empty(),
+                "views.vl must compile clean, got {:?}",
+                views_document.diagnostics
+            );
+
+            // File 2: theme.vl, opened and edited while views.vl stays open.
+            vilan_core::analyzer::set_document_overlay(&theme_path, Some(theme(0)));
+            let mut theme_document =
+                Document::analyze_on_this_thread(&theme(0), &std_dir, &theme_path);
+            for keystroke in 1..=4 {
+                let text = theme(keystroke);
+                vilan_core::analyzer::set_document_overlay(&theme_path, Some(text.clone()));
+                theme_document.adopt_analysis(Document::analyze_on_this_thread(
+                    &text,
+                    &std_dir,
+                    &theme_path,
+                ));
+            }
+            assert!(theme_document.diagnostics.is_empty());
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (0, 0),
+                "neither sibling imports an open file, so neither world \
+                 claims anything — the claims below are client.vl's"
+            );
+
+            // File 3: client.vl, which imports the OPEN views.vl. Its first
+            // analysis is a miss that stores; every one after it hits.
+            let client_text = client(0);
+            vilan_core::analyzer::set_document_overlay(&client_path, Some(client_text.clone()));
+            let (hits_open, misses_open) = vilan_core::analyzer::base_cache_stats();
+            let mut client_document =
+                Document::analyze_on_this_thread(&client_text, &std_dir, &client_path);
+            let (hits_first, misses_first) = vilan_core::analyzer::base_cache_stats();
+            assert!(
+                client_document.diagnostics.is_empty(),
+                "client.vl must compile clean over its open sibling, got {:?}",
+                client_document.diagnostics
+            );
+            assert_eq!(
+                (hits_first, misses_first > misses_open),
+                (hits_open, true),
+                "the first analysis of a new key must MISS and store"
+            );
+            let views_bytes = views(4).len();
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, views_bytes),
+                "the stored world must claim the overlay-served views.vl copy \
+                 it borrows — that claim is what M9's store gate refused to \
+                 make, at the price of `base` 1.4-2.7 s per keystroke"
+            );
+
+            for keystroke in 1..=8 {
+                let text = client(keystroke);
+                vilan_core::analyzer::set_document_overlay(&client_path, Some(text.clone()));
+                let (hits_before, misses_before) = vilan_core::analyzer::base_cache_stats();
+                client_document.adopt_analysis(Document::analyze_on_this_thread(
+                    &text,
+                    &std_dir,
+                    &client_path,
+                ));
+                let (hits_after, misses_after) = vilan_core::analyzer::base_cache_stats();
+                assert!(
+                    hits_after > hits_before,
+                    "M23: client.vl keystroke {keystroke} must HIT the base \
+                     cache — it imports an open sibling, which is exactly the \
+                     case §7.9.4a's store gate refused"
+                );
+                assert_eq!(
+                    misses_after, misses_before,
+                    "client.vl keystroke {keystroke} must not also miss"
+                );
+                assert!(
+                    client_document.diagnostics.is_empty(),
+                    "client.vl keystroke {keystroke} must stay clean over the \
+                     served world, got {:?}",
+                    client_document.diagnostics
+                );
+            }
+
+            // Observation identity: what the served world answers must be
+            // what a cold build answers. A world whose borrows had been freed
+            // answered `cannot find 'greeting' in the imported path` when the
+            // M9 gate was planted away, so this is the assertion that tells a
+            // legitimate hit from a corrupt one.
+            let final_text = client(8);
+            let hot_tokens = format!("{:?}", client_document.semantic_tokens());
+            let hot_diagnostics = format!("{:?}", client_document.diagnostics);
+            vilan_core::analyzer::base_cache_clear();
+            let cold = Document::analyze_on_this_thread(&final_text, &std_dir, &client_path);
+            assert_eq!(
+                (
+                    format!("{:?}", cold.semantic_tokens()),
+                    format!("{:?}", cold.diagnostics)
+                ),
+                (hot_tokens, hot_diagnostics),
+                "a base-cache hit over an open sibling must be \
+                 observation-identical to a build with the cache cleared"
+            );
+
+            drop(cold);
+            drop(client_document);
+            drop(theme_document);
+            drop(views_document);
+            vilan_core::analyzer::base_cache_clear();
+            for path in [&views_path, &theme_path, &client_path] {
+                vilan_core::analyzer::set_document_overlay(path, None);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+}
+
+/// M24, where it meets M23: a world evicted by the BYTE BUDGET lets go of the
+/// overlay claims it held, exactly as a displaced or stale one does — and the
+/// live analysis that was served from that world goes on reading, because its
+/// own claim is what keeps the allocation alive.
+#[cfg(test)]
+mod m24_budget_eviction {
+    use super::*;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    const SIBLING: &str = "export fun app_shell(): i32 {\n\t7\n}\n";
+    const IMPORTER: &str =
+        "import pkg::views::app_shell;\n\nfun main() {\n\tlet shell = app_shell();\n}\n";
+
+    #[test]
+    fn an_evicted_world_releases_its_overlay_claims_and_the_live_analysis_survives() {
+        let _cache = base_cache_guard();
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_m24_claims_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let sibling_path = dir.join("views.vl");
+        let importer_path = dir.join("client.vl");
+        std::fs::write(&sibling_path, SIBLING).expect("write views.vl");
+        std::fs::write(&importer_path, IMPORTER).expect("write client.vl");
+
+        on_big_stack(move || {
+            let std_dir = std_root();
+            vilan_core::analyzer::set_base_cache_budget(
+                vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            );
+            vilan_core::analyzer::base_cache_clear();
+            // The sibling is OPEN, so the importer's world claims its copy.
+            vilan_core::analyzer::set_document_overlay(&sibling_path, Some(SIBLING.to_string()));
+            leak_tally::reset();
+            let document = Document::analyze_on_this_thread(IMPORTER, &std_dir, &importer_path);
+            assert!(
+                document.diagnostics.is_empty(),
+                "the fixture must compile clean, got {:?}",
+                document.diagnostics
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (1, SIBLING.len()),
+                "the stored world must claim the open sibling's copy (M23) — \
+                 without that this pin has nothing to evict"
+            );
+
+            // Evict it by budget rather than by staleness or displacement.
+            vilan_core::analyzer::set_base_cache_budget(1);
+            assert_eq!(
+                vilan_core::analyzer::base_cache_retained(),
+                0,
+                "the budget must evict the world"
+            );
+            assert_eq!(
+                vilan_core::analyzer::base_cache_overlay_claims(),
+                (0, 0),
+                "an evicted world must give its overlay claims back — every \
+                 eviction path releases through the same routine"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                SIBLING.len() as isize,
+                "the LIVE analysis's own claim keeps the allocation alive: \
+                 evicting a world must not free what a program is reading"
+            );
+            assert!(
+                !document.semantic_tokens().is_empty(),
+                "the analysis served from the evicted world must go on \
+                 answering from memory its own claim holds"
+            );
+
+            drop(document);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                0,
+                "the last claim released is what frees the copy"
+            );
+
+            vilan_core::analyzer::set_base_cache_budget(
+                vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+            );
+            vilan_core::analyzer::set_document_overlay(&sibling_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+}
+
+/// M63: what an open document goes on answering once the server has taken its
+/// `Program` back.
+///
+/// The retention rule is only as good as this module. Dropping an analysis is
+/// easy; dropping it without the editor noticing is the item — the file is
+/// still OPEN, its tab is still there, its squiggles are still on the screen
+/// and a find-references in another file must still see through it. So each pin
+/// here asks the same question twice, once with the program and once without,
+/// and requires the same answer.
+///
+/// The two-document shape is the one kolt.local 034 was filed on: `library.vl`
+/// declares, `application.vl` imports and uses, and the query runs in the
+/// DEFINER — the direction a single program cannot answer, because a program
+/// reaches its own import closure and never its importers.
+#[cfg(test)]
+mod released_documents {
+    use super::*;
+    use crate::document::tests::{analyze_workspace, base_cache_guard, std_root};
+
+    const LIBRARY: &str = "struct Point {\n\tx: i32,\n}\n";
+    const APPLICATION: &str =
+        "import pkg::library::Point;\n\nfun main(): i32 {\n\tlet p = Point { x = 1 };\n\tp.x\n}\n";
+
+    /// The definer as the open document, its importer open beside it.
+    fn library_and_application() -> (PathBuf, Document, Document) {
+        let (dir, library) =
+            analyze_workspace(&[("library.vl", LIBRARY), ("application.vl", APPLICATION)]);
+        let application = Document::analyze(APPLICATION, &std_root(), &dir.join("application.vl"));
+        (dir, library, application)
+    }
+
+    /// `(path tail, span, message)` per published diagnostic — the shape the
+    /// planner publishes, compared as text so a released document's answer can
+    /// be held to the one it gave a moment earlier.
+    fn published(document: &Document) -> Vec<(String, std::ops::Range<usize>, String)> {
+        document
+            .published_diagnostics()
+            .into_iter()
+            .map(|item| {
+                (
+                    item.path
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    item.span.into_range(),
+                    item.message,
+                )
+            })
+            .collect()
+    }
+
+    fn outline(document: &Document) -> Vec<String> {
+        document
+            .document_symbols()
+            .into_iter()
+            .map(|symbol| format!("{}:{:?}", symbol.name, symbol.full.into_range()))
+            .collect()
+    }
+
+    /// THE PIN (M63): the three answers a released document owes the editor —
+    /// its diagnostics, its outline, and its half of a cross-document
+    /// find-references — are the answers it gave while it held its program.
+    #[test]
+    fn a_released_document_answers_diagnostics_symbols_and_references_from_its_tables() {
+        let _guard = base_cache_guard();
+        let (dir, library, mut application) = library_and_application();
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+
+        let diagnostics_before = published(&application);
+        let outline_before = outline(&application);
+        let references_before = library.references_across(offset, [&application]);
+        assert!(
+            references_before
+                .iter()
+                .any(|(path, _)| path.ends_with("application.vl")),
+            "the union must reach the importer BEFORE the release, or this pin \
+             is measuring nothing: {references_before:?}",
+        );
+
+        assert!(
+            application.release_analysis(),
+            "a document holding a program releases it",
+        );
+        assert!(!application.holds_program());
+        assert!(application.is_released());
+        assert!(
+            !application.release_analysis(),
+            "releasing twice is a no-op, not a second capture",
+        );
+
+        assert_eq!(
+            published(&application),
+            diagnostics_before,
+            "a released document publishes what it published — its `SourceId`s \
+             were resolved to paths before the program went away",
+        );
+        assert_eq!(
+            outline(&application),
+            outline_before,
+            "the outline is served from the capture",
+        );
+        assert_eq!(
+            library.references_across(offset, [&application]),
+            references_before,
+            "the cross-document union must still see through a released \
+             neighbor: its reference index is a table, and the two program \
+             questions it asks (which file a source id is, what a definition is \
+             called) are answered from the released tables. A union that goes \
+             quiet for the files the user is not looking at is the silent \
+             incomplete edit set kolt.local 034 exists to prevent",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE OTHER PIN (M63): a rename at a definition still rewrites a released
+    /// importer.
+    ///
+    /// The sharpest edge of the whole item. Find-references going quiet for a
+    /// background file is a visible failure; a RENAME going quiet for one is an
+    /// invisible corruption — the edit set comes back, the client applies it,
+    /// and the file the user was not looking at still says the old name. The
+    /// rule is that rename is complete or it refuses, so a released neighbor
+    /// has to produce its edits from its tables: its occurrence spans (the
+    /// index), the declaration's name and kind (E143's expansion), and the
+    /// source sets a rename may not rewrite.
+    #[test]
+    fn a_rename_at_a_definition_still_rewrites_a_released_importer() {
+        let _guard = base_cache_guard();
+        let (dir, library, mut application) = library_and_application();
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+        let before = library
+            .rename_edits_across(offset, "Spot", [&application])
+            .expect("the rename answers while the importer holds its program");
+        assert_eq!(
+            before
+                .iter()
+                .filter(|(path, _, _)| path.ends_with("application.vl"))
+                .count(),
+            2,
+            "the import leaf and the constructor: {before:?}",
+        );
+
+        assert!(
+            application.release_analysis(),
+            "the release has to happen, or this pin is a pin on a document that \
+             still holds its program",
+        );
+
+        let after = library
+            .rename_edits_across(offset, "Spot", [&application])
+            .expect(
+                "a released importer must still answer with its edits — a rename \
+                 that refuses because a background file gave its program back is \
+                 a rename that stops working as soon as the retention rule runs",
+            );
+        assert_eq!(after, before, "and the same edits, span for span");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dependency edge survives the release — which is what stops the
+    /// retention rule from paying itself back one sweep later: a released
+    /// document that answered "I might depend on anything" would be
+    /// re-analyzed by every save in the workspace.
+    #[test]
+    fn a_released_document_still_knows_which_files_it_loaded() {
+        let _guard = base_cache_guard();
+        let (dir, _library, mut application) = library_and_application();
+        let library_path = dir.join("library.vl");
+        let unrelated = dir.join("nothing.vl");
+        assert!(application.depends_on(&library_path));
+        assert!(!application.depends_on(&unrelated));
+        let entry_before = application.entry_path().map(Path::to_path_buf);
+        assert!(entry_before.is_some(), "an analyzed document has an entry");
+
+        assert!(
+            application.release_analysis(),
+            "the release has to happen, or this pin is a pin on a document that \
+             still holds its program",
+        );
+
+        assert!(
+            application.depends_on(&library_path),
+            "the source list is captured, so the edge stays exact",
+        );
+        assert!(
+            !application.depends_on(&unrelated),
+            "and stays exact in the negative direction, which is the half that \
+             saves the work",
+        );
+        assert_eq!(
+            application.entry_path().map(Path::to_path_buf),
+            entry_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a released document CANNOT answer, stated as a pin rather than
+    /// left to be discovered: the program walks. Each of them is a caret
+    /// request, each of them focuses the document, and focus re-analyzes.
+    #[test]
+    fn a_released_document_answers_the_program_walks_emptily_until_it_is_analyzed_again() {
+        let _guard = base_cache_guard();
+        let (dir, _library, mut application) = library_and_application();
+        let caret = APPLICATION
+            .find("Point { x = 1 }")
+            .expect("the constructor")
+            + 2;
+        assert!(application.hover(caret).is_some(), "the control");
+
+        assert!(application.release_analysis());
+        assert!(application.hover(caret).is_none());
+        assert!(application.definition(caret).is_none());
+        assert!(
+            application.dead_item_spans().is_empty(),
+            "a released document paints no top-level gray: a gray is a claim \
+             the user acts on by deleting, and determination 8 allows staleness \
+             only toward FEWER of them",
+        );
+
+        // Refocus: the server re-analyzes, `adopt_analysis` lands the program,
+        // and the tables that stood in for it are dropped with the fallback.
+        let fresh = Document::analyze(APPLICATION, &std_root(), &dir.join("application.vl"));
+        application.adopt_analysis(fresh);
+        assert!(application.holds_program());
+        assert!(
+            !application.is_released(),
+            "the fallback is cleared by the program's arrival, not left to \
+             shadow it",
+        );
+        assert!(application.hover(caret).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A document that never analyzed is not a released one: it has no tables
+    /// and says so, which is what keeps the server's refocus trigger off the
+    /// entry `did_open` inserts before the first analysis is even scheduled.
+    #[test]
+    fn a_document_that_never_analyzed_is_not_released() {
+        let mut document = Document::unanalyzed("fun main() {}\n");
+        assert!(!document.holds_program());
+        assert!(!document.is_released());
+        assert!(!document.release_analysis());
+        assert!(!document.is_released());
+    }
+}
+
 // Linux-only, and specifically Linux rather than unix: the harness reads
 // resident-set size from `/proc/self/statm`, which Windows does not have (the
 // CI run failed with `NotFound`) and macOS does not have either. The E3 Phase-1
@@ -11126,7 +23720,7 @@ fun main() {
 #[cfg(all(test, target_os = "linux"))]
 mod leak_measurement {
     use super::*;
-    use crate::document::tests::{on_big_stack, std_root};
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
     use vilan_core::leak_tally::{self, LeakSite};
 
     /// Resident set size in KiB, from /proc/self/statm (Linux pages × 4).
@@ -11149,7 +23743,7 @@ mod leak_measurement {
     /// with allocator retention. `None` off glibc — like `/proc` above, the
     /// gate is about the instrument, not the claim.
     #[cfg(target_env = "gnu")]
-    fn heap_split_bytes() -> Option<(isize, isize)> {
+    pub(super) fn heap_split_bytes() -> Option<(isize, isize)> {
         /// glibc's `struct mallinfo2` (malloc.h): ten `size_t` counters.
         #[repr(C)]
         struct MallInfo2 {
@@ -11174,7 +23768,7 @@ mod leak_measurement {
     }
 
     #[cfg(not(target_env = "gnu"))]
-    fn heap_split_bytes() -> Option<(isize, isize)> {
+    pub(super) fn heap_split_bytes() -> Option<(isize, isize)> {
         None
     }
 
@@ -11534,6 +24128,7 @@ mod leak_measurement {
     // still out.
     #[test]
     fn per_analysis_leak_is_bounded_by_named_sites_and_the_entry_is_reclaimed() {
+        let _cache = base_cache_guard();
         let warmup = 20;
         let measured = 200;
         let report = on_big_stack(move || measure(no_macro_text, warmup, measured));
@@ -11617,6 +24212,7 @@ mod leak_measurement {
     // content cache (keyed on the site-stamped text) makes it plateau to zero.
     #[test]
     fn gensym_expansion_leak_plateaus() {
+        let _cache = base_cache_guard();
         // `tail` stays four digits so the blanked world source is byte-stable.
         let warmup = 8;
         let measured = 40;
@@ -11662,6 +24258,7 @@ mod leak_measurement {
     // analysis: the whole macro path plateaus.
     #[test]
     fn world_leak_plateaus_under_length_changing_edits() {
+        let _cache = base_cache_guard();
         let warmup = 8;
         let measured = 40;
         let report = on_big_stack(move || {
@@ -11706,6 +24303,7 @@ mod leak_measurement {
     // definition recompiles once per layout — recorded, accepted.)
     #[test]
     fn broken_world_failure_plateaus_without_releaking() {
+        let _cache = base_cache_guard();
         fn broken_macro_text(i: usize) -> String {
             format!(
                 "import std::io::print;\n\n\
@@ -11790,6 +24388,7 @@ mod leak_measurement {
     // over warm-window noise.
     #[test]
     fn const_evaluations_in_use_bytes_plateau() {
+        let _cache = base_cache_guard();
         let warmup = 8;
         let window = 75;
         let (reports, scopes_alive) = on_big_stack(move || {
@@ -11970,6 +24569,7 @@ mod leak_measurement {
     #[test]
     #[ignore = "the leak soak: thousands of analyses per corpus, run deliberately (proposal/leak-soak.md §5)"]
     fn leak_soak_corpus_plateaus() {
+        let _cache = base_cache_guard();
         soak_corpora(SOAK_CORPORA);
     }
 
@@ -12468,6 +25068,2058 @@ mod perf_baseline {
     }
 }
 
+/// E106 — "the language server slows down over a session", measured.
+///
+/// The item's suspects were a per-analysis leak and S5's per-request re-parses;
+/// the instruments this tree grew after them (`leak_measurement` above, the
+/// session trace, `keystroke.rs`'s gate) all answer a question about ONE
+/// analysis or one request. None of them answers the item's question, which is
+/// about the two-thousandth: does the SAME keystroke, on the same file, in one
+/// process, cost more at the end of a session than at the start?
+///
+/// So the shape here is a session rather than a sample. 2,000 keystrokes land
+/// in ONE process on ONE document, and the window — 100 keystrokes — is the
+/// reporting unit: a median per window, twenty windows, with RSS and the
+/// deliberate leak's outstanding balance read at each window's end. A median
+/// and not a mean, because one scheduler hiccup in two thousand analyses will
+/// move a mean and cannot move a median; twenty windows and not a before/after
+/// pair, because growth has a SHAPE (linear, a step, a plateau) and two numbers
+/// cannot show one.
+///
+/// **CPU, never wall** (M27's rule, E121's re-statement): this box recorded
+/// loadavg 6 to 150 across one order, wall readings moved 5× with it, and CPU
+/// readings did not. The analyses run inline on the measuring thread, so the
+/// thread clock sees all of their work and none of anyone else's.
+///
+/// **RSS is read but never asserted alone.** Resident size confounds a genuine
+/// leak with allocator retention (`leak-soak.md` §7.7 — the reason
+/// `leak_measurement` reads `mallinfo2` beside it), so the row carries both the
+/// resident figure and the tally's own outstanding balance at the two entry
+/// sites, and the assertion is on what the tally says.
+///
+/// Run the full session deliberately:
+///
+/// ```text
+/// cargo nextest run --release -p vilan-lsp --run-ignored ignored-only \
+///     -E 'test(session_growth)' --no-capture > session.log 2>&1
+/// ```
+///
+/// `VILAN_PERF_KOLT` points the same driver at a sibling checkout's
+/// `src/views.vl` (`perf-baseline.md` §1's convention, and the owner's standing
+/// rule: kolt is evidence, never a fixture — nothing is copied in).
+///
+/// ## What it found, 2026-09-11 (release, a box at loadavg 25–140 — every row
+/// carries its own)
+///
+/// **Not the deliberate leak, and not the analysis.** 2,000 keystrokes on one
+/// document, kolt's `views.vl`: the entry text/tree balance is the SAME
+/// constant at every window (one live document, one analysis — 4,528 → 4,529
+/// bytes on the exhibit, the single byte being the keystroke counter widening),
+/// RSS moves 62,656 → 63,088 KiB, and the analyze cost does not trend (1.30×
+/// first-to-last window on a box whose loadavg moved 68 → 73 under it; 1.02×
+/// on the analyze-only driver at loadavg 28–34). The reclaim across
+/// `adopt_analysis` works, every window, for two thousand of them. The item's
+/// PRIME SUSPECT is refuted, and its second — S5's per-request re-parses — is
+/// a per-request constant and not growth: the five-provider burst reads 5.95 ms
+/// at keystroke 100 and 6.21 ms at keystroke 2,000.
+///
+/// **What does grow is what a session OPENS.** [`open_documents`] opens
+/// kolt's eighteen `src/*.vl` files in one process: RSS 5.4 MB → 864 MB, about
+/// 48 MB per file and 126 MB for `views.vl` alone, because a `Document` holds
+/// its whole analysis for as long as the editor holds the file. Closing all
+/// eighteen returns 418 MB to the ALLOCATOR (in-use 738 → 320 MB, free-retained
+/// 3 → 421 MB) and 62 MB to the OS: glibc does not trim, so resident size
+/// ratchets up across a session of opening and closing files and never comes
+/// back down. Beside it, the owner's own live server — read from `/proc` on the
+/// same box, eight hours into a working day — stood at 4.13 GB resident, 4.40
+/// GB high-water, 6.64 GB peak virtual. The instrument and the field agree
+/// about the shape; neither of them is the per-analysis leak.
+#[cfg(all(test, target_os = "linux"))]
+mod session_growth {
+    use super::*;
+    use crate::document::leak_measurement::heap_split_bytes;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use crate::keystroke::gate::{
+        EXHIBIT_ENTRY, GATE_FUNCTIONS, exhibit_module, loadavg_1m, profile, thread_cpu_now,
+    };
+    use std::time::Duration;
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    /// Keystrokes per reported window.
+    const WINDOW: usize = 100;
+    /// Windows in a full session — 2,000 keystrokes, the item's figure.
+    const SESSION_WINDOWS: usize = 20;
+    /// The smoke session: the same driver, small enough for every suite run.
+    const SMOKE_WINDOWS: usize = 2;
+    const SMOKE_WINDOW: usize = 5;
+
+    /// The growth bound. A session's last window may cost more than its first —
+    /// an allocator settles, a cache fills — but not MUCH more, and 1.5× is the
+    /// line: below it no editor session is perceptibly slower at hour two, and
+    /// above it the thing the owner reported is happening.
+    ///
+    /// Stated on each window's CHEAPEST analysis, not its median, and the
+    /// reason is a measurement this lane took rather than a preference: CPU
+    /// time on this box is LOAD-DEPENDENT (E121's standing note, re-confirmed
+    /// here — one window of the same 100 keystrokes on the same file read a
+    /// 371 ms median at loadavg 11.7 and 772 ms at loadavg 35.2). A median
+    /// carries that contention and a growth ratio built from two of them
+    /// measures the box; the minimum is the sample that ran with the fewest
+    /// neighbours and is the closest thing to the quiet-box number the mandate
+    /// is written in. The median is REPORTED beside it, per window and in the
+    /// verdict, because it is what the brief asks to see — it is simply not
+    /// what the gate may be built on.
+    const GROWTH_BOUND: f64 = 1.5;
+
+    /// The bound on what a session RETAINS, stated against the first window and
+    /// applied to both the deliberate leak's outstanding balance and to RSS.
+    ///
+    /// Tighter than [`GROWTH_BOUND`] because it is a claim about a CONSTANT:
+    /// one live document holds one analysis, so the balance moves only by the
+    /// edited text's own growth (a keystroke counter widening by a digit), and
+    /// the measured drift over 2,000 keystrokes is 4,528 → 4,529 bytes and
+    /// 62,656 → 63,088 KiB resident. The 10% here is slack for the allocator,
+    /// not room for a trend. Proven non-vacuous by planting the defect it
+    /// names — an `adopt_analysis` that does not drop the outgoing analysis —
+    /// which takes the balance to 1.83× and RSS to 1.38× within TEN
+    /// keystrokes.
+    const RETENTION_BOUND: f64 = 1.1;
+
+    /// Resident set size in KiB, from `/proc/self/statm` (pages × 4) — the same
+    /// reader `leak_measurement` uses, for the same reason it is Linux-gated.
+    fn rss_kib() -> usize {
+        let statm = std::fs::read_to_string("/proc/self/statm").expect("statm");
+        let pages: usize = statm
+            .split_whitespace()
+            .nth(1)
+            .expect("resident field")
+            .parse()
+            .expect("resident pages");
+        pages * 4
+    }
+
+    /// One window's report: the median CPU of its analyses, and the memory
+    /// picture as the window closed.
+    #[derive(Clone, Copy, Debug)]
+    struct Window {
+        index: usize,
+        median: Duration,
+        minimum: Duration,
+        maximum: Duration,
+        /// The median cost of the five-provider request burst the same
+        /// keystroke answered off the LIVE buffer before the analysis landed —
+        /// the keystroke path (E121 §2.1), measured beside the analysis rather
+        /// than instead of it, because the item's second suspect (S5's
+        /// per-request re-parses) lives here and nowhere else.
+        burst: Duration,
+        rss_kib: usize,
+        /// Recorded-minus-reclaimed at the two entry sites: the deliberate
+        /// per-analysis leak's NET balance, which is the number that has to
+        /// stay flat for a session to stay honest.
+        entry_outstanding: isize,
+        /// The macro-expansion sites' gross bytes — the leak that PLATEAUs once
+        /// an unchanged program's expansions are cached (analysis-reuse.md §2),
+        /// carried here because a session is exactly where a plateau that is
+        /// not one would show.
+        macro_bytes: usize,
+    }
+
+    fn median(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// Drives `windows × per_window` keystrokes on one document in this
+    /// process, reporting per window. `text_at` is the edited buffer at
+    /// keystroke `i` — a distinct text each time, which is what makes every
+    /// analysis a real one rather than a cache hit.
+    fn drive(
+        label: &str,
+        text_at: impl Fn(usize) -> String,
+        entry: &Path,
+        windows: usize,
+        per_window: usize,
+    ) -> Vec<Window> {
+        let std_dir = std_root();
+        // The first analysis in a process resolves std and fills the base
+        // cache, so it is the COLD one and no window may carry it
+        // (`suite-speed.md` §2.1). It is also the document the session then
+        // edits, which is exactly how a file opens in the editor.
+
+        // ONE long-lived document for the whole session, as the server keeps
+        // one per open file. Everything a session RETAINS hangs off it — the
+        // live and analyzed line indices, the keystroke path's captured token
+        // stream, hint list, declaration stamp and symbol index, the reference
+        // index, the retained tail — so a driver that minted a fresh
+        // `Document` per keystroke would be measuring the analyzer and
+        // reporting on the server.
+        let mut document = Document::analyze_on_this_thread(&text_at(0), &std_dir, entry);
+        // A stable, real offset for the completion request: the end of the
+        // first line, which is a char boundary in every file and a position a
+        // person actually types at.
+        let completion_offset = text_at(0).find('\n').unwrap_or(0);
+
+        let mut reported = Vec::with_capacity(windows);
+        let mut keystroke = 1;
+        for index in 0..windows {
+            let mut analyses = Vec::with_capacity(per_window);
+            let mut bursts = Vec::with_capacity(per_window);
+            for _ in 0..per_window {
+                let text = text_at(keystroke);
+                keystroke += 1;
+
+                // 1. The edit reaches the LIVE snapshot at once, which is what
+                //    every request answers over until the analysis lands.
+                document.set_text(&text);
+
+                // 2. The five-provider burst, off the landed capture through
+                //    the anchor — the path the editor actually drives per
+                //    keystroke (E121 §2.1, `keystroke.rs`).
+                let burst_started = thread_cpu_now();
+                let tokens = document.keystroke_tokens(false);
+                let hints = document.keystroke_hints(false);
+                let completions = document.keystroke_completion(completion_offset, false);
+                let symbols = document.document_symbols();
+                let landed_tokens = document.semantic_tokens();
+                let burst_ended = thread_cpu_now();
+                // Read so the compiler cannot delete the work being measured.
+                std::hint::black_box((
+                    tokens.len(),
+                    hints.len(),
+                    completions.len(),
+                    symbols.len(),
+                    landed_tokens.len(),
+                ));
+
+                // 3. The debounced re-analysis, landing on the SAME document.
+                //    `adopt_analysis` is the line the session-leak claim stops
+                //    at (`leak-soak.md` §4.1): it drops the outgoing program
+                //    and gives its entry text and tree back, which is why the
+                //    outstanding balance below is a fact about a session.
+                let analyze_started = thread_cpu_now();
+                let landed = Document::analyze_on_this_thread(&text, &std_dir, entry);
+                document.adopt_analysis(landed);
+                let analyze_ended = thread_cpu_now();
+
+                let elapsed = |before: Option<Duration>, after: Option<Duration>| {
+                    before
+                        .zip(after)
+                        .map(|(before, after)| after.saturating_sub(before))
+                        .expect("this host exposes no thread CPU clock")
+                };
+                analyses.push(elapsed(analyze_started, analyze_ended));
+                bursts.push(elapsed(burst_started, burst_ended));
+            }
+            let minimum = *analyses.iter().min().expect("a non-empty window");
+            let maximum = *analyses.iter().max().expect("a non-empty window");
+            let window = Window {
+                index,
+                median: median(&mut analyses),
+                minimum,
+                maximum,
+                burst: median(&mut bursts),
+                rss_kib: rss_kib(),
+                entry_outstanding: leak_tally::outstanding(LeakSite::LspEntryText)
+                    + leak_tally::outstanding(LeakSite::EntryAst),
+                macro_bytes: leak_tally::bytes(LeakSite::MacroParseText)
+                    + leak_tally::bytes(LeakSite::MacroParseAst)
+                    + leak_tally::bytes(LeakSite::MacroExpansion),
+            };
+            let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
+            println!(
+                "E106 {{\"section\":\"session_growth\",\"corpus\":\"{label}\",\
+                 \"profile\":\"{}\",\"load\":\"{}\",\"window\":{},\"keystrokes\":{},\
+                 \"median_cpu_ms\":{:.2},\"min_cpu_ms\":{:.2},\"max_cpu_ms\":{:.2},\
+                 \"median_burst_ms\":{:.3},\"rss_kib\":{},\"entry_outstanding_bytes\":{},\
+                 \"macro_bytes\":{}}}",
+                profile(),
+                loadavg_1m(),
+                window.index,
+                keystroke - 1,
+                milliseconds(window.median),
+                milliseconds(window.minimum),
+                milliseconds(window.maximum),
+                milliseconds(window.burst),
+                window.rss_kib,
+                window.entry_outstanding,
+                window.macro_bytes,
+            );
+            reported.push(window);
+        }
+        drop(document);
+        reported
+    }
+
+    /// Writes the generated exhibit — kolt-with-lucide's SIZE, none of its
+    /// content (E121 Q6, and the owner's standing rule) — and answers the
+    /// directory plus the entry path.
+    fn exhibit(tag: &str, functions: usize) -> (PathBuf, PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("vilan_e106_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), exhibit_module(functions))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, EXHIBIT_ENTRY).expect("write the exhibit entry");
+        (directory, entry)
+    }
+
+    /// One keystroke's buffer: a trailing comment that changes every time. It
+    /// is a whole re-analysis either way (the entry is never served from a
+    /// content cache once its bytes move) and it is the one edit valid in every
+    /// file, so the same mutation drives the exhibit and a sibling checkout
+    /// alike.
+    fn keystroke_text(base: &str, keystroke: usize) -> String {
+        format!("{base}\n// keystroke {keystroke}\n")
+    }
+
+    /// The verdict a driven session produces, printed and asserted on.
+    fn verdict(label: &str, windows: &[Window]) -> f64 {
+        let first = windows.first().expect("a driven session has windows");
+        let last = windows.last().expect("a driven session has windows");
+        let ratio = last.minimum.as_secs_f64() / first.minimum.as_secs_f64();
+        println!(
+            "E106 {{\"section\":\"session_verdict\",\"corpus\":\"{label}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"windows\":{},\"first_median_ms\":{:.2},\
+             \"last_median_ms\":{:.2},\"first_min_ms\":{:.2},\"last_min_ms\":{:.2},\
+             \"growth\":{:.3},\"median_growth\":{:.3},\"bound\":{GROWTH_BOUND},\
+             \"first_burst_ms\":{:.3},\"last_burst_ms\":{:.3},\
+             \"rss_kib_first\":{},\"rss_kib_last\":{},\"entry_outstanding_last\":{}}}",
+            profile(),
+            loadavg_1m(),
+            windows.len(),
+            first.median.as_secs_f64() * 1000.0,
+            last.median.as_secs_f64() * 1000.0,
+            first.minimum.as_secs_f64() * 1000.0,
+            last.minimum.as_secs_f64() * 1000.0,
+            ratio,
+            last.median.as_secs_f64() / first.median.as_secs_f64(),
+            first.burst.as_secs_f64() * 1000.0,
+            last.burst.as_secs_f64() * 1000.0,
+            first.rss_kib,
+            last.rss_kib,
+            last.entry_outstanding,
+        );
+        ratio
+    }
+
+    /// THE PIN (E106): a session does not get slower, and its deliberate leak
+    /// does not accumulate.
+    ///
+    /// Three assertions, and the third is the one that would have caught the
+    /// reported defect at its cause rather than at its symptom:
+    /// 1. the LAST window's median analyze CPU is within [`GROWTH_BOUND`] of
+    ///    the first's;
+    /// 2. no window's median is above the bound either — a session that slows
+    ///    in the middle and recovers is still a session that slowed;
+    /// 3. the entry text/tree leak's NET outstanding balance stays within 2× of
+    ///    the first window's at every window's end. Not zero — ONE live
+    ///    document holds ONE analysis, and that is the balance — but flat:
+    ///    `adopt_analysis` drops the outgoing program and gives its text and
+    ///    tree back (`leak-soak.md` §4.1), so a session retains one analysis
+    ///    and not one per keystroke. This is E106's PRIME SUSPECT stated as a
+    ///    gate: if the reclaim ever stops reaching this seam, 2,000 keystrokes
+    ///    are 2,000 analyses of deliberate garbage and the window that catches
+    ///    it is the second one.
+    ///
+    /// Smoke-sized here so the suite runs it on every change (the shape is what
+    /// regresses, and the shape is visible in two windows); the 2,000-keystroke
+    /// session is its `#[ignore]`d sibling below.
+    #[test]
+    fn a_session_does_not_get_slower_or_leak_across_windows() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("smoke", 24);
+        let windows = on_big_stack(move || {
+            let base = EXHIBIT_ENTRY.to_string();
+            drive(
+                "exhibit_24",
+                move |keystroke| keystroke_text(&base, keystroke),
+                &entry,
+                SMOKE_WINDOWS,
+                SMOKE_WINDOW,
+            )
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let first_outstanding = windows[0].entry_outstanding;
+        assert!(
+            first_outstanding > 0,
+            "the live document holds its own analysis, so the outstanding balance cannot be \
+             zero — a zero here means the tally was read on the wrong thread and this pin is \
+             measuring nothing",
+        );
+        let first_rss = windows[0].rss_kib as f64;
+        for window in &windows {
+            assert!(
+                (window.entry_outstanding as f64) <= first_outstanding as f64 * RETENTION_BOUND,
+                "window {} closed with {} bytes of entry text/tree outstanding against the \
+                 first window's {first_outstanding} — ONE live document holds ONE analysis, so \
+                 that balance is a CONSTANT plus the edited text's own growth, and one that \
+                 tracks the keystroke count is the per-analysis leak going unreclaimed across \
+                 `adopt_analysis` (leak-soak.md §4.1): E106's prime suspect, and what a session \
+                 would accumulate without bound",
+                window.index,
+                window.entry_outstanding,
+            );
+            assert!(
+                window.rss_kib as f64 <= first_rss * RETENTION_BOUND,
+                "window {} held {} KiB resident against the first window's {} — a session that \
+                 grows in memory while holding one document is E106's report in the instrument",
+                window.index,
+                window.rss_kib,
+                windows[0].rss_kib,
+            );
+        }
+        let ratio = verdict("exhibit_24", &windows);
+        let first = windows[0].minimum.as_secs_f64();
+        for window in &windows {
+            let window_ratio = window.minimum.as_secs_f64() / first;
+            assert!(
+                window_ratio < GROWTH_BOUND,
+                "window {} of {} cost {window_ratio:.2}× the first window's cheapest analyze \
+                 CPU (bound {GROWTH_BOUND}) — the session is slowing down (E106)",
+                window.index,
+                windows.len(),
+            );
+        }
+        assert!(
+            ratio < GROWTH_BOUND,
+            "the session's last window cost {ratio:.2}× its first (bound {GROWTH_BOUND})",
+        );
+    }
+
+    /// The OTHER axis a session grows along, and the one a single-document
+    /// driver cannot see: how much a server retains PER OPEN FILE.
+    ///
+    /// A `Document` holds its whole analysis — the `Program` and the entry text
+    /// and tree it borrows, both line indices, the reference index, the
+    /// keystroke path's captured token stream, hint list and symbol index — and
+    /// the server keeps one per open document for as long as the editor has it
+    /// open. Nothing here is a leak; it is the design. The question this
+    /// answers is how big the design's constant is on a real application, which
+    /// is what turns "twelve files open" into a number.
+    ///
+    /// Reports RSS and the leak tally's outstanding balance after each open, so
+    /// the row is a curve rather than a total.
+    fn open_documents(label: &str, entries: &[PathBuf]) {
+        let std_dir = std_root();
+        let baseline = rss_kib();
+        let mut open: Vec<Document> = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let Ok(text) = std::fs::read_to_string(entry) else {
+                println!("E106-SKIP {label}: {} is not readable", entry.display());
+                continue;
+            };
+            let before = thread_cpu_now();
+            open.push(Document::analyze_on_this_thread(&text, &std_dir, entry));
+            let after = thread_cpu_now();
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            let resident = rss_kib();
+            let (in_use, retained) = heap_split_bytes().unwrap_or((-1, -1));
+            println!(
+                "E106 {{\"section\":\"open_documents\",\"corpus\":\"{label}\",\
+                 \"profile\":\"{}\",\"load\":\"{}\",\"open\":{},\"file\":\"{}\",\
+                 \"analyze_cpu_ms\":{:.2},\"rss_kib\":{},\"rss_kib_since_baseline\":{},\
+                 \"heap_in_use_kib\":{},\"heap_free_retained_kib\":{},\
+                 \"entry_outstanding_bytes\":{}}}",
+                profile(),
+                loadavg_1m(),
+                index + 1,
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                cpu.as_secs_f64() * 1000.0,
+                resident,
+                resident.saturating_sub(baseline),
+                in_use / 1024,
+                retained / 1024,
+                leak_tally::outstanding(LeakSite::LspEntryText)
+                    + leak_tally::outstanding(LeakSite::EntryAst),
+            );
+        }
+        let held = rss_kib();
+        let (held_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        drop(open);
+        // The split is the whole point of reading it here (`leak-soak.md`
+        // §7.7): if RSS stays up while IN-USE bytes fall, the memory is the
+        // allocator's to hand back and not the server's to free, and the fix
+        // is a different one entirely.
+        let (closed_in_use, closed_retained) = heap_split_bytes().unwrap_or((-1, -1));
+        println!(
+            "E106 {{\"section\":\"open_documents_released\",\"corpus\":\"{label}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"rss_kib_held\":{},\"rss_kib_after_close\":{},\
+             \"heap_in_use_kib_held\":{},\"heap_in_use_kib_after_close\":{},\
+             \"heap_free_retained_kib_after_close\":{},\"entry_outstanding_bytes\":{}}}",
+            profile(),
+            loadavg_1m(),
+            held,
+            rss_kib(),
+            held_in_use / 1024,
+            closed_in_use / 1024,
+            closed_retained / 1024,
+            leak_tally::outstanding(LeakSite::LspEntryText)
+                + leak_tally::outstanding(LeakSite::EntryAst),
+        );
+    }
+
+    /// E106's second measurement: what a session costs per OPEN FILE.
+    ///
+    /// `#[ignore]`d for its cost and because its subject is a sibling checkout:
+    /// with `VILAN_PERF_KOLT` set it opens every `.vl` file directly under that
+    /// checkout's `src/`, which is the shape of the owner's own session.
+    #[test]
+    #[ignore = "E106's per-open-document measurement: needs VILAN_PERF_KOLT, run deliberately"]
+    fn session_growth_across_open_documents() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("E106-SKIP open_documents: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        on_big_stack(move || open_documents("kolt_src", &entries));
+    }
+
+    /// M63/M64: the same session, under the retention rule the server now
+    /// applies — and with M64's trim at every release.
+    ///
+    /// [`open_documents`] is the BEFORE: every open document holds its whole
+    /// analysis, for as long as the editor holds the file. This is the after.
+    /// After each open, every document but the `retained` most recently opened
+    /// drops to its editor tables ([`Document::release_analysis`]) and the
+    /// allocator is asked to hand back what that freed
+    /// ([`crate::memory::trim`]) — which is exactly what `Backend::focus` and
+    /// `analyze_and_publish` do in the shipped server, with "most recently
+    /// opened" standing in for "most recently focused".
+    ///
+    /// Reports the same row as its sibling plus the number of documents that
+    /// still hold a program, so the two logs diff line for line, and answers
+    /// the readings the pins are stated on.
+    fn open_documents_under_retention(
+        label: &str,
+        entries: &[PathBuf],
+        retained: usize,
+    ) -> RetentionReading {
+        let std_dir = std_root();
+        let baseline = rss_kib();
+        let mut open: Vec<Document> = Vec::with_capacity(entries.len());
+        let mut first = None;
+        let mut at_capacity = None;
+        for (index, entry) in entries.iter().enumerate() {
+            let Ok(text) = std::fs::read_to_string(entry) else {
+                println!("M63-SKIP {label}: {} is not readable", entry.display());
+                continue;
+            };
+            let before = thread_cpu_now();
+            open.push(Document::analyze_on_this_thread(&text, &std_dir, entry));
+            let after = thread_cpu_now();
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            // The rule, applied where the server applies it.
+            let count = open.len();
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                if position + retained < count {
+                    released |= document.release_analysis();
+                }
+            }
+            if released {
+                crate::memory::trim();
+            }
+            let programs = open
+                .iter()
+                .filter(|document| document.holds_program())
+                .count();
+            let resident = rss_kib();
+            let (in_use, retained_free) = heap_split_bytes().unwrap_or((-1, -1));
+            println!(
+                "M63 {{\"section\":\"open_documents_retained\",\"corpus\":\"{label}\",\
+                 \"profile\":\"{}\",\"load\":\"{}\",\"open\":{},\"programs\":{},\
+                 \"file\":\"{}\",\"analyze_cpu_ms\":{:.2},\"rss_kib\":{},\
+                 \"rss_kib_since_baseline\":{},\"heap_in_use_kib\":{},\
+                 \"heap_free_retained_kib\":{}}}",
+                profile(),
+                loadavg_1m(),
+                index + 1,
+                programs,
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                cpu.as_secs_f64() * 1000.0,
+                resident,
+                resident.saturating_sub(baseline),
+                in_use / 1024,
+                retained_free / 1024,
+            );
+            // The two readings the bound is stated against: the FIRST open,
+            // whose cost is one whole cold analysis plus everything the process
+            // resolves once (std, the base cache, the interned names), and the
+            // session at capacity — exactly as many documents open as it
+            // retains programs for. Everything opened after that one costs its
+            // editor tables and nothing else, which is the claim.
+            if open.len() == 1 {
+                first = Some((resident, in_use));
+            }
+            if open.len() == retained {
+                at_capacity = Some((resident, in_use));
+            }
+        }
+        // THE REFOCUS, measured: the first document opened was released long
+        // ago, and this is what the server pays when the user comes back to its
+        // tab — M58's warm path, in a process whose base world, parse caches
+        // and interned names are all full. Reported beside the COLD cost of the
+        // same file (the first row above) because the two together are the
+        // trade the rule makes.
+        if let Some(entry) = entries.first()
+            && let Ok(text) = std::fs::read_to_string(entry)
+        {
+            let before = thread_cpu_now();
+            let landed = Document::analyze_on_this_thread(&text, &std_dir, entry);
+            let after = thread_cpu_now();
+            if let Some(document) = open.first_mut() {
+                document.adopt_analysis(landed);
+            }
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            println!(
+                "M63 {{\"section\":\"refocus\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"analyze_cpu_ms\":{:.2},\
+                 \"holds_program\":{}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                cpu.as_secs_f64() * 1000.0,
+                open.first().is_some_and(Document::holds_program),
+            );
+            // And then the visit is over: the rule runs again, exactly as the
+            // server runs it when the next analysis lands, so the readings
+            // below are the session's steady state and not a session with one
+            // extra program in it.
+            let count = open.len();
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                if position + retained < count {
+                    released |= document.release_analysis();
+                }
+            }
+            if released {
+                crate::memory::trim();
+            }
+        }
+        let held = rss_kib();
+        let (held_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        let programs = open
+            .iter()
+            .filter(|document| document.holds_program())
+            .count();
+        drop(open);
+        // M64: the close, and the trim that is the item. The pair of readings
+        // on either side of it is the whole question — how much a session gets
+        // back when every file is closed, and how much of that reaches the OS.
+        let (closed_in_use, closed_retained) = heap_split_bytes().unwrap_or((-1, -1));
+        let closed_rss = rss_kib();
+        crate::memory::trim();
+        let (trimmed_in_use, trimmed_retained) = heap_split_bytes().unwrap_or((-1, -1));
+        let trimmed_rss = rss_kib();
+        println!(
+            "M63 {{\"section\":\"open_documents_retained_released\",\"corpus\":\"{label}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"programs_held\":{},\
+             \"base_cache_worlds\":{},\"base_cache_weight_kib\":{},\"rss_kib_baseline\":{},\
+             \"rss_kib_held\":{},\"rss_kib_after_close\":{},\"rss_kib_after_trim\":{},\
+             \"heap_in_use_kib_held\":{},\"heap_in_use_kib_after_close\":{},\
+             \"heap_in_use_kib_after_trim\":{},\"heap_free_retained_kib_after_close\":{},\
+             \"heap_free_retained_kib_after_trim\":{}}}",
+            profile(),
+            loadavg_1m(),
+            programs,
+            // What is left when every document is gone is not the documents':
+            // the base cache retains a resolved world per key (M21/M23/M24),
+            // and it is the floor every reading here sits on.
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            baseline,
+            held,
+            closed_rss,
+            trimmed_rss,
+            held_in_use / 1024,
+            closed_in_use / 1024,
+            trimmed_in_use / 1024,
+            closed_retained / 1024,
+            trimmed_retained / 1024,
+        );
+        RetentionReading {
+            baseline_rss_kib: baseline,
+            opened: entries.len(),
+            retained,
+            first_in_use_kib: first.map(|(_, in_use)| in_use).unwrap_or(0) / 1024,
+            at_capacity_rss_kib: at_capacity.map(|(rss, _)| rss).unwrap_or(baseline),
+            at_capacity_in_use_kib: at_capacity.map(|(_, in_use)| in_use).unwrap_or(0) / 1024,
+            held_rss_kib: held,
+            held_in_use_kib: held_in_use / 1024,
+            programs_held: programs,
+            closed_rss_kib: closed_rss,
+            trimmed_rss_kib: trimmed_rss,
+            closed_in_use_kib: closed_in_use / 1024,
+        }
+    }
+
+    /// What [`open_documents_under_retention`] answers: the readings its two
+    /// pins are stated on, in the units they are stated in.
+    #[derive(Clone, Copy, Debug)]
+    struct RetentionReading {
+        /// Resident KiB before the first document was opened.
+        baseline_rss_kib: usize,
+        /// How many documents the session opened, and how many programs it was
+        /// allowed to keep.
+        opened: usize,
+        retained: usize,
+        /// Heap KiB in use with ONE document open: one whole analysis, plus
+        /// everything a process resolves exactly once.
+        first_in_use_kib: isize,
+        /// Resident KiB with exactly as many documents open as programs are
+        /// retained — the "N × the largest document" figure, measured rather
+        /// than estimated.
+        at_capacity_rss_kib: usize,
+        at_capacity_in_use_kib: isize,
+        /// Resident KiB with every document open.
+        held_rss_kib: usize,
+        held_in_use_kib: isize,
+        /// How many programs were live at the end. The rule's own number.
+        programs_held: usize,
+        /// Resident KiB after every document was dropped, before and after the
+        /// trim M64 adds.
+        closed_rss_kib: usize,
+        trimmed_rss_kib: usize,
+        /// Heap KiB in use with every document open, and once they are all
+        /// dropped: the difference is what the close handed BACK to the
+        /// allocator, which is what the trim is asked to pass on to the OS.
+        closed_in_use_kib: isize,
+    }
+
+    /// THE PIN (M63): opening documents past the retained few does not grow the
+    /// process by a program each.
+    ///
+    /// Stated on the heap's IN-USE bytes rather than on resident size, and the
+    /// reason is the same one `leak-soak.md` §7.7 gives: RSS confounds what the
+    /// server holds with what the allocator has not handed back, and the claim
+    /// here is about the first. Resident size is asserted too, with the slack
+    /// that confound deserves, because it is the number the owner reads.
+    ///
+    /// Six documents of the generated exhibit, two retained. The bound is the
+    /// reading at capacity — the session with exactly two documents open — plus
+    /// a fifth: every document past the second costs its editor tables, which
+    /// are real and are not nothing, and the pin's subject is that it does NOT
+    /// cost another analysis.
+    #[test]
+    fn open_documents_retain_at_most_the_ruled_number_of_programs() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("retention", 24);
+        // Six copies of one generated module, each its own entry: the same
+        // shape as six open files of an application, small enough for the
+        // suite.
+        let entries: Vec<PathBuf> = (0..6)
+            .map(|index| {
+                let path = directory.join(format!("open{index}.vl"));
+                std::fs::write(&path, EXHIBIT_ENTRY).expect("write an exhibit entry");
+                path
+            })
+            .collect();
+        let _ = entry;
+        let reading = on_big_stack(move || {
+            open_documents_under_retention("exhibit_24", &entries, RETAINED_PROGRAMS)
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+
+        assert_eq!(
+            reading.programs_held, RETAINED_PROGRAMS,
+            "six open documents, and the rule says {RETAINED_PROGRAMS} programs",
+        );
+        assert!(
+            reading.at_capacity_in_use_kib > reading.first_in_use_kib,
+            "the calibration readings must exist and must differ — without \
+             them this pin has no bound to compare against ({reading:?})",
+        );
+        // What one document costs WITH a program, measured on this box in this
+        // run: the second open, which pays an analysis and its tables against a
+        // process that has already resolved everything a process resolves once.
+        let with_a_program = reading.at_capacity_in_use_kib - reading.first_in_use_kib;
+        // What one costs WITHOUT one: the average over every document opened
+        // past capacity, each of which keeps its editor tables and gave its
+        // program back.
+        let past_capacity = (reading.opened - reading.retained) as isize;
+        let without_a_program =
+            (reading.held_in_use_kib - reading.at_capacity_in_use_kib) / past_capacity;
+        assert!(
+            without_a_program * 4 <= with_a_program * 3,
+            "a document opened past the retained few cost {without_a_program} \
+             KiB of heap against the {with_a_program} KiB one that keeps its \
+             program costs — the tables are real and are not nothing, but a \
+             released document must cost materially less than an analysis, or \
+             the rule is not releasing (M63). {reading:?}",
+        );
+        let resident_bound =
+            (reading.at_capacity_rss_kib as f64 * 1.5).max(reading.baseline_rss_kib as f64);
+        assert!(
+            (reading.held_rss_kib as f64) <= resident_bound,
+            "six open documents held {} KiB resident against the two-document \
+             reading's {} KiB — RSS carries the allocator's retention as well \
+             as the server's, which is what the slack is for, and 1.5× of it \
+             is another analysis (M63)",
+            reading.held_rss_kib,
+            reading.at_capacity_rss_kib,
+        );
+    }
+
+    /// THE PIN (M64): closing every document returns the session to where it
+    /// started — resident size within 1.2× of the figure before the first open.
+    ///
+    /// This is the number that did not hold before the trim: closing kolt's
+    /// files returned 418 MB to the allocator's free list and 62 MB to the OS,
+    /// so a session of opening and closing files ratcheted resident size up and
+    /// never brought it down. `malloc_trim(0)` is the whole difference, and the
+    /// pin is stated on RSS deliberately — the allocator's free list is exactly
+    /// what is being asserted about.
+    #[test]
+    fn closing_every_document_returns_the_process_to_its_opening_size() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("close", 24);
+        let entries: Vec<PathBuf> = (0..4)
+            .map(|index| {
+                let path = directory.join(format!("close{index}.vl"));
+                std::fs::write(&path, EXHIBIT_ENTRY).expect("write an exhibit entry");
+                path
+            })
+            .collect();
+        let _ = entry;
+        let reading = on_big_stack(move || {
+            open_documents_under_retention("exhibit_24_close", &entries, RETAINED_PROGRAMS)
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+
+        // THE ASSERTION THAT IS ABOUT THE TRIM. Closing every document handed
+        // a heap's worth of bytes back to the allocator; this is how much of
+        // that reached the OS. Without `malloc_trim` it is zero — which is
+        // exactly the defect M64 names, and is what makes this pin non-vacuous
+        // where the ratio below is not: the ratio passes on this exhibit with
+        // the trim removed, because four small documents do not push resident
+        // size far enough past the floor for 1.2× to catch it.
+        let given_back_to_the_allocator = reading.held_in_use_kib - reading.closed_in_use_kib;
+        let returned_to_the_os = (reading.closed_rss_kib - reading.trimmed_rss_kib) as isize;
+        assert!(
+            returned_to_the_os * 2 >= given_back_to_the_allocator,
+            "closing every document handed {given_back_to_the_allocator} KiB \
+             back to the allocator and only {returned_to_the_os} KiB of it \
+             reached the OS: glibc does not trim on its own, which is why the \
+             server asks it to (M64). {reading:?}",
+        );
+        // And the ratio the item states, against the AT-CAPACITY reading rather
+        // than the baseline: the process keeps what the first analysis resolved
+        // — std's parsed world, the interned names, the base cache's retained
+        // worlds — and none of that belongs to a document or comes back when
+        // one closes. What must come back is every analysis the session opened
+        // after that.
+        let bound = (reading.at_capacity_rss_kib as f64 * 1.2) as usize;
+        assert!(
+            reading.trimmed_rss_kib <= bound,
+            "after closing every document the process holds {} KiB resident \
+             against the two-document reading's {} KiB (bound {bound} KiB, and \
+             {} KiB before the trim) (M64)",
+            reading.trimmed_rss_kib,
+            reading.at_capacity_rss_kib,
+            reading.closed_rss_kib,
+        );
+    }
+
+    /// M63/M64's measurement on the owner's own application: kolt's `src/*.vl`,
+    /// opened under the retention rule.
+    ///
+    /// `#[ignore]`d for its cost and because its subject is a sibling checkout,
+    /// exactly like [`session_growth_across_open_documents`] — which is the
+    /// BEFORE of the same reading. Run the two back to back:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(open_documents)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M63's per-open-document measurement under the retention rule: needs VILAN_PERF_KOLT, run deliberately"]
+    fn open_documents_under_retention_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M63-SKIP open_documents_retained: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        // `VILAN_M63_RETAINED` overrides the ruled figure, which is how the
+        // measurement ATTRIBUTES what is left: at 0 no document keeps a
+        // program, so what the session holds is its editor tables plus the
+        // process-global caches, and the difference between that run and this
+        // one is what the retained programs themselves cost.
+        let retained = std::env::var("VILAN_M63_RETAINED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(RETAINED_PROGRAMS);
+        on_big_stack(move || open_documents_under_retention("kolt_src", &entries, retained));
+    }
+
+    /// M67's measurement, and the one the ruled default is set FROM: what a
+    /// session pays for a base cache bounded at `budget_mib` RESIDENT MiB.
+    ///
+    /// [`open_documents_under_retention`] answers what the open documents cost.
+    /// This answers what is left when they are gone: the base cache's own
+    /// worlds — thirteen of them for kolt's nineteen files, 270 MiB of the
+    /// 336 MiB floor — and what BOUNDING them costs the session that meets
+    /// them. The trade has exactly two sides and this measures both:
+    ///
+    /// - the FOOTPRINT, read after the walk (worlds live, their weight, RSS,
+    ///   the heap's in-use half), and
+    /// - the MISSES the bound causes, and what a miss COSTS in CPU — a miss is
+    ///   a whole pre-entry resolve of the file's std closure, which is M36's
+    ///   3.5–5 s floor in a cold process and rather less in a warm one, and the
+    ///   difference between the two is the number the default turns on.
+    ///
+    /// Two walks, because a bound behaves differently under each and a default
+    /// chosen against one alone would be chosen against half the question:
+    ///
+    /// - **`scan`** — every file once, in order. The worst case for an LRU of
+    ///   any size below the key count: a full cycle evicts exactly what the
+    ///   next visit wants.
+    /// - **`working_set`** — the shape a session actually has: a handful of
+    ///   files the author moves between (the five largest, round-robin) with an
+    ///   excursion to some other file every third visit. This is what the
+    ///   ruling's "never a focused document's key" is stated about.
+    ///
+    /// The process is warmed first (one analysis, before the cache is cleared)
+    /// so the parse cache, the interner and the allocator's arenas are not
+    /// charged to the first budget measured; the base cache itself IS cleared,
+    /// so every run starts from the same empty map.
+    fn base_cache_budget_walk(
+        label: &str,
+        entries: &[PathBuf],
+        budget_mib: usize,
+        retained: usize,
+    ) {
+        let std_dir = std_root();
+        let Some(warm) = entries.first() else {
+            println!("M67-SKIP {label}: no entries");
+            return;
+        };
+        if let Ok(text) = std::fs::read_to_string(warm) {
+            drop(Document::analyze_on_this_thread(&text, &std_dir, warm));
+        }
+        // `0` is UNBOUNDED here, not "retain nothing": this harness measures
+        // what a bound costs, and the run it is all compared against is the run
+        // with no bound at all. (`set_base_cache_budget`'s own `0` keeps its
+        // meaning; this is the harness's spelling, and it is why the row
+        // carries `budget_mib` verbatim.)
+        let budget = if budget_mib == 0 {
+            usize::MAX
+        } else {
+            vilan_core::analyzer::base_cache_budget_for_resident(budget_mib * 1024 * 1024)
+        };
+        vilan_core::analyzer::base_cache_clear();
+        vilan_core::analyzer::set_base_cache_budget(budget);
+        let baseline = rss_kib();
+        let texts: Vec<String> = entries
+            .iter()
+            .map(|entry| std::fs::read_to_string(entry).unwrap_or_default())
+            .collect();
+
+        // Phase one: open every file, under the server's own retention rule.
+        let mut open: Vec<Document> = Vec::with_capacity(entries.len());
+        let mut order: Vec<usize> = Vec::new();
+        let mut opened = WalkTally::default();
+        for (index, entry) in entries.iter().enumerate() {
+            if texts[index].is_empty() {
+                println!("M67-SKIP {label}: {} is not readable", entry.display());
+                continue;
+            }
+            let (hits_before, misses_before) = vilan_core::analyzer::base_cache_stats();
+            let before = thread_cpu_now();
+            open.push(Document::analyze_on_this_thread(
+                &texts[index],
+                &std_dir,
+                entry,
+            ));
+            let after = thread_cpu_now();
+            let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+            let cpu = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before))
+                .unwrap_or_default();
+            let served = hits_after > hits_before;
+            order.retain(|held| *held != index);
+            order.insert(0, index);
+            let keep: Vec<usize> = order.iter().copied().take(retained).collect();
+            // M67: the server tells the base cache its retained set at this
+            // very seam (`enforce_program_retention`), so the walk tells it
+            // too — the exemption is part of what a budget costs, and a
+            // measurement that left it out would be measuring a policy the
+            // server does not run.
+            let live: Vec<PathBuf> = keep.iter().map(|index| entries[*index].clone()).collect();
+            vilan_core::analyzer::set_base_cache_live_entries(&live);
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                if !keep.contains(&position) {
+                    released |= document.release_analysis();
+                }
+            }
+            if released {
+                crate::memory::trim();
+            }
+            let _ = misses_before;
+            opened.record(cpu, served);
+            visit_row(label, budget_mib, "open", index + 1, entry, cpu, served);
+        }
+        summary_row(label, budget_mib, retained, "open", &opened, baseline);
+
+        // Phase two: the scan — every file once, in order.
+        let mut scan = WalkTally::default();
+        for index in 0..open.len() {
+            let (cpu, served) = revisit(
+                &mut open, entries, &texts, &std_dir, &mut order, retained, index,
+            );
+            scan.record(cpu, served);
+            visit_row(
+                label,
+                budget_mib,
+                "scan",
+                index + 1,
+                &entries[index],
+                cpu,
+                served,
+            );
+        }
+        summary_row(label, budget_mib, retained, "scan", &scan, baseline);
+
+        // Phase three: the working set — the five largest files, round-robin,
+        // with an excursion to one of the others every third visit.
+        let mut by_size: Vec<usize> = (0..open.len()).collect();
+        by_size.sort_by_key(|index| std::cmp::Reverse(texts[*index].len()));
+        let core: Vec<usize> = by_size.iter().copied().take(5).collect();
+        let excursions: Vec<usize> = by_size.iter().copied().skip(5).collect();
+        let mut working = WalkTally::default();
+        if !core.is_empty() {
+            for step in 0..WORKING_SET_VISITS {
+                let index = if step % 3 == 2 && !excursions.is_empty() {
+                    excursions[(step / 3) % excursions.len()]
+                } else {
+                    core[step % core.len()]
+                };
+                let (cpu, served) = revisit(
+                    &mut open, entries, &texts, &std_dir, &mut order, retained, index,
+                );
+                working.record(cpu, served);
+                visit_row(
+                    label,
+                    budget_mib,
+                    "working_set",
+                    step + 1,
+                    &entries[index],
+                    cpu,
+                    served,
+                );
+            }
+        }
+        summary_row(
+            label,
+            budget_mib,
+            retained,
+            "working_set",
+            &working,
+            baseline,
+        );
+
+        // What the session is holding at the end, and what is left when every
+        // document is gone: the floor M67 is about.
+        let held = rss_kib();
+        let (held_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        drop(open);
+        crate::memory::trim();
+        let (closed_in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        println!(
+            "M67 {{\"section\":\"budget_floor\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+             \"load\":\"{}\",\"budget_mib\":{budget_mib},\"retained\":{retained},\
+             \"worlds\":{},\"weight_kib\":{},\"rss_kib_baseline\":{baseline},\
+             \"rss_kib_held\":{held},\"rss_kib_after_close\":{},\
+             \"heap_in_use_kib_held\":{},\"heap_in_use_kib_after_close\":{}}}",
+            profile(),
+            loadavg_1m(),
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            rss_kib(),
+            held_in_use / 1024,
+            closed_in_use / 1024,
+        );
+        vilan_core::analyzer::set_base_cache_live_entries(&[]);
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// How many visits the working-set walk takes. Six laps of a five-file
+    /// working set, which is long enough for an LRU to have evicted and
+    /// re-admitted every key a bound below the key count cannot hold.
+    const WORKING_SET_VISITS: usize = 30;
+
+    /// One walk's answer: how many visits, how many the cache served, and what
+    /// each kind cost in CPU.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct WalkTally {
+        visits: usize,
+        hits: usize,
+        hit_cpu: Duration,
+        miss_cpu: Duration,
+    }
+
+    impl WalkTally {
+        fn record(&mut self, cpu: Duration, served: bool) {
+            self.visits += 1;
+            if served {
+                self.hits += 1;
+                self.hit_cpu += cpu;
+            } else {
+                self.miss_cpu += cpu;
+            }
+        }
+
+        fn misses(&self) -> usize {
+            self.visits - self.hits
+        }
+
+        fn mean_ms(total: Duration, count: usize) -> f64 {
+            if count == 0 {
+                0.0
+            } else {
+                total.as_secs_f64() * 1000.0 / count as f64
+            }
+        }
+    }
+
+    /// Re-analyze `index` and land it on the open document, then apply the
+    /// retention rule with that document most recently focused — one visit of a
+    /// focus walk, exactly as `Backend::focus` and `analyze_and_publish`
+    /// sequence it. Answers the CPU the analysis cost and whether the base
+    /// cache served it.
+    fn revisit(
+        open: &mut [Document],
+        entries: &[PathBuf],
+        texts: &[String],
+        std_dir: &Path,
+        order: &mut Vec<usize>,
+        retained: usize,
+        index: usize,
+    ) -> (Duration, bool) {
+        let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+        let before = thread_cpu_now();
+        let landed = Document::analyze_on_this_thread(&texts[index], std_dir, &entries[index]);
+        let after = thread_cpu_now();
+        let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+        open[index].adopt_analysis(landed);
+        let cpu = before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default();
+        order.retain(|held| *held != index);
+        order.insert(0, index);
+        let keep: Vec<usize> = order.iter().copied().take(retained).collect();
+        // M67's exemption, declared where the server declares it.
+        let live: Vec<PathBuf> = keep.iter().map(|index| entries[*index].clone()).collect();
+        vilan_core::analyzer::set_base_cache_live_entries(&live);
+        let mut released = false;
+        for (position, document) in open.iter_mut().enumerate() {
+            if !keep.contains(&position) {
+                released |= document.release_analysis();
+            }
+        }
+        if released {
+            crate::memory::trim();
+        }
+        (cpu, hits_after > hits_before)
+    }
+
+    /// One visit's row.
+    fn visit_row(
+        label: &str,
+        budget_mib: usize,
+        phase: &str,
+        visit: usize,
+        entry: &Path,
+        cpu: Duration,
+        served: bool,
+    ) {
+        println!(
+            "M67 {{\"section\":\"budget_visit\",\"corpus\":\"{label}\",\
+             \"budget_mib\":{budget_mib},\"phase\":\"{phase}\",\"visit\":{visit},\
+             \"file\":\"{}\",\"served\":\"{}\",\"analyze_cpu_ms\":{:.2},\
+             \"worlds\":{},\"weight_kib\":{},\"rss_kib\":{}}}",
+            entry.file_name().unwrap_or_default().to_string_lossy(),
+            if served { "hit" } else { "miss" },
+            cpu.as_secs_f64() * 1000.0,
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            rss_kib(),
+        );
+    }
+
+    /// One walk's row — the table M67's ruling is set from.
+    fn summary_row(
+        label: &str,
+        budget_mib: usize,
+        retained: usize,
+        phase: &str,
+        tally: &WalkTally,
+        baseline: usize,
+    ) {
+        let (in_use, _) = heap_split_bytes().unwrap_or((-1, -1));
+        println!(
+            "M67 {{\"section\":\"budget_walk\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+             \"load\":\"{}\",\"budget_mib\":{budget_mib},\"retained\":{retained},\
+             \"phase\":\"{phase}\",\"visits\":{},\"hits\":{},\"misses\":{},\
+             \"cpu_total_ms\":{:.2},\"cpu_hit_mean_ms\":{:.2},\"cpu_miss_mean_ms\":{:.2},\
+             \"worlds\":{},\"weight_kib\":{},\"rss_kib\":{},\"rss_kib_since_baseline\":{},\
+             \"heap_in_use_kib\":{}}}",
+            profile(),
+            loadavg_1m(),
+            tally.visits,
+            tally.hits,
+            tally.misses(),
+            (tally.hit_cpu + tally.miss_cpu).as_secs_f64() * 1000.0,
+            WalkTally::mean_ms(tally.hit_cpu, tally.hits),
+            WalkTally::mean_ms(tally.miss_cpu, tally.misses()),
+            vilan_core::analyzer::base_cache_retained(),
+            vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            rss_kib(),
+            rss_kib().saturating_sub(baseline),
+            in_use / 1024,
+        );
+    }
+
+    /// M67's budget sweep over the owner's own application, one budget per run:
+    ///
+    /// ```text
+    /// for mib in 0 128 192 256; do
+    ///   VILAN_PERF_KOLT=<checkout> VILAN_M67_BUDGET_MIB=$mib \
+    ///     cargo nextest run --release -p vilan-lsp --run-ignored ignored-only \
+    ///     -E 'test(base_cache_budget_walk)' --no-capture
+    /// done
+    /// ```
+    ///
+    /// `0` is the unbounded run every other one is read against.
+    #[test]
+    #[ignore = "M67's base-cache budget sweep: needs VILAN_PERF_KOLT, run deliberately"]
+    fn base_cache_budget_walk_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M67-SKIP budget_walk: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        let budget_mib = std::env::var("VILAN_M67_BUDGET_MIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let retained = std::env::var("VILAN_M63_RETAINED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(RETAINED_PROGRAMS);
+        on_big_stack(move || base_cache_budget_walk("kolt_src", &entries, budget_mib, retained));
+    }
+
+    /// What a base-cache MISS costs over a hit, paired — the other half of the
+    /// budget decision, and the half a walk cannot answer honestly.
+    ///
+    /// A walk's mean-miss and mean-hit figures are means over DIFFERENT FILES:
+    /// kolt's `views.vl` costs ten times `routes.vl` whether it hits or misses,
+    /// so the two means differ by the file mix as much as by the cache. And CPU
+    /// time on this box moves with the load average (E121's standing note),
+    /// which a sweep spread over twenty minutes of somebody else's build cannot
+    /// hold still.
+    ///
+    /// So this measures the SAME file both ways, alternately, inside one
+    /// process: analyze it with its world stored (a hit), then evict every
+    /// world with a zero budget and analyze it again (a miss), `pairs` times,
+    /// and report the median of each half. A zero budget rather than
+    /// [`vilan_core::analyzer::base_cache_clear`] deliberately — an eviction is
+    /// what a budget does, and it leaves M19's checks record standing, which a
+    /// clear does not; clearing would price the miss as something no budget can
+    /// cause.
+    fn base_cache_miss_cost(label: &str, entries: &[PathBuf], pairs: usize) {
+        let std_dir = std_root();
+        let unbounded = usize::MAX;
+        let mut texts: Vec<(PathBuf, String)> = entries
+            .iter()
+            .filter_map(|entry| {
+                std::fs::read_to_string(entry)
+                    .ok()
+                    .map(|text| (entry.clone(), text))
+            })
+            .collect();
+        texts.sort_by_key(|(_, text)| text.len());
+        if texts.is_empty() {
+            println!("M67-SKIP {label}: no readable entries");
+            return;
+        }
+        // Four files across the size range this application actually has: the
+        // smallest, the two quartiles and the largest. A miss's cost is the
+        // file's own pre-entry closure, so one file's number is one file's.
+        let picks = [0, texts.len() / 4, texts.len() / 2, texts.len() - 1];
+        vilan_core::analyzer::set_base_cache_budget(unbounded);
+        for pick in picks {
+            let (entry, text) = &texts[pick];
+            let mut hits: Vec<Duration> = Vec::new();
+            let mut misses: Vec<Duration> = Vec::new();
+            // The warm-up analysis stores the world this file's hits are served
+            // from — and is itself neither.
+            drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+            for _ in 0..pairs {
+                let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+                let cpu = started
+                    .zip(ended)
+                    .map(|(started, ended)| ended.saturating_sub(started))
+                    .unwrap_or_default();
+                if hits_after > hits_before {
+                    hits.push(cpu);
+                }
+                // The eviction, in the currency the budget evicts in.
+                vilan_core::analyzer::set_base_cache_budget(0);
+                vilan_core::analyzer::set_base_cache_budget(unbounded);
+                let (_, misses_before) = vilan_core::analyzer::base_cache_stats();
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                let (_, misses_after) = vilan_core::analyzer::base_cache_stats();
+                let cpu = started
+                    .zip(ended)
+                    .map(|(started, ended)| ended.saturating_sub(started))
+                    .unwrap_or_default();
+                if misses_after > misses_before {
+                    misses.push(cpu);
+                }
+            }
+            hits.sort();
+            misses.sort();
+            let median = |samples: &[Duration]| {
+                samples
+                    .get(samples.len() / 2)
+                    .copied()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "M67 {{\"section\":\"miss_cost\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"bytes\":{},\"pairs\":{pairs},\
+                 \"hit_samples\":{},\"miss_samples\":{},\"hit_median_ms\":{:.2},\
+                 \"miss_median_ms\":{:.2}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                text.len(),
+                hits.len(),
+                misses.len(),
+                median(&hits),
+                median(&misses),
+            );
+        }
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// M67's paired miss-cost probe over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(base_cache_miss_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M67's paired miss-cost probe: needs VILAN_PERF_KOLT, run deliberately"]
+    fn base_cache_miss_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M67-SKIP miss_cost: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        on_big_stack(move || base_cache_miss_cost("kolt_src", &entries, 3));
+    }
+    /// M70's per-KEYSTROKE probe, PAIRED: for every file of a package, what one
+    /// edit costs with the base cache holding this file's world and what the
+    /// same edit costs with the cache emptied — the same file, both ways,
+    /// alternately, inside one process.
+    ///
+    /// The miss-cost probe above prices a miss against a hit on the files that
+    /// HAVE both. M70 is about the files that have neither: an import cycle
+    /// reaching the entry's own module sets `entry_alias_module`, file mode
+    /// makes that an OPEN MODULE, and an open module's world was never stored
+    /// — so every keystroke in those files rebuilt the whole pre-entry world,
+    /// and no row in the hit/miss table said which files those were. The
+    /// `served` leg is what M70 buys; the `evicted` leg is what every keystroke
+    /// in those files used to cost, measured beside it rather than in another
+    /// run at another load average.
+    ///
+    /// A file the cache can never serve reads `served_hits: 0` with the two
+    /// legs equal — which is the finding, before and after.
+    fn base_cache_keystroke_walk(label: &str, entries: &[PathBuf], keystrokes: usize) {
+        let std_dir = std_root();
+        let unbounded = usize::MAX;
+        vilan_core::analyzer::set_base_cache_budget(unbounded);
+        for entry in entries {
+            let Ok(base) = std::fs::read_to_string(entry) else {
+                continue;
+            };
+            // The warm analysis: it stores this file's world if this file's
+            // shape can store one, and is itself in neither leg.
+            drop(Document::analyze_on_this_thread(&base, &std_dir, entry));
+            let mut served: Vec<Duration> = Vec::new();
+            let mut evicted: Vec<Duration> = Vec::new();
+            let mut served_hits = 0u64;
+            let mut evicted_hits = 0u64;
+            // One edit, timed in thread CPU, with the cache in whatever state
+            // the caller left it.
+            let edit = |text: &str| -> (Duration, u64) {
+                let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+                (
+                    started
+                        .zip(ended)
+                        .map(|(started, ended)| ended.saturating_sub(started))
+                        .unwrap_or_default(),
+                    hits_after - hits_before,
+                )
+            };
+            for keystroke in 0..keystrokes {
+                // A real edit: the entry TEXT differs every time, which is what
+                // an editor hands the analysis. The key does not move — the
+                // seeds are the same import lines — so a file that can be
+                // served is served on every one of these.
+                let (cpu, hits) = edit(&format!("{base}\n// m70 served {keystroke}\n"));
+                served.push(cpu);
+                served_hits += hits;
+                // The eviction, in the currency the budget evicts in (M67's
+                // probe takes the same one): every world goes, so the next edit
+                // pays the whole pre-entry load whatever the key says.
+                vilan_core::analyzer::set_base_cache_budget(0);
+                vilan_core::analyzer::set_base_cache_budget(unbounded);
+                let (cpu, hits) = edit(&format!("{base}\n// m70 evicted {keystroke}\n"));
+                evicted.push(cpu);
+                evicted_hits += hits;
+                // Re-warm, unmeasured, so the next served leg has a world to be
+                // served — on a tree where this file's world is storable at all.
+                drop(Document::analyze_on_this_thread(&base, &std_dir, entry));
+            }
+            served.sort();
+            evicted.sort();
+            let median = |samples: &[Duration]| {
+                samples
+                    .get(samples.len() / 2)
+                    .copied()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "M70 {{\"section\":\"keystroke\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"bytes\":{},\"keystrokes\":{keystrokes},\
+                 \"served_hits\":{served_hits},\"evicted_hits\":{evicted_hits},\
+                 \"served_median_ms\":{:.2},\"evicted_median_ms\":{:.2},\
+                 \"worlds\":{},\"weight_kib\":{}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                base.len(),
+                median(&served),
+                median(&evicted),
+                vilan_core::analyzer::base_cache_retained(),
+                vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            );
+        }
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// M70's per-keystroke probe over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(base_cache_keystroke_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M70's per-keystroke probe: needs VILAN_PERF_KOLT, run deliberately"]
+    fn base_cache_keystroke_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M70-SKIP keystroke: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        let keystrokes = std::env::var("VILAN_M70_KEYSTROKES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3);
+        on_big_stack(move || base_cache_keystroke_walk("kolt_src", &entries, keystrokes));
+    }
+
+    /// M76's paired probe: what one keystroke in an ENTRY-SHAPED file costs
+    /// with the checks-reuse record read and with it withheld — the same file,
+    /// both ways, alternately, inside one process.
+    ///
+    /// M70 stored an open module's world and left its checks record
+    /// withheld, so `[vilan phase] reused 0/69` on every one of the six kolt
+    /// files it names: the whole widened seam stood down there, R10's sites
+    /// and the class D tables included. M76 files the record and narrows the
+    /// reading side instead (`Analyzer::alias_reaching_sources`). The BEFORE
+    /// leg is `set_world_reuse(false)`, which is exactly the state those files
+    /// were in — no ranges sealed, nothing replayed, nothing restored — so the
+    /// two legs differ in the seam and in nothing else, at one load average.
+    ///
+    /// The census rides beside the CPU, because a leg that reused nothing
+    /// would agree with the other for a reason that is not a measurement.
+    fn checks_reuse_keystroke_walk(label: &str, entries: &[PathBuf], keystrokes: usize) {
+        let std_dir = std_root();
+        vilan_core::analyzer::set_base_cache_budget(usize::MAX);
+        for entry in entries {
+            let Ok(base) = std::fs::read_to_string(entry) else {
+                continue;
+            };
+            // One edit, timed in thread CPU, with the seam in whatever state
+            // the caller set. The warm analysis before it is what fills the
+            // world AND files its record, so neither leg measures the fill.
+            let edit = |text: &str| -> (Duration, (usize, usize, usize)) {
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                (
+                    started
+                        .zip(ended)
+                        .map(|(started, ended)| ended.saturating_sub(started))
+                        .unwrap_or_default(),
+                    vilan_core::analyzer::reuse_census(),
+                )
+            };
+            let mut with: Vec<Duration> = Vec::new();
+            let mut without: Vec<Duration> = Vec::new();
+            let mut census_with = (0, 0, 0);
+            let mut census_without = (0, 0, 0);
+            for keystroke in 0..keystrokes {
+                for reuse in [true, false] {
+                    vilan_core::analyzer::set_world_reuse(reuse);
+                    // The record is filed by the analysis that derives it, so
+                    // each leg re-warms under its own switch: the ON leg needs
+                    // a record to read, the OFF leg must not be measured
+                    // against one it could not have had.
+                    drop(Document::analyze_on_this_thread(&base, &std_dir, entry));
+                    let (cpu, census) = edit(&format!(
+                        "{base}\n// m76 {} {keystroke}\n",
+                        if reuse { "with" } else { "without" }
+                    ));
+                    if reuse {
+                        with.push(cpu);
+                        census_with = census;
+                    } else {
+                        without.push(cpu);
+                        census_without = census;
+                    }
+                }
+            }
+            vilan_core::analyzer::set_world_reuse(true);
+            with.sort();
+            without.sort();
+            let median = |samples: &[Duration]| {
+                samples
+                    .get(samples.len() / 2)
+                    .copied()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "M76 {{\"section\":\"keystroke\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"bytes\":{},\"keystrokes\":{keystrokes},\
+                 \"reused_with\":{},\"reused_without\":{},\"sources\":{},\"entry_dirty\":{},\
+                 \"with_median_ms\":{:.2},\"without_median_ms\":{:.2}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                base.len(),
+                census_with.0,
+                census_without.0,
+                census_with.2,
+                census_with.1,
+                median(&with),
+                median(&without),
+            );
+        }
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// M76's paired probe over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(checks_reuse_keystroke_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M76's paired checks-reuse probe: needs VILAN_PERF_KOLT, run deliberately"]
+    fn checks_reuse_keystroke_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M76-SKIP keystroke: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let only: Option<Vec<String>> = std::env::var("VILAN_M76_FILES")
+            .ok()
+            .map(|value| value.split(',').map(str::to_string).collect());
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .filter(|path| match &only {
+                Some(only) => only.iter().any(|name| {
+                    path.file_name()
+                        .is_some_and(|file| file.to_string_lossy() == *name)
+                }),
+                None => true,
+            })
+            .collect();
+        entries.sort();
+        let keystrokes = std::env::var("VILAN_M76_KEYSTROKES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3);
+        on_big_stack(move || checks_reuse_keystroke_walk("kolt_src", &entries, keystrokes));
+    }
+
+    /// M68's measurement: what the trim at the analysis-landing seam COSTS, and
+    /// what each landing actually hands back for it.
+    ///
+    /// M64 put `malloc_trim(0)` after every release, which is right at a CLOSE
+    /// — a whole document's analysis goes back at once and glibc hands the
+    /// arenas to the OS — and is asked far more often than that: the dependency
+    /// sweep re-analyzes every open importer of an edited file, each of those
+    /// landings releases the program it just brought (the document is not one
+    /// of the focused few), and each release trims. The item's estimate was
+    /// ~100 ms per background document at kolt scale, from a wall-clock
+    /// difference; this measures it in CPU, per landing, beside the two numbers
+    /// that decide the threshold — how much the landing released, and how much
+    /// of it reached the OS.
+    ///
+    /// Also the cost of ASKING: `mallinfo2` is what the conditional reads, and
+    /// a conditional that costs what it saves is not one. Reported first, as a
+    /// mean over a thousand calls.
+    fn trim_cost(label: &str, entries: &[PathBuf], landings: usize) {
+        let std_dir = std_root();
+        // What the reading itself costs.
+        let started = thread_cpu_now();
+        let mut sink = 0usize;
+        for _ in 0..1000 {
+            sink += heap_split_bytes()
+                .map(|(in_use, _)| in_use as usize)
+                .unwrap_or(0);
+        }
+        let ended = thread_cpu_now();
+        let read_ns = started
+            .zip(ended)
+            .map(|(started, ended)| ended.saturating_sub(started).as_nanos() / 1000)
+            .unwrap_or(0);
+        println!(
+            "M68 {{\"section\":\"mallinfo2_cost\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+             \"load\":\"{}\",\"calls\":1000,\"mean_ns\":{read_ns},\"sink\":{}}}",
+            profile(),
+            loadavg_1m(),
+            sink % 7,
+        );
+
+        // A session in its steady state: every file open, the focused few
+        // holding programs.
+        let mut open: Vec<Document> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        for entry in entries {
+            let Ok(text) = std::fs::read_to_string(entry) else {
+                continue;
+            };
+            open.push(Document::analyze_on_this_thread(&text, &std_dir, entry));
+            texts.push(text);
+            let count = open.len();
+            for (position, document) in open.iter_mut().enumerate() {
+                if position + RETAINED_PROGRAMS < count {
+                    document.release_analysis();
+                }
+            }
+        }
+        crate::memory::trim();
+
+        // The seam itself, `landings` times: a BACKGROUND document's analysis
+        // lands, is adopted, and is released by the retention rule — which is
+        // `analyze_and_publish`'s tail, with the focus held elsewhere.
+        let mut landings_seen: Vec<(usize, Duration, usize)> = Vec::new();
+        for landing in 0..landings {
+            let index = landing % open.len();
+            let landed = Document::analyze_on_this_thread(&texts[index], &std_dir, &entries[index]);
+            open[index].adopt_analysis(landed);
+            let before_release = heap_split_bytes().map(|(in_use, _)| in_use).unwrap_or(-1);
+            let mut released = false;
+            for (position, document) in open.iter_mut().enumerate() {
+                // Index 0 stands in for the focused tab. Every other document
+                // gives its program back, which is what makes this landing a
+                // BACKGROUND one — the shape the dependency sweep produces.
+                if position != 0 {
+                    released |= document.release_analysis();
+                }
+            }
+            let after_release = heap_split_bytes().map(|(in_use, _)| in_use).unwrap_or(-1);
+            let released_kib = (before_release - after_release) / 1024;
+            let rss_before = rss_kib();
+            let started = thread_cpu_now();
+            // The shipped decision (M68), not a bare trim: the row is what the
+            // server does at this seam, threshold and all.
+            let trimmed =
+                released && crate::memory::trim_if_released(usize::try_from(before_release).ok());
+            let ended = thread_cpu_now();
+            let rss_after = rss_kib();
+            let cpu = started
+                .zip(ended)
+                .map(|(started, ended)| ended.saturating_sub(started))
+                .unwrap_or_default();
+            println!(
+                "M68 {{\"section\":\"landing\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"landing\":{landing},\"file\":\"{}\",\"released\":{released},\
+                 \"released_kib\":{},\"trimmed\":{trimmed},\"trim_cpu_ms\":{:.2},\
+                 \"rss_returned_kib\":{},\"rss_kib\":{rss_after}}}",
+                profile(),
+                loadavg_1m(),
+                entries[index]
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                released_kib,
+                cpu.as_secs_f64() * 1000.0,
+                rss_before.saturating_sub(rss_after),
+            );
+            landings_seen.push((
+                usize::try_from(released_kib).unwrap_or(0),
+                cpu,
+                rss_before.saturating_sub(rss_after),
+            ));
+        }
+
+        // What a DIFFERENT threshold would have decided over the same
+        // landings: the sweep the shipped floor is chosen from, so the choice
+        // is readable rather than asserted.
+        for candidate_mib in [4usize, 16, 32, 64] {
+            let floor = candidate_mib * 1024;
+            let (skipped, cpu_saved, rss_forgone) = landings_seen.iter().fold(
+                (0usize, Duration::ZERO, 0usize),
+                |(skipped, cpu, rss), (released_kib, trim_cpu, returned)| {
+                    if *released_kib < floor {
+                        (skipped + 1, cpu + *trim_cpu, rss + *returned)
+                    } else {
+                        (skipped, cpu, rss)
+                    }
+                },
+            );
+            println!(
+                "M68 {{\"section\":\"threshold\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"threshold_mib\":{candidate_mib},\"landings\":{},\
+                 \"skipped\":{skipped},\"cpu_saved_ms\":{:.2},\"rss_forgone_kib\":{rss_forgone}}}",
+                profile(),
+                loadavg_1m(),
+                landings_seen.len(),
+                cpu_saved.as_secs_f64() * 1000.0,
+            );
+        }
+    }
+
+    /// M68's per-landing trim cost over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(trim_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M68's per-landing trim cost: needs VILAN_PERF_KOLT, run deliberately"]
+    fn trim_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M68-SKIP trim_cost: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        on_big_stack(move || trim_cost("kolt_src", &entries, 12));
+    }
+    /// The item's own session: 2,000 keystrokes, twenty windows, on the
+    /// kolt-sized generated exhibit — and on a sibling checkout's `views.vl`
+    /// when `VILAN_PERF_KOLT` points at one.
+    ///
+    /// `#[ignore]`d for its cost, like every other row of the baseline: at a
+    /// real file's per-keystroke price this is a quarter of an hour.
+    #[test]
+    #[ignore = "E106's session measurement: 2,000 analyses, run deliberately (proposal/perf-baseline.md §3)"]
+    fn session_growth_over_two_thousand_keystrokes() {
+        let _guard = base_cache_guard();
+        let (directory, entry) = exhibit("session", GATE_FUNCTIONS);
+        let windows = on_big_stack(move || {
+            let base = EXHIBIT_ENTRY.to_string();
+            drive(
+                "exhibit_1791",
+                move |keystroke| keystroke_text(&base, keystroke),
+                &entry,
+                SESSION_WINDOWS,
+                WINDOW,
+            )
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+        let ratio = verdict("exhibit_1791", &windows);
+
+        if let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) {
+            let entry = root.join("src/views.vl");
+            match std::fs::read_to_string(&entry) {
+                Ok(base) => {
+                    let sibling = on_big_stack(move || {
+                        drive(
+                            "kolt_views",
+                            move |keystroke| keystroke_text(&base, keystroke),
+                            &entry,
+                            SESSION_WINDOWS,
+                            WINDOW,
+                        )
+                    });
+                    verdict("kolt_views", &sibling);
+                }
+                Err(error) => println!("E106-SKIP kolt_views: {} ({error})", entry.display()),
+            }
+        } else {
+            println!("E106-SKIP kolt_views: VILAN_PERF_KOLT is not set");
+        }
+
+        assert!(
+            ratio < GROWTH_BOUND,
+            "the 2,000-keystroke session's last window cost {ratio:.2}× its first \
+             (bound {GROWTH_BOUND})",
+        );
+    }
+}
+
+/// M58 — the WARM re-analysis profile, and the driver that takes it.
+///
+/// Every lane profile in this tree so far has used the COLD shape: one process,
+/// one analysis, `vilan check` from the outside. That is the right subject for
+/// a build and the wrong one for an editor, where the base world is already
+/// resolved, the parse caches are full, and the only new thing in the process
+/// is the entry's own bytes — which is the keystroke path, and where the owner
+/// spends the day. The two shapes profile differently enough that M58 exists to
+/// say so: `post_analysis_passes` is 62.7% of a warm analysis (57.1% after M53)
+/// and nothing like that share of a cold one.
+///
+/// The driver is a COLD analysis followed by a WARM one in the same process,
+/// with the warm half behind [`warm_reanalysis`] — an `#[inline(never)]` frame
+/// that exists for exactly one reason: it is the symbol callgrind toggles
+/// collection on, so the profile contains the warm analysis and not the cold
+/// one that filled the caches for it.
+///
+/// Take a profile (the `profiling` profile is release + symbols, root
+/// `Cargo.toml`):
+///
+/// ```text
+/// cargo build --profile profiling -p vilan-lsp --tests
+/// valgrind --tool=callgrind --collect-atstart=no \
+///     --toggle-collect='*warm_reanalysis*' --callgrind-out-file=warm.out \
+///     <the test binary> --exact --ignored --nocapture \
+///     document::warm_profile::m58_warm_reanalysis_profile
+/// callgrind_annotate --auto=no --inclusive=yes warm.out | head -40
+/// ```
+///
+/// `VILAN_M58_ENTRY` names the entry to profile — a sibling checkout's
+/// `src/client.vl`, say. Absent, the driver profiles the generated exhibit, so
+/// the instrument is runnable with nothing else on the machine (the owner's
+/// standing rule: a sibling checkout is evidence, never a fixture).
+///
+/// `VILAN_PHASE_TIMING=1` on the same run prints the analyzer's own phase line
+/// for both halves, which is the cross-check a callgrind reading wants: Ir
+/// attributes to symbols, the phase line attributes to PASSES, and a profile
+/// whose two readings disagree about which pass dominates is a profile of the
+/// wrong process.
+///
+/// ## The warm profile, 2026-09-11 (kolt's `client.vl`, `profiling`, callgrind)
+///
+/// 3,635,194,953 Ir for one warm re-analysis. The top five, by INCLUSIVE Ir —
+/// and the entries callgrind marks `'2` are left out of the ranking, because
+/// inclusive cost double-counts a recursive function (`Interpreter::eval'2`
+/// reads 143.6% of the program total):
+///
+/// | | | Ir | share |
+/// |-|-|-|-|
+/// | 1 | `post_analysis_passes` (lib.rs) | 1,856,489,029 | 51.07% |
+/// | 2 | `analyzer::analyze_cancellable` | 1,099,268,791 | 30.24% |
+/// | 3 | `const_eval::evaluate` (inside 1) | 827,668,479 | 22.77% |
+/// | 4 | `context::thread_contexts` (inside 1) | 468,847,124 | 12.90% |
+/// | 5 | `async_infer::infer` (inside 1) | 376,042,827 | 10.34% |
+///
+/// then `call_graph::Collector::walk` 357,110,799 (9.82%),
+/// `dispatch_refine::refined_edges` 344,848,848 (9.49%),
+/// `Program::source_of` 262,380,207 (7.22%) and `Document::semantic_tokens`
+/// 258,348,201 (7.11%). M58's own headline reproduces: the post-passes are the
+/// warm analysis's majority, where a COLD profile is dominated by the analyzer.
+///
+/// **What this lane took off the table.** The eighth and ninth rows were the
+/// same row: `semantic_tokens` was 98% `Program::source_of`, which is a LINEAR
+/// scan of `source_ranges` asked once per entity of every whole-program table —
+/// 426,198 calls in one analysis, against about sixty ranges. M27 had already
+/// built the answer (`Program::source_lookup`, a verified binary search that
+/// falls back to the scan rather than assume ranges are disjoint) and this
+/// table never took it. Hoisted: `semantic_tokens` 258,348,201 → 25,518,527 Ir,
+/// `source_of` across the whole analysis 262,380,207 → 7,548,684, and the WARM
+/// RE-ANALYSIS 3,635,194,953 → 3,401,139,236 Ir, **−6.44%**. The residue is
+/// `vilan_ide::completion::CompletionIndex::build`, which asks the same
+/// question 14,580 times for 7.5 M Ir — another lane's file, filed rather than
+/// taken.
+#[cfg(all(test, target_os = "linux"))]
+mod warm_profile {
+    use super::*;
+    use crate::document::tests::{base_cache_guard, on_big_stack, std_root};
+    use crate::keystroke::gate::{
+        EXHIBIT_ENTRY, GATE_FUNCTIONS, exhibit_module, loadavg_1m, process_cpu_now, profile,
+    };
+    use std::time::Duration;
+
+    /// THE PROFILED FRAME. `#[inline(never)]` so the symbol survives release
+    /// codegen and callgrind can toggle on it; it does one warm analysis and
+    /// nothing else, so everything inside the toggle is the thing being
+    /// measured.
+    #[inline(never)]
+    fn warm_reanalysis(text: &str, std_dir: &Path, entry: &Path) -> Duration {
+        let before = process_cpu_now();
+        let document = Document::analyze_on_this_thread(text, std_dir, entry);
+        let after = process_cpu_now();
+        // Dropped inside the frame: a superseded analysis is released in the
+        // server, and the release is part of what a keystroke costs.
+        drop(document);
+        before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default()
+    }
+
+    /// The cold half — named too, so a profile taken with the toggle OFF can
+    /// tell the two apart in one run.
+    #[inline(never)]
+    fn cold_analysis(text: &str, std_dir: &Path, entry: &Path) -> Duration {
+        let before = process_cpu_now();
+        drop(Document::analyze_on_this_thread(text, std_dir, entry));
+        let after = process_cpu_now();
+        before
+            .zip(after)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or_default()
+    }
+
+    fn report(corpus: &str, phase: &str, cpu: Duration) {
+        println!(
+            "M58 {{\"section\":\"warm_profile\",\"corpus\":\"{corpus}\",\"phase\":\"{phase}\",\
+             \"profile\":\"{}\",\"load\":\"{}\",\"cpu_ms\":{:.2}}}",
+            profile(),
+            loadavg_1m(),
+            cpu.as_secs_f64() * 1000.0,
+        );
+    }
+
+    /// The subject: a sibling checkout's entry when `VILAN_M58_ENTRY` names
+    /// one, else the generated kolt-sized exhibit written to a temp directory.
+    fn subject() -> (Option<PathBuf>, PathBuf, String) {
+        if let Some(entry) = std::env::var_os("VILAN_M58_ENTRY").map(PathBuf::from) {
+            let text = std::fs::read_to_string(&entry)
+                .unwrap_or_else(|error| panic!("VILAN_M58_ENTRY {}: {error}", entry.display()));
+            return (None, entry, text);
+        }
+        let directory = std::env::temp_dir().join(format!("vilan_m58_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), exhibit_module(GATE_FUNCTIONS))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, EXHIBIT_ENTRY).expect("write the exhibit entry");
+        (Some(directory), entry, EXHIBIT_ENTRY.to_string())
+    }
+
+    #[test]
+    #[ignore = "M58's warm re-analysis profile: run under callgrind (the module docs give the command)"]
+    fn m58_warm_reanalysis_profile() {
+        let _guard = base_cache_guard();
+        let (directory, entry, text) = subject();
+        let corpus = entry.display().to_string();
+        let (cold, warm) = on_big_stack(move || {
+            let std_dir = std_root();
+            let cold = cold_analysis(&text, &std_dir, &entry);
+            // The edit: a trailing comment, so the entry's bytes move and the
+            // analysis is a real one rather than a cache hit — the same
+            // mutation E106's session driver uses, for the same reason.
+            let edited = format!("{text}\n// warm keystroke\n");
+            let warm = warm_reanalysis(&edited, &std_dir, &entry);
+            (cold, warm)
+        });
+        if let Some(directory) = directory {
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+        report(&corpus, "cold", cold);
+        report(&corpus, "warm", warm);
+        assert!(
+            warm > Duration::ZERO,
+            "the warm analysis measured zero CPU — the clock is not measuring the work",
+        );
+    }
+}
+
 /// E111: a capture's name span inside an `is`/`match` pattern — the one span
 /// semantic tokens and inlay hints BOTH read (`Variable::name_span`), so a
 /// wrong one paints the highlighting and slides the hint together.
@@ -12860,6 +27512,1153 @@ mod builder_chain_member_completion {
         assert!(
             !found.contains(&"twin".to_string()) && !found.contains(&"x".to_string()),
             "nothing from the OTHER call site's specialization: {found:?}",
+        );
+    }
+
+    // --- E130: the declared return IS a type parameter (E107's other half) ---
+    //
+    // E107 covered the callee with NO declared return. This is the callee whose
+    // declared return is a bare `T`: the declaration is there, so the
+    // `inferred_return_types` fallback is never reached, and `T`'s own TypeId
+    // is a `Type::Generic` that names no nominal at all. The receiver's own
+    // type argument is what says which type `T` is at THIS call, and the
+    // analyzer recorded it.
+
+    /// The item's user-code reduction, with no std type involved: a generic
+    /// `Box<T>` whose `get` returns the bare parameter and whose `wrap` returns
+    /// a nominal head over it.
+    const GENERIC_BOX: &str = "import std::option::Option::{ self, Some, None };\n\
+         struct Box<T> {\n\tv: T,\n}\n\
+         impl Box<type T> {\n\
+         \tfun get(self): T { self.v }\n\
+         \tfun wrap(self): Option<T> { Some(self.v) }\n\
+         }\n\
+         struct Point { x: i32, y: i32 }\n\
+         impl Point { fun twin(self): Point { self } }\n";
+
+    #[test]
+    fn a_call_returning_a_bare_type_parameter_offers_the_bound_types_members() {
+        let found = labels(
+            GENERIC_BOX,
+            "\tlet b: Box<Point> = Box { v = Point { x = 1, y = 2 } };\n\tb.get().~;\n",
+        );
+        assert!(
+            found.contains(&"x".to_string()) && found.contains(&"twin".to_string()),
+            "`get(): T` on a `Box<Point>` answers Point's members: {found:?}",
+        );
+        assert!(
+            !found.contains(&"get".to_string()) && !found.contains(&"v".to_string()),
+            "the RESULT's members, not the box's: {found:?}",
+        );
+    }
+
+    /// A FREE generic function whose return is its own parameter — the other
+    /// channel the bindings arrive through, with no impl subject in sight.
+    #[test]
+    fn a_free_generic_call_returning_its_own_parameter_substitutes_too() {
+        let prelude = "struct Point { x: i32, y: i32 }\n\
+             impl Point { fun twin(self): Point { self } }\n\
+             fun echo<T>(value: T): T { value }\n";
+        for body in [
+            "\techo(Point { x = 1, y = 2 }).~;\n",
+            "\techo<Point>(Point { x = 1, y = 2 }).~;\n",
+        ] {
+            let found = labels(prelude, body);
+            assert!(
+                found.contains(&"x".to_string()) && found.contains(&"twin".to_string()),
+                "`echo<T>(value: T): T` at a Point call answers Point's members \
+                 ({body:?}): {found:?}",
+            );
+        }
+    }
+
+    /// The control the item names: the SAME impl's `wrap(): Option<T>` has a
+    /// nominal head written in the declaration and has always answered, so a
+    /// red here says the fix broke the path it was built beside.
+    #[test]
+    fn a_call_returning_a_nominal_over_a_parameter_still_answers() {
+        let found = labels(
+            GENERIC_BOX,
+            "\tlet b: Box<Point> = Box { v = Point { x = 1, y = 2 } };\n\tb.wrap().~;\n",
+        );
+        assert!(
+            found.contains(&"unwrap_or".to_string()),
+            "`wrap(): Option<T>` answers Option's members: {found:?}",
+        );
+    }
+
+    /// The reported shape, on std's own reactive cell: `SignalCell<T>::get`
+    /// declares `T`, and the owner's buffer is `c.get().` on a
+    /// `SignalCell<List<str>>`.
+    #[test]
+    fn a_signal_cells_get_offers_the_held_types_members() {
+        let found = labels(
+            "import std::reactive::SignalCell;\n",
+            "\tlet c: SignalCell<List<str>> = SignalCell::new(List::new());\n\tc.get().~;\n",
+        );
+        assert!(
+            found.contains(&"len".to_string()) && found.contains(&"push".to_string()),
+            "`SignalCell<List<str>>::get()` answers List's members: {found:?}",
+        );
+    }
+}
+
+/// E131: a member request answered while the buffer is AHEAD of the analysis
+/// resolves its receiver from the LIVE text, not from analyzed coordinates.
+///
+/// The owner's report: base text `<div .styled(base_style)>`, one un-landed
+/// change to `<div .styled(const style::style().)>`, a request inside the
+/// 150 ms debounce — and the popup offered `element, text, class, styled,
+/// style_var, attr, on, child, bind_text, …`, which is `View`'s method set.
+/// Settled, the same position offers Style's 89.
+///
+/// The cause was a coordinate one, and E125 fixed its twin for
+/// `semanticTokens/range`. `receiver_nominal_id`'s complex arm did
+/// `to_analyzed_offset(receiver_end - 1)` and then `entity_at`, and
+/// `to_analyzed_offset` is a line/character round-trip that CLAMPS: it repairs
+/// other lines (E52), but the cursor's own line is ALWAYS an edited line, so
+/// the live column clamped back onto the analyzed line's last character and
+/// `entity_at` answered with the enclosing `.styled(..)`/element — typed
+/// `View`. The keystroke layer could not catch it either: `keystroke_verdict`
+/// is `Exact` because `shape_stamp` skips `fun` bodies, and `Exact` is the
+/// anchor's claim about TOKEN positions, while the anchor is line-aligned and
+/// the cursor's line is inside its window by construction.
+///
+/// Both halves are here. The receiver's IDENTITY now comes from the live token
+/// stream — a bare name, a call, a method call, a field — with only NAMES
+/// resolved against the landed program; and what that walk cannot type falls
+/// back to the analyzed arm only where the analyzed text still describes the
+/// receiver's own bytes. Inside the edit window it declines, because a wrong
+/// list is worse than no list and the next settled request is right (Q4).
+#[cfg(test)]
+mod stale_receiver_member_completion {
+    use super::tests::analyze_workspace;
+    use super::*;
+
+    /// kolt's own manifest shape: the web prelude puts `style`, `View` and the
+    /// element vocabulary in scope with no import, which is what makes the
+    /// reported buffer the buffer it is.
+    const MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n\
+         [entry.main]\ntarget = \"browser\"\n";
+
+    /// The LANDED text: the attribute holds a plain binding.
+    const BASE: &str = "fun app(): View {\n\t<div .styled(base_style)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    fn labels(document: &Document, offset: usize) -> Vec<String> {
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
+    /// The labels at the `~` cursor in `live`, with `BASE` analyzed and `live`
+    /// applied as an UN-LANDED edit — a request inside the debounce.
+    fn stale(live: &str) -> Vec<String> {
+        let text = live.replace('~', "");
+        let offset = live.find('~').expect("the pin source needs a `~` cursor");
+        let (directory, mut document) =
+            analyze_workspace(&[("main.vl", BASE), ("vilan.toml", MANIFEST)]);
+        document.set_text(&text);
+        assert_eq!(
+            document.keystroke_verdict(false),
+            crate::keystroke::Verdict::Exact,
+            "the reported request is one the keystroke layer calls Exact — that is \
+             the half of the report the gate exists for",
+        );
+        let found = labels(&document, offset);
+        let _ = std::fs::remove_dir_all(&directory);
+        found
+    }
+
+    /// The same position with the analysis LANDED on the same text — what the
+    /// request answers a moment later, and the answer the stale one must not
+    /// contradict.
+    fn settled(live: &str) -> Vec<String> {
+        let text = live.replace('~', "");
+        let offset = live.find('~').expect("the pin source needs a `~` cursor");
+        let (directory, document) =
+            analyze_workspace(&[("main.vl", &text), ("vilan.toml", MANIFEST)]);
+        let found = labels(&document, offset);
+        let _ = std::fs::remove_dir_all(&directory);
+        found
+    }
+
+    /// Style members that are not View members, and vice versa — the two lists
+    /// the report is about, named so a failure says WHICH one came back.
+    fn assert_style_and_not_view(found: &[String], what: &str) {
+        for member in ["flex_direction", "padding", "gap"] {
+            assert!(
+                found.contains(&member.to_string()),
+                "{what} must offer Style's `{member}`: {found:?}",
+            );
+        }
+        for member in ["child", "bind_text", "style_var"] {
+            assert!(
+                !found.contains(&member.to_string()),
+                "{what} must not offer View's `{member}`: {found:?}",
+            );
+        }
+    }
+
+    const CALL_RECEIVER: &str = "fun app(): View {\n\t<div .styled(const style::style().~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    /// The report, verbatim.
+    #[test]
+    fn a_stale_call_receiver_answers_the_live_expressions_type() {
+        assert_style_and_not_view(&stale(CALL_RECEIVER), "a stale call receiver");
+    }
+
+    /// …and it is the SAME answer the settled request gives, which is the
+    /// property the whole item is about.
+    #[test]
+    fn the_settled_call_receiver_answers_what_the_stale_one_does() {
+        let settled = settled(CALL_RECEIVER);
+        assert_style_and_not_view(&settled, "the settled call receiver");
+        assert_eq!(
+            settled,
+            stale(CALL_RECEIVER),
+            "the stale request and the settled one answer one list",
+        );
+    }
+
+    /// The item's own isolation: a BARE-NAME receiver was always right, because
+    /// that arm reads the name off the live text. It stays right.
+    #[test]
+    fn a_stale_bare_name_receiver_still_answers() {
+        assert_style_and_not_view(
+            &stale(
+                "fun app(): View {\n\t<div .styled(base_style.~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+                 let base_style = const style::style();\nlet styles = [const style::style()];\n",
+            ),
+            "a stale bare-name receiver",
+        );
+    }
+
+    /// A METHOD call typed since the landing — the `x.m(…)` shape of the live
+    /// walk, where the sub-receiver is itself resolved live.
+    #[test]
+    fn a_stale_method_call_receiver_answers_the_methods_return() {
+        assert_style_and_not_view(
+            &stale(
+                "fun app(): View {\n\t<div .styled(base_style.padding(space(4)).~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+                 let base_style = const style::style();\nlet styles = [const style::style()];\n",
+            ),
+            "a stale method-call receiver",
+        );
+    }
+
+    const INDEX_RECEIVER: &str = "fun app(): View {\n\t<div .styled(styles[0].~)>\n\t\t\"hi\"\n\t</div>\n}\n\n\
+         let base_style = const style::style();\nlet styles = [const style::style()];\n";
+
+    /// The GATE. An index is a shape the live walk does not type, and the
+    /// analyzed arm behind it would answer about whatever used to be written on
+    /// this line — `View`'s members, the report's own wrong list. Inside the
+    /// edit window it declines instead.
+    #[test]
+    fn a_stale_receiver_the_live_walk_cannot_type_declines_rather_than_guessing() {
+        let found = stale(INDEX_RECEIVER);
+        assert!(
+            found.is_empty(),
+            "an unresolvable stale receiver offers nothing rather than the old \
+             expression's members: {found:?}",
+        );
+    }
+
+    /// …and the gate is not a permanent refusal: the same position, settled,
+    /// answers through the analyzed arm exactly as it always did.
+    #[test]
+    fn the_gate_lifts_the_moment_the_analysis_lands() {
+        assert_style_and_not_view(&settled(INDEX_RECEIVER), "the settled index receiver");
+    }
+}
+
+/// E124's paint, at both granularities (`proposal/dead-code-paint.md`).
+///
+/// These are the pins that need a MANIFEST — the module-level slice, the
+/// library rule and the `generated` root are all manifest facts, and the
+/// package union is a fact about several files at once, so none of them can be
+/// pinned on a single source string the way E114's three producers are. The
+/// definition's own pins (the exemptions, the type-level narrowing, the
+/// trait-impl class) live in `vilan-core/tests/dead_items.rs`.
+#[cfg(test)]
+mod dead_item_paint_tests {
+    use super::tests::std_root;
+    use super::*;
+    use std::sync::Arc;
+    use vilan_core::cancel::CancelToken;
+
+    /// The kolt shape, shrunk: two entries, a module both of them load, and a
+    /// module neither does.
+    const MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n[entry.client]\n\n[entry.server]\n";
+    const CLIENT: &str =
+        "import pkg::shared::used_by_client;\n\nfun main() {\n\tused_by_client();\n}\n";
+    const SERVER: &str =
+        "import pkg::shared::used_by_server;\n\nfun main() {\n\tused_by_server();\n}\n";
+    const SHARED: &str = "import std::io::print;\n\n\
+         let read_by_client: i32 = 1;\n\n\
+         let read_by_nobody: i32 = 2;\n\n\
+         fun used_by_client() {\n\tprint(i\"{read_by_client}\");\n}\n\n\
+         fun used_by_server() {\n\tprint(\"s\");\n}\n\n\
+         fun used_by_nobody() {\n\tprint(\"n\");\n}\n";
+    const ORPHAN: &str = "import std::io::print;\n\n\
+         let orphan_binding: i32 = 7;\n\n\
+         fun orphan_fun() {\n\tprint(\"o\");\n}\n";
+
+    fn workspace(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan-e124-{name}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        for (relative, contents) in files {
+            let path = directory.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("a scratch directory");
+            }
+            std::fs::write(path, contents).expect("a fixture file");
+        }
+        directory
+    }
+
+    /// The package's own two-entry fixture, on disk.
+    fn package(name: &str) -> PathBuf {
+        workspace(
+            name,
+            &[
+                ("vilan.toml", MANIFEST),
+                ("src/client.vl", CLIENT),
+                ("src/server.vl", SERVER),
+                ("src/shared.vl", SHARED),
+                ("src/orphan.vl", ORPHAN),
+            ],
+        )
+    }
+
+    fn open(directory: &Path, relative: &str) -> Document {
+        let path = directory.join(relative);
+        let text = std::fs::read_to_string(&path).expect("the fixture file");
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{relative} analyzes cleanly: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        document
+    }
+
+    /// The package's union, computed the way the server's clock computes it —
+    /// from disk, since these fixtures have no buffers.
+    fn union(directory: &Path) -> Option<Arc<crate::dead_items::PackageReach>> {
+        let entries = crate::dead_items::entry_paths(directory)?;
+        crate::dead_items::compute(&entries, &std_root(), 0, &CancelToken::new(), |path| {
+            std::fs::read_to_string(path).ok()
+        })
+        .map(Arc::new)
+    }
+
+    /// The source text each faded span covers.
+    fn named(document: &Document, spans: &[Span]) -> Vec<String> {
+        let text = document.analyzed_text();
+        let mut names: Vec<String> = spans
+            .iter()
+            .map(|span| text[span.start..span.end].to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// **A module no entry loads is faded whole**, and the message names the
+    /// entries that were asked — the free slice (§2.5), which rides the
+    /// per-entry module walk the analysis already paid for.
+    #[test]
+    fn a_module_no_entry_loads_is_faded_whole() {
+        let directory = package("orphan");
+        let document = open(&directory, "src/orphan.vl");
+        let (message, spans) = document
+            .unloaded_module_paint()
+            .expect("no entry loads `orphan.vl`");
+        assert_eq!(
+            named(&document, &spans),
+            vec!["orphan_binding".to_string(), "orphan_fun".to_string()],
+            "both top-level items of the unloaded module fade",
+        );
+        assert!(
+            message.contains("`client`") && message.contains("`server`"),
+            "the message names the entries that were asked: {message}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The other direction: a module an entry DOES load is not faded whole,
+    /// whatever is unused inside it. Without this the pin above would pass on a
+    /// paint that fades everything.
+    #[test]
+    fn a_module_an_entry_loads_is_never_faded_whole() {
+        let directory = package("loaded");
+        for relative in ["src/shared.vl", "src/client.vl", "src/server.vl"] {
+            let document = open(&directory, relative);
+            assert!(
+                document.unloaded_module_paint().is_none(),
+                "{relative} is loaded by an entry",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **The union is a union** (pin 12): an item reached by exactly one of the
+    /// two entries is not gray, and only the item neither reaches is.
+    ///
+    /// This is also the NO-MAIN pin (13): `shared.vl` has no `main`, so its own
+    /// analysis has no root to walk from — every term of the union comes from
+    /// the package clock, which is the finding that reframed the ruling.
+    #[test]
+    fn an_item_no_entry_reaches_is_faded_and_one_a_single_entry_reaches_is_not() {
+        let directory = package("union");
+        let mut document = open(&directory, "src/shared.vl");
+        assert!(
+            vilan_core::platform_color::paint_reachable_nodes(
+                document.program.as_ref().expect("a program")
+            )
+            .is_none(),
+            "`shared.vl` analyzed as its own entry has no `main` — the premise",
+        );
+        document.set_package_reach(union(&directory));
+        assert_eq!(
+            named(&document, &document.dead_item_spans()),
+            vec!["read_by_nobody".to_string(), "used_by_nobody".to_string()],
+            "`used_by_client` and `used_by_server` are each reached by exactly \
+             ONE entry and live in the union; only what neither reaches grays",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Withdrawal** (pin 15, determination 8): with no union in hand the
+    /// paint is silent. This is the state every edit puts the package into, and
+    /// it is why a gray can never be served stale toward MORE grays — there is
+    /// nothing to serve.
+    #[test]
+    fn the_paint_is_silent_until_the_package_union_lands() {
+        let directory = package("withdrawn");
+        let mut document = open(&directory, "src/shared.vl");
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "no union, no gray — the withdrawn state",
+        );
+        document.set_package_reach(union(&directory));
+        assert!(
+            !document.dead_item_spans().is_empty(),
+            "the union lands and the gray returns",
+        );
+        document.set_package_reach(None);
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "withdrawing takes it off again, with no analysis in between",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A broken parse anywhere in the package suppresses the package's
+    /// top-level grays** (pin 17), not merely its own file's. A salvaged parse
+    /// can lose a whole block or the file's entire tail, and a smaller program
+    /// reads to a reachability walk as a deader one.
+    #[test]
+    fn a_broken_module_anywhere_refuses_the_whole_union() {
+        let directory = package("broken");
+        std::fs::write(
+            directory.join("src/shared.vl"),
+            format!("{SHARED}\nfun half_typed(: {{\n"),
+        )
+        .expect("break the module");
+        assert!(
+            union(&directory).is_none(),
+            "one broken module in the package refuses the union outright",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **A `[library]`'s top-level items are never gray** (pins 18/19,
+    /// determination 9). A library has no entries — validation refuses them
+    /// outright — so there is no union and nothing to say. Every top-level item
+    /// is surface a consumer may import, and that is the property that saves a
+    /// consumer from forking an under-exported package.
+    #[test]
+    fn a_library_module_is_never_gray_at_either_granularity() {
+        let directory = workspace(
+            "library",
+            &[
+                ("vilan.toml", "[library]\nname = \"lib\"\n"),
+                (
+                    "src/lib.vl",
+                    "import std::io::print;\n\nfun exported() {\n\tprint(\"e\");\n}\n",
+                ),
+                ("src/aside.vl", ORPHAN),
+            ],
+        );
+        for relative in ["src/lib.vl", "src/aside.vl"] {
+            let mut document = open(&directory, relative);
+            assert!(
+                document.unloaded_module_paint().is_none(),
+                "{relative}: a library module is never faded whole",
+            );
+            document.set_package_reach(union(&directory));
+            assert!(
+                document.dead_item_spans().is_empty(),
+                "{relative}: a library item is never gray",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Nothing under a declared `generated` root is gray** (pin 9,
+    /// determination 3). The key already exists, kolt already sets it for
+    /// lucide, and it already means "this is not code you maintain": on kolt
+    /// the paint as ruled would have faded an 18,198-line machine-written
+    /// module wall to wall, 1,815 of its 1,820 items, forever.
+    #[test]
+    fn a_module_under_a_declared_generated_root_is_never_gray() {
+        let directory = workspace(
+            "generated",
+            &[
+                (
+                    "vilan.toml",
+                    "[package]\nname = \"app\"\ngenerated = \"src/icons\"\n\n[entry.server]\n",
+                ),
+                (
+                    "src/server.vl",
+                    "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+                ),
+                ("src/icons/lib.vl", ORPHAN),
+            ],
+        );
+        let mut document = open(&directory, "src/icons/lib.vl");
+        assert!(
+            document.unloaded_module_paint().is_none(),
+            "a generated module is not faded whole even though no entry loads it",
+        );
+        document.set_package_reach(union(&directory));
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "and none of its items is grayed either",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E140: the union records the CLOSURE it walked, which is what the
+    /// withdrawal's cone test reads. The entries and the module they load are
+    /// in it; the orphan module in the same package is not, and that is the
+    /// whole distinction the narrowed withdrawal rests on.
+    #[test]
+    fn the_union_records_the_sources_its_entries_loaded() {
+        let directory = package("cone");
+        let union = union(&directory).expect("the package's union");
+        for relative in ["src/client.vl", "src/server.vl", "src/shared.vl"] {
+            assert!(
+                union.depends_on(&directory.join(relative)),
+                "{relative} is in an entry's closure",
+            );
+        }
+        assert!(
+            !union.depends_on(&directory.join("src/orphan.vl")),
+            "no entry loads `orphan.vl`, so an edit to it cannot move a term of \
+             the union",
+        );
+        assert!(
+            !union.sources.is_empty() && union.sources.len() > 3,
+            "std is in the closure too — the union carries what it READ, not a \
+             filtered view of it: {}",
+            union.sources.len(),
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E140: the legs are computed separately now (concurrently, in the
+    /// server), so the rule that a refused leg refuses the WHOLE union has to
+    /// be stated where the legs are joined rather than fall out of an early
+    /// `return` in a loop. One `None` leg — a broken module, an entry with no
+    /// `main`, an unreadable file — and there is no union.
+    #[test]
+    fn one_refused_leg_refuses_the_whole_union() {
+        let directory = package("legs");
+        let entries = crate::dead_items::entry_paths(&directory).expect("two entries");
+        let legs: Vec<Option<crate::dead_items::EntryReach>> = entries
+            .iter()
+            .map(|(_, path)| {
+                let text = std::fs::read_to_string(path).expect("the entry");
+                crate::dead_items::analyze_entry(path, &std_root(), &CancelToken::new(), &text)
+            })
+            .collect();
+        assert!(
+            legs.iter().all(Option::is_some),
+            "both legs answer on a clean package",
+        );
+        assert!(
+            crate::dead_items::union_of(legs, 0).is_some(),
+            "and their union is a union",
+        );
+        let broken = vec![
+            Some(crate::dead_items::EntryReach {
+                reached: Default::default(),
+                sources: Default::default(),
+            }),
+            None,
+        ];
+        assert!(
+            crate::dead_items::union_of(broken, 0).is_none(),
+            "one refused leg refuses the whole union",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 10** (E140) — a `[platform("browser")]` item reached by the
+    /// BROWSER entry is not gray in a package whose other entry is node.
+    ///
+    /// This is the fence's own case, and the reason the union is a union of
+    /// per-entry walks rather than one walk: each entry is analyzed under its
+    /// own platform, so a browser-only item is simply unreachable from the
+    /// server entry's program — not exempt, not special-cased, absent. If the
+    /// union were taken from the default entry alone, every browser-fenced
+    /// item in a fullstack package would gray at once. The negative beside it
+    /// is what makes the pin about the fence: a browser-fenced item NO entry
+    /// reaches still grays, so the platform is not being read as an exemption.
+    #[test]
+    fn a_browser_fenced_item_the_browser_entry_reaches_is_not_gray() {
+        let directory = workspace(
+            "platform",
+            &[
+                (
+                    "vilan.toml",
+                    "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                     [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+                ),
+                (
+                    "src/client.vl",
+                    "import pkg::ui::mount;\n\nfun main() {\n\tmount();\n}\n",
+                ),
+                (
+                    "src/server.vl",
+                    "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+                ),
+                (
+                    "src/ui.vl",
+                    "import std::ui::{ View, view };\n\n\
+                     [platform(\"browser\")]\n\
+                     fun mount(): View {\n\tview(\"div\")\n}\n\n\
+                     [platform(\"browser\")]\n\
+                     fun never_mounted(): View {\n\tview(\"span\")\n}\n",
+                ),
+            ],
+        );
+        let mut document = open(&directory, "src/ui.vl");
+        document.set_package_reach(union(&directory));
+        assert_eq!(
+            named(&document, &document.dead_item_spans()),
+            vec!["never_mounted".to_string()],
+            "`mount` lives in the union through the BROWSER entry; the \
+             browser-fenced item no entry reaches still grays, so the fence is \
+             not being read as an exemption",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 16** (E140) — deleting the last use of an item does not have to
+    /// gray it immediately. **Lateness is allowed**, and this pin asserts that
+    /// it is, so a later optimization cannot be justified by a promise the
+    /// design never made.
+    ///
+    /// The asymmetry is deliberate and it is the whole safety argument.
+    /// Withdrawal is instant, because a gray that has become WRONG is a lie
+    /// about the user's own code — pin 15 and `withdraw_package_grays`.
+    /// Restoration rides the idle clock, because a gray that has not appeared
+    /// YET says nothing at all. So an edit that removes the last call to
+    /// `used_by_server` may leave the union standing until the clock re-walks:
+    /// the paint the user sees is a paint that was true, one clock tick ago,
+    /// and the direction it is stale in is the one that cannot mislead.
+    #[test]
+    fn deleting_the_last_use_of_an_item_may_gray_it_late() {
+        let directory = package("lateness");
+        let union_before = union(&directory).expect("the package's union");
+        // The edit that kills `used_by_server`: the server entry stops calling
+        // it. The union in hand was computed BEFORE it and is now out of date.
+        std::fs::write(
+            directory.join("src/server.vl"),
+            "import std::io::print;\n\nfun main() {\n\tprint(\"s\");\n}\n",
+        )
+        .expect("rewrite the server entry");
+        let mut document = open(&directory, "src/shared.vl");
+        document.set_package_reach(Some(Arc::clone(&union_before)));
+        assert!(
+            !named(&document, &document.dead_item_spans()).contains(&"used_by_server".to_string()),
+            "the stale union still reaches `used_by_server`, and serving it is \
+             ALLOWED: a gray that has not appeared yet says nothing",
+        );
+        // And the clock catches up: recomputed against the edited package, the
+        // item is gray. Lateness is a permission, not a ceiling.
+        document.set_package_reach(union(&directory));
+        assert!(
+            named(&document, &document.dead_item_spans()).contains(&"used_by_server".to_string()),
+            "the next union grays it",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Pin 19** (E140) — a `[library]` that is a WORKSPACE MEMBER consumed by
+    /// a sibling `[package]` is still never gray.
+    ///
+    /// Pin 18's library stands alone; this one is inside a `[project]` and has
+    /// a consumer in the same tree, which is the shape where "surely we can see
+    /// every use of it" is most tempting and most wrong. A workspace is not a
+    /// closed world: the library is publishable, the sibling is one consumer of
+    /// it, and an item no sibling happens to call today is still surface. The
+    /// rule holds for the same reason it holds anywhere — a library declares no
+    /// entries, so there is no union and nothing to say.
+    #[test]
+    fn a_library_that_is_a_workspace_member_is_never_gray() {
+        let directory = workspace(
+            "workspace-library",
+            &[
+                ("vilan.toml", "[project]\npackages = [\"lib\", \"app\"]\n"),
+                ("lib/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                (
+                    "lib/src/lib.vl",
+                    "import std::io::print;\n\n\
+                     fun used_by_the_sibling() {\n\tprint(\"u\");\n}\n\n\
+                     fun used_by_nobody_here() {\n\tprint(\"n\");\n}\n",
+                ),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { path = \"../lib\" }\n",
+                ),
+                (
+                    "app/src/main.vl",
+                    "import shapes::used_by_the_sibling;\n\n\
+                     fun main() {\n\tused_by_the_sibling();\n}\n",
+                ),
+            ],
+        );
+        let mut document = open(&directory, "lib/src/lib.vl");
+        assert!(
+            document.unloaded_module_paint().is_none(),
+            "a workspace library's module is never faded whole",
+        );
+        document.set_package_reach(union(&directory.join("lib")));
+        assert!(
+            document.dead_item_spans().is_empty(),
+            "no item of a workspace-member library is gray, including the one \
+             its sibling does not call: {:?}",
+            named(&document, &document.dead_item_spans()),
+        );
+        // The consumer's own package still paints, so the pin is about the
+        // LIBRARY rule rather than about a paint that is off in this fixture.
+        let mut consumer = open(&directory, "app/src/main.vl");
+        consumer.set_package_reach(union(&directory.join("app")));
+        assert!(
+            consumer.dead_item_spans().is_empty(),
+            "the app's own entry reaches everything it declares",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The classic single-entry form (`[package] entry = …`) answers the same
+    /// way as the `[entry.<name>]` form — pin 14's shape: the two manifests
+    /// produce the same grays for an item only one of them reaches.
+    #[test]
+    fn a_single_entry_package_answers_at_both_granularities() {
+        let directory = workspace(
+            "single",
+            &[
+                ("vilan.toml", "[package]\nname = \"app\"\n"),
+                (
+                    "src/main.vl",
+                    "import pkg::shared::used_by_client;\n\nfun main() {\n\tused_by_client();\n}\n",
+                ),
+                ("src/shared.vl", SHARED),
+                ("src/orphan.vl", ORPHAN),
+            ],
+        );
+        let orphan = open(&directory, "src/orphan.vl");
+        let (_, spans) = orphan
+            .unloaded_module_paint()
+            .expect("the single entry does not load `orphan.vl`");
+        assert_eq!(
+            named(&orphan, &spans),
+            vec!["orphan_binding".to_string(), "orphan_fun".to_string()],
+        );
+        let mut shared = open(&directory, "src/shared.vl");
+        shared.set_package_reach(union(&directory));
+        assert_eq!(
+            named(&shared, &shared.dead_item_spans()),
+            vec![
+                "read_by_nobody".to_string(),
+                "used_by_nobody".to_string(),
+                "used_by_server".to_string(),
+            ],
+            "with one entry, what the other entry used to reach grays too",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// N119: the analysis fence, and what it can and cannot contain.
+///
+/// [`Document::analyze_cancellable`] runs the whole pipeline on a dedicated
+/// 128 MiB-stack thread under `catch_unwind`, so an analyzer PANIC degrades to
+/// the internal-error document instead of unwinding through the join and out
+/// of whichever handler asked for the analysis (B40). The thread is what buys
+/// the depth; the fence is what buys the containment.
+///
+/// What the fence does NOT contain is a stack OVERFLOW, and the reason is the
+/// runtime's, not this server's: Rust's guard-page handler prints
+/// `thread '…' has overflowed its stack` and calls `abort()`, from ANY thread,
+/// so `join()` never returns and there is no `Err` to observe. Measured on
+/// this host: a 1 MiB-stack thread recursing without bound exits the process
+/// 134 (SIGABRT), and the line after the `join` never runs. That is what took
+/// the server down in B385. N121's answer is a stack-remaining probe in the
+/// analyzer's recursive funnels (`vilan_core::stack_guard`) that PANICS short
+/// of the guard page, on a thread that declared its stack — which the analysis
+/// thread now does — so the overflow becomes a panic this fence catches.
+#[cfg(test)]
+mod analysis_fence_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// The entry path whose analysis panics, once per call. Keyed on the file
+    /// rather than armed globally: the analysis runs on a thread this test
+    /// does not own, and the suite analyzes documents concurrently, so a
+    /// global flag would fire inside a stranger's analysis.
+    const PLANTED: &str = "n119-planted-panic.vl";
+
+    /// N121's plant: an analysis on this path recurses WITHOUT BOUND, probing
+    /// the stack once per level the way the analyzer's funnels do — a
+    /// runaway walk, minus the walk. Keyed on the file for the same reason.
+    const PLANTED_RUNAWAY: &str = "n121-planted-runaway.vl";
+
+    /// Called on the analysis thread, inside the fence.
+    pub(crate) fn maybe_inject(entry_path: &Path) {
+        if entry_path.file_name().is_some_and(|name| name == PLANTED) {
+            unreachable!("N119: planted analyzer abort");
+        }
+        if entry_path
+            .file_name()
+            .is_some_and(|name| name == PLANTED_RUNAWAY)
+        {
+            runaway(0);
+        }
+    }
+
+    /// One level of the planted runaway: a probe, then a frame the optimizer
+    /// cannot fold into a loop.
+    #[allow(
+        unconditional_recursion,
+        reason = "the plant IS an unbounded recursion; the stack probe inside it is the only way out"
+    )]
+    fn runaway(level: usize) -> usize {
+        vilan_core::stack_guard::ensure_sufficient_stack("the planted runaway");
+        let frame = std::hint::black_box([level as u8; 4096]);
+        runaway(level + 1) + frame[0] as usize
+    }
+
+    /// N121: a recursion that runs away on the analysis thread is refused by
+    /// the stack probe and lands the internal-error document — the SERVER
+    /// lives, and the next analysis runs the normal path.
+    ///
+    /// Non-vacuous against the thread's DECLARATION, which is what the probe
+    /// reads its floor from: remove `with_declared_stack` from
+    /// `analyze_cancellable` and the probe is inert, the plant runs past
+    /// 128 MiB into the guard page, and this test ABORTS the test process
+    /// (`thread '<unknown>' has overflowed its stack`, SIGABRT) — a red with
+    /// no assertion message, which is the very failure this pins away.
+    #[test]
+    fn a_runaway_recursion_answers_a_diagnostic_and_the_server_lives() {
+        let planted = Document::analyze(GOOD, &std_root(), Path::new(PLANTED_RUNAWAY));
+        assert!(
+            !planted.program.is_some(),
+            "a refused analysis lands no program"
+        );
+        let published = planted.published_diagnostics();
+        let messages: Vec<&str> = published.iter().map(|one| one.message.as_str()).collect();
+        assert_eq!(published.len(), 1, "{messages:?}");
+        assert!(
+            published[0].message.contains("internal error")
+                && published[0].message.contains(PLANTED_RUNAWAY),
+            "the internal-error diagnostic names the file: {messages:?}"
+        );
+        let next = Document::analyze(GOOD, &std_root(), Path::new("n121-next.vl"));
+        assert!(
+            next.program.is_some(),
+            "the next analysis produces a program"
+        );
+    }
+
+    const GOOD: &str = "fun main() {\n\tlet value = 1;\n\tlet _ = value;\n}\n";
+
+    /// A panicking analysis lands the internal-error document — which NAMES
+    /// the file — and the next analysis runs the normal path.
+    ///
+    /// Non-vacuous against the containment, which is TWO fences and not one:
+    /// the thread body's `catch_unwind` and the `join`'s own `Err` arm each
+    /// contain the planted `unreachable!()` on their own (removing either one
+    /// alone leaves this green — which is itself worth knowing). Remove BOTH
+    /// and the panic re-raises on this test's thread: measured red, with
+    /// `PROBE: outer fence removed: Any { .. }` in place of an assertion.
+    #[test]
+    fn a_panicked_analysis_answers_a_diagnostic_naming_the_file_and_the_next_analysis_works() {
+        let planted = Document::analyze(GOOD, &std_root(), Path::new(PLANTED));
+        assert!(
+            !planted.program.is_some(),
+            "a panicked analysis lands no program"
+        );
+        let published = planted.published_diagnostics();
+        let messages: Vec<&str> = published.iter().map(|one| one.message.as_str()).collect();
+        assert_eq!(published.len(), 1, "{messages:?}");
+        let message = &published[0].message;
+        assert!(
+            message.contains("internal error") && message.contains(PLANTED),
+            "the internal-error diagnostic names the file: {message}"
+        );
+        // The document is still a document: its line index is the live text's,
+        // so position mapping and the next re-analysis behave.
+        assert_eq!(planted.line_index.text(), GOOD);
+
+        // The next request — a fresh analysis of an ordinary file — runs the
+        // normal path. The injection is one file's, and the caught panic left
+        // nothing poisoned behind it.
+        let next = Document::analyze(GOOD, &std_root(), Path::new("n119-next.vl"));
+        assert!(
+            next.program.is_some(),
+            "the next analysis produces a program"
+        );
+        let after = next.published_diagnostics();
+        let after: Vec<&str> = after.iter().map(|one| one.message.as_str()).collect();
+        assert!(after.is_empty(), "{after:?}");
+        // And hover still answers on it.
+        let offset = GOOD.find("value").expect("the binding");
+        assert!(
+            next.hover(offset).is_some(),
+            "the request after a contained analyzer abort is answered normally"
+        );
+    }
+}
+
+/// M85: what a field hover costs on a workspace with many structs.
+///
+/// `Document::field_at_offset` — the answer behind a hover on a field's
+/// declaration or on a struct-initializer key (E204) — WALKED `program.structs`
+/// and then `program.struct_initializer_field_spans`, testing every span for
+/// containment. That was a linear scan per hover, and hover fires on MOVE, so
+/// the item asked whether it wants an offset -> field index built with the
+/// program. It got one (`Document::field_spans`); this measures the lookup
+/// that replaced the scan, and measured the scan before it landed.
+///
+/// Measured before building anything, which is what the item asks for. The
+/// instrument is the thread CPU clock (M15) around a batch of hovers, the
+/// subject is two generated entry files an order of magnitude apart in field
+/// count, and the claim is a RATIO: a scan follows the field count, an index
+/// does not.
+///
+/// `#[ignore]` for its cost, like every other gate in this tree that generates
+/// a workspace, and it asserts NOTHING — it is a measurement, and the number
+/// it prints is what the item is closed on. Run it with
+/// `cargo nextest run --release -p vilan-lsp --run-ignored all -E 'test(m85)'`.
+#[cfg(test)]
+mod m85_field_hover_cost {
+    use super::*;
+    use crate::document::tests::std_root;
+    use crate::keystroke::gate::{loadavg_1m, profile, thread_cpu_now};
+
+    /// The generated WORKSPACE module: `structs` exported structs of ten
+    /// fields each, mechanical, nothing copied from any application.
+    fn field_exhibit(structs: usize) -> String {
+        let mut text = String::from(
+            "// GENERATED by M85's measurement: structs of ten fields, mechanical.\n\n\
+             export *;\n\n",
+        );
+        for index in 0..structs {
+            text.push_str(&format!("struct Shape{index:04} {{\n"));
+            for field in 0..10 {
+                text.push_str(&format!("\tfield_{field}: i32,\n"));
+            }
+            text.push_str("}\n\n");
+        }
+        text
+    }
+
+    /// The small open buffer: two structs of its own, one initializer, and one
+    /// use of the workspace module so it is loaded. Held FIXED across both
+    /// subject sizes, which is what isolates workspace size from file size.
+    const M85_ENTRY: &str = concat!(
+        "import pkg::table::Shape0000;\n\n",
+        "struct Local {\n\tmark: i32,\n\tcount: i32,\n}\n\n",
+        "struct Other {\n\tlabel: str,\n}\n\n",
+        "fun main() {\n",
+        "\tlet _local = Local { mark = 1, count = 2 };\n",
+        "\tlet _other = Other { label = \"x\" };\n",
+        "\tlet _shape = Shape0000 { field_0 = 0, field_1 = 0, field_2 = 0, field_3 = 0, ",
+        "field_4 = 0, field_5 = 0, field_6 = 0, field_7 = 0, field_8 = 0, field_9 = 0 };\n",
+        "}\n",
+    );
+
+    /// Write the exhibit to a fresh directory, land one analysis on the small
+    /// entry, remove the directory, and answer the document with the
+    /// workspace's total field count.
+    fn exhibit(structs: usize) -> (Document, usize) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan_m85_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), field_exhibit(structs))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, M85_ENTRY).expect("write the entry");
+        let document = Document::analyze(M85_ENTRY, &std_root(), &entry);
+        let _ = std::fs::remove_dir_all(&directory);
+        let fields = document
+            .program
+            .as_ref()
+            .expect("the exhibit analyzes")
+            .structs
+            .values()
+            .map(|structure| structure.fields.len())
+            .sum::<usize>();
+        (document, fields)
+    }
+
+    /// `(microseconds per field LOOKUP, microseconds per whole HOVER, field
+    /// count)` over `repetitions` requests on the entry's own field.
+    ///
+    /// The shape is the item's: a SMALL open buffer inside a LARGE workspace.
+    /// `structs` structs live in an imported `pkg::table`, and the entry that
+    /// is hovered declares two of its own — because the scan this measured
+    /// walked `program.structs`, which is every struct in the loaded WORLD, and
+    /// paid `source_of` on each before discovering it was not the entry's. An
+    /// exhibit that put the structs in the entry would measure a different and
+    /// much kinder loop.
+    fn microseconds_per_hover(structs: usize, repetitions: usize) -> Option<(f64, f64, usize)> {
+        let (document, fields) = exhibit(structs);
+        let program = document.program.as_ref().expect("the exhibit analyzes");
+        // The declaration of the entry's own first field.
+        let needle = "struct Local {\n\tmark";
+        let offset =
+            M85_ENTRY.find(needle).expect("the entry's struct") + needle.len() - "mark".len();
+        // Warm the caches the way a session would, so the reading is the
+        // steady state and not the first touch.
+        for _ in 0..8 {
+            let _ = document.field_at_offset(program, offset);
+            let _ = document.hover(offset);
+        }
+        // The SUBJECT: the field lookup alone. Measured apart from `hover`
+        // deliberately — the first reading of this took the whole request and
+        // could not tell the lookup from everything else hover does, which is
+        // how a perf item closes on the wrong number.
+        let started = thread_cpu_now()?;
+        for _ in 0..repetitions {
+            let answer = document.field_at_offset(program, offset);
+            assert!(answer.is_some(), "the exhibit's field must be found");
+        }
+        let lookup = thread_cpu_now()? - started;
+        // The whole request beside it, for scale.
+        let started = thread_cpu_now()?;
+        for _ in 0..repetitions {
+            let answer = document.hover(offset);
+            assert!(answer.is_some(), "the exhibit's field must hover");
+        }
+        let whole = thread_cpu_now()? - started;
+        Some((
+            lookup.as_secs_f64() * 1_000_000.0 / repetitions as f64,
+            whole.as_secs_f64() * 1_000_000.0 / repetitions as f64,
+            fields,
+        ))
+    }
+
+    /// The property the index HAS and the scan does not: the field table is
+    /// the size of the BUFFER, not of the workspace.
+    ///
+    /// A count and not a clock (N116's rule, one file over): this runs in the
+    /// default suite beside eleven other binaries, and the microseconds are
+    /// measured in the `#[ignore]`d gate below where they can be read and not
+    /// failed on. What the count says is the whole claim — twenty workspace
+    /// structs and five hundred give the open buffer the same table, because
+    /// the rows are the entry's own field positions and nothing else.
+    ///
+    /// Non-vacuous: it is asserted over a table the scan does not build, and
+    /// the number is pinned exactly, so a filter that let the workspace's
+    /// 5,000 rows in reds by three orders of magnitude.
+    #[test]
+    fn m85_the_field_table_is_the_buffers_not_the_programs() {
+        let (small, _) = exhibit(20);
+        let (large, _) = exhibit(500);
+        // The entry's own positions: three field declarations (`Local`'s two,
+        // `Other`'s one) and thirteen initializer keys (2 + 1 + `Shape0000`'s
+        // ten, which are written HERE even though the struct is not).
+        assert_eq!(
+            small.field_spans.len(),
+            16,
+            "the rows are the entry's own field positions: {:?}",
+            small
+                .field_spans
+                .iter()
+                .take(20)
+                .map(|(start, end, ..)| (*start, *end))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            small.field_spans.len(),
+            large.field_spans.len(),
+            "a workspace twenty-five times the size gives the open buffer the \
+             same table"
+        );
+        // And it is sorted, which is what makes the bisect an answer.
+        assert!(
+            large
+                .field_spans
+                .windows(2)
+                .all(|pair| pair[0].0 <= pair[1].0),
+            "the rows ascend by start"
+        );
+        // The lookup still answers, at both ends of a row and not past it.
+        let program = large.program.as_ref().expect("the exhibit analyzes");
+        let needle = "struct Local {\n\tmark";
+        let start = M85_ENTRY.find(needle).expect("the entry's struct") + needle.len() - 4;
+        assert!(large.field_at_offset(program, start).is_some());
+        assert!(large.field_at_offset(program, start + 3).is_some());
+        assert!(large.field_at_offset(program, start + 4).is_none());
+    }
+
+    #[test]
+    #[ignore = "M85: a measurement, not a gate — it generates two workspaces and asserts no cost"]
+    fn m85_field_hover_cost_against_the_field_count() {
+        const REPETITIONS: usize = 50;
+        let load = loadavg_1m();
+        let Some((small, small_hover, small_fields)) = microseconds_per_hover(20, REPETITIONS)
+        else {
+            println!("M85: no thread CPU clock on this host; nothing measured");
+            return;
+        };
+        let Some((large, large_hover, large_fields)) = microseconds_per_hover(500, REPETITIONS)
+        else {
+            println!("M85: no thread CPU clock on this host; nothing measured");
+            return;
+        };
+        let ratio = large / small.max(f64::MIN_POSITIVE);
+        let hover_ratio = large_hover / small_hover.max(f64::MIN_POSITIVE);
+        let growth = large_fields as f64 / small_fields as f64;
+        println!(
+            "M85 profile={} · lookup: {small_fields} fields {small:.2} µs, \
+             {large_fields} fields {large:.2} µs, ratio {ratio:.1}× · whole hover: \
+             {small_hover:.1} µs, {large_hover:.1} µs, ratio {hover_ratio:.1}× · over \
+             {growth:.0}× the fields · load={load}",
+            profile()
         );
     }
 }

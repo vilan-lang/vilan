@@ -5,26 +5,26 @@
 // `fetch(url)` is a GET shorthand. For another method, a request body, or headers,
 // build a request with `get`/`post`, chain `.header(..)`, and `.send()` it.
 //
-// `fetch`/`send` and `Response::text` are async (the host returns promises), so calls
-// to them are implicitly awaited.
+// `fetch`/`send` and `Response::text` are async (the host returns promises), so
+// calls to them are implicitly awaited.
 
 import pkg::bytes::{ ByteBuffer, Bytes, bytes_of_buffer };
-import pkg::option::Option::{ None, Some, self };
+import pkg::option::Option::{ self, None, Some };
 import pkg::task::{ CancelSignal, ambient_signal };
 
-external struct Response;
+export external struct Response;
 
-/// GET `url` and await the response. Inside a nursery's dynamic extent the
-/// request carries the ambient cancel signal (the structural bridge), so
-/// cancellation aborts it in flight.
-fun fetch(url: str): Response {
+/// GET `url` and await the response. Inside a nursery's dynamic extent the request
+/// carries the ambient cancel signal (the structural bridge), so cancellation
+/// aborts it in flight.
+export fun fetch(url: str): Response {
 	let options = new_request_init();
 	attach_ambient_signal(options);
 	fetch_with(url, options)
 }
 
-/// Attach the ambient nursery's cancel signal to a request init, if there is
-/// one — every request built by this module goes through here.
+/// Attach the ambient nursery's cancel signal to a request init, if there is one —
+/// every request built by this module goes through here.
 fun attach_ambient_signal(options: RequestInit) {
 	match ambient_signal() {
 		Some(let signal) => options.set_signal(signal),
@@ -32,7 +32,7 @@ fun attach_ambient_signal(options: RequestInit) {
 	}
 }
 
-impl Response {
+export impl Response {
 	/// The HTTP status code (e.g. 200).
 	[extern(get, "status")]
 	external fun status(self): i32;
@@ -49,7 +49,33 @@ impl Response {
 	fun bytes(self): Bytes {
 		bytes_of_buffer(self.raw_body())
 	}
+
+	/// One response header, case-insensitively, or `None` when the response does
+	/// not carry it.
+	///
+	/// The host `Headers` object is not a plain object — its entries are not
+	/// own properties — so this is glue (`__response_header`,
+	/// `transformer.rs`) rather than the `JsonValue` read
+	/// `std::http::Request::header` does on node's request object. `Headers`
+	/// already lowercases what it is asked for, which is why nothing is done
+	/// to `name` here.
+	///
+	/// A header that is PRESENT with an empty value reads back as `None`, and that
+	/// is deliberate rather than a rounding: the two are the same fact to a caller
+	/// deciding what a body is, and distinguishing them would cost a second host
+	/// call for a case no HTTP header meaningfully has.
+	fun header(self, name: str): Option<str> {
+		let value = raw_response_header(self, name);
+		if value == "" {
+			None
+		} else {
+			Some(value)
+		}
+	}
 }
+
+[extern("__response_header")]
+external fun raw_response_header(response: Response, name: str): str;
 
 // --- Streaming responses -------------------------------------------------------
 
@@ -67,23 +93,23 @@ external struct BodyReader;
 /// One `reader.read()` result: `{ done, value }`.
 external struct ChunkResult;
 
-impl Response {
+export impl Response {
 	[extern(get, "body")]
 	external fun body_stream(self): BodyStream;
 }
 
-impl BodyStream {
+export impl BodyStream {
 	[extern(method, "getReader")]
 	external fun reader(self): BodyReader;
 }
 
-impl BodyReader {
+export impl BodyReader {
 	/// Await the next chunk; `finished()` turns true once the stream closes.
 	[extern(method, "read")]
 	async external fun read_chunk(self): ChunkResult;
 }
 
-impl ChunkResult {
+export impl ChunkResult {
 	[extern(get, "done")]
 	external fun finished(self): bool;
 
@@ -96,13 +122,13 @@ impl ChunkResult {
 /// One request header. A two-field struct lowers to the `[name, value]` array that
 /// the host `fetch` accepts as a headers entry, so `List<Header>` is a valid
 /// `HeadersInit` with no conversion.
-struct Header {
+export struct Header {
 	name: str,
 	value: str,
 }
 
-/// The host `fetch` init object — `{ method, headers, body }` — built up via setters.
-/// It's an opaque host value (like a DOM node), not a vilan struct.
+/// The host `fetch` init object — `{ method, headers, body }` — built up via
+/// setters. It's an opaque host value (like a DOM node), not a vilan struct.
 external struct RequestInit;
 
 /// `Object()` returns a fresh empty `{}` to fill in.
@@ -133,7 +159,7 @@ impl RequestInit {
 async external fun fetch_with(url: str, options: RequestInit): Response;
 
 /// A request being built: its method + URL, an optional body, and headers.
-struct Request {
+export struct Request {
 	url: str,
 	method: str,
 	body: str,
@@ -141,29 +167,52 @@ struct Request {
 }
 
 /// Start a GET request.
-fun get(url: str): Request {
-	Request { url = url, method = "GET", body = "", headers = [] }
+export fun get(url: str): Request {
+	Request { url, method = "GET", body = "", headers = [] }
 }
 
 /// Start a POST request carrying `body`.
-fun post(url: str, body: str): Request {
-	Request { url = url, method = "POST", body = body, headers = [] }
+export fun post(url: str, body: str): Request {
+	Request { url, method = "POST", body, headers = [] }
 }
 
-/// A one-shot binary POST (no header chaining): send `body` as bytes and await
-/// the response — the byte-capable leg of the RPC transport (§6.2).
-fun post_bytes(url: str, body: Bytes): Response {
+/// A one-shot binary POST (no header chaining): send `body` as bytes and await the
+/// response — the byte-capable leg of the RPC transport (§6.2).
+///
+/// It sends no `Content-Type`, and the host's default for a `Uint8Array` body is
+/// none at all. `post_bytes_typed` is the same call with one, which is what a
+/// server that requires a media type needs (`transport-rpc.md` §9.7.9).
+export fun post_bytes(url: str, body: Bytes): Response {
+	post_bytes_with_headers(url, body, [])
+}
+
+/// `post_bytes` with a declared `Content-Type`.
+export fun post_bytes_typed(url: str, body: Bytes, media_type: str): Response {
+	if media_type == "" {
+		post_bytes_with_headers(url, body, [])
+	} else {
+		post_bytes_with_headers(url, body, [Header { name = "Content-Type", value = media_type }])
+	}
+}
+
+/// `post_bytes` with the request's headers written out — a `Content-Type`, a
+/// credential, anything the server reads. The one-shot binary POST that
+/// `std::rpc`'s `HeaderedHttpTransport` sends every binary frame through.
+export fun post_bytes_with_headers(url: str, body: Bytes, headers: List<Header>): Response {
 	let options = new_request_init();
 	options.set_method("POST");
 	options.set_body_bytes(body);
+	if headers.len() > 0 {
+		options.set_headers(headers);
+	}
 	attach_ambient_signal(options);
 	fetch_with(url, options)
 }
 
-impl Request {
+export impl Request {
 	/// Add a request header (e.g. `Content-Type`, `Authorization`).
 	fun header(own self, name: str, value: str): Request {
-		self.headers.push(Header { name = name, value = value });
+		self.headers.push(Header { name, value });
 		self
 	}
 

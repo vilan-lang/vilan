@@ -1,9 +1,16 @@
 # The Node member of the workspace, and the one `vilan run .` starts. It depends
 # on the same `common` library the browser member does; each member declares the
 # dependency for itself.
+#
+# The base set, which is also what omitting `prelude` means: this member is a
+# process program and `src/main.vl` wants nothing from the web set. Note that it
+# differs from the browser member's — a package's ambient scope is its own
+# (`proposal/prelude.md` §7), and `common`, which both members import, resolves
+# under the prelude ITS manifest declares rather than either consumer's.
 [package]
 name = "server"
 target = "node"
+prelude = "std::prelude"
 
 [package.dependencies]
 common = { path = "../common" }

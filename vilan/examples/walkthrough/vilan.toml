@@ -7,8 +7,19 @@
 #   vilan build .           compiles both entries into dist/
 #   vilan run .             builds, then starts the server
 #                           → http://localhost:4600
+#
+# `prelude` names the ambient scope every file in the package resolves under —
+# the names in scope with no import (`proposal/prelude.md` §5). It is a PACKAGE
+# key, so both entries share it: `std::web` is the application set — the base
+# seven (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) plus `Signal`,
+# `SignalCell`, `view` and `View`, plus the MODULES `style` and `ui`. Every one
+# of those names is base-layer or declared by both platform layers, so the node
+# entry loses nothing by sharing the browser entry's prelude, and `src/store.vl`
+# — server-colored, full of `Option` and `SignalCell` — is where you can see it.
+# Omit the key for the base set; `false` turns it off.
 [package]
 name = "notes"
+prelude = "std::web"
 
 [entry.client]
 target = "browser"

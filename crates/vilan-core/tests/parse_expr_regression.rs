@@ -40,7 +40,7 @@ fn expression_subtree(fixture: &str) -> Option<String> {
     let wrapped = format!("let __probe = {fixture};");
     let tree = parse_clean(&wrapped)?;
     let (first, _) = tree.0.first()?;
-    if let Node::Let(_, _, Some(value), _) = first {
+    if let Node::Let(_, _, Some(value), _, _, _) = first {
         Some(format!("{value:?}"))
     } else {
         None
@@ -218,11 +218,20 @@ fn the_postfix_chain_and_lift_grouping_are_pinned() {
 fn element_atoms_are_pinned() {
     // The element form's parse shape, span-inclusive (element-syntax S2): one
     // attribute head item, one string child. The desugar-critical structure —
-    // head item kinds, child list, tag span — is all visible here.
+    // head item kinds, child list, tag span — is all visible here, and so are
+    // the four angle-bracket spans the editor paints from (E115): `<` at
+    // 14..15, the head's `>` at 27..28, `</` at 32..34 and its `>` at 35..36.
     snapshot("<p class(\"x\")>\"hi\"</p>", SNAP_ELEMENT);
+    // A46: the FRAGMENT's parse shape beside it — the same body with the two
+    // names absent (`tag`/`close_tag` are `None`, which is what makes a
+    // fragment a fragment) and an empty head, since `<>` has nowhere to put
+    // one. Its four angle-bracket spans are the pair `<>` and the pair `</>`.
+    snapshot("<><i>\"a\"</i></>", SNAP_FRAGMENT);
 }
 
-const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: 15..16, head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [Bare((String(\"hi\"), 28..32))], self_closing: false, close_tag: Some(34..35) }), 14..36)";
+const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: Some(15..16), head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [Bare((String(\"hi\"), 28..32))], self_closing: false, close_tag: Some(34..35), punctuation: [14..15, 27..28, 32..34, 35..36] }), 14..36)";
+
+const SNAP_FRAGMENT: &str = "(Element(ElementBody { tag: None, head: [], children: [Bare((Element(ElementBody { tag: Some(17..18), head: [], children: [Bare((String(\"a\"), 19..22))], self_closing: false, close_tag: Some(24..25), punctuation: [16..17, 18..19, 22..24, 25..26] }), 16..26))], self_closing: false, close_tag: None, punctuation: [14..15, 15..16, 26..28, 28..29] }), 14..29)";
 
 #[test]
 fn the_is_tier_and_condition_heads_are_pinned() {
@@ -285,10 +294,346 @@ const SNAP_IS_BIND_TUPLE: &str = "(Is((Accessor(\"x\"), 14..15), (Variant([\"Som
 const SNAP_COND_BIT_EQ: &str = "(Binary(Eq, (Binary(BitAnd, (Accessor(\"flag\"), 3..7), (Accessor(\"mask\"), 10..14)), 3..14), (Number(\"0\", None, None), 18..19)), 3..19)";
 const SNAP_COND_SHL_GT: &str = "(Binary(Gt, (Binary(Shl, (Accessor(\"a\"), 3..4), (Number(\"2\", None, None), 8..9)), 3..9), (Accessor(\"b\"), 12..13)), 3..13)";
 const SNAP_COND_IS_OR: &str = "(Binary(Or, (Is((Accessor(\"a\"), 3..4), (Variant([\"None\"], None), 8..12)), 3..12), (Is((Accessor(\"b\"), 16..17), (Variant([\"None\"], None), 21..25)), 16..25)), 3..25)";
-const SNAP_COND_PAREN_STRUCT: &str = "(StructInitializer(\"Foo\", None, ([((\"x\", Some((Number(\"1\", None, None), 14..15))), 10..15)], 8..17)), 4..17)";
+const SNAP_COND_PAREN_STRUCT: &str = "(StructInitializer([], (\"Foo\", 4..7), None, ([((\"x\", Some((Number(\"1\", None, None), 14..15))), 10..15)], 8..17)), 4..17)";
+
+// ---------------------------------------------------------------------------
+// 4. Located decliner messages — the shapes whose WORDING is the contract
+// ---------------------------------------------------------------------------
+
+/// The rendered diagnostics of `source`, each paired with the source text its
+/// span covers — so a pin holds the anchor as well as the wording.
+fn diagnostics_at(source: &str) -> Vec<(String, String)> {
+    parsing::parse(source)
+        .1
+        .iter()
+        .map(|error| {
+            let range = error.span.into_range();
+            (
+                parsing::render(error),
+                source[range.start..range.end].to_string(),
+            )
+        })
+        .collect()
+}
+
+/// E135. `a::` is in the decliner corpus above, which only asserts that SOMETHING
+/// was reported; the message is the point. An unfinished path used to roll its
+/// `::` back, leaving the enclosing statement to complain about a missing `;` at
+/// the operator — a true statement about a program nobody wrote, and one that
+/// never named the thing that is actually absent.
+#[test]
+fn an_unfinished_path_names_the_missing_name() {
+    assert_eq!(
+        diagnostics_at("let __probe = a::;"),
+        vec![(
+            "found ';' expected a name after `::`".to_string(),
+            ";".to_string()
+        )],
+    );
+}
+
+/// E135, the two shapes the owner hit while migrating kolt. Each is ONE parse
+/// error, anchored on the token standing where the name should be.
+///
+/// The first is the face that used to report `expected ';' to end this
+/// statement` on the `::` — the element on the next line read as a comparison
+/// once the `::` rolled back, and the whole statement degenerated. The second is
+/// the same mistake terminated on its own line.
+///
+/// E142 sharpened the FIRST of the two. Its `<` is on the line below the `::`,
+/// so the line rule now recognizes it before the missing-name arm does, and
+/// says the more specific thing: the name is not missing, it is on another
+/// line. The second pin — terminated on its own line — still carries E135's
+/// own message, which is the pair working exactly as intended.
+#[test]
+fn an_unfinished_path_before_an_element_reports_once_at_the_element() {
+    let source = "fun panel(): View {\n\tlet x = style::\n\t<div class(\"panel\")></div>\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(
+            A_NAME_ON_THIS_LINE.replace("found 'print'", "found '<'"),
+            "<".to_string()
+        )],
+    );
+}
+
+#[test]
+fn an_unfinished_path_reports_once_when_the_statement_is_terminated() {
+    let source = "fun panel(): View {\n\tlet x = style::;\n\t<div></div>\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(
+            "found ';' expected a name after `::`".to_string(),
+            ";".to_string()
+        )],
+    );
+}
+
+/// B238's census, standing. The report was that `disabled` cannot be used as a
+/// binding name; it can, in every position, and no lexer or parser table claims
+/// it — the only table in the compiler holding the word is the FORMATTER's
+/// `STYLE_CONDITION_METHODS`, which sorts a `.name(…)` chain link and never
+/// looks at an identifier. What the report was really asking for is a gate, so
+/// this is one: every word the compiler matches BY TEXT outside the keyword
+/// table must still lex and parse as an ordinary name.
+///
+/// The tables are read programmatically, so a word added to any of them is
+/// covered the day it lands, and a leak reds by name. A word that IS a keyword
+/// is skipped — that is a deliberate reservation, and `grammar_ebnf` is what
+/// holds the keyword list itself.
+fn table_words() -> Vec<(&'static str, &'static str)> {
+    use vilan_core::formatter::{
+        STYLE_BARRIER_METHODS, STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS,
+        STYLE_PROPERTY_METHODS,
+    };
+    let mut words: Vec<(&str, &str)> = Vec::new();
+    for marker in vilan_core::parsing::KNOWN_ATTRIBUTE_MARKERS {
+        words.push((marker, "an attribute marker"));
+    }
+    for method in STYLE_PROPERTY_METHODS {
+        words.push((method.name, "a style property method"));
+    }
+    for (name, _) in STYLE_CONDITION_METHODS {
+        words.push((name, "a style condition method"));
+    }
+    for name in STYLE_BARRIER_METHODS {
+        words.push((name, "a style barrier method"));
+    }
+    for (name, _) in STYLE_BREAKPOINT_WIDTHS {
+        words.push((name, "a style breakpoint"));
+    }
+    // The contextual words the parser matches by text, and the one the report
+    // named. `as` is E142's import alias; `on` opens an element event; `context`
+    // and `sync` mark a closure type; `hidden` is `[doc(hidden)]`'s argument.
+    for word in [
+        "as", "on", "context", "sync", "hidden", "retains", "disabled",
+    ] {
+        words.push((word, "a contextual word"));
+    }
+    let keywords: Vec<&str> = vilan_core::lexing::KEYWORDS
+        .iter()
+        .map(|(word, _)| *word)
+        .collect();
+    words.retain(|(word, _)| !keywords.contains(word));
+    words.sort();
+    words.dedup();
+    words
+}
+
+#[test]
+fn b238_every_table_word_is_still_an_ordinary_identifier() {
+    let words = table_words();
+    assert!(
+        words.len() > 40,
+        "the census needs the real tables, got {} words",
+        words.len()
+    );
+    let mut leaked: Vec<String> = Vec::new();
+    for (word, what) in &words {
+        for (position, source) in [
+            ("a binding", format!("fun main() {{ let {word} = 1; }}")),
+            (
+                "a field",
+                format!("struct S {{ {word}: i32 }}\nfun main() {{ let s = S {{ {word} = 1 }}; }}"),
+            ),
+            ("a function", format!("fun {word}(): i32 {{ 1 }}")),
+            (
+                "a parameter",
+                format!("fun take({word}: i32): i32 {{ {word} }}"),
+            ),
+        ] {
+            if parse_clean(&source).is_none() {
+                leaked.push(format!("`{word}` ({what}) is not usable as {position}"));
+            }
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "{} table word(s) leaked into identifier position: {leaked:#?}",
+        leaked.len()
+    );
+}
+
+#[test]
+fn b238_the_census_is_non_vacuous() {
+    // The same four positions with a real KEYWORD in them: every one must
+    // decline, or the census above proves nothing.
+    for word in ["match", "is", "with", "let"] {
+        let sources = [
+            format!("fun main() {{ let {word} = 1; }}"),
+            format!("struct S {{ {word}: i32 }}\nfun main() {{ let s = S {{ {word} = 1 }}; }}"),
+            format!("fun {word}(): i32 {{ 1 }}"),
+            format!("fun take({word}: i32): i32 {{ {word} }}"),
+        ];
+        assert!(
+            sources.iter().all(|source| parse_clean(source).is_none()),
+            "`{word}` is a keyword and must not parse as a name",
+        );
+    }
+}
+
+/// E142. E135's UNFIXED face: `style::` at the end of a line and `print(..)` on
+/// the next is the perfectly legal path `style::print`, so the parser read the
+/// following statement as this one's tail and swallowed it — no diagnostic
+/// could exist, because nothing was wrong. A `::` path may not cross a line
+/// break, which is what turns the swallow into something the parser can see.
+///
+/// The census that made the rule free is in the lane report: zero lines end in
+/// `::` across the 228 `.vl` files of the tree, kolt's 25, and the book.
+const A_NAME_ON_THIS_LINE: &str = "found 'print' expected a name after `::` on the same line: \
+     a `::` path does not cross a line break, because `a::` at the end of a line joins whatever \
+     the next line starts with — join the line, or import the path under a shorter name \
+     (`import a::b::c as d;`) and write `d`";
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_an_expression() {
+    let source = "fun demo() {\n\tlet x = style::\n\tprint(\"swallowed\");\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(A_NAME_ON_THIS_LINE.to_string(), "print".to_string())],
+    );
+}
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_an_import() {
+    let source = "import std::io::\nprint;\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(A_NAME_ON_THIS_LINE.to_string(), "print".to_string())],
+    );
+}
+
+#[test]
+fn a_path_on_one_line_is_untouched_by_the_rule() {
+    // The control the rule must not eat: the same two paths, joined. Both parse
+    // clean, so the rule is about the LINE BREAK and nothing else.
+    assert!(
+        parse_clean("import std::io::print;\nfun demo() { let x = style::print; }\n").is_some()
+    );
+    // And a break INSIDE a brace set — which is not a `::` continuation — is
+    // still how a long import wraps.
+    assert!(parse_clean("import std::io::{\n\tprint,\n};\n").is_some());
+}
+
+/// E142's other half: `as` renames an import's leaf, and it is CONTEXTUAL — a
+/// module or item genuinely called `as` still parses, because the alias is only
+/// read where a segment has ended and a NAME follows.
+#[test]
+fn an_import_alias_parses_in_every_position_it_is_offered() {
+    for source in [
+        "import a::b::c as d;\n",
+        "import a as b;\n",
+        "import a::{ b as x, c };\n",
+        "import a::b::{ self as base, c as z };\n",
+        "use a::B::{ C as Alias };\n",
+        "export import a::b as c;\n",
+    ] {
+        assert!(parse_clean(source).is_some(), "{source:?} should parse");
+    }
+    // `as` is not a keyword: it is still an ordinary name.
+    assert!(parse_clean("import a::as;\n").is_some());
+    assert!(parse_clean("fun demo() { let as = 1; }\n").is_some());
+    // An alias renames the LEAF, so it cannot be followed by more path.
+    assert!(parse_clean("import a::b as c::d;\n").is_none());
+    // And `as` with nothing after it is not an alias.
+    assert!(parse_clean("import a::b as;\n").is_none());
+}
+
+/// E136. A multi-value attribute is one mistake with one message, and the
+/// message belongs on the COMMA — in either element spelling.
+///
+/// The self-closing form always had it. The paired form did not: the comma arm
+/// declined the whole element, `parse_atom` fell back to element recovery, the
+/// enclosing statement then failed to parse around the `<`/`>` pair, and
+/// `attempt`'s `errors.truncate` threw the curated message away with the branch
+/// that produced it — leaving `expected ';'` on the tag.
+#[test]
+fn a_multi_value_attribute_reports_at_the_comma_in_both_element_spellings() {
+    let expected = "found ',' expected `)` (an attribute takes one value; \
+                    a chain link starts with `.`)"
+        .to_string();
+    assert_eq!(
+        diagnostics_at("let __probe = <div name(a, b)/>;"),
+        vec![(expected.clone(), ",".to_string())],
+    );
+    assert_eq!(
+        diagnostics_at("let __probe = <div name(a, b)></div>;"),
+        vec![(expected, ",".to_string())],
+    );
+}
 
 // The fixture arrays live in a SUBDIRECTORY, not beside this file: cargo makes a
 // test target out of every `tests/*.rs`, so a fixtures file at the top level was
 // also compiled as a target of its own — a binary with no tests in it, whose only
 // output was four "never used" warnings against the arrays this file consumes.
 include!("parse_expr_regression/fixtures.rs");
+
+/// E145. The `::` line rule at the two productions E142 left out: a TYPE PATH
+/// and a STRUCT-LITERAL HEAD, which probe both tokens before consuming the
+/// separator. Neither can swallow a following statement — the harm E142's rule
+/// was written for — so the extension buys consistency: one rule about where a
+/// path's next name may sit, rather than a rule with two exceptions. Both
+/// positions parsed the join CLEANLY before this (`style::` ⏎ `Style` was the
+/// annotation `style::Style`, with no diagnostic to see), and the census that
+/// made the rule free holds here too: zero lines end in `::` across the tree.
+///
+/// The rule reuses E142's ledger row — the expectation string is the same
+/// sentence, because the mistake and its two cures are the same.
+#[test]
+fn a_path_may_not_cross_a_line_break_in_a_type() {
+    let source = "fun demo(x: style::\n\tStyle): i32 { 0 }\n";
+    assert!(
+        parse_clean(source).is_none(),
+        "the annotation must not join"
+    );
+    let messages: Vec<String> = diagnostics_at(source)
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("a `::` path does not cross a line break")),
+        "expected the line rule, got {messages:?}",
+    );
+}
+
+#[test]
+fn a_path_may_not_cross_a_line_break_in_a_struct_literal_head() {
+    let source = "fun demo(): i32 {\n\tlet p = shapes::\n\tDot { x = 1 };\n\t0\n}\n";
+    assert_eq!(
+        diagnostics_at(source),
+        vec![(
+            A_NAME_ON_THIS_LINE.replace("found 'print'", "found 'Dot'"),
+            "Dot".to_string()
+        )],
+    );
+}
+
+#[test]
+fn a_qualified_type_and_literal_head_on_one_line_are_untouched() {
+    // The control the extension must not eat: the same two shapes, joined.
+    assert!(
+        parse_clean(
+            "mod style { struct Style { a: i32 } }\n\
+             fun demo(x: style::Style): i32 { 0 }\n"
+        )
+        .is_some()
+    );
+    assert!(
+        parse_clean(
+            "mod shapes { struct Dot { x: i32 } }\n\
+             fun demo(): i32 {\n\tlet p = shapes::Dot { x = 1 };\n\t0\n}\n"
+        )
+        .is_some()
+    );
+    // And a break inside the literal's BODY — which is not a `::`
+    // continuation — is how a wide literal wraps.
+    assert!(
+        parse_clean(
+            "mod shapes { struct Dot { x: i32 } }\n\
+             fun demo(): i32 {\n\tlet p = shapes::Dot {\n\t\tx = 1,\n\t};\n\t0\n}\n"
+        )
+        .is_some()
+    );
+}

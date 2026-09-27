@@ -166,8 +166,10 @@ CHANGELOG_AWK='
 function rank_of(family) {
     if (family == "breaking") return 1
     if (family == "miscompile") return 2
-    if (family == "feature") return 3
-    if (family == "tooling" || family == "diagnostics") return 4
+    if (family == "fix") return 3
+    if (family == "feature") return 4
+    if (family == "performance") return 5
+    if (family == "tooling" || family == "diagnostics") return 6
     return 0
 }
 function problem(message) {
@@ -224,7 +226,7 @@ function emit_section(   wanted, i, printed) {
             }
             return
         }
-        for (wanted = 1; wanted <= 4; wanted++)
+        for (wanted = 1; wanted <= 6; wanted++)
             for (i = 1; i <= count; i++)
                 if (rank_of(family[i]) == wanted) {
                     printf "E\t%d\t%s\t%s\t%s\n", wanted, family[i], dash(commit[i]), head[i]
@@ -234,7 +236,7 @@ function emit_section(   wanted, i, printed) {
     }
     if (refusals > 0) return
     printed = 0
-    for (wanted = 1; wanted <= 4; wanted++) {
+    for (wanted = 1; wanted <= 6; wanted++) {
         for (i = 1; i <= count; i++) {
             if (rank_of(family[i]) != wanted) continue
             printed++
@@ -616,10 +618,19 @@ say ""
 run sh scripts/bump-version.sh "$VERSION"
 say ""
 
-RELEASE_FILES="CHANGELOG.md Cargo.lock crates/vilan-cli/Cargo.toml
-crates/vilan-core/Cargo.toml crates/vilan-embedded-std/Cargo.toml
-crates/vilan-lsp/Cargo.toml crates/vilan-wasm/Cargo.toml crates/vilan-ide/Cargo.toml
-editors/vscode/package.json editors/vscode/package-lock.json"
+# Every file the bump rewrites, which is exactly what the release commit stages:
+# the CHANGELOG, the lockfile, EVERY workspace member's manifest — DERIVED, the
+# way `bump-version.sh` derives the set it rewrites, because a named list goes
+# stale the day a crate joins the workspace (it did: `vilan-rt`,
+# `vilan-rt-sqlite` and `vilan-rust` were bumped and never staged, so a
+# `--commit` cut would have tagged a tree whose three manifests still said the
+# old version) — and the extension's two. `release_scripts.rs` holds this to
+# the workspace's `members`.
+release_files() {
+    printf '%s\n' CHANGELOG.md Cargo.lock crates/*/Cargo.toml \
+        editors/vscode/package.json editors/vscode/package-lock.json
+}
+RELEASE_FILES="$(release_files)"
 
 if [ "$DO_COMMIT" = 1 ]; then
     counts="$(awk -F"$TAB" '$1 == "E" { seen[$3]++ }

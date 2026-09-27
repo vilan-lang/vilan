@@ -40,7 +40,7 @@
 //! an unranked pair that reached emission answers exactly as it did before
 //! rather than turning a reported program into a second failure.
 
-use crate::analyzer::{Implementation, Program};
+use crate::analyzer::{Implementation, Program, SourceId};
 use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 use crate::type_::{Type, TypeId};
@@ -161,10 +161,91 @@ fn provides_trait(program: &Program, type_id: TypeId, trait_id: Id) -> bool {
     if !is_resolvable(type_) {
         return true;
     }
+    // A124 R3: a trait OBJECT provides the trait it was erased to and that
+    // trait's supertraits — its table is the implementation, and no impl
+    // subject names it. That is what lets a blanket `impl type S: Src with
+    // Loud` apply to a `dyn Src`, with `S` bound to the object.
+    if let Type::Dyn(object_trait_id, _) = type_
+        && object_provides(program, *object_trait_id, trait_id)
+    {
+        return true;
+    }
+    // A question already being asked further up this proof is NOT evidence
+    // for itself. `trait Feed<T> with Source<List<T>>` beside
+    // `impl type S: Source<List<type T>> with Feed<T>` makes the blanket a
+    // provider of `Source` (a supertrait comes with the trait), and whether
+    // it applies to a type is whether that type provides `Source` — the
+    // question that reached it. Asked again it recursed until the stack was
+    // gone, aborting every program that imported the module declaring the
+    // pair. The cycle proves nothing, so it answers no, and the type's OTHER
+    // providers decide: a cell with its own `Source` impl still provides it,
+    // and a type with none still does not.
+    let Some(_proving) = ProvingGuard::enter(type_id, trait_id) else {
+        return false;
+    };
     program.implementations.iter().any(|implementation| {
         provided_trait_ids(program, implementation).contains(&trait_id)
             && subject_applies(program, implementation.subject, type_id)
     })
+}
+
+thread_local! {
+    /// The `(type, trait)` questions [`provides_trait`] is answering on this
+    /// thread, innermost last — the proof's own stack, so a question that
+    /// reaches itself is seen as the cycle it is.
+    static PROVING: std::cell::RefCell<Vec<(TypeId, Id)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One `(type, trait)` question held open on [`PROVING`] for as long as the
+/// guard lives; `None` when that question is already open further up.
+struct ProvingGuard;
+
+impl ProvingGuard {
+    fn enter(type_id: TypeId, trait_id: Id) -> Option<ProvingGuard> {
+        PROVING.with(|proving| {
+            let mut proving = proving.borrow_mut();
+            if proving.contains(&(type_id, trait_id)) {
+                return None;
+            }
+            proving.push((type_id, trait_id));
+            Some(ProvingGuard)
+        })
+    }
+}
+
+impl Drop for ProvingGuard {
+    fn drop(&mut self) {
+        PROVING.with(|proving| {
+            proving.borrow_mut().pop();
+        });
+    }
+}
+
+/// Whether an object over `object_trait_id` provides `trait_id`: the trait
+/// itself, or one of its supertraits.
+fn object_provides(program: &Program, object_trait_id: Id, trait_id: Id) -> bool {
+    let mut stack = vec![object_trait_id];
+    let mut seen: Vec<Id> = Vec::new();
+    while let Some(id) = stack.pop() {
+        if id == trait_id {
+            return true;
+        }
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        if let Some(trait_) = program.traits.get(&id) {
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Whether `subject` — an impl subject, in the impl's own generic terms —
@@ -181,6 +262,69 @@ pub fn subject_applies(program: &Program, subject: TypeId, target: TypeId) -> bo
         bound_trait_ids(program, *constraint_id)
             .iter()
             .all(|trait_id| provides_trait(program, *bound_type, *trait_id))
+    })
+}
+
+/// [`subject_applies`], with each binder's PARAMETERIZED bounds read at their
+/// own arguments (B268).
+///
+/// `bound_trait_ids` keeps the bound's trait id and drops its arguments, so
+/// every blanket over a parameterized trait applied to every instantiation of
+/// it: `impl type S: Source<str> with Slot` applied to a `SignalCell<View>`,
+/// and a `Signal<View>` in child position was placed by std's TEXT arm — the
+/// DOM taking the view's runtime shape, `[object Object]`.
+///
+/// Used only by [`applying_implementations`], and only as a NARROWING pass
+/// there: the analyzer's own bound check threads no arguments through a
+/// supertrait match (`satisfies_trait_bound`, v1), so a program it admitted
+/// must still find a body here. The public [`subject_applies`] stays at the
+/// trait id, which is what its other callers ask of it.
+fn subject_applies_at_arguments(program: &Program, subject: TypeId, target: TypeId) -> bool {
+    if !subject_applies(program, subject, target) {
+        return false;
+    }
+    let mut bindings = HashMap::default();
+    bind_subject(program, subject, target, &mut bindings);
+    bindings.iter().all(|(constraint_id, bound_type)| {
+        bound_type_ids(program, *constraint_id)
+            .iter()
+            .all(|bound_id| match program.type_id_to_type_map.get(bound_id) {
+                Some(Type::Trait(trait_id, bound_arguments)) => {
+                    bound_arguments_hold(program, *bound_type, *trait_id, bound_arguments)
+                }
+                _ => true,
+            })
+    })
+}
+
+/// Whether `concrete` provides `trait_id` AT `wanted` — the bound's own
+/// arguments. Lenient wherever it cannot tell, like [`instantiation_agrees`]
+/// itself: an unparameterized bound, a receiver with no impl of the trait in
+/// view, an arity mismatch, and a bound argument that is still a binder
+/// (`type S: Source<type T>`) all keep the impl.
+fn bound_arguments_hold(
+    program: &Program,
+    concrete: TypeId,
+    trait_id: Id,
+    wanted: &[TypeId],
+) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    let Some(provided) = provided_trait_arguments(program, concrete, trait_id) else {
+        return true;
+    };
+    if provided.len() != wanted.len() {
+        return true;
+    }
+    wanted.iter().zip(provided).all(|(wanted_id, provided_id)| {
+        match (
+            program.type_id_to_type_map.get(wanted_id),
+            program.type_id_to_type_map.get(&provided_id),
+        ) {
+            (Some(wanted), Some(provided)) => instantiation_agrees(program, wanted, provided),
+            _ => true,
+        }
     })
 }
 
@@ -238,19 +382,47 @@ fn bounds_are_stronger(program: &Program, stronger: TypeId, weaker: TypeId) -> b
     }
     let mut strictly = false;
     for (stronger_id, weaker_id) in stronger_binders.iter().zip(weaker_binders.iter()) {
-        let stronger_bounds = bound_trait_ids(program, *stronger_id);
-        let weaker_bounds = bound_trait_ids(program, *weaker_id);
+        let stronger_bounds = bound_trait_closure(program, *stronger_id);
+        let weaker_bounds = bound_trait_closure(program, *weaker_id);
         if !weaker_bounds
             .iter()
             .all(|trait_id| stronger_bounds.contains(trait_id))
         {
             return false;
         }
-        if stronger_bounds.len() > weaker_bounds.len() {
+        if stronger_bounds
+            .iter()
+            .any(|trait_id| !weaker_bounds.contains(trait_id))
+        {
             strictly = true;
         }
     }
     strictly
+}
+
+/// A binder's declared bounds CLOSED over the supertrait graph — the emission
+/// side's copy of the analyzer's `bound_trait_closure` (B378), so a subtrait
+/// bound outranks its supertrait bound here exactly as it does at check time.
+/// The two must agree: a program the analyzer ranks and this does not would
+/// dispatch to the loser's body.
+fn bound_trait_closure(program: &Program, constraint_id: TypeId) -> Vec<Id> {
+    let mut closure = Vec::new();
+    let mut pending = bound_trait_ids(program, constraint_id);
+    while let Some(trait_id) = pending.pop() {
+        if closure.contains(&trait_id) {
+            continue;
+        }
+        closure.push(trait_id);
+        let Some(trait_) = program.traits.get(&trait_id) else {
+            continue;
+        };
+        for supertrait in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, _)) = program.type_id_to_type_map.get(supertrait) {
+                pending.push(*super_id);
+            }
+        }
+    }
+    closure
 }
 
 /// The specificity order over two impl subjects (tier 3): shape first, then
@@ -277,6 +449,14 @@ pub fn subject_outranks(program: &Program, subject: TypeId, other: TypeId) -> bo
 /// concrete `type_id` (`List<i32>`), accumulating `{T -> i32}`. Recurses
 /// through nominal arguments, tuples, arrays, and closures so a nested
 /// parameter (`List<List<T>>` -> `T = i32`) is reached.
+///
+/// It matches [`Type::Generic`] and nothing else, and that is COMPLETE rather
+/// than a happy path: `Generic(constraint)` is the one spelling a parameter has
+/// in a nominal declaration's body (B366, the invariant is written at
+/// [`Type::Generic`] and gated by `tests/nominal_generic_spelling.rs`). A walk
+/// that also accepted a bare constraint id would be defending against a
+/// spelling the analyzer does not mint — which is what the emit-Rust backend's
+/// own copy of this walk did, and what the gate lets it stop doing.
 pub fn bind_subject(
     program: &Program,
     pattern: TypeId,
@@ -316,9 +496,11 @@ pub fn bind_subject(
         (Type::Array(pattern_element, _), Type::Array(concrete_element, _)) => {
             bind_subject(program, pattern_element, concrete_element, out);
         }
+        // B309: a clause binds no generic — it names context BINDINGS, not
+        // types — so impl-argument recovery walks the shape and ignores it.
         (
-            Type::Closure(pattern_parameters, pattern_return),
-            Type::Closure(concrete_parameters, concrete_return),
+            Type::Closure(pattern_parameters, pattern_return, _),
+            Type::Closure(concrete_parameters, concrete_return, _),
         ) => {
             zip_arguments(out, &pattern_parameters, &concrete_parameters);
             bind_subject(program, pattern_return, concrete_return, out);
@@ -346,10 +528,35 @@ fn ground(program: &Program, type_id: TypeId, bindings: &HashMap<TypeId, TypeId>
 /// treated as agreeing — the same leniency the transformer's older
 /// `trait_instantiation_conflicts` applied, so a program whose arguments were
 /// already unambiguous keeps its answer.
+///
+/// A TUPLE and an ARRAY compare element-wise too (B410). Their element types
+/// are ids, minted per spelling and never interned, so the bare `left ==
+/// right` below compared two spellings of `(i32, i32)` by id and answered no:
+/// an impl providing `Src<(i32, i32)>` was turned down for exactly that
+/// instantiation, and a call through a `Src<T>` bound at `T = (i32, i32)` ran
+/// the trait's DEFAULT where the impl overrides it.
 fn instantiation_agrees(program: &Program, wanted: &Type, provided: &Type) -> bool {
+    // A walk that gives up proves nothing, so it answers NO.
+    let Some(_guard) = crate::util::RecursionGuard::enter() else {
+        return false;
+    };
     if !is_resolvable(wanted) || !is_resolvable(provided) {
         return true;
     }
+    let elements_agree = |left: &[TypeId], right: &[TypeId]| {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(wanted_id, provided_id)| {
+                match (
+                    program.type_id_to_type_map.get(wanted_id),
+                    program.type_id_to_type_map.get(provided_id),
+                ) {
+                    (Some(wanted), Some(provided)) => {
+                        instantiation_agrees(program, wanted, provided)
+                    }
+                    _ => true,
+                }
+            })
+    };
     match (wanted, provided) {
         (Type::Struct(left, left_arguments), Type::Struct(right, right_arguments))
         | (Type::Enum(left, left_arguments), Type::Enum(right, right_arguments)) => {
@@ -359,17 +566,16 @@ fn instantiation_agrees(program: &Program, wanted: &Type, provided: &Type) -> bo
             if left_arguments.is_empty() || right_arguments.is_empty() {
                 return true;
             }
-            left_arguments.len() == right_arguments.len()
-                && left_arguments.iter().zip(right_arguments).all(
-                    |(wanted_id, provided_id)| match (
-                        program.type_id_to_type_map.get(wanted_id),
-                        program.type_id_to_type_map.get(provided_id),
-                    ) {
-                        (Some(wanted), Some(provided)) => {
-                            instantiation_agrees(program, wanted, provided)
-                        }
-                        _ => true,
-                    },
+            elements_agree(left_arguments, right_arguments)
+        }
+        (Type::Tuple(left_elements), Type::Tuple(right_elements)) => {
+            elements_agree(left_elements, right_elements)
+        }
+        (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
+            left_length == right_length
+                && elements_agree(
+                    std::slice::from_ref(left_element),
+                    std::slice::from_ref(right_element),
                 )
         }
         (left, right) => left == right,
@@ -419,6 +625,23 @@ fn provides_wanted_instantiation(
         })
 }
 
+/// [`bind_subject`], then the binders the subject's BOUNDS introduce
+/// ([`bind_bound_binders`]) — everything an impl's body can name, grounded from
+/// one concrete receiver. An emitter that has to SPELL every type (the native
+/// one) needs the second half: `impl type S: Source<type T> with Upstream<T>`
+/// names `T` in its members' signatures, and `T` is written in `S`'s bound, not
+/// in the shape `S` matches. (Before B409 that `T` was `Source`'s own parameter
+/// id, which some other binding happened to ground.)
+pub fn bind_subject_and_bounds(
+    program: &Program,
+    subject: TypeId,
+    type_id: TypeId,
+    out: &mut HashMap<TypeId, TypeId>,
+) {
+    bind_subject(program, subject, type_id, out);
+    bind_bound_binders(program, subject, out);
+}
+
 /// Grounds the binders a subject's BOUNDS introduce (B165): in
 /// `impl type S: Src<type T> with Maybe<T>`, `S` binds from the receiver and
 /// `T` binds from the receiver's OWN `Src` implementation — `Cell: Src<i32>`
@@ -434,6 +657,12 @@ fn provides_wanted_instantiation(
 /// that was never a `Cell`, and printed `undefined`. A silent miscompile, and
 /// only expressible once a binder could be written inside a bound at all.
 fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap<TypeId, TypeId>) {
+    // The walk recurses through a BLANKET provider's own bounds
+    // (`provided_trait_arguments`), so it carries the shared depth guard; a
+    // walk that gives up binds nothing further.
+    let Some(_guard) = crate::util::RecursionGuard::enter() else {
+        return;
+    };
     let mut binders = Vec::new();
     collect_subject_binders(program, subject, &mut binders);
     for binder in binders {
@@ -455,8 +684,22 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
             if provided.len() != bound_arguments.len() {
                 continue;
             }
+            // What the subject itself bound is the receiver's own answer and
+            // is never overwritten by a bound's — a bound argument grounded no
+            // further than a provider's binder would otherwise replace the
+            // receiver's `i32` with that binder (B409's native half).
+            let mut from_bound = HashMap::default();
             for (pattern, actual) in bound_arguments.iter().zip(provided) {
-                bind_subject(program, *pattern, actual, bindings);
+                if matches!(
+                    program.type_id_to_type_map.get(&actual),
+                    Some(Type::Generic(_))
+                ) {
+                    continue;
+                }
+                bind_subject(program, *pattern, actual, &mut from_bound);
+            }
+            for (binder, value) in from_bound {
+                bindings.entry(binder).or_insert(value);
             }
         }
     }
@@ -494,6 +737,11 @@ fn provided_trait_arguments(
         }
         let mut bindings = HashMap::default();
         bind_subject(program, implementation.subject, concrete, &mut bindings);
+        // A BLANKET provider writes its arguments in its bound's binders
+        // (`impl type S: Source<type T> with Upstream<T>`): ground those from
+        // the receiver's own impls too, or `Upstream`'s argument comes back as
+        // the blanket's bare `T` (B379's analyzer half, here for emission).
+        bind_bound_binders(program, implementation.subject, &mut bindings);
         return Some(
             written
                 .iter()
@@ -522,9 +770,21 @@ fn ground_id(program: &Program, type_id: TypeId, bindings: &HashMap<TypeId, Type
 }
 
 /// Every implementation that applies to `concrete`, in declaration order,
-/// filtered by the caller's `wanted` trait instantiation when it has one.
+/// filtered by the caller's `wanted` trait instantiation when it has one and by
+/// the FILE the question is asked on behalf of.
+///
+/// **`file` is the per-importer namespace (B318 S4, `visibility.md` §3.3).** An
+/// impl the file's imports did not admit is not a candidate here at all — not
+/// merely a candidate that loses — because the whole point of the rule is that
+/// two independent packages may declare one method name for one type and a
+/// file that took only one of them must not be answered by the other. `None`
+/// means "no file to scope by", which is the honest answer for a caller that
+/// has none and is also what the estate always gets: nothing in it writes
+/// `only` or a selector, so [`crate::analyzer::ImplAdmission::admits_impl`]
+/// returns `true` without a lookup.
 pub fn applying_implementations<'a, 'src>(
     program: &'a Program<'src>,
+    file: Option<SourceId>,
     concrete: TypeId,
     wanted: Option<WantedTrait>,
 ) -> Vec<&'a Implementation<'src>> {
@@ -534,15 +794,44 @@ pub fn applying_implementations<'a, 'src>(
     if !is_resolvable(concrete_type) {
         return Vec::new();
     }
-    program
+    // B318 S4: the per-importer namespace. Asked once for the FILE here rather
+    // than once per registered block below — a file that restricts nothing has
+    // today's meaning and there is nothing to filter.
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
+    let by_instantiation: Vec<&Implementation> = program
         .implementations
         .iter()
+        .filter(|implementation| {
+            scope.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
+        })
         .filter(|implementation| match wanted {
             Some(wanted) => {
                 provides_wanted_instantiation(program, implementation, concrete, wanted)
             }
             None => true,
         })
+        .collect();
+    // Tier 1, at the bounds' own arguments (B268) — the pass that separates
+    // `impl type S: Source<str>` from `impl type S: Source<View>` on a
+    // `SignalCell<View>`.
+    let at_arguments: Vec<&Implementation> = by_instantiation
+        .iter()
+        .copied()
+        .filter(|implementation| {
+            subject_applies_at_arguments(program, implementation.subject, concrete)
+        })
+        .collect();
+    if !at_arguments.is_empty() {
+        return at_arguments;
+    }
+    // NARROWS, never empties — the same policy the analyzer's own
+    // `applicable_candidates` keeps. A bound's arguments are read more strictly
+    // here than in `satisfies_trait_bound`, which threads none through a
+    // supertrait match, so a program the analyzer admitted would otherwise
+    // resolve to its trait's body-less requirement and be reported as an
+    // internal error. It keeps the body it has always had instead.
+    by_instantiation
+        .into_iter()
         .filter(|implementation| subject_applies(program, implementation.subject, concrete))
         .collect()
 }
@@ -606,19 +895,65 @@ fn inherits_a_default(program: &Program, implementation: &Implementation, member
 /// declares nothing still outranks a blanket that does. Such a winner returns
 /// `None` — it has no member of its own, and the caller reaches its answer
 /// through the trait default, which is the same verdict by the same order.
+/// The maxima of the specificity order among the impls that DECLARE `member`
+/// for `concrete`, under `file`'s admitted set — what [`select_member`] picks
+/// its answer out of.
+///
+/// One maximum is the winner. TWO OR MORE is the unranked residue: nothing in
+/// the order separates them, so `select_member` takes the first in declaration
+/// order and the program's meaning becomes a function of which block was
+/// written first. That is precisely what B57 exists to prevent, and B330's
+/// call-site refusal is what reports it — the question it asks is this
+/// function's length, because only the SITE, which knows the receiver, can ask
+/// it at all.
+pub fn declaring_maxima<'a, 'src>(
+    program: &'a Program<'src>,
+    file: Option<SourceId>,
+    concrete: TypeId,
+    member: &str,
+) -> Vec<&'a Implementation<'src>> {
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
+    let contenders: Vec<&Implementation> = applying_implementations(program, file, concrete, None)
+        .into_iter()
+        .filter(
+            |implementation| match implementation.declarations.get(member) {
+                Some(member_id) => scope.is_none_or(|file| {
+                    program
+                        .impl_admission
+                        .admits_member(file, implementation, *member_id)
+                }),
+                None => false,
+            },
+        )
+        .collect();
+    maxima(program, &contenders)
+}
+
 pub fn select_member(
     program: &Program,
+    file: Option<SourceId>,
     concrete: TypeId,
     member: &str,
     wanted: Option<WantedTrait>,
 ) -> Option<SelectedMember> {
-    let contenders: Vec<&Implementation> = applying_implementations(program, concrete, wanted)
-        .into_iter()
-        .filter(|implementation| {
-            implementation.declarations.contains_key(member)
-                || inherits_a_default(program, implementation, member)
-        })
-        .collect();
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
+    let contenders: Vec<&Implementation> =
+        applying_implementations(program, file, concrete, wanted)
+            .into_iter()
+            .filter(|implementation| {
+                // B318 S4, one step finer than the block filter above: a
+                // `(impl T)::{ m }` selector takes ONE member out of a block,
+                // so a block this file admits may still not offer `member`.
+                match implementation.declarations.get(member) {
+                    Some(member_id) => scope.is_none_or(|file| {
+                        program
+                            .impl_admission
+                            .admits_member(file, implementation, *member_id)
+                    }),
+                    None => inherits_a_default(program, implementation, member),
+                }
+            })
+            .collect();
     let winner = *maxima(program, &contenders).first()?;
     Some(SelectedMember {
         member_id: *winner.declarations.get(member)?,
@@ -631,11 +966,13 @@ pub fn select_member(
 /// (which arguments it implements the trait at, say).
 pub fn select_implementation<'a, 'src>(
     program: &'a Program<'src>,
+    file: Option<SourceId>,
     concrete: TypeId,
     trait_id: Id,
 ) -> Option<&'a Implementation<'src>> {
     let applying = applying_implementations(
         program,
+        file,
         concrete,
         Some(WantedTrait {
             trait_id,
@@ -648,8 +985,8 @@ pub fn select_implementation<'a, 'src>(
 /// The traits a concrete type's applying implementations provide, most
 /// specific first — the search order for an INHERITED trait default, which no
 /// impl declares and which therefore cannot be found by [`select_member`].
-pub fn applying_trait_ids(program: &Program, concrete: TypeId) -> Vec<Id> {
-    let applying = applying_implementations(program, concrete, None);
+pub fn applying_trait_ids(program: &Program, file: Option<SourceId>, concrete: TypeId) -> Vec<Id> {
+    let applying = applying_implementations(program, file, concrete, None);
     let winners = maxima(program, &applying);
     winners
         .iter()

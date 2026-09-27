@@ -743,7 +743,7 @@ fn b126_a_nested_closures_rets_stay_on_the_closures_frame() {
         }
 
         fun main() {
-        	let y: i32 = outer(true);
+        	let y: usize = outer(true);
         	print(y);
         }
         "#,
@@ -853,19 +853,24 @@ fn b126_mutually_recursive_unannotated_functions_infer_together() {
     );
 }
 
-// B126 residue (2026-08-22), KNOWN, NOT FIXED: a self-call bound by a `let`
-// and read in the tail. The inference path does not read a `let` binding
-// through its initializer, so the tail `x + 1` is unresolved while `x`'s own
-// constraint is waiting on `g(n - 1)` — and the function's answer never
-// lands: "type of variable 'x' could not be resolved". Same on `next` before
-// the amendment. Asserts what SHOULD hold; goes green when the binding is
-// read through its initializer on the inference path.
+// --- B191 (B126's residue): a `let`-bound self-call in an unannotated body ----
+//
+// `fun g(n: i32) { if n == 0 { ret 1; } let x = g(n - 1); x + 1 }` deadlocked:
+// `x`'s own constraint waits on `g(n - 1)`, which waits on `g`'s inferred
+// return, which reads the tail `x + 1`, which read `x` — and a binding whose
+// type slot is still `Unknown` answered `Unresolved` rather than looking at
+// what it was bound TO. Nothing ever landed: "type of variable 'x' could not
+// be resolved", on the binding and on every caller.
+//
+// The direct-tail form (`g(n - 1) + 1`) always worked, because there the
+// self-call is read where it is written and the re-entrant ask answers
+// `never` — evidence that constrains nothing, which the other evidence (`ret
+// 1`) then decides. The fix gives the `let` the same reading: an unannotated
+// binding with no type yet is read THROUGH its initializer, which is the move
+// B185 gave `unfilled_closure_parameter` for closure parameters.
+
 #[test]
-#[ignore = "B126 residue, 2026-08-22: a self-call bound by a `let` and read in the tail \
-            (`let x = g(n - 1); x + 1`) in an unannotated recursive body still fails \
-            \"could not be resolved\" — a `let` binding is not read through its \
-            initializer on the inference path"]
-fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
+fn b191_a_let_bound_self_call_read_in_the_tail_resolves() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -884,6 +889,173 @@ fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
         }
         "#,
         "4\n",
+    );
+}
+
+#[test]
+fn b191_a_let_bound_self_call_read_in_a_ret_resolves() {
+    // The read need not be the tail — a `ret` is return evidence too, and it
+    // reached the binding by the same path.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = g(n - 1);
+        	ret x + 1;
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_a_let_bound_mutual_call_resolves() {
+    // The re-entrant ask is not only the direct self-call: `a` reaches itself
+    // through `b`, and the binding sits on that cycle exactly the same way.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun a(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = b(n - 1);
+        	x + 1
+        }
+
+        fun b(n: i32) {
+        	a(n)
+        }
+
+        fun main() {
+        	let y: i32 = a(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_a_chain_of_let_bindings_is_followed_to_the_self_call() {
+    // Rebindings count, for the reason B185 gives: `y`'s type is `Unknown`
+    // *because* `x`'s is, so the hop has to walk the chain rather than stop at
+    // the first binding.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = g(n - 1);
+        	let y = x;
+        	y + 1
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_the_direct_tail_form_still_resolves() {
+    // The control the item is measured against: the shape that always worked,
+    // and still gives the same answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	g(n - 1) + 1
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b191_an_annotated_binding_still_reads_its_annotation() {
+    // The hop is for a binding with nothing written on it. An annotation is
+    // the binding's own answer and outranks whatever the initializer would
+    // have said, so the hop must not reach past it — here the `u53` the
+    // literal alone would not have chosen.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun take(value: u53): u53 { value }
+
+        fun main() {
+        	let x: u53 = 7;
+        	print(take(x));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b191_a_binding_cycle_is_still_refused_rather_than_followed_forever() {
+    // Following initializers can meet a cycle — module bindings resolve in any
+    // order, so `let p = q; let q = p;` is writable. It stays the ordinary
+    // refusal; the walk does not chase it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        let p = q;
+        let q = p;
+
+        fun main() {
+        	print("ok");
+        }
+        "#,
+        "could not be resolved",
+    );
+}
+
+#[test]
+fn b191_a_let_bound_self_call_with_no_base_case_is_still_never() {
+    // The companion to `b126_a_function_that_only_calls_itself_is_never`: the
+    // hop hands the fold a `never`, which constrains nothing, so a body whose
+    // only evidence is itself keeps that answer through a `let`.
+    assert_compiles(
+        r#"
+        fun forever(n: i32) {
+        	let x = forever(n - 1);
+        	x
+        }
+
+        fun main() {
+        	if false {
+        		let y: i32 = forever(5);
+        	}
+        }
+        "#,
     );
 }
 
@@ -1445,26 +1617,26 @@ fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
     );
 }
 
-// `Signal::map<U>` — the shape the todo example annotates around; `sync |T|
-// U` binds the same way as `List::map`'s `|T| U`.
+// `Source::map<U>` — `sync |T| U` binds the same way as `List::map`'s `|T| U`.
+// Re-derived at A124 S2c: `map` answers a `Map<S, T, U>` node now, so the
+// expectation that binds `U` is the node's annotation (the pre-flip pin wrote
+// `SignalCell<i32>`, which a node is not). Written `count.map(..).cell()` under
+// a `SignalCell<i32>` annotation, the expectation stops at `.cell()`'s receiver
+// and the diagnostic is the plainer "Expected SignalCell<i32>, but got
+// SignalCell<void>" over the chain — no steer (reported with Order 42's finds).
 #[test]
 fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
     assert_fails_spanning_nth(
         r#"
         import std::io::print;
-        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+        import std::reactive::{ Map, Signal, SignalCell, Source };
 
         fun main() {
-        	let scope = Owner::new();
-        	let n = owner_scope.run(scope, || {
-        		let count = Signal::new(1);
-        		let doubled: SignalCell<i32> = count.map(|n| {
-        			n * 2;
-        		});
-        		doubled.get()
+        	let count: SignalCell<i32> = Signal::new(1);
+        	let doubled: Map<SignalCell<i32>, i32, i32> = count.map(|n| {
+        		n * 2;
         	});
-        	print(n);
-        	scope.dispose();
+        	print(doubled.get());
         }
         "#,
         "}",
@@ -2161,7 +2333,7 @@ fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
         fun main() {
         	mut points: List<Point> = List::new();
         	points.push(Point { x = 1, y = 10 });
-        	let widths: List<i32> = points.map(|point: str| point.len());
+        	let widths: List<usize> = points.map(|point: str| point.len());
         	print(widths.len());
         }
         "#;
@@ -2169,7 +2341,7 @@ fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
     assert_fails_spanning(
         source,
         "|point: str| point.len()",
-        "Expected |Point| i32, but got |str| i32 instead.",
+        "Expected |Point| usize, but got |str| usize instead.",
     );
 }
 
@@ -4006,7 +4178,7 @@ fn a_user_lift_container_dispatches_to_its_own_map_and_and_then() {
         	let boxed = Boxy { value = Profile { name = "ada" }, tag = "outer" };
         	let mapped: Boxy<str> = boxed?.name;
         	print(i"{mapped.value} [{mapped.tag}]");
-        	let lengths: Boxy<i32> = boxed?.name.len();
+        	let lengths: Boxy<usize> = boxed?.name.len();
         	print(format(lengths.value));
         	let flat: Boxy<str> = boxed?.boxed_name();
         	print(i"{flat.value} [{flat.tag}]");
@@ -4158,6 +4330,22 @@ fn expression_lift_result_receivers_need_one_error_type() {
         "#,
         "Convert the error first with `.map_err(…)`",
     );
+    // Ledger row 87's steer, compiled: `.map_err(…)` on the odd receiver puts
+    // the region back on one error type, and the program runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+        struct Wrapped { msg: str }
+        fun a(): Result<i32, str> { Ok(1) }
+        fun b(): Result<i32, Wrapped> { Ok(2) }
+        fun main() {
+            let sum: Result<i32, str> = a()? + b().map_err(|w| w.msg)?;
+            match sum { Ok(let n) => print(n), Err(let e) => print(e) }
+        }
+        "#,
+        "3\n",
+    );
 }
 
 #[test]
@@ -4173,6 +4361,70 @@ fn expression_lift_mixed_containers_are_rejected() {
         }
         "#,
         "must split the same container",
+    );
+    // The steer, and the spelling it blesses, compiled and run on the very
+    // program the refusal draws (audit run 7's steer sweep, ledger row 86):
+    // `.ok_or(err)` is only named when both sides are the std pair, so it is a
+    // claim about THIS region and it has to hold.
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::result::Result::{ self, Ok, Err };
+        fun main() {
+            let opt = Some(1);
+            let res: Result<i32, str> = Ok(2);
+            let sum = opt? + res?;
+        }
+        "#,
+        "Convert first: `.ok_or(err)` turns an `Option` into a `Result`.",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::result::Result::{ self, Ok, Err };
+        fun main() {
+            let opt = Some(1);
+            let res: Result<i32, str> = Ok(2);
+            let sum: Result<i32, str> = opt.ok_or("none")? + res?;
+            match sum { Ok(let n) => print(n), Err(let e) => print(e) }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn expression_lift_flatten_error_mismatch_steers_to_map_err() {
+    // Ledger row 88, which the steer sweep found pinned by nothing at all — the
+    // `?.` chain's near-identical message (row 84) has pins, this one had none.
+    // The body's container IS the region's, so the two error types have to
+    // agree, and `.map_err(…)` on the BODY is what makes them.
+    assert_fails_with(
+        r#"
+        import std::result::Result::{ self, Ok, Err };
+        struct Wrapped { msg: str }
+        fun rows(): Result<List<Result<i32, Wrapped>>, str> { Ok([Ok(7)]) }
+        fun main() {
+            let x = rows()?[0];
+        }
+        "#,
+        "this lifted expression flattens into its own `Result`, so the error \
+         types must match: the receivers' is str, the body yields Wrapped. \
+         Convert the error first with `.map_err(…)`.",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+        struct Wrapped { msg: str }
+        fun rows(): Result<List<Result<i32, Wrapped>>, str> { Ok([Ok(7)]) }
+        fun main() {
+            let x: Result<i32, str> = rows()?[0].map_err(|w| w.msg);
+            match x { Ok(let n) => print(n), Err(let e) => print(e) }
+        }
+        "#,
+        "7\n",
     );
 }
 
@@ -4548,5 +4800,747 @@ fn the_match_control_refuses_the_same_mismatch() {
         }
         "#,
         "match legs have mismatched types: expected i32, but got str instead.",
+    );
+}
+
+// --- B204: `never` erases, and the checker counts what paint counts ----------
+//
+// `panic(..)` types as `Never`, the bottom type that reconciles with every
+// type, and the checker's divergence analysis now has the two leaves the
+// editor's unreachable-code paint has had since E114: a `panic(..)` call and a
+// `for { … }` nothing breaks out of. Each pin below is one join `Never` erases
+// out of, or one place the widening must NOT reach.
+
+// The headline: a body that is nothing but a `panic` satisfies a declared
+// return type — and really does throw, so no value was owed. Before B204 this
+// wanted an `i32` after the panic (std's `rpc.vl` carried `0 - 1 // unreachable`
+// for exactly this, N48).
+#[test]
+fn a_panic_tail_satisfies_a_declared_return_type_and_throws() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun answer(): i32 {
+        	panic("no answer")
+        }
+
+        fun main() {
+        	print(answer());
+        }
+        "#,
+        "no answer",
+    );
+}
+
+// The same body written as a STATEMENT (`panic("…");`), whose synthesized void
+// tail follows it. The tail is dead code, not a missing return value.
+#[test]
+fn a_panic_statement_leaves_no_value_owed_at_the_tail() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun answer(): i32 {
+        	print("checking");
+        	panic("no answer");
+        }
+
+        fun main() {
+        	print(answer());
+        }
+        "#,
+        "no answer",
+    );
+}
+
+// std's own shape (N48, `rpc.vl:308`): a `match` whose failure leg panics and
+// whose success leg produces the value. The panic leg erases from the merge, so
+// the leg needs no unreachable value after it.
+#[test]
+fn a_panic_match_leg_erases_from_the_merge() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::panic;
+
+        fun parse_announced(text: str): i32 {
+        	match text.parse_i32() {
+        		Some(let id) => id,
+        		None => {
+        			panic("malformed: " + text);
+        		},
+        	}
+        }
+
+        fun main() {
+        	print(parse_announced("7"));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+// The `if` twin of the leg above: a panicking `else` erases, and the `if` takes
+// its type from the arm that survives.
+#[test]
+fn a_panic_if_arm_erases_from_the_merge() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::panic;
+
+        fun pick(c: bool): i32 {
+        	let value: i32 = if c { 1 } else { panic("no"); };
+        	value + 1
+        }
+
+        fun main() {
+        	print(pick(true));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// `never + i32 = i32` — the erasure rule stated on an OPERATOR, where the
+// diverging side is an operand rather than a branch.
+#[test]
+fn never_erases_as_an_operator_operand() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun total(): i32 {
+        	panic("no total") + 1
+        }
+
+        fun main() {
+        	print(total());
+        }
+        "#,
+        "no total",
+    );
+}
+
+// And as a call ARGUMENT: the parameter's type is never reached, so the call
+// site is legal whatever the parameter says.
+#[test]
+fn never_erases_as_a_call_argument() {
+    assert_run_panics(
+        r#"
+        import std::io::panic;
+
+        fun shout(word: str): i32 {
+        	print(word);
+        	1
+        }
+
+        fun main() {
+        	print(shout(panic("no word")));
+        }
+        "#,
+        "no word",
+    );
+}
+
+// Erasure removes the DIVERGING participant and nothing else: with the panic
+// arm gone the join is still `i32` against the annotation's `str`, and that is
+// what is reported. The `1` is the mistake, not the `panic`.
+#[test]
+fn erasure_does_not_hide_the_mismatch_in_the_arm_that_survives() {
+    assert_fails_with(
+        r#"
+        import std::io::panic;
+
+        fun main() {
+        	let c = false;
+        	let v: str = if c { 1 } else { panic("no") };
+        	print(v);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
+    );
+}
+
+// The second leaf: a `for { … }` nothing breaks out of never falls through, so
+// a body that ends in one owes no return value.
+#[test]
+fn an_endless_for_tail_satisfies_a_declared_return_type() {
+    assert_compiles(
+        r#"
+        fun serve(): i32 {
+        	for {
+        		print("tick");
+        	}
+        }
+
+        fun main() {
+        	print("started");
+        }
+        "#,
+    );
+}
+
+// The control that keeps the leaf honest: a loop something DOES break out of
+// falls through, so the tail is reachable and still owes its value.
+#[test]
+fn a_for_with_a_break_still_owes_its_tail_value() {
+    assert_fails_with(
+        r#"
+        fun serve(c: bool): i32 {
+        	for {
+        		if c {
+        			jump break;
+        		}
+        	}
+        }
+
+        fun main() {
+        	print(serve(true));
+        }
+        "#,
+        "Expected i32, but got void instead.",
+    );
+}
+
+// `jump break` binds to the NEAREST enclosing loop, so an inner break leaves the
+// OUTER loop endless — the nesting the reader sees is the nesting the checker
+// reads.
+#[test]
+fn a_break_binds_to_its_own_loop_and_leaves_the_outer_one_endless() {
+    assert_compiles(
+        r#"
+        fun serve(c: bool): i32 {
+        	for {
+        		for {
+        			if c {
+        				jump break;
+        			}
+        		}
+        	}
+        }
+
+        fun main() {
+        	print("started");
+        }
+        "#,
+    );
+}
+
+// A `for cond { … }` is the `while`, not the endless form: it can finish, so the
+// tail after it is reachable and owes its value.
+#[test]
+fn a_conditional_for_is_not_an_endless_loop() {
+    assert_fails_with(
+        r#"
+        fun count_up(limit: i32): i32 {
+        	mut count = 0;
+        	for count < limit {
+        		count += 1;
+        	}
+        }
+
+        fun main() {
+        	print(count_up(3));
+        }
+        "#,
+        "Expected i32, but got void instead.",
+    );
+}
+
+// The control for the whole widening: a tail that neither leaves nor loops still
+// has to produce the declared type. Nothing about `Never` weakened that.
+#[test]
+fn a_non_diverging_tail_still_owes_its_value() {
+    assert_fails_with(
+        r#"
+        fun answer(): i32 {
+        	print("checking");
+        }
+
+        fun main() {
+        	print(answer());
+        }
+        "#,
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
+
+// --- B214: a `ret` inside `main` ----------------------------------------------
+//
+// `main` is INLINED at module scope, where `return` is a `SyntaxError` that
+// refuses the whole module at parse time — so every program here compiled clean
+// and then died before a line of it ran:
+//
+//     SyntaxError: Illegal return statement
+//         at compileSourceTextModule (node:internal/modules/esm/utils)
+//
+// The fix wraps `main`'s inlined body in a labeled block and lowers those `ret`s
+// to `break main`, which is legal at module scope and costs a `main` without one
+// nothing (the corpus is byte-identical).
+
+// The exhibit: the guard leaves, and what follows it does not run.
+#[test]
+fn an_early_ret_in_main_leaves_and_skips_the_rest() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let flag = true;
+        	print("before");
+        	if flag {
+        		ret;
+        	}
+        	print("after");
+        }
+        "#,
+        "before\n",
+    );
+}
+
+// The same `ret` nested in a LOOP inside `main`. A bare `break` would have left
+// the loop and run the tail; `break main` leaves the program, which is what `ret`
+// means — so the loop's own `break` and this one stay distinguishable.
+#[test]
+fn a_ret_inside_a_loop_in_main_leaves_the_program_not_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	mut i = 0;
+        	for i < 5 {
+        		if i == 2 {
+        			ret;
+        		}
+        		print(i);
+        		i = i + 1;
+        	}
+        	print("after");
+        }
+        "#,
+        "0\n1\n",
+    );
+}
+
+// The control: a `ret` inside a CLOSURE in `main` is a real JS `return` in a real
+// JS function, and is left exactly as it was — the rewrite stops at every
+// function boundary, so the closure's early exit still returns a value to its
+// caller rather than leaving `main`.
+#[test]
+fn a_ret_inside_a_closure_in_main_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let clamp = |x: i32| { if x > 1 { ret 9; } x };
+        	print(clamp(0));
+        	print(clamp(5));
+        	print("after");
+        }
+        "#,
+        "0\n9\nafter\n",
+    );
+}
+
+// A VALUED `ret` in a `main` that carries an exit code: the value is the code, so
+// it is held in a temp inside the block and handed to `process.exit` after it —
+// breaking out must not skip the exit the way a plain wrap would.
+#[test]
+fn a_valued_ret_in_main_becomes_the_exit_code() {
+    let (stdout, _stderr, exit_code) = compile_and_run_status(
+        r#"
+        import std::io::print;
+
+        fun main(): i32 {
+        	let flag = true;
+        	if flag {
+        		ret 2;
+        	}
+        	print("after");
+        	0
+        }
+        "#,
+    );
+    assert_eq!(stdout, "");
+    assert_eq!(exit_code, 2, "the early `ret`'s value is the exit code");
+}
+
+// The tail still decides the code when nothing leaves early — the same program
+// with the guard off runs to the end and exits on its trailing expression.
+#[test]
+fn a_main_that_does_not_ret_early_still_exits_on_its_tail() {
+    let (stdout, _stderr, exit_code) = compile_and_run_status(
+        r#"
+        import std::io::print;
+
+        fun main(): i32 {
+        	let flag = false;
+        	if flag {
+        		ret 2;
+        	}
+        	print("after");
+        	7
+        }
+        "#,
+    );
+    assert_eq!(stdout, "after\n");
+    assert_eq!(exit_code, 7);
+}
+
+// A `main` that owns a RESOURCE is restructured into `try`/`finally` teardown
+// (destruction.md §7). The label wraps that whole structure, so breaking out of
+// it runs the `finally` on the way — an early `ret` destroys what `main` owns
+// exactly as falling off the end does.
+#[test]
+fn an_early_ret_in_a_resource_owning_main_still_runs_teardown() {
+    let (stdout, _stderr, exit_code) = compile_and_run_status(
+        r#"
+        import std::io::print;
+        import std::drop::{ Drop };
+
+        [resource] struct Res { tag: str }
+        impl Res with Drop {
+        	fun drop(&mut self) {
+        		print(i"drop {self.tag}");
+        	}
+        }
+
+        fun main(): i32 {
+        	let held = Res { tag = "held" };
+        	let flag = true;
+        	print(held.tag);
+        	if flag {
+        		ret 3;
+        	}
+        	print("after");
+        	0
+        }
+        "#,
+    );
+    assert_eq!(stdout, "held\ndrop held\n");
+    assert_eq!(exit_code, 3);
+}
+
+// An ASYNC `main` already runs inside an invoked `async () => { … }`
+// (execution.md §7.1), which is a real function — so its `ret` was legal all
+// along and the wrapper is not applied. This pins that it stays that way: the
+// program runs, and the emission carries no labeled block.
+#[test]
+fn an_async_main_keeps_its_plain_return() {
+    let source = r#"
+        import std::io::print;
+
+        async fun main() {
+        	let flag = true;
+        	print("before");
+        	if flag {
+        		ret;
+        	}
+        	print("after");
+        }
+        "#;
+    assert_compiles_and_runs(source, "before\n");
+    let javascript = compile(source).expect("expected a clean compile");
+    assert!(
+        javascript.contains("return;") && !javascript.contains("main:"),
+        "an async `main` keeps its `return` and gains no label:\n{javascript}"
+    );
+}
+
+// --- B221: the first diverging STATEMENT exempts the tail ---------------------
+//
+// B124 exempted a body whose tail diverges, and a body whose LAST statement
+// does — the two shapes the parser's synthesized void tail arrives in. It is
+// the position that was wrong, not the rule: the first diverging statement
+// makes everything after it unreachable, so `fun g(): i32 { ret 1;
+// print("dead"); }` owed a tail value it could never be asked for, and paint
+// (which grays `print("dead")`) and the checker described one block two ways.
+// The question is now `Divergence`'s own — does this BLOCK diverge — asked of
+// every statement, which is B124's exemption list widened once.
+
+#[test]
+fn b221_a_ret_before_the_last_statement_exempts_the_tail() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        fun g(): i32 {
+        	ret 1;
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+    );
+}
+
+#[test]
+fn b221_a_panic_before_the_last_statement_exempts_the_tail() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+
+        fun g(): i32 {
+        	panic("no answer");
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+    );
+}
+
+#[test]
+fn b221_an_endless_loop_before_the_last_statement_exempts_the_tail() {
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        fun g(): i32 {
+        	for { print("forever"); }
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+    );
+}
+
+#[test]
+fn b221_a_diverging_statement_in_a_non_taken_branch_does_not_exempt() {
+    // The control. `expr_diverges` needs EVERY path out of the statement to
+    // leave; an `if` with no `else` falls through, so the tail is reachable
+    // and still owes its value.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+
+        fun g(flag: bool): i32 {
+        	if flag { ret 1; }
+        	print("dead");
+        }
+
+        fun main() { print(g(true)); }
+        "#,
+        "ends without producing a value",
+    );
+}
+
+#[test]
+fn b221_an_unannotated_body_infers_from_the_reachable_ret_alone() {
+    // The same question, asked by return INFERENCE (`return_evidence`): a tail
+    // the body cannot reach is no evidence, so the void after the dead
+    // `print` does not vote against the `ret` above it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun g() {
+        	ret 1;
+        	print("dead");
+        }
+
+        fun main() { print(g()); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b221_a_closure_body_that_leaves_early_owes_no_tail() {
+    // And by the closure route, which shares the check.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply(f: |i32| i32): i32 { f(2) }
+
+        fun main() {
+        	print(apply(|x| {
+        		ret x + 1;
+        		print("dead");
+        	}));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+// --- B369: an inferred return type takes the call's substitution --------------
+//
+// A function with no declared return type infers one written in ITS OWN binders
+// — `fun hold<C: Show>(body: C) { Holder { body } }` infers `Holder<C>`, and the
+// struct literal's own inference is what puts `C` there (correctly: the item's
+// "the inferred return type loses `C`" premise was wrong). What was missing is
+// the caller's half: the tail's type comes back out of the solver's cache
+// verbatim, so the call site had to apply the substitution to the inferred
+// answer exactly as it already did to a declared one. Without it `hold("x")`
+// typed as `Holder<C>` and the first trait dispatch on that value resolved to
+// the trait's BODYLESS requirement — an `internal:` error anchored wherever the
+// generic function that received the value lives (in kolt's case, in std).
+
+/// The class, with no `Slot` and no UI in sight: a generic struct with a trait
+/// impl, built by an un-annotated generic function, dispatched through a
+/// generic function. Ran red as `internal: a call resolved to `Show`'s
+/// requirement `show`, which has no body` before the fix.
+#[test]
+fn b369_an_un_annotated_generic_constructor_types_its_call_under_the_substitution() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Show {
+        	fun show(self): str;
+        }
+
+        struct Holder<C: Show> {
+        	body: C,
+        }
+
+        impl Holder<type C: Show> with Show {
+        	fun show(self): str {
+        		self.body.show()
+        	}
+        }
+
+        impl str with Show {
+        	fun show(self): str { self }
+        }
+
+        fun hold<C: Show>(body: C) {
+        	Holder { body }
+        }
+
+        fun render<S: Show>(value: S): str { value.show() }
+
+        fun main() { print(render(hold("x"))); }
+        "#,
+        "x\n",
+    );
+}
+
+/// The type itself, read off a refusal so the pin is about the substitution and
+/// not about a downstream symptom: `Holder<str>`, not `Holder<C>`.
+#[test]
+fn b369_the_inferred_return_type_names_the_arguments_type_not_the_callees_binder() {
+    assert_fails_with(
+        r#"
+        struct Holder<C> {
+        	body: C,
+        }
+
+        fun hold<C>(body: C) {
+        	Holder { body }
+        }
+
+        fun main() {
+        	let held = hold("x");
+        	let n: i32 = held;
+        	print(n);
+        }
+        "#,
+        "but got Holder<str>",
+    );
+}
+
+/// TWO generic parameters, bound from two different arguments, so a fix that
+/// substituted only the first (or only the last) reds here.
+#[test]
+fn b369_an_inferred_generic_return_type_carries_both_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Pair<A, B> {
+        	left: A,
+        	right: B,
+        }
+
+        fun pair<A, B>(left: A, right: B) {
+        	Pair { left, right }
+        }
+
+        fun main() {
+        	let both = pair("x", 2);
+        	print(both.left);
+        	print(both.right + 1);
+        }
+        "#,
+        "x\n3\n",
+    );
+}
+
+/// A parameter reachable only through ANOTHER parameter's bound (B251's shape)
+/// under an inferred return: `T` is named by no field, so it is derived from
+/// `S`'s `Signal` impl — and that derivation has to survive the substitution
+/// too.
+#[test]
+fn b369_a_bound_reachable_parameter_survives_an_inferred_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source, SignalCell };
+
+        struct Held<T, S: Source<T>> {
+        	cell: S,
+        }
+
+        fun hold<T, S: Source<T>>(cell: S) {
+        	Held { cell }
+        }
+
+        fun main() {
+        	let held = hold(SignalCell::new(41));
+        	print(held.cell.get() + 1);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+/// Kolt's exact shape (`lib/conditional_value.vl`'s `when_value`), which is
+/// where B369 was found: THREE parameters, one of them bound only through
+/// another's bound, and a closure-typed parameter carrying a `context` clause —
+/// placed through std's own generic `Slot` machinery. The `open_row_before`
+/// internal error was anchored in std here.
+#[test]
+fn b369_the_kolt_shape_a_context_carrying_closure_parameter_and_a_slot_impl() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, SignalCell, owner_scope };
+        import std::ui::{ Region, Slot, View };
+        import std::ui;
+
+        struct Conditional<T, S: Source<Option<T>>, C: Slot> {
+        	condition: S,
+        	body: (|T| C) context owner_scope,
+        }
+
+        impl Conditional<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
+        	fun place(self, parent: View) {
+        		let region = Region::open(parent);
+        		self.condition.effect(|on| {
+        			if on is Some(let value) {
+        				let _row = region.open_row((self.body)(value));
+        			}
+        		});
+        	}
+        }
+
+        fun when_value<T, S: Source<Option<T>>, C: Slot>(
+        	condition: S,
+        	body: (|T| C) context owner_scope,
+        ) {
+        	Conditional { condition, body }
+        }
+
+        fun main() {
+        	let name: SignalCell<Option<str>> = SignalCell::new(Some("x"));
+        	let _root = ui::mount_root("app", || <div>{when_value(name, |value| <span>{value}</span>)}</div>);
+        }
+        "#,
     );
 }

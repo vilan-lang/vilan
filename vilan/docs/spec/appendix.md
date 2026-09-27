@@ -26,20 +26,22 @@ top-tier-only forms: `const expr` and struct initializers (§3.8).
 ## A.2 Reserved words
 
 ```text
-async  await  borrows  const     else    enum   export  external
-for    fun    if       impl      import  in     is      jump
-let    macro  match    mod       mut     null   own     resource
-ret    struct trait    type      use     with   true    false
+async     await     borrows  const   css    dyn     else  enum
+export    external  for      fun     if     impl    import in
+is        jump      lazy     let     macro  match   mod   mut
+null      own       ret      struct  trait  type    use   with
+true      false
 ```
 
 Contextual (identifier everywhere else): `context`, `sync`, `void`,
-`self`, `Self`, `break`/`continue` (after `jump`), and the attribute names
-`derive` `service` `extern` `must_use` `rpc` `trait_only` `doc`
-`expose` `platform` `deprecated`.
+`self`, `Self`, `as`, `only`, `break`/`continue` (after `jump`), and the
+attribute names `derive` `service` `extern` `must_use` `rpc` `trait_only`
+`doc` `expose` `platform` `deprecated` `internal` `resource` (`resource`
+was a keyword until B413 made it the `[resource]` attribute).
 
 ## A.3 Literal suffixes
 
-`i8 i16 i32 i53 u8 u16 u32 u53 f f32 f64 n`: §2.3 (unknown suffixes
+`i8 i16 i32 i53 u8 u16 u32 u53 usize f f32 f64 n`: §2.3 (unknown suffixes
 error; `i64`/`u64` were renamed to `i53`/`u53`). Unsuffixed: integer
 → `i32`, fractional → `f64`.
 
@@ -57,7 +59,7 @@ has it with no prelude at all.
 | primitives (`bool`, `str`, numerics, `BigInt`) | `std::boolean`/`string`/`number` | literal types | built-in |
 | `List<T>` | `std::list` | list literals, `for` | built-in |
 | `Option<T>` | `std::option` | `?.` results, view-returning lookups | base (with `Some`/`None`) |
-| `Try`, `Verdict`, `Lift` | `std::operators` | `!`, `?.` (§5.10) | — (but `Result`/`Ok`/`Err` are base) |
+| `Try`, `Verdict`, `Lift` | `std::operators` | `!`, `?.`, `?` (§5.10) | — (but `Result`/`Ok`/`Err` are base) |
 | `Add Sub Mul Div Rem Shl Shr BitAnd BitOr BitXor` | `std::operators` | operators (§5.7) | — |
 | `PartialEq`, `PartialOrd` | `std::compare` | `==`/ordering (§5.7) | — |
 | `Iterator`/`Iterable` | `std::iterator` | `for … in` | — |

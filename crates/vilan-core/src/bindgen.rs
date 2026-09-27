@@ -239,8 +239,8 @@ const RESERVED: &[&str] = &[
     "any", "async", "await", "bool", "borrows", "const", "else", "enum", "export", "external",
     "f32", "f64", "false", "for", "fun", "i16", "i32", "i53", "i8", "if", "impl", "import", "in",
     "is", "jump", "let", "macro", "match", "mod", "mut", "null", "own", "resource", "ret", "self",
-    "str", "struct", "trait", "true", "type", "u16", "u32", "u53", "u8", "use", "void", "with",
-    "BigInt", "List", "Map", "Option", "Set",
+    "str", "struct", "trait", "true", "type", "u16", "u32", "u53", "u8", "use", "usize", "void",
+    "with", "BigInt", "List", "Map", "Option", "Set",
 ];
 
 fn escape_reserved(name: &str) -> String {

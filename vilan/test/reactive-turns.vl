@@ -3,7 +3,7 @@
 // two-requests scenario, distilled — and a turn follows its own extent's
 // continuations across `await` (capture-at-creation).
 import std::io::print;
-import std::reactive::{ Signal, Subscription, Turn, FlushPolicy, turn_scope, turn, batch, flush };
+import std::reactive::{ FlushPolicy, Signal, Subscription, Turn, batch, flush, turn, turn_scope };
 
 async fun tick() {
 	let _beat = 1;

@@ -13,16 +13,17 @@ impl List<type T> {
 	fun new(): List<T>
 	fun push(&mut self, own item: T)
 	fun pop(&mut self): Option<T>
-	fun insert(&mut self, index: i32, value: T)   // panics out of bounds
-	fun remove(&mut self, index: i32): T          // panics out of bounds
-	fun len(self): i32
+	fun insert(&mut self, index: usize, value: T) // panics out of bounds
+	fun remove(&mut self, index: usize): T        // panics out of bounds
+	fun len(self): usize
 	fun is_empty(self): bool
 	fun iter(self): ListIterator<T>              // the lazy cursor; see Iterator
-	fun get(self, index: i32): Option<T>
+	fun get(self, index: usize): Option<T>
 	fun first(self): Option<T>
 	fun last(self): Option<T>
 	fun map<U>(self, fn: |T| U): List<U>
 	fun filter(self, predicate: |T| bool): List<T>
+	fun filter_map<U>(self, fn: |T| Option<U>): List<U>   // both, one pass
 	fun find(self, predicate: |T| bool): Option<T>
 	fun fold<B>(self, init: B, fn: |B, T| B): B
 	fun for_each(self, fn: |T| void)
@@ -34,12 +35,13 @@ impl List<type T: Mul + Default> { fun product(self): T }
 impl List<type T: Ord> { fun sort(self): List<T> }        // stable
 impl List<type T: PartialEq> {
 	fun contains(self, value: T): bool
-	fun index_of(self, value: T): Option<i32>
+	fun index_of(self, value: T): Option<usize>
 }
 impl List<type T: PartialEq> with PartialEq {
 	fun eq(self, b: List<T>): bool           // element-wise, length first
 }
 impl List<type T: Display> { fun join(self, separator: str): str }
+impl List<type T> with Default { fun default(): List<T> }       // []
 ```
 
 Indexing is `list[i]`; iterate with `for item in list` (copies) or
@@ -78,8 +80,8 @@ a *place*, and a value with no other owner moves in.
 fun main() {
 	let words = ["alpha", "beta", "gamma"];
 	let lengths = words.map(|word| word.len());
-	print(lengths.fold(0, |total, n| total + n));
 	print(lengths.sum());
+	print(words.fold("", |joined, word| joined + word));
 }
 ```
 
@@ -98,7 +100,7 @@ fun main() {
 	let scores = [40, 91, 65];
 	print(scores.find(|n| n > 50).unwrap_or(0));  // 91
 	print(scores.contains(65));                   // true
-	print(scores.index_of(65).unwrap_or(-1));     // 2
+	print(scores.index_of(65).unwrap_or(0));      // 2
 	print(scores.index_of(7).is_none());          // true
 	print(scores == [40, 91, 65]);                // true
 	print(scores == [40, 91]);                    // false — length first
@@ -164,7 +166,7 @@ impl Map<type K: Hashable, type V> {
 	fun get(self, key: K): Option<V>
 	fun contains_key(self, key: K): bool
 	fun remove(&mut self, key: K)
-	fun len(self): i32
+	fun len(self): usize
 	fun is_empty(self): bool
 	fun keys(self): List<K>
 	fun values(self): List<V>
@@ -174,6 +176,9 @@ impl Map<type K: Hashable, type V: PartialEq> {
 	fun contains_value(self, value: V): bool
 }
 impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
+impl Map<type K: Hashable, type V> with Default {
+	fun default(): Map<K, V>                 // the empty map
+}
 ```
 
 Keys compare **by value**. Scalars work directly, and so does a **backed enum**
@@ -252,7 +257,7 @@ impl Set<type T: Hashable> {
 	fun insert(&mut self, value: T)
 	fun contains(self, value: T): bool
 	fun remove(&mut self, value: T)
-	fun len(self): i32
+	fun len(self): usize
 	fun is_empty(self): bool
 	fun values(self): List<T>
 	fun union(self, other: Set<T>): Set<T>
@@ -260,6 +265,7 @@ impl Set<type T: Hashable> {
 	fun difference(self, other: Set<T>): Set<T>
 }
 impl List<type T: Hashable> { fun to_set(self): Set<T> }
+impl Set<type T: Hashable> with Default { fun default(): Set<T> }  // the empty set
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
@@ -285,6 +291,56 @@ fun main() {
 	print(a.difference(b).len());     // 1 -- {1}
 }
 ```
+
+## `Memo<K, V>`
+
+```vilan,fragment
+impl Memo<type K: Hashable, type V> {
+	fun new(): Memo<K, V>
+	fun get_or(self, key: K, make: || V): V
+	fun get(self, key: K): Option<V>
+	fun forget(self, key: K)
+	fun clear(self)
+	fun len(self): usize
+}
+```
+
+A per-key cache of values **made on first ask**. `get_or` answers what is held
+for `key`, or runs `make`, keeps the result and answers that. `get` is the
+passive read — it makes nothing.
+
+```vilan
+import std::memo::Memo;
+
+fun main() {
+	let squares: Memo<i32, i32> = Memo::new();
+	print(squares.get_or(7, || 7 * 7));   // 49 -- made
+	print(squares.get_or(7, || 0));       // 49 -- held; the maker did not run
+	squares.forget(7);
+	print(squares.len());                 // 0
+}
+```
+
+`make` runs **at the call site**, which is what makes a memo usable for values
+that read an ambient context — the one this exists for is a remote handle:
+
+```vilan,fragment
+// One handle per id, shared by every call site (`guide/services.md`).
+let bodies: Memo<str, RemoteSource<MessageBody>> = Memo::new();
+
+fun body_of(id: str): RemoteSource<MessageBody> {
+	bodies.get_or(id, || client().get_message(id))
+}
+```
+
+Two views asking for the same row then lease the *same* mirror instead of
+minting a second one, so a row that re-renders finds the handle it had.
+Nothing is evicted by itself, and a remote handle needs no eviction to stay
+correct — demand decides its channel's life, and a released mirror re-mints on
+the next lease. `forget` is yours, for a value that turned out wrong.
+
+It holds a `Shared` table inside, so a `Memo` bound with `let` at module level
+is written by every call site that reads it; no `mut` is needed.
 
 ## `Hashable`
 
@@ -462,7 +518,7 @@ Anything else is a compile error. A struct or enum of your own that provides no
 its fields and an enum is its variant tag at runtime:
 
 ```vilan,fragment
-struct Cursor { items: List<i32>, index: i32 }
+struct Cursor { items: List<i32>, index: usize }
 
 fun main() {
 	mut walked = Cursor { items = [1, 2], index = 0 };
@@ -483,12 +539,18 @@ all of them:
 ```vilan,fragment
 fun map<U>(self, fn: |T| U): Mapped<Self, T, U>
 fun filter(self, predicate: |T| bool): Filtered<Self, T>
-fun take(self, count: i32): Taken<Self, T>
-fun skip(self, count: i32): Skipped<Self, T>
+fun filter_map<U>(self, fn: |T| Option<U>): FilterMapped<Self, T, U>   // both, one pass
+fun take(self, count: usize): Taken<Self, T>
+fun skip(self, count: usize): Skipped<Self, T>
 fun enumerate(self): Enumerated<Self, T>                       // (0, a), (1, b), …
 fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U>
 fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T>
 ```
+
+`filter_map` is `map` and `filter` at once: the projection answers
+`Some(value)` to keep that value and `None` to drop the element, so a partial
+or fallible projection needs neither a two-stage chain nor an `Option` to
+unwrap afterwards. `List` carries the eager twin under the same name.
 
 They are **lazy**: each returns a small struct holding its upstream, and nothing
 runs until something pulls. So a chain makes one pass over the source and builds
@@ -623,7 +685,7 @@ fun main() {
 	print(unique.len());   // 2
 
 	let lengths = ["alpha", "hi"].iter().map(|word| (word, word.len())).to_list().to_map();
-	print(lengths.get("hi").unwrap_or(-1));   // 2
+	print(lengths.get("hi").unwrap_or(0));    // 2
 }
 ```
 

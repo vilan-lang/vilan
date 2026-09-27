@@ -23,6 +23,17 @@ use crate::transformer;
 use crate::type_::{Type, TypeId};
 use sha2::{Digest, Sha256};
 
+/// G24's R2 steer on the RUNTIME-BINDING refusal, as its own constant: the
+/// analyzer writes it and the editor's "Declare it `const let`" quick fix
+/// reads it, so the two cannot drift into disagreeing about which diagnostic
+/// the fix belongs to (the `REACH_IS_UNMARKED` discipline).
+pub const CONST_LET_STEER_RUNTIME: &str = "to make it compile-time-known";
+
+/// Its twin on the PLAIN-DATA refusal, at a `let x = const ..` whose result is
+/// a closure.
+pub const CONST_LET_STEER_CLOSURE: &str =
+    "A compile-time CLOSURE is spelled as a declaration: write";
+
 /// The budgets the EXPLICIT form evaluates under (const-eval.md §9.3). A miss
 /// here is a diagnostic (§4's "did not finish within the compile-time budget"),
 /// so the user can see it and act — which is what lets them be generous.
@@ -90,10 +101,10 @@ thread_local! {
     /// `post_analysis_passes` for its phase line. Thread-local because an
     /// analysis is single-threaded, the same way the transformer's
     /// `CONST_LOWERING_COUNT` is.
-    static PHASE_LOWER: std::cell::Cell<std::time::Duration> =
-        const { std::cell::Cell::new(std::time::Duration::ZERO) };
-    static PHASE_INTERP: std::cell::Cell<std::time::Duration> =
-        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    static PHASE_LOWER: std::cell::Cell<crate::PhaseSpan> =
+        const { std::cell::Cell::new(crate::PhaseSpan::ZERO) };
+    static PHASE_INTERP: std::cell::Cell<crate::PhaseSpan> =
+        const { std::cell::Cell::new(crate::PhaseSpan::ZERO) };
     /// The most fuel any single explicit `const` site consumed this analysis —
     /// the budget instrument beside the timing split: `EXPLICIT_LIMITS.fuel`
     /// is sized against measured workloads, and this is how a workload gets
@@ -106,7 +117,7 @@ thread_local! {
 /// the `VILAN_PHASE_TIMING` line. The two do NOT sum to the pass: the
 /// remainder is classification (free locals, `check_const_only`) and failure
 /// attribution.
-pub(crate) fn phase_split() -> (std::time::Duration, std::time::Duration) {
+pub(crate) fn phase_split() -> (crate::PhaseSpan, crate::PhaseSpan) {
     (
         PHASE_LOWER.with(std::cell::Cell::get),
         PHASE_INTERP.with(std::cell::Cell::get),
@@ -120,7 +131,7 @@ pub(crate) fn max_fuel_used() -> u64 {
 }
 
 fn phase_add(
-    bucket: &'static std::thread::LocalKey<std::cell::Cell<std::time::Duration>>,
+    bucket: &'static std::thread::LocalKey<std::cell::Cell<crate::PhaseSpan>>,
     started: crate::PhaseClock,
 ) {
     bucket.with(|cell| cell.set(cell.get() + started.elapsed()));
@@ -149,6 +160,58 @@ struct ProjectReader {
     site: Cell<(SourceId, Span)>,
     /// What the channel did, with the site that did it — see [`ConstFact`].
     facts: RefCell<Vec<ConstFact>>,
+    /// `asset::stage`'s REGISTRY (B308): every staged contribution of the
+    /// pass, in call order, which is the one order the read-back must not use
+    /// — [`ProjectReader::staged`] orders by `(token, line)` and deduplicates
+    /// on that pair, exactly as the keyed flush does, so the answer is a
+    /// function of the SET of contributions and never of the sequence
+    /// (build-hooks.md §5.1's rule, which the registry is no exception to).
+    ///
+    /// It lives on the reader rather than in the program because the const
+    /// pass gives every site its own interpreter scopes: there is no vilan
+    /// global that can span two `const` expressions, so a module accumulating
+    /// across the build has to accumulate HERE.
+    staged: RefCell<Vec<StagedContribution>>,
+    /// The tokens the build still NAMES — the liveness set, computed once
+    /// after the last const evaluation and `None` until then. A staged
+    /// contribution survives when its token is in here, or when its token is
+    /// empty (an unconditional contribution, which nothing references because
+    /// it names nothing).
+    ///
+    /// `None` is not "nothing is live": it is "the question cannot be answered
+    /// yet", and `staged` says so rather than guessing, because until the last
+    /// site has run a token may still be about to be named.
+    live_tokens: RefCell<Option<Liveness>>,
+}
+
+/// The tokens a build still NAMES, in the two shapes a name reaches a const
+/// result in — see [`live_tokens_of`].
+#[derive(Default)]
+struct Liveness {
+    /// Every result string, and every whitespace-separated word of one. The
+    /// second is what a joined class list is: `Style::class_list` renders
+    /// `"s1ufvr2 s8myyrk"`, and a `const` whose result is that string names
+    /// two tokens, not one.
+    words: HashSet<String>,
+    /// Every result string, concatenated with a separator no token can span.
+    /// The fallback for a token a split did not isolate — a class glued into
+    /// a larger word by interpolation or `+`. Scanned only for a token the set
+    /// misses, which in practice is none.
+    text: String,
+}
+
+impl Liveness {
+    fn names(&self, token: &str) -> bool {
+        self.words.contains(token) || self.text.contains(token)
+    }
+}
+
+/// One `asset::stage` contribution: the kind it belongs to, the LIVENESS TOKEN
+/// that decides whether it survives, and the line itself.
+struct StagedContribution {
+    kind: String,
+    token: String,
+    line: String,
 }
 
 /// One thing the compile-time asset channel did, and the `const` site that did
@@ -400,6 +463,55 @@ pub fn directory_input_hash(directory: &Path) -> Option<u64> {
     Some(crate::content_hash(&names.join("\n")))
 }
 
+/// The content key ONE tracked build input is recorded and re-verified by, over
+/// the bytes the recording side already holds — the RECORDING half of the pair
+/// [`tracked_input_hash`] completes (tracker B276).
+///
+/// Text if the file decodes as UTF-8 (BOM dropped, `windows-support.md` §2),
+/// bytes otherwise. The rule is a function of the FILE and of nothing else,
+/// which is the whole point: the watch loop is handed a path and no memory of
+/// which const verb touched it, so a hash that depended on the verb could never
+/// be recomputed there. That is exactly what B276 was — `asset::bundle`
+/// recorded `content_hash_bytes(&bytes)` while the watch loop re-hashed with
+/// `read_source` + `content_hash`, the two disagreed on every file (they
+/// disagree even on plain ASCII: `str`'s hash terminates with `0xff` where a
+/// byte slice's is length-prefixed), and a leg that bundled anything could
+/// never be `Fresh`.
+///
+/// The text arm and not bytes throughout, because a `.vl` module's recorded
+/// hash is `content_hash` of the text the compiler consumed
+/// (`Program.source_hashes`) and the same map holds both: one rule that already
+/// agrees with the module rows beats two rules that agree with neither.
+pub fn tracked_input_hash_of_bytes(bytes: &[u8]) -> u64 {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => crate::content_hash(crate::util::strip_bom(text)),
+        Err(_) => crate::content_hash_bytes(bytes),
+    }
+}
+
+/// The content key a tracked build input re-hashes to RIGHT NOW — the
+/// VERIFYING half, and the one function the watch loop's per-leg skip decision
+/// asks its question with (`hmr::leg_is_current`).
+///
+/// A recorded input that is a DIRECTORY re-hashes as its listing
+/// (`asset::read_dir`, const-eval.md §3.1), so a file appearing or vanishing in
+/// a listed tree fails the compare. Everything else goes through
+/// [`tracked_input_hash_of_bytes`], which is what makes the answer here and the
+/// answer recorded at compile time the same answer by construction — the
+/// invariant `hashing_agrees_between_the_recording_side_and_the_watch_side`
+/// pins, including for a `.vl` module row, whose `content_hash` of the
+/// compiler's text is the text arm's answer for the same file.
+///
+/// `None` — deleted, unreadable — disqualifies the skip by construction.
+pub fn tracked_input_hash(path: &Path) -> Option<u64> {
+    if path.is_dir() {
+        return directory_input_hash(path);
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| tracked_input_hash_of_bytes(&bytes))
+}
+
 impl ProjectReader {
     /// Points every fact recorded from here on at `site` — the `const`
     /// expression whose evaluation is about to run.
@@ -436,7 +548,15 @@ impl interpreter::AssetReader for ProjectReader {
         let resolved = self.root.join(requested);
         match crate::util::read_source(&resolved) {
             Ok(text) => {
-                self.track(resolved, Some(crate::content_hash(&text)), "asset::read");
+                // Through the one rule, over the text's own bytes — which is
+                // `content_hash(&text)` for anything `read_source` can return,
+                // and says so at the site rather than leaving a reader to
+                // re-derive that the two agree (B276).
+                self.track(
+                    resolved,
+                    Some(tracked_input_hash_of_bytes(text.as_bytes())),
+                    "asset::read",
+                );
                 Ok(text)
             }
             Err(error) => {
@@ -486,7 +606,7 @@ impl interpreter::AssetReader for ProjectReader {
             Ok(bytes) => {
                 self.track(
                     resolved.clone(),
-                    Some(crate::content_hash_bytes(&bytes)),
+                    Some(tracked_input_hash_of_bytes(&bytes)),
                     function,
                 );
             }
@@ -577,7 +697,7 @@ impl interpreter::AssetReader for ProjectReader {
             Ok(bytes) => {
                 self.track(
                     resolved,
-                    Some(crate::content_hash_bytes(&bytes)),
+                    Some(tracked_input_hash_of_bytes(&bytes)),
                     "asset::digest",
                 );
                 let mut hasher = Sha256::new();
@@ -597,6 +717,39 @@ impl interpreter::AssetReader for ProjectReader {
                 ))
             }
         }
+    }
+
+    fn stage(&self, kind: &str, token: &str, line: &str) {
+        self.staged.borrow_mut().push(StagedContribution {
+            kind: kind.to_string(),
+            token: token.to_string(),
+            line: line.to_string(),
+        });
+    }
+
+    fn staged(&self, kind: &str) -> Result<Vec<String>, String> {
+        let live = self.live_tokens.borrow();
+        let Some(live) = live.as_ref() else {
+            return Err(
+                "`asset::staged` reads the registry AFTER evaluation has finished, and \
+                 this build is still evaluating — until the last `const` expression has \
+                 run, a token it stages may still be about to be named. Read it from a \
+                 function passed to `asset::schedule_at_end`, which is where the build \
+                 runs it."
+                    .to_string(),
+            );
+        };
+        let mut surviving: Vec<(String, String)> = self
+            .staged
+            .borrow()
+            .iter()
+            .filter(|contribution| contribution.kind == kind)
+            .filter(|contribution| contribution.token.is_empty() || live.names(&contribution.token))
+            .map(|contribution| (contribution.token.clone(), contribution.line.clone()))
+            .collect();
+        surviving.sort_unstable();
+        surviving.dedup();
+        Ok(surviving.into_iter().map(|(_, line)| line).collect())
     }
 }
 
@@ -639,6 +792,8 @@ impl ProjectReader {
             .iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
+        // [`directory_input_hash`]'s rule, over the listing already in hand —
+        // spelled out here rather than re-listing the directory to ask it.
         self.track(
             directory.to_path_buf(),
             Some(crate::content_hash(&names.join("\n"))),
@@ -689,13 +844,17 @@ pub struct Evaluated {
     /// program asked — the provenance `vilan build --explain` reads (G11).
     /// Nothing consumes it during a build; see [`ConstFact`].
     pub facts: Vec<ConstFact>,
+    /// G24: the const world's generated name for every entity it named — what
+    /// the emitter resolves a closure snapshot's name-keyed captures through.
+    /// Empty when nothing was evaluated.
+    pub snapshot_bindings: HashMap<String, Id>,
 }
 
 pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) -> Evaluated {
     // Reset the phase buckets FIRST, before any early return, so the timing
     // line never reports a previous analysis's accumulation.
-    PHASE_LOWER.with(|cell| cell.set(std::time::Duration::ZERO));
-    PHASE_INTERP.with(|cell| cell.set(std::time::Duration::ZERO));
+    PHASE_LOWER.with(|cell| cell.set(crate::PhaseSpan::ZERO));
+    PHASE_INTERP.with(|cell| cell.set(crate::PhaseSpan::ZERO));
     FUEL_MAX.with(|cell| cell.set(0));
     // A program that already failed analysis skips evaluation entirely: the
     // transformer's entity lookups (used to lower the const world) assume
@@ -708,6 +867,7 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
             input_files: Vec::new(),
             bundled: Vec::new(),
             facts: Vec::new(),
+            snapshot_bindings: HashMap::default(),
         };
     }
     let reader = ProjectReader {
@@ -719,13 +879,28 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
         // against it: every channel call happens inside an explicit `const`.
         site: Cell::new((SourceId(0), Span::default())),
         facts: RefCell::new(Vec::new()),
+        staged: RefCell::new(Vec::new()),
+        live_tokens: RefCell::new(None),
     };
     let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(program, Mode::Explicit, HashSet::default(), Some(&reader));
     state.check_const_only(graph);
+    // G24: the `const fun` promise, checked at each declaration before any
+    // site is evaluated — so a body that cannot fold is reported where it was
+    // promised rather than at the first call that tried.
+    state.check_const_functions(graph);
     for &expr_id in &program.const_exprs {
         state.evaluate_one(&mut world, expr_id);
     }
+    // B308: the LIVENESS SET, computed the moment before the finalisers run
+    // and not a moment earlier — every token the build still names. See
+    // [`live_tokens_of`] for what "names" means and why this is the answer
+    // `asset::staged` gives.
+    *reader.live_tokens.borrow_mut() = Some(live_tokens_of(&state.results));
+    // G23: the END of evaluation. Every finaliser the pass was asked for runs
+    // here, once, in registration order — after the last `const` expression
+    // above and before anything reads what the pass produced.
+    state.run_finalisers(&mut world);
     // Destructure first: `state` holds the borrow of `reader`, and the borrow
     // must end before the recorded inputs move out of it.
     let State {
@@ -738,11 +913,15 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     inputs.sort();
     inputs.dedup();
     let facts = reader.facts.into_inner();
+    // G24: taken AFTER evaluation, so every name the world minted for a
+    // snapshot's captures is in it.
+    let snapshot_bindings = world.emitted_binding_names();
     Evaluated {
         results,
         assets,
         errors,
         facts,
+        snapshot_bindings,
         input_files: inputs,
         // Insertion order, NOT sorted: a build log that names the files in the
         // order the program asked for them reads as the program does, and the
@@ -756,6 +935,79 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
             .map(|row| (row.source, row.name))
             .collect(),
     }
+}
+
+/// Every token the build still NAMES — `asset::staged`'s liveness predicate
+/// (B308), and the whole of what makes late emission a DROP rather than a
+/// delay.
+///
+/// A token is live when some `const` expression's result NAMES it: the token is
+/// one of that result's strings, one of the whitespace-separated words of one
+/// (`Style::class_list` renders a joined list, so a `const` ending in it names
+/// every class at once), or — the fallback, for a token glued into a larger
+/// word by interpolation or `+` — a substring of one. That is the right
+/// question for the styling case it was built for, and the argument is short:
+/// every class name is minted by
+/// `Style::rule` at const time, every `Style` that dresses an element reaches
+/// the program through a const RESULT (`class_list` and `+` are runtime code
+/// that can only read classes already in a const-built map), and a condition
+/// combinator that re-mints an inner style's rules under a composed condition
+/// DROPS the inner — so the inner's class is in no surviving value, and its
+/// rule is dead. The rules that survive are the rules of the styles the
+/// program kept.
+///
+/// It is deliberately an OVER-approximation in the safe direction. A const
+/// result later removed by dead-code elimination still names its tokens, so
+/// its rules still ship; a string that merely looks like a token keeps a rule
+/// alive. Both leave a live sheet correct and only a dead line behind, where
+/// the opposite error would delete a rule an element still wears.
+///
+/// The scan is over every result of the pass, which is also the only place it
+/// could be: a site's value is plain data by the time it lands here, so there
+/// is nothing type-shaped to consult, and nothing in the host knows what a
+/// `Style` is — which is exactly the wall lane styles-33 hit when it priced a
+/// Rust-side flush that "learns `Style` by type".
+fn live_tokens_of(results: &HashMap<Id, interpreter::ConstValue>) -> Liveness {
+    fn collect(value: &interpreter::ConstValue, into: &mut Liveness) {
+        match value {
+            interpreter::ConstValue::Str(text) => {
+                for word in text.split_whitespace() {
+                    if !into.words.contains(word) {
+                        into.words.insert(word.to_string());
+                    }
+                }
+                into.words.insert(text.clone());
+                into.text.push_str(text);
+                // A separator no token can span, so a token is never found
+                // straddling two unrelated results.
+                into.text.push('\u{1}');
+            }
+            // G24: a snapshot's own body is code, not a token source; its
+            // CAPTURES are values like any other and are walked.
+            interpreter::ConstValue::Callable { captures, .. } => {
+                for (_, value) in captures {
+                    collect(value, into);
+                }
+            }
+            interpreter::ConstValue::Array(items) | interpreter::ConstValue::Set(items) => {
+                for item in items {
+                    collect(item, into);
+                }
+            }
+            interpreter::ConstValue::Map(entries) => {
+                for (key, item) in entries {
+                    collect(key, into);
+                    collect(item, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut liveness = Liveness::default();
+    for value in results.values() {
+        collect(value, &mut liveness);
+    }
+    liveness
 }
 
 /// The INFERENCE sweep (const-eval.md §9): fold every `let`/`mut` initializer
@@ -1220,7 +1472,7 @@ impl<'p, 'src> TypeParameterScan<'p, 'src> {
             // The type parameter itself, and the two "we do not know" cases —
             // conservative, since a fold under either is unverifiable.
             Some(Type::Generic(_)) | Some(Type::Unknown) | Some(Type::Unresolved) | None => true,
-            Some(Type::Closure(arguments, result)) => {
+            Some(Type::Closure(arguments, result, _)) => {
                 let result = *result;
                 arguments
                     .clone()
@@ -1288,11 +1540,18 @@ struct LocalIndex {
 }
 
 impl LocalIndex {
+    /// M53: `Program::source_of` is a LINEAR scan of ~60 source ranges and this
+    /// asks it once per `Expr::Local` in the WHOLE program — kolt's client has
+    /// tens of thousands, and the product was 1.87% of a cold check, all of it
+    /// attributed to `State::new` because the scan inlines into it. M27 built
+    /// the hoisted twin for exactly this shape: one validation of the ranges,
+    /// then a binary search per row, answer-identical by construction.
     fn build(program: &Program) -> Self {
+        let lookup = program.source_lookup();
         let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::default();
         for (id, expr) in &program.entity_map {
             if let Expr::Local(binding) = expr
-                && let Some(source) = program.source_of(*id)
+                && let Some(source) = lookup.of(*id)
                 && let Some(span) = program.span_map.get(id)
             {
                 by_source
@@ -1348,7 +1607,14 @@ struct State<'p, 'src> {
     /// compile-time-known, which is what makes `let a = 1 + 2; let b = a * 2;`
     /// fold both (const-eval.md §9.5).
     inferable: HashSet<Id>,
-    locals: LocalIndex,
+    /// The `Expr::Local` index, built on FIRST USE (M53).
+    ///
+    /// It is a whole-program table — every local reference in every source,
+    /// std included — and its only reader is `free_locals`, which runs per
+    /// `const` root. A program with no `const` expression and no inference
+    /// candidate never asks, and used to build it anyway, twice per build:
+    /// once in the explicit pass and once in the inference sweep.
+    locals: std::cell::OnceCell<LocalIndex>,
     /// The `const` subtrees, as a per-source interval index — see
     /// [`SpanRegions`] and [`State::in_const_subtree`].
     const_regions: SpanRegions,
@@ -1360,6 +1626,16 @@ struct State<'p, 'src> {
     /// `asset::read`'s host — present in [`Mode::Explicit`], `None` in
     /// [`Mode::Inferred`] (the inferred form's channels are closed, §9.2).
     reader: Option<&'p ProjectReader>,
+    /// The END-OF-EVALUATION finalisers the pass has been asked for (G23), as
+    /// `(emitted name, the site that asked)`, in REGISTRATION order and
+    /// deduplicated on the name — the item's set, so three requests for one
+    /// function are one finaliser. The site is kept because a finaliser is
+    /// re-entered from a program of its own and that program's reach and
+    /// prelude are the scheduling site's ([`transformer::ConstWorld::
+    /// stage_finaliser`]); the FIRST site to ask is the one recorded, so which
+    /// program a finaliser runs against is a function of registration order
+    /// and not of how many times it was asked for.
+    scheduled: Vec<(String, Id)>,
 }
 
 /// How a const expression's free variable is (or isn't) compile-time-known.
@@ -1385,7 +1661,7 @@ impl<'p, 'src> State<'p, 'src> {
             mode,
             const_set: program.const_exprs.iter().copied().collect(),
             inferable,
-            locals: LocalIndex::build(program),
+            locals: std::cell::OnceCell::new(),
             const_regions: SpanRegions::of(program, &program.const_exprs),
             results: HashMap::default(),
             assets: Vec::new(),
@@ -1393,7 +1669,13 @@ impl<'p, 'src> State<'p, 'src> {
             in_progress: HashSet::default(),
             errors: Vec::new(),
             reader,
+            scheduled: Vec::new(),
         }
+    }
+
+    /// The `Expr::Local` index, built on first use (M53).
+    fn locals(&self) -> &LocalIndex {
+        self.locals.get_or_init(|| LocalIndex::build(self.program))
     }
 
     /// Records a diagnostic — or, in [`Mode::Inferred`], does not.
@@ -1451,13 +1733,14 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
                 Known::Runtime(name) => {
+                    let steer = self.declare_it_const_steer(binding);
                     let error = Error {
                         trace: Vec::new(),
                         note: None,
                         span: self.span_of(reference_id),
                         msg: format!(
                             "`{name}` is a runtime value; a `const` expression reads only \
-                             compile-time-known bindings"
+                             compile-time-known bindings{steer}"
                         ),
                     };
                     self.report(reference_id, error);
@@ -1529,7 +1812,13 @@ impl<'p, 'src> State<'p, 'src> {
                     let reader = self
                         .reader
                         .map(|reader| reader as &dyn interpreter::AssetReader);
-                    let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS, reader);
+                    // G24: only a `const let` binding's initializer may
+                    // evaluate to a closure (`const-eval.md` §11). Every other
+                    // const site keeps §1's plain-data rule, and its refusal
+                    // now steers to the declaration that admits one.
+                    let snapshots = self.program.const_let_initializers.contains(&expr_id);
+                    let evaluated =
+                        interpreter::eval_const(&site, EXPLICIT_LIMITS, snapshots, reader);
                     phase_add(&PHASE_INTERP, interp_started);
                     match evaluated {
                         Ok(outcome) => {
@@ -1550,6 +1839,15 @@ impl<'p, 'src> State<'p, 'src> {
                                 }
                             }
                             self.assets.extend(outcome.assets);
+                            // G23: the site's finaliser requests join the
+                            // pass's list here, deduplicated on the emitted
+                            // name — one name generator serves the whole pass,
+                            // so the name IS the function's identity.
+                            for name in outcome.scheduled {
+                                if !self.scheduled.iter().any(|(already, _)| already == &name) {
+                                    self.scheduled.push((name, expr_id));
+                                }
+                            }
                             true
                         }
                         Err(failure) => {
@@ -1577,6 +1875,263 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
             };
+        }
+    }
+
+    /// **G24 — the `const fun` declaration gate.** A `const fun` PROMISES its
+    /// body is const-evaluable, and the point of the promise is that it is
+    /// checked where it is made: at the declaration, spanned on the name,
+    /// naming the capability — not at whichever distant `const` site first
+    /// tried to fold a call to it and reported a failure the reader has to
+    /// trace back.
+    ///
+    /// What disqualifies a body is what disqualifies any const evaluation: a
+    /// HOST BINDING (an `[extern]` — `fetch`, the DOM, `console` by another
+    /// name), or one of the five IMPURE intrinsics the const interpreter
+    /// deliberately has no answer for (`scan`, `args`, `env`, the two
+    /// randoms). Both are read off the CALL GRAPH, transitively, so a body
+    /// that reaches one three calls down is refused at its own declaration and
+    /// each `const fun` on the path is told what it reaches.
+    ///
+    /// NOT a colouring requirement (`const-eval.md` §1's Zig-shaped rule
+    /// stands): a plain `fun` is still const-callable, and a `const fun` is
+    /// still an ordinary function at runtime with runtime arguments. This is
+    /// the opt-in guarantee, and this is where it is kept.
+    fn check_const_functions(&mut self, graph: &CallGraph) {
+        if self.program.const_functions.is_empty() {
+            return;
+        }
+        // Reachability over the graph, memoized: the first capability each
+        // node reaches, by the entity that names it. First-in wins — the
+        // message names ONE capability, and the walk is deterministic because
+        // `calls_of` is in source order.
+        let mut reaches: HashMap<Id, Option<Id>> = HashMap::default();
+        let mut declarations: Vec<Id> = self.program.const_functions.iter().copied().collect();
+        declarations.sort_by_key(|id| id.0);
+        for function_id in declarations {
+            let mut visiting: HashSet<Id> = HashSet::default();
+            let Some(capability) =
+                self.capability_reached(graph, function_id, &mut reaches, &mut visiting)
+            else {
+                continue;
+            };
+            let Some(function) = self.program.functions.get(&function_id) else {
+                continue;
+            };
+            let name = function.name;
+            let capability_label = self.capability_label(capability);
+            self.errors.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: function.name_span,
+                    msg: format!(
+                        "`{name}` is declared `const fun`, but its body reaches \
+                         {capability_label}, which has no compile-time answer: a `const fun` \
+                         promises its body is const-evaluable, and that promise is checked \
+                         here rather than at a call site. Drop the `const` to keep an \
+                         ordinary function, or move the capability out of the body"
+                    ),
+                },
+                self.source_of(function_id),
+            ));
+        }
+    }
+
+    /// The first compile-time-impossible capability `node` reaches, by the
+    /// entity that names it — itself when `node` IS one. Memoized across the
+    /// declarations, and cycle-safe (a recursive body answers `None` on the
+    /// re-entry and the outer frame's own findings still stand).
+    fn capability_reached(
+        &self,
+        graph: &CallGraph,
+        node: Id,
+        reaches: &mut HashMap<Id, Option<Id>>,
+        visiting: &mut HashSet<Id>,
+    ) -> Option<Id> {
+        if let Some(answer) = reaches.get(&node) {
+            return *answer;
+        }
+        if !visiting.insert(node) {
+            return None;
+        }
+        let mut answer = None;
+        for call in graph.calls_of(node) {
+            match call.target {
+                CallTarget::External(target) => {
+                    if self.is_compile_time_impossible(target) {
+                        answer = Some(target);
+                        break;
+                    }
+                }
+                CallTarget::Function(target) | CallTarget::Closure(target) => {
+                    if let Some(found) = self.capability_reached(graph, target, reaches, visiting) {
+                        answer = Some(found);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        visiting.remove(&node);
+        reaches.insert(node, answer);
+        answer
+    }
+
+    /// Whether this external is one the const interpreter cannot answer: a
+    /// host binding, or one of the five impure intrinsics it closes off.
+    fn is_compile_time_impossible(&self, target: Id) -> bool {
+        if self
+            .program
+            .external_functions
+            .get(&target)
+            .is_some_and(|external| external.extern_binding.is_some())
+        {
+            return true;
+        }
+        matches!(
+            self.program.intrinsics.get(&target),
+            Some(
+                crate::analyzer::Intrinsic::Scan
+                    | crate::analyzer::Intrinsic::Args
+                    | crate::analyzer::Intrinsic::Env
+                    | crate::analyzer::Intrinsic::RandomInt
+                    | crate::analyzer::Intrinsic::RandomFloat
+            )
+        )
+    }
+
+    /// How a capability names itself in the `const fun` refusal: its host
+    /// SYMBOL where it has one (`fetch`, not the vilan wrapper's name), and
+    /// its declared name otherwise.
+    fn capability_label(&self, capability: Id) -> String {
+        let external = self.program.external_functions.get(&capability);
+        let symbol = external.and_then(|external| match &external.extern_binding {
+            Some(crate::node::ExternBinding::Function { symbol, .. }) => Some(symbol.to_string()),
+            _ => None,
+        });
+        match symbol {
+            Some(symbol) => format!("the host binding `{symbol}`"),
+            None => match external.map(|external| external.name) {
+                Some(name) => format!("`{name}`"),
+                None => "a runtime capability".to_string(),
+            },
+        }
+    }
+
+    /// **G23 — the end of evaluation.** Every finaliser
+    /// `asset::schedule_at_end` was asked for, run ONCE, in REGISTRATION
+    /// order, after the last `const` expression of the build has been
+    /// evaluated and in a const context of its own (so `emit` and the rest of
+    /// the channel are live, which is the whole point: a module accumulates
+    /// during evaluation and processes + emits the result in one go here).
+    ///
+    /// **What "the end" is.** The end of ONE COMPILE's const pass — this
+    /// function's caller is [`evaluate`], and `evaluate` runs once per
+    /// compile, per leg (`const-eval.md` §3's "a two-target build evaluates
+    /// consts per compile"). Under `run --watch`'s HMR rounds that is the end
+    /// of the ROUND: a round recompiles the entry it invalidated, the modules
+    /// it re-evaluates re-schedule and re-emit, and a module the round did not
+    /// touch neither re-schedules nor re-emits — its asset is retained by the
+    /// round's artifact record, which is the machinery B276/M59 already built
+    /// for every other asset. A finaliser therefore never has to ask whether
+    /// it is in a first build or a rebuild; it is handed one complete pass
+    /// either way.
+    ///
+    /// **A finaliser sees every contribution made after its scheduling**,
+    /// because it runs after every const expression rather than at the
+    /// scheduling site: a style module schedules on its FIRST rule and still
+    /// flushes the last one.
+    ///
+    /// **A finaliser that schedules** joins the same list and runs in the same
+    /// pass (the walk is by index over a list that may grow), and one that
+    /// re-schedules ITSELF is a no-op — the set is deduplicated on the
+    /// function's identity, which is what makes "runs once" true whoever asks
+    /// and however often.
+    ///
+    /// **A finaliser that panics fails the build naming it**, at the site that
+    /// scheduled it — the only span the pass has, since the interpreted tree
+    /// carries none (§8.2) — with the function's own declaration as the note.
+    fn run_finalisers<'w>(&mut self, world: &mut transformer::ConstWorld<'w>) {
+        let mut index = 0;
+        while index < self.scheduled.len() {
+            let (name, scheduler) = self.scheduled[index].clone();
+            index += 1;
+            self.run_finaliser(world, &name, scheduler);
+        }
+    }
+
+    /// One finaliser, against a program of its own: the scheduling site's
+    /// reach and prelude with a synthetic body that calls the function
+    /// ([`transformer::ConstWorld::stage_finaliser`] says why that reach is
+    /// the right one).
+    fn run_finaliser<'w>(
+        &mut self,
+        world: &mut transformer::ConstWorld<'w>,
+        name: &str,
+        scheduler: Id,
+    ) {
+        let free = self.free_locals(scheduler);
+        let external: HashSet<Id> = free.iter().map(|(_, binding)| *binding).collect();
+        let lower_started = crate::PhaseClock::now();
+        // The scheduling site was evaluated, so its bindings resolved; a
+        // straggler here would have been reported at that site and is not
+        // reported twice.
+        let (reach, prelude, _unresolved) = world.prepare(scheduler, &external, &self.results);
+        world.stage_finaliser(name, scheduler);
+        let site = world.finaliser_site(name, &reach, prelude);
+        phase_add(&PHASE_LOWER, lower_started);
+        if let Some(recorder) = self.reader {
+            recorder.enter_site(self.source_of(scheduler), self.span_of(scheduler));
+        }
+        let reader = self
+            .reader
+            .map(|reader| reader as &dyn interpreter::AssetReader);
+        let interp_started = crate::PhaseClock::now();
+        // A finaliser's result is discarded, so it never needs a snapshot.
+        let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS, false, reader);
+        phase_add(&PHASE_INTERP, interp_started);
+        match evaluated {
+            Ok(outcome) => {
+                FUEL_MAX.with(|cell| cell.set(cell.get().max(outcome.fuel_used)));
+                if let Some(recorder) = self.reader {
+                    let mut seen: BTreeSet<&str> = BTreeSet::new();
+                    for asset in &outcome.assets {
+                        if seen.insert(&asset.kind) {
+                            recorder.record(ConstFactKind::Emitted {
+                                kind: asset.kind.clone(),
+                            });
+                        }
+                    }
+                }
+                self.assets.extend(outcome.assets);
+                for scheduled in outcome.scheduled {
+                    if !self
+                        .scheduled
+                        .iter()
+                        .any(|(already, _)| already == &scheduled)
+                    {
+                        self.scheduled.push((scheduled, scheduler));
+                    }
+                }
+            }
+            Err(failure) => {
+                let trace = [name.to_string()];
+                let source_name = world
+                    .resolve_trace(&trace)
+                    .first()
+                    .copied()
+                    .flatten()
+                    .map(|function_id| self.program.functions[&function_id].name);
+                let frames = world.resolve_trace(&failure.trace);
+                let mut error = self.failure_error(scheduler, failure, &frames);
+                let finaliser = source_name.unwrap_or(name);
+                error.msg = format!(
+                    "the end-of-evaluation finaliser `{finaliser}` failed: {}",
+                    error.msg
+                );
+                self.report(scheduler, error);
+            }
         }
     }
 
@@ -1637,6 +2192,21 @@ impl<'p, 'src> State<'p, 'src> {
         let mut worklist: Vec<Id> = Vec::new();
         let mut boundary_errors: Vec<(Id, Id)> = Vec::new(); // (call site, callee)
         let mut owned_calls: HashSet<Id> = HashSet::default();
+        // G23's one carve-out from the value-escape rule below, collected here
+        // because this is the loop that already resolves a call to a channel
+        // verb: the ARGUMENT of `asset::schedule_at_end` is a const-only
+        // function NAMED as a value, which is what §2's escape rule refuses —
+        // and it is also the entire point of the hook. The value never becomes
+        // a runtime one: it is handed to the const pass, which re-enters it at
+        // the end of evaluation and nowhere else. Narrow on purpose — the
+        // argument expression of a call to this one verb, nothing wider.
+        let schedule_at_end = self
+            .program
+            .asset_channel_fns
+            .iter()
+            .find(|(_, path)| *path == "asset::schedule_at_end")
+            .map(|(id, _)| *id);
+        let mut scheduled_arguments: HashSet<Id> = HashSet::default();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
                 owned_calls.insert(call.call_id);
@@ -1644,6 +2214,11 @@ impl<'p, 'src> State<'p, 'src> {
                     CallTarget::External(target) if const_only.contains(&target) => target,
                     _ => continue,
                 };
+                if Some(target) == schedule_at_end
+                    && let Some(scheduled) = self.program.function_calls.get(&call.call_id)
+                {
+                    scheduled_arguments.extend(scheduled.argument_ids.iter().copied());
+                }
                 if self.in_const_subtree(call.call_id) {
                     continue;
                 }
@@ -1675,6 +2250,25 @@ impl<'p, 'src> State<'p, 'src> {
                 CallTarget::Indirect(IndirectReason::TraitDispatch | IndirectReason::GenericMember)
             )
         };
+        // The candidate lists below are NAME-KEYED and program-wide
+        // (`candidates_of`, B279's sweep): every override of every trait
+        // declaring the dispatched name, whatever the receiver. They are
+        // deliberately NOT narrowed here, and the reason is the DIRECTION this
+        // check reads an edge in. An edge is a REFUSAL — a runtime path that
+        // reaches a `[const_only]` capability is rejected — so a candidate
+        // this site could never select can only make the check refuse MORE.
+        // Over-refusing costs an author a diagnostic they can see and argue
+        // with; under-refusing ships the capability into a runtime path in
+        // silence, which is the whole failure this check exists to prevent.
+        // The context pass narrows the same lists because it reads an edge as
+        // a property of the site (B258); nothing here narrows by RECEIVER.
+        //
+        // B318 S4's file scope is the one narrowing this check does take, and
+        // it survives the direction argument above because it is not a guess
+        // about what a site selects: an `impl` the calling file's imports did
+        // not admit is one that file CANNOT reach at all, so no runtime path
+        // through it exists here to refuse. Dropping it removes a refusal that
+        // could only ever have been about another file's program.
         let mut refinement_sites: Vec<DispatchSite> = Vec::new();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
@@ -1687,7 +2281,11 @@ impl<'p, 'src> State<'p, 'src> {
                 refinement_sites.push(DispatchSite {
                     owner: RefinedCaller::Node(node.id()),
                     call: call.call_id,
-                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                    candidates: crate::dispatch_refine::candidates_of(
+                        self.program,
+                        self.program.admitting_file(call.call_id),
+                        name,
+                    ),
                 });
             }
         }
@@ -1708,7 +2306,11 @@ impl<'p, 'src> State<'p, 'src> {
                 refinement_sites.push(DispatchSite {
                     owner: RefinedCaller::TopLevel,
                     call: call.call_id,
-                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                    candidates: crate::dispatch_refine::candidates_of(
+                        self.program,
+                        self.program.admitting_file(call.call_id),
+                        name,
+                    ),
                 });
             }
         }
@@ -1727,7 +2329,11 @@ impl<'p, 'src> State<'p, 'src> {
             refinement_sites.push(DispatchSite {
                 owner: RefinedCaller::TopLevel,
                 call: *call_id,
-                candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                candidates: crate::dispatch_refine::candidates_of(
+                    self.program,
+                    self.program.admitting_file(*call_id),
+                    name,
+                ),
             });
         }
         let mut refined_callers: HashMap<Id, Vec<(RefinedCaller, Id)>> = HashMap::default();
@@ -1832,7 +2438,7 @@ impl<'p, 'src> State<'p, 'src> {
             ));
         }
 
-        self.check_value_escapes(graph, &in_r, &reaches);
+        self.check_value_escapes(graph, &in_r, &reaches, &scheduled_arguments);
     }
 
     /// The value-escape half of §2's rule. Two shapes make a runtime function
@@ -1848,11 +2454,17 @@ impl<'p, 'src> State<'p, 'src> {
     /// narrowest span that identifies the problem (diagnostics-standard A1).
     /// A reference inside a `const` subtree is untouched: there the interpreter
     /// makes the call, which is the whole styling shape.
+    ///
+    /// `scheduled_arguments` is G23's carve-out: the argument of an
+    /// `asset::schedule_at_end` call names a const-only function on purpose,
+    /// and the name never leaves the const pass — it is the identity the pass
+    /// re-enters the function by at the end of evaluation.
     fn check_value_escapes(
         &mut self,
         graph: &CallGraph,
         in_r: &HashSet<Id>,
         reaches: &HashMap<Id, Id>,
+        scheduled_arguments: &HashSet<Id>,
     ) {
         let mut escapes: Vec<(Id, Option<Id>)> = Vec::new(); // (site, named function)
 
@@ -1867,7 +2479,10 @@ impl<'p, 'src> State<'p, 'src> {
             .chain(self.program.module_level_bindings());
         for owner in reference_owners {
             for &(reference_id, function_id) in graph.function_references_of(owner) {
-                if !in_r.contains(&function_id) || self.in_const_subtree(reference_id) {
+                if !in_r.contains(&function_id)
+                    || self.in_const_subtree(reference_id)
+                    || scheduled_arguments.contains(&reference_id)
+                {
                     continue;
                 }
                 escapes.push((reference_id, Some(function_id)));
@@ -2035,8 +2650,68 @@ impl<'p, 'src> State<'p, 'src> {
             trace: Vec::new(),
             note,
             span: self.span_of(expr_id),
-            msg: format!("{headline}{subject}: {}", failure.message),
+            msg: format!(
+                "{headline}{subject}: {}{}",
+                failure.message,
+                self.const_let_steer(expr_id, &failure.message)
+            ),
         }
+    }
+
+    /// **G24's R2 steer, on the runtime-binding refusal.** A `const` expression
+    /// reading a plain `let` is refused, correctly — and where that `let` is an
+    /// immutable binding with an initializer, the fix is one keyword, so the
+    /// refusal says which. Silent for a parameter, a `mut`, or a binding with
+    /// no initializer, where `const let` is not the answer and an impossible
+    /// steer is worse than none (B83).
+    fn declare_it_const_steer(&self, binding: Id) -> String {
+        let Some(variable) = self.program.variables.get(&binding) else {
+            return String::new();
+        };
+        if variable.mutable || variable.initial.is_none() {
+            return String::new();
+        }
+        format!(
+            ". Declare it `const let {} = ..;` {CONST_LET_STEER_RUNTIME} — the build \
+             computes it, and a closure over plain data is admitted there \
+             (`const-eval.md` §11)",
+            variable.name
+        )
+    }
+
+    /// **G24's R2 steer, on the plain-data refusal.** "a `const` result must be
+    /// plain data; this evaluates to a closure" is true and, at a `let x =
+    /// const ..`, unhelpful: the author wanted a compile-time closure, the
+    /// language now has one, and the only thing between them is which keyword
+    /// the declaration carries. So the refusal names it — and names the
+    /// binding, so the steer is the line to write and not a shape to derive.
+    ///
+    /// Only at a BINDING's initializer, because that is the only place the
+    /// replacement declaration exists: a `const` result in an argument or a
+    /// tail has no `let` to promote.
+    fn const_let_steer(&self, expr_id: Id, message: &str) -> String {
+        if !message.contains("evaluates to a closure") {
+            return String::new();
+        }
+        let Some(name) = self.binding_initialized_by(expr_id) else {
+            return String::new();
+        };
+        format!(
+            ". {CONST_LET_STEER_CLOSURE} \
+             `const let {name} = ..;` — a `const let` admits a closure over plain \
+             data (`const-eval.md` §11), and every later `const` expression can \
+             call it"
+        )
+    }
+
+    /// The name of the immutable binding `expr_id` initializes, if it is one —
+    /// what both of G24's steers are written against.
+    fn binding_initialized_by(&self, expr_id: Id) -> Option<&'src str> {
+        self.program
+            .variables
+            .values()
+            .find(|variable| variable.initial == Some(expr_id) && !variable.mutable)
+            .map(|variable| variable.name)
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic
@@ -2079,7 +2754,7 @@ impl<'p, 'src> State<'p, 'src> {
             };
         // The index yields references in span order already — the order
         // diagnostics want.
-        self.locals
+        self.locals()
             .references_within(self.program, root)
             .filter(|(_, binding)| !declared_within(*binding))
             .collect()

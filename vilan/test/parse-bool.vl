@@ -1,0 +1,26 @@
+import std::display::Display;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+fun main() {
+	// The two words `Display::to_string` writes, and nothing else.
+	print("true".parse_bool().unwrap_or(false)); // true
+	print("false".parse_bool().unwrap_or(true)); // false
+
+	// The round trip, both ways.
+	print(true.to_string()); // true
+	print(false.to_string().parse_bool().unwrap()); // false
+
+	// The refusals — every one of them `None`, not a guess.
+	print("1".parse_bool().is_some()); // false — "1"/"0" are NOT admitted
+	print("0".parse_bool().is_some()); // false
+	print("True".parse_bool().is_some()); // false — case-sensitive
+	print("FALSE".parse_bool().is_some()); // false
+	print("yes".parse_bool().is_some()); // false
+	print("".parse_bool().is_some()); // false
+	print(" true ".parse_bool().unwrap_or(false)); // true — trimmed, as parse_i32 is
+	print("tr ue".parse_bool().is_some()); // false — trimming is not stripping
+
+	// The `unwrap_or` shape four kolt preference decoders spell.
+	print("nonsense".parse_bool().unwrap_or(true)); // true
+}

@@ -43,9 +43,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// A fresh temp directory for one test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("vilan_dom_events_{tag}_{}", std::process::id()));
+    let dir =
+        support::scratch_root().join(format!("vilan_dom_events_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -59,68 +62,17 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// A document, a window, and elements that all register AND remove listeners the
 /// way a browser does — by handler identity. `count(target, event)` is what the
 /// negative assertions read.
-const DOM_STUB: &str = r#"class StubTarget {
-    constructor(tag) {
-        this.tagName = tag;
-        this.children = [];
-        this.parent = null;
-        this.listeners = {};
-        this._text = "";
-        this.value = "";
-        this.attributes = {};
-        this.style = { setProperty: () => {} };
-    }
-    set textContent(text) { this._text = text; this.children = []; }
-    get textContent() { return this._text; }
-    setAttribute(name, value) { this.attributes[name] = value; }
-    appendChild(child) {
-        if (child.parent) child.parent.children = child.parent.children.filter(c => c !== child);
-        child.parent = this;
-        this.children.push(child);
-    }
-    remove() {
-        if (this.parent) {
-            this.parent.children = this.parent.children.filter(c => c !== this);
-            this.parent = null;
-        }
-    }
-    replaceChildren() { for (const c of this.children) c.parent = null; this.children = []; }
-    addEventListener(event, handler) { (this.listeners[event] = this.listeners[event] || []).push(handler); }
-    // Identity-matched, exactly as the DOM's is. A `dispose` that reconstructs
-    // the handler instead of holding the registered one removes NOTHING here.
-    removeEventListener(event, handler) {
-        this.listeners[event] = (this.listeners[event] || []).filter(h => h !== handler);
-    }
-    count(event) { return (this.listeners[event] || []).length; }
-    // Slice: a handler that disposes its own registration must not perturb the
-    // iteration it is being dispatched from.
-    fire(event, payload = {}) { for (const h of (this.listeners[event] || []).slice()) h(payload); }
-    find(predicate) {
-        if (predicate(this)) return this;
-        for (const c of this.children) { const hit = c.find(predicate); if (hit) return hit; }
-        return null;
-    }
-}
-
-const documentRoot = new StubTarget("div");
-global.document = {
-    createElement: (tag) => new StubTarget(tag),
-    createElementNS: (namespace, tag) => new StubTarget(tag),
-    getElementById: () => documentRoot,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = { pushState(state, title, path) { global.location.pathname = path; } };
-global.window = new StubTarget("window");
-
-let failures = 0;
+const DOM_STUB: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/dom_events.js"),
+    r#"let failures = 0;
 const assert = (condition, message) => {
     if (!condition) { failures += 1; console.log("FAIL - " + message); }
     else console.log("ok   - " + message);
 };
 const done = () => process.exit(failures === 0 ? 0 : 1);
-"#;
+"#,
+);
 
 /// Builds `app.vl` for the browser with the real CLI and runs `harness.js` under
 /// node, returning its stdout. Fails loudly with both streams.
@@ -509,8 +461,9 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
     };
 
     // Registration: the host STORES the vilan closure and calls it later, which
-    // is the audit table's own sentence for `browser/dom.vl`.
-    for name in ["on", "on_event"] {
+    // is the audit table's own sentence for `browser/dom.vl`. `on_event_capture`
+    // (A59) is the same sentence in the other phase and carries the same mark.
+    for name in ["on", "on_event", "on_event_capture"] {
         let (binding, retains) = marking(name);
         assert!(
             binding.contains("addEventListener"),
@@ -522,17 +475,20 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
              the call. Declared as `[extern({binding})]`"
         );
     }
-    // Both targets declare both verbs — `Element` and `Window` each contribute a
-    // pair, so four registrations in total, and a missing one would silently
-    // shrink the surface `listen` is built on.
+    // Both targets declare every verb — `Element` and `Window` each contribute
+    // `on`, `on_event` and (A59) `on_event_capture`, so six registrations in
+    // total, and a missing one would silently shrink the surface `listen` and
+    // `listen_capture` are built on. The number is spelled by the names, so a
+    // future verb is added here rather than absorbed by a bumped count.
     let registrations = externs
         .iter()
         .filter(|(_, binding, _)| binding.contains("addEventListener"))
         .count();
     assert_eq!(
-        registrations, 4,
-        "both targets must declare `on` and `on_event`; found {registrations} \
-         addEventListener bindings"
+        registrations,
+        2 * ["on", "on_event", "on_event_capture"].len(),
+        "both targets must declare `on`, `on_event` and `on_event_capture`; \
+         found {registrations} addEventListener bindings"
     );
     assert!(
         externs
@@ -545,29 +501,114 @@ fn the_event_surfaces_externs_are_marked_by_the_audit_rule() {
     // Removal: nothing is kept past the call, so marking it would be the
     // over-marking the §S4 audit caught on `appendChild` (proposal/router.md
     // §5.2). kolt's hand-roll marks both; this surface deliberately does not.
-    let (binding, retains) = marking("off_event");
-    assert!(
-        binding.contains("removeEventListener"),
-        "`off_event` should bind removeEventListener; got `{binding}`"
-    );
-    assert!(
-        !retains,
-        "`off_event` must NOT be marked `retains` — removal keeps nothing past \
-         the call. Declared as `[extern({binding})]`"
-    );
+    for name in ["off_event", "off_event_capture"] {
+        let (binding, retains) = marking(name);
+        assert!(
+            binding.contains("removeEventListener"),
+            "`{name}` should bind removeEventListener; got `{binding}`"
+        );
+        assert!(
+            !retains,
+            "`{name}` must NOT be marked `retains` — removal keeps nothing past \
+             the call. Declared as `[extern({binding})]`"
+        );
+    }
     let removals = externs
         .iter()
         .filter(|(_, binding, _)| binding.contains("removeEventListener"))
         .collect::<Vec<_>>();
     assert_eq!(
         removals.len(),
-        2,
-        "both targets must declare the removal twin `listen` is built on; found \
-         {}",
+        2 * ["off_event", "off_event_capture"].len(),
+        "both targets must declare the removal twins `listen` and \
+         `listen_capture` are built on; found {}",
         removals.len()
     );
     assert!(
         removals.iter().all(|(_, _, retains)| !*retains),
         "no removeEventListener binding may carry `retains`"
     );
+}
+
+// --- 5. `code`, `target` and `current_target` (tracker A58) -------------------
+
+/// The three getters kolt hand-wrote in three different files
+/// (`lib/input_system.vl:5-9`, `views.vl:31-34`, `lib/overlay.vl:91-94`), on one
+/// page.
+///
+/// `code` is read beside `key` on the same events, because the pair is the
+/// whole point: a shortcut table wants the PHYSICAL key and a text-entry
+/// handler wants the character, and a program that picks wrong is silently
+/// wrong only under another keyboard layout.
+///
+/// `target` and `current_target` are read from ONE dispatch to a node that is
+/// not the node the listener sits on — the only arrangement in which the two
+/// differ, and therefore the only one that can tell them apart. The handler
+/// marks each element it is handed, so the negative half is an assertion too:
+/// the inner node must NOT carry the `current_target` mark.
+const EVENT_TARGETS_AND_CODE: &str = r#"import std::io::print;
+import std::dom::{ Event, get_element_by_id, window };
+
+fun main() {
+	window().on_event("keydown", |event| {
+		print(i"key={event.key()} code={event.code()}");
+	});
+	let app = get_element_by_id("app");
+	app.on_event("click", |event| {
+		event.target().set_attribute("marked", "target");
+		event.current_target().set_attribute("marked", "current");
+	});
+}
+main();
+"#;
+
+#[test]
+fn code_reads_the_physical_key_and_target_and_current_target_are_distinct() {
+    let harness = format!(
+        r#"{DOM_STUB}
+require("./app.js");
+// The same physical key under two layouts: `code` is stable, `key` is not.
+window.fire("keydown", {{ key: "e", code: "KeyE" }});
+window.fire("keydown", {{ key: ".", code: "KeyE" }});
+window.fire("keydown", {{ key: "Escape", code: "Escape" }});
+
+// A click that STARTS on an inner node and is handled on the container.
+const inner = new StubTarget("span");
+documentRoot.appendChild(inner);
+documentRoot.fire("click", {{ target: inner, currentTarget: documentRoot }});
+assert(inner.attributes["marked"] === "target", "target() is the node the event was dispatched to");
+assert(documentRoot.attributes["marked"] === "current", "current_target() is the node the listener sits on");
+
+// The same dispatch straight at the listening element: the two coincide, which
+// is exactly why the previous case is the one that can tell them apart.
+const solo = new StubTarget("div");
+documentRoot.fire("click", {{ target: solo, currentTarget: solo }});
+assert(solo.attributes["marked"] === "current", "one node dispatched to and listening on reads both");
+done();
+"#
+    );
+    let stdout = build_and_run("event_targets_and_code", EVENT_TARGETS_AND_CODE, &harness);
+    assert!(
+        stdout.contains("key=e code=KeyE"),
+        "`code` must read event.code beside `key`; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("key=. code=KeyE"),
+        "`code` must be layout-independent where `key` is not — the same \
+         physical key under a second layout; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("key=Escape code=Escape"),
+        "a named key spells the same in both; got:\n{stdout}"
+    );
+    for claim in [
+        "target() is the node the event was dispatched to",
+        "current_target() is the node the listener sits on",
+        "one node dispatched to and listening on reads both",
+    ] {
+        assert!(
+            stdout.contains(&format!("ok   - {claim}")),
+            "the target exhibit must hold `{claim}`; got:\n{stdout}"
+        );
+    }
 }

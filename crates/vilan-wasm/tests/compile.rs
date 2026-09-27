@@ -36,7 +36,8 @@ fn compiler() -> MutexGuard<'static, ()> {
 ///
 /// Measured since (B138, `VILAN_DEPTH_STATS`): the analyses these tests run
 /// peak under 1 MiB of stack unoptimized — what closed the CI margin was the
-/// expression walk's ~36 KiB-per-nesting-level frames, depth-bounded at 500
+/// expression walk's 42,464-bytes-per-nesting-level frames (41.5 KiB, N97's
+/// re-measurement — the record read ~36 KiB), depth-bounded at 500
 /// levels now, as are the return-inference chain (B139) and the parser itself
 /// (B142). The 256 MiB here matches the vilan-core harness convention, not a
 /// measured need of these fixtures — the SHIPPED margins are sized from the
@@ -117,7 +118,7 @@ fn a_browser_layer_import_resolves() {
 fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
     let output = compile(
         "import std::reactive::{ Signal, SignalCell };\n\
-         import std::ui::{ View, mount_root, view };\n\
+         import std::ui::{ View, mount_root, swap, view };\n\
          \n\
          [derive(PartialEq)]\n\
          enum Route {\n\
@@ -135,10 +136,10 @@ fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
          \n\
          fun main() {\n\
          \tlet route: SignalCell<Route> = Signal::new(Route::Home);\n\
-         \tlet _root = mount_root(\"app\", || view(\"main\").swap(route, |current| match current {\n\
+         \tlet _root = mount_root(\"app\", || view(\"main\").child(swap(route, |current| match current {\n\
          \t\tRoute::Home => home_page(),\n\
          \t\tRoute::Away => away_page(),\n\
-         \t}));\n\
+         \t})));\n\
          }\n",
     );
     assert!(
@@ -164,15 +165,19 @@ fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
 /// The stance above, guarded at its cause rather than at its symptom: the
 /// playground's compile path must never reach the split emitter.
 ///
-/// The output pin alone cannot see this. `chunks::plan` recognizes nothing in
-/// the playground anyway — `embedded_std_spec` hand-builds its package spec and
-/// leaves `Program::std_sources` EMPTY, so `View` does not read as std-resident
-/// and the `swap` recognizer finds no site — which means swapping `transform`
-/// for `transform_split` here would today produce the same single string and
-/// pass unnoticed. It would also be a trap: the residence rules in `chunks.rs`
-/// ("std is never chunked") all read the other way under an empty
-/// `std_sources`, so the day that spec learns to mark std, a playground wired
-/// to the split emitter would start chunking the standard library.
+/// The output pin alone cannot see this. Until E198 `chunks::plan` recognized
+/// nothing in the playground at all: `Program::std_sources` was the S1 FROZEN
+/// set, the embedded toolchain lives in the document overlay and an overlaid
+/// source is never frozen, so `View` did not read as std-resident and the
+/// `swap` recognizer found no site. Swapping `transform` for `transform_split`
+/// here would have produced the same single string and passed unnoticed.
+///
+/// E198 split residence from freezing, so the playground now DOES record its
+/// std sources and `chunks.rs`'s residence rules ("std is never chunked") read
+/// the right way there — which is what this pin was written against. The
+/// stance is unchanged and the guard stays at the cause: `split` is a
+/// `vilan build` decision and the playground's compile path must not reach the
+/// split emitter at all.
 #[test]
 fn the_playground_compile_path_never_calls_the_split_emitter() {
     let source = include_str!("../src/lib.rs");
@@ -181,6 +186,51 @@ fn the_playground_compile_path_never_calls_the_split_emitter() {
         "`split` is a `vilan build` decision: the playground has no manifest to \
          declare it in, a single-string `CompileResult` to carry it, and an \
          opaque-origin srcdoc frame that cannot resolve a chunk's relative import"
+    );
+}
+
+/// E198: a diagnostic whose steer is keyed on STD RESIDENCE fires in the
+/// playground too.
+///
+/// The A99 steer is the reader: it names the free slot value that replaced a
+/// retired `View` method, and it only fires on std's OWN `View` (a user type
+/// with a `bind_each` of its own must not be told it retired one). The
+/// residence test used to read `Program::std_sources`, which was the S1 FROZEN
+/// set — and the playground's whole toolchain lives in the document overlay,
+/// where nothing is ever frozen. So the playground answered the bare
+/// `View has no method 'swap'` and swallowed the one sentence that says what to
+/// write instead, for every visitor migrating an Order-36-era snippet.
+#[test]
+fn a_retired_view_method_carries_the_a99_steer_in_the_playground() {
+    let output = compile(
+        "import std::reactive::{ Signal, SignalCell };\n\
+         import std::ui::{ View, mount_root, view };\n\
+         \n\
+         fun main() {\n\
+         \tlet tab: SignalCell<i32> = Signal::new(1);\n\
+         \tlet _root = mount_root(\"app\", || view(\"div\")\n\
+         \t\t.swap(tab, |value: i32| view(\"section\").text(i\"p{value}\")));\n\
+         }\n",
+    );
+    let steered = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("is no longer a `View` method (A99)")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the playground must carry the A99 steer, got: {:#?}",
+                output.diagnostics
+            )
+        });
+    assert!(
+        steered.message.contains("write `child(swap(..))`")
+            && steered.message.contains("`{swap(..)}` in a child hole"),
+        "the steer spells BOTH replacements: {}",
+        steered.message
     );
 }
 
@@ -380,7 +430,7 @@ fn a_second_compile_replaces_the_first_program() {
 /// their platform tokens must still be what `embedded_std_spec` hard-codes.
 #[test]
 fn the_hand_built_std_spec_matches_the_manifest() {
-    let manifest = vilan_embedded_std::FILES
+    let manifest = vilan_embedded::FILES
         .iter()
         .find(|(key, _)| *key == "std/vilan.toml")
         .map(|(_, contents)| *contents)
@@ -469,27 +519,91 @@ fn recompiling_identical_source_interns_the_entry_text() {
 
 #[test]
 fn a_misindented_program_formats_to_the_canonical_layout() {
-    let formatted = vilan_wasm::format_program("fun main() {\n      let a = 1;\n\tprint(a);\n}\n");
+    let outcome = vilan_wasm::format_program("fun main() {\n      let a = 1;\n\tprint(a);\n}\n");
     assert_eq!(
-        formatted, "fun main() {\n\tlet a = 1;\n\tprint(a);\n}\n",
+        outcome.text, "fun main() {\n\tlet a = 1;\n\tprint(a);\n}\n",
         "format must canonicalize indentation the way `vilan fmt` does"
     );
     assert_eq!(
-        vilan_wasm::format_program(&formatted),
-        formatted,
-        "formatting must be idempotent"
+        outcome.declined, None,
+        "a reprint that stands declines nothing"
+    );
+    let again = vilan_wasm::format_program(&outcome.text);
+    assert_eq!(again.text, outcome.text, "formatting must be idempotent");
+    assert_eq!(again.declined, None);
+}
+
+/// E197: the page can tell "already canonical" from "the printer could not
+/// render this", which `formatter::format` made indistinguishable — it answers
+/// the original bytes on every way out, so the Format button did nothing and
+/// said nothing on a file it could not print.
+#[test]
+fn a_program_that_does_not_parse_formats_to_itself_and_says_so() {
+    let broken = "fun main( {\n   let a = ;\n";
+    let outcome = vilan_wasm::format_program(broken);
+    assert_eq!(
+        outcome.text, broken,
+        "a decline must return the original bytes untouched — a file the \
+         formatter does not understand is not one to rewrite"
+    );
+    assert_eq!(
+        outcome.declined.as_deref(),
+        Some("it does not parse"),
+        "and it must say which of the four ways out it took"
+    );
+    // The already-canonical file is the other side of the same question: same
+    // text back, and NOTHING said — which is what makes the sentence above
+    // information rather than noise.
+    let canonical = "fun main() {\n\tlet a = 1;\n}\n";
+    let clean = vilan_wasm::format_program(canonical);
+    assert_eq!(clean.text, canonical);
+    assert_eq!(clean.declined, None);
+}
+
+/// E216: the page's own `[fmt] wrap_comments`. A pasted buffer has no manifest
+/// to climb to, so the toggle is threaded in — and the export the deployed
+/// glue calls keeps the default, which is what makes adding this safe.
+#[test]
+fn the_page_can_ask_for_wrapped_comments_and_the_old_export_cannot() {
+    const LONG: &str = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed
+fun main() {}
+";
+    let default = vilan_wasm::format_program(LONG);
+    assert_eq!(
+        default.text, LONG,
+        "`format`'s answer is byte-for-byte what it was"
+    );
+    let wrapped = vilan_wasm::format_program_with(
+        LONG,
+        vilan_core::formatter::FormatOptions {
+            wrap_comments: true,
+            comment_width: vilan_core::formatter::DEFAULT_COMMENT_WIDTH,
+        },
+    );
+    assert_eq!(
+        wrapped.declined, None,
+        "the fill must not decline: {:?}",
+        wrapped.declined
+    );
+    assert!(
+        wrapped.text.starts_with(
+            "// the formatter has laid code out to a width since the day it existed and left \
+             every comment\n// exactly as typed\n"
+        ),
+        "{:?}",
+        wrapped.text
     );
 }
 
+/// The printer-gap face, which is the one the item is about: a construct the
+/// safety net throws away reports the construct, not just "no".
 #[test]
-fn a_program_that_does_not_parse_formats_to_itself() {
-    let broken = "fun main( {\n   let a = ;\n";
-    assert_eq!(
-        vilan_wasm::format_program(broken),
-        broken,
-        "a bail must return the original bytes untouched — a file the \
-         formatter does not understand is not one to rewrite"
-    );
+fn a_construct_the_printer_cannot_render_names_itself() {
+    // An unterminated string reaches the LEXER's refusal, the one decline that
+    // carries no construct — pinned so the page's note is never an empty
+    // sentence.
+    let outcome = vilan_wasm::format_program("fun main() {\n\tlet a = \"open;\n}\n");
+    assert_eq!(outcome.declined.as_deref(), Some("it does not lex"));
 }
 
 // --- compile_for: the server check mode's contract ---------------------------
@@ -572,7 +686,7 @@ fn a_browser_program_is_rejected_for_node() {
 /// promises "a toolchain path for a diagnostic inside std", and nothing else
 /// here produces one.
 ///
-/// The injected key is not one of `vilan_embedded_std::FILES`, so `boot()` —
+/// The injected key is not one of `vilan_embedded::FILES`, so `boot()` —
 /// which re-registers every embedded file on every compile — neither clobbers
 /// it nor is clobbered by it, and no other test imports the module.
 #[test]
@@ -702,6 +816,71 @@ fn member_completion_answers_from_the_retained_analysis() {
     assert!(
         !named(&items, "x").is_snippet,
         "a field inserts its bare name"
+    );
+}
+
+/// E160/E193: a struct initializer's FIELD position reaches the playground —
+/// the remaining fields, the shorthand where a local of that name is in scope,
+/// and not one binding from the enclosing scope.
+#[test]
+fn struct_initializer_completion_offers_the_remaining_fields() {
+    let compiled = "struct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet x = 1;\n\tlet p = Point { };\n}\n";
+    let live = "struct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet x = 1;\n\tlet p = Point { \n}\n";
+    let items = complete_after(compiled, live, 7, 17);
+    let offered = labels(&items);
+    assert_eq!(offered, vec!["x", "y"], "the fields and nothing else");
+    // `x` is a local too, so the shorthand is the insertion; `y` is not.
+    assert_eq!(named(&items, "x").insert, "x", "the shorthand");
+    assert_eq!(named(&items, "y").insert, "y = ");
+    assert_eq!(named(&items, "y").kind, "field");
+}
+
+/// E69: the element head's attribute vocabulary reaches the playground
+/// unchanged — the table is a `vilan-ide` const, so the crate that builds for
+/// `wasm32-unknown-unknown` carries it with no protocol and no filesystem.
+#[test]
+fn element_head_completion_offers_the_attribute_table() {
+    let compiled =
+        "import std::ui::view;\n\nfun main() {\n\tlet card = <input/>;\n\tlet _ = card;\n}\n";
+    let live =
+        "import std::ui::view;\n\nfun main() {\n\tlet card = <input />;\n\tlet _ = card;\n}\n";
+    let items = complete_after(compiled, live, 3, 19);
+    let offered = labels(&items);
+    for expected in ["type", "disabled", "value", "class", "id"] {
+        assert!(
+            offered.contains(&expected),
+            "`{expected}` missing from the playground's head popup: {offered:?}"
+        );
+    }
+    assert!(
+        offered.contains(&"on:click"),
+        "the event names too: {offered:?}"
+    );
+    // The call shape an attribute inserts is the front-end's own mapping of
+    // `call_parameters`, not a second rule for the playground.
+    let attribute = named(&items, "type");
+    assert_eq!(attribute.kind, "field");
+    assert_eq!(attribute.insert, "type(${1:value})$0");
+    assert!(attribute.is_snippet);
+}
+
+/// E194's server half: the candidate list at `<svg stroke-w|` DOES carry
+/// `stroke-width`. The bug was never here — VS Code filtered the list against
+/// the word under the cursor, and with no `wordPattern` declared its default
+/// excludes `-`, so the word was `w` and the one candidate the author was
+/// typing towards was the one that disappeared. The client half is pinned in
+/// `vilan-cli::vscode_extension` (`the_word_pattern_reads_a_hyphenated_
+/// attribute_prefix_whole`); this is the half that says the server was right.
+#[test]
+fn element_head_completion_offers_a_hyphenated_attribute_under_its_own_prefix() {
+    let compiled =
+        "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg/>;\n\tlet _ = icon;\n}\n";
+    let live = "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg stroke-w/>;\n\tlet _ = icon;\n}\n";
+    let items = complete_after(compiled, live, 3, 25);
+    let offered = labels(&items);
+    assert!(
+        offered.contains(&"stroke-width"),
+        "the SVG-wide vocabulary is offered at a hyphenated prefix: {offered:?}"
     );
 }
 
@@ -911,5 +1090,354 @@ fn an_auto_import_edit_is_positioned_in_the_live_text() {
             "{}'s edit {edit:?} is in the live text's coordinates",
             candidate.label
         );
+    }
+}
+
+// --- the ambient scope: the playground's prelude option (K14) ----------------
+
+/// A compile under an explicit ambient scope, the way the page's toggle drives
+/// it. `PlaygroundPrelude::Default` is what both `compile` and
+/// `compile_for_node` above already take, so these only ever pass the other
+/// shapes.
+fn compile_with(
+    source: &str,
+    platform: vilan_core::Platform,
+    prelude: vilan_wasm::PlaygroundPrelude,
+) -> CompileOutput {
+    let _guard = compiler();
+    on_big_stack(|| vilan_wasm::compile_program_with(source, platform, prelude))
+}
+
+fn assert_clean(output: &CompileOutput, what: &str) {
+    assert!(
+        output.diagnostics.is_empty(),
+        "{what} must compile clean, got: {:#?}",
+        output.diagnostics
+    );
+}
+
+fn assert_reports(output: &CompileOutput, needle: &str, what: &str) {
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains(needle)),
+        "{what} must report `{needle}`, got: {:#?}",
+        output.diagnostics
+    );
+}
+
+/// The charge's first pin: a hello-shaped program, pasted with no imports at
+/// all, means in the playground what it would mean inside a fresh `vilan init`
+/// package — in BOTH modes, because `print` is in both std sets.
+#[test]
+fn a_hello_shaped_program_compiles_with_a_bare_print_in_both_modes() {
+    let hello = "fun main() {\n\tprint(\"hello, vilan\");\n}\n";
+    assert_clean(&compile(hello), "the browser mode's hello");
+    assert_clean(&compile_for_node(hello), "the node mode's hello");
+}
+
+/// Browser mode takes the WEB set (`prelude.md` §5.3), because the playground's
+/// browser mode IS a web app: the ambient members and both ambient modules
+/// resolve with no import at all.
+#[test]
+fn browser_mode_seeds_the_web_set() {
+    let output = compile(
+        "fun card(label: str): View {\n\
+         \tview(\"div\").text(label)\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet count: SignalCell<i32> = Signal::new(0);\n\
+         \tlet _card = card(\"hi\");\n\
+         \tlet _display = style::Display::Flex;\n\
+         \tlet _twin = ui::view(\"span\");\n\
+         \tprint(count.get());\n\
+         }\n",
+    );
+    assert_clean(&output, "the web set's ambient names");
+}
+
+/// Node mode takes the BASE set: the web set's members are genuinely absent,
+/// and the miss is reported without pointing at a manifest the playground has
+/// not got.
+///
+/// The second half is the honesty half, and it is a pin rather than an
+/// observation: `web_prelude_steer` (`prelude.md` §11.4) must not answer "set
+/// `prelude = \"std::web\"` in vilan.toml" here, because a pasted buffer has no
+/// manifest to edit.
+///
+/// It used to hold for the wrong reason — the steer was SILENT, its std module
+/// inventory being a `read_dir` (`analyzer.rs`, `std_module_files`) behind a
+/// compiler with no filesystem, so the pin was recording a defect (E120). The
+/// inventory lists the document overlay now, so the steer fires; what keeps the
+/// manifest sentence away is the front end declaring which control can change
+/// the ambient scope — [`vilan_core::PreludeRepair::Toggle`] — and the arm it
+/// selects is pinned below.
+#[test]
+fn node_mode_takes_the_base_set_and_names_no_manifest() {
+    assert_clean(
+        &compile_for_node("fun main() {\n\tprint(1);\n}\n"),
+        "the base set in node mode",
+    );
+    let output = compile_for_node("fun main() {\n\tlet count = Signal::new(0);\n}\n");
+    let miss = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Signal"))
+        .expect("node mode must report the absent web-set name");
+    assert!(
+        !miss.message.contains("vilan.toml"),
+        "a pasted buffer has no manifest to edit: {}",
+        miss.message
+    );
+}
+
+/// The web-set steer's PLAYGROUND arm (E120): where there is no manifest, the
+/// repair is the page's own prelude toggle — and the one-name import beside it,
+/// which is the repair a visitor who wants exactly this name can take without
+/// changing what the rest of the buffer means.
+#[test]
+fn the_web_set_steer_names_the_prelude_toggle_and_the_import() {
+    let output = compile_for_node("fun main() {\n\tlet count = Signal::new(0);\n}\n");
+    let miss = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Signal"))
+        .expect("node mode must report the absent web-set name");
+    assert!(
+        miss.message
+            .contains("switch the playground's prelude to the web set"),
+        "the playground's repair is its toggle: {}",
+        miss.message
+    );
+    assert!(
+        miss.message.contains("import std::reactive::Signal;"),
+        "and the one-name import beside it: {}",
+        miss.message
+    );
+}
+
+/// The B4 import steer — "cannot find `X`; import it first" — is what a
+/// playground visitor most needs, and it was dead here for the same reason
+/// (E120): the steer's std-wide index is built from `std_module_files`, which
+/// only ever listed a directory.
+///
+/// `Arena` is the probe rather than a name like `Map`, and the difference is
+/// what makes this pin non-vacuous. `import_steer_inner` searches the LOADED
+/// modules first, and the web prelude drags most of std in behind `ui` and
+/// `style` — so a name in any of those already steered here, index or no index.
+/// Nothing a playground buffer loads reaches `std::arena`, so only the
+/// inventory can name it.
+#[test]
+fn the_plain_import_steer_fires_with_no_filesystem() {
+    assert_reports(
+        &compile("fun main() {\n\tlet a: Arena<i32> = Arena::new();\n}\n"),
+        "import it first (`import std::arena::Arena;`)",
+        "the B4 import steer",
+    );
+}
+
+/// The same inventory feeds the unimported-trait-method steer (std-surface.md
+/// §5), so it was dead here too: `to_string` needs `std::display::Display`,
+/// which a browser-mode buffer never loads on its own.
+#[test]
+fn the_trait_method_steer_fires_with_no_filesystem() {
+    assert_reports(
+        &compile("fun main() {\n\tlet s = 42.to_string();\n}\n"),
+        "import std::display::Display",
+        "the unimported-trait-method steer",
+    );
+}
+
+/// The toggle's OFF position restores today's behavior exactly: no ambient
+/// scope, explicit imports required, and the removed-alias steer still naming
+/// the real path (`prelude.md` §10.2).
+#[test]
+fn the_prelude_off_position_requires_the_explicit_import() {
+    let off = vilan_wasm::PlaygroundPrelude::Off;
+    assert_reports(
+        &compile_with(
+            "fun main() {\n\tprint(1);\n}\n",
+            vilan_core::Platform::Browser,
+            off.clone(),
+        ),
+        "cannot find 'print'",
+        "with the prelude off, `print` is an import away",
+    );
+    assert_clean(
+        &compile_with(
+            "import std::io::print;\n\nfun main() {\n\tprint(1);\n}\n",
+            vilan_core::Platform::Browser,
+            off.clone(),
+        ),
+        "the explicit spelling with the prelude off",
+    );
+    assert_reports(
+        &compile_with(
+            "import std::print;\n\nfun main() {\n\tprint(1);\n}\n",
+            vilan_core::Platform::Browser,
+            off,
+        ),
+        "its module path is `std::io::print`",
+        "the removed-alias steer",
+    );
+}
+
+/// The shadowing pin's twin, on the playground's side: an explicit import beats
+/// the ambient binding, and the cost the paper records (§4.1) is paid here too.
+/// A name has ONE binding, so within one file you take the ambient MODULE
+/// `style` or the imported FUNCTION `style`, never both.
+#[test]
+fn an_explicit_import_beats_the_ambient_name() {
+    // No import: `style` is the ambient MODULE, and the function it contains is
+    // not ambient — only the module's own name is (§5.2).
+    let ambient = compile("fun main() {\n\tlet _display = style::Display::Flex;\n}\n");
+    assert_clean(&ambient, "the ambient module `style`");
+    assert_reports(
+        &compile("fun main() {\n\tlet _builder = style();\n}\n"),
+        "`style` is a module, not a value",
+        "the ambient module publishes its own name, not its members",
+    );
+
+    // Imported: the FUNCTION wins the name, silently…
+    assert_clean(
+        &compile("import std::style::style;\n\nfun main() {\n\tlet _builder = style();\n}\n"),
+        "the imported function `style`",
+    );
+    // …and the qualified spelling that ambient module bought is gone with it.
+    assert_reports(
+        &compile(
+            "import std::style::style;\n\nfun main() {\n\tlet _display = style::Display::Flex;\n}\n",
+        ),
+        "is not a module",
+        "an imported member costs the file its ambient module",
+    );
+}
+
+/// A local declaration is stronger still (`prelude.md` §9.1): the file's own
+/// `enum Signal` wins over the web set's ambient one, silently — the exact
+/// collision §4.1's census found in the estate, met here in a pasted buffer.
+#[test]
+fn a_local_declaration_shadows_an_ambient_prelude_name() {
+    let output = compile(
+        "enum Signal {\n\
+         \tQuit,\n\
+         \tFinished,\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet state = Signal::Quit;\n\
+         \tmatch state {\n\
+         \t\tSignal::Quit => print(\"quit\"),\n\
+         \t\tSignal::Finished => print(\"done\"),\n\
+         \t}\n\
+         }\n",
+    );
+    assert_clean(&output, "a local `enum Signal` under the web set");
+}
+
+/// The page's wire, mapped: absent is the mode's recommended set, the `"off"`
+/// word is no prelude, and anything else is a module path — which is how the
+/// browser mode can be asked for the BASE set even though the web one is what
+/// it recommends. The whole decision lives here rather than in the
+/// `wasm_bindgen` layer, which the native tests cannot reach.
+#[test]
+fn the_prelude_wire_maps_absent_off_and_a_module_path() {
+    use vilan_wasm::PlaygroundPrelude;
+    assert_eq!(
+        PlaygroundPrelude::from_option(None),
+        PlaygroundPrelude::Default,
+        "the page saying nothing takes the mode's set"
+    );
+    assert_eq!(
+        PlaygroundPrelude::from_option(Some(vilan_wasm::PRELUDE_OFF)),
+        PlaygroundPrelude::Off
+    );
+    assert_eq!(
+        PlaygroundPrelude::from_option(Some("std::prelude")),
+        PlaygroundPrelude::Module("std::prelude".to_string())
+    );
+    assert_eq!(
+        PlaygroundPrelude::recommended_for(vilan_core::Platform::Browser),
+        vilan_core::manifest::PreludeSpec::Module("std::web".to_string()),
+        "the playground's browser mode IS a web app"
+    );
+    assert_eq!(
+        PlaygroundPrelude::recommended_for(vilan_core::Platform::default()),
+        vilan_core::manifest::PreludeSpec::Module("std::prelude".to_string()),
+        "the server check mode is a process program"
+    );
+
+    // And the pinned path is really the one that binds: the base set in the
+    // browser leaves the web set's names exactly as absent as node mode does.
+    assert_reports(
+        &compile_with(
+            "fun main() {\n\tlet count = Signal::new(0);\n}\n",
+            vilan_core::Platform::Browser,
+            PlaygroundPrelude::Module("std::prelude".to_string()),
+        ),
+        "Signal",
+        "a pinned base prelude in the browser",
+    );
+}
+
+/// E183, on the playground: the `css` block's dotted head is `vilan-ide`'s
+/// answer, so the page reaches it unchanged — the combinators first, then every
+/// `impl Style` method the program declares, out of the analyzed impl table the
+/// last compile retained.
+#[test]
+fn css_dotted_head_completion_reaches_the_playground() {
+    let compiled = "import std::style::{ Style, style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}\n}\n\nfun main() {\n\tlet card = css {\n\t};\n}\n";
+    let live = compiled.replace(
+        "\tlet card = css {\n\t};",
+        "\tlet card = css {\n\t\t.\n\t};",
+    );
+    let items = complete_after(compiled, &live, 10, 3);
+    let offered = labels(&items);
+    for method in ["hover", "md", "script_label", "raw"] {
+        assert!(
+            offered.contains(&method),
+            "`{method}` missing at the dotted head: {offered:?}"
+        );
+    }
+    assert!(
+        !offered.contains(&"flex-direction"),
+        "a dotted item is never a property: {offered:?}"
+    );
+}
+
+/// N128: the stack the wasm entries DECLARE to the probe is the stack the
+/// builds LINK. A declaration larger than the real stack puts the probe's floor
+/// below the stack's end, where it never fires and the runaway walk writes past
+/// the shadow stack into the page's data; one smaller refuses programs the page
+/// could hold. Every `-zstack-size` in the shipping build (`release.yml`) and in
+/// CI's wasm leg (`scripts/ci-local.sh`) must be `WASM_STACK_SIZE` — planted red
+/// by the 64 MiB the local leg linked before N128.
+#[test]
+fn the_declared_wasm_stack_is_the_one_the_builds_link() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for file in [".github/workflows/release.yml", "scripts/ci-local.sh"] {
+        let text = std::fs::read_to_string(root.join(file)).expect("read the build file");
+        let sizes: Vec<usize> = text
+            .split("-zstack-size=")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .expect("a numeric -zstack-size")
+            })
+            .collect();
+        assert!(!sizes.is_empty(), "{file} links no -zstack-size");
+        for size in sizes {
+            assert_eq!(
+                size,
+                vilan_wasm::WASM_STACK_SIZE,
+                "{file} links a {size}-byte wasm stack, but the entries declare \
+                 `WASM_STACK_SIZE` to the stack probe"
+            );
+        }
     }
 }

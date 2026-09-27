@@ -3,11 +3,24 @@ import std::io::print;
 // String-literal patterns, or-patterns (`"y", ""`), qualified variant patterns
 // (`Signal::Quit`), `let NAME if CONDITION` match guards, and a guarded FINAL
 // leg — the one leg that may not become the bare `else` (B115).
-enum Signal { Quit, Finished }
-enum Align { Start = "start", End = "end" }
-enum Wrap { One(i32), Two }
-enum Pair { Of(Align) }
-enum Boxed { Of(i32) }
+enum Signal {
+	Quit,
+	Finished,
+}
+enum Align {
+	Start = "start",
+	End = "end",
+}
+enum Wrap {
+	One(i32),
+	Two,
+}
+enum Pair {
+	Of(Align),
+}
+enum Boxed {
+	Of(i32),
+}
 
 fun classify(s: str): str {
 	match s {

@@ -1,4 +1,4 @@
-//! Resources and affine moves (`destruction.md`): the `resource` modifier, R1
+//! Resources and affine moves (`destruction.md`): the `[resource]` attribute, R1
 //! through R12, the `drop` sink, the generic exactly-once rule, and the std
 //! resources `Database` and `File`.
 //!
@@ -7,10 +7,10 @@
 
 use crate::support::*;
 
-// --- C4 S1 chunk 1: the `resource` declaration modifier (surface only) -------
+// --- C4 S1 chunk 1: the `[resource]` declaration attribute (surface only) ----
 //
-// destruction.md §3: `resource` is a declaration modifier in `external`'s
-// position, canonical order `resource external struct`. This chunk parses,
+// destruction.md §3: `[resource]` (a keyword until B413) labels a struct or an
+// enum ahead of `external`, canonical order `[resource] external struct`. This chunk parses,
 // carries, and formats the flag with NO classification or affine checking yet,
 // so a `resource` type still compiles and runs exactly like its data
 // counterpart. (Formatter round-trip is pinned beside its neighbours in
@@ -21,7 +21,7 @@ fn resource_struct_parses_and_is_inert() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Session {
+        [resource] struct Session {
             id: i32,
             name: str,
         }
@@ -41,7 +41,7 @@ fn resource_struct_with_generics_parses() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Wrapper<T> {
+        [resource] struct Wrapper<T> {
             value: T,
         }
         fun main() {
@@ -58,7 +58,7 @@ fn resource_enum_parses_and_is_inert() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource enum Color {
+        [resource] enum Color {
             Red,
             Green,
             Blue,
@@ -79,10 +79,10 @@ fn resource_enum_parses_and_is_inert() {
 #[test]
 fn resource_external_struct_parses() {
     // The leaf case: an opaque host resource declares its own resource-ness,
-    // in canonical order `resource external struct` (destruction.md §3).
+    // in canonical order `[resource] external struct` (destruction.md §3).
     assert_compiles(
         r#"
-        resource external struct Database;
+        [resource] external struct Database;
         fun main() {}
         "#,
     );
@@ -90,14 +90,14 @@ fn resource_external_struct_parses() {
 
 #[test]
 fn resource_struct_carries_a_derive_through_expansion() {
-    // The flag survives macro expansion: a `[derive(..)]` on a `resource struct`
+    // The flag survives macro expansion: a `[derive(..)]` on a `[resource] struct`
     // still synthesizes, and the derived `==` works — expansion keeps the
     // modifier (the item is boxed, not rebuilt).
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         [derive(PartialEq, Debug)]
-        resource struct Session {
+        [resource] struct Session {
             id: i32,
             name: str,
         }
@@ -113,14 +113,14 @@ fn resource_struct_carries_a_derive_through_expansion() {
 
 #[test]
 fn resource_on_a_function_is_rejected() {
-    // `resource` is a type-declaration modifier — anywhere but a struct/enum it
-    // steers (destruction.md §3's classification role).
-    assert_fails_with("resource fun foo() {}\n", "type-declaration modifier");
+    // `[resource]` labels a type declaration — anywhere but a struct/enum it
+    // steers (destruction.md §3's classification role; B413's attribute).
+    assert_fails_with("[resource] fun foo() {}\n", "may label only a `struct`");
 }
 
 #[test]
 fn resource_on_an_impl_is_rejected() {
-    assert_fails_with("resource impl Foo {}\n", "type-declaration modifier");
+    assert_fails_with("[resource] impl Foo {}\n", "may label only a `struct`");
 }
 
 #[test]
@@ -128,23 +128,74 @@ fn resource_on_a_let_is_rejected() {
     assert_fails_with(
         r#"
         fun main() {
-            resource let x = 1;
+            [resource] let x = 1;
         }
         "#,
-        "type-declaration modifier",
+        "may label only a `struct`",
     );
 }
 
 #[test]
 fn resource_on_a_trait_is_rejected() {
-    assert_fails_with("resource trait Foo {}\n", "type-declaration modifier");
+    assert_fails_with("[resource] trait Foo {}\n", "may label only a `struct`");
 }
 
 #[test]
 fn resource_after_external_is_rejected() {
-    // Canonical order is `resource external struct`; the reverse is not a
+    // Canonical order is `[resource] external struct`; the reverse is not a
     // program (destruction.md §3 fixes the order).
-    assert_fails("external resource struct Database;\n");
+    assert_fails("external [resource] struct Database;\n");
+}
+
+#[test]
+fn b413_the_retired_resource_keyword_is_refused_with_the_attribute_steer() {
+    // B413: the spelling before the keyword dissolved — one refusal, naming
+    // the attribute, for each of its three forms.
+    for source in [
+        "resource struct Session { id: i32 }\nfun main() {}\n",
+        "resource external struct Database;\nfun main() {}\n",
+        "resource enum State { A, B }\nfun main() {}\n",
+    ] {
+        assert_fails_with(source, "write `[resource]` before the declaration");
+    }
+}
+
+#[test]
+fn b413_resource_is_an_ordinary_name() {
+    // B413: dissolving the keyword frees the word — a binding, a field and a
+    // function called `resource` compile and run (the collision `Resource<T>`'s
+    // constructor met is gone).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Lease { resource: i32 }
+        fun resource(): i32 { 7 }
+        fun main() {
+            let resource = resource();
+            let lease = Lease { resource = resource };
+            print(lease.resource);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b413_an_attribute_declared_resource_is_the_same_kind_the_keyword_was() {
+    // The kind is read off the label: a `[resource]` struct moves (R1's
+    // use-after-move refusal) exactly as a `resource struct` did.
+    assert_fails_with(
+        r#"
+        [resource] struct Token { id: i32 }
+        fun take(own token: Token) {}
+        fun main() {
+            let token = Token { id = 1 };
+            take(token);
+            take(token);
+        }
+        "#,
+        "after it was moved",
+    );
 }
 
 // === C4 S1 chunk 2: resource CLASSIFICATION + its cheap consumers ===============
@@ -162,7 +213,7 @@ fn resource_classification_direct_declared() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let d = Db { handle = 1 };
             print(d);
@@ -179,7 +230,7 @@ fn resource_classification_nested_struct_containment() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct Session { db: Db }
         fun main() {
             let s = Session { db = Db { handle = 1 } };
@@ -196,7 +247,7 @@ fn resource_classification_enum_payload_containment() {
     // `List<Holder>` argument is rejected because `Holder` is a resource).
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         enum Holder { Has(Db), Empty }
         fun sink(items: List<Holder>) {}
         fun main() {}
@@ -210,7 +261,7 @@ fn resource_classification_tuple_member_containment() {
     // A tuple with a resource MEMBER is a resource — observed via R10.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(items: List<(Db, i32)>) {}
         fun main() {}
         "#,
@@ -246,7 +297,7 @@ fn resource_classification_option_of_resource_is_a_resource() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, None };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let o: Option<Db> = None;
             print(o);
@@ -280,7 +331,7 @@ fn resource_classification_option_of_data_is_not_a_resource() {
 fn r10_list_rejects_a_resource_argument() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(items: List<Db>) {}
         fun main() {}
         "#,
@@ -293,7 +344,7 @@ fn r10_map_rejects_a_resource_argument() {
     assert_fails_with(
         r#"
         import std::map::Map;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(table: Map<str, Db>) {}
         fun main() {}
         "#,
@@ -306,7 +357,7 @@ fn r10_set_rejects_a_resource_argument() {
     assert_fails_with(
         r#"
         import std::set::Set;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(items: Set<Db>) {}
         fun main() {}
         "#,
@@ -319,7 +370,7 @@ fn r10_shared_rejects_a_resource_argument() {
     assert_fails_with(
         r#"
         import std::shared::Shared;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(cell: Shared<Db>) {}
         fun main() {}
         "#,
@@ -333,7 +384,7 @@ fn r10_task_rejects_a_resource_argument() {
     assert_fails_with(
         r#"
         import std::task::Task;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(handle: Task<Db>) {}
         fun main() {}
         "#,
@@ -347,7 +398,7 @@ fn r10_option_accepts_a_resource_argument() {
     assert_compiles(
         r#"
         import std::option::Option;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(item: Option<Db>) {}
         fun main() {}
         "#,
@@ -366,7 +417,7 @@ fn r10_refuses_a_resource_reaching_shared_through_a_generic_field() {
     assert_fails_spanning(
         r#"
         import std::shared::Shared;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct Cell<T> { value: Shared<T> }
         fun sink(cell: Cell<Db>) {}
         fun main() {}
@@ -393,6 +444,82 @@ fn r10_refuses_a_signal_of_a_resource() {
     );
 }
 
+// --- B385: a GENERIC recursive type must not descend forever. The walk's
+// --- guard was keyed on the instantiation's `TypeId`, and substituting a
+// --- recursive member in the head's own context mints a fresh id for the inner
+// --- application every time, so a nine-line enum overflowed the stack (and took
+// --- the language server with it) whenever a resource type was in the world.
+
+#[test]
+fn b385_a_generic_recursive_enum_does_not_overflow_the_resource_walk() {
+    // The owner's report minimized: the wrapper, the parameter count and `any`
+    // are all irrelevant; GENERIC + recursive + a resource type loaded is the
+    // whole trigger. Before the head-keyed guard this aborted the process.
+    assert_compiles(
+        r#"
+        import std::reactive::SignalCell;
+        enum M<type T> {
+            Base(T),
+            Map(List<M<T>>),
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b385_the_owners_signal_mapper_shape_checks_clean() {
+    // Three parameters, permuted through `Shared`, an `any` argument, closure
+    // payloads — the shape as reported, kept whole so the fix is measured against
+    // the real thing and not only its minimization.
+    assert_compiles(
+        r#"
+        import std::reactive::SignalCell;
+        import std::shared::Shared;
+        enum SignalMapper<type T, type U, type O> {
+            Base(SignalCell<O>),
+            Map(Shared<SignalMapper<any, T, O>>, |T| U),
+            Filter(SignalCell<O>, |T| Option<U>),
+            And(SignalCell<O>, |T| SignalCell<U>),
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b385_a_mutually_recursive_generic_pair_checks_clean() {
+    // Two heads, each reached through the other: the head set must hold BOTH
+    // while the walk is inside them, or the pair alternates forever.
+    assert_compiles(
+        r#"
+        import std::reactive::SignalCell;
+        import std::shared::Shared;
+        struct A<type T> { value: T, next: Option<Shared<B<T>>> }
+        struct B<type T> { value: T, back: List<A<T>> }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b385_a_resource_inside_a_recursive_generic_is_still_refused() {
+    // The guard must not hide the diagnostic the walk exists for: a resource
+    // argument reaching `Shared` through a recursive generic's OWN member is
+    // R10's, with the path, exactly as through a non-recursive one (A19).
+    assert_fails_spanning(
+        r#"
+        import std::shared::Shared;
+        [resource] struct Db { handle: i32 }
+        struct Node<T> { value: Shared<T>, children: List<Node<T>> }
+        fun sink(node: Node<Db>) {}
+        fun main() {}
+        "#,
+        "Node<Db>",
+        "`Shared` cannot hold the resource `Db`, reached through `Node.value`",
+    );
+}
+
 #[test]
 fn r10_leaves_a_signal_of_data_alone() {
     // The other direction: the descent looks at the INSTANTIATED member, so a
@@ -415,7 +542,7 @@ fn r10_refuses_a_resource_reaching_a_list_through_two_generic_fields() {
     // The descent is transitive, and the path names every step it took.
     assert_fails_spanning(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct Inner<T> { items: List<T> }
         struct Outer<T> { inner: Inner<T> }
         fun sink(outer: Outer<Db>) {}
@@ -433,7 +560,7 @@ fn r10_leaves_a_generic_aggregate_over_a_resource_alone() {
     // NATIVE container beneath it is refused.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct Holder<T> { value: T }
         fun sink(holder: Holder<Db>) {}
         fun main() {}
@@ -452,7 +579,7 @@ fn b103_program(body: &str) -> String {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         {body}
         "#
@@ -745,7 +872,7 @@ fn r12_rejects_a_resource_argument_to_any() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let d = Db { handle = 1 };
             print(d);
@@ -759,7 +886,7 @@ fn r12_rejects_a_resource_argument_to_any() {
 fn r12_rejects_a_resource_bound_to_any() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let d = Db { handle = 1 };
             let sink: any = d;
@@ -773,7 +900,7 @@ fn r12_rejects_a_resource_bound_to_any() {
 fn r12_rejects_a_resource_returned_as_any() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun leak(): any {
             let d = Db { handle = 1 };
             d
@@ -811,7 +938,7 @@ fn r12_accepts_a_data_value_in_all_three_positions() {
 fn derive_wire_rejects_a_resource_field() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         [derive(Wire)]
         struct Envelope { db: Db }
         fun main() {}
@@ -824,7 +951,7 @@ fn derive_wire_rejects_a_resource_field() {
 fn derive_hashable_rejects_a_resource_field() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         [derive(Hashable)]
         struct Key { db: Db }
         fun main() {}
@@ -837,7 +964,7 @@ fn derive_hashable_rejects_a_resource_field() {
 fn derive_partialeq_rejects_a_resource_field() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         [derive(PartialEq)]
         struct Pair { db: Db }
         fun main() {}
@@ -869,7 +996,7 @@ fn resource_classification_fixed_array_containment() {
     // `any` binding.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let pair: [Db; 2] = [Db { handle = 1 }, Db { handle = 2 }];
             let laundered: any = pair;
@@ -887,7 +1014,7 @@ fn resource_classification_fixed_array_containment() {
 fn r12_rejects_a_resource_method_argument_to_any() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct Sink { count: i32 }
         impl Sink {
             fun swallow(self, value: any) {}
@@ -949,7 +1076,7 @@ fn r1_let_move_then_use_is_use_after_move_with_note() {
     // "donor"), the primary at the later use (`&donor`, occurrence 2).
     assert_use_after_move_noting(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun peek(d: &Db) {}
         fun main() {
             let donor = Db { handle = 1 };
@@ -967,7 +1094,7 @@ fn r1_let_move_without_later_use_compiles() {
     // The move alone is fine — a resource may be re-bound; only a LATER use errors.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun main() {
             let donor = Db { handle = 1 };
@@ -982,7 +1109,7 @@ fn r1_let_move_without_later_use_compiles() {
 fn r1_double_let_move_is_use_after_move() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let a = Db { handle = 1 };
             let b = a;
@@ -999,7 +1126,7 @@ fn r1_double_let_move_is_use_after_move() {
 fn r3_own_argument_at_last_use_compiles() {
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun peek(d: &Db) {}
         fun main() {
@@ -1016,7 +1143,7 @@ fn r3_own_argument_not_last_use_is_rejected() {
     // `sink(a)` moves `a`; the later `peek(&a)` — even a loan — is use-after-move.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun peek(d: &Db) {}
         fun main() {
@@ -1035,7 +1162,7 @@ fn r3_loans_never_move_a_resource() {
     // owned — a later move is fine.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         impl Db { fun ping(&self) {} }
         fun peek(d: &Db) {}
         fun poke(d: &mut Db) {}
@@ -1058,7 +1185,7 @@ fn r3_method_loan_after_a_later_use_compiles() {
     // the receiver loan does not consume it.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         impl Db { fun ping(&self) {} }
         fun sink(own d: Db) {}
         fun main() {
@@ -1078,7 +1205,7 @@ fn r3_own_self_receiver_moves_the_subject() {
     // with the note at the call.
     assert_use_after_move_noting(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         impl Db {
             fun close(own self) {}
             fun ping(&self) {}
@@ -1101,7 +1228,7 @@ fn r3_bare_self_receiver_stays_a_loan() {
     // std and the corpus depends on this.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         impl Db { fun ping(self) {} }
         fun sink(own d: Db) {}
         fun main() {
@@ -1128,8 +1255,8 @@ fn r3_consuming_a_loaned_receiver_is_rejected() {
     assert_fails_with(
         r#"
         import std::io::panic;
-        resource struct Db { handle: i32 }
-        resource enum Slot { Full(Db), Empty }
+        [resource] struct Db { handle: i32 }
+        [resource] enum Slot { Full(Db), Empty }
         impl Slot {
             fun into_inner(self): Db {
                 match self {
@@ -1154,7 +1281,7 @@ fn r3_consuming_a_loaned_parameter_is_rejected() {
     // too, so returning it moves it out of a loan.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun steal(d: Db): Db { d }
         fun sink(own d: Db) {}
         fun main() {
@@ -1172,8 +1299,8 @@ fn r3_consuming_a_ref_parameter_is_rejected() {
     // names the parameter's own spelling.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
-        resource struct Wrap { inner: Db }
+        [resource] struct Db { handle: i32 }
+        [resource] struct Wrap { inner: Db }
         impl Wrap {
             fun leak(&self): Wrap { self }
         }
@@ -1191,7 +1318,7 @@ fn r3_an_own_parameter_may_be_consumed() {
     // The accept half: `own` is exactly the convention that may be moved out.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun forward(own d: Db): Db { d }
         fun sink(own d: Db) {}
         fun main() {
@@ -1215,7 +1342,7 @@ fn b60_a_consuming_call_kills_the_source_binding() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { n: i32 }
+        [resource] struct Res { n: i32 }
         fun main() {
             let slot: Option<Res> = Some(Res { n = 1 });
             let taken = slot.unwrap();
@@ -1236,7 +1363,7 @@ fn b60_a_consuming_call_in_one_branch_is_a_conditional_move() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { n: i32 }
+        [resource] struct Res { n: i32 }
         fun main() {
             let slot: Option<Res> = Some(Res { n = 1 });
             if (true) {
@@ -1255,7 +1382,7 @@ fn b60_a_consuming_call_in_a_loop_is_rejected() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { n: i32 }
+        [resource] struct Res { n: i32 }
         fun main() {
             let slot: Option<Res> = Some(Res { n = 1 });
             mut index = 0;
@@ -1278,7 +1405,7 @@ fn b60_a_consuming_call_on_a_field_is_a_partial_move() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { n: i32 }
+        [resource] struct Res { n: i32 }
         struct Holder { slot: Option<Res> }
         fun main() {
             let holder = Holder { slot = Some(Res { n = 1 }) };
@@ -1300,7 +1427,7 @@ fn b60_reinitialization_after_a_consuming_call_compiles() {
         import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) {
                 print(i"drop {self.tag}");
@@ -1376,7 +1503,7 @@ fn b63_is_some_and_at_a_resource_instantiation() {
         import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str, n: i32 }
+        [resource] struct Res { tag: str, n: i32 }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let slot: Option<Res> = Some(Res { tag = "a", n = 7 });
@@ -1419,7 +1546,7 @@ fn b63_ok_or_at_a_resource_instantiation() {
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
-        resource struct Res { tag: str, n: i32 }
+        [resource] struct Res { tag: str, n: i32 }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let slot: Option<Res> = Some(Res { tag = "b", n = 1 });
@@ -1442,7 +1569,7 @@ fn b63_unzip_at_a_resource_instantiation() {
         import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str, n: i32 }
+        [resource] struct Res { tag: str, n: i32 }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let paired: Option<(Res, i32)> = Some((Res { tag = "p", n = 4 }, 9));
@@ -1466,7 +1593,7 @@ fn b63_inspect_at_a_resource_instantiation() {
         import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str, n: i32 }
+        [resource] struct Res { tag: str, n: i32 }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let slot: Option<Res> = Some(Res { tag = "c", n = 3 });
@@ -1489,7 +1616,7 @@ fn b63_or_else_at_a_resource_instantiation() {
         import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str, n: i32 }
+        [resource] struct Res { tag: str, n: i32 }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let empty: Option<Res> = None;
@@ -1515,7 +1642,7 @@ fn b63_eq_at_a_resource_instantiation() {
         import std::io::print;
         import std::compare::PartialEq;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str, n: i32 }
+        [resource] struct Res { tag: str, n: i32 }
         impl Res with PartialEq { fun eq(self, other: Res): bool { self.n == other.n } }
         fun sink(own o: Option<Res>) {}
         fun main() {
@@ -1540,7 +1667,7 @@ fn b63_or_at_a_resource_rejects_the_discarded_alternative() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let opt: Option<Db> = Some(Db { handle = 1 });
             let other: Option<Db> = None;
@@ -1562,7 +1689,7 @@ fn b63_xor_at_a_resource_rejects_the_two_some_discard() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let opt: Option<Db> = Some(Db { handle = 1 });
             let other: Option<Db> = None;
@@ -1583,7 +1710,7 @@ fn b63_unwrap_or_at_a_resource_rejects_the_discarded_fallback() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let opt: Option<Db> = Some(Db { handle = 1 });
             let value = opt.unwrap_or(Db { handle = 9 });
@@ -1603,7 +1730,7 @@ fn b63_unwrap_or_else_is_the_resource_clean_fallback() {
         import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str, n: i32 }
+        [resource] struct Res { tag: str, n: i32 }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let empty: Option<Res> = None;
@@ -1682,7 +1809,7 @@ fn b63_a_data_option_survives_the_own_self_combinators() {
 fn r4_return_moves_a_binding_out() {
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun give(own d: Db): Db { d }
         fun main() { let x = give(Db { handle = 1 }); }
         "#,
@@ -1695,7 +1822,7 @@ fn r4_return_through_if_tails_moves_each_branch() {
     // not a conditional move (the branches do not rejoin into continuing code).
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun pick(c: bool): Db {
             if c { Db { handle = 1 } } else { Db { handle = 2 } }
         }
@@ -1708,7 +1835,7 @@ fn r4_return_through_if_tails_moves_each_branch() {
 fn r4_return_same_binding_through_both_if_tails_compiles() {
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun pick(c: bool): Db {
             let d = Db { handle = 1 };
             if c { d } else { d }
@@ -1724,7 +1851,7 @@ fn r4_diverging_leg_is_exempt_from_every_path() {
     // reaches the merge, so the every-path requirement is satisfied.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f(c: bool) {
             let d = Db { handle = 1 };
@@ -1741,8 +1868,8 @@ fn r4_diverging_leg_is_exempt_from_every_path() {
 fn r5_struct_literal_moves_a_resource_in_then_use_after() {
     assert_use_after_move_noting(
         r#"
-        resource struct Db { handle: i32 }
-        resource struct Session { db: Db }
+        [resource] struct Db { handle: i32 }
+        [resource] struct Session { db: Db }
         fun peek(d: &Db) {}
         fun main() {
             let conn = Db { handle = 1 };
@@ -1760,8 +1887,8 @@ fn r5_field_copy_out_is_rejected() {
     // `let x = s.db` would copy a resource out of a live aggregate — R5 reject.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
-        resource struct Session { db: Db }
+        [resource] struct Db { handle: i32 }
+        [resource] struct Session { db: Db }
         fun main() {
             let s = Session { db = Db { handle = 1 } };
             let x = s.db;
@@ -1775,8 +1902,8 @@ fn r5_field_copy_out_is_rejected() {
 fn r5_partial_move_out_via_own_argument_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
-        resource struct Session { db: Db }
+        [resource] struct Db { handle: i32 }
+        [resource] struct Session { db: Db }
         fun sink(own d: Db) {}
         fun f(own s: Session) {
             sink(s.db);
@@ -1792,9 +1919,9 @@ fn r5_field_loans_are_accepted() {
     // `&self.db`, `&mut self.db`, and a method through the field are all loans.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         impl Db { fun ping(&self) {} }
-        resource struct Session { db: Db }
+        [resource] struct Session { db: Db }
         fun peek(d: &Db) {}
         fun poke(d: &mut Db) {}
         fun main() {
@@ -1815,7 +1942,7 @@ fn r6_match_by_value_consumes_the_subject() {
     // use-after-move.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         enum Holder { Has(Db), Empty }
         fun sink(own d: Db) {}
         fun f(own h: Holder) {
@@ -1834,7 +1961,7 @@ fn r6_match_captures_move_the_payload() {
     // on once — clean.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         enum Holder { Has(Db), Empty }
         fun sink(own d: Db) {}
         fun f(own h: Holder) {
@@ -1851,7 +1978,7 @@ fn r6_match_on_a_loan_inspects_without_consuming() {
     // later loan both work.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         enum Holder { Has(Db), Empty }
         fun peek(h: &Holder) {}
         fun f(h: &Holder) {
@@ -1870,7 +1997,7 @@ fn r6_match_on_a_loan_inspects_without_consuming() {
 fn r7_conditional_move_on_one_path_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f(c: bool) {
             let d = Db { handle = 1 };
@@ -1886,7 +2013,7 @@ fn r7_conditional_move_on_one_path_is_rejected() {
 fn r7_move_on_both_paths_compiles() {
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f(c: bool) {
             let d = Db { handle = 1 };
@@ -1901,7 +2028,7 @@ fn r7_move_on_both_paths_compiles() {
 fn r7_move_on_neither_path_compiles() {
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun other() {}
         fun f(c: bool) {
@@ -1920,7 +2047,7 @@ fn r7_move_in_one_match_arm_and_loan_in_another_is_rejected() {
     // merge, so R7 rejects (a use follows to make the divergence observable).
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         enum Sig { A, B }
         fun sink(own d: Db) {}
         fun peek(d: &Db) {}
@@ -1941,7 +2068,7 @@ fn r7_move_in_one_match_arm_and_loan_in_another_is_rejected() {
 fn r8_moving_an_outer_binding_inside_a_loop_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f() {
             let d = Db { handle = 1 };
@@ -1959,7 +2086,7 @@ fn r8_moving_a_loop_local_binding_compiles() {
     // fine.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f() {
             for { let d = Db { handle = 1 }; sink(d); }
@@ -1975,7 +2102,7 @@ fn r8_moving_a_loop_local_binding_compiles() {
 fn r9_closure_capturing_a_resource_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun run_it(body: || void) { body(); }
         fun f() {
@@ -1992,7 +2119,7 @@ fn r9_closure_capturing_a_resource_is_rejected() {
 fn r9_spawn_capturing_a_resource_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f() {
             let d = Db { handle = 1 };
@@ -2010,7 +2137,7 @@ fn r9_closure_resource_parameter_is_not_a_capture() {
     // `nursery(|n| ..)` shape. Using it via a method loan is clean.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         impl Db { fun ping(&self) {} }
         fun with_db(body: (|Db| void)) {}
         fun main() {
@@ -2027,7 +2154,7 @@ fn r9_injected_context_clause_body_is_exempt() {
     assert_compiles(
         r#"
         import std::context::Context;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         impl Db { fun ping(&self) {} }
         let flag: Context<i32> = Context::new();
         fun with_db(body: (|Db| void) context flag) {}
@@ -2043,7 +2170,7 @@ fn r9_closure_capturing_an_outer_resource_beside_its_param_is_rejected() {
     // Seeding the closure's parameter must NOT exempt a genuine outer capture.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun with_db(body: (|Db| void)) {}
         fun f() {
@@ -2067,7 +2194,7 @@ fn r9_module_level_resource_in_a_sync_closure_is_exempt() {
     // The sync closure (`Expr::Closure`) form: a method loan of the module global.
     assert_compiles(
         r#"
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         impl Res { fun ping(&self) {} }
         let res: Res = Res { handle = 1 };
         fun run_it(body: || void) { body(); }
@@ -2083,7 +2210,7 @@ fn r9_module_level_resource_in_an_async_closure_is_exempt() {
     // The async-block form (`Expr::Async` wrapping a block) — same exemption path.
     assert_compiles(
         r#"
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         impl Res { fun ping(&self) {} }
         let res: Res = Res { handle = 1 };
         fun main() {
@@ -2098,7 +2225,7 @@ fn r9_module_level_resource_in_a_spawn_is_exempt() {
     // The fire-and-forget spawn form (`async expr`, also `Expr::Async`).
     assert_compiles(
         r#"
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         impl Res { fun ping(&self) {} }
         let res: Res = Res { handle = 1 };
         fun main() {
@@ -2114,7 +2241,7 @@ fn r9_module_level_resource_in_a_nested_closure_is_exempt() {
     // how many closures enclose it, so the exemption holds at any nesting depth.
     assert_compiles(
         r#"
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         impl Res { fun ping(&self) {} }
         let res: Res = Res { handle = 1 };
         fun run_it(body: || void) { body(); }
@@ -2166,7 +2293,7 @@ fn r9_local_resource_in_a_closure_is_still_rejected() {
     // a capture (a second owner) — still rejected. Only the binding site differs.
     assert_fails_with(
         r#"
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         impl Res { fun ping(&self) {} }
         fun run_it(body: || void) { body(); }
         fun main() {
@@ -2184,7 +2311,7 @@ fn r9_parameter_resource_in_a_closure_is_still_rejected() {
     // capture — still rejected. The exemption is module-level only.
     assert_fails_with(
         r#"
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         impl Res { fun ping(&self) {} }
         fun run_it(body: || void) { body(); }
         fun holds(r: Res) {
@@ -2203,7 +2330,7 @@ fn r9_consuming_a_module_global_inside_a_closure_via_let_is_rejected() {
     // move scan covers closure bodies, not just top-level function bodies.
     assert_fails_with(
         r#"
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         let res: Res = Res { handle = 1 };
         fun run_it(body: || void) { body(); }
         fun main() {
@@ -2223,7 +2350,7 @@ fn r9_dropping_a_module_global_inside_a_closure_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::drop;
-        resource struct Res { handle: i32 }
+        [resource] struct Res { handle: i32 }
         let res: Res = Res { handle = 1 };
         fun run_it(body: || void) { body(); }
         fun main() {
@@ -2322,7 +2449,7 @@ fn owned_nursery_enter_runs_its_body_then_drops_clean() {
 fn edge_move_in_a_nested_block_kills_the_outer_binding() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f() {
             let d = Db { handle = 1 };
@@ -2341,7 +2468,7 @@ fn edge_shadowing_rebinds_a_fresh_owner() {
     // first and then the second is clean.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f() {
             let d = Db { handle = 1 };
@@ -2625,7 +2752,7 @@ fn edge_reassignment_re_owns_a_resource_binding() {
     // (the old value's drop lands in S2); a later use of the new value is fine.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun f() {
             mut d = Db { handle = 1 };
@@ -2645,7 +2772,7 @@ fn r7_non_terminal_if_tail_move_is_rejected() {
     // yields a fresh value is a conditional move of `d` — rejected.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun open(): Db { Db { handle = 2 } }
         fun f(condition: bool) {
             let d = Db { handle = 1 };
@@ -2665,7 +2792,7 @@ fn r5_variant_construction_moves_the_payload() {
     assert_fails_with(
         r#"
         import std::option::Option::{ self, Some };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun f() {
             let db = Db { handle = 1 };
             let stored: Option<Db> = Some(db);
@@ -2693,7 +2820,7 @@ fn r11_unwrap_shape_accept() {
     // move-clean shape (destruction.md §4: `Option::unwrap(self): T` passes).
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun take_one<T>(own x: T): T { x }
         fun sink(own d: Db) {}
         fun main() {
@@ -2712,7 +2839,7 @@ fn r11_std_option_unwrap_at_a_resource_accept() {
     assert_compiles(
         r#"
         import std::option::Option::{ self, Some };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(own d: Db) {}
         fun main() {
             let db = Db { handle = 1 };
@@ -2729,7 +2856,7 @@ fn r11_map_shape_closure_free_accept() {
     // `T` moved exactly once into a (closure-free) transform — a constructor.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct Box<T> { inner: T }
         fun wrap<T>(own x: T): Box<T> { Box { inner = x } }
         fun sink(own b: Box<Db>) {}
@@ -2755,7 +2882,7 @@ fn r11_std_option_map_at_a_resource_rejects() {
     assert_fails_spanning(
         r#"
         import std::option::Option::{ self, Some };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let db = Db { handle = 1 };
             let opt: Option<Db> = Some(db);
@@ -2792,7 +2919,7 @@ fn r11_the_map_shaped_leak_is_a_family_not_one_combinator() {
     assert_fails_spanning(
         r#"
         import std::option::Option::{ self, Some, None };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let db = Db { handle = 1 };
             let opt: Option<Db> = Some(db);
@@ -2810,7 +2937,7 @@ fn r11_generic_struct_method_accept() {
     // resource aggregate out once — clean at `W<Db>`.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct W<T> { value: T }
         impl W<type T> {
             fun into_self(own self): W<T> { self }
@@ -2833,7 +2960,7 @@ fn r11_multi_parameter_only_resource_is_checked_accept() {
     // the body is clean and it compiles.
     assert_compiles(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun pick<A, B>(own a: A, b: B): A { a }
         fun sink(own d: Db) {}
         fun main() {
@@ -2872,7 +2999,7 @@ fn r11_dirty_generic_stays_usable_at_data_even_when_used_at_a_resource() {
     // rejection is the use-twice one this test is about and not B60's
     // loan-consumption rule (a bare `x: T` may not be moved out at all).
     let source = r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun use_twice<T>(own x: T): T {
             let keep = x;
             x
@@ -2905,7 +3032,7 @@ fn r11_dirty_generic_stays_usable_at_data_even_when_used_at_a_resource() {
 fn r11_free_generic_used_twice_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun use_twice<T>(own x: T): T {
             let keep = x;
             x
@@ -2926,7 +3053,7 @@ fn r11_rejection_is_spanned_at_the_instantiation_with_a_body_note() {
     // Primary AT the call (`use_twice(db)`); the note points INTO the generic body
     // at the second use of `x` (the tail), which lives before the call in source.
     let source = r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun use_twice<T>(own x: T): T {
             let keep = x;
             x
@@ -2963,7 +3090,7 @@ fn r11_rejection_is_spanned_at_the_instantiation_with_a_body_note() {
 fn r11_generic_struct_method_used_twice_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct W<T> { value: T }
         impl W<type T> {
             fun use_twice(own self): W<T> {
@@ -2987,7 +3114,7 @@ fn r11_conditional_move_in_a_generic_body_is_rejected() {
     // the other — rejected at the instantiation of `maybe_sink` at `Db`.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun consume<U>(own u: U) {}
         fun maybe_sink<T>(own x: T, c: bool) {
             if c { consume(x); }
@@ -3007,7 +3134,7 @@ fn r11_closure_capturing_the_type_parameter_is_rejected() {
     // — rejected when T is a resource.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun run(fn: || i32): i32 { fn() }
         fun consume<U>(own u: U): i32 { 1 }
         fun capturing<T>(own x: T): i32 {
@@ -3029,7 +3156,7 @@ fn r11_resource_aggregate_type_argument_is_a_resource_instantiation() {
     // its double use rejected.
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         struct Pair<A, B> { first: A, second: B }
         fun use_twice<T>(own x: T): T {
             let keep = x;
@@ -3052,7 +3179,7 @@ fn r11_resource_aggregate_type_argument_is_a_resource_instantiation() {
 #[test]
 fn r11_same_dirty_instantiation_reported_once() {
     let source = r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun use_twice<T>(own x: T): T {
             let keep = x;
             x
@@ -3089,7 +3216,7 @@ fn r11_indirect_generic_chain_is_rejected() {
     // which is dirty — the worklist propagates `outer`'s instantiation to `inner`
     // and reports at the `inner(x)` call inside `outer`.
     let source = r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun inner<U>(own x: U): U {
             let keep = x;
             x
@@ -3129,7 +3256,7 @@ fn r11_indirect_generic_chain_is_rejected() {
 fn r11_nested_closure_internal_double_move_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun devour<T2>(own v: T2) {}
         fun g<T>(own value: T) {
             let outer = || {
@@ -3166,7 +3293,7 @@ fn drop_on_a_data_struct_is_rejected() {
         }
         fun main() {}
         "#,
-        "declare it a `resource`",
+        "mark it `[resource]`",
     );
 }
 
@@ -3197,7 +3324,7 @@ fn drop_runs_at_scope_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             fun drop(&mut self) { print("DROPPED"); }
         }
@@ -3234,7 +3361,7 @@ fn a_declared_async_drop_body_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             async fun drop(&mut self) {}
         }
@@ -3252,7 +3379,7 @@ fn an_awaiting_drop_body_is_rejected() {
         r#"
         import std::drop::Drop;
         async fun teardown() {}
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             fun drop(&mut self) { teardown(); }
         }
@@ -3273,7 +3400,7 @@ fn a_context_requiring_drop_body_is_rejected() {
         import std::drop::Drop;
         import std::reactive::{ Signal, SignalCell };
         let counter = Signal::new(0);
-        resource struct Bump { x: i32 }
+        [resource] struct Bump { x: i32 }
         impl Bump with Drop {
             fun drop(&mut self) { counter.set(counter.get() + 1); }
         }
@@ -3289,7 +3416,7 @@ fn a_resource_without_a_drop_impl_is_accepted() {
     // legal — its move discipline stands, and (from S2b) its fields drop.
     assert_compiles(
         r#"
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         fun main() {
             let r = Res { x = 1 };
         }
@@ -3304,8 +3431,8 @@ fn drop_on_a_resource_with_contained_resource_fields_is_accepted() {
     assert_compiles(
         r#"
         import std::drop::Drop;
-        resource external struct Handle;
-        resource struct Session { handle: Handle }
+        [resource] external struct Handle;
+        [resource] struct Session { handle: Handle }
         impl Session with Drop {
             fun drop(&mut self) {}
         }
@@ -3322,7 +3449,7 @@ fn drop_on_a_containment_inferred_resource_is_accepted() {
     assert_compiles(
         r#"
         import std::drop::Drop;
-        resource external struct Handle;
+        [resource] external struct Handle;
         struct Wrapper { handle: Handle }
         impl Wrapper with Drop {
             fun drop(&mut self) {}
@@ -3345,7 +3472,7 @@ fn a_drop_impl_with_a_by_value_receiver_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             fun drop(self) {}
         }
@@ -3361,7 +3488,7 @@ fn a_drop_impl_with_a_shared_receiver_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             fun drop(&self) {}
         }
@@ -3378,7 +3505,7 @@ fn a_drop_impl_with_an_extra_parameter_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             fun drop(&mut self, extra: i32) {}
         }
@@ -3395,7 +3522,7 @@ fn a_drop_impl_with_a_non_void_return_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             fun drop(&mut self): i32 { 0 }
         }
@@ -3411,7 +3538,7 @@ fn a_drop_impl_with_the_exact_signature_is_accepted() {
     assert_compiles(
         r#"
         import std::drop::Drop;
-        resource struct Res { x: i32 }
+        [resource] struct Res { x: i32 }
         impl Res with Drop {
             fun drop(&mut self) {}
         }
@@ -3433,7 +3560,7 @@ fn drop_locals_drop_in_reverse_declaration_order() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             let a = Res { tag = "a" };
@@ -3454,9 +3581,9 @@ fn drop_body_runs_before_fields_which_drop_in_reverse() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Leaf { tag: str }
+        [resource] struct Leaf { tag: str }
         impl Leaf with Drop { fun drop(&mut self) { print(self.tag); } }
-        resource struct Owner { first: Leaf, second: Leaf }
+        [resource] struct Owner { first: Leaf, second: Leaf }
         impl Owner with Drop { fun drop(&mut self) { print("owner-body"); } }
         fun main() {
             let o = Owner { first = Leaf { tag = "first" }, second = Leaf { tag = "second" } };
@@ -3476,7 +3603,7 @@ fn drop_enum_payload_drops_with_the_value() {
         import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             let opt = Some(Res { tag = "payload" });
@@ -3495,9 +3622,9 @@ fn containment_only_resource_drops_its_fields() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Leaf { tag: str }
+        [resource] struct Leaf { tag: str }
         impl Leaf with Drop { fun drop(&mut self) { print(self.tag); } }
-        resource struct Bag { item: Leaf }
+        [resource] struct Bag { item: Leaf }
         fun main() {
             let bag = Bag { item = Leaf { tag = "item" } };
             print(i"body {bag.item.tag}");
@@ -3532,7 +3659,7 @@ fn b113_program(body: &str) -> String {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Leaf {{ tag: str }}
+        [resource] struct Leaf {{ tag: str }}
         impl Leaf with Drop {{ fun drop(&mut self) {{ print(self.tag); }} }}
         {body}
         "#
@@ -3710,7 +3837,7 @@ fn b113_an_inherent_method_named_drop_never_runs() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Leaf { tag: str }
+        [resource] struct Leaf { tag: str }
         impl Leaf { fun drop(own self) { print(i"drop {self.tag}"); } }
         fun main() {
             let leaf = Leaf { tag = "leaf" };
@@ -3729,7 +3856,7 @@ fn drop_runs_on_early_ret() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun run(stop: bool) {
             let r = Res { tag = "r" };
@@ -3754,7 +3881,7 @@ fn drop_runs_on_jump_break_leaving_only_the_loop_scope() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             let outer = Res { tag = "outer" };
@@ -3779,7 +3906,7 @@ fn drop_runs_on_jump_continue_each_iteration() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             mut i = 0;
@@ -3804,7 +3931,7 @@ fn overwrite_drops_the_old_value_then_the_new_at_scope_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             mut r = Res { tag = "old" };
@@ -3825,7 +3952,7 @@ fn a_module_level_resource_never_drops() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         let global = Res { tag = "global" };
         fun main() {
@@ -3846,7 +3973,7 @@ fn a_resource_owned_across_an_await_drops_at_scope_end() {
         import std::io::print;
         import std::drop::Drop;
         import std::time::sleep;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         async fun work() {
             let r = Res { tag = "res" };
@@ -3875,7 +4002,7 @@ fn a_process_needing_drop_colors_its_owning_scope() {
         r#"
         import std::fs::write_file;
         import std::drop::Drop;
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }
@@ -3901,7 +4028,7 @@ fn a_platform_free_drop_adds_no_coloring() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun use_it() {
             let r = Res { tag = "r" };
@@ -3926,7 +4053,7 @@ fn a_drop_sink_call_colors_its_owning_function() {
         r#"
         import std::fs::write_file;
         import std::drop::{ Drop, drop };
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }
@@ -3952,7 +4079,7 @@ fn a_platform_free_drop_sink_call_adds_no_coloring() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun use_it() {
             let r = Res { tag = "r" };
@@ -3980,7 +4107,7 @@ fn a_drop_runs_synchronously_at_the_scope_exit() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             {
@@ -4080,7 +4207,7 @@ fn option_take_on_a_resource_moves_the_payload_out() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut opt: Option<Res> = Some(Res { tag = "r" });
@@ -4105,7 +4232,7 @@ fn option_replace_returns_the_old_resource_for_the_caller_to_own() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut slot: Option<Res> = Some(Res { tag = "old" });
@@ -4145,7 +4272,7 @@ fn option_replace_moves_the_new_value_in_rather_than_loaning_it() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut slot: Option<Res> = None;
@@ -4168,7 +4295,7 @@ fn option_replace_rejects_a_read_of_the_value_it_was_handed() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut slot: Option<Res> = None;
@@ -4203,7 +4330,7 @@ fn r10_refuses_a_native_map_of_a_resource() {
         import std::io::print;
         import std::native_map::NativeMap;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut table: NativeMap<Res> = NativeMap::new();
@@ -4227,7 +4354,7 @@ fn r10_refuses_the_measured_native_map_use_after_free() {
         import std::native_map::NativeMap;
         import std::hash::Hashable;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut table: NativeMap<Res> = NativeMap::new();
@@ -4298,7 +4425,7 @@ fn r10_map_of_a_resource_reports_once() {
     assert_fails_once_with(
         r#"
         import std::map::Map;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(table: Map<str, Db>) {}
         fun main() {}
         "#,
@@ -4311,7 +4438,7 @@ fn r10_set_of_a_resource_reports_once() {
     assert_fails_once_with(
         r#"
         import std::set::Set;
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun sink(items: Set<Db>) {}
         fun main() {}
         "#,
@@ -4329,7 +4456,7 @@ fn r10_map_construction_never_reports_the_native_map_inside_it() {
         import std::io::print;
         import std::map::Map;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut table: Map<str, Res> = Map::new();
@@ -4347,7 +4474,7 @@ fn r10_set_construction_never_reports_the_native_map_inside_it() {
         import std::io::print;
         import std::set::Set;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut items: Set<Res> = Set::new();
@@ -4366,7 +4493,7 @@ fn r11_still_reports_a_container_the_caller_cannot_see() {
     // signature holds no container at all, so it still reports.
     assert_fails_with(
         r#"
-        resource struct Guard { handle: i32 }
+        [resource] struct Guard { handle: i32 }
         fun stash<type T>(own value: T) { let items = [value]; }
         fun main() {
             stash(Guard { handle = 1 });
@@ -4386,8 +4513,8 @@ fn r11_reports_an_independent_body_container_beside_a_refused_signature() {
     // once each.
     let source = r#"
         import std::map::Map;
-        resource struct Guard { handle: i32 }
-        resource struct Other { handle: i32 }
+        [resource] struct Guard { handle: i32 }
+        [resource] struct Other { handle: i32 }
         fun two<type A, type B>(a: Map<str, A>, own b: B) { let items = [b]; }
         fun caller(table: Map<str, Guard>) {
             two(table, Other { handle = 2 });
@@ -4409,7 +4536,7 @@ fn r11_stands_down_on_a_body_container_built_from_the_refused_parameter() {
     assert_fails_once_with(
         r#"
         import std::map::Map;
-        resource struct Guard { handle: i32 }
+        [resource] struct Guard { handle: i32 }
         fun wrap<type A>(own a: A, table: Map<str, A>) { let items = [a]; }
         fun caller(table: Map<str, Guard>) {
             wrap(Guard { handle = 1 }, table);
@@ -4451,7 +4578,7 @@ fn drop_of_a_resource_tears_down_immediately() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"close {self.tag}"); } }
         fun main() {
             let db = Db { tag = "one" };
@@ -4461,6 +4588,40 @@ fn drop_of_a_resource_tears_down_immediately() {
         }
         "#,
         "before\nclose one\nafter\n",
+    );
+}
+
+/// B328: the sink resolves a PARAMETER's type through `expr_type_id`'s general
+/// answer rather than through a private copy of the arm.
+///
+/// A reference to a parameter is spelled `Expr::Local(parameter_id)` —
+/// `Expr::Parameter` is the DECLARATION — and `expr_type_id` looked the binding
+/// up in `variables` alone, so it read `None` for every one of them.
+/// `drop_argument_type_id` carried its own parameter arm to cover the gap; that
+/// copy is gone, so this program is the consumer reading a parameter's type
+/// with no fallback under it. Remove the arm and it does not silently leak: the
+/// sink's own internal-error guard fires, which is the shape that made the gap
+/// latent rather than dangerous — and is exactly why the general answer had to
+/// be right for the next consumer, which will not have a guard.
+#[test]
+fn b328_drop_of_an_own_parameter_tears_down_at_its_site() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::drop::{ Drop, drop };
+        [resource] struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        fun consume(own guard: Guard) {
+            print("before");
+            drop(guard);
+            print("after");
+        }
+        fun main() {
+            consume(Guard { label = "one" });
+            print("done");
+        }
+        "#,
+        "before\ndropped one\nafter\ndone\n",
     );
 }
 
@@ -4500,7 +4661,7 @@ fn b68_drop_of_a_call_result_destroys_it() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun identity(own value: Db): Db { value }
         fun main() {
@@ -4524,7 +4685,7 @@ fn b68_drop_of_a_construction_destroys_it() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             drop(Db { tag = "literal" });
@@ -4543,7 +4704,7 @@ fn b68_drop_of_a_method_call_result_destroys_it() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         struct Factory { tag: str }
         impl Factory { fun open(self): Db { Db { tag = self.tag } } }
@@ -4565,7 +4726,7 @@ fn b68_drop_of_a_nested_call_result_destroys_it() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun identity(own value: Db): Db { value }
         fun main() {
@@ -4608,7 +4769,7 @@ fn b68_a_generic_forwarding_a_call_result_to_the_sink_is_rejected_at_a_resource(
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
         fun identity<T>(own value: T): T { value }
         fun consume<T>(own x: T) { drop(identity(x)); }
@@ -4651,7 +4812,7 @@ fn the_conditional_teardown_idiom_tears_down_in_both_arms() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::{ Drop, drop };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut full: Option<Res> = Some(Res { tag = "cond" });
@@ -4683,7 +4844,7 @@ fn a_concrete_own_resource_parameter_drops_at_the_callee_scope_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun sink(own r: Res) {
             print(i"in-sink {r.tag}");
@@ -4705,7 +4866,7 @@ fn two_own_resource_parameters_drop_in_reverse_declaration_order() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun two(own a: Res, own b: Res) {
             print(i"in-two {a.tag}{b.tag}");
@@ -4727,7 +4888,7 @@ fn an_own_parameter_moved_out_on_every_path_drops_nowhere() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun passthrough(own r: Res): Res {
             print("in-passthrough");
@@ -4761,7 +4922,7 @@ fn an_async_own_resource_parameter_drops_after_the_await_at_scope_end() {
         [extern("node:timers/promises", "setTimeout")]
         async external fun sleep(ms: i32): void;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
 
         fun work(own r: Res) {
@@ -4789,7 +4950,7 @@ fn a_generic_own_t_never_moved_out_is_rejected_at_a_resource_instantiation() {
     assert_fails_spanning(
         r#"
         import std::io::print;
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         fun leak<T>(own x: T) {}
         fun main() {
             let db = Db { tag = "one" };
@@ -4827,7 +4988,7 @@ fn the_drop_sink_itself_is_accepted_at_a_resource() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             let db = Db { tag = "one" };
@@ -4845,7 +5006,7 @@ fn a_generic_own_t_moved_out_by_return_is_accepted_at_a_resource() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
         fun identity<T>(own x: T): T { x }
         fun main() {
@@ -4865,7 +5026,7 @@ fn a_generic_own_t_moved_out_on_every_branch_is_accepted() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
         fun choose<T>(own x: T, flag: bool): T {
             if flag { x } else { x }
@@ -4909,7 +5070,7 @@ fn two_own_generics_moved_on_different_branches_is_not_every_path() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
             if flag { first } else { second }
         }
@@ -4933,7 +5094,7 @@ fn b67_the_concrete_twin_of_pick_is_rejected_too() {
         import std::io::print;
         import std::drop::{ Drop, drop };
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun pick(flag: bool, own first: Option<Res>, own second: Option<Res>): Option<Res> {
             if flag { first } else { second }
@@ -4955,7 +5116,7 @@ fn b67_both_divergent_parameters_are_reported() {
     let source = r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
             if flag { first } else { second }
         }
@@ -4981,7 +5142,7 @@ fn b67_the_same_binding_returned_from_every_branch_stays_accepted() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun choose<T>(own x: T, flag: bool): T {
             if flag { x } else { x }
@@ -5011,7 +5172,7 @@ fn b67_an_is_refined_branch_may_leave_the_none_side_un_moved() {
         import std::io::print;
         import std::drop::{ Drop, drop };
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun pick_or<T>(own held: Option<T>, own fallback: || Option<T>): Option<T> {
             if held is Some(_) { held } else { fallback() }
@@ -5037,7 +5198,7 @@ fn b67_the_refinement_does_not_excuse_a_payload_carrying_complement() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         enum Pair<T> { First(T), Second(T) }
         fun take_one<T>(own slot: Pair<T>, own spare: Pair<T>): Pair<T> {
@@ -5064,7 +5225,7 @@ fn b67_a_loop_divergent_move_is_still_r8_not_r7() {
         import std::io::print;
         import std::drop::{ Drop, drop };
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun sink(own r: Option<Res>) {}
         fun main() {
@@ -5094,7 +5255,7 @@ fn a_generic_forwarding_own_t_to_the_drop_sink_is_rejected_at_a_resource() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
         fun consume<T>(own x: T) { drop(x); }
         fun main() {
@@ -5137,7 +5298,7 @@ fn a_concrete_own_parameter_dropped_via_the_sink_is_destroyed() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"close {self.tag}"); } }
         fun consume(own d: Db) {
             print("in");
@@ -5166,9 +5327,9 @@ fn a_resource_match_consume_moves_the_payload_to_its_new_owner() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
-        resource enum Holder { Full(Res), Empty }
+        [resource] enum Holder { Full(Res), Empty }
         fun main() {
             let holder = Holder::Full(Res { tag = "held" });
             let extracted = match holder {
@@ -5315,7 +5476,7 @@ fn a_module_level_resource_move_into_a_local_is_rejected() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         let shared: Res = Res { tag = "global" };
         fun steal() {
             let mine = shared;
@@ -5336,7 +5497,7 @@ fn a_module_level_resource_overwrite_is_rejected() {
     assert_fails_with(
         r#"
         import std::option::Option::{ self, Some, None };
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         mut slot: Option<Res> = None;
         fun poke() {
             slot = Some(Res { tag = "made" });
@@ -5364,7 +5525,7 @@ fn a_module_level_data_binding_overwrite_is_accepted() {
 }
 
 // --- kolt.local 031 S3: `File` — the second std resource (filesystem.md §3.2,
-// §5). The `Database` template followed exactly: `resource external struct`,
+// §5). The `Database` template followed exactly: `[resource] external struct`,
 // construction through associated funs (over one raw async extern rather than
 // an extern-new — `fsPromises.open` is a module function, not a constructor),
 // release a module-level free function reachable only from `Drop`, no public
@@ -5679,7 +5840,7 @@ fn a_cursor_method_that_awaits_cannot_take_a_mut_view() {
         r#"
         import std::bytes::Bytes;
         import std::fs::File;
-        resource struct Cursor {
+        [resource] struct Cursor {
             file: File,
             position: i53,
         }
@@ -5777,7 +5938,7 @@ fn a_reader_on_a_browser_build_is_refused_by_coloring() {
 // --- kolt.local 020: `Watcher` — the watch tier, and std's third resource.
 // Designed to MATCH `File` by ruling (the owner, 2026-08-28: 020 owns the whole
 // watch surface, shape and mechanism both, and its resource follows
-// filesystem.md §5's lifetime model): `resource external struct`, construction
+// filesystem.md §5's lifetime model): `[resource] external struct`, construction
 // through associated funs over one raw async extern, release a module-level
 // free function reachable only from `Drop`, no public `stop()`. Where it
 // DIVERGES from `File` is the interesting half — stopping a poll is a
@@ -6059,7 +6220,7 @@ fn a_recursive_watch_on_a_browser_build_is_refused_too() {
 fn a_module_level_resource_own_argument_is_rejected() {
     assert_fails_with(
         r#"
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         let shared: Res = Res { tag = "global" };
         fun consume(own r: Res) {}
         fun use_it() { consume(shared); }
@@ -6075,7 +6236,7 @@ fn a_module_level_resource_loan_is_accepted() {
     assert_compiles(
         r#"
         import std::io::print;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res { fun peek(self) { print(self.tag); } }
         let shared: Res = Res { tag = "global" };
         fun borrow_it(r: Res) { print(r.tag); }
@@ -6094,7 +6255,7 @@ fn dropping_a_module_level_resource_is_rejected() {
     assert_fails_with(
         r#"
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         let shared: Res = Res { tag = "global" };
         fun tear() { drop(shared); }
         fun main() { tear(); }
@@ -6127,7 +6288,7 @@ fn an_overwrite_whose_new_value_panics_drops_the_old_value_exactly_once() {
         import std::io::print;
         import std::io::panic;
         import std::drop::Drop;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6159,7 +6320,7 @@ fn an_overwrite_drops_the_old_value_before_the_new_one_is_stored() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6183,7 +6344,7 @@ fn an_overwrite_evaluates_an_effectful_new_value_before_dropping_the_old_one() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6211,11 +6372,11 @@ fn an_overwrite_through_a_view_also_evaluates_before_it_destroys() {
         import std::io::print;
         import std::io::panic;
         import std::drop::Drop;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
-        resource struct Slot { held: Guard }
+        [resource] struct Slot { held: Guard }
         fun boom(): Slot {
             panic("boom");
             Slot { held = Guard { tag = "never" } }
@@ -6258,7 +6419,7 @@ fn a_panic_before_an_explicit_drop_still_releases_the_resource() {
         import std::io::panic;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6290,7 +6451,7 @@ fn an_explicit_drop_on_the_normal_path_destroys_exactly_once() {
         import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6316,7 +6477,7 @@ fn an_explicit_drop_empties_the_slot_its_finally_tests() {
         import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6348,7 +6509,7 @@ fn a_resource_with_no_explicit_drop_keeps_its_unguarded_teardown() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6380,7 +6541,7 @@ fn a_panic_before_dropping_an_own_parameter_still_releases_it() {
         import std::io::panic;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6407,7 +6568,7 @@ fn an_own_parameter_dropped_explicitly_destroys_exactly_once() {
         import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6436,7 +6597,7 @@ fn a_panic_before_dropping_a_match_capture_still_releases_it() {
         import std::option::Option;
         import std::option::Some;
         import std::option::None;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6472,7 +6633,7 @@ fn a_match_capture_dropped_explicitly_destroys_exactly_once() {
         import std::option::Option;
         import std::option::Some;
         import std::option::None;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6500,7 +6661,7 @@ fn a_binding_reassigned_after_its_explicit_drop_destroys_each_value_once() {
         import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) { print(self.tag); }
         }
@@ -6548,7 +6709,7 @@ fn a_resource_drops_after_its_last_use_not_at_the_scope_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let r = Res { tag = "r" };
@@ -6569,7 +6730,7 @@ fn a_resource_nothing_reads_drops_at_its_declaration() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let r = Res { tag = "r" };
@@ -6591,7 +6752,7 @@ fn a_resource_used_after_a_never_ending_loop_would_start_is_released_before_it()
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun serve() {
             let handle = Res { tag = "handle" };
@@ -6616,7 +6777,7 @@ fn two_resources_last_used_in_one_statement_discharge_in_reverse_declaration_ord
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let a = Res { tag = "a" };
@@ -6639,7 +6800,7 @@ fn resources_last_used_in_different_statements_discharge_at_each_last_use() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let a = Res { tag = "a" };
@@ -6664,7 +6825,7 @@ fn a_resource_used_in_one_branch_arm_releases_on_the_taken_and_the_not_taken_pat
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res {{ tag: str }}
+        [resource] struct Res {{ tag: str }}
         impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
         fun run(cond: bool) {{
             let r = Res {{ tag = "r" }};
@@ -6690,7 +6851,7 @@ fn a_resource_used_in_both_arms_still_releases_once_at_the_join() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res {{ tag: str }}
+        [resource] struct Res {{ tag: str }}
         impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
         fun run(cond: bool) {{
             let r = Res {{ tag = "r" }};
@@ -6713,7 +6874,7 @@ fn a_resource_used_inside_a_loop_drops_once_after_the_loop() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let r = Res { tag = "r" };
@@ -6736,7 +6897,7 @@ fn a_resource_declared_inside_a_loop_drops_at_its_last_use_each_iteration() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             for round in [ 1, 2 ] {
@@ -6762,7 +6923,7 @@ fn a_view_extends_its_owners_liveness_to_the_views_last_use() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"drop {self.label}"); } }
         fun main() {
             mut held = Guard { label = "held" };
@@ -6788,7 +6949,7 @@ fn a_teardown_region_widens_over_a_name_a_later_closure_reads() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let r = Res { tag = "r" };
@@ -6813,7 +6974,7 @@ fn a_resource_read_in_the_scopes_tail_keeps_the_scope_end_teardown() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 7 } }
         fun measure(): i32 {
@@ -6837,7 +6998,7 @@ fn last_use_disposal_does_not_reach_a_module_level_resource() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         let global = Res { tag = "global" };
         fun main() {
@@ -6860,7 +7021,7 @@ fn an_explicit_drop_coincides_with_the_point_the_pass_infers() {
         import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let r = Res { tag = "r" };
@@ -6872,7 +7033,7 @@ fn an_explicit_drop_coincides_with_the_point_the_pass_infers() {
     let inferred = r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let r = Res { tag = "r" };
@@ -6893,7 +7054,7 @@ fn an_own_resource_parameter_drops_after_its_last_use() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun sink(own r: Res) {
             print(r.tag);
@@ -6918,7 +7079,7 @@ fn a_last_use_drop_still_runs_when_a_later_statement_in_its_region_panics() {
         import std::io::print;
         import std::io::panic;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             let r = Res { tag = "r" };
@@ -6942,7 +7103,7 @@ fn a_teardown_region_never_closes_over_a_name_read_after_it() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 7 } }
         fun main() {
@@ -6974,7 +7135,7 @@ fn a_teardown_region_inside_an_if_arm_widens_over_a_name_read_after_it() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun probe(flag: bool) {
             if flag {
@@ -7002,7 +7163,7 @@ fn a_teardown_region_inside_a_match_arm_widens_over_a_name_read_after_it() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun probe(n: i32) {
             match n {
@@ -7033,7 +7194,7 @@ fn a_teardown_region_inside_a_loop_body_widens_over_a_name_read_after_it() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun probe(n: i32) {
             mut i = 0;
@@ -7063,7 +7224,7 @@ fn a_teardown_region_two_blocks_deep_widens_over_a_name_read_after_it() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun probe(flag: bool) {
             if flag {
@@ -7097,7 +7258,7 @@ fn a_teardown_region_widens_whether_its_if_is_a_tail_or_a_statement() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun tail_form(flag: bool) {
             if flag {
@@ -7136,7 +7297,7 @@ fn a_teardown_region_inside_a_closure_body_widens_over_a_name_read_after_it() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun run(f: || void) { f(); }
         fun probe() {
@@ -7182,7 +7343,7 @@ fn a_temporary_receiver_drops_at_its_statements_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7203,7 +7364,7 @@ fn two_temporaries_in_one_statement_drop_in_reverse_construction_order() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7225,7 +7386,7 @@ fn a_temporary_drops_before_a_later_statements_temporary_is_built() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7246,7 +7407,7 @@ fn a_temporary_in_a_loop_body_drops_each_iteration() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7271,7 +7432,7 @@ fn a_temporary_bound_into_a_let_still_drops_and_leaves_the_name_readable() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7294,7 +7455,7 @@ fn a_temporary_drops_when_its_statement_throws() {
         import std::io::print;
         import std::io::panic;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun boom(&self): i32 { panic("mid-statement"); 0 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7320,7 +7481,7 @@ fn a_temporary_moved_into_an_own_parameter_is_not_dropped_twice() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun make(tag: str): Res { Res { tag = tag } }
         fun sink(own r: Res) { print(i"in-sink {r.tag}"); }
@@ -7351,7 +7512,7 @@ fn a_temporary_in_a_bare_loan_parameter_drops_at_its_statements_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun peek(handle: Res): str { handle.tag }
         fun main() {
@@ -7373,7 +7534,7 @@ fn a_temporary_in_a_bare_extern_parameter_drops_at_its_statements_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
 
         [extern("Boolean")]
@@ -7399,7 +7560,7 @@ fn a_temporary_handed_to_a_retaining_extern_is_left_to_the_host() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
 
         [extern("Boolean", retains)]
@@ -7423,7 +7584,7 @@ fn a_temporary_moved_into_the_drop_sink_is_not_dropped_twice() {
         import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun make(tag: str): Res { Res { tag = tag } }
         fun main() {
@@ -7442,7 +7603,7 @@ fn a_temporary_returned_by_ret_is_not_dropped() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { ret Res { tag = tag }; }
@@ -7465,7 +7626,7 @@ fn a_temporary_bound_by_a_let_is_not_a_temporary() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7489,7 +7650,7 @@ fn a_conditionally_constructed_resource_temporary_is_refused() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7510,7 +7671,7 @@ fn the_conditional_temporarys_refusal_names_binding_as_the_fix() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7533,7 +7694,7 @@ fn a_temporary_on_the_left_of_a_short_circuit_is_accepted() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7557,7 +7718,7 @@ fn a_temporary_in_a_branch_arm_drops_inside_that_arm() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res {{ tag: str }}
+        [resource] struct Res {{ tag: str }}
         impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
         impl Res {{ fun size(&self): i32 {{ 3 }} }}
         fun make(tag: str): Res {{ Res {{ tag = tag }} }}
@@ -7582,7 +7743,7 @@ fn a_temporary_in_a_tail_position_drops_after_the_value_is_computed() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         impl Res { fun size(&self): i32 { 3 } }
         fun make(tag: str): Res { Res { tag = tag } }
@@ -7603,7 +7764,7 @@ fn a_temporary_of_a_resource_with_no_destructor_is_not_lifted() {
     // keeps a bare `resource external` binding's scope free of them.
     let js = compile(
         r#"
-        resource struct Inert { tag: str }
+        [resource] struct Inert { tag: str }
         impl Inert { fun size(&self): i32 { 3 } }
         fun make(tag: str): Inert { Inert { tag = tag } }
         fun main() { make("t").size(); }
@@ -7640,7 +7801,7 @@ fn an_unmarked_extern_loan_is_call_bounded() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
 
         [extern("Boolean")]
@@ -7667,7 +7828,7 @@ fn a_retaining_extern_holds_its_argument_to_the_bindings_scope_end() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
 
         [extern("Boolean", retains)]
@@ -7727,4 +7888,302 @@ fn the_retention_flag_is_per_declaration_not_per_host() {
         fun main() {}
         "#,
     );
+}
+
+// --- M28: drop planning is per BODY, not per program -------------------------
+//
+// `declares_a_resource()` is a whole-program gate: one `resource` declaration
+// anywhere — and `std::db` / `std::fs` each carry one — turned the per-body
+// ownership walk on for EVERY body in the program. M28 keeps that gate and adds
+// a per-body predicate under it (`Analyzer::resource_reaching_roots`), so a body
+// whose own types cannot reach a resource is not walked at all.
+//
+// The predicate over-approximates by construction: `type_is_resource(T)` implies
+// `type_reaches_resource(T)`, so a route it does not know about would have to be
+// a body that owns a resource with NO resource-reaching type anywhere in its
+// signature, its bindings, its recorded expression types, or its callees'
+// signatures. Each route below is pinned positively — the destructor still runs
+// — and the counter pins the negative half: the bodies that reach nothing are
+// not walked.
+
+/// The M28 exhibit: one resource with an observable destructor, `fillers`
+/// resource-free functions that mention nothing, and `body` on top.
+fn m28_program(fillers: usize, body: &str) -> String {
+    let filler: String = (0..fillers)
+        .map(|n| format!("fun m28_filler{n}(x: i32): i32 {{ let y = x + {n}; y * 2 }}\n"))
+        .collect();
+    format!(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+        [resource] struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        {filler}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn m28_drop_planning_enrols_only_the_bodies_that_reach_a_resource() {
+    // The work order's pin, stated as the property rather than as a number
+    // std's own surface would date: enrolment is a function of WHAT REACHES A
+    // RESOURCE, not of how big the program is. A thousand resource-free
+    // functions added to the same program add nothing to the planner's work.
+    // Under the whole-program gate the two numbers were each the whole
+    // program, so they differed by exactly the thousand.
+    const MAIN: &str = r#"
+        fun main() {
+            let g = Guard { label = "one" };
+            print(g.label);
+        }
+        "#;
+    let (small, small_offered) = drop_plan_enrolment(&m28_program(10, MAIN));
+    let (large, large_offered) = drop_plan_enrolment(&m28_program(1010, MAIN));
+    assert!(
+        large_offered >= small_offered + 1000,
+        "the thousand extra fillers must reach the planner as offered roots: \
+         {small_offered} -> {large_offered}"
+    );
+    assert_eq!(
+        small, large,
+        "a thousand resource-free functions changed the planner's enrolment: \
+         {small} of {small_offered} -> {large} of {large_offered}"
+    );
+    assert!(
+        large * 20 < large_offered,
+        "the planner walked {large} of {large_offered} roots — the exhibit is \
+         overwhelmingly resource-free and the enrolment must say so"
+    );
+}
+
+#[test]
+fn m28_a_program_with_no_resource_type_enrols_nothing() {
+    // `declares_a_resource()`'s own behaviour, unchanged: a world with no
+    // `resource` declaration returns before the predicate is even asked.
+    let filler: String = (0..1000)
+        .map(|n| format!("fun m28_filler{n}(x: i32): i32 {{ let y = x + {n}; y * 2 }}\n"))
+        .collect();
+    let (planned, offered) = drop_plan_enrolment(&format!(
+        r#"
+        import std::io::print;
+        {filler}
+        fun main() {{ print(m28_filler0(1)); }}
+        "#
+    ));
+    assert!(offered > 1000, "got {offered} offered roots");
+    assert_eq!(
+        planned, 0,
+        "a resource-free world plans nothing; the planner walked {planned} of {offered}"
+    );
+}
+
+#[test]
+fn m28_route_signature_an_own_resource_parameter() {
+    // Route 1. `consume` binds nothing and constructs nothing: its only
+    // resource-reaching type is its own parameter, and an `own` resource
+    // parameter still owned at the fall-through end drops there (§6).
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        fun consume(own g: Guard) {
+            print("consumed");
+        }
+        fun main() {
+            consume(Guard { label = "sig" });
+            print("end");
+        }
+        "#,
+        ),
+        // `consume` never READS its parameter, so S3's last-use disposal
+        // destroys it right after the body's entry — before the `print`.
+        "dropped sig\nconsumed\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_container_a_struct_field_holding_a_resource() {
+    // Route 2 through containment: `Holder` is a resource BY CONTAINMENT, so
+    // `Holder`'s nominal is in the reaching set and `main`'s binding selects it.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        struct Holder { held: Guard }
+        fun main() {
+            let h = Holder { held = Guard { label = "held" } };
+            print(h.held.label);
+            print("end");
+        }
+        "#,
+        ),
+        "held\ndropped held\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_generic_instantiation_an_option_of_a_resource() {
+    // Route 5. `Option` is not a resource nominal — its payload is a parameter
+    // — so `Option<i32>` reaches nothing while `Option<Guard>` reaches `Guard`
+    // through its own argument.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let slot: Option<Guard> = Some(Guard { label = "opt" });
+            print(slot.is_some());
+            print("end");
+        }
+        "#,
+        ),
+        "true\ndropped opt\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_callee_signature_a_temporary_nobody_binds() {
+    // Route 4, C11's shape: the body binds nothing, overwrites nothing and
+    // calls no sink — the only thing naming a resource is the CALLEE's return
+    // type, which is why the predicate has to read signatures.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        fun open(label: str): Guard {
+            Guard { label = label }
+        }
+        fun main() {
+            print(open("tmp").label);
+            print("end");
+        }
+        "#,
+        ),
+        "tmp\ndropped tmp\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_closure_body_owns_its_own_resource() {
+    // Route 6. A closure is its own scan root, selected on its own evidence —
+    // an enclosing body that reaches nothing does not enrol it, and must not
+    // need to.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        fun main() {
+            let make = || {
+                let g = Guard { label = "closed" };
+                print(g.label);
+            };
+            make();
+            print("end");
+        }
+        "#,
+        ),
+        "closed\ndropped closed\nend\n",
+    );
+}
+
+#[test]
+fn m28_route_the_drop_sink() {
+    // Route 7. `drop<T>(own value: T)` is generic, so its signature reaches no
+    // resource — the sink is recognized by identity instead.
+    assert_compiles_and_runs(
+        &m28_program(
+            0,
+            r#"
+        import std::drop::drop;
+        fun main() {
+            let g = Guard { label = "sunk" };
+            drop(g);
+            print("end");
+        }
+        "#,
+        ),
+        "dropped sunk\nend\n",
+    );
+}
+
+#[test]
+fn m28_the_resource_free_control_still_compiles_and_runs() {
+    // The negative control the counter pins: the same thousand bodies, with the
+    // resource present but unreachable from any of them.
+    assert_compiles_and_runs(
+        &m28_program(
+            4,
+            r#"
+        fun main() {
+            print(m28_filler0(1));
+            print(m28_filler3(1));
+        }
+        "#,
+        ),
+        "2\n8\n",
+    );
+}
+
+// --- B365: the enrolment gate's struct-literal arm -----------------------------
+//
+// `expr_is_resource_evidence`'s literal arm read
+// `Expr::StructInitializer(struct_id, _) => nominals.contains(struct_id)`, and
+// that payload is the LITERAL's own expression id — never a struct declaration
+// — so the arm answered `false` for every program there has ever been. It now
+// goes through `struct_initializer_to_def`, the map written at the same place
+// the literal is recorded, exactly as the `EnumVariant` arm beside it already
+// carried its declaration's id.
+//
+// MEASURED, and reported with the repair: the arm is SUBSUMED today. The check
+// above it reads the literal's recorded type and asks
+// `type_mentions_nominal`, whose `Type::Struct(id, ..)` arm is
+// `nominals.contains(&id)` — the same question, keyed on the type instead of
+// on the map — so the arm can only decide a literal the solver gave a
+// DEFINITION and no TYPE, and both are written at the same place.
+//
+// B384 settled what to do about that. The counter B365 wired to watch for the
+// day a literal reaches the gate untyped is GONE, because a counter that can
+// only read zero makes a pin over it vacuous, and a vacuous pin is worse than
+// none. The evidence it was removed on: solver-39's seven shapes, five more
+// here (a generic wrapper, a module-level binding, an enum payload, an
+// argument position, a helper's return), and a probe planted at the arm
+// itself — it is REACHED about twenty times per analysis of any std-importing
+// program, always for a literal whose type does not reach a resource, and it
+// has never once been the thing that decided. The arm stays, as the
+// "constructed" leg of the completeness argument, with that written at it.
+//
+// So this pin is the ROUTE, which is what is observable: each shape enrols its
+// body. It would pass with the arm removed, and it says so here rather than
+// pretending otherwise.
+
+#[test]
+fn b365_a_struct_literal_of_a_resource_type_enrols_its_body() {
+    let base = r#"
+        import std::io::print;
+
+        [resource] struct Handle { id: i32 }
+
+        impl Handle with std::drop::Drop {
+        	fun destroy(own self) { print("closed"); }
+        }
+    "#;
+    let shapes = [
+        // A literal returned from a helper.
+        "fun build(): Handle { Handle { id = 1 } }\n\nfun main() { let h = build(); print(h.id); }",
+        // A literal inside another struct's literal.
+        "struct Wrapper { handle: Handle }\n\nfun main() { let w = Wrapper { handle = Handle { id = 1 } }; print(w.handle.id); }",
+        // A literal built inside a closure.
+        "fun main() { let make = || Handle { id = 2 }; let h = make(); print(h.id); }",
+    ];
+    for shape in shapes {
+        let source = format!("{base}\n{shape}\n");
+        let (planned, offered) = drop_plan_enrolment(&source);
+        assert!(
+            planned > 0 && planned < offered,
+            "a body building a resource literal must be ENROLLED, and the gate \
+             must still be selective: planned={planned} offered={offered} for\n{source}"
+        );
+    }
 }

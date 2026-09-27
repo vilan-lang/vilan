@@ -11,7 +11,7 @@ fun bump(mut x: i32): i32 {
 
 fun grow(mut xs: List<i32>): i32 {
 	xs.push(9);
-	xs.len()
+	xs.len().as_i32()
 }
 
 fun poke(mut x: i32): i32 {

@@ -1,8 +1,8 @@
-// `NativeMap<V>` — the raw JS `Map`, an internal building block for the
-// value-keyed `Map`/`Set` (proposal/hashable-keys.md, I1). It is always keyed by
-// a `Hash` (a string/primitive JS keys by value); the public `Map`/`Set` compute
-// that `Hash` from `key.hash()` and store the original key alongside the value.
-// Not part of the public surface.
+// `NativeMap<V>` — the raw JS `Map`, an internal building block for the value-keyed
+// `Map`/`Set` (proposal/hashable-keys.md, I1). It is always keyed by a `Hash` (a
+// string/primitive JS keys by value); the public `Map`/`Set` compute that `Hash`
+// from `key.hash()` and store the original key alongside the value. Not part of the
+// public surface.
 //
 // The key type is fixed as `Hash` rather than generic — the raw layer only ever
 // takes canonical keys — which also keeps `NativeMap` single-parameter, so a
@@ -14,6 +14,8 @@
 // snapshots in insertion order.
 import pkg::hash::Hash;
 import pkg::option::Option;
+
+export *;
 
 external struct NativeMap<V>;
 
@@ -28,7 +30,7 @@ impl NativeMap<type V> {
 
 	external fun remove(&mut self, key: Hash): void;
 
-	external fun len(self): i32;
+	external fun len(self): usize;
 
 	external fun keys(self): List<Hash>;
 

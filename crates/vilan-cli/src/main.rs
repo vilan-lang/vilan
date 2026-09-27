@@ -1,20 +1,24 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::{Duration, SystemTime},
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime},
 };
 
 use ariadne::{Color, Label, Report, ReportKind, sources};
 use clap::{Parser as _, Subcommand};
 mod bindgen;
 mod explain;
+mod fix;
 mod hmr;
 mod init;
 mod job;
+mod native;
 mod paint;
 mod upgrade;
+mod watch_log;
 
 use job::ManagedChild;
 use vilan_core::analyzer::{Program, SourceId, analyze, check_library_contract};
@@ -68,7 +72,8 @@ enum Command {
         /// to it, else `node`. `--target` is an accepted alias.
         #[arg(long, alias = "target")]
         platform: Option<String>,
-        /// The emitter backend: `js` (the only backend today).
+        /// The emitter backend: `js` (the default) or `rust` (the native
+        /// backend; a debug build unless you build the cargo project yourself).
         #[arg(long)]
         backend: Option<String>,
         /// Also emit debug dumps beside the source, one per pipeline stage:
@@ -105,7 +110,8 @@ enum Command {
         /// to it, else `node`. `--target` is an accepted alias.
         #[arg(long, alias = "target")]
         platform: Option<String>,
-        /// The emitter backend: `js` (the only backend today).
+        /// The emitter backend: `js` (the default) or `rust` (the native
+        /// backend; a debug build unless you build the cargo project yourself).
         #[arg(long)]
         backend: Option<String>,
         /// Also emit debug dumps beside the source, one per pipeline stage:
@@ -118,9 +124,16 @@ enum Command {
         /// Re-check whenever a watched `.vl` source file changes (Ctrl-C to stop).
         #[arg(long)]
         watch: bool,
+        /// Before checking, apply the fix every numeric mismatch carries — the
+        /// `.as_*()` conversion its message names, or a literal-bound counter
+        /// declared `usize` — to the package's own files, repeating until a
+        /// round finds nothing more to fix (the migration to `usize` indexes).
+        /// What is left is reported as usual.
+        #[arg(long, conflicts_with = "watch")]
+        fix: bool,
     },
     /// Build and run a source file, forwarding any trailing arguments to the
-    /// program (reach them with `process::args()`).
+    /// program (reach them with `import std::process;` and `process::args()`).
     Run {
         /// A `.vl` file, a project directory, or omitted to use `vilan.toml`.
         file: Option<PathBuf>,
@@ -141,6 +154,11 @@ enum Command {
         /// are not launched. Unnecessary for a single-node workspace.
         #[arg(long)]
         entry: Option<String>,
+        /// The emitter backend: `js` (the default, run with Node) or `rust`
+        /// (F1's native backend — the program is emitted as Rust, built with
+        /// `cargo` in DEBUG by default, and the binary is run).
+        #[arg(long)]
+        backend: Option<String>,
         /// Arguments passed through to the running program (after the file).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -197,6 +215,67 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Work on the toolchain's own caches under `~/.vilan`.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Delete materialized std trees no binary can use any more.
+    ///
+    /// Each build of the toolchain materializes its std under its own content
+    /// hash, so a machine that builds vilan from source accumulates one tree
+    /// per build. Materialization and `vilan upgrade` both prune on the same
+    /// seven-day guard; this is the explicit gesture for the times that is not
+    /// enough.
+    Prune {
+        /// Delete every entry, not only those older than seven days. This
+        /// binary's own tree is still kept — the next command would write it
+        /// straight back.
+        #[arg(long)]
+        all: bool,
+        /// Print what would be deleted, with sizes, and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// The stack every compile runs on — the one this process's whole CLI runs on,
+/// and the one each member of a PARALLEL check gets (M35), because a member is
+/// a complete analysis and the reasoning below is about an analysis, not about
+/// a process.
+const COMPILER_STACK_SIZE: usize = 128 * 1024 * 1024;
+
+/// Spawns a compiler thread: [`COMPILER_STACK_SIZE`] of stack, DECLARED to the
+/// analyzer's stack probe (`vilan_core::stack_guard`, N121) as the first thing
+/// the thread does. An undeclared thread's probes are inert, so a runaway walk
+/// on it runs into the guard page and aborts the process with no word about
+/// which walk; declared, the probe panics naming it, and the CLI's stance on a
+/// compiler panic (outside the fence, AGENTS.md: exit loudly) takes it from
+/// there. Every compiler thread goes through here or
+/// [`spawn_scoped_compiler_thread`] (N128), and a pin holds the sites to that.
+fn spawn_compiler_thread<T: Send + 'static>(
+    body: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<T>> {
+    std::thread::Builder::new()
+        .stack_size(COMPILER_STACK_SIZE)
+        .spawn(|| vilan_core::stack_guard::with_declared_stack(COMPILER_STACK_SIZE, body))
+}
+
+/// [`spawn_compiler_thread`] inside a `std::thread::scope` — the parallel
+/// build legs and check members (M35).
+fn spawn_scoped_compiler_thread<'scope, 'env, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    body: impl FnOnce() -> T + Send + 'scope,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    std::thread::Builder::new()
+        .stack_size(COMPILER_STACK_SIZE)
+        .spawn_scoped(scope, || {
+            vilan_core::stack_guard::with_declared_stack(COMPILER_STACK_SIZE, body)
+        })
 }
 
 fn main() -> ExitCode {
@@ -209,31 +288,42 @@ fn main() -> ExitCode {
     // it is BOUNDED now (B138/B139/B142, `VILAN_DEPTH_STATS`) — which is what
     // brought this number down from 256 MiB:
     //
-    //   * the PARSER, at 500 levels of nesting. The deepest consumer in the
-    //     pipeline and the one that runs first, so before B142 it reached the
-    //     cliff before either analyzer bound could refuse. Measured through
-    //     this binary on the worst plant (5000 nested parentheses): peak depth
-    //     501, 35.2 MiB unoptimized, ~10 MiB optimized.
-    //   * the phase-1 expression walk, ~36 KiB per level (500 levels, ~18 MiB).
+    //   * the PARSER, at 500 levels of nesting. It runs FIRST, so before B142
+    //     it reached the cliff before either analyzer bound could refuse.
+    //     Measured through this binary on the worst plant (5000 nested
+    //     parentheses): peak depth 501, 34,181 bytes (33.4 KiB) per level of
+    //     source nesting, 16.24 MiB unoptimized, 3.93 MiB optimized.
+    //   * the phase-1 expression walk, ~47,400 bytes (46.3 KiB) per level
+    //     (500 levels, ~22.6 MiB) — the deepest consumer by bytes per level.
+    //     OPTIMIZED it is ~2.1 KiB a level (~1 MiB at the bound).
     //   * the return-inference chain, ~12.8 KiB per call link (500, ~6.4 MiB).
+    //
+    // The parse figures are N101's re-measurement: the record had the parse
+    // frame at ~71.8 KiB a level and 35.2 MiB at the bound, which did not
+    // reproduce (2.2x what `VILAN_DEPTH_STATS` reads). The walk figures are
+    // N128's (2026-09-25, `VILAN_DEPTH_STATS`, the slope between a 100- and a
+    // 450-link chain, debug and release binaries): the frame had grown from
+    // N97's 42,464 bytes, and AGENTS.md's "11.3 KiB optimized" was an older
+    // frame still. `deep_nesting.rs` holds both with the method that produced
+    // them, and a canary each.
     //
     // Each refuses with a diagnostic rather than overflowing, and the phases
     // run in SEQUENCE — the parse has unwound before analysis starts — so the
-    // worst case is the largest of them, not their sum: ~35 MiB unoptimized.
-    // Real code is nowhere near it: all 211 corpus entries peak at 23 parser
-    // levels against a bound of 500, and a realistic analysis peaks under 1 MiB.
+    // worst case is the largest of them, not their sum: ~23 MiB unoptimized,
+    // and it is the WALK now rather than the parse. Real code is nowhere near
+    // it: all 211 corpus entries peak at 23 parser levels against a bound of
+    // 500, and a realistic analysis peaks under 1 MiB.
     //
-    // 128 MiB is ~3.6x that measured worst case, and the headroom is not idle.
+    // 128 MiB is ~5.7x that measured worst case, and the headroom is not idle.
     // A macro-world compile NESTS a full pipeline inside the running analysis
     // (see `Document::analyze` in vilan-lsp), so a deep walk carrying a deep
-    // nested parse inside it composes to roughly 53 MiB; this covers that with
-    // room over. Bounding the parser is what made the number finite at all —
+    // nested parse inside it composes to roughly 39 MiB; this covers that with
+    // room over. The thread DECLARES this size to the stack probe
+    // (`spawn_compiler_thread`, N128), so a walk that runs away past every
+    // bound is refused by name rather than aborting in the guard page. Bounding the parser is what made the number finite at all —
     // before B142 there was no worst case to size anything against, and the
     // margin was standing in for a bound that did not exist.
-    const COMPILER_STACK_SIZE: usize = 128 * 1024 * 1024;
-    std::thread::Builder::new()
-        .stack_size(COMPILER_STACK_SIZE)
-        .spawn(run_cli)
+    spawn_compiler_thread(run_cli)
         .expect("spawn compiler thread")
         .join()
         .expect("compiler thread panicked")
@@ -261,14 +351,26 @@ fn run_cli() -> ExitCode {
                 "`--explain` reports what a build wrote, and `--stdout` writes nothing — \
                  it prints a bundle, not a build. Drop one of the two.",
             ),
-            Ok(_backend) => {
+            Ok(backend) => {
                 PRINT_CHUNKS.store(print_chunks, std::sync::atomic::Ordering::Relaxed);
                 if explain {
                     explain::ask();
                 }
                 let roots = watch.then(|| watch_roots(&file));
+                // M22: the per-leg reuse record lives for the life of the
+                // watcher and is created only for one. A one-shot build passes
+                // `None` and is the build it always was.
+                let mut watch_state = watch.then(BuildWatchState::default);
                 run_or_watch(roots, move || {
-                    build_once(file.clone(), stdout, platform.clone(), debug, rerun_hooks)
+                    build_once(
+                        file.clone(),
+                        stdout,
+                        platform.clone(),
+                        backend,
+                        debug,
+                        rerun_hooks,
+                        watch_state.as_mut(),
+                    )
                 })
             }
         },
@@ -278,8 +380,16 @@ fn run_cli() -> ExitCode {
             backend,
             debug,
             watch,
+            fix,
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error(&message),
+            Ok(_backend) if fix => match fix_project(file.clone(), platform.as_deref()) {
+                Err(message) => report_error(&message),
+                Ok(fixed) => {
+                    fix::report(&fixed);
+                    check_once(file, platform, debug).into()
+                }
+            },
             Ok(_backend) => {
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
@@ -296,13 +406,26 @@ fn run_cli() -> ExitCode {
             no_hmr,
             hmr_port,
             entry,
-        } => {
-            if watch {
-                run_watch(file, args, no_hmr, hmr_port, entry)
-            } else {
-                run_once(file, &args, entry.as_deref())
+            backend,
+        } => match effective_backend(backend.as_deref()) {
+            Err(message) => report_error::<ExitCode>(&message),
+            // `--watch` is the JS dev loop — HMR, a swapped bundle, a restarted
+            // node process. None of it exists natively yet (the round would be a
+            // full `cargo build`), so the combination is refused rather than
+            // silently taking the JS path.
+            Ok(Backend::Rust) if watch => report_error::<ExitCode>(concat!(
+                "`--backend rust` has no `--watch` yet: the native round is a full ",
+                "`cargo build`, and the dev loop's swap is the JS backend's. ",
+                "Re-run `vilan run --backend rust` after an edit."
+            )),
+            Ok(backend) => {
+                if watch {
+                    run_watch(file, args, no_hmr, hmr_port, entry)
+                } else {
+                    run_once(file, &args, entry.as_deref(), backend)
+                }
             }
-        }
+        },
         Command::Test { path, watch } => {
             let roots = watch.then(|| watch_roots(&path));
             run_or_watch(roots, move || test(path.clone()))
@@ -318,6 +441,136 @@ fn run_cli() -> ExitCode {
             stats,
         } => bindgen::bindgen(file, output, platform, only, stdout, stats),
         Command::Upgrade { check } => upgrade::upgrade(check),
+        Command::Cache { command } => match command {
+            CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
+        },
+    }
+}
+
+/// `vilan cache prune` (L21): drop materialized std trees and the check tables
+/// beside them, reporting what went and what it freed.
+///
+/// The age guard is the default because it is the safe one — an entry younger
+/// than a week may belong to a compile running right now, which reads std files
+/// lazily — and `--all` is the gesture for a machine that knows it is idle. The
+/// running binary's own tree is kept under both, so the command can never make
+/// the very next command re-materialize.
+///
+/// TWO roots since N92. `~/.vilan/check-cache` holds one macro expansion table
+/// per package a `vilan check` has ever warmed, and it is here for the reason
+/// N63 gave for keeping the BUILD's table in `dist/`: a machine-global cache
+/// nobody can reach is the bad kind. This is the gesture that reaches it, and
+/// the age guard covers it for the same reason (a check running right now is
+/// holding its table open).
+///
+/// THREE since F19. `~/.vilan/rt-cache` holds the native backend's runtime
+/// crate, materialized by content hash on exactly the same terms — so a machine
+/// that has run `--backend rust` under several toolchains can reach those trees
+/// with the gesture that reaches the others, rather than accumulating a root
+/// this command does not know about.
+fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
+    let max_age = (!all).then_some(vilan_embedded::STALE_AFTER);
+    let roots = [
+        (
+            vilan_embedded::default_cache_root(),
+            Some("this binary's own tree is never pruned"),
+        ),
+        (vilan_embedded::default_check_cache_root(), None),
+        (
+            vilan_embedded::default_rt_cache_root(),
+            Some("this binary's own runtime tree is never pruned"),
+        ),
+    ];
+    let mut outcome = ExitCode::SUCCESS;
+    for (root, protected) in &roots {
+        let one = prune_one_cache_root(root, max_age, dry_run, all, *protected);
+        if one != ExitCode::SUCCESS {
+            outcome = one;
+        }
+    }
+    outcome
+}
+
+/// One cache root pruned and reported. Split out when the check tables became a
+/// second root (N92): the reporting was the whole function, and two roots
+/// printing two different shapes of summary is how a reader stops trusting
+/// either.
+fn prune_one_cache_root(
+    root: &Path,
+    max_age: Option<std::time::Duration>,
+    dry_run: bool,
+    all: bool,
+    // What this root protects unconditionally, if anything. The std root keeps
+    // the running binary's own tree — pruning it would make the very next
+    // command re-materialize — and the check root protects nothing of the kind:
+    // its entries are one package's table each, and no package is "current".
+    protected: Option<&str>,
+) -> ExitCode {
+    let before = vilan_embedded::cache_entries(root).len();
+    let removed = vilan_embedded::prune(root, max_age, dry_run);
+    let kept = before - removed.len();
+    let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
+    if removed.is_empty() {
+        println!(
+            "{}: nothing to prune ({kept} entr{} kept)",
+            root.display(),
+            if kept == 1 { "y" } else { "ies" }
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{}: {} {} entr{} ({})",
+        root.display(),
+        if dry_run { "would prune" } else { "pruned" },
+        removed.len(),
+        if removed.len() == 1 { "y" } else { "ies" },
+        human_bytes(freed),
+    );
+    for entry in &removed {
+        println!(
+            "  {}  {:>9}  {}",
+            entry.name,
+            human_bytes(entry.bytes),
+            entry
+                .age
+                .map(|age| format!("{} days old", age.as_secs() / (24 * 60 * 60)))
+                .unwrap_or_else(|| "age unknown".to_string()),
+        );
+    }
+    // The rule, not a claim about the survivors: with `--all` the only entry
+    // that CAN survive is one this root protects, and there may be none.
+    if kept > 0 {
+        let age_rule = (!all).then_some("nothing created in the last seven days is pruned");
+        let rule = match (protected, age_rule) {
+            (Some(protected), Some(age)) => format!("{protected}, and {age}"),
+            (Some(protected), None) => protected.to_string(),
+            (None, Some(age)) => age.to_string(),
+            // `--all` on a root that protects nothing: an entry survived only
+            // because its removal failed, which the removal count already says.
+            (None, None) => "the removal did not reach them".to_string(),
+        };
+        println!(
+            "{}",
+            paint::out(
+                paint::Style::DIM,
+                &format!(
+                    "{kept} entr{} kept: {rule}",
+                    if kept == 1 { "y" } else { "ies" }
+                )
+            )
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// A byte count for a human: `468 KB`, `1.4 MB`. Decimal units, because that is
+/// what a disk reports.
+fn human_bytes(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1_000.0),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", bytes as f64 / 1_000_000.0),
+        _ => format!("{:.1} GB", bytes as f64 / 1_000_000_000.0),
     }
 }
 
@@ -327,8 +580,12 @@ fn build_once(
     file: Option<PathBuf>,
     stdout: bool,
     platform: Option<String>,
+    backend: Backend,
     debug: bool,
     rerun_hooks: bool,
+    // `Some` only under `--watch` (backlog M22): what the previous round
+    // compiled each leg from, so a leg the edit did not reach is reused.
+    watch_state: Option<&mut BuildWatchState>,
 ) -> RoundOutcome {
     // Before the hooks, which are the first thing that records: every round of
     // `--watch` explains itself, and a round must not inherit the previous
@@ -345,12 +602,23 @@ fn build_once(
                 ..
             } => match effective_platform(platform.as_deref(), package_platform) {
                 Ok(Platform::None) => no_host_platform(),
-                Ok(platform) => build_single(&unit, stdout, platform, debug),
+                Ok(platform) => build_single(&unit, stdout, platform, backend, debug),
                 Err(message) => report_error(&message),
             },
             // A workspace builds each member for its own declared platform, so the
             // `--platform` flag doesn't apply.
-            Project::Workspace { root, members, .. } => build_workspace(&root, &members, debug),
+            Project::Workspace { root, members, .. } if backend == Backend::Js => {
+                build_workspace(&root, &members, debug, watch_state)
+            }
+            // …and `--backend rust` does not apply either: a workspace's legs
+            // are a browser bundle and a node server, and the native backend
+            // has neither. Refused rather than silently building the JS legs
+            // and calling it a native build.
+            Project::Workspace { .. } => report_error(concat!(
+                "`--backend rust` builds ONE entry, not a workspace: a workspace's legs are a ",
+                "browser bundle and a process server, and the native backend has neither yet. ",
+                "Point it at a `.vl` file."
+            )),
             Project::Library { name, .. } => not_buildable_library(&name),
         }
     })
@@ -460,23 +728,29 @@ fn note_refused_dependency_hooks(project: &Project) {
 fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> RoundOutcome {
     with_project(file, |project| match project {
         Project::Single {
-            unit,
+            mut unit,
             platform: package_platform,
             shared_platforms,
-            module_file,
             ..
         } => match effective_platform(platform.as_deref(), package_platform) {
             // A `none` package is a pure library — not buildable, but type-checkable
             // (against the base layer only).
             Ok(first) => {
-                let goal = if module_file {
-                    CompileGoal::CheckModule
-                } else {
-                    CompileGoal::Check
+                let goal = match unit.entry_mode {
+                    vilan_core::EntryMode::Declared { .. } => CompileGoal::Check,
+                    vilan_core::EntryMode::OpenFile { .. } => CompileGoal::CheckModule,
                 };
                 let mut platforms = vec![first];
                 if platform.is_none() {
                     platforms.extend(shared_platforms);
+                } else {
+                    // The flag overrode the coloring, so it is also the whole
+                    // answer to "why this platform" (E119). Nothing the file's
+                    // own situation says still applies.
+                    unit.platform_reasons = vec![(
+                        first,
+                        vilan_core::platform_color::PlatformReason::Flag.clause(),
+                    )];
                 }
                 check_single(&unit, &platforms, debug, goal)
             }
@@ -487,10 +761,52 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
     })
 }
 
+/// `vilan check --fix`'s pass over the project `check` would check, under
+/// every platform it would check it under: each unit's numeric mismatches
+/// fixed to a fixed point ([`fix::fix_unit`]). A standalone library has no
+/// program to analyze, so it has nothing to fix.
+fn fix_project(file: Option<PathBuf>, platform: Option<&str>) -> Result<fix::Fixed, String> {
+    let mut fixed = fix::Fixed::default();
+    match resolve_project(file)? {
+        Project::Single {
+            unit,
+            platform: package_platform,
+            shared_platforms,
+            ..
+        } => {
+            let first = effective_platform(platform, package_platform)?;
+            let mut platforms = vec![first];
+            if platform.is_none() {
+                platforms.extend(shared_platforms);
+            }
+            for platform in platforms {
+                fix::fix_unit(&unit, platform, &mut fixed)?;
+            }
+        }
+        Project::Workspace { members, .. } => {
+            for (unit, platform) in &members {
+                fix::fix_unit(unit, *platform, &mut fixed)?;
+            }
+        }
+        Project::Library { name, .. } => {
+            return Err(format!(
+                "`{name}` is a library: `--fix` analyzes a program, and a library is compiled \
+                 only as a dependency of one — run it from a package that uses `{name}`"
+            ));
+        }
+    }
+    Ok(fixed)
+}
+
 /// Builds and runs the project once with Node, waiting for it to exit and
 /// propagating its code (the blocking, non-`--watch` path). `entry` picks the
 /// Node leg to run in a multi-node workspace (A15).
-fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> ExitCode {
+fn run_once(
+    file: Option<PathBuf>,
+    args: &[String],
+    entry: Option<&str>,
+    backend: Backend,
+) -> ExitCode {
     with_project(file, |project| {
         // `--rerun-hooks` is a `vilan build` flag: `run` is the dev loop, where
         // the whole point of the staleness gate is that an expensive hook stops
@@ -501,8 +817,8 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
         match project {
             Project::Single { unit, platform, .. } => {
                 let platform = platform.unwrap_or_default();
-                if matches!(platform, Platform::Node { .. }) {
-                    run_single(&unit, args)
+                if backend == Backend::Rust || matches!(platform, Platform::Node { .. }) {
+                    run_single(&unit, args, backend)
                 } else {
                     eprintln!(
                         "{} `vilan run` executes with Node, but the package platform is `{}`",
@@ -517,7 +833,15 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
                 members,
                 default_entry,
                 ..
-            } => run_workspace(&root, &members, args, entry, &default_entry),
+            } if backend == Backend::Js => {
+                run_workspace(&root, &members, args, entry, &default_entry)
+            }
+            Project::Workspace { .. } => report_error::<RoundOutcome>(concat!(
+                "`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a ",
+                "browser bundle and a process server, and the native backend has neither yet. ",
+                "Point it at a `.vl` file."
+            ))
+            .into(),
             Project::Library { name, .. } => not_buildable_library(&name).into(),
         }
     })
@@ -527,6 +851,14 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
 
 /// How often the watcher polls for changes.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// How often `VILAN_WATCH_LOG`'s trace says the loop is alive and found nothing
+/// (tracker B208). Not a poll rate: the loop still polls every
+/// [`WATCH_POLL_INTERVAL`], and every poll that finds a DIFFERENCE is traced
+/// whenever it happens. This only rate-limits the silence, so a 300 s wait
+/// leaves ~30 heartbeat lines instead of ~1000 — enough to separate "the loop
+/// was polling and the file never moved" from "the loop was not polling".
+const WATCH_LOG_HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// The build inputs a round declared or read beyond its `.vl` sources — the
 /// **recorded-inputs** set the watcher polls alongside [`scan_vl`]. Two
@@ -915,16 +1247,28 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> Ex
     // the initial build causes one extra round — which is the correct behavior.
     let started = SystemTime::now();
     let mut snapshot = watch_snapshot(roots);
+    watch_log::session_start(roots, snapshot.len());
     // The first round has no difference to keep — the baseline below is built
     // after it either way — so its verdict is nothing this loop can act on.
-    let _ = action();
+    watch_log::line("round 1 (the initial build) start");
+    let round_started = Instant::now();
+    let first = action();
+    watch_log::line(&format!(
+        "round 1 end verdict={first:?} in {:.3}s",
+        round_started.elapsed().as_secs_f64()
+    ));
     // The first build just revealed which `asset::read` inputs exist — paths
     // the baseline could not contain. Seed them in with E20's rule intact: an
     // input whose mtime predates the build joins the baseline (no spurious
     // round), one modified at or after the build's start does NOT, so the
     // next poll sees it and fires the round that re-reads it.
     for (path, modified) in watch_snapshot(roots) {
-        if !snapshot.contains_key(&path) && modified < started {
+        if snapshot.contains_key(&path) {
+            continue;
+        }
+        let seeded = modified < started;
+        watch_log::seed(&path, modified, started, seeded);
+        if seeded {
             snapshot.insert(path, modified);
         }
     }
@@ -932,12 +1276,35 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> Ex
     // failed. This flag is the spin guard: the difference is kept for exactly
     // one re-fire, and the failure that ends a retry consumes it.
     let mut retrying = false;
+    // Round 1 is counted, so the trace's round numbers match the session's.
+    let mut round = 1_u64;
+    // The trace's heartbeat: the polls that found nothing are the ones that
+    // prove the loop is alive, and one line per 300 ms poll would bury the
+    // ones that found something. One line per `WATCH_LOG_HEARTBEAT` says both.
+    let mut last_heartbeat = Instant::now();
     loop {
         std::thread::sleep(WATCH_POLL_INTERVAL);
         let next = watch_snapshot(roots);
         if next == snapshot {
+            if watch_log::enabled() && last_heartbeat.elapsed() >= WATCH_LOG_HEARTBEAT {
+                last_heartbeat = Instant::now();
+                watch_log::line(&format!(
+                    "poll: no difference ({} entries watched, retrying={retrying})",
+                    next.len()
+                ));
+            }
             continue;
         }
+        if watch_log::enabled() {
+            last_heartbeat = Instant::now();
+            watch_log::line(&format!(
+                "poll: {}",
+                watch_log::snapshot_diff(&snapshot, &next)
+            ));
+        }
+        round += 1;
+        watch_log::line(&format!("round {round} start (retry={retrying})"));
+        let round_started = Instant::now();
         eprintln!(
             "\n{}",
             paint::err(
@@ -949,7 +1316,12 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> Ex
                 }
             )
         );
-        match action() {
+        let outcome = action();
+        watch_log::line(&format!(
+            "round {round} end verdict={outcome:?} in {:.3}s",
+            round_started.elapsed().as_secs_f64()
+        ));
+        match outcome {
             // Consumed by a round that dealt with it. `next` was read BEFORE the
             // action, so an edit landing while the round ran is still a
             // difference at the next poll — E20's rule, unchanged.
@@ -1189,35 +1561,59 @@ fn hmr_round(
     let manifest_changed = state.manifest.is_some_and(|previous| previous != manifest);
     state.manifest = Some(manifest);
     let force_full = hmr::round_forces_full(state.legs.is_empty(), state.failed, manifest_changed);
-    let current_hash = |path: &Path| -> Option<u64> {
-        // A recorded input that is a DIRECTORY re-hashes as its listing
-        // (`asset::read_dir` / `read_dir_all`, const-eval.md §3.1). Without
-        // this arm the read below fails on it and the leg could never skip;
-        // with it, an unchanged directory compares equal and a file appearing
-        // or vanishing anywhere in a listed tree fails the compare, which is
-        // exactly the invalidation the tracked-directory doctrine promises.
-        if path.is_dir() {
-            return vilan_core::const_eval::directory_input_hash(path);
-        }
-        // Read the same way the compiler reads (BOM dropped,
-        // windows-support.md §2), or the hash recorded from the text it
-        // consumed could never match.
-        vilan_core::util::read_source(path)
-            .ok()
-            .map(|text| vilan_core::content_hash(&text))
-    };
-    let skip: BTreeSet<String> = if force_full {
-        BTreeSet::new()
-    } else {
-        members
+    // The ONE hash rule, asked of the path (B276): [`current_source_hash`] is
+    // the function the recording side used too, so a re-hash equal to the
+    // recorded hash means the file is unchanged and nothing else. Directories,
+    // text and bytes are all its arms.
+    // B203 — the legs in artifact-dependency order, and the edges the skip
+    // decision consults at each leg's own turn. The HMR round writes `dist/`
+    // AFTER the whole compile loop (the shim carries a version the classifier
+    // has not decided yet), so re-hashing against the disk can never see this
+    // round's own work: here the edge itself is the instrument, and a leg that
+    // reads a recompiling leg's artifact recompiles with it.
+    let dist_directory = root.join("dist");
+    let schedule = {
+        let scheduled: Vec<ScheduledLeg> = members
             .iter()
-            .filter(|(_, platform)| !platform.is_none())
-            .filter_map(|(unit, _)| {
-                let previous = state.legs.iter().find(|leg| leg.name == unit.name)?;
-                hmr::leg_is_current(&previous.sources, current_hash).then(|| unit.name.clone())
+            .map(|(unit, platform)| {
+                let previous = state.legs.iter().find(|leg| leg.name == unit.name);
+                ScheduledLeg {
+                    name: &unit.name,
+                    extension: platform.script_extension(),
+                    bundled: previous.map(|leg| leg.bundled.as_slice()).unwrap_or(&[]),
+                    sources: previous.map(|leg| &leg.sources),
+                }
             })
-            .collect()
+            .collect();
+        leg_schedule(&dist_directory, &scheduled)
     };
+    // Walked in SCHEDULE order, so a leg's answer is given after every leg it
+    // reads has already given one — which is what makes
+    // `downstream_of_a_recompile` a statement about this round rather than a
+    // guess about it. A leg with no record recompiles by construction, and is
+    // recorded as recompiling so the legs downstream of it recompile too.
+    let mut recompiled: BTreeSet<usize> = BTreeSet::new();
+    let mut skip: BTreeSet<String> = BTreeSet::new();
+    for index in &schedule.order {
+        let (unit, platform) = &members[*index];
+        if platform.is_none() {
+            continue;
+        }
+        let reusable = !force_full
+            && !schedule.downstream_of_a_recompile(*index, &recompiled)
+            && state
+                .legs
+                .iter()
+                .find(|leg| leg.name == unit.name)
+                .is_some_and(|previous| {
+                    hmr::leg_is_current(&previous.sources, current_source_hash)
+                });
+        if reusable {
+            skip.insert(unit.name.clone());
+        } else {
+            recompiled.insert(*index);
+        }
+    }
 
     // Compile every host leg (skipped legs excepted), capturing the RAW bundle
     // bytes (before the shim is prepended — the shim embeds the version, so
@@ -1225,7 +1621,10 @@ fn hmr_round(
     // as a swap).
     let mut next = Vec::new();
     let mut other_assets: Vec<(String, BTreeMap<String, String>)> = Vec::new();
-    for (unit, platform) in &members {
+    // B203's order: a leg whose artifact another leg reads compiles first, so
+    // `next` — and therefore `dist/` — is written producer before consumer.
+    for index in schedule.order.clone() {
+        let (unit, platform) = &members[index];
         if platform.is_none() {
             continue;
         }
@@ -1255,6 +1654,7 @@ fn hmr_round(
         let compiled = match compile_unit(
             unit,
             *platform,
+            Backend::Js,
             CompileGoal::Emit,
             false,
             matches!(platform, Platform::Browser),
@@ -1325,8 +1725,9 @@ fn hmr_round(
     // Write `dist/` from the freshly-compiled legs: browser bundles carry the
     // shim (with the current port + version embedded) so every served browser
     // bundle's version matches what the channel reports on connect; node bundles
-    // and CSS sidecars are written verbatim.
-    let dist = root.join("dist");
+    // and CSS sidecars are written verbatim. The directory is the one the leg
+    // schedule already named, so the round has ONE idea of where `dist/` is.
+    let dist = dist_directory;
     if let Err(error) = fs::create_dir_all(&dist) {
         eprintln!(
             "{} cannot create {}: {error}",
@@ -1608,6 +2009,7 @@ fn build_and_spawn_run(
             let compiled = compile_unit(
                 &unit,
                 Platform::default(),
+                Backend::Js,
                 CompileGoal::Emit,
                 false,
                 false,
@@ -1636,7 +2038,7 @@ fn build_and_spawn_run(
             )
             .ok()?;
             let script = watch_script_path();
-            if let Err(error) = fs::write(&script, compiled.javascript) {
+            if let Err(error) = write_run_script(&script, &compiled.javascript) {
                 eprintln!(
                     "{} cannot write {}: {error}",
                     paint::error_prefix(),
@@ -1666,7 +2068,9 @@ fn build_and_spawn_run(
                     return None;
                 }
             };
-            if build_workspace_artifacts(&root, &members, false, Emission::WholeBundles).is_err() {
+            if build_workspace_artifacts(&root, &members, false, Emission::WholeBundles, None)
+                .is_err()
+            {
                 return None;
             }
             launch(
@@ -1742,15 +2146,14 @@ fn effective_platform(flag: Option<&str>, package: Option<Platform>) -> Result<P
     }
 }
 
-/// Validates a `--backend` flag value (only `js` today). The returned [`Backend`]
-/// selects nothing yet — there's a single backend — so this exists to reject an
-/// unknown name (e.g. `wasm`, not yet implemented) at the CLI boundary rather than
-/// silently ignoring it.
+/// Validates a `--backend` flag value (`js` / `rust`) and answers which emitter
+/// runs. `rust` is F1's native backend (slice S1a): `build` writes a cargo
+/// project and builds it, `run` runs the binary it produced. An unknown name is
+/// rejected at the CLI boundary rather than silently ignored.
 fn effective_backend(flag: Option<&str>) -> Result<Backend, String> {
     match flag {
-        Some(name) => {
-            Backend::parse(name).ok_or_else(|| format!("unknown backend `{name}` (expected `js`)"))
-        }
+        Some(name) => Backend::parse(name)
+            .ok_or_else(|| format!("unknown backend `{name}` (expected `js` or `rust`)")),
         None => Ok(Backend::default()),
     }
 }
@@ -1807,15 +2210,39 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
         paths.to_vec()
     };
     let mut files = Vec::new();
-    let mut outside: BTreeSet<PathBuf> = BTreeSet::new();
-    for root in &roots {
-        outside.extend(collect_vl_files(root, &mut files));
-    }
+    // ONE walk across every root, so the identity set spans them: overlapping
+    // roots (`vilan fmt --check src src/pkg`) name the same files twice on the
+    // command line and must still format each of them once (B213).
+    let outside: BTreeSet<PathBuf> = collect_vl_files_across(&roots, &mut files)
+        .into_iter()
+        .collect();
     report_links_outside_the_project(&outside);
     exclude_generated(&mut files);
     let mut changed = 0;
     let mut failed = false;
+    // N90: files the printer DECLINED — a construct it has no rule for, or a
+    // reprint its own safety net threw away. Counted apart from `changed`
+    // because they are a different outcome with a different owner: a file that
+    // "would reformat" is the author's to fix, a file the printer declined is
+    // the FORMATTER's, and a run reporting the second as the first is how a
+    // printer gap stays invisible.
+    let mut declined = 0;
+    // E205/E215: the `[fmt]` knobs are a PACKAGE's opinion, so they are
+    // resolved per file — and cached per DIRECTORY for `exclude_generated`'s
+    // reason: every file in one directory has the same ancestors, so one
+    // manifest climb per directory rather than one per file. One climb answers
+    // both keys, and each key takes its own nearest declaration.
+    let mut fmt_opinions: HashMap<PathBuf, vilan_core::manifest::FmtOpinions> = HashMap::new();
     for file in &files {
+        let directory = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let opinions = *fmt_opinions
+            .entry(directory)
+            .or_insert_with_key(|directory| vilan_core::manifest::fmt_opinions_covering(directory));
+        let defaults = vilan_core::formatter::FormatOptions::default();
+        let options = vilan_core::formatter::FormatOptions {
+            wrap_comments: opinions.wrap_comments.unwrap_or(defaults.wrap_comments),
+            comment_width: opinions.comment_width.unwrap_or(defaults.comment_width),
+        };
         let source = match fs::read_to_string(file) {
             Ok(source) => source,
             Err(error) => {
@@ -1828,7 +2255,20 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
                 continue;
             }
         };
-        let formatted = vilan_core::formatter::format(&source);
+        // N90: `format` answers the original bytes on every way out, so a file
+        // the printer DECLINED reads exactly like one that was already
+        // canonical — `export let x = 1;` bailed for a whole order with
+        // `fmt --check vilan/std` green over it, and an idempotency pin on one
+        // file is what caught it. `reprint` says which happened, and a decline
+        // is reported by name here instead of being counted as clean.
+        let formatted = match vilan_core::formatter::reprint_with(&source, options) {
+            Ok(formatted) => formatted,
+            Err(decline) => {
+                report_decline(file, &decline);
+                declined += 1;
+                continue;
+            }
+        };
         if formatted == source {
             continue;
         }
@@ -1854,11 +2294,51 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
             );
         }
     }
-    if failed || (check && changed > 0) {
+    // Three outcomes, three codes (N90). `2` is the distinct one, and it says
+    // something `1` cannot: the formatter could not format a file, as opposed
+    // to the tree not being formatted. It holds in BOTH modes, because a
+    // `vilan fmt` that skipped a file did not write it either, and the silence
+    // is what the item is about. It also OUTRANKS `1`: a run that met a file it
+    // could not format has not established anything about the rest.
+    if declined > 0 {
+        eprintln!(
+            "{} {declined} file(s) did not format (see the `declined` lines above); \
+             `vilan fmt` says nothing about whether the rest of the tree is clean",
+            paint::error_prefix(),
+        );
+        ExitCode::from(DECLINED)
+    } else if failed || (check && changed > 0) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `vilan fmt`'s exit code for a file it could NOT format (N90) — distinct
+/// from `1`, which `--check` already spends on "the tree is not formatted", so
+/// a CI leg (and `scripts/ci-local.sh`'s `vilan-fmt`) can tell a formatter that
+/// declined from a tree that is merely unformatted, by the code alone.
+///
+/// Before this, `format` answered the original bytes on every way out and the
+/// run reported the file as already-formatted: a printer gap was invisible to
+/// the gate whose whole job is to find one, and so was a `.vl` file that does
+/// not parse.
+const DECLINED: u8 = 2;
+
+/// Reports one file that did not format: the path, the line, and the construct
+/// in the words of the source. Naming the CONSTRUCT is the point — "this file
+/// did not format" sends a reader into a 900-line std module looking for what.
+fn report_decline(file: &Path, decline: &vilan_core::formatter::Decline) {
+    let where_ = match decline.line {
+        Some(line) => format!("{}:{line}", file.display()),
+        None => file.display().to_string(),
+    };
+    eprintln!(
+        "{} {}  {}",
+        paint::out(paint::Style::YELLOW, "declined"),
+        paint::out(paint::Style::BOLD, &where_),
+        decline.sentence(),
+    );
 }
 
 /// Drops every file that lives under a declared `generated` root, and says so
@@ -1965,27 +2445,72 @@ fn display_relative(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-/// A directory's identity for [`TreeWalk`]'s cycle guard: `(device, inode)` on
-/// unix, which answers "the same directory" whatever chain of names reached it,
-/// and the resolved path elsewhere — the portable spelling of the same question,
+/// An entry's identity for [`TreeWalk`]'s two guards: `(device, inode)` on
+/// unix, which answers "the same entry" whatever chain of names reached it, and
+/// the resolved path elsewhere — the portable spelling of the same question,
 /// since Windows exposes no stable inode through `std`. Either way the key is
-/// the DIRECTORY and never its name, which is the whole point: a cycle is one
-/// directory wearing many names.
+/// the ENTRY and never its name, which is the whole point: a cycle is one
+/// directory wearing many names, and G22 is one FILE wearing two.
+///
+/// Directories alone until G22. The guard read the tree as though only a
+/// directory could be reached twice, so a file link inside the project
+/// (`src/alias.vl -> src/real.vl`, or a linked directory beside the real one)
+/// handed the SAME FILE to the collector under both names: `vilan fmt --check`
+/// printed two `would reformat` lines for one file and counted it twice,
+/// `vilan fmt` formatted it twice, and [`manifest_fingerprint`] hashed one
+/// `vilan.toml` twice. The identity is the same value for both kinds — a
+/// filesystem object is a filesystem object — so the set is one set.
 #[cfg(unix)]
-type DirectoryIdentity = (u64, u64);
+type EntryIdentity = (u64, u64);
 #[cfg(not(unix))]
-type DirectoryIdentity = PathBuf;
+type EntryIdentity = PathBuf;
 
+/// `metadata` is the entry's own, already **followed** through any link by
+/// [`TreeWalk::walk`] — which is what makes the link and its target answer
+/// alike, and what keeps the guard from costing a second `stat` per entry on
+/// the watcher's 300 ms poll.
 #[cfg(unix)]
-fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+fn entry_identity(_path: &Path, metadata: &fs::Metadata) -> Option<EntryIdentity> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = fs::metadata(path).ok()?;
     Some((metadata.dev(), metadata.ino()))
 }
 
+/// `fs::canonicalize` rather than [`vilan_core::util::canonical_path`], and the
+/// difference is the whole guard (audit run 7's F6). `canonical_path` NEVER
+/// fails: where the resolution fails it degrades to the lexical
+/// `normalize_components`, which is the right answer for a comparison KEY over a
+/// path that may not be on disk, and the wrong one for an IDENTITY. The two
+/// agree while the resolution succeeds — and while it does, an ordinary junction
+/// cycle is caught either way, because both spellings resolve to one directory,
+/// and a file reached through two names resolves to one path for the same
+/// reason (G22).
+///
+/// It is the failure that mattered, and the old code could not express it. A
+/// cycle spells one directory `src/l1`, `src/l1/l1`, `src/l1/l1/l1`, …, so the
+/// moment resolution stops answering, the lexical fallback mints a DISTINCT key
+/// at every level: [`visited`](TreeWalk::visited) never collides, the `else` arm
+/// below never runs — it was unreachable, since `Some` was the only value this
+/// function could return — and the walk fans out with nothing behind it, because
+/// [`TreeWalk::walk`] has no depth cap and there is no ELOOP on this side to
+/// backstop it. `None` is the sentence "I cannot identify this entry", and what
+/// the consumer does with it now depends on WHICH entry: a directory it cannot
+/// identify is not descended into (stopping beats re-walking a tree it cannot
+/// recognize), a file it cannot identify is visited anyway (a duplicate line
+/// beats a source file that is never formatted). That asymmetry is
+/// [`TreeWalk::walk`]'s and is spelled there; this function's job is only to say
+/// honestly that it does not know. The unix arm above says the same when
+/// `fs::metadata` fails, and it is the safe answer to every way resolution can
+/// fail (an ACL that lets `read_dir` list a directory `CreateFileW` cannot open,
+/// a volume going away mid-walk).
+///
+/// The verbatim (`\\?\`) prefix `canonicalize` returns is kept. This value is
+/// only ever compared with another produced right here, so the one property it
+/// needs is that one entry yields one key however it was reached; stripping
+/// is [`vilan_core::util::canonical_path`]'s job, for the keys that have to meet
+/// join-built paths.
 #[cfg(not(unix))]
-fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
-    Some(vilan_core::util::canonical_path(path))
+fn entry_identity(path: &Path, _metadata: &fs::Metadata) -> Option<EntryIdentity> {
+    fs::canonicalize(path).ok()
 }
 
 /// One walk of a project tree, with the two guards a link-following walk needs
@@ -2017,7 +2542,11 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
 struct TreeWalk {
     /// The resolved tree the walk may not leave.
     scope: PathBuf,
-    visited: BTreeSet<DirectoryIdentity>,
+    /// Every entry already handed to the visitor, or already descended into,
+    /// by [`EntryIdentity`]. One set for files and directories alike: the
+    /// question "have I been here before" is the same question about both, and
+    /// the answers cannot collide, since one filesystem object has one identity.
+    visited: BTreeSet<EntryIdentity>,
     /// Directory links whose target resolves outside [`scope`](Self::scope), in
     /// the spelling they were reached by — what a command tells the user about
     /// rather than skipping in silence.
@@ -2026,6 +2555,16 @@ struct TreeWalk {
 
 impl TreeWalk {
     fn rooted_at(root: &Path) -> TreeWalk {
+        TreeWalk {
+            scope: Self::scope_of(root),
+            visited: BTreeSet::new(),
+            outside: Vec::new(),
+        }
+    }
+
+    /// The tree a walk rooted at `root` may not leave: the nearest `vilan.toml`
+    /// at or above it, else the root itself.
+    fn scope_of(root: &Path) -> PathBuf {
         let resolved = vilan_core::util::canonical_path(root);
         let start = if resolved.is_dir() {
             resolved
@@ -2035,11 +2574,20 @@ impl TreeWalk {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| resolved.clone())
         };
-        TreeWalk {
-            scope: find_project_root(&start).unwrap_or(start),
-            visited: BTreeSet::new(),
-            outside: Vec::new(),
-        }
+        find_project_root(&start).unwrap_or(start)
+    }
+
+    /// Re-points the walk at another command-line root, KEEPING everything it
+    /// has already visited (B213).
+    ///
+    /// G22 gave one walk one identity set — one file, one visit, whichever name
+    /// reached it — and `fmt` then built a fresh walk per root, so the set did
+    /// not span roots and `vilan fmt --check src src/pkg` reported every file
+    /// under `src/pkg` twice. The scope is re-derived per root, because each
+    /// root answers "which project is this" for itself; only the identities
+    /// carry over, which is exactly the state that has to.
+    fn re_root(&mut self, root: &Path) {
+        self.scope = Self::scope_of(root);
     }
 
     /// Whether a link is part of this project — the one question the walk asks
@@ -2079,11 +2627,28 @@ impl TreeWalk {
         } else {
             entry
         };
+        let identity = entry_identity(path, &metadata);
         if !metadata.is_dir() {
+            // G22 — one file, one visit, whichever name reached it. A file
+            // symlink inside the project resolves to the same `(device, inode)`
+            // as its target, so the second spelling is recognized and dropped.
+            //
+            // An UNIDENTIFIABLE file is visited (the `None` arm falls through),
+            // which is the opposite of the directory arm below, and deliberately
+            // so: the cost of visiting a directory twice is an unbounded walk,
+            // while the cost of visiting a file twice is one duplicate line — and
+            // the cost of SKIPPING one is a source file the formatter never
+            // formats and the watcher never watches. Each arm takes its own safe
+            // direction rather than one rule taking the wrong one twice.
+            if let Some(identity) = identity
+                && !self.visited.insert(identity)
+            {
+                return;
+            }
             visit(path);
             return;
         }
-        let Some(identity) = directory_identity(path) else {
+        let Some(identity) = identity else {
             return;
         };
         if !self.visited.insert(identity) {
@@ -2105,12 +2670,31 @@ impl TreeWalk {
 /// follow because they leave the project ([`TreeWalk`]) — which `fmt` reports
 /// and the watcher's scan ignores.
 fn collect_vl_files(path: &Path, out: &mut Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut walk = TreeWalk::rooted_at(path);
-    walk.walk(path, &mut |file| {
-        if file.extension().and_then(|extension| extension.to_str()) == Some("vl") {
-            out.push(file.to_path_buf());
-        }
-    });
+    let roots = [path.to_path_buf()];
+    collect_vl_files_across(&roots, out)
+}
+
+/// The same collection over SEVERAL command-line roots, sharing one walk — and
+/// so one identity set — across all of them (B213).
+///
+/// One root at a time is not the same thing: `vilan fmt --check src src/pkg`
+/// walks `src`, reaches `src/pkg/helper.vl`, and then walks `src/pkg` and
+/// reaches it again, because the second walk starts with an empty set. G22's
+/// rule is "one file, one visit, whichever name reached it"; a per-root walk
+/// only ever held it within one name.
+fn collect_vl_files_across(roots: &[PathBuf], out: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    let Some(first) = roots.first() else {
+        return Vec::new();
+    };
+    let mut walk = TreeWalk::rooted_at(first);
+    for root in roots {
+        walk.re_root(root);
+        walk.walk(root, &mut |file| {
+            if file.extension().and_then(|extension| extension.to_str()) == Some("vl") {
+                out.push(file.to_path_buf());
+            }
+        });
+    }
     walk.outside
 }
 
@@ -2131,6 +2715,30 @@ struct Unit {
     /// beside the bundle. The manifest has already refused it off a browser leg.
     split: bool,
     options: BuildOptions,
+    /// E119: per platform, WHY this unit is compiled under it — the clause
+    /// [`vilan_core::platform_color::PlatformReason::clause`] renders. Only FILE
+    /// mode fills it, because only there is the colour a conclusion the author
+    /// did not write; a package leg is compiled under its own declared target,
+    /// which the manifest already says out loud. Empty means "nothing to
+    /// explain", and the diagnostic then names the overlay alone.
+    platform_reasons: Vec<(Platform, String)>,
+    /// Whether this unit's `entry` is a program the package DECLARES — a
+    /// package leg, the single `[package] entry`, a bare file — rather than one
+    /// of the package's MODULES addressed by path (E113's `is_package_module`),
+    /// and, when it is a module, which siblings ARE declared programs (B240).
+    ///
+    /// Two things read it, and they used to be one: `check` skips the `main`
+    /// demand and the emission walk for a module (E113), and the analysis is
+    /// told which kind of entry it has been handed, so a sibling that imports
+    /// the module can still import it (B239). It rides on the unit beside
+    /// `platform_reasons` because it is the same kind of fact — what the
+    /// manifest says about the file the caller named — and because every
+    /// compile of the unit needs it, not only `check`'s.
+    ///
+    /// It IS `vilan_core::EntryMode`, rather than a `bool` beside one: the two
+    /// were one fact spelled twice, and the declared-entry set B240 adds has
+    /// exactly the shape the analysis reads.
+    entry_mode: vilan_core::EntryMode,
 }
 
 /// The `[build] run` hooks of the addressed manifest (A9): external commands —
@@ -2192,7 +2800,14 @@ impl DeclaredHook {
     /// Content, never mtime. Not a new rule here: the watch loop's leg reuse
     /// already decides by content and says why, and a hook stamp that trusted
     /// mtime would reintroduce the bug the watcher refused.
-    fn fingerprint(&self, dir: &Path) -> Option<HookFingerprint> {
+    /// The declared inputs' digests as they are NOW. Taken BEFORE the hook
+    /// runs, because the stamp must record what the hook CONSUMED: an input
+    /// edited while the hook's commands are still running belongs to the next
+    /// round, and a stamp that re-read the inputs afterwards would swallow
+    /// that edit — the next round would find the digests equal and call the
+    /// hook fresh. An unreadable input is `None` for the whole map, and such
+    /// a hook is never stamped.
+    fn input_digests(&self, dir: &Path) -> Option<BTreeMap<String, Option<String>>> {
         let mut inputs = BTreeMap::new();
         for declared in &self.inputs {
             // A declared input that is MISSING is recorded as missing rather
@@ -2200,6 +2815,20 @@ impl DeclaredHook {
             // way `asset::read`'s reader records its misses.
             inputs.insert(declared.clone(), file_digest(&dir.join(declared))?);
         }
+        Some(inputs)
+    }
+
+    /// The hook's stamp: its command text, the inputs as digested by
+    /// [`Self::input_digests`] (before the run), and its outputs as they are
+    /// on disk NOW — after the run, when the caller is stamping a hook that
+    /// ran. `None` when an output is missing: nothing is recorded for a hook
+    /// whose output is missing, so it re-runs on every build.
+    fn fingerprint(
+        &self,
+        dir: &Path,
+        inputs: Option<BTreeMap<String, Option<String>>>,
+    ) -> Option<HookFingerprint> {
+        let inputs = inputs?;
         let mut outputs = BTreeMap::new();
         for declared in &self.outputs {
             outputs.insert(declared.clone(), file_digest(&dir.join(declared))??);
@@ -2452,7 +3081,8 @@ impl BuildHooks {
         let mut next: BTreeMap<String, HookFingerprint> = BTreeMap::new();
         for hook in &self.declared {
             let label = format!("`[[build.hook]]` `{}`", hook.name);
-            let before = hook.fingerprint(&self.dir);
+            let inputs_before = hook.input_digests(&self.dir);
+            let before = hook.fingerprint(&self.dir, inputs_before.clone());
             let fresh = !rerun
                 && hook.is_skippable()
                 && before.is_some()
@@ -2512,7 +3142,10 @@ impl BuildHooks {
             // Fingerprinted AFTER the run: the outputs recorded are the ones
             // the run actually produced. A hook that did not produce a
             // declared output records nothing and re-runs next build.
-            if let Some(after) = hook.fingerprint(&self.dir) {
+            // Inputs as digested BEFORE the run, outputs as written by it: an
+            // input edited while the commands ran is the next round's, not this
+            // stamp's (the race Windows CI exposed at Order 25's seal).
+            if let Some(after) = hook.fingerprint(&self.dir, inputs_before) {
                 next.insert(hook.name.clone(), after);
             }
         }
@@ -2921,10 +3554,6 @@ enum Project {
         /// including a build, which writes one artifact and so uses `platform`
         /// alone.
         shared_platforms: Vec<Platform>,
-        /// The addressed file is a MODULE of its package rather than one of its
-        /// program entries — only file mode can produce it, and only `check`
-        /// reads it (a module has no `main` to lack, E113).
-        module_file: bool,
         /// The `[build] run` hooks to run before building it (A9).
         hooks: BuildHooks,
     },
@@ -3043,20 +3672,43 @@ fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
 /// a file under a `[project]` or `[library]` root, which has no `[package]` to
 /// belong to.
 fn file_project(entry: PathBuf) -> Result<Project, String> {
-    let bare = |entry: PathBuf| Project::Single {
-        unit: Unit {
-            name: String::new(),
-            pkg_root: pkg_root_of(&entry),
-            entry,
-            package_dir: None,
-            split: false,
-            options: BuildOptions::default(),
-        },
-        platform: None,
-        shared_platforms: Vec::new(),
-        // A file with no `[package]` above it IS the program it names.
-        module_file: false,
-        hooks: BuildHooks::default(),
+    let bare = |entry: PathBuf| {
+        // No project to colour it — but the file may say itself (F27 R1):
+        // `[platform("browser")] mod self;`, or fences that admit one platform, is the
+        // platform the editor analyzes it under, and the terminal must not
+        // answer differently. Otherwise the CLI's `node` default answers, and
+        // there is nothing about the file's own situation to explain.
+        let declared = vilan_core::util::read_source(&entry)
+            .ok()
+            .and_then(|text| vilan_core::platform_color::declared_platform(&text));
+        let platform = declared.as_ref().map(|declared| declared.hosts[0]);
+        let platform_reasons = declared
+            .map(|declared| {
+                vec![(
+                    declared.hosts[0],
+                    vilan_core::platform_color::PlatformReason::Declared(declared.written).clause(),
+                )]
+            })
+            .unwrap_or_default();
+        Project::Single {
+            unit: Unit {
+                name: String::new(),
+                pkg_root: pkg_root_of(&entry),
+                entry,
+                package_dir: None,
+                split: false,
+                options: BuildOptions::default(),
+                platform_reasons,
+                // A file with no `[package]` above it IS the program it names,
+                // and there is no manifest to name any other (B250).
+                entry_mode: vilan_core::EntryMode::Declared {
+                    declared_entries: Vec::new(),
+                },
+            },
+            platform,
+            shared_platforms: Vec::new(),
+            hooks: BuildHooks::default(),
+        }
     };
     let Some((directory, manifest)) = owning_package(&entry)? else {
         return Ok(bare(entry));
@@ -3077,11 +3729,28 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
     // designated `default-entry` answers. A file outside the source root is not
     // the package's to color — it still resolves `pkg::` and the dependencies,
     // which is what it needs.
-    let mut platforms =
-        vilan_core::platform_color::file_platforms(&pkg_root, &manifest, &entry).into_iter();
+    // Each colour with the REASON it was chosen (E119): a file addressed by path
+    // is coloured by something the author did not write — which entry reaches
+    // it, or which one the manifest designates — and a type-level diagnostic
+    // that follows from the colour is unreadable without it.
+    let choices = vilan_core::platform_color::file_platform_choices(&pkg_root, &manifest, &entry);
+    let platform_reasons: Vec<(Platform, String)> = choices
+        .iter()
+        .map(|choice| (choice.platform, choice.reason.clause()))
+        .collect();
+    let mut platforms = choices.into_iter().map(|choice| choice.platform);
     let platform = platforms.next();
     let shared_platforms: Vec<Platform> = platforms.collect();
-    let module_file = is_package_module(&pkg_root, &manifest, &entry);
+    // B239/B240: which situation this compile is in, and — in file mode — which
+    // of the package's files are programs a module may not import.
+    // B250: the same set on both legs. Which one this is decides only what
+    // `pkg::<this file>` means; a file the manifest declares is a program on
+    // either.
+    let declared_entries = vilan_core::platform_color::declared_entry_module_names(&manifest);
+    let entry_mode = match is_package_module(&pkg_root, &manifest, &entry) {
+        false => vilan_core::EntryMode::Declared { declared_entries },
+        true => vilan_core::EntryMode::OpenFile { declared_entries },
+    };
     Ok(Project::Single {
         unit: Unit {
             name: String::new(),
@@ -3090,10 +3759,11 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             package_dir: Some(directory),
             split: false,
             options,
+            platform_reasons,
+            entry_mode,
         },
         platform,
         shared_platforms,
-        module_file,
         hooks: BuildHooks::default(),
     })
 }
@@ -3103,28 +3773,13 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
 /// `main.vl`, or an `[entry.<name>]` path). A module has no `main`, and nothing
 /// should ask it for one (E113).
 ///
-/// A file OUTSIDE the source root is not the package's module — it is a program
-/// that happens to sit in the directory, and it keeps the demand it always had.
-///
-/// Compared canonically on both sides, never textually: `./src/main.vl` and
-/// `src/main.vl` name one file and must get one answer, and — the symlink
-/// doctrine, `spec/const.md` §9.2 — so must a file reached through a link.
+/// The rule itself lives in `vilan_core::platform_color` beside
+/// `file_platform_choices`, because the language server asks the same question
+/// about the same file and the two surfaces must not answer it twice (B239 —
+/// the editor reads it to say whether the analyzed entry is a declared program
+/// or one of the package's modules opened as one).
 fn is_package_module(pkg_root: &Path, manifest: &Manifest, file: &Path) -> bool {
-    let Some(package) = manifest.package.as_ref() else {
-        return false;
-    };
-    let file = vilan_core::util::canonical_path(file);
-    if !file.starts_with(vilan_core::util::canonical_path(pkg_root)) {
-        return false;
-    }
-    let same = |candidate: PathBuf| vilan_core::util::canonical_path(candidate) == file;
-    if manifest.entries.is_empty() {
-        return !same(pkg_root.join(package.entry()));
-    }
-    !manifest
-        .entries
-        .iter()
-        .any(|(name, declared)| same(pkg_root.join(declared.path(name))))
+    vilan_core::platform_color::is_package_module(pkg_root, manifest, file)
 }
 
 /// Reads, parses, validates, and reports warnings for the `vilan.toml` in
@@ -3216,7 +3871,12 @@ fn read_manifest_quietly(directory: &Path) -> Result<(Manifest, Vec<String>), St
 }
 
 /// Builds a [`Unit`] from a package manifest in `directory`.
-fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions) -> Unit {
+fn unit_from_package(
+    directory: &Path,
+    package: &Package,
+    manifest: &Manifest,
+    options: BuildOptions,
+) -> Unit {
     let pkg_root = directory.join(package.root());
     Unit {
         name: package.name.clone().unwrap_or_default(),
@@ -3225,6 +3885,15 @@ fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions)
         package_dir: Some(directory.to_path_buf()),
         split: package.splits(),
         options,
+        // A package leg is compiled under its own declared `target`, which the
+        // manifest says out loud — nothing for E119 to explain.
+        platform_reasons: Vec::new(),
+        // The `[package] entry` itself: the program the manifest declares —
+        // beside the package's other declared programs, which a MODULE of this
+        // package may not import either (B250: the set is read on both legs).
+        entry_mode: vilan_core::EntryMode::Declared {
+            declared_entries: vilan_core::platform_color::declared_entry_module_names(manifest),
+        },
     }
 }
 
@@ -3241,9 +3910,13 @@ fn package_units(
 ) -> Vec<(Unit, Platform)> {
     if manifest.entries.is_empty() {
         let platform = package.resolved_target().unwrap_or_default();
-        return vec![(unit_from_package(directory, package, options), platform)];
+        return vec![(
+            unit_from_package(directory, package, manifest, options),
+            platform,
+        )];
     }
     let pkg_root = directory.join(package.root());
+    let declared_entries = vilan_core::platform_color::declared_entry_module_names(manifest);
     let mut units: Vec<(Unit, Platform)> = manifest
         .entries
         .iter()
@@ -3256,6 +3929,15 @@ fn package_units(
                     package_dir: Some(directory.to_path_buf()),
                     split: entry.splits(),
                     options,
+                    // As above: this leg's `[entry.<name>] target` IS the
+                    // explanation, and the author wrote it.
+                    platform_reasons: Vec::new(),
+                    // An `[entry.<name>]` path: declared, by name — and the
+                    // whole declared set beside it, which a module of this
+                    // package may not import (B250).
+                    entry_mode: vilan_core::EntryMode::Declared {
+                        declared_entries: declared_entries.clone(),
+                    },
                 },
                 entry.resolved_target().unwrap_or_default(),
             )
@@ -3428,12 +4110,12 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
     }
 
     Ok(Project::Single {
-        unit: unit_from_package(directory, package, options),
+        unit: unit_from_package(directory, package, &manifest, options),
         platform: package.resolved_target(),
-        // A package addressed as a DIRECTORY builds its own entry: one leg, one
-        // color, and an entry it is. Both are file-mode questions (E113).
+        // A package addressed as a DIRECTORY builds its own entry: one leg and
+        // one color — a file-mode question (E113), and it has no file to ask
+        // about.
         shared_platforms: Vec::new(),
-        module_file: false,
         hooks: BuildHooks::from_manifest(directory, &manifest),
     })
 }
@@ -3463,7 +4145,7 @@ fn resolve_workspace(unit: &Unit) -> Result<Workspace, String> {
 /// byte-clean for `build --stdout`. Dim like `vilan upgrade`'s download line,
 /// TTY-gated by `paint` like every other status line.
 fn git_deps() -> vilan_core::git_dep::GitDeps {
-    vilan_core::git_dep::GitDeps::fetching(vilan_embedded_std::default_git_dep_root())
+    vilan_core::git_dep::GitDeps::fetching(vilan_embedded::default_git_dep_root())
         .reporting(|message| eprintln!("{}", paint::err(paint::Style::DIM, message)))
 }
 
@@ -3473,7 +4155,7 @@ fn git_deps() -> vilan_core::git_dep::GitDeps {
 /// pass that fetched would move the network ahead of the `[build]` hooks and
 /// change what the build does in order to describe it.
 fn git_deps_cached() -> vilan_core::git_dep::GitDeps {
-    vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root())
+    vilan_core::git_dep::GitDeps::cache_only(vilan_embedded::default_git_dep_root())
 }
 
 /// Resolves a unit's workspace and compiles its entry for `platform`, returning the
@@ -3500,6 +4182,21 @@ fn git_deps_cached() -> vilan_core::git_dep::GitDeps {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompileGoal {
     Emit,
+    /// `vilan run` of a lone package or a bare file: the emission walk's TEXT
+    /// is wanted, and nothing is written into `dist/` (tracker N103).
+    ///
+    /// `Emit` in every respect but that one, and that one is the whole reason
+    /// the variant exists. `run_single` hands Node a temp script and keeps the
+    /// canonical `<entry>.<ext>` sidecars beside the source, so it has no
+    /// build directory — yet it compiled under `Emit`, which put its macro
+    /// expansion table in `dist/.cache/`. N92 moved `vilan check`'s table out
+    /// of the package for exactly this reason and stopped one command short:
+    /// after `vilan run <package>` the tree held a `dist/` containing
+    /// `.cache/macro-expansions` and NOTHING else — a build directory in a
+    /// tree nobody asked to build, with no build in it. Milder than the check
+    /// case, because `rm -rf dist` still means what it says; misleading all
+    /// the same, and it is the same root.
+    Run,
     Check,
     CheckModule,
 }
@@ -3511,10 +4208,29 @@ impl CompileGoal {
         matches!(self, CompileGoal::Check | CompileGoal::CheckModule)
     }
 
+    /// Whether this goal writes artifacts INTO `dist/` — which is what decides
+    /// where its macro expansion table lives (N92, N103): `dist/` belongs to a
+    /// build, and a command that puts nothing there has no business creating
+    /// one. `Run` emits text and writes none, so it answers `false` with the
+    /// two checking goals.
+    fn emits_artifacts(self) -> bool {
+        matches!(self, CompileGoal::Emit)
+    }
+
     /// Whether this goal runs the emission walk. `CheckModule` does not: a
     /// module is not a program, and emission's only diagnostic says so.
     fn emits(self) -> bool {
         !matches!(self, CompileGoal::CheckModule)
+    }
+
+    /// Whether the emission walk's TEXT is wanted, as against its diagnostics
+    /// (backlog M34). Only `Emit` writes JavaScript; `Check` runs the same walk
+    /// through `transformer::diagnose`, which refuses in exactly the four
+    /// places `transform` does and skips the scope rename and the formatting —
+    /// 6.3% of a cold check's instructions spent producing names and text that
+    /// this goal drops on the floor.
+    fn emits_text(self) -> bool {
+        matches!(self, CompileGoal::Emit | CompileGoal::Run)
     }
 }
 
@@ -3544,6 +4260,10 @@ struct Compiled {
 fn compile_unit(
     unit: &Unit,
     platform: Platform,
+    // Which emitter runs (F1 S1a). Threaded rather than read from a global
+    // because it decides what the compile PRODUCES, and a workspace compiles
+    // several legs in one process.
+    backend: Backend,
     goal: CompileGoal,
     emit_debug: bool,
     hmr: bool,
@@ -3557,13 +4277,56 @@ fn compile_unit(
     // decision and nothing else.
     chunks: Option<(&str, &mut Vec<EmittedChunk>)>,
 ) -> Result<Compiled, ExitCode> {
-    let workspace = match resolve_workspace(unit) {
+    let mut workspace = match resolve_workspace(unit) {
         Ok(workspace) => workspace,
         Err(message) => {
             eprintln!("{} {message}", paint::error_prefix());
             return Err(ExitCode::FAILURE);
         }
     };
+    // E119: why THIS compile is coloured the way it is, for the diagnostics that
+    // follow from the colour. Keyed on the platform, because a shared module is
+    // compiled once per leg and each leg has its own answer.
+    workspace.platform_reason = unit
+        .platform_reasons
+        .iter()
+        .find(|(colored, _)| *colored == platform)
+        .map(|(_, reason)| reason.clone());
+    // B239: whether the file this compile was pointed at is a program the
+    // package declares, or one of its modules addressed by path. Threaded on
+    // the same context and for the same reason as the line above — a fact about
+    // THIS compile that only the front end, which read the manifest, can know.
+    //
+    // B240: file mode carries the manifest's DECLARED-ENTRY set with it, so the
+    // analysis can see that a SIBLING is a program — `views.vl` importing
+    // `pkg::client` is refused here exactly as `vilan check .`'s `client` leg
+    // refuses it.
+    workspace.entry_mode = unit.entry_mode.clone();
+    // M33: the package's build directory, where the cross-process macro
+    // expansion table lives. Set HERE and nowhere else, which is what makes the
+    // table a build-tool feature: the language server and the wasm playground
+    // build their own workspaces and leave it `None`, so an editor never writes
+    // into a user's `dist/` and a keystroke keeps the in-memory table it
+    // already had. `dist/` for the same reason the build hooks' stamp file is
+    // there — `rm -rf dist` means recompile everything, macro worlds included.
+    //
+    // The MANIFEST's directory, not `pkg_root`: `pkg_root` is the package's
+    // SOURCE root (`src/`), and `dist/` is a sibling of `vilan.toml`, which is
+    // where `build` writes and where a user goes to delete it. A bare file with
+    // no manifest has no build directory and gets none — it has no `dist/` for
+    // the same reason it has no package.
+    //
+    // N92: except when the goal EMITS NOTHING. `dist/.cache` is the build's
+    // memory and `rm -rf dist` is the sentence that justifies it, but `vilan
+    // check` writes no artifacts — so it was creating a build directory in a
+    // tree nobody asked to build, and a read-only-sounding command mutated the
+    // package it was pointed at. A checking goal keys its table under
+    // `~/.vilan/check-cache/<hash of the package>` instead, which is out of the
+    // tree and swept by `vilan cache prune`.
+    workspace.macro_expansion_cache = unit
+        .package_dir
+        .as_ref()
+        .map(|directory| expansion_cache_root(directory, goal));
     // HMR instrumentation is opt-in per compile (an HMR-active `run --watch`,
     // browser legs only) — every other caller passes `false`, so `build`/`run`/
     // `check` output stays byte-identical.
@@ -3574,6 +4337,7 @@ fn compile_unit(
         &unit.entry,
         &unit.pkg_root,
         platform,
+        backend,
         goal,
         &options,
         &workspace,
@@ -3583,9 +4347,49 @@ fn compile_unit(
     )
 }
 
+/// Where THIS compile keeps its cross-process macro expansion table (M33, N92).
+///
+/// Two roots, chosen by what the compile writes INTO `dist/`. A goal that puts
+/// artifacts there uses the package's own `dist/`, which is what `rm -rf dist`
+/// is about: one gesture, "recompile everything, macro worlds included". A goal
+/// that puts nothing there has no build directory of its own to keep memory in
+/// — and creating one made `vilan check` mutate the package it was pointed at,
+/// which is the whole of N92. Its table lives under
+/// `~/.vilan/check-cache/<hash>` instead, keyed by the package's canonical path
+/// so two packages never share a table and one package's two spellings do.
+///
+/// N103: `vilan run` of a lone package or a bare file is on that side too. It
+/// hands Node a temp script and keeps its sidecars beside the source, so it
+/// writes nothing into `dist/` — but it compiled under `Emit` and so left a
+/// `dist/` holding `.cache/macro-expansions` and nothing else. See
+/// [`CompileGoal::Run`].
+///
+/// The hash and not the path itself: a directory name has to be one path
+/// segment on every platform, and a project path is neither (it carries
+/// separators, and on Windows a drive letter and a colon).
+fn expansion_cache_root(package_dir: &Path, goal: CompileGoal) -> PathBuf {
+    if goal.emits_artifacts() {
+        return package_dir.join("dist");
+    }
+    let canonical = vilan_core::util::canonical_path(package_dir);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&canonical, &mut hasher);
+    vilan_embedded::default_check_cache_root()
+        .join(format!("{:016x}", std::hash::Hasher::finish(&hasher)))
+}
+
 /// Builds a lone package / bare file, writing `<entry>.mjs` on a process leg
 /// and `<entry>.js` on the browser (or printing to stdout).
-fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool) -> RoundOutcome {
+fn build_single(
+    unit: &Unit,
+    stdout: bool,
+    platform: Platform,
+    backend: Backend,
+    emit_debug: bool,
+) -> RoundOutcome {
+    if backend == Backend::Rust {
+        return native::build(unit, platform, emit_debug, stdout);
+    }
     let mut chunks = Vec::new();
     // A lone package writes `<entry>.<ext>` beside its source, so the entry file's
     // own stem is what its chunks are named after.
@@ -3597,6 +4401,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
     let compiled = match compile_unit(
         unit,
         platform,
+        Backend::Js,
         CompileGoal::Emit,
         emit_debug,
         false,
@@ -3679,15 +4484,44 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
 /// leg's diagnostics and a clean verdict means clean everywhere (E113). One
 /// verdict line either way — the file is the subject, not the number of colors
 /// it took to clear it.
+///
+/// **Sequential, and the blocker is named** (M51). `build` compiles a tier of a
+/// workspace's legs at once and `check_workspace` its members (M35); this loop
+/// stays one thread because of the ledger it arms three lines down.
+/// [`RENDERED_THIS_ROUND`] is process-global and its claim is about THIS
+/// round's ORDER — the first color to raise a diagnostic reports it and the
+/// rest are suppressed — so colors running at once would claim in whatever
+/// order they finished, and a file's report would name a different leg run to
+/// run. M35's answer for the workspace does not carry over: there the ledger is
+/// applied at REPLAY, member by member, because a member is a whole compile
+/// whose diagnostics can be buffered and re-ordered; the same trick here needs
+/// the ledger to be a per-round value the round threads rather than a static
+/// the renderer reaches for, which is B182's own shape to change.
 fn check_single(
     unit: &Unit,
     platforms: &[Platform],
     emit_debug: bool,
     goal: CompileGoal,
 ) -> RoundOutcome {
+    // The same one-report-per-round ledger `check_workspace` arms, for the same
+    // reason (B182): several colors over ONE file is several analyses of one
+    // source tree, and a refusal that holds under every leg is one refusal. A
+    // diagnostic only ONE color raises still renders — the key carries the
+    // reason, so two colors' answers are two errors.
+    let _round = RoundReports::arm();
     let mut ok = true;
     for platform in platforms {
-        ok &= compile_unit(unit, *platform, goal, emit_debug, false, None, None).is_ok();
+        ok &= compile_unit(
+            unit,
+            *platform,
+            Backend::Js,
+            goal,
+            emit_debug,
+            false,
+            None,
+            None,
+        )
+        .is_ok();
     }
     if !ok {
         return RoundOutcome::Failed;
@@ -3701,9 +4535,21 @@ fn check_single(
 }
 
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
-fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
+fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
     let platform = Platform::default();
-    let compiled = match compile_unit(unit, platform, CompileGoal::Emit, false, false, None, None) {
+    if backend == Backend::Rust {
+        return native::run(unit, platform, args);
+    }
+    let compiled = match compile_unit(
+        unit,
+        platform,
+        Backend::Js,
+        CompileGoal::Run,
+        false,
+        false,
+        None,
+        None,
+    ) {
         Ok(compiled) => compiled,
         Err(code) => return code,
     };
@@ -3739,16 +4585,82 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
 /// — a `none` member is a pure library, compiled only as a dependency of a host.
 /// Members build in declaration order (the client before the server, so the
 /// server's `dist/client.js` exists). `--platform`/`--stdout` don't apply.
-fn build_workspace(root: &Path, members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
-    match build_workspace_artifacts(root, members, debug, Emission::AsDeclared) {
+fn build_workspace(
+    root: &Path,
+    members: &[(Unit, Platform)],
+    debug: bool,
+    watch_state: Option<&mut BuildWatchState>,
+) -> RoundOutcome {
+    // A borrow of the state has to survive the call, and the failure arm has
+    // to write to it — so take the flag update through a raw re-borrow rather
+    // than moving the option in twice.
+    let mut state = watch_state;
+    let outcome = build_workspace_artifacts(
+        root,
+        members,
+        debug,
+        Emission::AsDeclared,
+        state.as_deref_mut(),
+    );
+    match outcome {
         Ok(()) => {
+            if let Some(state) = state {
+                state.failed = false;
+            }
             // Every leg is written, so the report is complete — see
             // `build_single` for why only a successful build prints one.
             explain::print();
             RoundOutcome::Succeeded
         }
-        Err(_) => RoundOutcome::Failed,
+        Err(_) => {
+            // A failed round's `dist/` is not a baseline: the next round
+            // recompiles every leg (`hmr::round_forces_full`).
+            if let Some(state) = state {
+                state.failed = true;
+            }
+            RoundOutcome::Failed
+        }
     }
+}
+
+/// What one `vilan build --watch` round remembers for the next one, so a leg
+/// the edit did not reach is REUSED rather than recompiled (backlog M22).
+///
+/// `run --watch` has had this since E12 half b; `build --watch` never did, and
+/// the measured consequence on kolt was that a one-character edit in
+/// `views.vl` — a module only the CLIENT leg loads — recompiled client, probe
+/// AND server every round. The state is deliberately the same three fields the
+/// HMR round keeps, and the decision is made by the same two functions
+/// (`hmr::round_forces_full`, `hmr::leg_is_current`): two watch loops that
+/// answer "is this leg current?" two different ways is exactly the drift this
+/// tree refuses elsewhere.
+///
+/// Only `--watch` builds carry one. A one-shot `vilan build` passes `None` and
+/// is byte-for-byte the build it always was.
+#[derive(Default)]
+struct BuildWatchState {
+    /// Per leg, in `members` order: what the last round compiled it from and
+    /// what it bundled. Empty on the first round, which is one of the guards
+    /// that forces a full one.
+    legs: Vec<BuildWatchLeg>,
+    /// Every `vilan.toml` in the tree, hashed: a manifest change can alter
+    /// output without touching a `.vl` source, so it forces a full round.
+    manifest: Option<u64>,
+    /// The previous round failed, so nothing it left in `dist/` is trustworthy.
+    failed: bool,
+}
+
+/// One leg's record in [`BuildWatchState`].
+struct BuildWatchLeg {
+    name: String,
+    /// Each source the leg was compiled from, mapped to the content hash it
+    /// was compiled at — re-hashed, never re-stat'ed (the E12 rule).
+    sources: BTreeMap<PathBuf, u64>,
+    /// What `const asset::bundle` registered for this leg, kept so a SKIPPED
+    /// leg still occupies its output names in the cross-leg collision check
+    /// below: two legs bundling two different files to one name is an error
+    /// whether or not this round recompiled both of them.
+    bundled: Vec<(PathBuf, String)>,
 }
 
 /// Whether a build honours a browser leg's `[entry.<name>] split`
@@ -3795,6 +4707,10 @@ fn build_workspace_artifacts(
     members: &[(Unit, Platform)],
     debug: bool,
     emission: Emission,
+    // `Some` only under `vilan build --watch` (backlog M22): the previous
+    // round's per-leg record, which decides which legs this round may reuse.
+    // Replaced with this round's record on the way out.
+    watch_state: Option<&mut BuildWatchState>,
 ) -> Result<(), ExitCode> {
     let dist = root.join("dist");
     if let Err(error) = fs::create_dir_all(&dist) {
@@ -3817,74 +4733,675 @@ fn build_workspace_artifacts(
     // files to one output name is one `dist/` asked to serve two files on one
     // url, which `asset::bundle_as` made expressible (const-eval.md §3.1).
     let mut bundled_names: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for (unit, platform) in members {
-        if platform.is_none() {
-            continue;
+    // M22 — whether this round may SKIP a leg at all. Same decision, same two
+    // functions and the same safety cases as the HMR round's: reuse is by
+    // CONTENT (every source the leg's artifact was compiled from re-hashes to
+    // what it was compiled with), never by mtime — the watcher's scan only
+    // TRIGGERS rounds. `--explain` forces a full round: the report is a
+    // statement about what THIS build wrote, and a skipped leg has no facts to
+    // contribute, so reusing one would silently shorten the report rather than
+    // speed it up.
+    //
+    // **Whether**, not *which*: B203. The per-leg question is asked at each
+    // leg's own turn, below, because one leg's sources can include another
+    // leg's artifact.
+    let mut watch_state = watch_state;
+    // The tree walk it costs is paid once per round, whatever it decides.
+    let manifest = watch_state.is_some().then(|| manifest_fingerprint(root));
+    let may_reuse = match watch_state.as_deref() {
+        Some(state) => {
+            !explain::asked()
+                && !hmr::round_forces_full(
+                    state.legs.is_empty(),
+                    state.failed,
+                    state
+                        .manifest
+                        .is_some_and(|previous| Some(previous) != manifest),
+                )
         }
-        if emission == Emission::WholeBundles {
-            note_split_ignored(unit);
+        None => false,
+    };
+    // B203 — a producer leg compiles before the leg that reads its artifact.
+    let schedule = {
+        let scheduled: Vec<ScheduledLeg> = members
+            .iter()
+            .map(|(unit, platform)| {
+                let previous = state_leg(watch_state.as_deref(), &unit.name);
+                ScheduledLeg {
+                    name: &unit.name,
+                    extension: platform.script_extension(),
+                    bundled: previous.map(|leg| leg.bundled.as_slice()).unwrap_or(&[]),
+                    sources: previous.map(|leg| &leg.sources),
+                }
+            })
+            .collect();
+        leg_schedule(&dist, &scheduled)
+    };
+    // Which legs this round actually recompiled, in schedule order — read by
+    // `downstream_of_a_recompile` at each later leg's turn.
+    let mut recompiled: BTreeSet<usize> = BTreeSet::new();
+    if let Some(state) = watch_state.as_deref_mut() {
+        state.manifest = manifest;
+    }
+    // This round's record, built as the legs are compiled (or carried over) and
+    // kept in DECLARATION order however the round chose to compile them: the
+    // record is a statement about the workspace, not about one round's schedule.
+    let mut recorded: Vec<Option<BuildWatchLeg>> = (0..members.len()).map(|_| None).collect();
+    // M51 — whether the round has compiled a leg yet. The FIRST leg compiles
+    // alone on this thread: it is what fills the process-global caches every
+    // later leg meets warm (the clean-parse cache, the base world, the macro
+    // worlds), and starting a whole tier cold would have each of them analyze
+    // `std` from scratch — N times the CPU for one world. The same shape, and
+    // the same reason, as M35's parallel `check`.
+    let mut warmed = false;
+    // What the legs of the CURRENT tier have already written into `dist/` this
+    // round — `(leg, extension, bundled names)`, which is everything
+    // [`leg_writes`] needs to say whether a path is one of them. Read by the
+    // stale-read guard below; cleared at each tier, because a leg of an
+    // EARLIER tier wrote before this tier compiled and is not a hazard.
+    let mut written_this_tier: Vec<(String, &'static str, Vec<(PathBuf, String)>)> = Vec::new();
+    for tier in schedule_tiers(&schedule) {
+        // B203's question, still asked at each leg's own turn — which for a
+        // tier is this loop. No leg of a tier reads a leg of the same tier
+        // ([`schedule_tiers`] splits the schedule exactly there), so putting a
+        // sibling into `recompiled` cannot change a sibling's answer: these are
+        // the answers a serial round gave, in the order it gave them.
+        let mut plan: Vec<(usize, bool)> = Vec::new();
+        for index in tier {
+            let (unit, platform) = &members[index];
+            if platform.is_none() {
+                continue;
+            }
+            let fresh = may_reuse
+                && !schedule.downstream_of_a_recompile(index, &recompiled)
+                && state_leg(watch_state.as_deref(), &unit.name)
+                    .is_some_and(|leg| hmr::leg_is_current(&leg.sources, current_source_hash));
+            if !fresh {
+                recompiled.insert(index);
+            }
+            plan.push((index, fresh));
         }
-        let mut chunks = Vec::new();
-        let sink = (emission == Emission::AsDeclared).then_some((unit.name.as_str(), &mut chunks));
-        let mut compiled =
-            compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
-        // Before the writers, which record the files this leg's facts explain.
-        explain::leg_facts(&unit.name, std::mem::take(&mut compiled.explain));
-        let output = artifact_path(&dist, &unit.name, *platform);
-        let styles = write_assets(&output, &compiled.assets);
-        let assets = write_bundled(
-            &dist,
-            &compiled.bundled,
-            &unit.name,
-            &reserved,
-            &mut bundled_names,
-        )?;
-        // Unconditional: this is also where a previous build's chunks are swept
-        // when this one wrote none, and where a browser leg's build manifest is
-        // written whether it split or not (`fullstack-dx.md` §10.3).
-        write_chunks(
-            &output,
-            &chunks,
-            styles.as_deref(),
-            &assets,
-            matches!(platform, Platform::Browser),
-        )?;
-        if let Err(error) = fs::write(&output, compiled.javascript) {
-            eprintln!(
-                "{} cannot write {}: {error}",
-                paint::error_prefix(),
-                output.display()
+        // The ONE phase that overlaps (M51). Every writer below stays serial
+        // and in schedule order: `dist/` is one directory, `write_chunks`
+        // sweeps a namespace, `bundled_names` is written by each leg and read
+        // by every later one, and `explain`'s log is a report about a build,
+        // not about a scheduler. So the collision blame, the report and the
+        // round's own lines are the serial round's, whatever order the compiles
+        // finished in.
+        let compiling: Vec<usize> = plan
+            .iter()
+            .filter(|(_, fresh)| !fresh)
+            .map(|(index, _)| *index)
+            .collect();
+        let mut compiles = compile_tier(members, &compiling, debug, emission, &mut warmed);
+        written_this_tier.clear();
+        for (index, fresh) in plan {
+            let (unit, platform) = &members[index];
+            if fresh {
+                // Reuse: the leg's artifact in `dist/` was compiled from exactly
+                // these bytes, so a recompile would rewrite the file it already
+                // holds. Its bundled names still have to occupy the collision map
+                // — the other legs' copies are checked against them this round
+                // just as they were last round — and they are already on disk, so
+                // no copy is repeated.
+                let previous = state_leg(watch_state.as_deref(), &unit.name)
+                    .expect("`fresh` is decided off the recorded leg");
+                for (source, name) in &previous.bundled {
+                    bundled_names.insert(name.clone(), source.clone());
+                }
+                let output = artifact_path(&dist, &unit.name, *platform);
+                println!(
+                    "{} {} -> {}",
+                    paint::out(paint::Style::CYAN, "Fresh"),
+                    unit.entry.display(),
+                    paint::out(paint::Style::BOLD, &output.display().to_string())
+                );
+                recorded[index] = Some(BuildWatchLeg {
+                    name: previous.name.clone(),
+                    sources: previous.sources.clone(),
+                    bundled: previous.bundled.clone(),
+                });
+                continue;
+            }
+            let mut leg = compiles
+                .remove(&index)
+                .expect("the tier compiled every leg the plan did not call fresh");
+            // The stale-read guard, and the price of compiling a tier at once.
+            // A tier's compiles all read the `dist/` the tier STARTED with, and
+            // the edges that would have split the tier come from the PREVIOUS
+            // round's record — which a first build, and a `--watch` round one,
+            // do not have. So the answer is checked against what the compile
+            // actually loaded: if this leg read a file a leg earlier in this
+            // tier has just written, the speculative compile saw the previous
+            // build's bytes where a serial round would have seen this one's.
+            // Throw it away — its diagnostics with it, they were about the
+            // wrong `dist/` — and compile the leg again HERE, which is exactly
+            // where a serial round compiled it. One wasted compile, for the one
+            // leg with the edge, on the one round that could not know about it:
+            // the record this round writes puts the leg in a tier of its own
+            // from the next round on.
+            if let Ok(compiled) = &leg.compiled
+                && reads_a_leg_written_this_tier(&dist, &compiled.sources, &written_this_tier)
+            {
+                leg = compile_leg(members, index, debug, emission);
+            }
+            if emission == Emission::WholeBundles {
+                note_split_ignored(unit);
+            }
+            // M35's replay, for the build: rendered on the leg's own thread,
+            // printed at the leg's own place in the schedule.
+            replay_captured(leg.reports);
+            let chunks = leg.chunks;
+            let mut compiled = leg.compiled?;
+            // What the NEXT round re-hashes to decide this leg's skip (M22).
+            // Recorded whether or not a watch is running: the cost is a clone of
+            // the loaded-file list, and a state to write it into is what makes it
+            // a watch. Written into a per-leg slot and merged after the join, so
+            // no worker ever holds the round's state.
+            recorded[index] = Some(BuildWatchLeg {
+                name: unit.name.clone(),
+                sources: compiled.sources.iter().cloned().collect(),
+                bundled: compiled.bundled.clone(),
+            });
+            // Before the writers, which record the files this leg's facts explain.
+            explain::leg_facts(&unit.name, std::mem::take(&mut compiled.explain));
+            let output = artifact_path(&dist, &unit.name, *platform);
+            let styles = write_assets(&output, &compiled.assets);
+            let assets = write_bundled(
+                &dist,
+                &compiled.bundled,
+                &unit.name,
+                &reserved,
+                &mut bundled_names,
+            )?;
+            // Unconditional: this is also where a previous build's chunks are swept
+            // when this one wrote none, and where a browser leg's build manifest is
+            // written whether it split or not (`fullstack-dx.md` §10.3).
+            write_chunks(
+                &output,
+                &chunks,
+                styles.as_deref(),
+                &assets,
+                matches!(platform, Platform::Browser),
+            )?;
+            if let Err(error) = fs::write(&output, compiled.javascript) {
+                eprintln!(
+                    "{} cannot write {}: {error}",
+                    paint::error_prefix(),
+                    output.display()
+                );
+                return Err(ExitCode::FAILURE);
+            }
+            written_this_tier.push((
+                unit.name.clone(),
+                platform.script_extension(),
+                compiled.bundled,
+            ));
+            println!(
+                "{} {} -> {}",
+                paint::out(paint::Style::GREEN, "Compiled"),
+                unit.entry.display(),
+                paint::out(paint::Style::BOLD, &output.display().to_string())
             );
-            return Err(ExitCode::FAILURE);
+            warn_superseded_sibling(&output);
+            explain::bundle(output, &unit.name);
         }
-        println!(
-            "{} {} -> {}",
-            paint::out(paint::Style::GREEN, "Compiled"),
-            unit.entry.display(),
-            paint::out(paint::Style::BOLD, &output.display().to_string())
-        );
-        warn_superseded_sibling(&output);
-        explain::bundle(output, &unit.name);
+    }
+    if let Some(state) = watch_state {
+        state.legs = recorded.into_iter().flatten().collect();
     }
     Ok(())
 }
 
+/// A leg's record from the previous `build --watch` round, by name.
+fn state_leg<'state>(
+    state: Option<&'state BuildWatchState>,
+    name: &str,
+) -> Option<&'state BuildWatchLeg> {
+    state?.legs.iter().find(|leg| leg.name == name)
+}
+
+/// One leg as the round's schedule sees it (B203): what it is called, what it
+/// writes into `dist/`, and what the PREVIOUS round compiled it from.
+///
+/// Both watch loops build this from their own state — `build --watch` from
+/// [`BuildWatchState`], the HMR round from [`WatchState`] — because the
+/// question "which leg reads which leg's artifact" is one question and must not
+/// be answered two ways.
+struct ScheduledLeg<'round> {
+    name: &'round str,
+    /// The bundle's extension, which is half of what [`LegNamespace`] needs to
+    /// say what a leg's output names are.
+    extension: &'static str,
+    /// The names this leg's `const asset::bundle` copies took in `dist/` last
+    /// round. Not derivable from anything: the leg's own sources chose them.
+    bundled: &'round [(PathBuf, String)],
+    /// What the leg was compiled from last round, or `None` for a leg with no
+    /// record (a `none` platform, or a first round).
+    sources: Option<&'round BTreeMap<PathBuf, u64>>,
+}
+
+/// Whether `path` is a file `leg` WRITES into `dist/` — the edge the round's
+/// leg ordering is built from (B203).
+///
+/// Two kinds of output, and they come from two places because they are known
+/// two different ways:
+///
+/// * the leg's **own namespace** — its bundle, its style sidecar, its build
+///   manifest, its whole route-chunk pattern. [`LegNamespace::claims`] already
+///   answers exactly this question, for the cross-leg collision fence, and
+///   reusing it is what keeps one leg's idea of what it owns from drifting
+///   from another's.
+/// * the leg's **bundled copies**, whose names the leg's sources chose. Those
+///   are not a pattern and cannot be derived; they are read off the previous
+///   round's record, which is the same place the dependency itself is read
+///   from.
+///
+/// Both sides are resolved, because the recorded source path came from the
+/// const channel's own resolution and this one is built by joining — the seam
+/// `util::canonical_path` exists for. `canonical_path_of_unwritten` on the
+/// subject: a `dist/` entry a round has not written yet still has to compare
+/// equal to the same name spelled through a resolved root (B198's rule).
+fn leg_writes(dist: &Path, leg: &ScheduledLeg, path: &Path) -> bool {
+    let path = vilan_core::util::canonical_path_of_unwritten(path);
+    let Ok(relative) = path.strip_prefix(vilan_core::util::canonical_path(dist)) else {
+        return false;
+    };
+    let Some(relative) = relative.to_str() else {
+        return false;
+    };
+    LegNamespace {
+        leg: leg.name.to_string(),
+        extension: leg.extension,
+    }
+    .claims(relative)
+    .is_some()
+        || leg
+            .bundled
+            .iter()
+            .any(|(_, bundled)| bundled.as_str() == relative)
+}
+
+/// How a round compiles its legs, and which of them may be reused (B203).
+///
+/// Both watch loops decided "fresh" for every leg BEFORE any leg compiled, off
+/// hashes recorded in the previous round. When one leg's recorded sources
+/// include another leg's `dist/` artifact — a server leg bundling the client's
+/// bundle — the consumer was measured against the producer's OLD artifact,
+/// judged fresh, and skipped; the producer then rewrote that file, and the
+/// consumer's own artifact went on embedding bytes that no longer exist until
+/// some unrelated edit happened to reach it.
+///
+/// The schedule answers both halves of the cure:
+///
+/// * [`order`](Self::order) — the producer compiles FIRST, so `dist/` holds
+///   this round's bytes by the time anything downstream is asked about it, and
+///   the report reads in dependency order;
+/// * [`reads_the_artifacts_of`](Self::reads_the_artifacts_of) — from which
+///   [`downstream_of_a_recompile`](Self::downstream_of_a_recompile) says, at
+///   each leg's own turn, whether a leg it reads has already recompiled in
+///   THIS round. That is the half the HMR round needs on its own: it writes
+///   `dist/` after the whole compile loop, so a re-hash against the disk cannot
+///   see the round's own work however the legs are ordered.
+struct LegSchedule {
+    order: Vec<usize>,
+    reads_the_artifacts_of: Vec<BTreeSet<usize>>,
+}
+
+impl LegSchedule {
+    /// Whether a leg already-recompiled this round produces something `leg`
+    /// reads. Conservative on purpose: a producer that recompiled to
+    /// byte-identical output still costs its consumer a recompile, because the
+    /// alternative — comparing the bytes the round is about to write against
+    /// the ones it has not written yet — is exactly the reasoning-ahead that
+    /// caused this bug. A spurious recompile of one leg is the cheap direction;
+    /// a stale artifact that survives every later round is the expensive one.
+    fn downstream_of_a_recompile(&self, leg: usize, recompiled: &BTreeSet<usize>) -> bool {
+        !self.reads_the_artifacts_of[leg].is_disjoint(recompiled)
+    }
+}
+
+/// Builds a round's [`LegSchedule`] from the previous round's records.
+///
+/// The edges come from the PREVIOUS round's record, which is the only place
+/// they can come from — a leg's sources are what compiling it reveals. That is
+/// not a gap in the fix but the same boundary the skip decision has: a round
+/// with no record forces a full recompile of every leg
+/// ([`hmr::round_forces_full`]), so the round that cannot know the edges is
+/// also the round in which no leg is reused and the order is a schedule rather
+/// than a correctness question. From the second round on, the record is there.
+///
+/// Ties keep declaration order ([`hmr::legs_in_artifact_order`] is stable), so a
+/// workspace whose legs read nothing of each other's compiles exactly as it
+/// always did, and `dist/` is written in the order the manifest lists.
+fn leg_schedule(dist: &Path, legs: &[ScheduledLeg]) -> LegSchedule {
+    let reads_the_artifacts_of: Vec<BTreeSet<usize>> = legs
+        .iter()
+        .map(|consumer| {
+            let Some(sources) = consumer.sources else {
+                return BTreeSet::new();
+            };
+            legs.iter()
+                .enumerate()
+                .filter(|(_, producer)| {
+                    producer.name != consumer.name
+                        && sources
+                            .keys()
+                            .any(|source| leg_writes(dist, producer, source))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
+    LegSchedule {
+        order: hmr::legs_in_artifact_order(&reads_the_artifacts_of),
+        reads_the_artifacts_of,
+    }
+}
+
+/// The schedule cut into TIERS — the groups a round may compile at once (M51).
+///
+/// A tier is a run of consecutive legs of [`LegSchedule::order`] in which no
+/// leg reads a leg of the same run. That is the exact condition the overlap
+/// needs, in both directions, because every WRITER stays serial and runs after
+/// the whole tier has compiled:
+///
+/// * a leg that reads a producer of an EARLIER tier sees this round's bytes —
+///   the producer compiled and was written before this tier began;
+/// * a leg that reads a producer of a LATER position sees the previous round's
+///   bytes, which is what a serial round showed it too (the producer had not
+///   written yet either) — the only way that arises is a cycle, which
+///   [`hmr::legs_in_artifact_order`] already breaks by index;
+/// * a leg that reads a producer of its OWN run is what opens a new tier, so
+///   it never arises.
+///
+/// Parallelism therefore caps at the widest tier, which is the honest ceiling:
+/// a chain of three legs that each read the next's artifact has three tiers of
+/// one and compiles exactly as it always did.
+///
+/// The edges come from the previous round's record and a round without one has
+/// none — every leg lands in one tier. That is safe for the ORDER (no leg is
+/// reordered; a tier is a contiguous run of the same schedule) and it is what
+/// the stale-read guard in [`build_workspace_artifacts`] answers for.
+fn schedule_tiers(schedule: &LegSchedule) -> Vec<Vec<usize>> {
+    let mut tiers: Vec<Vec<usize>> = Vec::new();
+    for leg in schedule.order.iter().copied() {
+        let opens_a_tier = match tiers.last() {
+            None => true,
+            Some(current) => current
+                .iter()
+                .any(|placed| schedule.reads_the_artifacts_of[leg].contains(placed)),
+        };
+        match tiers.last_mut() {
+            Some(current) if !opens_a_tier => current.push(leg),
+            _ => tiers.push(vec![leg]),
+        }
+    }
+    tiers
+}
+
+/// Whether any of `sources` is a file one of the legs `written` has already
+/// written into `dist/` this tier — the stale-read guard (M51).
+///
+/// Asked through [`leg_writes`], which is where "does this leg write that
+/// path" is answered for the schedule itself: one question, one answer, however
+/// it is reached.
+fn reads_a_leg_written_this_tier(
+    dist: &Path,
+    sources: &[(PathBuf, u64)],
+    written: &[(String, &'static str, Vec<(PathBuf, String)>)],
+) -> bool {
+    written.iter().any(|(name, extension, bundled)| {
+        let producer = ScheduledLeg {
+            name,
+            extension,
+            bundled,
+            sources: None,
+        };
+        sources
+            .iter()
+            .any(|(source, _)| leg_writes(dist, &producer, source))
+    })
+}
+
+/// One leg's compile, held until the round can use it at the leg's own place in
+/// the schedule (M51): what it produced, the route chunks its `split` asked
+/// for, and the diagnostics it rendered on its own thread.
+struct LegCompile {
+    chunks: Vec<EmittedChunk>,
+    reports: Vec<CapturedReport>,
+    compiled: Result<Compiled, ExitCode>,
+}
+
+/// Compiles one leg with its diagnostics captured rather than raced to stderr
+/// (M35's machinery, unchanged) — the unit of work a tier hands to a thread.
+fn compile_leg(
+    members: &[(Unit, Platform)],
+    index: usize,
+    debug: bool,
+    emission: Emission,
+) -> LegCompile {
+    let (unit, platform) = &members[index];
+    let mut chunks = Vec::new();
+    let sink = (emission == Emission::AsDeclared).then_some((unit.name.as_str(), &mut chunks));
+    capture_arm();
+    let compiled = compile_unit(
+        unit,
+        *platform,
+        Backend::Js,
+        CompileGoal::Emit,
+        debug,
+        false,
+        None,
+        sink,
+    );
+    LegCompile {
+        chunks,
+        reports: capture_take(),
+        compiled,
+    }
+}
+
+/// Compiles a tier's legs — one thread each — and answers them by leg index.
+///
+/// The round's FIRST leg runs ALONE on this thread before anything is spawned:
+/// it fills the process-global caches (the clean-parse cache, the base world,
+/// the macro worlds) that every later leg then meets warm, which is M35's
+/// measured shape and the reason a parallel round costs no extra CPU. A tier
+/// with one leg to compile stays on this thread too, rather than paying for a
+/// thread to wait on.
+///
+/// **Abort.** A serial round stops at the first leg that fails (`?`), so the
+/// warm-up's failure returns before any worker is spawned. A failure INSIDE a
+/// tier cannot be seen before the tier is joined; the caller replays and aborts
+/// at the first failing leg in SCHEDULE order, so the terminal and `dist/` are
+/// the serial round's either way — the tier's later legs merely did work that
+/// is thrown away, and no leg after the failing one ever writes.
+fn compile_tier(
+    members: &[(Unit, Platform)],
+    tier: &[usize],
+    debug: bool,
+    emission: Emission,
+    warmed: &mut bool,
+) -> BTreeMap<usize, LegCompile> {
+    let mut done: BTreeMap<usize, LegCompile> = BTreeMap::new();
+    // The escape hatch a parallelism change owes its users, and the instrument
+    // its determinism pins compare against.
+    if sequential_build() {
+        *warmed = true;
+        for index in tier.iter().copied() {
+            let leg = compile_leg(members, index, debug, emission);
+            let failed = leg.compiled.is_err();
+            done.insert(index, leg);
+            if failed {
+                break;
+            }
+        }
+        return done;
+    }
+    let mut rest = tier;
+    if !*warmed && let Some((first, tail)) = rest.split_first() {
+        *warmed = true;
+        let leg = compile_leg(members, *first, debug, emission);
+        let failed = leg.compiled.is_err();
+        done.insert(*first, leg);
+        if failed {
+            return done;
+        }
+        rest = tail;
+    }
+    match rest {
+        [] => {}
+        [only] => {
+            done.insert(*only, compile_leg(members, *only, debug, emission));
+        }
+        rest => {
+            let compiled: Vec<(usize, LegCompile)> = std::thread::scope(|scope| {
+                let workers: Vec<_> = rest
+                    .iter()
+                    .copied()
+                    .map(|index| {
+                        spawn_scoped_compiler_thread(scope, move || {
+                            (index, compile_leg(members, index, debug, emission))
+                        })
+                        .expect("spawn a build worker")
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+                    .collect()
+            });
+            done.extend(compiled);
+        }
+    }
+    done
+}
+
+/// `VILAN_SEQUENTIAL_BUILD`, read once: compiles a workspace's legs one after
+/// another, as every build did before M51. `VILAN_SEQUENTIAL_CHECK`'s twin, for
+/// the same two jobs — the escape hatch, and the reference a parallel round's
+/// `dist/` and terminal are held to.
+fn sequential_build() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VILAN_SEQUENTIAL_BUILD").is_ok_and(|value| value != "0"))
+}
+
+/// A watched source's content hash RIGHT NOW — [`vilan_core::const_eval::
+/// tracked_input_hash`], which is the SAME function the compile recorded the
+/// hash with (tracker B276). One rule, both sides: a directory re-hashes as its
+/// listing, a file as its text where it decodes (BOM dropped,
+/// `windows-support.md` §2) and as its bytes where it does not, and `None` —
+/// deleted, unreadable — disqualifies the skip by construction.
+///
+/// It used to re-hash every path as text, while `asset::bundle` recorded its
+/// files' bytes: the two never agreed, so a leg that bundled anything
+/// recompiled on every round however little had changed. Kept as a named
+/// function so both watch loops — this one and the HMR round's — are visibly
+/// asking the one question.
+fn current_source_hash(path: &Path) -> Option<u64> {
+    vilan_core::const_eval::tracked_input_hash(path)
+}
+
 /// Type-checks every member of a workspace (each for its own platform; a `none`
-/// library against the base layer).
+/// library against the base layer) — and every ENTRY of a multi-entry package,
+/// which reaches here as its own member.
+///
+/// One round, one report per distinct error (B182). The members share a source
+/// tree: a module several legs reach is analyzed once per leg and yields the
+/// same diagnostics each time, and reading the same refusal three times says
+/// nothing the first did not. [`RoundReports`] scopes the ledger to this loop —
+/// each `check` starts with an empty one, so a `--watch` round always reports.
 fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
-    let mut ok = true;
-    for (unit, platform) in members {
-        ok &= compile_unit(
+    let _round = RoundReports::arm();
+    let Some(((first_unit, first_platform), rest)) = members.split_first() else {
+        return RoundOutcome::Succeeded;
+    };
+    let check = |unit: &Unit, platform: Platform| {
+        compile_unit(
             unit,
-            *platform,
+            platform,
+            Backend::Js,
             CompileGoal::Check,
             debug,
             false,
             None,
             None,
         )
-        .is_ok();
+        .is_ok()
+    };
+
+    // The FIRST member runs alone, on this thread, writing its diagnostics
+    // straight out (M35). It is what fills the process-global caches — the
+    // clean-parse cache, the base world, the macro worlds — and starting every
+    // member cold at once would have each of them analyze `std` from scratch:
+    // N times the CPU for one world, and N threads queued on the one mutex that
+    // hands it out. Every member after it meets those caches warm, which is
+    // where the parallelism is actually free. The caches themselves need
+    // nothing: each is a content-keyed `Mutex`, M23's claims are taken under
+    // the lookup's own lock, and every counter and scope inside an analysis
+    // (`cancel`, `owned_modules`, `leak_tally`, `depth_stats`, the analyzer's
+    // own probes) is already thread-local, because an analysis has run on a
+    // thread of its own since the language server's first one.
+    let mut ok = check(first_unit, *first_platform);
+    if rest.is_empty() || sequential_check() {
+        for (unit, platform) in rest {
+            ok &= check(unit, *platform);
+        }
+        return outcome(ok);
     }
+
+    // The rest, one thread each, each capturing its diagnostics rather than
+    // racing to stderr with them.
+    let captured: Vec<(bool, Vec<CapturedReport>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = rest
+            .iter()
+            .map(|(unit, platform)| {
+                spawn_scoped_compiler_thread(scope, || {
+                    capture_arm();
+                    let ok = check(unit, *platform);
+                    (ok, capture_take())
+                })
+                .expect("spawn a check worker")
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+
+    // MEMBER order, which is the order a sequential round reported in — the
+    // members arrive alphabetically (a `BTreeMap`), and the B182 ledger is
+    // applied here rather than on the workers so the same member claims the
+    // same shared-module diagnostic whatever the scheduler did.
+    for (member_ok, reports) in captured {
+        ok &= member_ok;
+        replay_captured(reports);
+    }
+    outcome(ok)
+}
+
+/// `VILAN_SEQUENTIAL_CHECK`, read once: compiles a workspace's members one
+/// after another, as every check did before M35. The escape hatch a
+/// parallelism change owes its users, and the instrument its determinism pin
+/// compares against — a parallel round's bytes must be the sequential round's
+/// bytes.
+fn sequential_check() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VILAN_SEQUENTIAL_CHECK").is_ok_and(|value| value != "0"))
+}
+
+/// A round's verdict from whether every member compiled.
+fn outcome(ok: bool) -> RoundOutcome {
     if ok {
         RoundOutcome::Succeeded
     } else {
@@ -3992,7 +5509,8 @@ fn run_workspace(
             return ExitCode::FAILURE;
         }
     };
-    if let Err(code) = build_workspace_artifacts(root, members, false, Emission::WholeBundles) {
+    if let Err(code) = build_workspace_artifacts(root, members, false, Emission::WholeBundles, None)
+    {
         return code;
     }
     // Run from the project root so the server reads sibling `dist/` bundles; the script
@@ -4136,6 +5654,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         file,
         &pkg_root,
         Platform::default(),
+        Backend::Js,
         CompileGoal::Emit,
         &options,
         &workspace,
@@ -4145,7 +5664,7 @@ fn run_test(file: &Path) -> Result<(), String> {
     )
     .map_err(|_| String::new())?;
     let script = env::temp_dir().join(format!("vilan-test-{}.mjs", std::process::id()));
-    if let Err(error) = fs::write(&script, compiled.javascript) {
+    if let Err(error) = write_run_script(&script, &compiled.javascript) {
         return Err(format!("cannot write {}: {error}", script.display()));
     }
     let output = std::process::Command::new("node").arg(&script).output();
@@ -4192,26 +5711,49 @@ fn discover_tests(path: Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The `std` package directory, resolved in order (proposal/releases.md §3):
-/// `$VILAN_STD`; the nearest ancestor of the entry file (then of the working
-/// directory) containing `vilan/std/vilan.toml` — a checkout, so a `vilan`
-/// built from this repo compiles against the working tree; else the binary's
-/// own embedded std, materialized once to `~/.vilan/std-cache/<hash>/` — what
-/// an installed binary uses, from any directory, with no checkout.
-/// `resolve_std` reads the resulting package's `[library]` manifest (or, if
-/// `$VILAN_STD` points at a bare source root with no manifest, uses it as the
-/// base layer).
+/// `$VILAN_STD`; the nearest ancestor of the entry file containing
+/// `vilan/std/vilan.toml` — a checkout, so a `vilan` built from this repo
+/// compiles against the working tree; else the binary's own embedded std,
+/// materialized once to `~/.vilan/std-cache/<hash>/` — what an installed binary
+/// uses, from any directory, with no checkout. `resolve_std` reads the resulting
+/// package's `[library]` manifest (or, if `$VILAN_STD` points at a bare source
+/// root with no manifest, uses it as the base layer).
+///
+/// # The working directory is not a toolchain (tracker N56)
+///
+/// The ancestor walk used to run a SECOND time from the process working
+/// directory, so a file addressed by absolute path was compiled against
+/// whichever checkout the shell happened to be standing in. That is not a
+/// fallback, it is a different toolchain: `vilan check ~/code/app/src/x.vl` from
+/// inside this repository expanded the application's derives against the working
+/// tree's `std`, and where the two versions differ every derive fails at once —
+/// 37 `macro PartialEq's definition did not compile` from the vilan tree, 0 from
+/// the application's own directory, on one unchanged file. `file_project` already
+/// resolves the PACKAGE from the file's own location (G20); the std it compiles
+/// against has to come from the same place.
+///
+/// The one thing the working directory legitimately answers for is a file that
+/// belongs to nothing — a bare `.vl` with no `vilan.toml` at or above it, which
+/// is a scratch program and not a package's module. `vilan check /tmp/probe.vl`
+/// run from a checkout means the checkout's std, because there is no other
+/// toolchain in the question; a file INSIDE a package has one, and it is the
+/// package's. (An entry that does not exist yet keeps the working directory too:
+/// there is no location to ask, and the read error is reported either way.)
 fn std_dir(entry: &Path) -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("VILAN_STD") {
         return Ok(PathBuf::from(path));
     }
-    let starts = [
-        entry
-            .canonicalize()
-            .ok()
-            .and_then(|file| file.parent().map(Path::to_path_buf)),
-        env::current_dir().ok(),
-    ];
-    for start in starts.iter().flatten() {
+    let entry_dir = entry
+        .canonicalize()
+        .ok()
+        .and_then(|file| file.parent().map(Path::to_path_buf));
+    let in_a_package = entry_dir.as_deref().and_then(find_project_root).is_some();
+    let working_dir = if in_a_package {
+        None
+    } else {
+        env::current_dir().ok()
+    };
+    for start in [entry_dir, working_dir].into_iter().flatten() {
         let mut directory = Some(start.as_path());
         while let Some(current) = directory {
             let candidate = current.join("vilan").join("std");
@@ -4221,7 +5763,7 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
             directory = current.parent();
         }
     }
-    vilan_embedded_std::materialize()
+    vilan_embedded::materialize()
 }
 
 /// Runs the full pipeline (lex -> parse -> analyze -> contexts -> async infer ->
@@ -5042,6 +6584,11 @@ fn compile_to_js(
     file: &Path,
     pkg_root: &Path,
     platform: Platform,
+    // `Backend::Rust` swaps the emitter at the one seam below and changes
+    // nothing else: the same analysis, the same post-passes, the same
+    // diagnostics. `Compiled::javascript` then carries Rust source, which is
+    // what the field's comment says and what its two native callers read.
+    backend: Backend,
     goal: CompileGoal,
     options: &BuildOptions,
     workspace: &Workspace,
@@ -5063,11 +6610,11 @@ fn compile_to_js(
     let src = match vilan_core::util::read_source(file) {
         Ok(src) => src,
         Err(error) => {
-            eprintln!(
+            diagnostic_line(&format!(
                 "{} cannot read {}: {error}",
                 paint::error_prefix(),
                 file.display()
-            );
+            ));
             return Err(ExitCode::FAILURE);
         }
     };
@@ -5078,23 +6625,24 @@ fn compile_to_js(
     // names it), so it reports like the read failure above rather than through
     // the diagnostic channel.
     if let Some((requested, on_disk)) = entry_case_mismatch(file, pkg_root) {
-        eprintln!(
+        diagnostic_line(&format!(
             "{} entry {} resolved to `{on_disk}` on disk, but it is named `{requested}`: \
              Vilan matches source files by exact case, so this builds only where the \
              filesystem ignores case; rename one to match the other",
             paint::error_prefix(),
             file.display()
-        );
+        ));
         return Err(ExitCode::FAILURE);
     }
     let filename = file.to_string_lossy().into_owned();
-    let std = match std_dir(file) {
-        Ok(directory) => vilan_core::manifest::resolve_std(&directory),
+    let std_directory = match std_dir(file) {
+        Ok(directory) => directory,
         Err(error) => {
-            eprintln!("{} {error}", paint::error_prefix());
+            diagnostic_line(&format!("{} {error}", paint::error_prefix()));
             return Err(ExitCode::FAILURE);
         }
     };
+    let std = vilan_core::manifest::resolve_std(&std_directory);
     let mut output = None;
 
     // Fast path: a clean entry file reuses the shared content-addressed parse
@@ -5117,6 +6665,10 @@ fn compile_to_js(
     // separately (they still count against a clean build via `noted_errors`).
     let mut analyzer_errors: Vec<(SourceId, std::ops::Range<usize>, String)> = Vec::new();
     let mut noted_errors = 0usize;
+    // Diagnostics this round already rendered for an earlier entry (B182). They
+    // are not shown again and they still count: the leg is broken, and only the
+    // repetition was dropped.
+    let mut repeated_errors = 0usize;
     // The same diagnostics, captured as structured items for the HMR overlay
     // (only assembled into text when `overlay` is `Some`). Populated alongside
     // the terminal path — never in place of it — reusing each message verbatim.
@@ -5271,6 +6823,14 @@ fn compile_to_js(
                 )
                 .with_trace(overlay_trace),
             );
+            // B182: a module every leg of a package reaches is analyzed once
+            // per leg, so its errors arrive once per leg. Render the first,
+            // COUNT the rest — the leg still failed, and dropping it from the
+            // verdict would let a second entry emit over a broken module.
+            if !first_report_this_round(overlay_name, &error.span.into_range(), &error.msg) {
+                repeated_errors += 1;
+                continue;
+            }
             // A diagnostic carrying secondary locations — an E78 requirement
             // trace and/or a C3 note — renders directly (multi-label; the
             // shared ariadne path has nowhere to put them); plain ones keep
@@ -5337,7 +6897,11 @@ fn compile_to_js(
         // nobody wrote. (`clean` below already refuses to RETURN the output; this
         // is what stops it being produced, and with it every transformer panic a
         // salvaged tree could provoke.)
-        if analyzer_errors.is_empty() && noted_errors == 0 && parse_errors.is_empty() {
+        if analyzer_errors.is_empty()
+            && noted_errors == 0
+            && repeated_errors == 0
+            && parse_errors.is_empty()
+        {
             // `--print-chunks` (bundle-splitting.md S1): report what a split
             // build would chunk. Analysis-only — the emitted JavaScript below
             // is untouched — and gated on a clean analysis, so a failing build
@@ -5376,6 +6940,22 @@ fn compile_to_js(
                 // `main` a module never had, and running the walk for it would
                 // be asking a file to be a program because someone named it.
                 _ if !goal.emits() => Ok(String::new()),
+                // A `check` of an ENTRY: the walk runs, its refusals are asked
+                // for, and its output is not (backlog M34). `transform` can
+                // refuse four ways and only the missing `main` is knowable
+                // before the walk, so skipping the transformer outright would
+                // let `check` go green over a program `build` will not ship —
+                // `diagnose` is the same `assemble` without the cosmetic tail.
+                _ if !goal.emits_text() => {
+                    vilan_core::diagnose(&program, options).map(|()| String::new())
+                }
+                _ if backend == Backend::Rust && split.is_some() => Err(vilan_core::error::Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: vilan_core::span::Span::new((), 0..0),
+                    msg: "`--backend rust` does not split: route chunks are a browser artifact"
+                        .to_string(),
+                }),
                 Some((leg, sink)) => {
                     vilan_core::transform_split(&program, options, leg).map(|split_program| {
                         // Splitting is not free, and below a few KB of
@@ -5394,6 +6974,22 @@ fn compile_to_js(
                         }
                         sink.extend(split_program.chunks);
                         split_program.main
+                    })
+                }
+                // F1 S1a: the ONE seam the native backend changes. Everything
+                // above — analysis, the post-passes, the diagnostics, the
+                // const channel — is the same compile; only the emitter that
+                // reads the finished `Program` differs.
+                None if backend == Backend::Rust => {
+                    vilan_rust::emit(&program, options).map(|emitted| {
+                        native::record_boxed_bindings(emitted.boxed_bindings);
+                        native::record_copy_census(
+                            emitted.consumed_copies,
+                            emitted.consumed_copies_elided,
+                        );
+                        native::record_host_gaps(emitted.host_gaps);
+                        native::record_optional_crates(emitted.optional_crates);
+                        emitted.source
                     })
                 }
                 None => transform(&program, options),
@@ -5431,32 +7027,59 @@ fn compile_to_js(
                         })
                 }
                 Err(error) => {
+                    // The entry, and not as a fallback (E16's leftover, resolved
+                    // by looking): `transform_entry_ast`'s missing `main`
+                    // (`transformer.rs`) is STRUCTURAL. Its subject is the
+                    // ABSENCE of a definition, so there is no span to take a
+                    // source from (it carries `0..0` for that reason), and the
+                    // entity whose absence it reports is the entry's `main`.
+                    //
+                    // E190: a refusal that DOES know where to point says so in
+                    // its note, whose `source` is the file its span indexes —
+                    // the channel every other diagnostic attributes through,
+                    // reached here without a second one. B55's body-less
+                    // emission is the first to use it: its span was the
+                    // requirement's name in std, rendered against the entry, so
+                    // the terminal printed one bare `Error:` line with no file
+                    // and no line at all.
+                    //
+                    // E196: computed ONCE and read by both consumers. E190
+                    // taught the terminal to follow the note and left the
+                    // overlay's push above it on the entry's own filename, so
+                    // the browser showed a module's refusal against the entry —
+                    // the file wrong and, since the span indexes the other
+                    // file's bytes, the line and column wrong with it. The
+                    // overlay and the terminal are two renderings of one fact,
+                    // and one expression is what keeps them from drifting again.
+                    let located = transformer_refusal_source(&error);
+                    load_diagnostic_file(&mut diagnostic_files, &program, located);
+                    let (overlay_name, overlay_text) = diagnostic_file(&diagnostic_files, located);
                     overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
-                        &filename,
-                        source_ref,
+                        overlay_name,
+                        overlay_text,
                         error.span.into_range(),
                         error.msg.clone(),
                         error.note.as_ref().map(|note| note.msg.clone()),
                     ));
-                    // The entry, and not as a fallback (E16's leftover, resolved
-                    // by looking): `transform` has exactly ONE failure —
-                    // `transform_entry_ast`'s missing `main`
-                    // (`transformer.rs`) — and it is STRUCTURAL. Its subject is
-                    // the ABSENCE of a definition, so there is no span to take a
-                    // source from (it carries `0..0` for that reason), and the
-                    // entity whose absence it reports is the entry's `main`. The
-                    // span-source rule the post-analyze passes follow needs a
-                    // span that indexes a file; this one indexes nothing, and
-                    // the entry is where the missing definition was looked for.
-                    // A future transformer error WITH a real span must attribute
-                    // through `program.source_of(..)` like everything else.
-                    analyzer_errors.push((SourceId(0), error.span.into_range(), error.msg));
+                    analyzer_errors.push((located, error.span.into_range(), error.msg));
                 }
             }
         }
+    } else {
+        // No tree to analyse — `build`'s parse failed and its diagnostics are
+        // reported below. The depth instrument was anchored before that parse
+        // and its report rides the end of `post_analysis_passes`, which this
+        // path never reaches, so the `VILAN_DEPTH_STATS` line was missing for
+        // exactly the analyses the PARSER's bound exists for (B142's 500-level
+        // refusal, N111). Released here instead, with the parse family's peak
+        // in it.
+        vilan_core::report_depth_stats();
     }
 
-    let clean = analyzer_errors.is_empty() && parse_errors.is_empty() && noted_errors == 0;
+    let clean = analyzer_errors.is_empty()
+        && parse_errors.is_empty()
+        && noted_errors == 0
+        && repeated_errors == 0;
     // The overlay's copy of this leg's diagnostics (hmr.md §§2/§6): the analyzer/
     // codegen items captured above, plus the parse errors rendered with the SAME
     // `render` the terminal `report` uses — only the location prefix and framing
@@ -5479,14 +7102,62 @@ fn compile_to_js(
         }
         *sink = hmr::render_overlay(&filename, &overlay_diagnostics, hmr::OVERLAY_DIAGNOSTIC_CAP);
     }
+    // A CASCADE of "…'s definition did not compile" is almost never several
+    // broken macros (tracker N56). It is one `std` that does not match the
+    // program: every derive is expanded against the world that std defines, so a
+    // mismatched one fails all of them at once, and the screen fills with a
+    // repeated message about the user's own `#[derive]`s. The path is the fact
+    // that answers it and nothing else printed carries it — std resolution is
+    // silent by design — so it is stated once, beneath the diagnostics.
+    let cascade = analyzer_errors
+        .iter()
+        .filter(|(_, _, message)| message.ends_with("'s definition did not compile"))
+        .count();
     // The entry's parse errors belong to the entry; the analyzer's carry their
     // own source.
     report(&diagnostic_files, analyzer_errors, parse_errors);
+    if cascade > 1 {
+        eprintln!(
+            "{} {cascade} macro definitions failed to compile; this compile \
+             resolved `std` from {}",
+            paint::err(paint::Style::BOLD, "note:"),
+            std_directory.display()
+        );
+    }
 
     match output {
         Some(compiled) if clean => Ok(compiled),
         _ => Err(ExitCode::FAILURE),
     }
+}
+
+/// Writes one of the CLI's three temp scripts — `vilan-run-<pid>.mjs`,
+/// `vilan-watch-<pid>.mjs`, `vilan-test-<pid>.mjs` — and hands back the write's
+/// own error for the caller to report against its own path.
+///
+/// **Why not `fs::write`** (N111). The system temp directory is the right home
+/// for a file its writer deletes again — it is not the package tree, which is
+/// N103's concern — but it is SHARED, and every one of these names is
+/// predictable from a process id. `fs::write` FOLLOWS a symlink, so a
+/// `vilan-run-<pid>.mjs` planted there by anyone else on the machine had this
+/// process truncate whatever it pointed at and then execute it. The path is
+/// unlinked first (which takes the LINK, never its target) and then created
+/// with `create_new`, so the file handed to `node` is a file this process made;
+/// the remaining race can only make the create FAIL, which is reported.
+///
+/// The unlink is also what keeps a script leaked by an abnormal exit — the one
+/// case the callers' own removal cannot cover — from wedging a later run whose
+/// pid happens to match. `run --watch` rewrites its script once per round, and
+/// that is safe for the reason `remove_watch_script`'s comment already gives:
+/// the round deletes it after the child is killed AND reaped, so nothing holds
+/// it when the next round creates it.
+fn write_run_script(script: &Path, javascript: &str) -> std::io::Result<()> {
+    let _ = fs::remove_file(script);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(script)?;
+    std::io::Write::write_all(&mut file, javascript.as_bytes())
 }
 
 /// Writes `javascript` to a temp file and executes it with Node.js, propagating
@@ -5496,7 +7167,7 @@ fn compile_to_js(
 /// script would consume it, breaking `scan()`.)
 fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
     let script = env::temp_dir().join(format!("vilan-run-{}.mjs", std::process::id()));
-    if let Err(error) = fs::write(&script, javascript) {
+    if let Err(error) = write_run_script(&script, javascript) {
         eprintln!(
             "{} cannot write {}: {error}",
             paint::error_prefix(),
@@ -5624,6 +7295,75 @@ fn diagnostic_config() -> ariadne::Config {
     ariadne::Config::new()
         .with_index_type(ariadne::IndexType::Char)
         .with_color(paint::stderr_enabled())
+}
+
+/// The file a TRANSFORMER refusal belongs to (E190, E196): the source its note
+/// carries, else the entry.
+///
+/// A transformer refusal is the one diagnostic class with no `Program`
+/// diagnostic index to attribute through — it is returned from `transform`, not
+/// pushed onto `program.diagnostics` — so the note IS the channel. A refusal
+/// whose subject is an ABSENCE has no span to take a file from and no note
+/// either, and the entry is its honest answer: `transform_entry_ast`'s missing
+/// `main` reports the entry's own missing definition. A refusal that does know
+/// where to point says so in the note (B55's body-less emission names the body
+/// that reached the requirement; B318 S4's admission miss names the module whose
+/// import decides it), and both the terminal report and the HMR overlay read
+/// that one answer here — which is E196: they used to read two, and the browser
+/// showed a module's refusal against the entry, at the entry's bytes.
+fn transformer_refusal_source(error: &vilan_core::Error) -> SourceId {
+    error
+        .note
+        .as_ref()
+        .and_then(|note| note.source)
+        .unwrap_or(SourceId(0))
+}
+
+#[cfg(test)]
+mod transformer_refusal_source_tests {
+    use super::transformer_refusal_source;
+    use vilan_core::Error;
+    use vilan_core::analyzer::SourceId;
+    use vilan_core::error::Note;
+
+    /// The message is deliberately EMPTY: `diagnostics_ledger.rs`'s enumeration
+    /// reads every `Error { .. msg: <literal> }` in the compiler crates, this
+    /// module included, and a fixture's message would read there as a shipped
+    /// diagnostic owing a ledger row. Nothing under test looks at it.
+    fn refusal(note: Option<Note>) -> Error {
+        Error {
+            msg: String::new(),
+            span: (12..19).into(),
+            note,
+            trace: Vec::new(),
+        }
+    }
+
+    /// A refusal that names a file is placed in THAT file — the case the
+    /// overlay got wrong.
+    #[test]
+    fn a_refusal_whose_note_names_a_file_is_placed_there() {
+        let error = refusal(Some(Note {
+            span: (30..37).into(),
+            msg: "`app_shell` is the body that reached the requirement".to_string(),
+            source: Some(SourceId(4)),
+        }));
+        assert_eq!(transformer_refusal_source(&error), SourceId(4));
+    }
+
+    /// A refusal with no note, and one whose note names no file, are both the
+    /// ENTRY's — a structural refusal about an absence has no other answer, and
+    /// guessing one would put a diagnostic in a file that does not mention it.
+    #[test]
+    fn a_refusal_with_no_file_to_name_is_the_entrys() {
+        assert_eq!(transformer_refusal_source(&refusal(None)), SourceId(0));
+        let no_source = refusal(Some(Note {
+            span: (0..0).into(),
+            msg: "the bound is declared here".to_string(),
+            source: None,
+        }));
+        assert_eq!(transformer_refusal_source(&no_source), SourceId(0));
+    }
 }
 
 /// Reads the file a diagnostic renders against into `files`, once per source.
@@ -5767,6 +7507,198 @@ fn char_range(text: &str, span: &std::ops::Range<usize>) -> std::ops::Range<usiz
     start..start + text[span.start..span.end].chars().count()
 }
 
+/// The diagnostics already RENDERED this round, keyed exactly the way the
+/// module loader's two-seams dedup keys its own (E102,
+/// `report_module_parse_errors`): **file, position and reason** — all three of
+/// what an error *is*. Not the file alone (two modules can hold the same reason
+/// at the same offset), not the position alone (two different refusals land on
+/// one offset), not the reason alone (the same reason recurs down a file).
+///
+/// `None` — the default — means DISARMED: every diagnostic renders, which is
+/// right for every single-analysis path, where nothing can repeat.
+///
+/// [`check_workspace`] and [`check_single`] arm it, because a multi-entry
+/// package's check is several analyses of ONE source tree (B182). A module
+/// every leg reaches is analyzed once per leg and produces the same errors each
+/// time, so kolt's two refused fields' one report each arrived three times
+/// over — the entry is the same seam the loader already deduplicates, one level
+/// up. Process-global rather than threaded because the rendering sits several
+/// frames below the loop that knows a round is running; scoped by
+/// [`RoundReports`], so a watch round starts clean and a single-unit build
+/// never consults it at all.
+static RENDERED_THIS_ROUND: Mutex<Option<HashSet<(String, usize, usize, String)>>> =
+    Mutex::new(None);
+
+/// Arms [`RENDERED_THIS_ROUND`] for the lifetime of one multi-unit round.
+struct RoundReports;
+
+impl RoundReports {
+    fn arm() -> Self {
+        *RENDERED_THIS_ROUND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HashSet::new());
+        RoundReports
+    }
+}
+
+impl Drop for RoundReports {
+    fn drop(&mut self) {
+        *RENDERED_THIS_ROUND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// The ledger's key: file, position and reason — see [`RENDERED_THIS_ROUND`].
+type ReportKey = (String, usize, usize, String);
+
+/// Whether this diagnostic has not been rendered yet this round — always true
+/// while the ledger is disarmed. Recording is the same call, as
+/// `HashSet::insert` already answers both halves.
+///
+/// A CAPTURING member (M35) defers the question: its diagnostics are rendered
+/// into a buffer on its own thread, in an order the scheduler chose, and the
+/// ledger is a claim about the ROUND's order. [`replay_captured`] asks it
+/// instead, member by member, which is the order a sequential round asked in —
+/// so the same diagnostic is suppressed for the same member.
+fn first_report_this_round(file: &str, span: &std::ops::Range<usize>, message: &str) -> bool {
+    if capturing() {
+        return true;
+    }
+    claim_report(&(file.to_string(), span.start, span.end, message.to_string()))
+}
+
+/// The ledger proper: `true` the first time this round is asked about `key`.
+fn claim_report(key: &ReportKey) -> bool {
+    match RENDERED_THIS_ROUND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        Some(rendered) => rendered.insert(key.clone()),
+        None => true,
+    }
+}
+
+/// One rendered diagnostic, held until the round can print it in MEMBER order
+/// (M35). `key` is present for the diagnostics [`RENDERED_THIS_ROUND`]
+/// deduplicates and `None` for a warning or a status line, which a sequential
+/// round prints once per member too.
+struct CapturedReport {
+    key: Option<ReportKey>,
+    bytes: Vec<u8>,
+}
+
+thread_local! {
+    /// This thread's captured diagnostics while it is compiling a member of a
+    /// PARALLEL round, and `None` on every other thread and in every other
+    /// command. Thread-local because it is exactly a property of the analysis
+    /// running here — the same reason every counter in `vilan_core` is.
+    static CAPTURED_REPORTS: std::cell::RefCell<Option<Vec<CapturedReport>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this thread is writing its diagnostics to a buffer rather than to
+/// stderr.
+fn capturing() -> bool {
+    CAPTURED_REPORTS.with(|reports| reports.borrow().is_some())
+}
+
+/// Arms the capture on this thread.
+fn capture_arm() {
+    CAPTURED_REPORTS.with(|reports| *reports.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disarms it and takes what was captured.
+fn capture_take() -> Vec<CapturedReport> {
+    CAPTURED_REPORTS.with(|reports| reports.borrow_mut().take().unwrap_or_default())
+}
+
+/// Opens a new captured chunk under `key`, so the bytes a renderer is about to
+/// write are one addressable diagnostic. A no-op when nothing is capturing.
+fn capture_open(key: Option<ReportKey>) {
+    CAPTURED_REPORTS.with(|reports| {
+        if let Some(reports) = reports.borrow_mut().as_mut() {
+            reports.push(CapturedReport {
+                key,
+                bytes: Vec::new(),
+            });
+        }
+    });
+}
+
+/// Where every diagnostic byte goes: this thread's open capture chunk while a
+/// parallel round is running, and stderr otherwise. One type rather than a
+/// branch at each renderer, because ariadne wants a `Write` and the two
+/// destinations must be indistinguishable to it — the rendering, colour gate
+/// included, is the same either way.
+struct DiagnosticStream;
+
+impl std::io::Write for DiagnosticStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let captured = CAPTURED_REPORTS.with(|reports| match reports.borrow_mut().as_mut() {
+            Some(reports) => {
+                // A writer that starts before any `capture_open` still has
+                // somewhere to go: an unkeyed chunk, which replays unfiltered.
+                if reports.is_empty() {
+                    reports.push(CapturedReport {
+                        key: None,
+                        bytes: Vec::new(),
+                    });
+                }
+                reports
+                    .last_mut()
+                    .expect("just pushed")
+                    .bytes
+                    .extend_from_slice(buffer);
+                true
+            }
+            None => false,
+        });
+        if !captured {
+            std::io::Write::write_all(&mut std::io::stderr(), buffer)?;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if capturing() {
+            return Ok(());
+        }
+        std::io::Write::flush(&mut std::io::stderr())
+    }
+}
+
+/// Prints one member's captured diagnostics, applying the round ledger in the
+/// order a sequential round would have applied it (M35).
+fn replay_captured(reports: Vec<CapturedReport>) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    for report in reports {
+        if let Some(key) = &report.key
+            && !claim_report(key)
+        {
+            continue;
+        }
+        let _ = stderr.write_all(&report.bytes);
+    }
+    let _ = stderr.flush();
+}
+
+/// One line of the CLI's own (non-ariadne) diagnostic output, routed through
+/// the capture so a parallel member's read failure lands in its member's place
+/// rather than wherever the scheduler happened to put it. Everything a
+/// COMPILE writes goes through here or through the three ariadne renderers
+/// above; the status lines a command writes around its compiles do not, because
+/// the round that writes them is the sequential one.
+/// One line of the CLI's own (non-ariadne) diagnostic output, routed through
+/// the capture (M35) — see [`DiagnosticStream`].
+fn diagnostic_line(text: &str) {
+    capture_open(None);
+    let _ = std::io::Write::write_all(&mut DiagnosticStream, text.as_bytes());
+    let _ = std::io::Write::write_all(&mut DiagnosticStream, b"\n");
+}
+
 /// Renders parser diagnostics (via the handwritten frontend's `render`) and
 /// analyzer/codegen diagnostics with ariadne. Analyzer diagnostics arrive
 /// pre-rendered as `(source, span, message)` — each renders against the file
@@ -5790,6 +7722,15 @@ fn report(
     for (source, span, message) in diagnostics {
         let (filename, text) = diagnostic_file(files, source);
         let char_span = char_range(text, &span);
+        // The ledger's key, re-derived from the same three things it is made of
+        // (M35). A capturing member defers the dedup to the replay, and the
+        // replay needs to know which diagnostic this rendering IS.
+        capture_open(Some((
+            filename.to_string(),
+            span.start,
+            span.end,
+            message.clone(),
+        )));
         Report::build(ReportKind::Error, (filename.to_string(), char_span.clone()))
             .with_config(diagnostic_config())
             .with_message(&message)
@@ -5801,10 +7742,10 @@ fn report(
             .finish()
             // stderr, like the warnings (ratified call (f)): a diagnostic must
             // never land in `build --stdout`'s JavaScript.
-            .eprint(sources([(
-                filename.to_string(),
-                snippet(text, &span).to_string(),
-            )]))
+            .write(
+                sources([(filename.to_string(), snippet(text, &span).to_string())]),
+                DiagnosticStream,
+            )
             .unwrap()
     }
 }
@@ -5907,16 +7848,26 @@ fn report_error_with_labels(
                 .with_color(color),
         );
     }
+    capture_open(Some((
+        filename.to_string(),
+        primary_span.start,
+        primary_span.end,
+        error.msg.clone(),
+    )));
     report
         .finish()
         // stderr, like the warnings (ratified call (f)).
-        .eprint(sources(files))
+        .write(sources(files), DiagnosticStream)
         .unwrap();
 }
 
 /// Renders a single analyzer warning (e.g. an unused `[must_use]` result) — like
 /// `report`, but `ReportKind::Warning` and non-fatal. Carries its own file too.
 fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, message: &str) {
+    // Unkeyed: the round ledger covers errors only, so a warning a shared
+    // module raises is printed once per member under a sequential check too,
+    // and the capture must reproduce that rather than improve on it (M35).
+    capture_open(None);
     let char_span = char_range(src, &span);
     Report::build(
         ReportKind::Warning,
@@ -5932,16 +7883,59 @@ fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, messa
     .finish()
     // stderr, so it doesn't corrupt `build --stdout` JS — the call the
     // errors now match too.
-    .eprint(sources([(
-        filename.to_string(),
-        snippet(src, &span).to_string(),
-    )]))
+    .write(
+        sources([(filename.to_string(), snippet(src, &span).to_string())]),
+        DiagnosticStream,
+    )
     .unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- N128: every compiler thread DECLARES its stack ----------------------
+
+    /// The main compiler thread's body runs with its stack declared to the
+    /// probe, at the size it was spawned with. Planted red by spawning without
+    /// `with_declared_stack`: the body reads `None`, which is what all three
+    /// compiler threads read before N128 — and a probe on an undeclared thread
+    /// never fires.
+    #[test]
+    fn a_compiler_thread_declares_its_stack_to_the_probe() {
+        let declared = spawn_compiler_thread(vilan_core::stack_guard::declared_stack_size)
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert_eq!(declared, Some(COMPILER_STACK_SIZE));
+    }
+
+    /// The same for the parallel build legs' and check members' threads.
+    #[test]
+    fn a_scoped_compiler_thread_declares_its_stack_to_the_probe() {
+        let declared = std::thread::scope(|scope| {
+            spawn_scoped_compiler_thread(scope, vilan_core::stack_guard::declared_stack_size)
+                .expect("spawn")
+                .join()
+                .expect("join")
+        });
+        assert_eq!(declared, Some(COMPILER_STACK_SIZE));
+    }
+
+    /// And no compiler thread is spawned any other way: the stack size is
+    /// written in this file exactly twice, inside the two helpers above. A
+    /// third spawn written the old way — a `Builder` with the size and no
+    /// declaration — reds here rather than shipping an inert probe.
+    #[test]
+    fn every_compiler_thread_is_spawned_through_the_declaring_helpers() {
+        let needle = concat!(".stack_size(", "COMPILER_STACK_SIZE)");
+        assert_eq!(
+            include_str!("main.rs").matches(needle).count(),
+            2,
+            "a compiler thread spawned outside `spawn_compiler_thread` / \
+             `spawn_scoped_compiler_thread` declares no stack to the probe"
+        );
+    }
 
     // --- Renamed CLI spellings (proposal/deprecation.md §4) -----------------
 
@@ -6142,6 +8136,12 @@ mod tests {
                 package_dir: None,
                 split: false,
                 options: BuildOptions::default(),
+                platform_reasons: Vec::new(),
+                // A test fixture's unit: no manifest, so no other declared
+                // program to name (B250).
+                entry_mode: vilan_core::EntryMode::Declared {
+                    declared_entries: Vec::new(),
+                },
             },
             platform,
         )
@@ -6597,5 +8597,86 @@ mod tests {
         assert_eq!(char_range(multibyte, &(5..7)), 5..7); // mid-codepoint
         assert_eq!(char_range(multibyte, &(400..420)), 400..420); // past the end
         assert_eq!(char_range("", &(5..7)), 5..7); // and against empty text
+    }
+}
+
+#[cfg(test)]
+mod write_run_script_tests {
+    use super::write_run_script;
+    use std::path::PathBuf;
+
+    /// A directory nothing else writes into, inside the worktree's own
+    /// `target/` — NOT `std::env::temp_dir()`, which is the shared tmpfs N86
+    /// swept the suites off. `CARGO_TARGET_TMPDIR` is not defined for a binary
+    /// crate's unit tests, so the same location is named from the manifest.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("vilan-cli-write-run-script-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("the unit scratch root");
+        root.join(tag)
+    }
+
+    /// The ordinary case: the script is written, and its bytes are the
+    /// program's.
+    #[test]
+    fn n111_a_script_is_written_with_its_own_bytes() {
+        let script = scratch("plain.mjs");
+        let _ = std::fs::remove_file(&script);
+        write_run_script(&script, "console.log(7);\n").expect("the write succeeds");
+        assert_eq!(
+            std::fs::read_to_string(&script).expect("read it back"),
+            "console.log(7);\n"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// A leaked script from an earlier run with the same pid does not wedge
+    /// this one: the path is unlinked before it is created.
+    #[test]
+    fn n111_a_leaked_script_at_the_path_is_replaced() {
+        let script = scratch("leaked.mjs");
+        std::fs::write(&script, "// the previous run's program\n").expect("plant a leak");
+        write_run_script(&script, "console.log(8);\n").expect("the write succeeds");
+        assert_eq!(
+            std::fs::read_to_string(&script).expect("read it back"),
+            "console.log(8);\n"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The reason the unlink-then-`create_new` pair exists: a SYMLINK planted
+    /// at the predictable path is removed rather than followed, so the file
+    /// `node` is handed is this process's and the link's target is untouched.
+    /// `fs::write` wrote straight through it.
+    #[cfg(unix)]
+    #[test]
+    fn n111_a_planted_symlink_is_not_written_through() {
+        let victim = scratch("victim.txt");
+        let script = scratch("planted.mjs");
+        std::fs::write(&victim, "the victim's contents\n").expect("plant the victim");
+        let _ = std::fs::remove_file(&script);
+        std::os::unix::fs::symlink(&victim, &script).expect("plant the symlink");
+
+        write_run_script(&script, "console.log(9);\n").expect("the write succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("the victim is still there"),
+            "the victim's contents\n",
+            "the symlink's target was written through"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&script).expect("the script is a real file"),
+            "console.log(9);\n"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&script)
+                .expect("stat the script")
+                .file_type()
+                .is_symlink(),
+            "the path is still a symlink"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&victim);
     }
 }

@@ -3,8 +3,18 @@
 # `board.vl` is the program written against it. A single `browser`-target
 # package, so a plain `vilan build .` emits `board.js` next to `index.html` —
 # no `--target` flag needed. Sources sit at the package root, so `root` is `.`.
+#
+# `prelude` names the ambient scope every file here resolves under — the names in
+# scope with no import (`proposal/prelude.md` §5). `std::web`, the application
+# set, for the same reason `../browser` takes it: this is a browser app. It
+# deletes nothing here — `board.vl`'s whole surface comes from the generated
+# `pkg::canvas`, and `canvas.vl` imports nothing at all — and that is worth
+# seeing: an ambient scope is a floor a file may simply not stand on. It also
+# never collides with the generated bindings, since an ambient name is the
+# WEAKEST binding there is (§9.1) and loses to anything `canvas.vl` declares.
 [package]
 name = "canvas_demo"
 root = "."
 entry = "board.vl"
 target = "browser"
+prelude = "std::web"

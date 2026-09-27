@@ -28,6 +28,6 @@ fun main() {
 	print(run(|| 1));
 	print(helper(urls, |url| {
 		sleep(1);
-		url.len() + 10
+		url.len().as_i32() + 10
 	}));
 }

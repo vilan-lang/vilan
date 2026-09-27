@@ -34,11 +34,11 @@ Identifiers are ASCII. The following words are **reserved**; they lex as
 keyword tokens and are never `IDENT`:
 
 ```text
-async     await  borrows  const  css   else    enum  export
-external  for    fun      if     impl  import  in    is
-jump      let    macro    match  mod   mut     null  own
-resource  ret    struct   trait  type  use     with  true
-false
+async     await     borrows  const   css    dyn     else  enum
+export    external  for      fun     if     impl    import in
+is        jump      lazy     let     macro  match   mod   mut
+null      own       ret      struct  trait  type    use   with
+true      false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
@@ -46,11 +46,20 @@ false
 **Contextual keywords** lex as `IDENT` and take meaning only by position:
 `context` (the clause after a closure type, §3.9), `sync` (the marker
 opening a closure type, §3.9), `void` (the unit value/type), `self` and
-`Self` (receiver and receiver type), `derive`, `service`, `extern`,
-`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated` (attribute names in `[...]` position), and jump targets
-(`break`, `continue`) after `jump`. All remain usable as ordinary
-identifiers elsewhere.
+`Self` (receiver and receiver type; `self` is also the file's own module
+in `mod self;`, §3.1), `as` (the alias on an import path leaf, §3.2),
+`only` (the trailing modifier on an import, §3.2), `derive`, `service`,
+`extern`, `must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
+`deprecated`, `internal`, `resource` (attribute names in `[...]`
+position — `resource` was a keyword until B413 made it the `[resource]`
+attribute), and jump targets (`break`, `continue`) after `jump`. All remain usable as ordinary
+identifiers elsewhere, with one exception: `void` may not be a
+BINDER's name (a `let`, a `for` binder, a function parameter, a match
+capture). An expression `void` is always the unit, so a binding by
+that name could never be read back, and it is refused where it is
+written rather than where it is read (N113). A member — a struct
+field, a method — may still be called `void`: it is reached through a
+receiver, not through the atom production.
 
 ## 2.3 Literals
 
@@ -65,11 +74,30 @@ SUFFIX  = IDENT   (* immediately adjacent, no space *)
 
 The suffix names the literal's type: `i8 i16 i32 u8 u16 u32` (that
 two's-complement width), `i53`/`u53` (the wide integers; see below),
-`f` (`f64`), `f32`, `f64`, `n` (`BigInt`). An **unknown suffix is a
+`usize` (the index type; see below), `f` (`f64`), `f32`, `f64`, `n`
+(`BigInt`). An **unknown suffix is a
 compile error** (the retired `i64`/`u64` suffixes get a rename hint). An
-unsuffixed integer literal is `i32`; an unsuffixed fractional literal is
-`f64`. Every integer literal is **range-checked** against its type at
-compile time.
+unsuffixed literal takes its type from its CONTEXT — the annotation, the
+parameter, the field, the return type it lands at, the other operand of a
+binary operator (on either side: `1 + n` and `n + 1` are both `n`'s
+type), the element type of an annotated list literal (or a typed sibling
+element), the value a `match` pattern is tested against, and the type a
+generic call's expected result binds its parameter to (`let n: u53 =
+identity(5)`) — and `i32` for an integer literal, `f64` for a fractional
+one, is the DEFAULT where the context states nothing. A binding with no
+annotation whose initializer is such a literal (`let n = 0;`, or
+arithmetic over literals and other such bindings) has no type of its own
+either: it takes the numeric type its first typed USE states — an
+argument, an operand beside a typed value (`i < xs.len()`), an
+assignment — and the default only when no use states one. That holds for an expression of unsuffixed
+literals as well as for a lone one, including the operator it is
+computed with: `let ratio: f64 = 7 / 2;` is float division and `3.5`,
+where the same expression with no annotation truncates to `3`. A
+FRACTIONAL literal never takes an integer type from its context: to the
+right of an integer operand (`y / 2.0` with `y: i32`) it is a compile error
+whose fix is the other operand's conversion (`y.as_f64() / 2.0`). Every
+integer literal is **range-checked** against its type at compile time, and
+a negative one at an unsigned type (`let n: usize = -1`) is out of range.
 
 `i53` spans the symmetric range ±2^53 and `u53` spans [0, 2^53]: the
 window in which every integer is exactly representable in an IEEE-754
@@ -77,6 +105,12 @@ double (the backing representation). The names deliberately follow
 JavaScript's safe-integer convention (53 bits of integer precision)
 rather than the two's-complement `iN` convention. There is no `i64`;
 integers beyond the window take `BigInt`.
+
+`usize`, the index type, spans [0, 2^53] as `u53` does — on every backend,
+although its native representation is the platform word. Subtracting a
+`usize` past zero is **unspecified, never memory-unsafe** (§7.2a): the JS
+backend lets the value go negative, a native debug build panics, and every
+subscript's bounds check still refuses the result as an index.
 
 In a hex literal the digit run is maximal, so a suffix must begin with a
 non-hex letter: `0xFFu8` is valid; `0xFFf` is a single hex number `0xFFF`,
@@ -112,10 +146,20 @@ it is written into the literal, not read off the end of a line.
 
 ### Interpolated strings
 
+```text
+ISTRING          = 'i' , '"' , { istring_part } , '"' ;
+istring_part     = hole | istring_char ;
+hole             = '{' , expression , '}' ;
+istring_char     = "\" any_char_except_line_terminator
+                 | any_char_except_brace_quote_backslash_or_line_terminator ;
+```
+
 `i"…"` is an interpolated string: `{expr}` holes embed expressions; `\{`
-and `\}` are literal braces. The construct is defined by desugaring. An
-interpolated string is exactly equivalent to a parenthesized
-concatenation:
+and `\}` are literal braces. Every other escape is carried through as the
+plain twin carries it — `\` and the character it precedes, interpreted at
+code generation — and an unescaped `}` outside a hole is an error. The
+construct is defined by desugaring. An interpolated string is exactly
+equivalent to a parenthesized concatenation:
 
 ```text
 i"Hello, {name}!"   ≡   ("" + "Hello, " + (name) + "!")
@@ -126,6 +170,14 @@ delimit the hole; string literals inside a hole may still contain braces)
 and parsed as a single parenthesized expression. The result of the whole
 form is `str`; each part must therefore be valid as a `+` operand with
 `str` (§5's operator dispatch).
+
+A string literal inside a hole may be written either way — `i"{get("k")}"`
+or `i"{get(\"k\")}"` — and the two are the same token. The hole is lexed
+from the source bytes, so the enclosing literal's quotes never reach it and
+the plain spelling needs no escape; the escaped spelling is accepted
+because it is the one a writer reaches for, and it closes at the next `\"`.
+An embedded quote therefore has no escaped spelling: `"a\"b"`, the plain
+form, is the one that carries it.
 
 `i"…"` obeys the single-line rule of its plain twin: a raw line break in
 its body (or a backslash before one) is the same error. Interpolated
@@ -170,10 +222,6 @@ let report = i"""
     """
 ```
 
-*Implementation note: because a hole is re-lexed as ordinary tokens, a
-string literal inside a hole cannot use `\"` escapes; nested quoting
-inside holes is currently a parse error. Bind the value to a local first.*
-
 ### Other literals
 
 `true`, `false` (type `bool`); `null` (the host-boundary null, §5.2);
@@ -189,6 +237,10 @@ Two token classes:
   operator tokens; conversely `a+-b` lexes as `a`, `+-`, `b` and is a parse
   error.
 - **Control tokens**: the single characters `( ) [ ] { } < > ; , .`.
+- **`#`**, a token of its own: the import **reach** marker,
+  `import pkg::a::{ #hidden };` (spec §4.3). It is in neither run — it
+  never joins an operator run and never joins a name — so it is always
+  exactly one token wherever it is written.
 
 `<` and `>` are control tokens (they delimit generics), not operator
 characters. Consequently `<=`/`>=` lex as `<`/`>` followed by `=`, and the
@@ -205,18 +257,26 @@ same: a property name is that identical span-adjacent run, and a
 dimension such as `1px` or `1.5rem` was already one number token (§2.3),
 so CSS's own value shape needed nothing new.
 
-**`#` and `@` are in neither class, and lex as nothing at all.** They
-belong to no run and open no literal, so either one is a lex error
-wherever it is written — including inside a `css` block, which cannot
-change that, because lexing finishes before any parser exists (§2.5).
-The two consequences are stated rather than worked around, and each
-diagnostic names its spelling: a colour is a hole,
-`color: {Color::hex("#333")};`, which routes the value through the
-`Color` type that carries its own `:root` line; and a block has no
-at-rules, so a media query is a breakpoint condition rule
-(`.md { … }`) and a declaration block under a selector of your own is
-`std::style::declare`. `#id` selectors are unwritable for the same
-reason; `[id="x"]` is the spelling.
+**`@` is in none of these classes, and lexes as nothing at all.** It
+belongs to no run and opens no literal, so it is a lex error wherever it
+is written — including inside a `css` block, which cannot change that,
+because lexing finishes before any parser exists (§2.5). The consequence
+is stated rather than worked around and the diagnostic names the
+spelling: a block has no at-rules, so a media query is a breakpoint
+condition rule (`.md { … }`) and a declaration block under a selector of
+your own is `std::style::declare`.
+
+**`#` lexes, and a `css` block refuses it.** The byte is a token — the
+import reach marker — so the lexer has nothing to say about it, and the
+question "is this a colour or a reach?" is answered where the answer
+exists: inside a `css` block's value, a `#` is the hex-colour mistake and
+the block's own parser refuses it, naming the hole that routes the value
+through the `Color` type that carries its own `:root` line
+(`color: {Color::hex("#333")};`). That is the rule §2.5 demands, taken
+seriously in both directions: the LEXER cannot know which of the two it
+is looking at, so it does not guess, and the parser, which does know,
+decides. `#id` selectors are still unwritable inside a block;
+`[id="x"]` is the spelling.
 
 ## 2.5 Trivia and token separation
 

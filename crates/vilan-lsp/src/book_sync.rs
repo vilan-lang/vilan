@@ -3,8 +3,9 @@
 //!
 //! Two gates, test-only:
 //!
-//! 1. **The keyword-hover deep links resolve.** [`KEYWORD_DOCS`] carries 32
-//!    `page.html#anchor` links into the published book. Each page must exist
+//! 1. **The keyword-hover deep links resolve.** [`KEYWORD_DOCS`] carries one
+//!    `page.html#anchor` link into the published book per keyword, and
+//!    [`ATTRIBUTE_DOCS`] one per documented attribute (B413's `[resource]`). Each page must exist
 //!    under `vilan/docs/`, and each anchor must be the id mdBook gives one of
 //!    that page's headings. No renderer is required at test time (CI has no
 //!    `mdbook`; the docs gate is renderer-independent by design): mdBook's
@@ -33,7 +34,7 @@ use std::process::Command;
 use tower_lsp::lsp_types::{CodeActionKind, CodeActionProviderCapability, ServerCapabilities};
 
 use crate::server_capabilities;
-use vilan_ide::{BOOK_BASE, KEYWORD_DOCS};
+use vilan_ide::{ATTRIBUTE_DOCS, BOOK_BASE, KEYWORD_DOCS};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -312,7 +313,7 @@ fn book_pages() -> Vec<(String, String)> {
 fn keyword_hover_links_resolve_to_a_heading_in_the_book() {
     let mut headings: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut broken = Vec::new();
-    for (keyword, _, link) in KEYWORD_DOCS {
+    for (keyword, _, link) in KEYWORD_DOCS.iter().chain(ATTRIBUTE_DOCS) {
         let Some((page, anchor)) = link.split_once('#') else {
             broken.push(format!("`{keyword}` → {link}: no #anchor"));
             continue;
@@ -347,12 +348,48 @@ fn keyword_hover_links_resolve_to_a_heading_in_the_book() {
 }
 
 /// The mdBook this book's anchors are pinned to — the exact line
-/// `mdbook --version` prints. Two other places in the fleet hold the same pin:
-/// `scripts/regen-markdown-golden.py` (as `PINNED_MDBOOK`, a hard refusal) and
-/// the pages repo's `docs.yml` (a tarball fetched by sha256). This constant is
-/// the third consumer, and until N28 it was the one that shelled out
-/// unversioned.
+/// `mdbook --version` prints, and THE source of the pin: every other in-repo
+/// spelling of the version is held to this one by
+/// [`the_pin_agrees_with_every_in_repo_copy_of_it`], over
+/// [`PLACES_THAT_SPELL_THE_PIN`]. Outside the repository the pages repo's
+/// `docs.yml` holds it too (a tarball fetched by sha256), which no gate here
+/// can reach.
+///
+/// Until N28 this was the consumer that shelled out unversioned; until N42 it
+/// was held against one of the five copies and blind to the other three.
 const PINNED_MDBOOK: &str = "mdbook v0.5.4";
+
+/// Every other in-repo file that spells the pinned version, with what its copy
+/// is for (tracker N42).
+///
+/// The list is exact rather than a repository sweep on purpose: `CHANGELOG.md`
+/// names the version in entries that describe the tree AS IT WAS, and those
+/// spellings must not move when the pin does. A file that starts carrying the
+/// version is added here on purpose, in a diff — the same shape as every other
+/// exemption-adjacent list in this tree.
+const PLACES_THAT_SPELL_THE_PIN: &[(&str, &str)] = &[
+    (
+        "scripts/regen-markdown-golden.py",
+        "`PINNED_MDBOOK`, a hard refusal — it governs the anchors golden this \
+         crate's reimplementation is proven against",
+    ),
+    (
+        "README.md",
+        "the `cargo install mdbook` line a reader runs to build the book locally",
+    ),
+    (
+        "vilan/docs/README.md",
+        "the same install line, in the page that argues the pin",
+    ),
+    (
+        "vilan/std/src/markdown.vl",
+        "the heading-id algorithm's own header — the version it reimplements",
+    ),
+    (
+        "crates/vilan-core/tests/markdown_golden.rs",
+        "the golden's header, and the regeneration command it prints",
+    ),
+];
 
 /// The version `<program> --version` reported, or the refusal to fail with
 /// (N28). Absence and mismatch both REFUSE — loudly, naming the pin and how to
@@ -368,7 +405,13 @@ const PINNED_MDBOOK: &str = "mdbook v0.5.4";
 /// `cargo test` does not, and this harness has to be honest under both.
 fn pinned_mdbook_or_refusal(program: &std::ffi::OsStr) -> Result<String, String> {
     let named = program.to_string_lossy().into_owned();
-    let install = "install it with `cargo install mdbook --version 0.5.4 --locked`";
+    // Read off the pin rather than spelled again: an install line naming a
+    // different version than the one being refused for is the same fork this
+    // whole function exists to prevent, one file further in.
+    let version = PINNED_MDBOOK
+        .rsplit_once(" v")
+        .map_or(PINNED_MDBOOK, |(_, version)| version);
+    let install = format!("install it with `cargo install mdbook --version {version} --locked`");
     let reported = match Command::new(program).arg("--version").output() {
         Err(error) => {
             return Err(format!(
@@ -532,10 +575,90 @@ fn an_absent_renderer_is_refused_with_the_install_line() {
     );
 }
 
-// The pin is held in three places and this is one of them, so hold it to the
-// nearest sibling: `scripts/regen-markdown-golden.py`, whose `PINNED_MDBOOK`
-// governs the golden this crate's reimplementation is proven against. A tree
-// where the two disagree has one of them blessing a renderer the other refuses.
+/// The first `1.2.3`-shaped version in `text`, if it carries one.
+fn first_version(text: &str) -> Option<String> {
+    let characters: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    while index < characters.len() {
+        if !characters[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < characters.len()
+            && (characters[index].is_ascii_digit() || characters[index] == '.')
+        {
+            index += 1;
+        }
+        let run: String = characters[start..index].iter().collect();
+        let parts: Vec<&str> = run.split('.').collect();
+        if parts.len() == 3 && parts.iter().all(|part| !part.is_empty()) {
+            return Some(run);
+        }
+    }
+    None
+}
+
+// The pin the whole book's anchors rest on, held everywhere the tree spells it
+// (tracker N42). Before this it was held in ONE other place — the regeneration
+// script — while three more copies, including the two install lines a human
+// actually runs, could name a renderer this very file would refuse to trust.
+// That is the failure `pinned_mdbook_or_refusal`'s own refusal text warns
+// about, one file further out: it tells the reader to move the pin in five
+// places, and nothing checked that they did.
+//
+// A mention is read as carrying the version when a `1.2.3` follows `mdbook`
+// within the next few dozen characters, which is the distance in both
+// spellings this tree uses — `mdBook v0.5.4` and
+// `cargo install mdbook --version 0.5.4 --locked`. A mention with no version
+// near it (`mdbook serve vilan/docs`) is prose about the tool, not a copy of
+// the pin, and is passed over.
+#[test]
+fn the_pin_agrees_with_every_in_repo_copy_of_it() {
+    /// How far past `mdbook` a spelling of the version can sit.
+    const REACH: usize = 46;
+
+    let pinned = PINNED_MDBOOK
+        .rsplit_once(" v")
+        .map_or(PINNED_MDBOOK, |(_, version)| version);
+    let mut faults = Vec::new();
+    for (relative, purpose) in PLACES_THAT_SPELL_THE_PIN {
+        let text = read(&repo_root().join(relative));
+        let lowered = text.to_lowercase();
+        let mut copies = 0;
+        for (index, _) in lowered.match_indices("mdbook") {
+            let window: String = text[index..].chars().take(REACH).collect();
+            let Some(found) = first_version(&window) else {
+                continue;
+            };
+            copies += 1;
+            if found != pinned {
+                faults.push(format!(
+                    "  {relative}: names mdBook {found}, and the pin is {pinned} ({purpose})"
+                ));
+            }
+        }
+        if copies == 0 {
+            faults.push(format!(
+                "  {relative}: spells no mdBook version at all any more ({purpose}). \
+                 Either the copy moved — point this list at where it went — or it is \
+                 gone, and the entry should go with it."
+            ));
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "the mdBook pin is {PINNED_MDBOOK} here, and these copies of it disagree. A \
+         tree where they differ has one of them blessing a renderer another refuses, \
+         and the install line a reader follows is the copy that decides which \
+         renderer is actually on the machine:\n{}",
+        faults.join("\n")
+    );
+}
+
+// And the source of the pin is the constant, not a second hand-spelling of it:
+// the regeneration script's own `PINNED_MDBOOK` is held to this one verbatim,
+// line and all, which is more than the version-number check above can say.
 #[test]
 fn the_pin_agrees_with_the_golden_regeneration_script() {
     let script = read(&repo_root().join("scripts/regen-markdown-golden.py"));
@@ -969,7 +1092,26 @@ fn editor_page_code_action_titles_are_the_servers() {
             panic!("{EDITOR_PAGE}'s Quick fixes section no longer opens with a count — update this pin with the page")
         });
     let number_words = [
-        "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+        "One",
+        "Two",
+        "Three",
+        "Four",
+        "Five",
+        "Six",
+        "Seven",
+        "Eight",
+        "Nine",
+        "Ten",
+        "Eleven",
+        "Twelve",
+        "Thirteen",
+        "Fourteen",
+        "Fifteen",
+        "Sixteen",
+        "Seventeen",
+        "Eighteen",
+        "Nineteen",
+        "Twenty",
     ];
     assert_eq!(
         number_words
@@ -1045,9 +1187,14 @@ const CAPABILITY_CLAIMS: &[CapabilityClaim] = &[
     ("**Formatting**", true, |c| {
         c.document_formatting_provider.is_some()
     }),
-    ("there is no range or on-type formatting", false, |c| {
+    ("there is no range formatting", false, |c| {
         c.document_range_formatting_provider.is_some()
-            || c.document_on_type_formatting_provider.is_some()
+    }),
+    // E202: on-type formatting exists now, and it does exactly one thing —
+    // which is why the page's claim is the sentence about the `<` rather than
+    // the LSP feature's name.
+    ("**A generic `<` closes itself.**", true, |c| {
+        c.document_on_type_formatting_provider.is_some()
     }),
     ("**Linked editing**", true, |c| {
         c.linked_editing_range_provider.is_some()
@@ -1148,6 +1295,70 @@ fn editor_page_capabilities_are_the_servers() {
     );
 }
 
+/// E174: every `workspace/executeCommand` the server DECLARES is a command the
+/// extension actually sends, spelled the same way.
+///
+/// Two literals in two languages, and a typo in either is silent: the editor
+/// would send a name the server does not own (a warning on the channel and no
+/// summary), or the server would advertise a command nothing ever invokes. The
+/// extension's spelling is read out of its source rather than restated here,
+/// which is the same posture the code-action titles are held to above.
+#[test]
+fn the_servers_declared_commands_are_the_ones_the_extension_sends() {
+    let declared = server_capabilities()
+        .execute_command_provider
+        .expect("the server declares `workspace/executeCommand`")
+        .commands;
+    assert!(
+        !declared.is_empty(),
+        "server_capabilities() advertises `workspace/executeCommand` with no commands"
+    );
+    let extension = read(&repo_root().join(EXTENSION_SOURCE));
+    for command in &declared {
+        assert!(
+            extension.contains(&format!("'{command}'")),
+            "{EXTENSION_SOURCE} never spells `{command}`, which the server declares"
+        );
+    }
+}
+
+/// E222: the server's custom request, asked by the extension's `type`
+/// override. The same two-languages hazard as the commands above — a typo in
+/// either literal is silent, and the symptom is a `<` that quietly stops
+/// pairing — so the extension's spelling is read out of its source and held to
+/// the server's constant.
+#[test]
+fn the_servers_custom_requests_are_the_ones_the_extension_asks() {
+    let extension = read(&repo_root().join(EXTENSION_SOURCE));
+    assert!(
+        extension.contains(&format!(
+            "const OPENS_A_GENERIC_LIST = '{}';",
+            crate::OPENS_A_GENERIC_LIST
+        )),
+        "{EXTENSION_SOURCE} must spell the server's `{}` as its OPENS_A_GENERIC_LIST",
+        crate::OPENS_A_GENERIC_LIST
+    );
+    // F27 R1/R6: the status line's request, the same two-languages hazard.
+    assert!(
+        extension.contains(&format!(
+            "const ANALYSIS_PLATFORM = '{}';",
+            crate::ANALYSIS_PLATFORM
+        )),
+        "{EXTENSION_SOURCE} must spell the server's `{}` as its ANALYSIS_PLATFORM",
+        crate::ANALYSIS_PLATFORM
+    );
+    // And the declaration it makes is the key the server reads.
+    assert!(
+        extension.contains("autoClosing: { generics: typeOverride !== undefined }"),
+        "{EXTENSION_SOURCE} must declare `autoClosing.generics` — whether the \
+         override is INSTALLED — in the feature config the server reads"
+    );
+}
+
+/// The extension's one source file — read as TEXT, like the server's own
+/// sources above, because what is gated is a string literal in it.
+const EXTENSION_SOURCE: &str = "editors/vscode/src/extension.ts";
+
 fn extension_manifest() -> serde_json::Value {
     let path = repo_root().join("editors/vscode/package.json");
     serde_json::from_str(&read(&path)).expect("editors/vscode/package.json is JSON")
@@ -1210,14 +1421,22 @@ fn editor_page_settings_are_the_extensions() {
             )
         })
         .collect();
-    assert!(
-        flattened(&page).contains("**Vilan: Restart Language Server**"),
-        "{EDITOR_PAGE} no longer names the restart command in bold — update this check with the page"
-    );
-    assert!(
-        commands.contains(&"Vilan: Restart Language Server".to_string()),
-        "package.json's commands are {commands:?}; the page promises `Vilan: Restart Language Server`"
-    );
+    // Both palette entries the page promises. The status one is E174's: it
+    // prints the client's tally and then asks the SERVER for its own page, so
+    // the page describing it is a claim about two halves at once.
+    for promised in [
+        "Vilan: Restart Language Server",
+        "Vilan: Show Language Server Status",
+    ] {
+        assert!(
+            flattened(&page).contains(&format!("**{promised}**")),
+            "{EDITOR_PAGE} no longer names `{promised}` in bold — update this check with the page"
+        );
+        assert!(
+            commands.contains(&promised.to_string()),
+            "package.json's commands are {commands:?}; the page promises `{promised}`"
+        );
+    }
     // And the book the hovers link into is the book the listing links to.
     assert_eq!(
         manifest["homepage"].as_str(),

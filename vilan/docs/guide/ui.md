@@ -40,7 +40,8 @@ view so you can keep going:
   `pointer_x()`/`pointer_y()`). For window-level events, and for a listener
   you need to remove, drop to `std::dom` — [Escaping to the DOM](#escaping-to-the-dom).
 - **Reactive bindings**: `.bind_text(source)`, `.bind_class(source)`,
-  `.bind_attr(name, source)`, `.style_var(name, source)`.
+  `.bind_attr(name, source)`, `.toggle_attr(name, flag)`,
+  `.style_var(name, source)`.
 
 Every `bind_*` sets the property now and re-sets it whenever the source
 changes. There is no render loop to trigger.
@@ -54,12 +55,38 @@ signal.
 ## Text children and mixed content
 
 `child` takes more than a `View`. Anything that can fill a child
-position works — the value's type decides what lands in the DOM:
+position works — the value's type decides what lands in the DOM. Three
+static arms, and a reactive twin for each:
 
-- a `View` appends as an element;
-- a `str` appends as a **text node**;
-- a `SignalCell<str>` appends as a text node kept in sync;
-- a `List<View>` appends every view, in order.
+- a `View` appends as an element; a `Source<View>` appends the view it
+  holds and **replaces** it whenever the source changes;
+- a `str` appends as a **text node**; a `Source<str>` appends a text
+  node kept in sync;
+- a `List<View>` appends every view, in order; a `Source<List<View>>`
+  appends the run and replaces the whole run on every change. `<>…</>`
+  is the literal for one (see [Fragments](#fragments)).
+
+That pairing is the whole contract: whatever may be a child statically
+may be a child reactively, and `{expr}` in element syntax means the same
+thing either way. The reactive arms register one subscription with the
+nearest boundary, so a `{signal}` child inside an `each` row stops
+replacing anything when the row is disposed — but the views themselves
+arrive already built, so each one's own bindings belong to the scope
+that *constructed* it. Reach for `swap(source, |value| …)` when every
+subtree must be built and disposed per value; reach for a `Source<View>`
+child when the views are values the app already holds.
+
+**A reactive child keeps its place.** The replacement lands where the
+`{expr}` is written, not at the end of the parent — and so do `when`'s
+body, `swap`'s subtree and `each`'s rows. Each plants an empty text
+node where it is called and inserts before it, so
+`<nav>{brand}{when(..)}{footer}</nav>` puts the conditional between the
+two, and it is still between them after it toggles off and on. No
+wrapper element, and nothing to remember about ordering.
+
+A `Source<List<View>>` is not a reconciler: it replaces the run rather
+than moving surviving rows. `each` is the keyed form, and it is
+what a list of *data* wants.
 
 Text nodes make mixed content direct: prose around an inline element is
 a run of siblings, not a pile of wrapper spans.
@@ -85,9 +112,38 @@ re-sets whenever it changes — `attr("href", signal)` and
 name. (`text` is unchanged: it still replaces everything the element
 contains, text nodes included, like the DOM's `textContent`.)
 
-`attr` and `child` dispatch through traits rather than a bound, so their
-reactive arms are `SignalCell<str>` specifically — a custom `Source` goes
-through the named binding (`bind_attr`, `bind_text`) for now.
+An attribute that comes and goes is a third case, and both forms take it
+directly: over an `Option<str>` or a `Source<Option<str>>`, a `Some(text)`
+sets the attribute and a `None` leaves it off — removing it, where the value
+is reactive and the attribute was there a moment ago. `bind_attr` spells it by
+name and element syntax by type, so `<div data-dragging(drag_status)>` is the
+same binding as the chain below. Reach for it whenever a selector reads presence —
+`[data-dragging="row"] *` matches an element that *has* the attribute, so
+writing `""` between drags leaves the rule firing. `Some("")` is still a
+present, empty attribute, which is why the absence has to be its own value
+rather than a sentinel string.
+
+```vilan,fragment
+// `None` while nothing is being dragged; `Some("row")`/`Some("col")` while
+// something is.
+view("div").bind_attr("data-dragging", drag_status.map(|status| match status {
+	DragStatus::Still => None,
+	DragStatus::Vertical => Some("row"),
+	DragStatus::Horizontal => Some("col"),
+}))
+```
+
+A BOOLEAN attribute is a different thing and has its own binding:
+`inert`, `disabled`, `hidden` and `open` mean *present*, so there is no
+string that turns one off — `attr("disabled", "false")` is a disabled
+control. `.toggle_attr(name, flag)` takes a `Source<bool>` and writes
+the attribute when it is true, removes it when it is false:
+`shell.toggle_attr("inert", modal_open)`.
+
+`attr` and `child` dispatch through traits rather than a bound, and
+their reactive arms are blanket impls over `Source`, so a derived
+signal, a `RemoteSource` or a mirror of your own fills either position
+exactly as a cell does.
 
 ## Element syntax
 
@@ -123,8 +179,8 @@ One rule governs the head — everything between `<tag` and `>`:
   every `data-*`/`aria-*` attribute is written in the same undotted form
   and emitted verbatim.
 - A **leading dot** is the chain, verbatim: `.styled(card)`,
-  `.bind_value(draft)`, `.show(flag)`, `.bind_each(rows, |r| r.id,
-  |r| row(r))`. Every `View` method works in head position — the dot is
+  `.bind_value(draft)`, `.show(flag)`, `.child(each(rows, |r| r.id,
+  |r| row(r)))`. Every `View` method works in head position — the dot is
   what keeps attributes and methods from ever colliding, so a new
   method can never change what existing markup means.
 - `on:click(handler)` is an event. A zero-parameter closure literal
@@ -145,12 +201,12 @@ arms, and takes postfix chains. The two forms mix freely —
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 fun panel(items: SignalCell<List<str>>, flag: SignalCell<bool>): View {
 	<section class("panel")>
 		<input placeholder("What needs doing?") />
-		<ul .bind_each(items, |t| t, |t| <li>{t}</li>) />
+		<ul>{each(items, |t| t, |t| <li>{t}</li>)}</ul>
 		<p .show(flag)>"empty"</p>
 	</section>
 }
@@ -160,14 +216,56 @@ fun main() {
 }
 ```
 
+### Fragments
+
+A **fragment** groups several children under one hole, with no wrapper
+element. `<>…</>` is the nameless head, and it lowers to a **list
+literal** of its children — so its type is `List<View>`, the arm `child`
+already places:
+
+```vilan,browser
+import std::ui::{ View, mount_root, view };
+
+fun labelled(name: str, value: str): List<View> {
+	<>
+		<dt>{name}</dt>
+		<dd>{value}</dd>
+	</>
+}
+
+fun main() {
+	let _root = mount_root("app", || {
+		<dl>
+			{labelled("host", "localhost")}
+			{labelled("port", "8080")}
+		</dl>
+	});
+}
+```
+
+`<>` and `</>` are written tight, like `/>` and `</`. A fragment takes
+no attributes and no chain links — there is no element to put them on —
+and it has no self-closing form; the empty fragment is `<></>`.
+
+Its type is where its uses are, and where its limits are. A fragment is
+a `List<View>`, so it fills a child position and every position a list
+fills, and a `Source<List<View>>` of fragments keeps its place like any
+other reactive child. It is **not** a `View`: a `fun …: View` return, a
+`when` body, a `swap` render and an `each` row all want one view,
+and a fragment there is a type error that says so. It also does not
+flatten — a fragment written directly inside another is a list inside a
+list, which the literal refuses; nest through a child position instead.
+
 Components stay what they are — functions returning `View` — and are
 called in holes: `{todo_row(items, todo)}`. Reactivity stays explicit:
 an `if` or `match` inside a hole runs once at build, exactly as it does
-in a chain; reactive structure is `.show`/`.when`/`.swap`/`.bind_each`
-in head position, and `Signal` values in slots. The sugar adds no
-semantics: `import std::ui::{ view, View }` is still required (the
-compiler points the way if it is missing), and everything this guide
-says about ownership, boundaries, and binding types applies unchanged.
+in a chain; reactive structure is `.show` in head position and the
+`when`/`swap`/`each` values in holes, with `Signal` values in slots. The sugar adds no
+semantics: an element means `std::ui::view` whatever the file has
+imported, so element syntax needs no `view` import of its own (a `View`
+you write as a TYPE still needs one, and the editor offers it), and
+everything this guide says about ownership, boundaries, and binding
+types applies unchanged.
 
 ## Components are just functions
 
@@ -198,7 +296,7 @@ depth of function calls, registers with the nearest owner automatically
 (the [reactive guide](reactive.md) explains owners).
 
 If you create a reactive binding — a `bind_*`, a `Signal` in a slot, a
-`when`/`swap`/`bind_each` — outside any root, you'll get a compile
+`when`/`swap`/`each` — outside any root, you'll get a compile
 error mentioning `owner_scope`. It means "wrap this in `mount_root`"
 (or `run_with_owner` in a test). Purely static structure needs no
 boundary: `mount("app", view("div").child(view("p").text("hi")))` is
@@ -259,12 +357,13 @@ fun main() {
 }
 ```
 
-## Lists: `bind_each`
+## Lists: `each`
 
-`bind_each(source, key, render)` renders one row per element of any
+`each(source, key, render)` renders one row per element of any
 `Source<List<T>>` — a signal, a derived one, a mirror, a type of your own.
-Rows are **keyed**, like React's `key` prop, and the key does real work
-here:
+It is a **value**: write it in a child hole, or hand it to `child` to place
+the run at the parent's current end. Rows are **keyed**, like React's `key`
+prop, and the key does real work here:
 
 - A row whose key survives a change is reused. Its element moves to
   the new position with its state and subscriptions intact.
@@ -274,7 +373,7 @@ here:
   row's bindings die with the row.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::ui::{ each, view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 [derive(PartialEq)]
@@ -288,21 +387,217 @@ fun main() {
 		Todo { id = 1, title = "write docs" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").bind_each(todos, |todo| todo.id, |todo| {
+		view("ul").child(each(todos, |todo| todo.id, |todo| {
 			view("li").text(todo.title)
-		})
+		}))
 	});
 }
 ```
 
 ```vilan,fragment
-fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
-	self,
+fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
-	render: (sync |T| View) context owner_scope,
-): View
+	render: (sync |T| C) context owner_scope,
+): Each<T, K, S, C>
 ```
+
+### Three forms, one engine
+
+`each` asks two things of your items — a key **and** an equality —
+and most lists only have one of them to give. The other two forms each
+drop one bound:
+
+| | Signature | Key | Unchanged row | Asks of `T` |
+|---|---|---|---|---|
+| `each(source, key, render)` | `render: \|T\| C` | `key(item)` | reused; changed → rebuilt | `PartialEq` |
+| `each_values(source, render)` | `render: \|T\| C` | the item itself | reused; changed → rebuilt | `PartialEq` + `Hashable` |
+| `each_by(source, key, render)` | `render: \|SignalCell<T>\| C` | `key(item)` | **always** reused; the row's cell is rewritten | nothing |
+
+The **key** is always `PartialEq` **and** `Hashable`, in all three forms:
+the reconciler finds a moved row through a hash index, so a key's hash has
+to agree with its equality — `a == b` implies `a.hash() == b.hash()`. Ids
+and strings satisfy it for free. A struct key takes `[derive(Hashable)]`
+when it is equal by all of its fields, and a hand-written
+`impl Key with Hashable` hashing exactly the fields its `eq` reads when it
+is not. That agreement is what makes a reorder cost one comparison per
+row instead of N.
+
+- **`each_values`** is `each(source, |x| x, render)` written
+  once. Reach for it whenever the item *is* the identity — every
+  `|x| x` key in the wild is this.
+- **`each_by`** is Solid's `<Index>` beside `each`'s `<For>`.
+  A row whose key survives keeps its element, its owner and its
+  bindings, and std writes the new item into that row's own
+  `SignalCell<T>`, so the row updates *through* the bindings `render`
+  already made. That's what lets it take a `T` with no equality at all —
+  a struct carrying a closure, a handle, anything you can't derive
+  `PartialEq` for.
+
+  The trade: `set` never compares, so **every** kept row's cell is
+  written on every change of the list, and every binding in every row
+  re-runs. Reach for `each` when `T` compares cheaply and rows are
+  expensive to rebuild; reach for `each_by` when `T` can't compare,
+  or when the row's own bindings are the natural update path.
+
+```vilan,browser
+import std::ui::{ each_by, each_values, view, View, mount_root };
+import std::reactive::{ Signal, SignalCell };
+
+struct Task {
+	id: i32,
+	title: str,
+}
+
+fun main() {
+	let tasks: SignalCell<List<Task>> = Signal::new([
+		Task { id = 1, title = "write docs" },
+	]);
+	let names: SignalCell<List<str>> = Signal::new(["ada", "grace"]);
+	let _root = mount_root("app", || {
+		view("div")
+			// the item is the key
+			.child(view("ul").child(each_values(names, |name| view("li").text(name))))
+			// `Task` needs no PartialEq: the row updates through its cell
+			.child(view("ol").child(each_by(tasks, |task: Task| task.id, |task: SignalCell<Task>| {
+				view("li").bind_text(task.map(|current| current.title))
+			})))
+	});
+}
+```
+
+## After the element lands: `on_mount`, `autofocus`
+
+`view(..)` builds an element; it is not in the document until whatever
+appends it does. `.on_mount(action)` runs `action` with the element once
+it *is* — at every attachment site, including a `when` body or an
+`each` row that appears in a later change.
+
+```vilan,fragment
+view("input").attr("type", "text").on_mount(|element| element.focus())
+view("input").attr("type", "text").autofocus()          // and then some
+```
+
+`autofocus` is the reason the hook exists. HTML's `autofocus` attribute
+fires only on a document's initial parse, so it does nothing for a modal
+mounted later — and the workaround it forces (mint a uuid, set it as the
+id, start a 1 ms timer, look the element back up) is three lines of
+ceremony around a value you already had. There is nothing to look up:
+the callback is handed the element.
+
+`on_mount` promises the element is IN THE DOCUMENT, and that is all it
+promises. A microtask runs before the frame's rendering step, so at that
+moment the element is connected but not yet *rendered*: no layout, no
+resolved style, and no `ResizeObserver` reaction to either. `focus()` has
+a precondition — connected, rendered, visible, not inert, all of them at
+the call — and the platform's answer to a target that is not is to do
+nothing, silently. An overlay panel held at `visibility: hidden` until a
+`ResizeObserver` places it and flips it visible is exactly the shape that
+refuses.
+
+So `autofocus` is not `on_mount(|e| e.focus())`: it attempts in the
+microtask, and if the element did not take focus it attempts again on the
+next animation frame and once more on the frame after, then stops. Three
+attempts on the platform's own clock — no timer, no millisecond to tune.
+Written out, with `std::dom::request_animation_frame` as the clock and
+`matches(":focus")` as the read-back (`focus()` returns nothing):
+
+```vilan,fragment
+view("input").on_mount(|element| {
+	element.focus();
+	if !element.matches(":focus") {
+		request_animation_frame(|| element.focus());
+	}
+})
+```
+
+Two things no retry fixes. iOS Safari ignores a programmatic `focus()`
+outside a user gesture whatever frame it runs on; and the sound shape for
+an overlay is that focus is a consequence of the SHOW — a hook the driver
+runs when it flips visibility, or `<dialog>.showModal()`, whose focusing
+steps run once the dialog is rendered.
+
+The hook is a **microtask**, which is enough because the whole
+synchronous build — and the `mount` that finishes it — runs to
+completion before any microtask does. On the SSR twin both methods
+accept and drop, like the event binders: there is no document to be in.
+
+`autofocus` also writes the `autofocus` **attribute**. The attribute is
+inert for an element inserted after the page parsed — that is *why* this
+method exists — so it costs nothing at runtime and makes the choice
+readable: to a focus scope, to devtools, and to a test that asserts
+markup. The SSR twin deliberately does not write it, because a *served*
+`autofocus` is honored by the browser's own initial parse.
+
+## Focus scopes
+
+An overlay usually wants more than one focused input: it wants Tab to
+stay inside it while it is open, and it wants focus back where it was
+when it closes. That is a **focus scope**.
+
+```vilan,fragment
+view("div")
+	.focus_scope(FocusContainment::Wrap)
+	.child(view("input").autofocus())
+	.child(view("button").text("Close"))
+```
+
+`Wrap` is a menu: Tab cycles inside the subtree, and focus that leaves by
+any other route may leave. `Contain` is a modal: it also pulls focus back
+when it lands anywhere else. Neither writes anything outside the panel —
+the rest of the page stays clickable and stays in the accessibility tree,
+which is exactly what a menu needs and what `inert` would take away.
+`inert` is still yours for a true modal (`set_attribute("inert", "")` and
+`remove_attribute`), and it is a bigger hammer: it removes the subtree
+from the accessibility tree and blocks pointer events.
+
+`focus_scope` on a view is the ordinary case. A driver that owns its own
+visibility flip — which is every overlay system that positions a panel
+before showing it — installs the scope and takes the focus as **two
+acts**, because focus has a precondition the mount cannot satisfy:
+
+```vilan,fragment
+// at mount, or wherever the panel element is in hand:
+let scope = focus_scope(panel, FocusContainment::Contain);
+
+// …in the pass that flips it visible:
+let _took = scope.focus_initial();
+```
+
+`focus_initial` focuses the first `[autofocus]` descendant, else the
+first tabbable one, else the panel itself at `tabindex="-1"` — and it
+answers whether the focus was taken, so a show that fired too early is
+simply asked again on the next pass. It is idempotent: once focus has
+been taken, a later call leaves alone whatever the user has since moved
+to.
+
+Scopes NEST as a stack, not by DOM ancestry, because an overlay is a
+portal: a submenu opened from inside a menu mounts beside its parent's
+panel rather than inside it. The topmost `Contain` scope is the one that
+guards. A scope lives as long as the boundary it was installed in — when
+that boundary is disposed the scope pops, and focus goes back to whatever
+held it when the scope opened, unless the app moved focus deliberately in
+the meantime or the remembered element has since left the document.
+
+A scope can also tell you when focus **leaves** it, and for where:
+
+```vilan,fragment
+scope.on_leave(|to| close_menu());
+```
+
+The handler runs when focus moves from inside the scope to an element
+outside it AND outside every scope above it — so opening a submenu is not
+leaving the menu, and leaving the submenu for the page leaves both. It is
+handed the element focus went to. Focus leaving the document altogether
+(for the browser's chrome, another window) does nothing: there is no
+element to hand over, and the user has not gone anywhere on the page. A
+Tab never fires it under `Wrap`, which keeps Tab inside; under `Contain`
+a click outside fires it with the clicked element, and then the guard
+pulls focus back. The listener lives as long as the scope.
+
+`Element::tabbable()` is the query underneath, and it is public: a router
+that moves focus to the new page's heading, or a menu that implements
+arrow-key navigation, wants it too.
 
 ## Conditionals: `show`, `when`, `swap`
 
@@ -312,22 +607,105 @@ not visible:
 | | Content while off | State | Use for |
 |---|---|---|---|
 | `.show(condition)` | mounted, hidden | preserved | tabs, collapsibles, anything that should keep its input text |
-| `.when(condition, body)` | unmounted, disposed | dropped | content that shouldn't exist while off (an editor for a missing record) |
-| `.swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
+
+`show` makes two writes: the `hidden` attribute, which selectors and
+assistive technology read, and an inline `display: none`, which is what
+actually hides it. The attribute alone would not — the preflight's
+`[hidden]{display:none}` sits in `@layer vilan.preflight` and a compiled
+`Style`'s rules are unlayered, so any `display` you set beats the reset
+outright. Showing again puts back the element's own inline `display`,
+captured before the first toggle. If you write this element's inline
+`display` yourself after binding `show`, the next toggle takes it: style
+through a `Style` and the two never meet.
+| `when(condition, body)` | unmounted, disposed | dropped | content that shouldn't exist while off (an editor for a missing record) |
+| `when_some(source, render)` | unmounted, disposed | dropped | the same, when the content NEEDS the value — an editor for the selected record |
+| `swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
+
+`show` is a `View` method — it binds a property of the element it is written
+on. `when`, `when_some` and `swap` are **values**: each fills a child
+position, so it lands exactly where it is written.
 
 ```vilan,fragment
-.show(open)                             // any Source<bool>
-.when(present, || task_editor(…))       // any Source<bool> + (sync || View)
-.swap(route, |current| match current {  // any Source<T> + (sync |T| View)
+.show(open)                            // any Source<bool>
+{when(present, || task_editor(…))}     // any Source<bool> + (sync || C: Slot)
+{when_some(selected, |record|          // any Source<Option<T>>
+	task_editor(record))}              //   + (sync |SignalCell<T>| C: Slot)
+{swap(route, |current| match current { // any Source<T> + (sync |T| C: Slot)
 	Route::Home => home_page(),
 	Route::NotFound => not_found(),
-})
+})}
 ```
 
-`when` and `swap` build their content under a fresh owner each time, so
-everything inside cleans up when the content goes away. `swap` re-renders
-only when the value *changes* (`T: PartialEq`), so navigating
-to the page you're already on does nothing.
+All three build their content under a fresh owner each time, so everything
+inside cleans up when the content goes away. `swap` re-renders only when the
+value *changes* (`T: PartialEq`), so navigating to the page you're already on
+does nothing.
+
+`when_some` is the one that binds the value, and it is the reason to reach for
+it over `when(source.map(|value| value is Some(_)), ..)`: the body gets the
+payload, and it gets it as a `SignalCell<T>` rather than as a `T`. What decides
+structure is the PRESENCE — a `None` → `Some` builds, a `Some` → `None`
+disposes — so a changed payload writes to the cell and the row stands, with
+whatever bound to it updating in place. That is `each_by`'s row cell applied to
+a single row, and it is why `T` needs no `PartialEq`: nothing is compared.
+Read the cell inside a binding, exactly as an `each_by` row does:
+
+```vilan,fragment
+{when_some(selected, |account| <p>{account.map(|current| current.name)}</p>)}
+```
+
+### Position, and placing one at the end
+
+A value fills a child position, so the conditional or the run sits exactly
+among the siblings it is written between. `std::ui` exports six —
+`when`, `when_some`, `swap`, `each`, `each_values`, `each_by` — and each
+returns something that fills a child slot:
+
+```vilan,fragment
+<ul>
+	{header_row()}
+	{each_values(items, |item: str| <li>{item}</li>)}
+	{when(more, || <li>"and more"</li>)}
+	{footer_row()}
+</ul>
+```
+
+To place one at the parent's current *end* — where the retired `View` methods
+put it — hand it to `child`: `view("ul").child(each(rows, key, render))`. That
+is the mechanical rewrite for old code, since `parent.swap(s, r)` was never
+anything but `parent.child(swap(s, r))`. The run is called `each` rather than
+`bind_each` because `bind_` means "one property kept in sync" everywhere else,
+and a value that *is* a child has no property to bind.
+
+A helper that returns one names its type, since vilan has no trait objects —
+the last argument is the shape the closure yields (below):
+
+```vilan,fragment
+fun account_menu(signed_in: SignalCell<bool>): Conditional<SignalCell<bool>, View> {
+	when(signed_in, || <nav>"Account"</nav>)
+}
+```
+
+### A row, a body or a branch can be anything `Slot`
+
+The render closures are not limited to `View`. A row may be a fragment, a bare
+string, or another value form, and the run owns whatever it placed:
+
+```vilan,fragment
+<ul>
+	{each_values(items, |item: str| <><li>{item}</li><li class("sep")/></>)}
+</ul>
+```
+
+That is what makes a wrapper element unnecessary in the last place one was
+still needed — a row that is several nodes. It costs one empty text marker per
+row: a row's content can grow after it was placed (a `when` inside a row
+toggles later), so the reconciler moves and removes a row by the SPAN between
+its marker and the next one rather than by a list of nodes it remembered.
+
+Ownership is the same either way: the body, the subtree and every row run
+under a fresh owner established where the value is *placed*, and that owner is
+disposed with the instantiation.
 
 ## The ownership picture
 
@@ -342,11 +720,11 @@ many plain function calls sit in between:
 ├── view("header")                     static: no boundary of its own
 │     └─ .bind_text(title)             → registers with the ROOT
 │
-├── ◆ .swap(route, |page| …)           one owner PER PAGE shown
+├── ◆ {swap(route, |page| …)}         one owner PER PAGE shown
 │     └─ home_page()
 │           └─ .bind_text(…)           → registers with the PAGE
 │
-└── ◆ .bind_each(todos, key, |t| …)    one owner PER ROW
+└── ◆ {each(todos, key, |t| …)}        one owner PER ROW
       ├─ row(id = 1)
       │     └─ .bind_class(…)          → registers with ROW 1
       └─ row(id = 2)
@@ -358,6 +736,20 @@ created dies with it. Delete row 2, and only row 2's bindings die. This
 is why there is no unsubscribe code anywhere in a Vilan app: the tree of
 boundaries *is* the cleanup logic, and the framework already placed
 them where subtrees end.
+
+**A boundary also removes what it placed.** Disposing it takes the
+nodes out of the document: `when`'s body, `swap`'s subtree,
+`each`'s rows, a `{signal}` child's view or run or text node, and
+the invisible marker each of them keeps its position with. That is
+usually invisible — the subtree was leaving with its parent anyway —
+and it is the whole story for a **portal**, a container that outlives
+the boundary filling it: an overlay, a tooltip layer, a modal host
+mounted once at the top of the page. Fill one from a component's
+boundary, dispose the component, and the container is empty; there is
+nothing to remember to clean up by hand. The three **static** child
+arms are untouched, deliberately: a `str`, a `View` or a `List<View>`
+child belongs to the parent element it was appended to, not to a
+boundary.
 
 ## Server-side rendering
 
@@ -384,7 +776,7 @@ fun main() {
 
 Two rules make one component serve both legs:
 
-- **Bindings read once.** `bind_text`, `bind_attr`, `bind_each`, `when`, and
+- **Bindings read once.** `bind_text`, `bind_attr`, `each`, `when`, and
   `swap` embed the source's value *at render time*: no subscription is created,
   and nothing survives the request (create, serialize, discard). Build pure, bind
   reactive: a component that leans on effect side-channels at build time renders
@@ -437,8 +829,9 @@ signals that should settle as one wave.
   hidden content is expensive, use `when`.
 - Inline SVG works: `view("svg").attr("viewBox", …).child(view("path")…)`
   creates real SVG-namespace elements, and the server render carries the
-  `xmlns`. But `show` drives the HTML-only `hidden` property, which SVG
-  ignores: toggle an SVG subtree with `when` (or a class) instead.
+  `xmlns`. `show` works on an SVG subtree too — it writes the inline
+  `display`, which SVG honours, not only the HTML-only `hidden`
+  attribute that SVG ignores.
 - `bind_value` fights remote updates (every keystroke overwrites). For
   server-backed fields, use `bind_draft`.
 - The `owner_scope` compile error means you built UI outside every

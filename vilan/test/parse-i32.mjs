@@ -4,6 +4,25 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function __parse_i32(text) {
 	const trimmed = text.trim();
 	const value = Number(trimmed);
@@ -16,7 +35,7 @@ function $a(self, fallback) {
 		const x = __clone($b[1]);
 		$c = x;
 	} else {
-		$c = __clone(fallback);
+		$c = __clone(__force(fallback));
 	}
 	return $c;
 }
@@ -24,15 +43,27 @@ function $d(self) {
 	const $e = self;
 	return $e[0] === 0;
 }
-console.log($a(__parse_i32("42"), 0 - 1));
-console.log($a(__parse_i32("-7"), 0));
-console.log($a(__parse_i32("+9"), 0));
-console.log($a(__parse_i32(" 42 "), 0 - 1));
+console.log($a(__parse_i32("42"), __lazy("fallback", () => {
+	return 0 - 1;
+})));
+console.log($a(__parse_i32("-7"), __lazy("fallback", () => {
+	return 0;
+})));
+console.log($a(__parse_i32("+9"), __lazy("fallback", () => {
+	return 0;
+})));
+console.log($a(__parse_i32(" 42 "), __lazy("fallback", () => {
+	return 0 - 1;
+})));
 console.log($d(__parse_i32("")));
 console.log($d(__parse_i32("abc")));
 console.log($d(__parse_i32("1.5")));
 console.log($d(__parse_i32("12x")));
-console.log($a(__parse_i32("2147483647"), 0));
+console.log($a(__parse_i32("2147483647"), __lazy("fallback", () => {
+	return 0;
+})));
 console.log($d(__parse_i32("2147483648")));
-console.log($a(__parse_i32("-2147483648"), 0));
+console.log($a(__parse_i32("-2147483648"), __lazy("fallback", () => {
+	return 0;
+})));
 console.log($d(__parse_i32("-2147483649")));

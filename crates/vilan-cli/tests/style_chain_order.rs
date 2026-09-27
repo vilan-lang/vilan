@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use vilan_core::token::Token;
 
+mod support;
+
 /// The tracked sources that carry `style()` builder chains. Each is built as
 /// tracked and built again through the formatter, and the two must render the
 /// same style.
@@ -298,7 +300,7 @@ fn project_root(source: &Path, root: &Path) -> Option<PathBuf> {
 fn scratch_directory(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
+    let directory = support::scratch_root().join(format!(
         "{label}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -598,43 +600,38 @@ const CSS_ORDER_SENSITIVE: &str = concat!(
     "fun main() {\n",
     // The shorthand LAST wins the whole box; the longhand last wins one edge.
     // Both must survive the sort, and only the family rule makes them.
-    "\tlet a = const css { color: {Color::gray(900)}; padding-left: {space(1)}; ",
-    "padding: {space(4)}; };\n",
-    "\tlet b = const css { color: {Color::gray(900)}; padding: {space(4)}; ",
-    "padding-left: {space(1)}; };\n",
+    "\tlet a = const css { color(Color::gray(900)); padding-left(space(1)); ",
+    "padding(space(4)); };\n",
+    "\tlet b = const css { color(Color::gray(900)); padding(space(4)); ",
+    "padding-left(space(1)); };\n",
     // `size` writes width and height; `width` writes one of them. In a block
     // there is no `size` property, so the pair is `width`/`height` themselves.
-    "\tlet c = const css { gap: {space(2)}; width: 32px; height: 16px; };\n",
-    // `border-color` is one of `border`'s longhands. The shorthand's value is
-    // written HOLE-FREE (B148): a value that mixes text with a hole lowers to a
-    // `str` concatenation, and `1px solid {Color::gray(500)}` was concatenating
-    // the token's two-field struct — emitting
-    // `1px solid var(--gray-500),:root{--gray-500:#6b7280}`, invalid CSS that
-    // this fixture could not see because it compares two builds of itself. What
-    // is under test is the ORDER of the two properties; the values do not enter
-    // it, and `border-color`'s one-hole token still carries a real one.
-    "\tlet e = const css { display: flex; border-color: {Color::gray(300)}; ",
-    "border: 1px solid black; };\n",
-    "\tlet f = const css { display: flex; border: 1px solid black; ",
-    "border-color: {Color::gray(300)}; };\n",
+    "\tlet c = const css { gap(space(2)); width(px(32)); height(px(16)); };\n",
+    // `border-color` is one of `border`'s longhands. What is under test is the
+    // ORDER of the two properties; the values do not enter it, and
+    // `border-color`'s typed argument still carries a real token.
+    "\tlet e = const css { display(\"flex\"); border-color(Color::gray(300)); ",
+    "border(\"1px solid black\"); };\n",
+    "\tlet f = const css { display(\"flex\"); border(\"1px solid black\"); ",
+    "border-color(Color::gray(300)); };\n",
     // A property the table does not write is a BARRIER: `padding-top` must not
     // cross it to reach `display`, or the vendor rule stops landing where it was
     // written.
-    "\tlet h = const css { padding-top: {space(1)}; -webkit-mask-composite: source-in; ",
-    "display: flex; color: {Color::gray(900)}; };\n",
+    "\tlet h = const css { padding-top(space(1)); -webkit-mask-composite(\"source-in\"); ",
+    "display(\"flex\"); color(Color::gray(900)); };\n",
     // Conditions sort after every declaration, and among themselves by axis —
     // media, relation, attribute, pseudo — which is the order the selector nests
     // them in, so a wrong axis would change what the rule matches.
     "\tlet i = const css {\n",
-    "\t\t.hover { color: {Color::gray(50)}; }\n",
-    "\t\tpadding: {space(2)};\n",
-    "\t\t.within(\"data-theme\", \"dark\") { color: {Color::gray(100)}; }\n",
-    "\t\tdisplay: flex;\n",
-    "\t\t.md { padding: {space(6)}; }\n",
+    "\t\t.hover { color(Color::gray(50)); }\n",
+    "\t\tpadding(space(2));\n",
+    "\t\t.within(\"data-theme\", Some(\"dark\")) { color(Color::gray(100)); }\n",
+    "\t\tdisplay(\"flex\");\n",
+    "\t\t.md { padding(space(6)); }\n",
     "\t};\n",
     // A nested rule's own body sorts too, with the same rules inside it.
     "\tlet j = const css {\n",
-    "\t\t.hover { padding-left: {space(1)}; padding: {space(4)}; display: flex; }\n",
+    "\t\t.hover { padding-left(space(1)); padding(space(4)); display(\"flex\"); }\n",
     "\t};\n",
     "\tprint(a.class_list());\n",
     "\tprint(b.class_list());\n",
@@ -663,6 +660,188 @@ fn an_order_sensitive_css_block_resolves_the_same_slots() {
         "the canonical order changed which slots resolve in the order-sensitive `css` block \
          fixture — a dependent pair crossed. The block ranks a declaration by the CSS PROPERTY it \
          writes, so this is where the `properties`-to-`family` derivation is proved."
+    );
+}
+
+/// E167's claim, in the only currency that settles it: the `css` block the
+/// editor's "Convert to a `css` block" refactor produces for a TYPED chain
+/// renders the same style the chain does.
+///
+/// The refactor reads a typed link's declarations out of std's own `style.vl`
+/// (`Document::style_link_declarations` inlines the method's body), so
+/// `.padding_x(space(4))` becomes two declarations and `.radius(…)` becomes
+/// `border-radius`. Nothing about that is checkable by reading the block: it is
+/// right exactly when the two programs emit the same stylesheet and resolve the
+/// same slots, which is what this builds and compares — the same two assertions
+/// the sort's own twins make, for the same reason (a class name is a content
+/// hash of the slot key and the declaration, so any drift moves a hash).
+///
+/// The block below is the refactor's OWN OUTPUT, byte for byte: it is pinned as
+/// the replacement text in `vilan-lsp`'s
+/// `refactor_converts_a_typed_property_link_by_inlining_its_std_body` and
+/// `refactor_splits_a_chain_at_a_link_with_no_block_spelling`, so if the
+/// converter's rendering changes, that pin reds and this fixture is the place
+/// the new text has to be proved equivalent.
+const E167_TYPED_CHAIN: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ Color, Length, Style, space, style };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const style()\n",
+    "\t\t.padding_x(space(4))\n",
+    "\t\t.color(Color::gray(900))\n",
+    "\t\t.radius(Length::px(4))\n",
+    "\t\t.raw(\"outline\", \"none\")\n",
+    "\t\t.hover(style().background(Color::gray(100)));\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+const E167_CONVERTED_BLOCK: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ Color, Length, Style, space, style };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const css {\n",
+    "\t\tpadding-left(space(4));\n",
+    "\t\tpadding-right(space(4));\n",
+    "\t\tcolor(Color::gray(900));\n",
+    "\t\tborder-radius(Length::px(4));\n",
+    "\t\toutline(\"none\");\n",
+    "\t\t.hover {\n",
+    "\t\t\tbackground-color(Color::gray(100));\n",
+    "\t\t}\n",
+    "\t};\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+#[test]
+fn the_css_block_refactor_renders_the_typed_chain_it_converted() {
+    let temporary = scratch_directory("vilan-style-e167");
+    let chain_dir = temporary.join("chain");
+    let block_dir = temporary.join("block");
+    std::fs::create_dir_all(&chain_dir).expect("create the chain directory");
+    std::fs::create_dir_all(&block_dir).expect("create the block directory");
+    let chain_source = chain_dir.join("converted.vl");
+    let block_source = block_dir.join("converted.vl");
+    std::fs::write(&chain_source, E167_TYPED_CHAIN).expect("write the chain");
+    std::fs::write(&block_source, E167_CONVERTED_BLOCK).expect("write the block");
+
+    let chain = build(&chain_source, &chain_dir, false)
+        .unwrap_or_else(|error| panic!("the typed chain did not build:\n{error}"));
+    let block = build(&block_source, &block_dir, false)
+        .unwrap_or_else(|error| panic!("the converted block did not build:\n{error}"));
+    let _ = std::fs::remove_dir_all(&temporary);
+
+    assert_eq!(
+        chain.1, block.1,
+        "the converted `css` block emits a different stylesheet than the typed chain it was \
+         converted from - a class name is a content hash of the slot and the declaration, so one \
+         inlined body is writing something the method does not"
+    );
+    assert_eq!(
+        sort_map_entries(&chain.0),
+        sort_map_entries(&block.0),
+        "the converted `css` block resolves different slots than the typed chain it was converted \
+         from"
+    );
+}
+
+/// E172's twin of the above, and the exhibit the item was filed about: the
+/// converter now reads the CURRENT FILE's `impl Style` bodies, so a chain that
+/// opens with the app's OWN shorthand converts. kolt's `button_style` is that
+/// chain — `style().flex_row()` with `flex_row` four lines up the same file —
+/// and before E172 the convertible prefix was empty and the action offered
+/// nothing at all on it.
+///
+/// Inlining an app's method is the same substitution as inlining std's and it
+/// is checkable the same way and no other: the two programs must emit the same
+/// stylesheet and resolve the same slots. It matters more here than for a std
+/// body, because `display(Display::Flex)` inlines to
+/// `display: {Display::Flex.value()};` — a HOLE carrying a method call, written
+/// by a body two levels down (`flex_row` → `display` → `raw`) — and nothing
+/// about that is checkable by reading it.
+///
+/// The block below is the refactor's OWN OUTPUT for this chain, byte for byte;
+/// it is pinned as the replacement text in `vilan-lsp`'s
+/// `refactor_inlines_an_impl_style_extension_declared_in_the_current_file`.
+const E172_EXTENSION_CHAIN: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
+    "\n",
+    "impl Style {\n",
+    "\tfun flex_row(self): Style {\n",
+    "\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const style()\n",
+    "\t\t.flex_row()\n",
+    "\t\t.gap(space(2))\n",
+    "\t\t.align_items(AlignItems::Center)\n",
+    "\t\t.radius(Length::px(4))\n",
+    "\t\t.color(Color::gray(900));\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+const E172_CONVERTED_BLOCK: &str = concat!(
+    "import std::io::print;\n",
+    "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n",
+    "\n",
+    "impl Style {\n",
+    "\tfun flex_row(self): Style {\n",
+    "\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet chain = const css {\n",
+    "\t\tdisplay(Display::Flex.value());\n",
+    "\t\tflex-direction(FlexDirection::Row.value());\n",
+    "\t\tgap(space(2));\n",
+    "\t\talign-items(AlignItems::Center.value());\n",
+    "\t\tborder-radius(Length::px(4));\n",
+    "\t\tcolor(Color::gray(900));\n",
+    "\t};\n",
+    "\tprint(chain.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+#[test]
+fn the_css_block_refactor_renders_the_current_files_own_extension() {
+    let temporary = scratch_directory("vilan-style-e172");
+    let chain_dir = temporary.join("chain");
+    let block_dir = temporary.join("block");
+    std::fs::create_dir_all(&chain_dir).expect("create the chain directory");
+    std::fs::create_dir_all(&block_dir).expect("create the block directory");
+    let chain_source = chain_dir.join("converted.vl");
+    let block_source = block_dir.join("converted.vl");
+    std::fs::write(&chain_source, E172_EXTENSION_CHAIN).expect("write the chain");
+    std::fs::write(&block_source, E172_CONVERTED_BLOCK).expect("write the block");
+
+    let chain = build(&chain_source, &chain_dir, false)
+        .unwrap_or_else(|error| panic!("the extension chain did not build:\n{error}"));
+    let block = build(&block_source, &block_dir, false)
+        .unwrap_or_else(|error| panic!("the converted block did not build:\n{error}"));
+    let _ = std::fs::remove_dir_all(&temporary);
+
+    assert_eq!(
+        chain.1, block.1,
+        "the converted `css` block emits a different stylesheet than the chain it was converted \
+         from - the inlined body of the file's own `impl Style` method is writing something the \
+         method does not"
+    );
+    assert_eq!(
+        sort_map_entries(&chain.0),
+        sort_map_entries(&block.0),
+        "the converted `css` block resolves different slots than the chain it was converted from"
     );
 }
 

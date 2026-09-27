@@ -23,6 +23,29 @@ thing. If that sounds strange coming from JavaScript, start with
 [Coming from JavaScript](coming-from-javascript.md), then read
 [the memory model](memory-model.md) when you're ready for the full story.
 
+## Reserved words
+
+These words are the language's own; none of them can be a binding, a
+parameter, a field or a type name. Most you will meet as you go, but two
+are worth knowing before you hit them: `own` (a parameter that takes
+ownership — see [the memory model](memory-model.md)) and `jump` (the
+prefix on `break` and `continue`), because both are short, ordinary
+English words that make good variable names in every other language.
+
+```text
+async    await    borrows  const    css      dyn      else     enum
+export   external false    for      fun      if       impl     import
+in       is       jump     lazy     let      macro    match    mod
+mut      null     own      ret      struct   trait    true     type
+use      with
+```
+
+A few more words — `self`, `Self`, `void`, `context`, `sync`, `as`, and
+the attribute names in `[...]` — mean something only in one position and
+are ordinary identifiers everywhere else. Spec
+[§2.2](../spec/lexical.md#22-identifiers-and-keywords) lists them, and
+[§A.2](../spec/appendix.md#a2-reserved-words) is the table.
+
 ## Primitives
 
 - `bool`: `true` and `false`.
@@ -30,6 +53,10 @@ thing. If that sounds strange coming from JavaScript, start with
 - Signed integers `i8 i16 i32 i53` and unsigned `u8 u16 u32 u53`. A bare
   literal like `42` is `i32`. Other widths take a suffix: `0xFFu8`,
   `60000u16`, `9007199254740992i53`.
+- `usize`, the index type: a position, a length, a count. It is its own
+  type (convert with `as_usize()` / `as_i32()`), and subtracting one past
+  zero is unspecified — reach for `checked_sub` when zero is possible.
+  [Numbers](../std/numbers.md#usize-the-index-type) has the whole story.
 - Floats: `f64` (a bare `2.5`, or the `f` suffix) and `f32` (`2.5f32`).
 - `BigInt`: arbitrary precision, with the `n` suffix (`7n`).
 
@@ -55,14 +82,20 @@ fun main() {
 Two rules that differ from JS:
 
 - **Integer division truncates toward zero.** `7 / 2` is `3`, and
-  `-7 / 2` is `-3`. Float division works the way you expect.
+  `-7 / 2` is `-3`. Float division works the way you expect — and which
+  one you get is decided by the CONTEXT, because an unsuffixed literal
+  has no type of its own: `let ratio: f64 = 7 / 2;` is `3.5`, while the
+  same expression with nothing to take a type from defaults to `i32` and
+  truncates.
 - **There are no implicit conversions between numeric types.** Mixing an
   `i53` and an `i32` in one expression is a compile error. Convert
   explicitly with the `as_*` methods, or suffix the literal.
 
-That second rule has one trap. If `stamp` is an `i53`,
-write `stamp + 1000i53`, not `stamp + 1000`. The bare `1000` is an `i32`,
-and the mix won't compile.
+A bare literal is not a mix: it takes the type of what it meets. If
+`stamp` is an `i53`, `stamp + 1000` and `1000 + stamp` are both `i53`
+arithmetic, and so is `let delay = 1000; stamp + delay` — an unannotated
+binding of a literal takes its type from its first typed use, and is an
+`i32` only when no use says otherwise.
 
 > **Going deeper.** The `as_*` conversions use Rust's `as` semantics:
 > floats truncate toward zero, and integers fold two's-complement into

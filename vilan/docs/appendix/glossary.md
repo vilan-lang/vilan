@@ -66,9 +66,9 @@ hasn't confirmed yet. Dirty fields ignore adoption; the user's text wins.
 locally at once, commits in the background, and keeps your text on
 failure. [Reactive state](../guide/reactive.md).
 
-<a id="drop"></a>**drop**: destruction. The `Drop` hook runs at an owner's scope end;
-`drop(x)` moves a value in to destroy it early. Only [resources](#resource)
-have one. [Resources](../tour/resources.md).
+<a id="drop"></a>**drop**: destruction. The `Drop` hook runs after an owner's last use;
+`drop(x)` moves a value in to name that point yourself. Only
+[resources](#resource) have one. [Resources](../tour/resources.md).
 
 <a id="echo"></a>**echo**: your own change arriving back through a [mirror](#mirror). A
 draft recognizes it and does nothing, so your caret never jumps.
@@ -107,8 +107,14 @@ background, instead of waiting on the network. What [drafts](#draft)
 implement. [Reactive state](../guide/reactive.md).
 
 <a id="mirror"></a>**mirror**: an `[expose]`d server signal that every connected client
-receives a live copy of. The server writes; every client updates.
+receives a live copy of. The server writes; every client updates. A
+[keyed mirror](#keyed-mirror) sends only what changed.
 [Services & RPC](../guide/services.md).
+
+<a id="keyed-mirror"></a>**keyed mirror**: an `[expose(keyed)]`d collection, where the wire
+carries the CHANGE (an insert, an update, a removal) rather than the whole
+collection — and a client may subscribe to one key rather than all of them.
+[Services & RPC](../guide/services.md#keyed-mirrors-exposekeyed).
 
 <a id="monomorphization"></a>**monomorphization**: how generics compile: each concrete use gets its
 own specialized code, so generic dispatch has no runtime cost.
@@ -150,7 +156,7 @@ and is destroyed deterministically after its last use (a `Database`, an
 
 <a id="safe-integer"></a>**safe integer**: an integer JavaScript's 64-bit floats represent
 exactly: anything within ±2^53. Vilan's `i53`/`u53` are named for this
-window. [Values and types](../tour/values-and-types.md).
+window, and `usize` promises it too. [Values and types](../tour/values-and-types.md).
 
 <a id="service"></a>**service**: a server struct whose `[rpc]` methods clients call and
 whose `[expose]`d signals clients [mirror](#mirror).
@@ -202,6 +208,8 @@ held across a [suspension](#suspension).
 <a id="wave"></a>**wave**: one settling of a [turn](#turn): every affected watcher runs
 once with the final values. [Reactive state](../guide/reactive.md).
 
-<a id="wire"></a>**Wire**: the "can travel over the network" capability: scalars, lists
-and options of Wire types, and anything with `[derive(Wire)]`.
+<a id="wire"></a>**Wire**: the "can travel over the network" capability, and an
+ordinary trait: scalars, lists, options, results and maps of Wire types,
+anything with `[derive(Wire)]`, and any type you write an `impl … with Wire`
+for.
 [Services & RPC](../guide/services.md).

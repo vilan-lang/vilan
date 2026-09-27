@@ -57,8 +57,10 @@ fn seal<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
     (Node::LiftRegion(steps, Box::new(body)), span)
 }
 
-fn seal_boxed<'src>(node: Box<Spanned<Node<'src>>>) -> Box<Spanned<Node<'src>>> {
-    Box::new(seal(*node))
+// In place, in the box the tree already owns — see `css::desugar_boxed`.
+fn seal_boxed<'src>(mut node: Box<Spanned<Node<'src>>>) -> Box<Spanned<Node<'src>>> {
+    take_and_seal(&mut node);
+    node
 }
 
 fn seal_opt<'src>(node: Option<Box<Spanned<Node<'src>>>>) -> Option<Box<Spanned<Node<'src>>>> {
@@ -281,8 +283,8 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             return_type,
             return_value: seal_boxed(return_value),
         }),
-        Node::Let(name, annotation, value, mutable) => {
-            Node::Let(name, annotation, seal_opt(value), mutable)
+        Node::Let(name, annotation, value, mutable, lazy, labels) => {
+            Node::Let(name, annotation, seal_opt(value), mutable, lazy, labels)
         }
         Node::LetDestructure(pattern, annotation, value, mutable) => {
             Node::LetDestructure(pattern, annotation, seal_opt(value), mutable)
@@ -304,13 +306,13 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             Node::Tuple(items)
         }
         Node::Repeat(value, length) => Node::Repeat(seal_boxed(value), seal_boxed(length)),
-        Node::StructInitializer(name, generics, mut fields) => {
+        Node::StructInitializer(namespace, name, generics, mut fields) => {
             for field in fields.0.iter_mut() {
                 if let Some(value) = field.0.1.as_mut() {
                     take_and_seal(value);
                 }
             }
-            Node::StructInitializer(name, generics, fields)
+            Node::StructInitializer(namespace, name, generics, fields)
         }
         Node::Binary(op, left, right) => Node::Binary(op, seal_boxed(left), seal_boxed(right)),
         Node::Unary(op, inner) => Node::Unary(op, seal_boxed(inner)),
@@ -321,10 +323,10 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
         Node::Await(inner) => Node::Await(seal_boxed(inner)),
         Node::Async(inner) => Node::Async(seal_boxed(inner)),
         Node::FuncReturn(value) => Node::FuncReturn(seal_opt(value)),
-        Node::Export(inner) => Node::Export(seal_boxed(inner)),
+        Node::Export(scope, inner, labels) => Node::Export(scope, seal_boxed(inner), labels),
         Node::Const(inner) => Node::Const(seal_boxed(inner)),
         Node::Derive(names, inner) => Node::Derive(names, seal_boxed(inner)),
-        Node::Service(name, inner) => Node::Service(name, seal_boxed(inner)),
+        Node::Service(attribute, inner) => Node::Service(attribute, seal_boxed(inner)),
         Node::MacroAttribute(name, name_span, arguments, inner) => {
             Node::MacroAttribute(name, name_span, arguments, seal_boxed(inner))
         }
@@ -332,13 +334,13 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             seal_list(&mut items.0);
             Node::Module(name, items)
         }
-        Node::Impl(subject, traits, mut members) => {
+        Node::Impl(subject, traits, mut members, labels) => {
             seal_list(&mut members.0);
-            Node::Impl(subject, traits, members)
+            Node::Impl(subject, traits, members, labels)
         }
-        Node::Trait(name, generics, supertraits, mut members) => {
+        Node::Trait(name, generics, supertraits, mut members, labels) => {
             seal_list(&mut members.0);
-            Node::Trait(name, generics, supertraits, members)
+            Node::Trait(name, generics, supertraits, members, labels)
         }
         // A chain-form lift is a sealed atom: its own value never absorbs
         // into a region (§5), but marks in its interior slots (arguments of

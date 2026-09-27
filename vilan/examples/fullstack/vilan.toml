@@ -10,5 +10,12 @@
 #                   (`dist/server.mjs` for Node, `dist/client.js` for the browser)
 #   vilan run .     builds both and starts the Node server, which serves the
 #                   client bundle (the workspace's single `node` member is run)
+#
+# There is no `prelude` key here, and there cannot be one: the ambient scope is
+# PER PACKAGE and never inherited (`proposal/prelude.md` §7), so each member
+# below declares its own and a `[project]` declares none. This example is the
+# clearest place to see that — the browser member takes the web set, the node
+# member and the shared library take the base set, and none of the three has to
+# agree with the others.
 [project]
 packages = ["common", "client", "server"]

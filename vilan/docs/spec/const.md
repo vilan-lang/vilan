@@ -82,8 +82,8 @@ stops at a link whose target leaves the project — saying so, since that
 is where the command's scope ends and not a judgement about the link.
 
 A function that reaches any verb of the channel — `emit`, `emit_keyed`,
-`read`, `bundle`, `bundle_as`, `read_dir`, `read_dir_all`, `digest` — is
-**compile-time-only**,
+`schedule_at_end`, `stage`, `staged`, `read`, `bundle`, `bundle_as`,
+`read_dir`, `read_dir_all`, `digest` — is **compile-time-only**,
 transitively, and the compiler enforces that statically. A call from
 runtime code into compile-time-only territory is an error at the
 outermost crossing — the call that leaves ordinary code. A crossing
@@ -101,7 +101,47 @@ one as a value (passing it to a higher-order function, binding it, or
 writing a closure literal that reaches the channel) is an error at
 that reference, outside a `const`. Inside a `const` the restriction
 lifts entirely — the interpreter makes the call, so
-`const apply(styled)` is legal where `apply(styled)` is not.
+`const apply(styled)` is legal where `apply(styled)` is not. The one
+other place it lifts is `schedule_at_end`'s own argument, below: the
+name is handed to the const pass and never becomes a runtime value.
+
+The channel has a fourth direction, and it is a direction in TIME
+rather than in data: `schedule_at_end(f)` asks the build to call `f`
+once, after every const evaluation of this compile has finished, in a
+const context of its own. A module can then accumulate while the
+program evaluates and process and emit the whole result in one go at
+the end, instead of emitting each piece the moment it is minted and
+being unable to take any of it back — which is how `std::style` writes
+a stylesheet holding the rules that survived rather than every rule
+ever built.
+
+`f` must be a named function and its name is its identity: scheduling
+the same function three times schedules it once, so every contributor
+can ask without coordinating, and finalisers run in the order they were
+first asked for. A finaliser sees every contribution made *after* its
+scheduling, which is the point — it runs after the last const
+expression, not after the one that asked for it. It may schedule
+another finaliser (that one runs in the same pass); re-scheduling
+itself does nothing. A finaliser that panics fails the build, naming
+the function.
+
+"The end" is the end of one compile's const pass — per leg, like every
+other const fact. Under `vilan run --watch` that is the end of the
+round: what the round re-evaluated re-schedules and re-emits, and what
+it did not touch keeps the asset the previous round wrote.
+
+The hook's other half is the channel's **registry**. `stage(kind,
+token, line)` records a contribution without writing it, against a
+*liveness token*; `staged(kind)` hands back the staged lines whose
+token the build still **names** — the token appears in a value some
+`const` expression evaluated to — in `(token, line)` order and
+deduplicated on that pair. `staged` answers only after evaluation has
+finished, so it is read from a finaliser and refuses anywhere else.
+That is how `std::style` puts the rules that survived on the sheet
+instead of every rule ever constructed: a condition combinator re-mints
+an inner style's rules under the composed condition and drops the
+inner, so the inner's class is in no surviving style and its rule never
+reaches the file.
 
 ## 9.3 Failure and resource limits
 
@@ -172,3 +212,62 @@ computation where a stack trace can show it; `release` does. Folding is
 deterministic — the same source folds identically on every build — and
 the language server never runs the pass, since it produces nothing to
 report.
+
+## 9.6 `const let` and `const fun`
+
+Two **declarations** carry the keyword. Both are statements — module
+level or inside a body — and both are ordinary declarations otherwise.
+
+`const let NAME[: T] = EXPR;` binds a value the **build** computes. It
+is `let NAME = const EXPR;` with one addition: its result may be a
+**closure over compile-time data**, which §9.4's plain-data rule
+refuses everywhere else. Later `const` expressions call through it, and
+runtime code gets the closure's own body with the captured values baked
+in — one emitted arrow, no wrapper:
+
+```vilan
+const fun scale_step(rem: f64): |f64| f64 {
+	|n: f64| rem * n
+}
+
+const let space = scale_step(0.25);
+
+fun main() {
+	print(const space(2f));   // 0.5 — folded at build time
+	print(space(8f));         // 2   — `(n) => 0.25 * n`, emitted once
+}
+```
+
+`const mut` is refused: a compile-time value has no runtime mutation.
+Write `const let` for the compile-time binding, or `mut name = const
+..;` for a runtime binding seeded from one.
+
+`const fun NAME(..) { .. }` declares a function whose body is
+**const-evaluable, checked here**. Reaching a host capability (§9.2) is
+an error at the declaration, naming the capability, instead of at
+whichever `const` expression first tried to fold a call to it. This is
+**not** a colouring requirement: a plain `fun` is still const-callable
+under §9.2's transitive rule, and a `const fun` is still an ordinary
+function at runtime, called with runtime arguments.
+
+A `const` expression that reads a plain binding, and a `let x = const
+..` whose result is a closure, are both refused — and both refusals
+name `const let` as the declaration that admits what was wanted. The
+editor offers the edit as a quick fix.
+
+Both forms take the `export` marker, which wraps the declaration under
+the keyword exactly as it wraps a plain `fun` or a module-level `let`
+(§4 of the visibility rules). A module publishes a compile-time helper
+and the binding it computes the same way it publishes anything else:
+
+```vilan
+export const fun scale_step(rem: f64): |f64| f64 {
+	|n: f64| rem * n
+}
+
+export const let space = scale_step(0.25);
+
+fun main() {
+	print(space(8f));
+}
+```

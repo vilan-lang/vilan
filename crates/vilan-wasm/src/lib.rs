@@ -2,7 +2,7 @@
 //! (backlog D11, `proposal/web-playground.md`).
 //!
 //! There is no filesystem behind this. The toolchain's own sources are compiled
-//! into the binary by `vilan-embedded-std` and registered in core's
+//! into the binary by `vilan-embedded` and registered in core's
 //! document overlay under a synthetic `/toolchain` root at boot; the visitor's
 //! program is registered under `/project`. Module resolution then works exactly
 //! as it does in an editor with unsaved buffers, which is the seam D11 S1 built
@@ -27,7 +27,7 @@
 //!
 //! One thing, since K9 (`proposal/playground-completion.md` §5): the analysis
 //! the last compile produced, so that [`complete_program`] can answer a
-//! keystroke without analyzing. Every `compile_program_for` replaces it; the
+//! keystroke without analyzing. Every `compile_program_with` replaces it; the
 //! instance dying (the page's recycle) discards it; `complete_program` only
 //! reads it, leaks nothing, and answers empty when nothing is retained. The
 //! same single-threaded discipline covers it: a completion never runs
@@ -43,7 +43,9 @@ use vilan_core::{
     BuildOptions, Layer, PackageSpec, Platform, PlatformPattern, Program, Workspace,
     analyze_source, transform,
 };
-use vilan_ide::{Analysis, Completion, CompletionKind, ImportRoots, LineIndex, Position};
+use vilan_ide::{
+    Analysis, Completion, CompletionIndex, CompletionKind, ImportRoots, LineIndex, Position,
+};
 
 /// The synthetic root the embedded toolchain is registered under. It never
 /// exists on any disk; `util::canonical_path` normalizes a non-existent path
@@ -56,6 +58,16 @@ const PROJECT_ROOT: &str = "/project";
 /// The visitor's entry file. One file in v1 — multi-file editing is recorded
 /// future work in the proposal's §9.
 const ENTRY_NAME: &str = "main.vl";
+
+/// The wasm build's stack — the linker's `-zstack-size`, 16 MiB, which is what
+/// `release.yml` ships the playground with (its comment has the measurement)
+/// and what `scripts/ci-local.sh wasm` builds with. Every entry the page calls
+/// DECLARES it to the analyzer's stack probe (N128), because on wasm32 a stack
+/// overflow is not even an abort: the shadow stack grows down into linear
+/// memory and a runaway walk overwrites the page's data. Declared, the probe
+/// panics first, and the page recycles the instance. The two build flags are
+/// held to this number by `the_declared_wasm_stack_is_the_one_the_builds_link`.
+pub const WASM_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Where one diagnostic points, in the shape the page renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +153,14 @@ pub struct CompletionItem {
     /// The import an auto-import candidate adds when accepted (E54c), in the
     /// LIVE text's coordinates.
     pub import_edit: Option<ImportEdit>,
+    /// What the page should MATCH the typed prefix against (E211) — the label,
+    /// stated rather than left to the host's own word rules, which is what a
+    /// hyphenated candidate (`stroke-width`, `--card-gap`) needs.
+    pub filter_text: Option<String>,
+    /// The prefix this candidate REPLACES when it is accepted (E211), in the
+    /// LIVE text's coordinates — the same span the language server sends as a
+    /// `textEdit` range, so the two front-ends filter and insert alike.
+    pub replace: Option<ImportEdit>,
 }
 
 /// A text edit that adds an import: the range to replace (zero-based line,
@@ -191,6 +211,12 @@ impl CompletionItem {
             is_snippet = true;
             boost = -9;
         }
+        // A plain insertion (E160's `name = `): the text, no ranking change —
+        // a struct-initializer field is the only thing offered at its position.
+        if let Some(plain) = completion.insert {
+            insert = plain.text;
+            is_snippet = plain.is_snippet;
+        }
         let import_edit = completion.needs_import.map(|auto_import| {
             detail = Some(auto_import.module_path.join("::"));
             boost = -(1 + i32::from(auto_import.origin_tier));
@@ -203,6 +229,20 @@ impl CompletionItem {
                 text: auto_import.edit_replacement,
             }
         });
+        // E211: the prefix being replaced, in the page's coordinates. Reuses
+        // `ImportEdit`'s shape because it is the same thing — a range plus the
+        // text that goes in it — and the text here is the insertion above, so
+        // a page that applies the range cannot drop a call shape or a snippet.
+        let replace = completion.replace_span.map(|span| {
+            let (start, end) = live.range(&span);
+            ImportEdit {
+                line: start.line,
+                character: start.character,
+                end_line: end.line,
+                end_character: end.character,
+                text: insert.clone(),
+            }
+        });
         CompletionItem {
             label: completion.label,
             kind,
@@ -212,6 +252,8 @@ impl CompletionItem {
             is_snippet,
             boost,
             import_edit,
+            filter_text: completion.filter_text,
+            replace,
         }
     }
 }
@@ -231,23 +273,32 @@ struct Retained {
     entity_spans: Vec<(usize, usize, Id)>,
     platform_requirements: HashMap<Id, String>,
     import_roots: ImportRoots,
+    /// What completion may read that is a function of the analysis alone
+    /// (M25): the auto-import candidate table and the origins' module
+    /// listings. Derived here, where the program is retained, so a keystroke
+    /// reads it instead of re-deriving it — the same place in the playground's
+    /// life that `Document::capture_landed` is in the server's.
+    completion_index: CompletionIndex,
 }
 
 impl Retained {
     fn new(text: &'static str, program: Program<'static>) -> Retained {
         let entity_spans = vilan_ide::entity_spans(&program);
         let platform_requirements = vilan_core::platform_color::requirements(&program);
+        let import_roots = ImportRoots {
+            std: embedded_std_spec(),
+            pkg_root: PathBuf::from(PROJECT_ROOT),
+            dependencies: Vec::new(),
+        };
+        let completion_index = CompletionIndex::build(&program, Some(&import_roots), text);
         Retained {
             text,
             program,
             analyzed: LineIndex::new(text),
             entity_spans,
             platform_requirements,
-            import_roots: ImportRoots {
-                std: embedded_std_spec(),
-                pkg_root: PathBuf::from(PROJECT_ROOT),
-                dependencies: Vec::new(),
-            },
+            import_roots,
+            completion_index,
         }
     }
 }
@@ -307,7 +358,7 @@ fn embedded_std_spec() -> PackageSpec {
 /// instance no matter how many times this runs.
 pub fn boot() {
     let root = Path::new(TOOLCHAIN_ROOT);
-    for (key, contents) in vilan_embedded_std::FILES {
+    for (key, contents) in vilan_embedded::FILES {
         // Keys are always forward-slashed, on every host that generated them.
         vilan_core::analyzer::set_document_overlay(&root.join(key), Some((*contents).to_string()));
     }
@@ -376,25 +427,124 @@ fn interned_entry(source: &str) -> &'static str {
     leaked
 }
 
+/// The ambient scope a playground compile runs under (K14, `prelude.md` §5).
+///
+/// A pasted buffer has no `vilan.toml`, so B156's weakest-scope rule has no
+/// `[package]` to hang the key on and the prelude would have nowhere to come
+/// from. The playground supplies one anyway, as a SYNTHETIC package context —
+/// the entry prelude the manifest would have declared, handed to the analyzer's
+/// existing machinery. It is emphatically not a synthesized file-head import:
+/// §9.2's mandate is that the prelude binds at the weakest layer, so a local
+/// declaration and an explicit import both still win, silently.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PlaygroundPrelude {
+    /// The mode's recommended set — [`PlaygroundPrelude::recommended_for`].
+    #[default]
+    Default,
+    /// No ambient scope at all: the toggle's OFF position. Explicit imports
+    /// required, exactly as `prelude = false` states it in a manifest — and
+    /// the position a page teaching where a name really lives wants.
+    Off,
+    /// A named prelude module, for a caller that wants to pin one rather than
+    /// take the mode's default.
+    Module(String),
+}
+
+/// The wire spelling of [`PlaygroundPrelude::Off`] — the one value the page's
+/// toggle sends that is not a module path. A module path is `root::module`
+/// (`prelude_module_scope` accepts nothing else), so a single bare segment can
+/// never collide with one.
+pub const PRELUDE_OFF: &str = "off";
+
+impl PlaygroundPrelude {
+    /// The set a mode gets when the page says nothing: the WEB set in the
+    /// browser, the BASE set on a process platform.
+    ///
+    /// The browser mode is not "a program that happens to target the browser" —
+    /// it is the playground's running mode, and what runs there is a web app.
+    /// That is the corpus §5.3 sized the web set for, and it is the one corpus
+    /// §3.3 showed the base seven never empty an import block for. The server
+    /// check mode is a process program and takes the base set, which is what
+    /// `vilan init` would give it.
+    pub fn recommended_for(platform: Platform) -> vilan_core::manifest::PreludeSpec {
+        let module = match platform {
+            Platform::Browser => vilan_core::manifest::WEB_PRELUDE,
+            _ => vilan_core::manifest::DEFAULT_PRELUDE,
+        };
+        vilan_core::manifest::PreludeSpec::Module(module.to_string())
+    }
+
+    /// The page's wire form: absent is the mode's recommended set, [`PRELUDE_OFF`]
+    /// is no prelude, anything else is a module path. Total by construction —
+    /// the binding layer below has no decision left to make, and this one is
+    /// covered by the native tests.
+    pub fn from_option(value: Option<&str>) -> PlaygroundPrelude {
+        match value {
+            None => PlaygroundPrelude::Default,
+            Some(PRELUDE_OFF) => PlaygroundPrelude::Off,
+            Some(path) => PlaygroundPrelude::Module(path.to_string()),
+        }
+    }
+
+    /// This option resolved against the mode it was asked for.
+    fn resolve(self, platform: Platform) -> vilan_core::manifest::PreludeSpec {
+        match self {
+            PlaygroundPrelude::Default => PlaygroundPrelude::recommended_for(platform),
+            PlaygroundPrelude::Off => vilan_core::manifest::PreludeSpec::Off,
+            PlaygroundPrelude::Module(path) => vilan_core::manifest::PreludeSpec::Module(path),
+        }
+    }
+}
+
 /// Compiles one Vilan source string for the browser platform — what the
-/// playground runs. See [`compile_program_for`] for the platform-explicit
-/// form behind the page's server check mode.
+/// playground runs — under the browser mode's recommended ambient scope. See
+/// [`compile_program_for`] for the platform-explicit form behind the page's
+/// server check mode, and [`compile_program_with`] for the prelude-explicit one
+/// behind its toggle.
 pub fn compile_program(source: &str) -> CompileOutput {
     compile_program_for(source, Platform::Browser)
 }
 
-/// Compiles for an explicit platform. `Platform::Browser` is the running
-/// mode; a process platform is the playground's CHECK-ONLY server mode — the
-/// diagnostics (platform coloring above all) are real, and the emitted
-/// program, while genuine, is for a process host the page does not have.
-/// Passing the platform explicitly also bypasses `infer_platform`, which
-/// probes the disk.
+/// Compiles for an explicit platform, under that mode's recommended ambient
+/// scope. `Platform::Browser` is the running mode; a process platform is the
+/// playground's CHECK-ONLY server mode — the diagnostics (platform coloring
+/// above all) are real, and the emitted program, while genuine, is for a
+/// process host the page does not have. Passing the platform explicitly also
+/// bypasses `infer_platform`, which probes the disk.
 pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
+    compile_program_with(source, platform, PlaygroundPrelude::Default)
+}
+
+/// Compiles for an explicit platform and an explicit ambient scope — the full
+/// surface, behind the page's mode toggle and its prelude toggle.
+///
+/// The prelude rides on `Workspace::entry_prelude`, which is where a manifest's
+/// `[package] prelude` lands for every other front end (`prelude.md` §6). The
+/// playground has no manifest, so this IS the synthetic package context: one
+/// field, read by the same `seed_preludes` pass that serves `vilan build`, so a
+/// pasted single-file program means what it would inside a fresh `vilan init`
+/// package. The base cache keys on it (`BaseCacheKey::entry_prelude`), so
+/// flipping the toggle or the mode never serves the other one's world.
+pub fn compile_program_with(
+    source: &str,
+    platform: Platform,
+    prelude: PlaygroundPrelude,
+) -> CompileOutput {
     boot();
 
     let entry_path = PathBuf::from(PROJECT_ROOT).join(ENTRY_NAME);
     vilan_core::analyzer::set_document_overlay(&entry_path, Some(source.to_string()));
 
+    let workspace = Workspace {
+        entry_prelude: prelude.resolve(platform),
+        // There is no `vilan.toml` behind a pasted buffer, so the web-set steer
+        // must not send a visitor to one (E120). The page's own prelude toggle
+        // is where this program's ambient scope is actually set — the wire form
+        // the binding layer below passes straight through — so it is what the
+        // steer names.
+        prelude_repair: vilan_core::PreludeRepair::Toggle,
+        ..Workspace::default()
+    };
     let leaked = interned_entry(source);
     let (program, errors) = analyze_source(
         leaked,
@@ -402,7 +552,7 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         Path::new(PROJECT_ROOT),
         &entry_path,
         Some(platform),
-        &Workspace::default(),
+        &workspace,
     );
 
     let Some(program) = program else {
@@ -625,7 +775,10 @@ pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<Completi
             entity_spans: &retained.entity_spans,
             platform_requirements: &retained.platform_requirements,
             import_roots: Some(&retained.import_roots),
+            index: &retained.completion_index,
             source_texts: Default::default(),
+            anchor: Default::default(),
+            scope_extents: Default::default(),
         };
         let offset = live.offset(Position { line, character });
         analysis
@@ -636,12 +789,56 @@ pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<Completi
     })
 }
 
+/// What the Format button learns (E197): the text to put in the editor, and
+/// the reason there is no new text when there is none.
+///
+/// `text` is the ORIGINAL bytes on a decline, so a caller that wants text and
+/// nothing else reads this field alone and behaves exactly as the old
+/// `String`-returning `format_program` did — a file the formatter does not
+/// fully understand is not one to rewrite.
+pub struct FormatOutcome {
+    pub text: String,
+    /// The decline's own sentence (`formatter::Decline::sentence`, the CLI's
+    /// and the language server's words for the same event), or `None` when the
+    /// reprint stands.
+    pub declined: Option<String>,
+}
+
 /// Formats one Vilan source string — the CLI's `vilan fmt` rule exactly
-/// (`formatter::format`): canonical layout when the reprint round-trips, the
-/// ORIGINAL bytes when it does not (the source does not parse, or the printer
-/// bails). Pure text work: no boot, no overlay, no platform.
-pub fn format_program(source: &str) -> String {
-    vilan_core::formatter::format(source)
+/// (`formatter::reprint`): canonical layout when the reprint round-trips, and
+/// otherwise the ORIGINAL bytes plus the reason. Pure text work: no boot, no
+/// overlay, no platform.
+///
+/// E197 moved this off `formatter::format`, which answers the original bytes on
+/// every way out: the page could not tell an already-canonical file from one
+/// the printer cannot render, so pressing Format on a construct with no rule
+/// looked exactly like pressing it on a clean file.
+pub fn format_program(source: &str) -> FormatOutcome {
+    format_program_with(source, vilan_core::formatter::FormatOptions::default())
+}
+
+/// [`format_program`] under an explicit set of `[fmt]` knobs (E216).
+///
+/// The page is the manifest here: a pasted buffer has no `vilan.toml`, so the
+/// option cannot be climbed to the way the CLI and the language server climb
+/// to it (`manifest::wrap_comments_covering`) — it is a toggle on the page,
+/// threaded through exactly as the prelude and platform toggles are
+/// (`compile_program_with`). [`format_program`] keeps the defaults, so the
+/// deployed glue's `format` export is byte-for-byte what it was.
+pub fn format_program_with(
+    source: &str,
+    options: vilan_core::formatter::FormatOptions,
+) -> FormatOutcome {
+    match vilan_core::formatter::reprint_with(source, options) {
+        Ok(text) => FormatOutcome {
+            text,
+            declined: None,
+        },
+        Err(decline) => FormatOutcome {
+            text: source.to_string(),
+            declined: Some(decline.sentence()),
+        },
+    }
 }
 
 /// The toolchain version this module was built from, for the page's badge.
@@ -658,6 +855,13 @@ pub fn version() -> &'static str {
 #[cfg(target_arch = "wasm32")]
 mod bindings {
     use wasm_bindgen::prelude::*;
+
+    /// Runs one entry's work with the stack DECLARED ([`crate::WASM_STACK_SIZE`]).
+    /// Each export is called by the page from the top of the stack, so the
+    /// declaration made here is made at the thread's top, as the probe needs.
+    fn declared<T>(body: impl FnOnce() -> T) -> T {
+        vilan_core::stack_guard::with_declared_stack(crate::WASM_STACK_SIZE, body)
+    }
 
     /// One diagnostic, as the page consumes it.
     #[wasm_bindgen(getter_with_clone)]
@@ -764,7 +968,7 @@ mod bindings {
     /// Compiles Vilan source to JavaScript for the browser.
     #[wasm_bindgen]
     pub fn compile(source: String) -> CompileResult {
-        convert(crate::compile_program(&source))
+        declared(|| convert(crate::compile_program(&source)))
     }
 
     /// Compiles for a named platform: "node" checks the process leg (the
@@ -773,19 +977,98 @@ mod bindings {
     /// toggle.
     #[wasm_bindgen]
     pub fn compile_for(source: String, platform: String) -> CompileResult {
-        let platform = match platform.as_str() {
+        declared(|| convert(crate::compile_program_for(&source, platform_of(&platform))))
+    }
+
+    /// [`compile_for`] plus the ambient scope (K14): `prelude` is `undefined`
+    /// for the mode's recommended set (the toggle's ON position), the string
+    /// `"off"` for none (its OFF position), or a module path to pin one. The
+    /// page feature-detects this export, so a glue built before it existed
+    /// simply hides the prelude toggle and keeps compiling through
+    /// [`compile_for`] — which takes the same recommended default.
+    #[wasm_bindgen]
+    pub fn compile_with(
+        source: String,
+        platform: String,
+        prelude: Option<String>,
+    ) -> CompileResult {
+        declared(|| {
+            convert(crate::compile_program_with(
+                &source,
+                platform_of(&platform),
+                crate::PlaygroundPrelude::from_option(prelude.as_deref()),
+            ))
+        })
+    }
+
+    /// The page's platform word. "node" is the server check mode; anything
+    /// else — including the word the page sends for its running mode — is the
+    /// browser.
+    fn platform_of(platform: &str) -> crate::Platform {
+        match platform {
             "node" => crate::Platform::default(), // Node, current LTS
             _ => crate::Platform::Browser,
-        };
-        convert(crate::compile_program_for(&source, platform))
+        }
     }
 
     /// Formats Vilan source; the input comes back unchanged when it cannot be
     /// safely reformatted. The page feature-detects this export, so a glue
     /// built before it existed simply hides its Format button.
+    ///
+    /// Kept `String`-shaped deliberately (E197): the deployed glue feature-
+    /// detects the export by NAME and would insert whatever it is handed, so
+    /// widening the return here would put an object into the editor of every
+    /// page served before the next build. A page that wants the reason calls
+    /// [`format_checked`] instead.
     #[wasm_bindgen]
     pub fn format(source: String) -> String {
-        crate::format_program(&source)
+        declared(|| crate::format_program(&source).text)
+    }
+
+    /// One formatting verdict, as the page consumes it (E197).
+    #[wasm_bindgen(getter_with_clone)]
+    pub struct FormatResult {
+        /// The canonical text, or the original bytes when `declined` is set.
+        pub text: String,
+        /// Why there is no new text — the formatter's own sentence, the same
+        /// one `vilan fmt` prints and the language server toasts — or `null`.
+        pub declined: Option<String>,
+    }
+
+    /// Formats Vilan source and says whether it could. The honest half of
+    /// [`format`]: a page showing a status note reads `declined`, which is
+    /// `null` on success and a sentence naming the construct otherwise.
+    #[wasm_bindgen]
+    pub fn format_checked(source: String) -> FormatResult {
+        let outcome = declared(|| crate::format_program(&source));
+        FormatResult {
+            text: outcome.text,
+            declined: outcome.declined,
+        }
+    }
+
+    /// Formats Vilan source with `[fmt] wrap_comments` on or off (E216) — the
+    /// page's own toggle, since a pasted buffer has no manifest to read it
+    /// from. A separate export rather than a parameter on [`format_checked`]:
+    /// the deployed glue calls that one with one argument, and a page served
+    /// before this build must keep working against the next wasm module.
+    #[wasm_bindgen]
+    pub fn format_checked_with(source: String, wrap_comments: bool) -> FormatResult {
+        let outcome = declared(|| {
+            crate::format_program_with(
+                &source,
+                vilan_core::formatter::FormatOptions {
+                    wrap_comments,
+                    // The playground has no manifest to climb: the formatter's own
+                    // width (E215's default = the code width).
+                    comment_width: vilan_core::formatter::DEFAULT_COMMENT_WIDTH,
+                },
+            )
+        });
+        FormatResult {
+            text: outcome.text,
+            declined: outcome.declined,
+        }
     }
 
     /// The toolchain version, for the page's badge.
@@ -813,6 +1096,13 @@ mod bindings {
         pub import_end_line: Option<u32>,
         pub import_end_character: Option<u32>,
         pub import_text: Option<String>,
+        /// E211: what to filter by, and the prefix accepting this candidate
+        /// replaces — flat for the same reason the import edit is.
+        pub filter_text: Option<String>,
+        pub replace_line: Option<u32>,
+        pub replace_character: Option<u32>,
+        pub replace_end_line: Option<u32>,
+        pub replace_end_character: Option<u32>,
     }
 
     /// Completion candidates at `line`/`character` (zero-based line, UTF-16
@@ -821,10 +1111,11 @@ mod bindings {
     /// glue built before it existed simply registers no completion source.
     #[wasm_bindgen]
     pub fn complete(source: String, line: u32, character: u32) -> Vec<CompletionItem> {
-        crate::complete_program(&source, line, character)
+        declared(|| crate::complete_program(&source, line, character))
             .into_iter()
             .map(|item| {
                 let edit = item.import_edit;
+                let replace = item.replace;
                 CompletionItem {
                     label: item.label,
                     kind: item.kind.to_string(),
@@ -838,6 +1129,11 @@ mod bindings {
                     import_end_line: edit.as_ref().map(|edit| edit.end_line),
                     import_end_character: edit.as_ref().map(|edit| edit.end_character),
                     import_text: edit.map(|edit| edit.text),
+                    filter_text: item.filter_text,
+                    replace_line: replace.as_ref().map(|range| range.line),
+                    replace_character: replace.as_ref().map(|range| range.character),
+                    replace_end_line: replace.as_ref().map(|range| range.end_line),
+                    replace_end_character: replace.as_ref().map(|range| range.end_character),
                 }
             })
             .collect()

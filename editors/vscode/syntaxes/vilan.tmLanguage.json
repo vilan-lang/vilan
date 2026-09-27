@@ -3,7 +3,7 @@
  "information_for_contributors": [
   "The word-list halves of this grammar (the keyword, primitive-type, attribute-marker and operator lists) are GENERATED from the compiler's exported tables by crates/vilan-cli/tests/grammar_sync.rs, which byte-gates them on every suite run. Do not hand-edit a generated `match`/`begin` value; change the compiler table (or grammar_sync.rs's role tables) and regenerate:",
   "VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated",
-  "The structural rules (strings, number shapes, elements, `css` blocks, captures, the contextual `context`/`sync` anchors) are hand-written."
+  "The structural rules (strings, number shapes, elements, generic argument lists, `css` blocks, captures, the contextual `context`/`sync` anchors) are hand-written."
  ],
  "name": "Vilan",
  "scopeName": "source.vilan",
@@ -19,6 +19,9 @@
   },
   {
    "include": "#attributes"
+  },
+  {
+   "include": "#generics"
   },
   {
    "include": "#elements"
@@ -205,7 +208,7 @@
     {
      "comment": "Bracket attributes: the built-in markers anywhere, plus GENERIC macro attributes `[name]` / `[name(args)]` at the start of a line (an expression's list literal never opens an item line, which keeps `[1, 2]` and `[x]` out).",
      "name": "meta.attribute.vilan",
-     "begin": "(\\[)(?=\\s*(derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
+     "begin": "(\\[)(?=\\s*(derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated|internal|resource)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
      "beginCaptures": {
       "1": {
        "name": "punctuation.definition.attribute.begin.vilan"
@@ -223,7 +226,7 @@
      "patterns": [
       {
        "name": "keyword.other.attribute.vilan",
-       "match": "\\b(derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b"
+       "match": "\\b(derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated|internal|resource)\\b"
       },
       {
        "comment": "The form words and the `retains` flag inside `[extern(..)]`.",
@@ -305,16 +308,16 @@
     },
     {
      "name": "storage.modifier.vilan",
-     "match": "\\b(let|mut|own|external|export|async|const|resource)\\b"
+     "match": "\\b(let|mut|own|external|export|async|const|lazy)\\b"
     },
     {
      "comment": "`with` (trait impl / bound), the `borrows` return clause, and `css` (the head of a `css { … }` block).",
      "name": "keyword.other.vilan",
-     "match": "\\b(with|borrows|css)\\b"
+     "match": "\\b(dyn|with|borrows|css)\\b"
     },
     {
-     "comment": "The `context` CLAUSE on a closure type \u2014 `(|| void) context owner_scope`, multi `context (a, b)`. It is a contextual keyword (a value or module may be NAMED `context`), and the clause only ever follows a parenthesized closure type \u2014 so the guard is: keyword only right after a `)`.",
-     "match": "(?<=\\))\\s+(context)\\b",
+     "comment": "The `context` CLAUSE \u2014 on a closure type (`(|| void) context owner_scope`, multi `context (a, b)`) and on a `fun` DECLARATION, where it sits after the RETURN type (`fun f(): i32 context settings`, contexts.md \u00a73; B343/R9 keeps that position). It is a contextual keyword (a value or module may be NAMED `context`), so it is guarded on BOTH sides: something a type or a parameter list can END with before it, and a NAME or the multi form's `(` after it \u2014 which is what keeps `context.run(..)` and `context.get()` plain.",
+     "match": "(?<=[A-Za-z0-9_>\\)\\]])\\s+(context)\\b(?=\\s*[\\(A-Za-z_])",
      "captures": {
       "1": {
        "name": "keyword.other.vilan"
@@ -327,6 +330,15 @@
      "captures": {
       "1": {
        "name": "storage.modifier.vilan"
+      }
+     }
+    },
+    {
+     "comment": "The `as` ALIAS in an import path \u2014 `import a::b as c;`, `use a::{ b as c };` (E142/E145). Contextual like `context` and `sync`: the lexer hands `as` back as an identifier and `let as = 1` parses, so the guard is BOTH sides \u2014 an identifier character before it and a name after it, which is the only place the alias can sit.",
+     "match": "(?<=[A-Za-z0-9_])\\s+(as)\\b(?=\\s+[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "keyword.control.import.vilan"
       }
      }
     },
@@ -345,7 +357,7 @@
     {
      "comment": "Primitive types.",
      "name": "support.type.primitive.vilan",
-     "match": "\\b(str|i32|u32|f64|i8|u8|i16|u16|i53|u53|f32|bool|void|any)\\b"
+     "match": "\\b(str|i32|u32|f64|i8|u8|i16|u16|i53|u53|usize|f32|bool|void|any)\\b"
     },
     {
      "comment": "User types / variants \u2014 PascalCase identifiers (and `Self`).",
@@ -372,11 +384,71 @@
     }
    ]
   },
+  "generics": {
+   "patterns": [
+    {
+     "comment": "A generic argument list (E161). Structured as begin/end rather than matched, for two reasons a `match` cannot serve: a TextMate `match` sees ONE LINE, so a head wrapped across lines lost its closing `>` to the operator fallback (and, at the start of a line, to E115's element terminator); and the list NESTS, so one rule including itself is what makes `Source<Option<_: Source<type U>>>` close three lists with `>>>` instead of reading them as a shift. The begin is a `<` glued to a type-name character \u2014 element syntax's own atom-position rule (S2) read from the other side: a tag `<` opens an atom, so a `<` that does NOT is an argument list. The end is `>`, plus three bail-outs (`{`, `}`, `;`) that give the list back at a statement boundary, so the one shape that could run away \u2014 a glued comparison, which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book \u2014 costs the rest of its own statement rather than the rest of the file. The `;` bail-out cost one honest form until E162: a FIXED-ARRAY argument (`SignalCell<[i32; 4]>`) ended the list at the array's LENGTH separator and the tail fell back to the top-level rules. The `[`…`]` sub-rule below is what gives it back — the array is consumed as its own region, so the bail-out never sees that `;` at all. The begin declines a `<` followed by `/` (E164): a `</` is a CLOSING TAG and never an argument list, and without that guard `<span>hello</span>` offered this rule a `<` glued to the `o` of `hello` and had `</span>` painted as a generic — the commonest markup shape in the language, mis-coloured, and invisible to a pin that reads this regex instead of running it.",
+     "name": "meta.generic.vilan",
+     "begin": "(?<=[A-Za-z0-9_])<(?!/)",
+     "end": ">|(?=[{};])",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.definition.generic.begin.vilan"
+      }
+     },
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.definition.generic.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "comment": "The `type` BINDER keyword inside a head (`impl Option<type T>`) \u2014 it introduces a parameter, where the declaration-keyword rule's `type` names an item. Scoped `keyword.other.*`, which VS Code's own dark_vs/light_vs (and so Dark+/Light+/Dark Modern/Light Modern, which include them) colour from the base `keyword` rule \u2014 the keyword colour, and the one `storage.modifier` already resolves to in those themes. Guarded by a following NAME, which is the only shape a binder has.",
+       "name": "keyword.other.type-binder.vilan",
+       "match": "\\b(type)\\b(?=\\s+[A-Za-z_])"
+      },
+      {
+       "comment": "The ANONYMOUS binder `_` (B294) \u2014 a parameter the author declined to name, and a language-defined spelling rather than a type name, so it takes the scope `self` takes.",
+       "name": "variable.language.wildcard.vilan",
+       "match": "(?<![A-Za-z0-9_])_(?![A-Za-z0-9_])"
+      },
+      {
+       "comment": "A FIXED-ARRAY argument (E162): `SignalCell<[i32; 4]>`. Its own region, and that is the whole fix \u2014 the enclosing list bails out at a `;` so a glued comparison cannot run away, and an array's LENGTH separator is the one `;` a type argument legitimately contains. Consuming the array here means the bail-out is never offered that `;`: a begin/end region's contained rules and its end pattern are matched at their earliest position, and the `[` comes before the `;`. It carries its own `{`/`}` bail-out for the enclosing list's reason \u2014 an unclosed `[` gives itself back at a statement boundary rather than running to the end of the file. Zero occurrences in std, the corpus, the examples or the book, so nothing in the tree changes colour; the shape is legal and the grammar now reads it.",
+       "begin": "\\[",
+       "end": "\\]|(?=[{}])",
+       "patterns": [
+        {
+         "include": "#generics"
+        },
+        {
+         "include": "#numbers"
+        },
+        {
+         "include": "#keywords"
+        },
+        {
+         "include": "#types"
+        }
+       ]
+      },
+      {
+       "include": "#generics"
+      },
+      {
+       "include": "#keywords"
+      },
+      {
+       "include": "#types"
+      }
+     ]
+    }
+   ]
+  },
   "elements": {
    "patterns": [
     {
-     "comment": "Element syntax (element-syntax S2): a tag name glued to `<` or `</` \u2014 the grammar's own atom-position rule; a spaced comparison never matches.",
-     "match": "(</?)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(/?>)?",
+     "comment": "A CLOSING tag (E164), its own rule and deliberately WITHOUT the `(?<![A-Za-z0-9_])` guard the opening form carries. That guard is element syntax's atom-position rule (S2): a tag `<` OPENS an atom, so a `<` glued to the name before it is a generic argument list rather than a tag. A `</` is never an argument list, whatever precedes it — and with the guard here, `</span>` straight after text was refused by this rule and taken by the generic list instead, whose begin is a `<` glued to an identifier character, which is exactly what text ending in a letter offers it. The generic list declines a `</` now and this rule takes it wherever it sits. The `>` stays optional so a close being typed still reads as one.",
+     "match": "(</)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(>)?",
      "captures": {
       "1": {
        "name": "punctuation.definition.tag.vilan"
@@ -388,6 +460,43 @@
        "name": "punctuation.definition.tag.vilan"
       }
      }
+    },
+    {
+     "comment": "An element HEAD, from `<tag` to the `>` or `/>` that closes it (element-syntax S2). A begin/end REGION since E164, and that is the whole fix: the head was a `match`, a TextMate `match` sees ONE LINE, and its optional `(/?>)` could only reach a `>` that no head item stood between — so `<div class(\"row\")>` had its `>` painted by the operator list, and a head written one item per line had E115's line-start rule for a `>` alone on its own line and nothing at all for any other position. A region ends where the head ends, wherever that is, and E115's rule is gone with the shape that needed it. The begin keeps the atom-position guard (E161), so `Option<type _>` is still an argument list and never a tag named `type`. The end carries the generic list's own three bail-outs (`{`, `}`, `;`) for the generic list's reason: the one shape this begin cannot tell from a head is a GLUED comparison (`a<b`), which the formatter never writes and which appears nowhere in std, the corpus, the examples or the book, and the bail-out costs it the rest of its own statement rather than the rest of the file. A head item's VALUE is consumed by `#element-head-value` before the bail-out is ever offered the `{` or the `;` inside `on:click(|_| { bump(); })`.",
+     "name": "meta.tag.vilan",
+     "begin": "(?<![A-Za-z0-9_])(<)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)",
+     "end": "(/?>)|(?=[{};])",
+     "beginCaptures": {
+      "1": {
+       "name": "punctuation.definition.tag.vilan"
+      },
+      "2": {
+       "name": "entity.name.tag.vilan"
+      }
+     },
+     "endCaptures": {
+      "1": {
+       "name": "punctuation.definition.tag.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "include": "#element-head-value"
+      },
+      {
+       "comment": "A head item's NAME (E170). Inside a head, `class(\"row\")` is an ATTRIBUTE and not a call, and `type(\"checkbox\")` / `for(\"name\")` are attributes too rather than the declaration and control keywords they happen to spell. Before this rule the head had only `$self` to offer them, so a plain name was painted `entity.name.function.vilan` by the call rule and a keyword-named one by the keyword list \u2014 and only the `on:` form and a hyphenated name carried the attribute vocabulary, each by a rule of its own that needs no head to fire. E164's head REGION is what makes this one rule enough: the vocabulary can now be asked for inside a head and nowhere else. It sits before `$self` so it wins the tie at the name's first character (TextMate takes the leftmost match and breaks a tie by list order), and the lookbehind is what keeps it to a head item's OWN name: a `.` leaves a chained call alone (`hidden.show(..)`), a `-` leaves a hyphenated name to the rule that paints the whole of it rather than its last segment, and a `:` leaves `on:click` to the event rule. A value's parentheses are `#element-head-value`'s region, which this rule is not part of, so a genuine call inside a value (`on:click(|| go())`) is still a call.",
+       "match": "(?<![A-Za-z0-9_.:-])([a-z][a-zA-Z0-9_]*)(?=\\()",
+       "name": "entity.other.attribute-name.vilan"
+      },
+      {
+       "comment": "A PARENLESS head item's name (E176). E170 gave the head its attribute vocabulary and reached only the names a `(` follows, so the two head items that carry no parens of their own painted as NOTHING: a bare boolean attribute (`disabled` in `<input type(\"checkbox\") disabled />`) and the attribute half of an attribute-then-chain item (`hidden` in `hidden.show(flag)`, whose `show` is a chain link and is coloured as the call it is). Both are attribute names by the grammar's own one-token rule — inside a head, a leading `.` is chain form, `on` plus `:` is the event form, an ident plus `(` is an attribute with a value, and a bare ident is a boolean attribute — so the vocabulary is owed to them. One more rule, after E170's and before `$self`, with the SAME lookbehind (a `.` leaves a chain link alone, a `-` leaves a hyphenated name to the rule that paints the whole of it, a `:` leaves `on:click` to the event rule) plus a `<` that keeps it off a tag name in the shape where the head region's own begin did not consume one. What is new is the LOOKAHEAD, and it is what the rule is: not a `(`, which is E170's; not a `:`, which would take `on` out of `on:click` and leave the event name uncoloured, since this rule sits ahead of `$self` and would win the tie at the same character; and not a `-`, which is the first segment of a hyphenated name. A `.` is deliberately allowed, because that is the `hidden` case. A `{hole}` never reaches this rule: the head region ENDS at a `{`, so a child hole is outside it, and a value's parentheses are `#element-head-value`'s own region, which this rule is not part of.",
+       "match": "(?<![A-Za-z0-9_.:<-])([a-z][a-zA-Z0-9_]*)(?![A-Za-z0-9_(:-])",
+       "name": "entity.other.attribute-name.vilan"
+      },
+      {
+       "include": "$self"
+      }
+     ]
     },
     {
      "comment": "The event form `on:click(\u2026)`.",
@@ -402,6 +511,23 @@
      "comment": "A hyphenated attribute name in a head (`aria-label(`, `data-id(`).",
      "match": "\\b([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)+)(?=\\()",
      "name": "entity.other.attribute-name.vilan"
+    }
+   ]
+  },
+  "element-head-value": {
+   "patterns": [
+    {
+     "comment": "A head item's VALUE: the parenthesised expression in `class(\"row\")`, `on:click(|_| { bump(); })`, `hidden.show(a > b)`. Its own region for the reason E162's fixed-array sub-rule is one — the element head bails out at `{`, `}` and `;` so a glued comparison cannot run away, and those three characters are exactly what a closure-valued head item legitimately contains. Consuming the parens here means the bail-out is never offered them: a region's contained rules and its end pattern are matched at their earliest position, and the `(` comes first. It includes ITSELF for a nested call (`on:click(|| go())`) and `$self` for everything else an expression can be, so a value paints exactly as the same text would anywhere else.",
+     "begin": "\\(",
+     "end": "\\)",
+     "patterns": [
+      {
+       "include": "#element-head-value"
+      },
+      {
+       "include": "$self"
+      }
+     ]
     }
    ]
   },
@@ -471,26 +597,17 @@
      ]
     },
     {
-     "comment": "A property name and its `:` — the span-adjacent name-`-`-name run the grammar reads, custom properties (`--brand-ink`) and vendor prefixes (`-webkit-…`) included.",
-     "match": "(-{0,2}[a-zA-Z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(:)",
-     "captures": {
+     "comment": "A DECLARATION, which since A101 is a CALL: the property name — the span-adjacent name-`-`-name run the grammar reads, custom properties (`--brand-ink`) and vendor prefixes (`-webkit-…`) included — and then its argument list, whose contents are ordinary vilan. begin/end rather than a match, because the arguments are expressions and a value may span lines; the parens carry the scopes the `{expression}` hole used to, since they mark the same thing it did — where CSS stops and vilan starts.",
+     "begin": "(-{0,2}[a-zA-Z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(\\()",
+     "beginCaptures": {
       "1": {
        "name": "support.type.property-name.vilan"
       },
       "2": {
-       "name": "punctuation.separator.key-value.vilan"
-      }
-     }
-    },
-    {
-     "comment": "A `{expression}` hole. Nested rules are matched first and take their own braces, so a bare `{` inside a block is always a hole; its contents are ordinary vilan.",
-     "begin": "\\{",
-     "beginCaptures": {
-      "0": {
        "name": "punctuation.section.embedded.begin.vilan"
       }
      },
-     "end": "\\}",
+     "end": "\\)",
      "endCaptures": {
       "0": {
        "name": "punctuation.section.embedded.end.vilan"

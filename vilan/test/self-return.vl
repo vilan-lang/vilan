@@ -8,10 +8,14 @@ trait Combine<B = Self> {
 	}
 }
 
-struct Counter { value: i32 }
+struct Counter {
+	value: i32,
+}
 
 impl Counter with Combine {
-	fun value_of(self): i32 { self.value }
+	fun value_of(self): i32 {
+		self.value
+	}
 	fun combine(self, b: Counter): Counter {
 		Counter { value = self.value + b.value }
 	}

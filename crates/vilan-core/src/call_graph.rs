@@ -120,6 +120,48 @@ pub struct CallGraph {
     /// which is what makes module-level spawn legal). Module initialization is
     /// synchronous, so any entry here is a refusal; `async_infer` reports it.
     initializer_awaits: HashMap<Id, Vec<Id>>,
+    /// E124: the edges out of a `const`-marked module binding's initializer,
+    /// collected BESIDE the emission graph rather than into it — the four maps
+    /// above, for exactly the bindings the loop below skips.
+    ///
+    /// The skip is load-bearing for emission and must not be disturbed: a
+    /// `const` initializer is evaluated by the compile-time interpreter and
+    /// serialized as a value, so at runtime it is data, and following its calls
+    /// would drag (say) a `node:` import into a browser bundle. It is wrong for
+    /// PAINT, though, and measurably so — `dead-code-paint.md` §1.6 traces 27 of
+    /// kolt's 1,859 grays to two `const` initializers in one file, every one of
+    /// them a function whose deletion breaks the build. So the edges are kept,
+    /// unused by every consumer but [`crate::dead_items`], which asks the
+    /// traversal to follow them.
+    const_initializer_calls: HashMap<Id, Vec<Call>>,
+    const_initializer_closures: HashMap<Id, Vec<Id>>,
+    const_global_references: HashMap<Id, Vec<(Id, Id)>>,
+    const_function_references: HashMap<Id, Vec<(Id, Id)>>,
+    /// B269: every `const` REGION of the program, as a key into the four maps
+    /// above — the paint's roots beside `main`.
+    ///
+    /// E124 collected the const edges of a module BINDING's initializer and
+    /// left it at that, so a callee stayed reachable only through whatever
+    /// reached the binding. Three shapes have no such thing:
+    ///
+    ///  - `let _page_defaults = const page_defaults();` — the `_` exempts the
+    ///    BINDING from the paint and nothing references it, so the walk never
+    ///    arrives and never follows its const edges;
+    ///  - `const page_defaults();` at module level — a bare statement, not a
+    ///    binding, so `CallGraph::build`'s binding loop never sees it;
+    ///  - `const { bundle(..); style::preflight(); };` — the same, with a
+    ///    block, which is what kolt now writes.
+    ///
+    /// All three run: `const_eval::evaluate` walks `Program::const_exprs`
+    /// unconditionally — not a reachable subset — so a function a `const`
+    /// region calls is used at BUILD time whatever the runtime walk says, and
+    /// deleting it breaks the build. That is the whole of B269: a `const` call
+    /// is a use.
+    ///
+    /// Paint-only, exactly as the four maps are. Emission and admission ask
+    /// what RUNS on the target, and their answer about a const region — data,
+    /// not code — is right.
+    const_regions: Vec<Id>,
 }
 
 thread_local! {
@@ -159,6 +201,15 @@ impl CallGraph {
         let bindings = program.module_level_bindings();
         let module_bindings: HashSet<Id> = bindings.iter().copied().collect();
         let const_exprs: HashSet<Id> = program.const_exprs.iter().copied().collect();
+        // E189: the shape of the calls that never wired, so the walk below can
+        // descend into them exactly as it descends into the ones that did.
+        // Empty on a program with no resolution error, which is every program
+        // the emitting pipeline ever reaches.
+        let unwired: HashMap<Id, (Id, &[Id])> = program
+            .unwired_calls
+            .iter()
+            .map(|(call_id, subject_id, arguments)| (*call_id, (*subject_id, arguments.as_slice())))
+            .collect();
 
         for (id, function) in &program.functions {
             // A signature-only trait method has no body to walk.
@@ -169,6 +220,7 @@ impl CallGraph {
                 Node::Function(*id),
                 program,
                 &module_bindings,
+                &unwired,
                 |collector| {
                     collector.walk_all(&function.body.0);
                     collector.walk(function.body.1);
@@ -180,9 +232,15 @@ impl CallGraph {
         // roots directly; the walk of their defining body only records the
         // lexical parent link (it does not descend into the closure).
         for (id, closure) in &program.closures {
-            graph.add_node(Node::Closure(*id), program, &module_bindings, |collector| {
-                collector.walk(closure.return_);
-            });
+            graph.add_node(
+                Node::Closure(*id),
+                program,
+                &module_bindings,
+                &unwired,
+                |collector| {
+                    collector.walk(closure.return_);
+                },
+            );
         }
 
         // Module-level bindings: their initializers are code too — they run
@@ -200,9 +258,7 @@ impl CallGraph {
             else {
                 continue;
             };
-            if const_exprs.contains(&initial) {
-                continue;
-            }
+            let is_const = const_exprs.contains(&initial);
             let mut collector = Collector {
                 program,
                 globals: &module_bindings,
@@ -211,9 +267,30 @@ impl CallGraph {
                 global_references: Vec::new(),
                 function_references: Vec::new(),
                 await_sites: Vec::new(),
+                unwired: &unwired,
                 visited: HashSet::default(),
             };
             collector.walk(initial);
+            // A `const` initializer's edges go to the paint-only maps and
+            // NOWHERE else: not `initializer_awaits` (module init is
+            // synchronous and a const initializer does not run at run time at
+            // all, so an entry there would be a refusal about code that never
+            // executes), and not the reverse edges below.
+            if is_const {
+                graph
+                    .const_initializer_calls
+                    .insert(binding, collector.calls);
+                graph
+                    .const_initializer_closures
+                    .insert(binding, collector.nested_closures);
+                graph
+                    .const_global_references
+                    .insert(binding, collector.global_references);
+                graph
+                    .const_function_references
+                    .insert(binding, collector.function_references);
+                continue;
+            }
             graph.initializer_calls.insert(binding, collector.calls);
             graph
                 .initializer_awaits
@@ -229,17 +306,69 @@ impl CallGraph {
                 .insert(binding, collector.function_references);
         }
 
+        // B269: the const REGIONS, which are the paint's roots beside `main`.
+        // A module binding's initializer already has its edges above, so the
+        // binding itself is the key; every other `const` expression is
+        // collected here under its own id. `const_exprs` holds the marked
+        // expression ids in the order the walk found them (innermost first for
+        // a nest), and re-walking an outer region that contains an inner one
+        // costs a second visit of a subtree the const interpreter evaluates
+        // twice over anyway.
+        let const_initializers: HashSet<Id> = bindings
+            .iter()
+            .filter_map(|binding| {
+                let initial = program.variables.get(binding)?.initial?;
+                const_exprs.contains(&initial).then_some(initial)
+            })
+            .collect();
+        for &binding in &bindings {
+            if graph.const_initializer_calls.contains_key(&binding) {
+                graph.const_regions.push(binding);
+            }
+        }
+        for &region in &program.const_exprs {
+            if const_initializers.contains(&region) || graph.const_regions.contains(&region) {
+                continue;
+            }
+            let mut collector = Collector {
+                program,
+                globals: &module_bindings,
+                calls: Vec::new(),
+                nested_closures: Vec::new(),
+                global_references: Vec::new(),
+                function_references: Vec::new(),
+                await_sites: Vec::new(),
+                unwired: &unwired,
+                visited: HashSet::default(),
+            };
+            collector.walk(region);
+            graph
+                .const_initializer_calls
+                .insert(region, collector.calls);
+            graph
+                .const_initializer_closures
+                .insert(region, collector.nested_closures);
+            graph
+                .const_global_references
+                .insert(region, collector.global_references);
+            graph
+                .const_function_references
+                .insert(region, collector.function_references);
+            graph.const_regions.push(region);
+        }
+
         graph.build_reverse_edges();
         graph
     }
 
     /// Walks one node's body with a fresh collector, recording its forward
     /// edges and the parent link of any closure defined directly inside it.
-    fn add_node(
+    fn add_node<'a>(
         &mut self,
         node: Node,
-        program: &Program,
-        module_bindings: &HashSet<Id>,
+        program: &'a Program,
+        module_bindings: &'a HashSet<Id>,
+        unwired: &'a HashMap<Id, (Id, &'a [Id])>,
         walk: impl FnOnce(&mut Collector),
     ) {
         self.nodes.push(node);
@@ -251,6 +380,7 @@ impl CallGraph {
             global_references: Vec::new(),
             function_references: Vec::new(),
             await_sites: Vec::new(),
+            unwired,
             visited: HashSet::default(),
         };
         walk(&mut collector);
@@ -322,6 +452,48 @@ impl CallGraph {
     /// The calls inside a module-level binding's (non-`const`) initializer.
     pub fn initializer_calls_of(&self, id: Id) -> &[Call] {
         self.initializer_calls
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// E124: the calls inside a module-level binding's `const` initializer —
+    /// the edges [`initializer_calls_of`](Self::initializer_calls_of)
+    /// deliberately does not carry. Only the dead-item paint reads these; see
+    /// the field's own note for why they are kept apart.
+    pub fn const_initializer_calls_of(&self, id: Id) -> &[Call] {
+        self.const_initializer_calls
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// E124: the closures created inside a module-level binding's `const`
+    /// initializer.
+    pub fn const_initializer_closures_of(&self, id: Id) -> &[Id] {
+        self.const_initializer_closures
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// B269: every `const` region of the program — the paint's roots beside
+    /// `main`. See [`CallGraph::const_regions`].
+    pub fn const_regions(&self) -> &[Id] {
+        &self.const_regions
+    }
+
+    /// E124: the module-level bindings a `const` initializer references.
+    pub fn const_global_references_of(&self, id: Id) -> &[(Id, Id)] {
+        self.const_global_references
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// E124: the functions a `const` initializer references as values.
+    pub fn const_function_references_of(&self, id: Id) -> &[(Id, Id)] {
+        self.const_function_references
             .get(&id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
@@ -520,6 +692,16 @@ struct Collector<'a, 'src> {
     /// initializer needs the sites themselves, to span its refusal at the
     /// `await` the user wrote.
     await_sites: Vec<Id>,
+    /// E189 — the SUBJECT and ARGUMENT entities of the calls that never wired,
+    /// by call entity. A call's operands otherwise come out of
+    /// `function_calls`, which holds only the calls the solver SELECTED — and
+    /// an unwired METHOD call has no `entity_map` entry either, so the walk
+    /// stopped at the head of the chain and everything written inside it fell
+    /// out of this graph: the nested calls (their owner unrecorded, which reads
+    /// back as "entered from outside the graph") and the lexical parent link of
+    /// every closure literal among them. Empty for every program that
+    /// type-checks.
+    unwired: &'a HashMap<Id, (Id, &'a [Id])>,
     visited: HashSet<Id>,
 }
 
@@ -535,6 +717,27 @@ impl<'a, 'src> Collector<'a, 'src> {
         // so a single walk can't loop.
         if !self.visited.insert(id) {
             return;
+        }
+        // E189: a call the solver never wired. Whether a call RESOLVED says
+        // nothing about what it lexically CONTAINS, and this walk is about what
+        // it contains — so its operands are walked exactly as a wired call's
+        // are. Checked here rather than in the `Expr::Call` arm below because an
+        // unwired METHOD call never reaches that arm: the walk records
+        // `Expr::Call` when the call WIRES, so a method call that did not has no
+        // entity at all and the bail below would end the descent at the head of
+        // the chain. The subject is pre-marked exactly as the wired arm marks
+        // it, so naming a callee here is not read as taking it as a value.
+        if let Some(&(subject_id, arguments)) = self.unwired.get(&id) {
+            let subject_names_a_function = match self.program.entity_map.get(&subject_id) {
+                Some(Expr::Local(binding)) => self.program.functions.contains_key(binding),
+                Some(Expr::Function(_)) => true,
+                _ => false,
+            };
+            if subject_names_a_function {
+                self.visited.insert(subject_id);
+            }
+            self.walk(subject_id);
+            self.walk_all(arguments);
         }
         let Some(expr) = self.program.entity_map.get(&id) else {
             return;
@@ -803,6 +1006,17 @@ fn resolve_target(program: &Program, call_id: Id) -> CallTarget {
     // by the call id (an instance method call on a generic-bounded receiver, or an
     // `OnType` re-dispatch) — the transformer checks both, so this must too, or an
     // instance dispatch is mistaken for a direct call to the trait's signature.
+    // A124 R3: a call through a trait OBJECT's table reaches whichever
+    // implementation the object holds at run time — every implementation of
+    // the member is a candidate, exactly as for a bound's dispatch. Recording
+    // it as a direct call to the trait's declaration (the member the analyzer
+    // resolved) hid every body behind it from the graph: a module-level
+    // binding read only by `SignalCell::on_change`, reached only through a
+    // `dyn Source`, was pruned from the build and the table's slot threw
+    // `ReferenceError` at its first call.
+    if program.dyn_method_calls.contains_key(&call_id) {
+        return CallTarget::Indirect(IndirectReason::TraitDispatch);
+    }
     for key in [call_id, function_call.subject_id] {
         match program.generic_dispatch.get(&key) {
             Some(GenericDispatch::OnConstraint(..)) => {

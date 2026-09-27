@@ -51,7 +51,7 @@ mod support;
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_hmr_cli_{tag}_{}_{unique}",
         std::process::id()
     ));
@@ -555,7 +555,7 @@ fn the_dev_channel_drives_the_watch_round() {
 /// excluded from adopt), but `value: i32` is `TransferForm::Value`, so it IS
 /// wrapped in the `__hmr_adopt` thunk — which is built `is_async: false`.
 fn awaiting_initializer_source() -> String {
-    "import std::io::print;\nimport std::task::Task;\nimport std::time::sleep;\n\n     fun ready(): i32 {\n\tsleep(0);\n\t7\n}\n\n     let pending: Task<i32> = async ready();\nlet value: i32 = await pending;\n\n     fun main() {\n\tprint(value);\n}\n"
+    "import std::io::print;\nimport std::task::Task;\nimport std::time::sleep;\n\nfun ready(): i32 {\n\tsleep(0);\n\t7\n}\n\nlet pending: Task<i32> = async ready();\nlet value: i32 = await pending;\n\nfun main() {\n\tprint(value);\n}\n"
         .to_string()
 }
 

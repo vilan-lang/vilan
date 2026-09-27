@@ -5,7 +5,9 @@ import std::io::print;
 // borrowed value, so `obj.slot() = x` writes through to the original (a view is
 // assigned through directly, with no `*`) and `let v = obj.slot()` binds it.
 // Reading the value back out is the explicit `*` (`*v`).
-struct Wrapper { value: i32 }
+struct Wrapper {
+	value: i32,
+}
 
 impl Wrapper {
 	fun slot(&mut self): &mut i32 borrows self {

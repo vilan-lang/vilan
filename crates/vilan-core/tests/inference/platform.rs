@@ -33,6 +33,78 @@ fn a_platform_fence_rejects_an_off_platform_reach() {
     );
 }
 
+// --- F27 R1: a file's and an impl's own `[platform(..)]` -------------------
+
+/// A file's `[platform("browser")] mod self;` makes everything in it require browser:
+/// reached from a node entry, the reach is the chain error, anchored at the
+/// user's call — here the entry itself is in the file, so `main` is refused.
+#[test]
+fn a_file_declared_browser_refuses_a_node_build_that_reaches_it() {
+    assert_fails_with(
+        concat!(
+            "[platform(\"browser\")] mod self;\n\n",
+            "fun greet(): str {\n\t\"hi\"\n}\n\n",
+            "fun main() {\n\tlet _ = greet();\n}\n",
+        ),
+        "requires the `browser` platform its file declares and cannot run on `node",
+    );
+    // …and a browser build of the same file is clean.
+    assert!(
+        compile_browser(concat!(
+            "[platform(\"browser\")] mod self;\n\n",
+            "fun greet(): str {\n\t\"hi\"\n}\n\n",
+            "fun main() {\n\tlet _ = greet();\n}\n",
+        ))
+        .is_ok()
+    );
+}
+
+/// It is also the fence on each of the file's functions — a promise checked on
+/// every compile, entry or not — and every function under ONE declaration makes
+/// ONE promise: the off-platform call reached from two of them reports once.
+#[test]
+fn a_file_declaration_fences_its_functions_as_one_promise() {
+    assert_fails_once_with(
+        concat!(
+            "[platform(\"browser\")] mod self;\n\n",
+            "import std::fs::stat;\n\n",
+            "fun probe(): bool {\n\tstat(\"cache\").is_some()\n}\n\n",
+            "fun probe_twice(): bool {\n\tprobe()\n}\n",
+        ),
+        "which its declaration `[platform(\"browser\")]` fences",
+    );
+}
+
+/// On an `impl`, the members require it — and nothing else in the file does.
+#[test]
+fn an_impl_declared_browser_requires_it_of_its_members_alone() {
+    let source = concat!(
+        "struct Slot {}\n\n",
+        "[platform(\"browser\")]\n",
+        "impl Slot {\n\tfun place(self): i32 {\n\t\t1\n\t}\n}\n\n",
+        "fun plain(): i32 {\n\t2\n}\n\n",
+        "fun main() {\n\tlet _ = plain();\n\tlet _ = Slot {}.place();\n}\n",
+    );
+    assert_fails_with(
+        source,
+        "`place` requires the `browser` platform its `impl` declares",
+    );
+    assert_fails_without(source, "`plain` requires");
+}
+
+/// A pattern no platform answers to is reported ONCE, where it is written —
+/// not once per function the declaration covers.
+#[test]
+fn an_unknown_pattern_in_a_file_declaration_is_reported_once() {
+    assert_fails_once_with(
+        concat!(
+            "[platform(\"browsr\")] mod self;\n\n",
+            "fun a() {}\n\nfun b() {}\n\nfun main() {}\n",
+        ),
+        "unknown platform pattern `browsr`",
+    );
+}
+
 #[test]
 fn a_satisfied_fence_compiles_on_every_build_target() {
     let source = r#"
@@ -432,7 +504,7 @@ fn a_drop_only_mistake_still_reports_beside_an_unrelated_one() {
         import std::fs::{ stat, write_file };
         import std::drop::Drop;
 
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }
@@ -493,7 +565,7 @@ fn a_user_written_drop_anchors_at_its_own_off_platform_call() {
         import std::fs::write_file;
         import std::drop::Drop;
 
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }
@@ -1260,7 +1332,7 @@ fn chained_maps_ground_each_link() {
             i"{n}"
         }
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
@@ -1304,7 +1376,7 @@ fn a_closure_grounded_generic_meets_a_method_bound() {
             }
         }
 
-        fun parse(text: str): i32 {
+        fun parse(text: str): usize {
             text.len()
         }
 
@@ -1345,7 +1417,7 @@ fn a_named_function_passes_as_a_method_closure_argument() {
             }
         }
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
@@ -1391,15 +1463,15 @@ fn a_named_function_binds_to_an_annotated_let_and_field() {
         import std::io::print;
 
         struct Holder {
-            hook: |str| i32,
+            hook: |str| usize,
         }
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
         fun main() {
-            let bound: |str| i32 = measure;
+            let bound: |str| usize = measure;
             print(bound("abc"));
             let holder = Holder { hook = measure };
             let hook = holder.hook;
@@ -1463,19 +1535,19 @@ fn a_void_function_without_annotation_coerces() {
 
 #[test]
 fn a_stored_function_value_survives_shared_storage() {
-    // Through `Shared<|str| i32>` — stored as a value, read back, called
+    // Through `Shared<|str| usize>` — stored as a value, read back, called
     // indirectly (the pilot's hook pattern, without the eta-expansion).
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::shared::Shared;
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
         fun main() {
-            let hook: Shared<|str| i32> = Shared::new(measure);
+            let hook: Shared<|str| usize> = Shared::new(measure);
             let stored = hook.read();
             print(stored("abcd"));
         }
@@ -5279,8 +5351,10 @@ fn a_display_bound_reached_through_a_supertrait_still_renders() {
 // a numeric-left `+` refuses, whatever its bound promises — and the same
 // argument closes the rest of the native family, which had the identical hole
 // with the identical garbage. The generic LEFT operand is the other half of the
-// frame (B174) and stays open on purpose: trait defaults write
-// `self.once() + self.once()` over the trait's own parameter today.
+// frame and stayed open on purpose, because trait defaults wrote
+// `self.once() + self.once()` over the trait's own parameter; B174 took that
+// breaking step once its migration was priced at one site, and the two halves
+// now agree — a bound must PROVIDE the operator's method to admit either.
 
 #[test]
 fn a_bounded_generic_added_to_a_number_is_rejected() {
@@ -5564,6 +5638,568 @@ fn the_conversion_steer_for_a_generic_numeric_operand_compiles_and_runs() {
     );
 }
 
+// --- B180: the DISPATCH path never read the impl's declared `B` -------------
+//
+// B179 ruled the operand roles for a NATIVE left operand; a NOMINAL one is
+// where an impl gets to SAY what its operator accepts, and nothing read it.
+// `impl Counter with Add { fun add(self, other: Counter): Counter }` resolved
+// for `Counter { n = 1 } + Point { x = 1, y = 2 }`, handed the `Point` to a
+// body typed for a `Counter`, and printed `2` — the struct's slot 0, read as
+// `other.n`. Every operator the dispatch serves had it, all measured before the
+// fix: `-` gave `7` and `*` gave `30` off the same slot, `==` answered `true`,
+// `<` answered `true` through `PartialOrd`'s inherited default, `/ % << >> & ^
+// |` all computed, and `c += Point { .. }` rode the desugar's second
+// registration site into the same body. `impl Meters with Add<Feet>` accepted a
+// `Meters` (6, reading `other.f` off `m`), and `impl Bag<type T> with Add<T>`
+// at `Bag<i32>` accepted a `str`.
+//
+// The `B` to check is the IMPL's, and it is three things: a type the impl wrote
+// (`Add<Feet>`), the impl's own parameter substituted through what the subject
+// bound (`Add<T>` at `Vec2<i32>` wants an `i32`), or `Self` — spelled, or
+// arrived at through `Add<B = Self>`'s default. A generic right operand refuses
+// for B179's reason one level along: a bound promises a trait's METHODS, never
+// that the parameter IS the declared `B`. The comparison is the RIGID one
+// conformance uses, because the ordinary one treats a parameter as a hole and
+// answers `true` to whatever is asked.
+
+#[test]
+fn a_foreign_struct_on_the_right_of_a_dispatched_add_is_rejected() {
+    // The pin B180 was filed as: GROUNDED both sides, no generics anywhere, and
+    // it printed `2`.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Counter): Counter {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            let counter = Counter { n = 1 };
+            let point = Point { x = 1, y = 2 };
+            print((counter + point).n);
+        }
+        "#,
+        "counter + point",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn a_self_spelled_operand_is_the_subject_like_the_b_equals_self_default() {
+    // Two spellings of the same `B`. `Add<B = Self>`'s default interns `B` as
+    // the trait type itself rather than as a fresh parameter, and a `Self`
+    // written in the impl lands on that same type — so the position has to be
+    // read as "the subject" in both, or the check would have no `B` at all for
+    // the overwhelmingly common impl.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Self): Self {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            let counter = Counter { n = 1 };
+            let point = Point { x = 7, y = 9 };
+            print((counter + point).n);
+        }
+        "#,
+        "counter + point",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn the_self_spelled_operand_still_dispatches_for_the_subject() {
+    // The other half: the `Self` spelling must still ACCEPT a `Counter`, or the
+    // arm above would be refusing the position rather than checking it.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Self): Self {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            print((Counter { n = 1 } + Counter { n = 4 }).n);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn every_dispatched_operator_checks_its_right_operand() {
+    // One check at the dispatch site, not one per trait — so the whole family
+    // is the pin. Each of these computed off `Point`'s slot 0 before the fix.
+    for (operator, trait_name, method) in [
+        ("-", "Sub", "sub"),
+        ("*", "Mul", "mul"),
+        ("/", "Div", "div"),
+        ("%", "Rem", "rem"),
+        ("<<", "Shl", "shl"),
+        (">>", "Shr", "shr"),
+        ("&", "BitAnd", "bit_and"),
+        ("^", "BitXor", "bit_xor"),
+        ("|", "BitOr", "bit_or"),
+    ] {
+        assert_fails_spanning(
+            &format!(
+                r#"
+        import std::operators::{trait_name};
+
+        struct Counter {{ n: i32 }}
+        struct Point {{ x: i32, y: i32 }}
+
+        impl Counter with {trait_name} {{
+            fun {method}(self, other: Counter): Counter {{
+                Counter {{ n = self.n + other.n }}
+            }}
+        }}
+
+        fun main() {{
+            let counter = Counter {{ n = 12 }};
+            let point = Point {{ x = 3, y = 4 }};
+            print((counter {operator} point).n);
+        }}
+        "#
+            ),
+            &format!("counter {operator} point"),
+            &format!("`Counter`'s `{method}` accepts `Counter`, but the right operand is `Point`"),
+        );
+    }
+}
+
+#[test]
+fn a_dispatched_equality_checks_its_other_operand() {
+    // `PartialEq`'s parameter is the same `B`, and `Counter { n = 1 } == Point
+    // { x = 1, y = 2 }` answered a plausible `true` off slot 0. `!=` shares the
+    // dispatch (the transformer negates `eq`), so it shares the refusal.
+    for operator in ["==", "!="] {
+        assert_fails_spanning(
+            &format!(
+                r#"
+        import std::compare::PartialEq;
+
+        struct Counter {{ n: i32 }}
+        struct Point {{ x: i32, y: i32 }}
+
+        impl Counter with PartialEq {{
+            fun eq(self, other: Counter): bool {{
+                self.n == other.n
+            }}
+        }}
+
+        fun main() {{
+            let counter = Counter {{ n = 1 }};
+            let point = Point {{ x = 1, y = 2 }};
+            print(counter {operator} point);
+        }}
+        "#
+            ),
+            &format!("counter {operator} point"),
+            "`Counter`'s `eq` accepts `Counter`, but the right operand is `Point`",
+        );
+    }
+}
+
+#[test]
+fn a_dispatched_ordering_checks_the_operand_of_its_inherited_default() {
+    // The SECOND dispatch branch: an impl declares `partial_compare`, and the
+    // operator reaches its operand through `PartialOrd`'s inherited `lt`/`le`/
+    // `gt`/`ge` default, whose parameter is the TRAIT's `B`. `Counter { n = 1 }
+    // < Point { x = 5, y = 2 }` answered `true` off slot 0.
+    for (operator, method) in [("<", "lt"), (">", "gt"), ("<=", "le"), (">=", "ge")] {
+        assert_fails_spanning(
+            &format!(
+                r#"
+        import std::compare::{{ PartialOrd, PartialEq, Ordering }};
+        import std::option::Option::{{ Some }};
+
+        struct Counter {{ n: i32 }}
+        struct Point {{ x: i32, y: i32 }}
+
+        impl Counter with PartialEq {{
+            fun eq(self, other: Counter): bool {{
+                self.n == other.n
+            }}
+        }}
+
+        impl Counter with PartialOrd {{
+            fun partial_compare(self, other: Counter): Option<Ordering> {{
+                if self.n < other.n {{ Some(Ordering::Less) }} else {{ Some(Ordering::Greater) }}
+            }}
+        }}
+
+        fun main() {{
+            let counter = Counter {{ n = 1 }};
+            let point = Point {{ x = 5, y = 2 }};
+            print(counter {operator} point);
+        }}
+        "#
+            ),
+            &format!("counter {operator} point"),
+            &format!("`Counter`'s `{method}` accepts `Counter`, but the right operand is `Point`"),
+        );
+    }
+}
+
+#[test]
+fn a_compound_assignment_rides_the_dispatch_check() {
+    // `c += p` desugars to `c = c + p` and registers its own binary from the
+    // second site — the same route B179's `total += value` takes.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Counter): Counter {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            mut counter = Counter { n = 1 };
+            counter += Point { x = 7, y = 9 };
+            print(counter.n);
+        }
+        "#,
+        "counter += Point { x = 7, y = 9 }",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn a_concrete_non_self_b_accepts_it_and_refuses_the_subject() {
+    // `impl Meters with Add<Feet>` is the whole reason this is a reconciliation
+    // against the DECLARED `B` and not an equality against the subject: `Meters
+    // + Feet` is the impl's entire point and must run, while `Meters + Meters`
+    // — the shape a `B = Self` reader would assume is the safe one — is the
+    // miscompile, and printed `6` by reading `other.f` off the `m` slot.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+
+        impl Meters with Add<Feet> {
+            fun add(self, other: Feet): Meters {
+                Meters { m = self.m + other.f }
+            }
+        }
+
+        fun main() {
+            print((Meters { m = 1 } + Feet { f = 2 }).m);
+        }
+        "#,
+        "3\n",
+    );
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+
+        impl Meters with Add<Feet> {
+            fun add(self, other: Feet): Meters {
+                Meters { m = self.m + other.f }
+            }
+        }
+
+        fun main() {
+            let near = Meters { m = 1 };
+            let far = Meters { m = 5 };
+            print((near + far).m);
+        }
+        "#,
+        "near + far",
+        "`Meters`'s `add` accepts `Feet`, but the right operand is `Meters`",
+    );
+}
+
+#[test]
+fn the_impls_own_parameter_as_b_binds_from_the_subject_and_accepts() {
+    // `impl Vec2<type T> with Add<T>` declares its `B` as its OWN parameter,
+    // which the subject binds: at `Vec2<i32>` the operand must be an `i32`, at
+    // `Vec2<str>` a `str`. Both run, from ONE impl — the acceptance the check
+    // has to preserve, and the reason a bare "must equal the subject" guard
+    // would have been wrong.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+
+        impl Vec2<type T> with Add<T> {
+            fun add(self, other: T): Vec2<T> {
+                Vec2 { a = other }
+            }
+        }
+
+        fun main() {
+            print((Vec2 { a = 1 } + 5).a);
+            print((Vec2 { a = "x" } + "y").a);
+        }
+        "#,
+        "5\ny\n",
+    );
+}
+
+#[test]
+fn the_impls_own_parameter_as_b_refuses_a_mis_binding() {
+    // The same impl, mis-bound: `Vec2<i32>`'s `B` is `i32`, and a `str` there
+    // was stored and printed as `oops` before the fix. The refusal names what
+    // the subject bound, not the impl's abstract `T`.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+
+        impl Vec2<type T> with Add<T> {
+            fun add(self, other: T): Vec2<T> {
+                Vec2 { a = other }
+            }
+        }
+
+        fun main() {
+            let pair = Vec2 { a = 1 };
+            print((pair + "oops").a);
+        }
+        "#,
+        r#"pair + "oops""#,
+        "`Vec2<i32>`'s `add` accepts `i32`, but the right operand is `str`",
+    );
+}
+
+#[test]
+fn a_nested_impl_parameter_as_b_substitutes_through_its_nominal() {
+    // `Add<Vec2<T>>` — the binder inside a nominal argument, not at the top of
+    // the position. Same impl, both verdicts: `Vec2<i32> + Vec2<i32>` runs, and
+    // a `Point` there printed `3` off slot 0 before the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+
+        impl Vec2<type T> with Add<Vec2<T>> {
+            fun add(self, other: Vec2<T>): Vec2<T> {
+                other
+            }
+        }
+
+        fun main() {
+            print((Vec2 { a = 1 } + Vec2 { a = 9 }).a);
+        }
+        "#,
+        "9\n",
+    );
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+        struct Point { x: i32, y: i32 }
+
+        impl Vec2<type T> with Add<Vec2<T>> {
+            fun add(self, other: Vec2<T>): Vec2<T> {
+                other
+            }
+        }
+
+        fun main() {
+            let pair = Vec2 { a = 1 };
+            let point = Point { x = 3, y = 4 };
+            print((pair + point).a);
+        }
+        "#,
+        "pair + point",
+        "`Vec2<i32>`'s `add` accepts `Vec2<i32>`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn a_bounded_generic_right_operand_of_a_dispatched_operator_is_rejected() {
+    // B179's shape with a NOMINAL left operand. `Point` implements `Add`, so
+    // the bound is satisfied and the call type-checked — and `bump(Counter { n
+    // = 1 }, Point { x = 7, y = 9 })` printed `8`: `1 + 7`, the `Point`'s slot
+    // 0 read as `other.n`. The declaration is checked once for all of its
+    // instantiations, and `T: Add` promises `Add`'s methods, never that `T` IS
+    // `Counter`.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Counter): Counter {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        impl Point with Add {
+            fun add(self, other: Point): Point {
+                Point { x = self.x + other.x, y = self.y + other.y }
+            }
+        }
+
+        fun bump<T: Add>(counter: Counter, value: T): Counter {
+            counter + value
+        }
+
+        fun main() {
+            print(bump(Counter { n = 1 }, Point { x = 7, y = 9 }).n);
+        }
+        "#,
+        "counter + value",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `T`",
+    );
+}
+
+#[test]
+fn a_concrete_b_does_not_admit_a_parameter_either() {
+    // The same rule where the impl declares a non-`Self` `B`: `Add<i32>` does
+    // not admit `T`, whatever `T` is bounded to. This is the reading B179's
+    // second steer does NOT mean — see the pin below for the one it does.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Bag { total: i32 }
+
+        impl Bag with Add<i32> {
+            fun add(self, other: i32): Bag {
+                Bag { total = self.total + other }
+            }
+        }
+
+        fun bump<T: Add>(bag: Bag, value: T): Bag {
+            bag + value
+        }
+
+        fun main() {
+            print(bump(Bag { total = 1 }, 4).total);
+        }
+        "#,
+        "bag + value",
+        "`Bag`'s `add` accepts `i32`, but the right operand is `T`",
+    );
+}
+
+#[test]
+fn two_different_parameters_in_the_two_positions_are_rejected() {
+    // `Bag<A>`'s `B` is `A`; a `B` from the caller's own list is a DIFFERENT
+    // parameter, and nothing relates them. Rigid comparison is what says so —
+    // the ordinary one treats each as a hole and answers `true`, which is how
+    // `mix(Bag { first = 1 }, "x")` printed `x` before the fix.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Bag<T> { first: T }
+
+        impl Bag<type T> with Add<T> {
+            fun add(self, other: T): Bag<T> {
+                Bag { first = other }
+            }
+        }
+
+        fun mix<A, B>(bag: Bag<A>, value: B): Bag<A> {
+            bag + value
+        }
+
+        fun main() {
+            print(mix(Bag { first = 1 }, "x").first);
+        }
+        "#,
+        "bag + value",
+        "`Bag<A>`'s `add` accepts `A`, but the right operand is `B`",
+    );
+}
+
+#[test]
+fn b179s_second_steer_now_names_a_spelling_that_works() {
+    // B179's refusal steers to "put a left operand there whose `Add` declares a
+    // `B` that admits `T`", and until B180 closed that sentence steered into a
+    // broken route: EVERY nominal left operand accepted the parameter, so the
+    // steer named a program that miscompiled instead of one that worked. This
+    // is the spelling it means — the left operand's own type carries the
+    // parameter, so its `Add` declares `B = T` and the operand IS a member.
+    // Same generic function, two instantiations, both running through the impl.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Bag<T> { first: T }
+
+        impl Bag<type T> with Add<T> {
+            fun add(self, other: T): Bag<T> {
+                Bag { first = other }
+            }
+        }
+
+        fun bump<T: Add>(bag: Bag<T>, value: T): Bag<T> {
+            bag + value
+        }
+
+        fun main() {
+            print(bump(Bag { first = 1 }, 4).first);
+            print(bump(Bag { first = "a" }, "b").first);
+        }
+        "#,
+        "4\nb\n",
+    );
+}
+
+#[test]
+fn a_generic_receiver_and_operand_of_one_parameter_still_compare() {
+    // The control the rigid comparison must not break, and std's own shape:
+    // `impl List<type T: PartialEq> with PartialEq { fun eq(self, b: List<T>) }`
+    // reached from a generic body, where BOTH sides are the caller's `T`. The
+    // parameters are rigid but IDENTICAL, which is exactly the case rigidity
+    // admits.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+
+        fun same<T: PartialEq>(left: List<T>, right: List<T>): bool {
+            left == right
+        }
+
+        fun main() {
+            print(same([1, 2], [1, 2]));
+            print(same(["a"], ["b"]));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
 // --- B170: `+` skipped its check when the LEFT operand was non-nominal -------
 //
 // B148 closed the hole for a NATIVE left operand and the dispatch loop's own
@@ -5678,26 +6314,37 @@ fn a_function_reference_left_operand_of_addition_is_rejected() {
     );
 }
 
+// --- B174: the generic LEFT operand, the deferred breaking step, TAKEN ------
+//
+// The other half of the operand-role frame, and the last escape from the
+// unbounded-parameter check inside a trait default. B169 and B179 closed the
+// RIGHT operand and B181 closed the logical pair's right half; each time the
+// LEFT was left, on the stated ground that refusing it is a bound requirement
+// on every trait default written over the trait's OWN parameter — a breaking
+// generics change with a migration, not a miscompile fix.
+//
+// The census priced that migration and the number was ONE: a single compiler
+// fixture (`macros::an_inherited_default_on_a_generic_subject_dispatches`)
+// writes the shape, and the only other estate sites are the `#[ignore]`d pins
+// below, which the change turns green. Zero in std, the corpus, docs fences,
+// examples, templates, kolt or the website. Ruled 2026-09-01: take it, and
+// require a bound that PROVIDES the operator's method rather than merely any
+// bound — otherwise `<T: Display>` on the left of `+` stays exactly as broken
+// as `<T>` (P4 of the census), and the two sides would still disagree about
+// what a bound has to prove.
+//
+// The garbage the refusals replace, from the census and audit run 7:
+//   `bump(Point { … })`            emitted `value + 1`      -> the tuple, concatenated
+//   `both(Point { … }, true)`      emitted `value && flag`  -> the struct, typed `bool`
+//   `same<T>(M { n = 7 }, M { n = 7 })`                     -> `false`
+//   `less<T>(M { n = 10 }, M { n = 9 })`                    -> `true` ("10" < "9")
+// Each a plausible wrong answer rather than a visible `NaN`.
+
 #[test]
-#[ignore = "B174: an unbounded generic LEFT operand still escapes the check — \
-            refusing it is a bound requirement on every trait default written \
-            over the trait's own parameter, the deferred breaking step"]
 fn an_unbounded_generic_left_operand_of_addition_is_rejected() {
-    // KNOWN BUG, and the one left-operand shape the fix deliberately did not
-    // take. The declaration is checked once for all instantiations and an
-    // unbounded `T` promises nothing, so `bump(Point { … })` emits `value + 1`
-    // and the host concatenates the struct's tuple.
-    //
-    // The census says why it stays: a trait default body over the trait's own
-    // parameter is written unbounded today and computes correct answers for
-    // every numeric instantiation — `macros::an_inherited_default_on_a_generic_
-    // subject_dispatches` is exactly that shape, and refusing here refuses it.
-    // Closing this is a bound requirement on every such declaration, the
-    // breaking generics change b148's SCOPE note deferred; the sibling on the
-    // RIGHT side is narrower and IS closed — B169 for the unbounded parameter,
-    // B179 for the bounded one and for the rest of the native family — because
-    // there the left operand is already a grounded native whose semantics are
-    // known, and the question is only whether the right one is a member.
+    // The declaration is checked once for all instantiations and an unbounded
+    // `T` promises nothing, so `bump(Point { … })` emitted `value + 1` and the
+    // host concatenated the struct's tuple.
     assert_fails_spanning(
         r#"
         fun bump<T>(value: T): T {
@@ -5709,7 +6356,7 @@ fn an_unbounded_generic_left_operand_of_addition_is_rejected() {
         }
         "#,
         "value + 1",
-        "`T` is neither: it has no `Add`",
+        "`+` on `T` needs `T: Add`",
     );
 }
 
@@ -5731,6 +6378,452 @@ fn a_bounded_generic_left_operand_of_addition_still_dispatches() {
         }
         "#,
         "6\n4\n",
+    );
+}
+
+#[test]
+fn an_unbounded_generic_left_operand_of_the_sibling_operators_is_rejected() {
+    // Audit run 7 widened B174 past `+`: every operator that models a trait
+    // escaped through the same fall-through, and the arithmetic ones are the
+    // least dangerous of them. `-` and `*` produced `NaN`, but the comparisons
+    // produced plausible BOOLEANS — `same(M { n = 7 }, M { n = 7 })` was
+    // `false` (JS compares the lowered structs by reference) and
+    // `less(M { n = 10 }, M { n = 9 })` was `true` (lexicographic `"10" < "9"`).
+    // Each names the bound that admits it, which differs per operator.
+    assert_fails_spanning(
+        r#"
+        fun drop_one<T>(value: T): T {
+            value - 1
+        }
+
+        fun main() {
+            let _n = drop_one(5);
+        }
+        "#,
+        "value - 1",
+        "`-` on `T` needs `T: Sub`",
+    );
+    assert_fails_spanning(
+        r#"
+        fun same<T>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun main() {
+            let _same = same(1, 1);
+        }
+        "#,
+        "a == b",
+        "`==` on `T` needs `T: PartialEq`",
+    );
+    assert_fails_spanning(
+        r#"
+        fun less<T>(a: T, b: T): bool {
+            a < b
+        }
+
+        fun main() {
+            let _less = less(1, 2);
+        }
+        "#,
+        "a < b",
+        "`<` on `T` needs `T: PartialOrd`",
+    );
+}
+
+#[test]
+fn a_trait_defaults_own_parameter_as_a_left_operand_is_rejected() {
+    // THE breaking shape, and the whole of the migration the census priced:
+    // a default written over the trait's own unbounded parameter. It cannot be
+    // fixed locally the way a free function's can — the bound goes on the
+    // TRAIT, and every `impl` and every bound naming it moves with it — which
+    // is why the refusal says where the parameter is declared.
+    //
+    // It worked by luck at `i32` and printed `abab` for `Holder { value = "ab" }`.
+    assert_fails_spanning(
+        r#"
+        trait Doubler<T> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T {
+                self.value
+            }
+        }
+
+        fun main() {
+            print(Holder { value = 21 }.twice());
+        }
+        "#,
+        "self.once() + self.once()",
+        "declared on `trait Doubler`",
+    );
+}
+
+#[test]
+fn a_left_operand_bound_that_does_not_provide_the_operator_is_rejected() {
+    // The ruling's refinement, and the difference between closing the item and
+    // closing the hole (census §6.2, probe P4): "require a bound" is not
+    // "require the RIGHT bound". `T: Display` promises `to_string`, not `add`,
+    // and before this it fell through to the SAME native emission an unbounded
+    // parameter did — `Holder { value = "ab" }` still printed `abab`. The
+    // right operand already checked adequacy (`T: Display` with `+` and with
+    // `==` both fail there), so the two sides disagreed about what a bound has
+    // to prove; now they do not.
+    assert_fails_spanning(
+        r#"
+        import std::display::Display;
+
+        fun bump<T: Display>(value: T): T {
+            value + 1
+        }
+
+        fun main() {
+            let _n = bump(5);
+        }
+        "#,
+        "value + 1",
+        "its bounds (`Display`) do not declare `add`",
+    );
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+
+        trait Doubler<T: Display> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+        "#,
+        "`+` on `T` needs `T: Add`",
+    );
+}
+
+#[test]
+fn a_generic_left_operand_of_the_logical_operators_is_rejected() {
+    // B181's left half, and the one family where "add a bound" is NOT the fix:
+    // `&&` and `||` admit `bool` and nothing else, they model no operator trait
+    // at all, and no trait names that set — so a parameter refuses outright,
+    // whatever it is bounded to, exactly as B181 already refused it on the
+    // right. `both(Point { x = 1, y = 2 }, true)` printed the struct: JS's `&&`
+    // yields its RIGHT operand when the left is truthy.
+    assert_fails_with(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun both<T>(value: T, flag: bool): bool {
+            value && flag
+        }
+
+        fun main() {
+            print(both(Point { x = 1, y = 2 }, true));
+        }
+        "#,
+        "takes `bool` operands",
+    );
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+
+        fun either<T: Display>(value: T, flag: bool): bool {
+            value || flag
+        }
+
+        fun main() {
+            print(either(7, true));
+        }
+        "#,
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn a_bounded_generic_left_operand_of_the_sibling_operators_still_dispatches() {
+    // Every refusal above has to have a legal spelling that RUNS, or the rule
+    // would only be a way of rejecting programs. One per bound the refusals
+    // name — `Sub`, `PartialEq`, `PartialOrd` — dispatched through the bound
+    // and re-resolved to each instantiation's own impl.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Sub;
+        import std::compare::PartialEq;
+        import std::compare::PartialOrd;
+
+        fun drop_one<T: Sub>(value: T, one: T): T {
+            value - one
+        }
+
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun less<T: PartialOrd>(a: T, b: T): bool {
+            a < b
+        }
+
+        fun main() {
+            print(drop_one(5, 1));
+            print(same(7, 7));
+            print(same("a", "b"));
+            print(less(9, 10));
+            print(less(10, 9));
+        }
+        "#,
+        "4\ntrue\nfalse\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn a_supertrait_bound_admits_the_left_operand() {
+    // The adequacy check reads the bound's SUPERTRAITS, not just the bound —
+    // std's own `math::minmax<T: Ord>` writes `a <= b`, and `Ord`'s `le` comes
+    // from its `PartialOrd` supertrait. A check that looked only at the named
+    // trait would refuse std.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::Ord;
+
+        fun smaller<T: Ord>(a: T, b: T): T {
+            if a <= b { a } else { b }
+        }
+
+        fun main() {
+            print(smaller(9, 4));
+            print(smaller("b", "a"));
+        }
+        "#,
+        "4\na\n",
+    );
+}
+
+#[test]
+fn a_bounded_trait_parameter_left_operand_still_dispatches() {
+    // The estate edit's own pin, in the spelling that shipped: the ONE site the
+    // census found, migrated. The bound is orthogonal to what the fixture
+    // asserts (that an inherited default dispatches on a generic impl subject),
+    // so the answer is unchanged — and now it is an answer the declaration
+    // earns rather than one it gets by luck at `i32`.
+    //
+    // The impl's binder does NOT restate the bound, which is why the migration
+    // is one edit and not two.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler<T: Add> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T {
+                self.value
+            }
+        }
+
+        fun main() {
+            print(Holder { value = 21 }.twice());
+        }
+
+        main();
+        "#,
+        "42\n",
+    );
+    // And the bound the trait now carries is load-bearing at the instantiation
+    // that used to produce garbage: this is the `abab` program, refused where
+    // the parameter is GROUNDED rather than where it is written — so the
+    // unrestated binder loses nothing.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct Point { x: i32, y: i32 }
+
+        trait Doubler<T: Add> {
+            fun once(self): T;
+
+            fun twice(self): T {
+                self.once() + self.once()
+            }
+        }
+
+        struct Holder<T> {
+            value: T,
+        }
+
+        impl Holder<type T> with Doubler<T> {
+            fun once(self): T {
+                self.value
+            }
+        }
+
+        fun main() {
+            print(Holder { value = Point { x = 1, y = 2 } }.twice());
+        }
+        "#,
+        "'Point' does not implement trait 'Add'",
+    );
+}
+
+#[test]
+fn a_derived_body_over_a_reached_parameter_satisfies_the_left_operands_bound() {
+    // The EXEMPTION IS GONE (B194 landing), and this is the pin that used to
+    // assert it. B174 drew a carve-out here on B188's boundary and for B188's
+    // reason: `[derive(PartialEq)]` on a generic struct emits
+    // `fun eq(self, other: ..)` comparing a `T`-typed field, and back then no
+    // generated impl bound a parameter at all, so the rule would have refused
+    // the derive surface wholesale from a span (`[derive(..)]`) that is not
+    // where a bound goes. B194 made the generators generic-aware, so the same
+    // programs now pass the rule instead of skipping it: the derived impl is
+    // `impl Holder<type T: PartialEq> with PartialEq`, the `eq` body's left
+    // operand is a BOUNDED `T`, and it dispatches through the bound like any
+    // other generic operand.
+    //
+    // Non-vacuous by the red-proof the b194-landing lane ran: plant the removal
+    // of B194's binder (`derive_binders` in `macro_std/src/meta.vl`, the reached
+    // branch emitting a bare `type T`) and this first program is refused with
+    // "in code generated by this attribute: `==` on `T` needs `T: PartialEq`" —
+    // which is exactly the diagnostic the exemption existed to suppress, and
+    // exactly what restoring the exemption suppresses again.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [derive(PartialEq)]
+        struct Holder<T> {
+            value: T,
+        }
+
+        fun main() {
+            print(Holder { value = 1 } == Holder { value = 1 });
+        }
+        "#,
+        "true\n",
+    );
+    // Bounding the struct itself changes nothing — the declaration's own bounds
+    // belong to the declaration and are not what the impl binds — so the same
+    // spelling still works and still runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        [derive(PartialEq)]
+        struct Holder<T: PartialEq> {
+            value: T,
+        }
+
+        fun main() {
+            print(Holder { value = 1 } == Holder { value = 2 });
+        }
+        "#,
+        "false\n",
+    );
+    // And the bound the impl now carries BITES, at the author's own call site
+    // rather than inside the generated body: this is the instantiation the
+    // exemption's stated objection was about — a diagnostic anchored where the
+    // reader cannot act — and it lands on the comparison the author wrote,
+    // naming the concrete type and the trait it does not implement.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Opaque { tag: i32 }
+
+        [derive(PartialEq)]
+        struct Holder<T> {
+            value: T,
+        }
+
+        fun main() {
+            print(Holder { value = Opaque { tag = 1 } } == Holder { value = Opaque { tag = 1 } });
+        }
+        "#,
+        "'Opaque' does not implement trait 'PartialEq', required by a generic bound of this call",
+    );
+    // The ENUM half of the same generator, which is a second code path and had
+    // no pin anywhere before this lane: a variant's `eq` compares PAYLOAD
+    // bindings (`s0 == o0`) rather than field accesses, and reachability reads
+    // payload types, so `Slot<T>`'s `T` is reached and the binder carries
+    // `PartialEq` exactly as the struct's does. Both branches of the match, and
+    // the payload-less variant that compares nothing at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [derive(PartialEq)]
+        enum Slot<T> {
+            Empty,
+            Full(T),
+        }
+
+        fun main() {
+            print(Slot::Full(1) == Slot::Full(1));
+            print(Slot::Full(1) == Slot::Full(2));
+            print(Slot<i32>::Empty == Slot<i32>::Empty);
+        }
+        "#,
+        "true\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn a_derived_body_over_a_phantom_parameter_is_refused_nothing() {
+    // The other side of B194's rule, and the reason lifting the exemption costs
+    // C7 nothing. A PHANTOM parameter takes a BARE binder
+    // (`impl Handle<type T> with PartialEq`) — the C7 departure from Rust's
+    // derive rule — so the left operand of every operator the generated body
+    // writes is a grounded field type, never `T`. There is no operator on `T`
+    // here to refuse, whatever `T` is instantiated with: `Session` holds a
+    // closure and implements nothing at all.
+    //
+    // Had the bare binder been the wrong call, this is where the lift would
+    // have shown it — an unbounded `T` reaching the rule through generated
+    // code. It does not reach it, because the body never touches `T`.
+    //
+    // Non-vacuous by its own red-proof: plant Rust's rule in `derive_binders`
+    // (bind the trait on the phantom branch too) and this program is refused
+    // `'Session' does not implement trait 'PartialEq', required by a generic
+    // bound of this call` — which is the C7 contradiction, in the small.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Session { socket: |str| void }
+
+        [derive(PartialEq)]
+        struct Handle<T> {
+            index: i32,
+            generation: i32,
+        }
+
+        fun main() {
+            let live: Handle<Session> = Handle { index = 1, generation = 0 };
+            print(live == Handle<Session> { index = 1, generation = 0 });
+            print(live == Handle<Session> { index = 2, generation = 0 });
+        }
+        "#,
+        "true\nfalse\n",
     );
 }
 
@@ -7200,5 +8293,2179 @@ fn a_closure_payload_capture_in_an_else_if_chain_calls_the_right_arm() {
         }
         "#,
         "second\n",
+    );
+}
+
+// --- B175: `Type::Trait` comes OFF the operator check's skip list ------------
+//
+// B170 routed every left-operand SHAPE through the check and then had to carve
+// one back out: `Type::Trait`. std's `List<T: Add + Default>::sum` wrote `mut
+// total = T::default()`, the bound-path `T::default()` inferred as the BOUND,
+// and judging a trait-typed left operand would have refused std's own
+// `sum`/`product` over an inference wart in a different subsystem. B175 fixed
+// the wart (`traits::b175_*`), so the carve-out goes, and with it the hole:
+// a value typed as a bare trait now gets a verdict like every other shape.
+
+#[test]
+fn b175_a_bare_trait_left_operand_of_addition_is_rejected() {
+    // The hole B170 left open, entered the only way a bare trait value can be
+    // built now that all six DECLARATION positions refuse one (B4 §12.2): the
+    // return of a trait's own associated function, whose `Self` legitimately
+    // stays abstract on the `Trait::func` path (B162). Pre-fix this compiled —
+    // the check `continue`d before ever looking for an impl — and emitted the
+    // host's `+`.
+    assert_fails_spanning(
+        r#"
+        import std::io::panic;
+
+        trait Maker {
+            fun make(): Self { panic("no default") }
+        }
+
+        fun main() {
+            let m = Maker::make();
+            let _sum = m + 1;
+        }
+        "#,
+        "m + 1",
+        "this operand is the bare trait `Maker`",
+    );
+}
+
+#[test]
+fn b175_a_bare_trait_left_operand_is_refused_without_impl_advice() {
+    // The B170 rule about WHICH refusal, applied to the shape B170 skipped: a
+    // tuple and an array can act on "add `impl (i32, i32) with PartialEq`"
+    // because such an impl resolves; `impl Maker with PartialEq` is not a
+    // declaration the language has, so a bare trait must get the reason
+    // instead — a trait is a bound, not a type — and the steer that does work.
+    let source = r#"
+        import std::io::panic;
+
+        trait Maker {
+            fun make(): Self { panic("no default") }
+        }
+
+        fun main() {
+            let _same = Maker::make() == Maker::make();
+        }
+        "#;
+    assert_fails_with(source, "a trait is a bound, not a value type");
+    assert_fails_with(source, "(`<T: Maker>`)");
+    assert_fails_without(source, "add `impl Maker with PartialEq`");
+}
+
+#[test]
+fn b175_the_sibling_operators_refuse_a_bare_trait_too() {
+    // The carve-out gated the whole loop, not one operator, so every operator
+    // modelling a trait skipped its refusal for this shape.
+    for (operator, trait_name) in [("<", "PartialOrd"), ("-", "Sub"), ("*", "Mul")] {
+        assert_fails_with(
+            &format!(
+                r#"
+                import std::io::panic;
+
+                trait Maker {{
+                    fun make(): Self {{ panic("no default") }}
+                }}
+
+                fun main() {{
+                    let _result = Maker::make() {operator} Maker::make();
+                }}
+                "#
+            ),
+            &format!("models `{trait_name}`, and this operand is the bare trait `Maker`"),
+        );
+    }
+}
+
+// --- B193: a trait default's `self <op> self` ---------------------------------
+//
+// The one trait-typed shape B175 left skipping, and the answer was never a
+// refusal: `self + self` in a default over a supertrait `Add` is exactly the
+// program declaring the supertrait is FOR. It miscompiled because nothing
+// dispatched it — skipping the operator check kept the anything-goes native
+// emission, and over two lowered structs the host's operators are garbage:
+//
+//   Money { cents = 21 }.twice()   →  `[21] + [21]` is the string "2121",
+//                                     slot 0 of it is "2", so `.cents`
+//                                     printed 2. A plausible wrong answer.
+//   Money { cents = 21 }.zero()    →  `[21] - [21]` is NaN; `.cents` printed
+//                                     `undefined`.
+//   Money { cents = 3 }.square()   →  `[3] * [3]`, `undefined` likewise.
+//   Tag { id = 1 }.same()          →  `self === self` — a reference compare
+//                                     that ignored the impl, so a `PartialEq`
+//                                     whose `eq` answers `false` still
+//                                     printed `true`.
+//
+// One fix, at the dispatch: a default body's operand dispatches on the type
+// the default is being SPECIALIZED for (`GenericDispatch::OnType(None, ..)`,
+// read against `current_self_type` at emission — the same channel a `self`
+// CALL in a default body has used since B55), and the analyzer stops skipping
+// the shape.
+
+#[test]
+fn a_trait_defaults_self_operand_dispatches_to_the_specialized_type() {
+    // The pin B193 was filed as. Pre-fix it printed `2`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Money with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_subtraction_dispatches_too() {
+    // Audit run 7 widened the item off `+`: `-` over the same pair is NaN, so
+    // this one printed `undefined` rather than a plausible number.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Sub;
+
+        trait Zeroer with Sub {
+            fun zero(self): Self { self - self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Sub {
+            fun sub(self, other: Money): Money { Money { cents = self.cents - other.cents } }
+        }
+
+        impl Money with Zeroer {}
+
+        fun main() {
+            print(Money { cents = 21 }.zero().cents);
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_multiplication_dispatches_too() {
+    // Pre-fix: `undefined`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Mul;
+
+        trait Squarer with Mul {
+            fun square(self): Self { self * self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Mul {
+            fun mul(self, other: Money): Money { Money { cents = self.cents * other.cents } }
+        }
+
+        impl Money with Squarer {}
+
+        fun main() {
+            print(Money { cents = 3 }.square().cents);
+        }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_defaults_self_equality_dispatches_to_the_impl() {
+    // `==` needs an impl that DISAGREES with the host to witness anything:
+    // `self === self` is true for the same value whatever the impl says, so a
+    // conventional `eq` would have hidden the defect. This one answers
+    // `false`, and pre-fix the program printed `true` — the emission was
+    // `self === self`, the impl never called.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        trait Selfsame with PartialEq {
+            fun same(self): bool { self == self }
+        }
+
+        struct Tag { id: i32 }
+
+        impl Tag with PartialEq {
+            fun eq(self, other: Tag): bool { false }
+        }
+
+        impl Tag with Selfsame {}
+
+        fun main() {
+            print(Tag { id = 1 }.same());
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_default_dispatches_at_each_specialization() {
+    // The point of dispatching on the SPECIALIZED type rather than on
+    // anything the default itself knows: one default body, two impls, two
+    // answers. The native specialization keeps native JS, which is what the
+    // emitter's own `compares_natively` guard is for — dispatching a native
+    // back into std's `impl i32 with Add` would recurse forever.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+        struct Steps { count: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Steps with Add {
+            // Deliberately not a plain sum, so the dispatch is visible.
+            fun add(self, other: Steps): Steps { Steps { count = self.count + other.count + 1 } }
+        }
+
+        impl Money with Doubler {}
+        impl Steps with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+            print(Steps { count = 21 }.twice().count);
+        }
+        "#,
+        "42\n43\n",
+    );
+}
+
+#[test]
+fn b193_a_trait_default_operator_its_trait_never_promised_is_refused() {
+    // The other half of no longer skipping: a default body may now be JUDGED,
+    // and `self + self` in a trait with no `Add` supertrait is a real error —
+    // every specialization would reach the host's `+` over a lowered value.
+    // It gets its own sentence rather than B175's bare-trait one, whose steer
+    // ("hold the value in a generic bounded by the trait") is nonsense inside
+    // the trait's own body: the declaration that works is a supertrait.
+    assert_fails_with(
+        r#"
+        trait Doubler {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+        }
+        "#,
+        "Declare it as a supertrait (`trait Doubler with Add`)",
+    );
+}
+
+// --- B197: an operator trait's method is required at impl time ---------------
+//
+// Audit run 7's F12, RULED. `std::operators`'s ten traits carry
+// `panic("not implemented yet")` bodies — deliberately, so the declarations
+// type-check (`ret-checking.md`) — and a body is a body, so the conformance
+// check's "a default is inherited" rule let `impl P with Add { }` through.
+//
+// Pre-fix, that program:
+//
+//   vilan check   →  `no errors`.
+//   vilan run     →  an uncaught `not implemented yet` from node, with no
+//                    type, no method and no span — the one diagnostic in the
+//                    surface that names nothing at all.
+//
+// while the refusal a type with NO impl gets reads "add `impl P with Add`
+// providing `add`": advice this program had followed to the letter, minus the
+// providing half.
+//
+// The ruling: the method is REQUIRED at the impl. The panicking bodies stay
+// (they are what the compound-assignment derivation reads, and `+=` still
+// derives from `+`), but there is no coherent program in which an operator
+// impl omits its method, because the default's only behaviour is to throw.
+
+#[test]
+fn b197_an_operator_impl_with_no_method_is_refused() {
+    // The exhibit the item was filed on. Pre-fix: `check` clean, `run`
+    // throwing `not implemented yet`.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add { }
+
+        fun main() {
+            let sum = P { n = 1 } + P { n = 2 };
+            print(sum.n);
+        }
+        "#,
+        "`impl P with Add` provides no `add`",
+    );
+}
+
+#[test]
+fn b197_the_refusal_names_the_type_and_the_signature_to_write() {
+    // The least the item asked for, which the ruling gets for free: the
+    // runtime panic named nothing, and this names the type, the method, the
+    // reason the default exists, and the exact signature. The signature came
+    // from a rendering of this arm's own until B206 taught the shared label to
+    // resolve a `= Self` position against the impl; both arms read the one
+    // rendering now.
+    let source = r#"
+        import std::operators::Mul;
+
+        struct Money { cents: i32 }
+
+        impl Money with Mul { }
+
+        fun main() {}
+        "#;
+    assert_fails_with(source, "Declare `fun mul(self, b: Money): Money`");
+    assert_fails_with(source, "it exists so `*=` can derive from `*`");
+    assert_fails_without(source, "b: Mul");
+}
+
+#[test]
+fn b197_a_declared_operand_type_is_named_in_the_signature() {
+    // `impl Meters with Add<Feet>` declares its own `B`, so the signature the
+    // refusal names is not the `Self`-defaulted one.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+
+        impl Meters with Add<Feet> { }
+
+        fun main() {}
+        "#,
+        "Declare `fun add(self, b: Feet): Meters`",
+    );
+}
+
+#[test]
+fn b197_the_requirement_reaches_through_a_supertrait() {
+    // Reached through `trait Doubler with Add`, the requirement comes from a
+    // trait the impl does not name — so the sentence says whose it is, and
+    // names the other way to satisfy it.
+    let source = r#"
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Doubler {}
+
+        fun main() {}
+        "#;
+    assert_fails_with(source, "(`Doubler` requires `Add`) provides no `add`");
+    assert_fails_with(source, "in an `impl Money with Add` of its own");
+}
+
+#[test]
+fn b197_a_separate_impl_of_the_operator_trait_satisfies_it() {
+    // And it does satisfy it: the conformance check's existing
+    // provided-elsewhere rule covers the operator family unchanged, which is
+    // what B193's own programs rely on.
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Money with Doubler {}
+
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b197_every_operator_trait_requires_its_own_method() {
+    // Per case, not per example: the item is one rule over ten traits, and a
+    // rule pinned at one of them is a rule pinned nowhere.
+    for (trait_name, method, symbol) in [
+        ("Add", "add", "+"),
+        ("Sub", "sub", "-"),
+        ("Mul", "mul", "*"),
+        ("Div", "div", "/"),
+        ("Rem", "rem", "%"),
+        ("Shl", "shl", "<<"),
+        ("Shr", "shr", ">>"),
+        ("BitAnd", "bit_and", "&"),
+        ("BitXor", "bit_xor", "^"),
+        ("BitOr", "bit_or", "|"),
+    ] {
+        let source = format!(
+            r#"
+            import std::operators::{trait_name};
+
+            struct P {{ n: i32 }}
+
+            impl P with {trait_name} {{ }}
+
+            fun main() {{}}
+            "#
+        );
+        assert_fails_with(
+            &source,
+            &format!("`impl P with {trait_name}` provides no `{method}`"),
+        );
+        assert_fails_with(
+            &source,
+            &format!("so `{symbol}=` can derive from `{symbol}`"),
+        );
+    }
+}
+
+#[test]
+fn b197_an_operator_impl_that_writes_its_method_still_runs() {
+    // The control the requirement must not break.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add {
+            fun add(self, other: P): P { P { n = self.n + other.n } }
+        }
+
+        fun main() {
+            print((P { n = 1 } + P { n = 2 }).n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b197_the_compound_form_still_derives_from_the_operator() {
+    // The reason the panicking defaults stay, pinned so a later lane cannot
+    // delete them and call the suite green: `+=` derives from `+`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct P { n: i32 }
+
+        impl P with Add {
+            fun add(self, other: P): P { P { n = self.n + other.n } }
+        }
+
+        fun main() {
+            mut total = P { n = 1 };
+            total += P { n = 2 };
+            print(total.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b197_a_non_operator_traits_default_is_still_inherited() {
+    // The rule is the operator family's, not "every default is now required":
+    // an ordinary trait's default body is inherited exactly as before, and so
+    // is a non-operator default of an operator trait's own supertrait chain
+    // (`PartialOrd`'s `lt`/`le`/`gt`/`ge` over `partial_compare`).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::{ Option, Some };
+
+        trait Greeter {
+            fun greet(self): str { "hello" }
+        }
+
+        struct Meters { m: i32 }
+
+        impl Meters with Greeter {}
+
+        impl Meters with PartialEq {
+            fun eq(self, other: Meters): bool { self.m == other.m }
+        }
+
+        impl Meters with PartialOrd {
+            fun partial_compare(self, other: Meters): Option<Ordering> {
+                if self.m < other.m {
+                    Some(Ordering::Less)
+                } else {
+                    if self.m > other.m { Some(Ordering::Greater) } else { Some(Ordering::Equal) }
+                }
+            }
+        }
+
+        fun main() {
+            print(Meters { m = 1 }.greet());
+            print(Meters { m = 1 } < Meters { m = 2 });
+        }
+        "#,
+        "hello\ntrue\n",
+    );
+}
+
+// --- B181: `&&`/`||` accepted a generic RIGHT operand and emitted the value --
+//
+// The same membership principle B179 settled for the native family, on the two
+// operators that model no trait at all. `grounded` excludes every
+// `Type::Generic`, so a parameter reached neither the `bool` check nor a
+// refusal, and `compare_type` would have admitted it anyway — a parameter
+// compares equal to whatever is asked of it. `fun both<T>(flag: bool, value: T):
+// bool { flag && value }` compiled, and `both(true, Point { x = 1, y = 2 })`
+// printed `[ 1, 2 ]`: JS's `&&` yields the RIGHT operand when the left is
+// truthy, so the struct itself came back, typed `bool`.
+//
+// No bound rescues it. `&&` admits `bool` and nothing else, no trait names that
+// set, and — unlike `+`, where a `str` left operand's admitted set IS
+// trait-characterizable (B176's render bound) — there is not even an operator
+// trait to consult. So every generic right operand refuses, whatever its bound.
+//
+// The LEFT half was B174's deferral shape and went with it: same check, side
+// condition dropped, same sentence — the reason a bound cannot prove `bool`
+// never depended on which operand was being judged.
+
+#[test]
+fn b181_an_unbounded_generic_right_operand_of_and_is_rejected() {
+    // The pin B181 was filed as. Pre-fix this program compiled and PRINTED the
+    // struct.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun both<T>(flag: bool, value: T): bool {
+            flag && value
+        }
+
+        fun main() {
+            print(both(true, Point { x = 1, y = 2 }));
+        }
+        "#,
+        "flag && value",
+        "`&&` takes `bool` operands, and `T` is a type parameter",
+    );
+}
+
+#[test]
+fn b181_a_bounded_generic_right_operand_of_or_is_rejected_too() {
+    // The bound is IRRELEVANT here, which is the ruling and therefore the pin:
+    // the refusal must not steer the author to add one, because no bound can
+    // make a parameter BE `bool`. `||` shares the arm, so it shares the rule.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        fun either<T: Add>(flag: bool, value: T): bool {
+            flag || value
+        }
+
+        fun main() {
+            print(either(false, 1));
+        }
+        "#,
+        "flag || value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b181_the_generic_right_operand_refusal_names_the_spelling_that_works() {
+    // A refusal is worth what the reader can do with it: the value has to
+    // become a `bool` before the operator sees it.
+    assert_fails_with(
+        r#"
+        fun both<T>(flag: bool, value: T): bool {
+            flag && value
+        }
+
+        fun main() {
+            print(both(true, 1));
+        }
+        "#,
+        "Test the value and combine the `bool`s, or declare this operand `bool`",
+    );
+}
+
+#[test]
+fn b181_a_bool_right_operand_still_short_circuits() {
+    // The escape hatch the refusal steers to has to work, or the rule would
+    // have no legal spelling — and the short circuit itself must survive: the
+    // right operand is not evaluated when the left already decides.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun loud(): bool {
+            print("evaluated");
+            true
+        }
+
+        fun both<T>(flag: bool, value: T, ready: bool): bool {
+            flag && ready
+        }
+
+        fun main() {
+            print(both(true, 7, true));
+            print(false && loud());
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn an_unbounded_generic_left_operand_of_and_is_rejected() {
+    // B174 took the left half. `both(Point { x = 1, y = 2 }, true)` printed the
+    // struct: the host's `&&` finds it truthy and yields the RIGHT operand,
+    // which is then typed `bool`. B181 left this to the breaking step; the
+    // wording it shipped already reads for either side, because the reason is
+    // the same one — `bool`'s set is `bool`, and no bound can prove membership
+    // of it.
+    assert_fails_with(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun both<T>(value: T, flag: bool): bool {
+            value && flag
+        }
+
+        fun main() {
+            print(both(Point { x = 1, y = 2 }, true));
+        }
+        "#,
+        "takes `bool` operands",
+    );
+}
+
+// --- B196: every native operator, not just `+`, when the LEFT operand is not
+//     a number ---------------------------------------------------------------
+//
+// Audit run 7's F1, and a RELEASED miscompile: shipped in v0.40.0. b148 gated
+// its native-operand check on `+` and argued the gate in a SCOPE note — "the
+// other operators emit arithmetic on numbers, where `+` emits a rendering".
+// That is a statement about a NUMERIC left operand. Three native types are not
+// numbers, and for those the argument inverts: the host operator returns a
+// number, a binary takes its static type from the LEFT operand, so the result
+// is a number wearing a type it is not. Fifty-five wrong-running squares of the
+// audit's 216-program operator matrix, one root.
+//
+// The pre-fix runs, recorded here because a green pin proves only that the
+// program is refused NOW:
+//
+//   let c: bool = true - 3         →  -2. `if c` took the TRUE branch and
+//                                     `c == true` printed false: a `bool`
+//                                     that is neither value.
+//   let c: bool = true & 3         →  1, printed as `1` by an i-string hole
+//                                     typed `bool`.
+//   let s: str = "12" - "3"        →  9, and `s.len()` was `undefined`.
+//   let s: str = "12" << 2         →  48.
+//   mut c: bool = true; c -= 3     →  -2, the compound form inheriting it
+//                                     through the desugar.
+//   mut s: str = "12"; s *= 3      →  36.
+//   Level::High - Level::Low       →  4 typed `Level`; the `match` on it
+//                                     panicked, "Level: 4 is not one of its
+//                                     values".
+//   Level::High ^ Level::Low       →  4 again, and SILENT: `== Level::Low`
+//                                     and `== Level::High` both printed
+//                                     false, a `Level` matching no variant.
+//
+// The carve-out is "the left operand is a number", never "the operator is not
+// `+`": `f64 * i32` computes a correct answer of the declared type, and
+// refusing it is the numeric-strictness change with an `as_f64()` migration
+// that b148's SCOPE note deferred. It stays deferred, and is pinned below as a
+// control so a later lane cannot take it by accident.
+//
+// The COMPARISONS need nothing: `bool` has no ordering (B24 refuses `<` on it),
+// a string backing is not an order (§3.6 refuses that), and `str` and an
+// integer backing both order correctly. Only the wrong-running squares close.
+
+#[test]
+fn b196_a_bool_left_operand_of_subtraction_is_rejected() {
+    // The exhibit the item was filed on. Pre-fix: `-2`, truthy, `== true`
+    // false.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let c: bool = true - 3;
+            print(c);
+        }
+        "#,
+        "true - 3",
+        "`-` on `bool` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_bool_left_operand_of_a_bitwise_operator_is_rejected() {
+    // The quietest of the family: `true & 3` is `1`, which prints as `1` and
+    // never looks like a `bool` going wrong until something compares it.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let c: bool = true & 3;
+            print(c);
+        }
+        "#,
+        "true & 3",
+        "`&` on `bool` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_str_left_operand_of_subtraction_is_rejected() {
+    // Pre-fix: `9`, typed `str`, with `.len()` undefined on it.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let s: str = "12" - "3";
+            print(s);
+        }
+        "#,
+        r#""12" - "3""#,
+        "`-` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_str_left_operand_of_a_shift_is_rejected() {
+    // Pre-fix: `48`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let s: str = "12" << 2;
+            print(s);
+        }
+        "#,
+        r#""12" << 2"#,
+        "`<<` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_backed_enum_left_operand_of_subtraction_is_rejected() {
+    // Pre-fix: a `Level` holding `4`, on which the `match` panicked — the one
+    // arm of the family a runtime guard happened to catch.
+    assert_fails_spanning(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let level: Level = Level::High - Level::Low;
+            print(level == Level::Low);
+        }
+        "#,
+        "Level::High - Level::Low",
+        "`-` on `Level` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_backed_enum_left_operand_of_a_bitwise_operator_is_rejected() {
+    // The same value with no guard in front of it: pre-fix both comparisons
+    // printed false, a `Level` that is no variant at all.
+    assert_fails_spanning(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let level: Level = Level::High ^ Level::Low;
+            print(level == Level::Low);
+        }
+        "#,
+        "Level::High ^ Level::Low",
+        "`^` on `Level` has no meaning",
+    );
+}
+
+#[test]
+fn b196_the_compound_forms_inherit_the_refusal() {
+    // `x -= y` desugars to `x = x - y` and reaches the same check, so the
+    // whole compound family closes with the binary one. Pre-fix `c -= 3` left
+    // `-2` in a `bool` and `s *= 3` left `36` in a `str`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            mut c: bool = true;
+            c -= 3;
+            print(c);
+        }
+        "#,
+        "c -= 3",
+        "`-` on `bool` has no meaning",
+    );
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            mut s: str = "12";
+            s *= 3;
+            print(s);
+        }
+        "#,
+        "s *= 3",
+        "`*` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b196_every_arithmetic_and_bitwise_operator_closes_on_every_non_numeric_left() {
+    // Per case, not per example: the rule is the left operand's SHAPE against
+    // the whole nine-operator family, so all twenty-seven squares are held.
+    for operator in ["-", "*", "/", "%", "&", "|", "^", "<<", ">>"] {
+        assert_fails_with(
+            &format!(
+                r#"
+                fun main() {{
+                    let flag = true;
+                    print(flag {operator} 3);
+                }}
+                "#
+            ),
+            &format!("`{operator}` on `bool` has no meaning"),
+        );
+        assert_fails_with(
+            &format!(
+                r#"
+                fun main() {{
+                    let text = "12";
+                    print(text {operator} 3);
+                }}
+                "#
+            ),
+            &format!("`{operator}` on `str` has no meaning"),
+        );
+        assert_fails_with(
+            &format!(
+                r#"
+                enum Level {{ Low = 1, High = 5 }}
+
+                fun main() {{
+                    print(Level::High {operator} Level::Low);
+                }}
+                "#
+            ),
+            &format!("`{operator}` on `Level` has no meaning"),
+        );
+    }
+}
+
+#[test]
+fn b196_the_refusal_names_the_admitted_set_of_the_left_operand() {
+    // The operand-role wording (row 345/353's family): a refusal that only
+    // says "not this one" leaves the reader to guess which ones are, so each
+    // left type names its own admitted set — and a STRING backing names a
+    // narrower one, because §3.6 refuses its ordering too.
+    assert_fails_with(
+        r#"
+        fun main() {
+            print(true - 3);
+        }
+        "#,
+        "`bool`'s admitted operators are `== != && || !`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print("12" - 3);
+        }
+        "#,
+        "`str`'s admitted operators are `+ == != < <= > >=`",
+    );
+    assert_fails_with(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            print(Level::High - Level::Low);
+        }
+        "#,
+        "`Level`'s admitted operators are `== != < <= > >=`",
+    );
+    assert_fails_with(
+        r#"
+        enum Size { Small = "sm", Large = "lg" }
+
+        fun main() {
+            print(Size::Large - Size::Small);
+        }
+        "#,
+        "`Size`'s admitted operators are `== !=`",
+    );
+}
+
+#[test]
+fn b196_the_refusal_steers_to_the_spelling_that_works() {
+    // A refusal is worth what the reader can do with it, and the three shapes
+    // want three different things: a bitwise operator on a `bool` is nearly
+    // always the logical one mistyped, a `str` wants parsing (or `.repeat`),
+    // and a backing is not a number to compute with at all.
+    assert_fails_with(
+        r#"
+        fun main() {
+            print(true & false);
+        }
+        "#,
+        "`&&` is `bool`'s conjunction",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print(true ^ false);
+        }
+        "#,
+        "`!=` is `bool`'s exclusive or",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print("ab" * 3);
+        }
+        "#,
+        "A `str` repeats with `.repeat(n)`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print("12" - 3);
+        }
+        "#,
+        "Parse the text first (`.parse_i32()`, `.parse_f64()`)",
+    );
+    assert_fails_with(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            print(Level::High / Level::Low);
+        }
+        "#,
+        "match on the variant, or hold the number you mean",
+    );
+}
+
+#[test]
+fn b196_the_steers_the_refusals_name_all_compile() {
+    // Each escape hatch has to work, or the rule would have no legal spelling.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let flag = true;
+            let as_number: i32 = if flag { 1 } else { 0 };
+            print(as_number - 3);
+            print(true && false);
+            print(true != false);
+            print("ab".repeat(3));
+            print("12".parse_i32().unwrap_or(0) - 3);
+            let rank: i32 = match Level::High { Level::Low => 1, Level::High => 5 };
+            print(rank - 1);
+        }
+        "#,
+        "-2\nfalse\ntrue\nababab\n9\n4\n",
+    );
+}
+
+#[test]
+fn b196_the_numeric_carve_out_is_untouched() {
+    // b148's SCOPE note deferred `f64 * i32` — two GROUNDED numbers computing
+    // a correct answer of the declared type — and B196 is not that change.
+    // The whole nine-operator family stays admitted on a numeric left operand,
+    // mixed widths included.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let scale: f64 = 2.5;
+            let count: i32 = 2;
+            print(scale * count);
+            print(scale - count);
+            print(7 % 4);
+            print(6 & 3);
+            print(1 << 3);
+        }
+        "#,
+        "5\n0.5\n3\n2\n8\n",
+    );
+}
+
+#[test]
+fn b196_the_admitted_operators_of_each_left_type_still_run() {
+    // The controls. Every operator each refusal NAMES as admitted has to keep
+    // working, or the rule would have eaten more than the bug.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Level { Low = 1, High = 5 }
+        enum Size { Small = "sm", Large = "lg" }
+
+        fun main() {
+            print("a" + "b");
+            print("a" == "a");
+            print("a" != "b");
+            print("a" < "b");
+            print(true == false);
+            print(true && false);
+            print(true || false);
+            print(!true);
+            print(Level::Low < Level::High);
+            print(Level::Low == Level::Low);
+            print(Size::Small == Size::Large);
+        }
+        "#,
+        "ab\ntrue\ntrue\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\ntrue\nfalse\n",
+    );
+}
+
+// --- B200: the unary operators' operands ------------------------------------
+//
+// B196's own find, closed here. The binary loop above reads
+// `prepped_binary_ops`; a unary was typed somewhere else entirely
+// (`Expr::Unary` in `infer_type_inner`, which simply returns the operand's
+// type) and reached no operand rule at all. Same defect, same family, one
+// operand to blame instead of two — and off the native path it is worse than
+// the binary case, because `-` on an aggregate is `NaN` rather than a
+// plausible wrong number.
+//
+// The pre-fix runs, recorded because a green pin proves only that the program
+// is refused NOW:
+//
+//   let flipped: bool = -true      →  -1. `== true` printed false and
+//                                      `== false` printed false: a `bool`
+//                                      that is neither value, exactly as
+//                                      `true - 3` was.
+//   let value: str = -"12"         →  -12, typed `str`.
+//   let level: Level = -Level::High →  -5 typed `Level`; `== Level::High` and
+//                                      `== Level::Low` both printed false.
+//   let p = -Point { x = 1, y = 2 } →  the host's `-[1, 2]`, `NaN`, and
+//                                      `p.x` printed `undefined`.
+//   fun negate<T: Sub>(v: T): T { -v } → compiled; `negate(5)` printed `-5`
+//                                      and `negate(Point { … }).x` printed
+//                                      `undefined`.
+//   print(!5) / print(!"hi") /
+//   print(!Point { x = 1, y = 2 }) →  false, false, false — the host's
+//                                      truthiness test, never the question
+//                                      the author asked.
+//
+// The admitted sets are stated, not read off an impl: vilan has no `Neg` and
+// no `Not` trait, so nothing here ever dispatches, and `-` admits the numeric
+// primitives while `!` admits `bool`. A type PARAMETER is refused for B179's
+// reason — no trait names either set, so no bound can prove membership.
+
+#[test]
+fn b196_a_unary_minus_on_a_non_numeric_operand_is_rejected() {
+    // The pin B200 was filed as (its `#[ignore]` reason named B200), kept
+    // under its found-as name. Pre-fix: `-1`, equal to neither `true` nor
+    // `false`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let flipped: bool = -true;
+            print(flipped);
+        }
+        "#,
+        "-true",
+        "`-` on `bool` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_str_is_rejected() {
+    // Pre-fix: `-12`, typed `str`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let value: str = -"12";
+            print(value);
+        }
+        "#,
+        r#"-"12""#,
+        "`-` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_backed_enum_is_rejected() {
+    // Pre-fix: `-5` typed `Level`, matching neither variant — the silent
+    // shape, exactly as `Level::High ^ Level::Low` was.
+    assert_fails_spanning(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let level: Level = -Level::High;
+            print(level == Level::High);
+        }
+        "#,
+        "-Level::High",
+        "`-` on `Level` has no meaning",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_struct_is_rejected() {
+    // The shape the binary family never had: no native coercion produces even
+    // a plausible number. Pre-fix this compiled and `p.x` printed `undefined`.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let p = -Point { x = 1, y = 2 };
+            print(p.x);
+        }
+        "#,
+        "-Point { x = 1, y = 2 }",
+        "vilan has no `Neg` trait",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_bounded_generic_is_rejected() {
+    // B179's rule at the unary site: the bound is IRRELEVANT, because no
+    // trait names the numeric set. Pre-fix `negate(5)` printed `-5` and
+    // `negate(Point { x = 1, y = 2 }).x` printed `undefined` — the same
+    // declaration, correct for one instantiation and garbage for the other.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Sub;
+
+        fun negate<T: Sub>(value: T): T {
+            -value
+        }
+
+        fun main() {
+            print(negate(5));
+        }
+        "#,
+        "-value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_an_unbounded_generic_is_rejected() {
+    // The unbounded half gets the same sentence for the same reason: a bound
+    // could not have rescued it either.
+    assert_fails_spanning(
+        r#"
+        fun negate<T>(value: T): T {
+            -value
+        }
+
+        fun main() {
+            print(negate(5));
+        }
+        "#,
+        "-value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_void_is_rejected() {
+    // B170's rule on the unary side: the refusal must be one the reader can
+    // act on, and `void` has no number inside it to negate.
+    assert_fails_with(
+        r#"
+        fun nothing() {}
+
+        fun main() {
+            print(-nothing());
+        }
+        "#,
+        "this operand is `void`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_number_is_rejected() {
+    // The twin. `!`'s RESULT was always typed `bool`, so nothing wore a type
+    // it was not — the defect is that the host's `!` admits every value, so
+    // `!5` compiled to `false` and the author's question was never asked.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            print(!5);
+        }
+        "#,
+        "!5",
+        "`!` negates a `bool`, and this operand is `i32`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_str_is_rejected() {
+    // Pre-fix: `false`. The emptiness test the author plausibly meant is
+    // `.is_empty()`, which the refusal names.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            print(!"hi");
+        }
+        "#,
+        r#"!"hi""#,
+        "`!` negates a `bool`, and this operand is `str`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_struct_is_rejected() {
+    // Pre-fix: `false`, and it would have been `false` for every struct ever
+    // written — an aggregate lowers to an array, and an array is always
+    // truthy.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            print(!Point { x = 1, y = 2 });
+        }
+        "#,
+        "!Point { x = 1, y = 2 }",
+        "`!` negates a `bool`, and this operand is `Point`",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_generic_is_rejected() {
+    // B181's sentence at the unary site, and for B181's reason: `bool`'s set
+    // is `bool` itself and `!` models no operator trait to consult.
+    assert_fails_spanning(
+        r#"
+        fun negated<T>(value: T): bool {
+            !value
+        }
+
+        fun main() {
+            print(negated(true));
+        }
+        "#,
+        "!value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b200_a_unary_minus_on_a_trait_typed_operand_is_rejected() {
+    // The trait-typed shape, which the BINARY site can rescue and this one
+    // cannot: B193 dispatches a default body's `self + self` on the type being
+    // specialized, because a supertrait can promise `Add`. Nothing can promise
+    // `-` — there is no `Neg` trait to declare — so every specialization would
+    // reach the host's `-` over a lowered value. Pre-fix,
+    // `Money { cents = 21 }.flipped().cents` printed `undefined`.
+    assert_fails_spanning(
+        r#"
+        trait Flipper {
+            fun flipped(self): Self { -self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Flipper {}
+
+        fun main() {
+            print(Money { cents = 21 }.flipped().cents);
+        }
+        "#,
+        "-self",
+        "vilan has no `Neg` for one to require",
+    );
+}
+
+#[test]
+fn b200_a_bang_on_a_trait_typed_operand_is_rejected() {
+    // Its twin: no `Not` trait either, so `!self` in a default body was the
+    // host's truthiness test over a lowered value — `false` for every
+    // specialization, whatever it held.
+    assert_fails_spanning(
+        r#"
+        trait Negator {
+            fun negated(self): bool { !self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Negator {}
+
+        fun main() {
+            print(Money { cents = 21 }.negated());
+        }
+        "#,
+        "!self",
+        "vilan has no `Not` for one to require",
+    );
+}
+
+#[test]
+fn b200_a_bare_trait_unary_operand_gets_the_bound_steer() {
+    // B175's rule about WHICH refusal, on the unary side: the two ways of
+    // arriving at a trait-typed operand need different steers, because only
+    // the default body has a trait to add a method to. A bare trait outside
+    // one gets B175's own sentence.
+    let source = r#"
+        import std::io::panic;
+
+        trait Maker {
+            fun make(): Self { panic("no default") }
+        }
+
+        fun main() {
+            print(-Maker::make());
+        }
+        "#;
+    assert_fails_with(source, "A trait is a bound, not a value type");
+    assert_fails_with(source, "(`<T: Maker>`)");
+    assert_fails_without(source, "Inside a default body");
+}
+
+#[test]
+fn b200_the_admitted_unary_forms_still_compile_and_run() {
+    // The control. Every form the two admitted sets cover, including the
+    // negative literal (`-128i8` is `Unary('-')` OVER the literal, and the
+    // range check runs before the minus applies) and a `!` over a comparison.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            print(-5);
+            print(-5.5);
+            let x = 3;
+            print(-x);
+            print(-x - 1);
+            print(-128i8);
+            print(!true);
+            print(!(1 == 2));
+            print(!!true);
+        }
+        "#,
+        "-5\n-5.5\n-3\n-4\n-128\nfalse\ntrue\ntrue\n",
+    );
+}
+
+// --- B206: a `= Self`-defaulted parameter renders as the impl's subject -------
+//
+// `impl P with PartialEq { }` advised ``declare `fun eq(self, b: PartialEq):
+// bool` `` — a signature nobody can write, because `PartialEq` is a trait and a
+// trait is not a type. The cause is the `= Self` default: `trait PartialEq<B =
+// Self>` resolves `B` to the very same type as `Self` (both are
+// `Type::Trait(PartialEq, [])`), so rendering the RESOLVED type printed the
+// trait's own name. `function_signature_label` now renders FOR the impl, by the
+// WRITTEN name — the B29 residue's own rule: `Self` is the subject, and a
+// parameter's own name is the matching `with`-clause argument, falling back to
+// the subject when the clause supplied none, which is exactly what `= Self`
+// means. B197's arm had rendered its own signature to route around this; with
+// the label fixed, both arms read the one rendering.
+
+#[test]
+fn b206_a_self_defaulted_parameter_renders_as_the_subject() {
+    let source = r#"
+        import std::compare::PartialEq;
+        struct P { x: i32 }
+        impl P with PartialEq { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "declare `fun eq(self, b: P): bool`");
+    assert_fails_without(source, "b: PartialEq");
+}
+
+#[test]
+fn b206_a_self_return_renders_as_the_subject_too() {
+    // `Add`'s shape has BOTH ambiguous positions — `b: B` and a `Self` return —
+    // and it is the arm B197 was rendering by hand, now routed through the
+    // shared label.
+    let source = r#"
+        import std::operators::Add;
+        struct P { x: i32 }
+        impl P with Add { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "Declare `fun add(self, b: P): P`");
+    assert_fails_without(source, "b: Add");
+}
+
+#[test]
+fn b206_a_user_traits_self_defaulted_parameter_renders_the_same_way() {
+    // Not a std shape and not an operator: the rule is the `= Self` default's,
+    // wherever it is declared.
+    let source = r#"
+        trait Combine<B = Self> {
+            fun merge(self, b: B): Self;
+        }
+        struct P { x: i32 }
+        impl P with Combine { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "declare `fun merge(self, b: P): P`");
+    assert_fails_without(source, "b: Combine");
+}
+
+#[test]
+fn b206_a_written_with_clause_argument_wins_over_the_default() {
+    // The half the written name is needed for: `B` and `Self` resolve to one
+    // type, and here they mean two different ones. The subject fallback would
+    // have rendered `b: Meters`.
+    assert_fails_with(
+        r#"
+        trait Combine<B = Self> {
+            fun merge(self, b: B): Self;
+        }
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+        impl Meters with Combine<Feet> { }
+        fun main() {}
+        "#,
+        "declare `fun merge(self, b: Feet): Meters`",
+    );
+}
+
+#[test]
+fn b206_an_ordinary_parameter_still_renders_as_written() {
+    // The control. Only a position that resolves to the DECLARING trait's own
+    // abstract type is ambiguous; everything else renders as the author wrote
+    // it, and a rule that rewrote more than that would show up here.
+    assert_fails_with(
+        r#"
+        trait Tagger {
+            fun tag(self, name: str): str;
+        }
+        struct P { x: i32 }
+        impl P with Tagger { }
+        fun main() {}
+        "#,
+        "declare `fun tag(self, name: str): str`",
+    );
+}
+
+// --- B249: the suggested declaration renders in the IMPL's terms ---------------
+//
+// `impl Counted with Source<i32>` was told to ``declare `fun on_change(self,
+// observer: |T| void)` `` — a `T` the impl does not have and cannot introduce, so
+// the one line the diagnostic exists to be copied is the one line that cannot be.
+// B206 fixed the two AMBIGUOUS positions (`Self`, a `= Self`-defaulted parameter)
+// and only those, because those are the two the resolved type cannot tell apart;
+// an ordinary `T` is not ambiguous at all and rendered as written. The trait's own
+// parameters now carry the `with` clause's arguments through the rendering, at
+// whatever depth they sit.
+
+#[test]
+fn b249_a_trait_parameter_takes_the_impls_argument() {
+    // The find's own shape, against std's own `Source<T>`: `T` is nested inside a
+    // closure type, which is why it is a substitution and not a per-position
+    // lookup.
+    let source = r#"
+        import std::reactive::Source;
+        struct Counted { n: i32 }
+        impl Counted with Source<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(
+        source,
+        "declare `fun on_change(self, observer: |i32| void): Subscription`",
+    );
+    assert_fails_without(source, "|T| void");
+}
+
+#[test]
+fn b249_a_parameter_in_return_position_takes_it_too() {
+    let source = r#"
+        trait Counted<T> {
+            fun latest(self): T;
+        }
+        struct P { x: i32 }
+        impl P with Counted<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "declare `fun latest(self): i32`");
+    assert_fails_without(source, "): T`");
+}
+
+#[test]
+fn b249_a_two_parameter_trait_substitutes_by_position() {
+    // The pin that makes it a substitution rather than "replace the one
+    // parameter": `A` and `B` take their own arguments, and the repeated `A`
+    // takes the same one in both positions.
+    assert_fails_with(
+        r#"
+        trait Pairer<A, B> {
+            fun pair(self, a: A, b: B): A;
+        }
+        struct P { x: i32 }
+        impl P with Pairer<i32, str> { }
+        fun main() {}
+        "#,
+        "declare `fun pair(self, a: i32, b: str): i32`",
+    );
+}
+
+#[test]
+fn b249_a_generic_impl_passing_its_own_binder_is_unchanged() {
+    // The leg that already read right, and still does: an impl that hands the
+    // trait its OWN binder renders that binder, which is a name the impl has. The
+    // identity pair is dropped from the map, so this string is built the same way
+    // it was before.
+    assert_fails_with(
+        r#"
+        trait Counted<T> {
+            fun on_change(self, observer: |T| void);
+        }
+        struct Box2<type T> { v: T }
+        impl Box2<type T> with Counted<T> { }
+        fun main() {}
+        "#,
+        "declare `fun on_change(self, observer: |T| void)`",
+    );
+}
+
+#[test]
+fn b249_a_generic_impl_renaming_the_parameter_takes_its_own_name() {
+    // The proof that the leg above is the substitution agreeing rather than the
+    // substitution being skipped: rename the impl's binder and the suggestion
+    // follows it, because `U` is the name THIS impl can write.
+    assert_fails_with(
+        r#"
+        trait Counted<T> {
+            fun on_change(self, observer: |T| void);
+        }
+        struct Box2<type U> { v: U }
+        impl Box2<type U> with Counted<U> { }
+        fun main() {}
+        "#,
+        "declare `fun on_change(self, observer: |U| void)`",
+    );
+}
+
+// --- B260: and the HEAD names the trait the same way ---------------------------
+//
+// B249 fixed the suggested declaration and stopped there: the sentence above it
+// still said `does not implement trait 'Source'` for an `impl Counted with
+// Source<i32>` — the arguments were what the refusal was ABOUT, and the one place
+// they did not appear was the sentence naming the trait. Two impls of one trait at
+// different arguments produced two refusals a reader could not tell apart.
+
+#[test]
+fn b260_the_head_carries_the_with_clauses_arguments() {
+    let source = r#"
+        import std::reactive::Source;
+        struct Counted { n: i32 }
+        impl Counted with Source<i32> { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "does not implement trait 'Source<i32>'");
+    assert_fails_without(source, "does not implement trait 'Source'");
+}
+
+#[test]
+fn b260_a_two_parameter_trait_names_both_in_the_head() {
+    let source = r#"
+        trait Pairer<A, B> {
+            fun pair(self, a: A, b: B): A;
+        }
+        struct P { x: i32 }
+        impl P with Pairer<i32, str> { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "does not implement trait 'Pairer<i32, str>'");
+    assert_fails_without(source, "does not implement trait 'Pairer'");
+}
+
+#[test]
+fn b260_an_impl_passing_its_own_binder_names_the_binder() {
+    // The arguments are in the IMPL's terms, so an impl that hands the trait its
+    // own binder reads as the author wrote it — the same leg B249 pins for the
+    // suggested declaration, now for the head above it.
+    assert_fails_with(
+        r#"
+        trait Counted<T> {
+            fun on_change(self, observer: |T| void);
+        }
+        struct Box3<type U> { v: U }
+        impl Box3<type U> with Counted<U> { }
+        fun main() {}
+        "#,
+        "does not implement trait 'Counted<U>'",
+    );
+}
+
+#[test]
+fn b260_a_trait_with_no_arguments_reads_as_it_always_has() {
+    // The non-vacuity control: an elided clause renders the bare name, so nothing
+    // grew an empty `<>`.
+    let source = r#"
+        trait Tagger {
+            fun tag(self, name: str): str;
+        }
+        struct P { x: i32 }
+        impl P with Tagger { }
+        fun main() {}
+        "#;
+    assert_fails_with(source, "does not implement trait 'Tagger': missing 'tag'");
+    assert_fails_without(source, "Tagger<");
+}
+
+// --- B290: `is` over an unannotated closure parameter ------------------------
+//
+// The `is` door's face of B23's family. `resolve_match` already waits for a
+// closure parameter's bidirectional FILL before typing its legs' captures;
+// `resolve_is` did not, so the pattern was read against the enum's own
+// declaration and the payload came out as the DECLARATION's parameter — a
+// free, unbounded generic. Both faces shipped: a legitimate read of the
+// payload was refused ("cannot call method 'len' on T"), and the same binding
+// satisfied any other type at all.
+
+#[test]
+fn b290_an_is_over_an_unannotated_closure_parameter_reads_its_payload() {
+    // The refuse face, on the std surface kolt hits: `sub`'s `|T| void` fills
+    // the parameter as `Option<List<i32>>`, so the payload is a `List<i32>`
+    // and `len()` is a method it has.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let outer: SignalCell<Option<List<i32>>> = Signal::new(Some([1, 2]));
+            outer.sub(|inner| {
+                if inner is Some(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_payload_on_a_closure_parameter_is_not_a_free_generic() {
+    // The UNSOUND face: the payload typed as `Option`'s own `T` reconciled
+    // with anything, so a `List<i53>` passed for a `str` compiled and ran.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let outer: SignalCell<Option<List<i53>>> = Signal::new(Some([1i53]));
+            let text: SignalCell<str> = Signal::new("");
+            outer.sub(|inner| {
+                if inner is Some(let payload) {
+                    text.set(payload);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i53> instead.",
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_non_generic_callees_closure_parameter_reads_its_payload() {
+    // The callee need not be generic at all — a plain `|Option<List<i32>>|
+    // void` parameter fills the same way, and used to fail the same way.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun main() {
+            take(|inner| {
+                if inner is Some(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_non_generic_callees_closure_parameter_is_checked() {
+    // The same non-generic callee's unsound face.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun sink(value: str) {
+            print(value);
+        }
+
+        fun main() {
+            take(|inner| {
+                if inner is Some(let payload) {
+                    sink(payload);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_result_payload_on_a_closure_parameter_reads_it() {
+    // `Ok(let v)` — the rule is the pattern's, not `Option`'s.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        fun take(g: |Result<List<i32>, str>| void) {
+            g(Ok([1, 2]));
+        }
+
+        fun main() {
+            take(|outcome| {
+                if outcome is Ok(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_user_enum_payload_on_a_closure_parameter_reads_it() {
+    // A user generic enum, whose own parameter is what the payload used to
+    // come out as ("cannot call method 'len' on P").
+    assert_compiles(
+        r#"
+        import std::io::print;
+
+        enum Holder<type P> {
+            Full(P),
+            Empty,
+        }
+
+        fun take(g: |Holder<List<i32>>| void) {
+            g(Holder::Full([1, 2]));
+        }
+
+        fun main() {
+            take(|held| {
+                if held is Holder::Full(let sides) {
+                    print(i"{sides.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_over_a_user_enum_payload_on_a_closure_parameter_is_checked() {
+    // And its unsound face: the free `P` satisfied a `str` parameter.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        enum Holder<type P> {
+            Full(P),
+            Empty,
+        }
+
+        fun take(g: |Holder<List<i32>>| void) {
+            g(Holder::Full([1, 2]));
+        }
+
+        fun sink(value: str) {
+            print(value);
+        }
+
+        fun main() {
+            take(|held| {
+                if held is Holder::Full(let sides) {
+                    sink(sides);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b290_a_nested_signal_cell_payload_on_a_closure_parameter_reads_it() {
+    // The payload is itself a `SignalCell` — the shape kolt's channel switch
+    // carries, and the one whose `get()` was refused "on T".
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let inner_cell: SignalCell<i32> = Signal::new(7);
+            let outer: SignalCell<Option<SignalCell<i32>>> = Signal::new(Some(inner_cell));
+            outer.sub(|held| {
+                if held is Some(let cell) {
+                    print(i"{cell.get()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn b290_an_is_guarded_by_a_conjunction_types_its_payload() {
+    // The `&&` spine (B215's frame): the same door, reached through a
+    // compound condition rather than a bare `if`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun sink(value: str) {
+            print(value);
+        }
+
+        fun main() {
+            take(|inner| {
+                if inner is Some(let payload) && true {
+                    sink(payload);
+                }
+            });
+        }
+        main();
+        "#,
+        "Expected str, but got List<i32> instead.",
+    );
+}
+
+#[test]
+fn b290_an_annotated_closure_parameter_stays_the_control() {
+    // The shipped workaround (kolt's `channel.vl` re-annotation): an
+    // ANNOTATED parameter never waited on anything, and still does not.
+    assert_compiles(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun take(g: |Option<List<i32>>| void) {
+            g(Some([1, 2]));
+        }
+
+        fun main() {
+            take(|inner: Option<List<i32>>| {
+                if inner is Some(let payload) {
+                    print(i"{payload.len()}");
+                }
+            });
+        }
+        main();
+        "#,
+    );
+}
+
+// --- B304: an unannotated closure parameter is not frozen at the callee's own
+// --- unbound generic --------------------------------------------------------
+//
+// `fun apply<E>(self, handler: |E| void)` binds `E` from no ordinary argument,
+// so the bidirectional fill wrote the abstract `E` into the closure
+// parameter's ONE-SHOT slot and every use of it in the body was refused. It
+// showed up as an asymmetry that looked like "free function versus impl
+// method" and is really "was the receiver's type known on the first attempt":
+// a receiver whose type had not landed made the call DEFER, the body typed the
+// parameter itself, and the retry bound `E` from the finished closure.
+// `std::router::link_to`'s `|event: Event|` was the workaround.
+
+#[test]
+fn b304_a_closure_parameter_is_not_frozen_at_the_callees_unbound_generic() {
+    // The exhibit, both receivers in one program: `from_chain`'s receiver is a
+    // CALL (its type lands late — this half always compiled) and
+    // `from_parameter`'s is a parameter (known immediately — this half did
+    // not). The body pins the parameter through a free function taking the
+    // concrete type, exactly as `plain_left_click(event)` does in std.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        impl Ev {
+            fun stop(self) { print("stopped"); }
+        }
+        struct Holder { tag: str }
+
+        fun make(): Holder { Holder { tag = "h" } }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun is_plain(event: Ev): bool { event.code == 0 }
+
+        fun from_chain(): Holder {
+            make().apply(|event| {
+                if is_plain(event) { event.stop(); }
+            })
+        }
+
+        fun from_parameter(holder: Holder): Holder {
+            holder.apply(|event| {
+                if is_plain(event) { event.stop(); }
+            })
+        }
+
+        fun main() {
+            from_chain();
+            from_parameter(make());
+            print("done");
+        }
+
+        main();
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b304_the_same_call_from_inside_an_inherent_impl_method_types_its_closure() {
+    // B304's own spelling: the call is made from inside an INHERENT IMPL
+    // METHOD, where `self` is known immediately — `View::link_to`'s shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        impl Ev {
+            fun stop(self) { print("stopped"); }
+        }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        fun is_plain(event: Ev): bool { event.code == 0 }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event| {
+                    if is_plain(event) { event.stop(); }
+                })
+            }
+        }
+
+        fun main() {
+            Holder { tag = "h" }.wire();
+            print("done");
+        }
+
+        main();
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b304_an_annotated_closure_parameter_still_binds_the_generic() {
+    // The control the workaround was: an annotation is still the binding
+    // channel it always was, and it still binds `E` for the rest of the call.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Ev { code: i32 }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event: Ev| { print(event.code); })
+            }
+        }
+
+        fun main() {
+            Holder { tag = "h" }.wire();
+            print("done");
+        }
+
+        main();
+        "#,
+        "done\n",
+    );
+}
+
+#[test]
+fn b304_a_generic_bound_by_an_ordinary_argument_still_fills_the_closure() {
+    // The shape that must NOT change: `E` is bound by a non-closure argument
+    // before the closure is typed, so the fill has a concrete type to give and
+    // the parameter needs no annotation. Declining here would starve every
+    // `each`-shaped call in the tree.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun each<E>(self, seed: E, handler: |E| void): Holder {
+                handler(seed);
+                self
+            }
+        }
+
+        fun main() {
+            Holder { tag = "h" }.each(7, |value| print(value + 1));
+        }
+
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b304_a_generic_in_the_closures_return_still_fills_the_parameter() {
+    // The other shape that must not change: the callee's own generic is in the
+    // closure's RETURN (`map<U>(transform: |T| U)`), which the closure BINDS.
+    // The parameter position carries only `T`, already bound from the
+    // receiver, so the fill still runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Cell<T> { value: T }
+        impl Cell<type T> {
+            fun map<U>(self, transform: |T| U): Cell<U> {
+                Cell { value = transform(self.value) }
+            }
+        }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            let mapped = cell.map(|value| i"n={value}");
+            print(mapped.value);
+        }
+
+        main();
+        "#,
+        "n=7\n",
+    );
+}
+
+#[test]
+fn b304_a_closure_body_that_pins_nothing_is_still_refused() {
+    // The negative control: leaving the slot open is not silent acceptance.
+    // A body that USES the parameter and pins nothing about it still gets the
+    // abstract-parameter refusal it always got — the fix removes the freeze,
+    // not the check.
+    assert_fails_with(
+        r#"
+        struct Ev { code: i32 }
+        impl Ev {
+            fun stop(self) { }
+        }
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event| { event.stop(); })
+            }
+        }
+
+        fun main() { }
+        "#,
+        "cannot call method 'stop' on E",
+    );
+}
+
+#[test]
+fn b304_a_closure_that_never_touches_its_parameter_compiles() {
+    // And the parameter nothing reads at all stays admitted: `E` is never
+    // instantiated, which is no one's problem.
+    assert_compiles(
+        r#"
+        struct Holder { tag: str }
+
+        impl Holder {
+            fun apply<E>(self, handler: |E| void): Holder { self }
+        }
+
+        impl Holder {
+            fun wire(self): Holder {
+                self.apply(|event| { })
+            }
+        }
+
+        fun main() { }
+        "#,
     );
 }

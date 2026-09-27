@@ -297,7 +297,7 @@ fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
         import std::io::print;
 
         impl List<type T> {
-            fun second_len(self): i32 {
+            fun second_len(self): usize {
                 self.len()
             }
         }
@@ -544,6 +544,154 @@ fn a_filter_that_rejects_everything_is_exhausted_not_stuck() {
     );
 }
 
+/// I3's remainder, filed off kolt's `server.vl:92` (`List::map_filter`, under a
+/// `// FIXME: Implement with std.`): `map` and `filter` in ONE pass, where the
+/// projection's `None` drops the element. The intermediate `Option` is never
+/// materialized, which is the difference from `it.map(f)` followed by a filter.
+#[test]
+fn filter_map_projects_and_drops_in_one_pass() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut halves = [1, 2, 3, 4, 5, 6].iter().filter_map(|n| {
+                    if n % 2 == 0 {
+                        Some(n / 2)
+                    } else {
+                        None
+                    }
+                });
+                for value in halves {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n3\n",
+    );
+}
+
+/// The projection may change the element type, exactly as `map`'s may — the
+/// adapter carries three parameters (upstream, in, out) for this reason.
+#[test]
+fn filter_map_changes_the_element_type() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut labelled = [1, 2, 3].iter().filter_map(|n| {
+                    if n == 2 {
+                        None
+                    } else {
+                        Some(i"n{n}")
+                    }
+                });
+                for value in labelled {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "n1\nn3\n",
+    );
+}
+
+/// `filter`'s pin, on the projecting twin: the loop inside `next` has to end on
+/// the UPSTREAM's `None` and not only on a `Some` from the projection, so a
+/// projection that answers `None` for everything is exhausted rather than stuck.
+#[test]
+fn a_filter_map_that_drops_everything_is_exhausted_not_stuck() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut none = [1, 2, 3].iter().filter_map(|n| {
+                    if n > 100 {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                });
+                mut seen = 0;
+                for _value in none {
+                    seen = seen + 1;
+                }
+                print(seen);
+                let empty: List<i32> = [];
+                print(empty.iter().filter_map(|n| Some(n)).next().is_none());
+            }
+            "#,
+        ),
+        "0\ntrue\n",
+    );
+}
+
+/// Lazy like every other adapter, and it composes: bounded by a later `take`,
+/// an unbounded source is pulled only as far as the budget needs — which is
+/// also what keeps this pin from hanging.
+#[test]
+fn filter_map_stays_lazy_and_composes_with_take() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut thirds = Naturals { at = 0 }.filter_map(|n| {
+                    if n % 3 == 0 {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                }).take(2);
+                for value in thirds {
+                    print(value);
+                }
+                mut pulls = 0;
+                mut unpulled = [1, 2, 3].iter().filter_map(|n| {
+                    pulls = pulls + 1;
+                    Some(n)
+                });
+                print(i"built {pulls}");
+            }
+            "#,
+        ),
+        "3\n6\nbuilt 0\n",
+    );
+}
+
+/// The EAGER twin, which is what a call site holding a `List` reaches for: it
+/// lives in `option.vl` beside `find`, because the always-loaded core stays off
+/// the `option` chain, and it does not route through `iter()` — that would copy
+/// the list for a single pass.
+#[test]
+fn the_eager_list_filter_map_is_the_one_pass_twin() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let kept = [1, 2, 3, 4].filter_map(|n| {
+                    if n % 2 == 0 {
+                        Some(i"n{n}")
+                    } else {
+                        None
+                    }
+                });
+                print(kept.len());
+                for value in kept {
+                    print(value);
+                }
+                let empty: List<i32> = [];
+                print(empty.filter_map(|n| Some(n)).len());
+                // kolt's own shape: a list of pairs projected through `zip`.
+                let pairs = [["a", "1"], ["b"]];
+                let both = pairs.filter_map(|row| row.get(0).zip(row.get(1)));
+                print(both.len());
+            }
+            "#,
+        ),
+        "2\nn2\nn4\n0\n1\n",
+    );
+}
+
 #[test]
 fn take_stops_at_its_budget() {
     assert_compiles_and_runs(
@@ -569,8 +717,6 @@ fn take_of_zero_yields_nothing_and_take_past_the_end_stops_early() {
             fun main() {
                 mut nothing = [1, 2, 3].iter().take(0);
                 print(nothing.next().is_none());
-                mut negative = [1, 2, 3].iter().take(-4);
-                print(negative.next().is_none());
                 mut over = [1, 2].iter().take(9);
                 mut seen = 0;
                 for _value in over {
@@ -580,7 +726,24 @@ fn take_of_zero_yields_nothing_and_take_past_the_end_stops_early() {
             }
             "#,
         ),
-        "true\ntrue\n2\n",
+        "true\n2\n",
+    );
+}
+
+#[test]
+fn take_of_a_negative_count_is_refused() {
+    // A count is a `usize` since I5 S2, so the negative `take` the pin above
+    // used to run (and answer nothing for) has no spelling: B407 refuses it.
+    assert_fails_with(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut negative = [1, 2, 3].iter().take(-4);
+                print(negative.next().is_none());
+            }
+            "#,
+        ),
+        "so the negative literal `-4` is out of range",
     );
 }
 
@@ -922,7 +1085,7 @@ fn a_protocol_loop_over_a_user_iterator_keeps_its_tuple_element() {
 
         struct Cursor<T> {
             items: List<T>,
-            index: i32,
+            index: usize,
         }
 
         impl Cursor<type T> {
@@ -1018,7 +1181,7 @@ fn a_protocol_loop_keeps_an_enum_subjects_element_type() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
 
-        enum Feed<T> { Ready(List<T>, i32), Done }
+        enum Feed<T> { Ready(List<T>, usize), Done }
 
         impl Feed<type T> {
             fun next(&mut self): Option<T> {
@@ -1060,7 +1223,7 @@ fn a_mut_view_loop_keeps_its_element_type_through_a_generic() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
 
-        struct Bag<T> { items: List<T>, cursor: i32 }
+        struct Bag<T> { items: List<T>, cursor: usize }
 
         impl Bag<type T> {
             fun next_mut(&mut self): Option<&mut T> {
@@ -1362,9 +1525,17 @@ fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
 /// The exemption set, end to end and at runtime: an `external struct` whose
 /// runtime shape is the host's (`List` — a JS array; `str` — a JS string,
 /// yielding characters; `Bytes` — a `Uint8Array`), `Set` (the `__set_iter`
-/// lowering over the backing map's stored originals), and the two shapes that
-/// never reach the struct/enum arm at all (`[T; n]` and a tuple). None of these
-/// declares a `next`, and every one of them must keep iterating.
+/// lowering over the backing map's stored originals), and `[T; n]`, which
+/// never reaches the struct/enum arm at all. None of these declares a `next`,
+/// and every one of them must keep iterating.
+///
+/// A TUPLE used to be listed here beside `[T; n]`, on the strength of the same
+/// "it is a JS array at runtime" argument — and running was all this pin ever
+/// checked. B209 measured what the binder was while it ran: `any`, so
+/// `for item in (5, "six")` printed `6` for one element and `six1` for the
+/// other. Being natively iterable is a fact about the EMISSION; having one
+/// element type is the question the loop's typing asks, and only `[T; n]`
+/// answers it. The tuple's refusal is pinned in `tuples.rs`.
 #[test]
 fn the_deliberate_native_iteration_forms_still_iterate() {
     assert_compiles_and_runs(
@@ -1378,15 +1549,13 @@ fn the_deliberate_native_iteration_forms_still_iterate() {
             for character in "ab" { print(character); }
             let fixed: [i32; 2] = [3, 4];
             for item in fixed { print(item); }
-            let pair = (5, 6);
-            for item in pair { print(item); }
             mut seen: Set<i32> = Set::new();
             seen.insert(7);
             for item in seen { print(item); }
             for byte in encode_utf8("h") { print(byte); }
         }
         "#,
-        "1\n2\na\nb\n3\n4\n5\n6\n7\n104\n",
+        "1\n2\na\nb\n3\n4\n7\n104\n",
     );
 }
 
@@ -1524,7 +1693,7 @@ fn an_inherited_default_on_a_generic_subject_keeps_its_element_type() {
             fun next(&mut self): Option<T> { self.take() }
         }
 
-        struct Bag<T> { items: List<T>, cursor: i32 }
+        struct Bag<T> { items: List<T>, cursor: usize }
         impl Bag<type T> with Feed<T> {
             fun take(&mut self): Option<T> {
                 if self.cursor < self.items.len() {
@@ -1562,7 +1731,7 @@ fn a_next_mut_inherited_from_a_trait_default_drives_a_mut_loop() {
             fun next_mut(&mut self): Option<&mut T> { self.step() }
         }
 
-        struct Bag2 { items: List<i32>, cursor: i32 }
+        struct Bag2 { items: List<i32>, cursor: usize }
         impl Bag2 with Walk<i32> {
             fun step(&mut self): Option<&mut i32> {
                 if self.cursor < self.items.len() {
@@ -2835,15 +3004,15 @@ fn to_map_builds_a_map_out_of_pairs_and_the_last_key_wins() {
         fun main() {
             let lengths = ["aa", "b"].iter().map(|word| (word, word.len())).to_list().to_map();
             print(lengths.len());
-            print(lengths.get("aa").unwrap_or(-1));
-            print(lengths.get("zz").unwrap_or(-1));
+            print(lengths.get("aa").unwrap_or(0));
+            print(lengths.get("zz").is_none());
             let repeated = [(1, "first"), (1, "second")].to_map();
             print(repeated.get(1).unwrap_or("miss"));
             let empty: List<(i32, str)> = [];
             print(empty.to_map().len());
         }
         "#,
-        "2\n2\n-1\nsecond\n0\n",
+        "2\n2\ntrue\nsecond\n0\n",
     );
 }
 
@@ -2974,7 +3143,7 @@ fn a_dispatched_call_is_not_colored_by_a_same_named_async_static() {
         struct Gate {}
 
         impl Gate {
-            async fun scan(items: List<i32>): i32 {
+            async fun scan(items: List<i32>): usize {
                 items.len()
             }
         }
@@ -3071,6 +3240,54 @@ fn a_genuinely_async_dispatched_member_still_colors_its_caller() {
         }
         "#,
         "slow\n",
+    );
+}
+
+#[test]
+fn a_default_body_self_call_is_not_colored_by_an_unrelated_inherent_async_member() {
+    // A49's second helping of the same collision, one layer in. The narrowing
+    // above dropped same-named STATICS; this one drops same-named members of
+    // types that do not implement the trait at all. `Self` inside a default
+    // body is the type the default is specialized for, and that type
+    // implements this trait — so `Client`, which implements nothing, can never
+    // be selected by `self.get()` however its own `get` is spelled.
+    //
+    // The live instance was std's: A49 made `Source::sub` a trait default whose
+    // body calls `self.get()`, and the `[service]` macro generates an async
+    // `get` on the client struct for a `[rpc] fun get`. Every `[service]`
+    // program then colored the whole `Source` protocol async.
+    assert_compiles_without_async(
+        r#"
+        import std::io::print;
+
+        struct Client { }
+
+        impl Client {
+            async fun get(self): i32 {
+                1
+            }
+        }
+
+        trait Peek {
+            fun get(self): i32;
+
+            fun doubled(self): i32 {
+                self.get() * 2
+            }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Peek {
+            fun get(self): i32 {
+                self.n
+            }
+        }
+
+        fun main() {
+            print(Cell { n = 3 }.doubled());
+        }
+        "#,
     );
 }
 
@@ -4252,5 +4469,202 @@ fn b102_the_unconditional_hoist_keeps_both_argument_orders_running() {
         }
         "#,
         "42\n42\n",
+    );
+}
+
+// --- B368: a binder pattern in a `for` header ---------------------------------
+//
+// R5: the header's binder is `let`'s own production, so a tuple (or array)
+// binder destructures the element in the header; anything else the binding
+// grammar does not take is refused BY NAME. Before this the header took a bare
+// IDENT followed by `in` and nothing else, and `for (i, item) in ..` fell
+// through to the WHILE branch — whose condition parse died on the `in` and
+// reported `found 'for' expected a statement or '}'` anchored on the keyword,
+// with no mention of the pattern (kolt's `lib/search.vl:26` wrote a manual
+// counter around it).
+
+#[test]
+fn b368_a_tuple_binder_in_a_for_header_destructures_the_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	for (index, item) in ["a", "b", "c"].iter().enumerate() {
+        		print(i"{index}:{item}");
+        	}
+        }
+        "#,
+        "0:a\n1:b\n2:c\n",
+    );
+}
+
+/// A list of tuples, so the element is a real tuple rather than one the
+/// iterator adapter builds — the plain shape, and the one whose element type
+/// the `ForEachItem` constraint has to resolve before the destructure can run.
+#[test]
+fn b368_a_tuple_binder_over_a_list_of_tuples() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let pairs = [(1, "x"), (2, "y")];
+        	for (number, label) in pairs {
+        		print(i"{number}-{label}");
+        	}
+        }
+        "#,
+        "1-x\n2-y\n",
+    );
+}
+
+/// NESTED, which is the whole point of sharing `let`'s production rather than
+/// writing a one-level tuple arm.
+#[test]
+fn b368_a_nested_binder_in_a_for_header() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let rows = [((1, 2), "x"), ((3, 4), "y")];
+        	for ((left, right), label) in rows {
+        		print(i"{left},{right},{label}");
+        	}
+        }
+        "#,
+        "1,2,x\n3,4,y\n",
+    );
+}
+
+/// The ARRAY binder comes along with the production, and takes exactly the
+/// rules `let [a, b] = ..` takes — including the fixed-array requirement.
+#[test]
+fn b368_an_array_binder_in_a_for_header_binds_a_fixed_array_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+        	for [left, right] in grid {
+        		print(i"{left}/{right}");
+        	}
+        }
+        "#,
+        "1/2\n3/4\n",
+    );
+}
+
+#[test]
+fn b368_an_array_binder_over_a_list_element_is_refused_as_a_let_would_be() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for [left, right] in [[1, 2], [3, 4]] {
+        		print(left + right);
+        	}
+        }
+        "#,
+        "cannot destructure List<i32> as a fixed array",
+    );
+}
+
+/// The binder's names are the loop's, so they shadow and go out of scope with
+/// it exactly as a plain one does.
+#[test]
+fn b368_a_binders_names_do_not_escape_the_loop() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for (index, item) in ["a"].iter().enumerate() {
+        		print(i"{index}{item}");
+        	}
+        	print(item);
+        }
+        "#,
+        "item",
+    );
+}
+
+/// A binder the binding grammar does NOT take is refused by name, anchored on
+/// the binder the author wrote rather than on the `for` keyword.
+#[test]
+fn b368_a_variant_pattern_in_a_for_header_is_refused_by_name() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	for Some(let value) in [1, 2] {
+        		print(value);
+        	}
+        }
+        "#,
+        "Some(let value)",
+        "a `for … in` header binds the element with `let`'s binder",
+    );
+}
+
+#[test]
+fn b368_a_literal_in_a_for_header_is_refused_by_name() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for 3 in [1, 2] {
+        		print("x");
+        	}
+        }
+        "#,
+        "bind the element and destructure in the body",
+    );
+}
+
+/// A ONE-element paren is not a tuple binder (`let (only) = ..` is not either),
+/// so it takes the same refusal rather than silently meaning `for only in ..`.
+#[test]
+fn b368_a_single_element_paren_binder_is_refused_by_name() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for (only) in [1, 2] {
+        		print(only);
+        	}
+        }
+        "#,
+        "a `for … in` header binds the element with `let`'s binder",
+    );
+}
+
+/// The three OTHER `for` forms still read as themselves — the binder attempt
+/// backtracks with its errors truncated, and a while condition that happens to
+/// contain a call is not mistaken for an unreadable binder.
+#[test]
+fn b368_the_while_and_infinite_forms_are_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun ready(count: i32): bool { count >= 2 }
+
+        fun main() {
+        	mut count = 0;
+        	for !ready(count) {
+        		count += 1;
+        	}
+        	print(count);
+        	mut spins = 0;
+        	for {
+        		spins += 1;
+        		if spins == 3 {
+        			jump break;
+        		}
+        	}
+        	print(spins);
+        	for _ in ["a", "b"] {
+        		print("tick");
+        	}
+        }
+        "#,
+        "2\n3\ntick\ntick\n",
     );
 }

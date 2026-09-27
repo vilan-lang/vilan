@@ -67,6 +67,31 @@ open (a listening server does so inherently; a socket-holding client
 must await something that ends with the app). On the browser platform,
 `main`'s completion leaves installed handlers and subscriptions live.
 
+**`ret` inside `main` leaves the program**, exactly as it leaves any
+other function — including from inside a loop, where it is distinct from
+that loop's own `break`. In a `main` that declares a return type, the
+value it carries is the exit status, the same as the value `main` falls
+off its end with; in a `void` `main`, `ret` takes no value and the
+status is zero. A `ret` inside a *closure* written in `main` returns
+from that closure, not from `main`.
+
+```vilan
+import std::io::print;
+
+fun main(): i32 {
+	mut attempts = 0;
+	for attempts < 5 {
+		if attempts == 2 {
+			ret 3;                 // leaves `main`; the status is 3
+		}
+		print(attempts);
+		attempts = attempts + 1;
+	}
+	print("not reached");
+	0
+}
+```
+
 `panic(message)` aborts execution with the message; it types as `any`
 (§5.1). Failed `assert`s panic.
 
@@ -105,6 +130,13 @@ types, out-of-range magnitudes for the narrow ones). Literals are
 range-checked at compile time (§2.3); runtime operations are not. An
 opt-in checked family (`add_safe`, …) is recorded future work; `BigInt`
 is the answer where the range itself is the problem.
+
+A `usize` subtracted past zero is this case, stated precisely: the result
+is unspecified, and it is never memory-unsafe. On the JS backend the value
+leaves the range and goes negative; natively a debug build panics and a
+release build wraps. No backend reaches memory through it — an index is
+bounds-checked on every backend, and a negative one fails the check.
+`usize` carries the defined answers, `checked_sub` and `saturating_sub`.
 
 ## 7.3 The async model
 

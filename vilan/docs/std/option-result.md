@@ -4,7 +4,7 @@
 `Result<T, E>` is how it says "this can fail" (there are no exceptions).
 Both are plain enums with a large helper-method surface, listed here. For
 how they replace `null` checks and `try`/`catch` in practice (including
-the `!` and `?.` operators), read [Control flow](../tour/control-flow.md)
+the `!`, `?.` and `?` operators), read [Control flow](../tour/control-flow.md)
 first.
 
 ```vilan,fragment
@@ -29,7 +29,8 @@ impl Option<type T> {
 
 	// extraction
 	fun unwrap(own self): T                  // panics on None
-	fun unwrap_or(own self, fallback: T): T
+	fun expect(own self, lazy message: str): T    // panic with your message
+	fun unwrap_or(own self, lazy fallback: T): T
 	fun unwrap_or_else(own self, fn: || T): T
 
 	// in-place partial move — read/replace the slot through `&mut self`,
@@ -63,9 +64,32 @@ impl Option<type T: Default> { fun unwrap_or_default(own self): T }
 impl Option<(type T, type U)> { fun unzip(own self): (Option<T>, Option<U>) }
 ```
 
-`str.parse_i32(): Option<i32>` and `str.parse_f64(): Option<f64>` (both
-declared here) are the string→number path, and `bool.then_some(value)` is the
-condition→`Option` one.
+`str.parse_i32(): Option<i32>`, `str.parse_f64(): Option<f64>` and
+`str.parse_bool(): Option<bool>` (all declared here) are the string→value
+path, and `bool.then_some(value)` is the condition→`Option` one. All three
+trim surrounding whitespace and are otherwise **strict**: the whole remaining
+text must be the value. `parse_bool` accepts `"true"` and `"false"` only —
+the exact inverse of `Display::to_string` on a `bool`, and the set
+`std::json`'s bool reader accepts. `"1"`, `"0"`, `"True"` and `"yes"` are
+`None`, because a parse whose accepted set is wider than its writer's output
+silently adopts some other producer's convention; an app with a legacy store
+says so in one line at its own decoder.
+
+That is the whole conversion idiom, and none of it needs hand-writing: out
+through `Display::to_string`, back through `str.parse_*`, and anything
+structured through `std::json`'s `Json` / `FromJson`.
+
+```vilan
+import std::display::Display;
+import std::io::print;
+import std::option::Option;
+
+fun main() {
+	let stored = true.to_string();
+	print(stored.parse_bool().unwrap_or(false));
+	print("1".parse_bool().is_some());
+}
+```
 
 The combinators that hand the payload onward take **`own self`**: they move
 the value out of the `Option`, so they must own it (`docs/spec/memory.md` R3).
@@ -76,14 +100,16 @@ use-after-move error, and `opt` is not torn down at all (the payload
 you now hold is). The pure predicates — `is_some`, `is_none` — keep a
 borrowing `self` and never consume, so they stay free on a resource.
 
-Reaching a resource payload is a `match`, not a guarded `unwrap`: `match opt
+`expect` is `unwrap` with your own panic message, and its message is
+deferred: it costs nothing on the path that has a value. Reaching a
+resource payload is a `match`, not a guarded `unwrap`: `match opt
 { Some(let value) => .., None => .. }` consumes `opt` on *every* path, which
 is what R7 requires. `if (opt.is_some()) { opt.unwrap() }` moves `opt` on one
 path only and is rejected as a conditional move (before this was checked it
 compiled and destroyed the payload twice).
 
-The capture *owns* the payload it took, so it is torn down at the end of its
-leg unless you move it on — into `drop`, into a return, into an `own`
+The capture *owns* the payload it took, so it is torn down at its last use
+inside the leg unless you move it on — into `drop`, into a return, into an `own`
 argument, into a struct field. Either way the payload is destroyed exactly
 once. A capture taken from a loan (`match &opt`, or `opt is Some(let value)`)
 consumes nothing and owns nothing: `opt` stays the owner and tears the
@@ -122,10 +148,10 @@ impl Result<type T, type E> {
 	// extraction
 	fun unwrap(self): T                      // panics on Err
 	fun unwrap_err(self): E                  // panics on Ok
-	fun unwrap_or(self, fallback: T): T
+	fun unwrap_or(self, lazy fallback: T): T
 	fun unwrap_or_else(self, fn: |E| T): T
-	fun expect(self, message: str): T        // panic with your message
-	fun expect_err(self, message: str): E
+	fun expect(self, lazy message: str): T   // panic with your message
+	fun expect_err(self, lazy message: str): E
 
 	// transformation
 	fun map<U>(self, fn: |T| U): Result<U, E>
@@ -178,6 +204,18 @@ fun main() {
 
 - Prefer `!` (propagate) and `unwrap_or*` over `unwrap`: `unwrap` is for
   invariants, and it panics.
+- `unwrap_or`'s fallback and `expect`'s message are
+  [**`lazy`**](../tour/functions-and-closures.md#lazy-parameters) on all
+  five of `Option::expect`, `Option::unwrap_or`, `Result::expect`,
+  `Result::unwrap_or` and `Result::expect_err`: the expression you write
+  in that position is evaluated only on the path that needs it, at most
+  once. So `opt.unwrap_or(expensive())` does not run `expensive()` when
+  `opt` is `Some`, and `res.expect(i"no row for {key}")` builds no message
+  when the row is there — nor does `res.expect_err(..)` on the `Err` path,
+  which is the one it does not panic on. `unwrap_or_else` remains the explicit spelling — a
+  closure, and on a `Result` the one that sees the error — and it is still
+  the resource-clean one, because it PRODUCES the fallback instead of
+  discarding it.
 - Application errors belong in `Result`'s `E`; only unreachable
   states panic.
 - `match` with `Some(let x)` / `Ok(let x)` patterns is always available

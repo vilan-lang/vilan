@@ -24,12 +24,13 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod support;
+use support::port::{free_port, wait_for_port};
 
 /// The emitted artifacts, in the order the golden directory holds them.
 const ARTIFACTS: &[&str] = &[
@@ -53,23 +54,17 @@ fn fixture(part: &str) -> PathBuf {
 /// Copies the fixture project into a fresh temp directory. `split` decides
 /// whether the manifest keeps its `split = true` line, so the same sources can
 /// be built both ways and compared.
+///
+/// DIRECTORIES in the fixture are skipped, by name (tracker N92). The fixture
+/// is a flat package of source files, and the only directory that ever appears
+/// in it is one a tool LEFT there — `vilan check .` run in this tree used to
+/// write `dist/.cache`, and the next `read_to_string` of it failed with
+/// `IsADirectory`, which is how ten tests in this file reported "cannot read a
+/// fixture file" for something no fixture file had done. The tool stopped
+/// writing there; the loader stops reading a directory as a file, and says
+/// which one it skipped rather than swallowing it.
 fn stage(tag: &str, split: bool) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("vilan_split_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
-    std::fs::create_dir_all(&staged).expect("create the staging directory");
-    for entry in std::fs::read_dir(fixture("project")).expect("read the fixture") {
-        let entry = entry.expect("a fixture entry");
-        let mut text = std::fs::read_to_string(entry.path()).expect("read a fixture file");
-        if !split && entry.file_name() == "vilan.toml" {
-            text = text
-                .lines()
-                .filter(|line| !line.starts_with("split"))
-                .map(|line| format!("{line}\n"))
-                .collect();
-        }
-        std::fs::write(staged.join(entry.file_name()), text).expect("stage a fixture file");
-    }
-    staged
+    stage_from(&fixture("project"), tag, split)
 }
 
 fn build(staged: &Path, extra: &[&str]) -> String {
@@ -123,6 +118,27 @@ fn first_difference(golden: &str, rebuilt: &str) -> String {
     }
 }
 
+/// How many times a source reads a registry slot AT A USE —
+/// `__vilan_chunks.fn.docs_nav(…)` rather than the preamble's
+/// `const docs_nav = __vilan_chunks.fn.docs_nav;` or the tail's
+/// `__vilan_chunks.fn.docs_nav = docs_nav;`. That is the form a reference to
+/// another CHUNK's function takes (M20, `bundle-boundaries.md` §4.1), and this
+/// counts its cost: one property lookup per occurrence.
+fn call_site_registry_reads(source: &str) -> usize {
+    source
+        .split("__vilan_chunks.fn.")
+        .skip(1)
+        .filter(|tail| {
+            let end = tail
+                .find(|character: char| {
+                    !character.is_alphanumeric() && character != '_' && character != '$'
+                })
+                .unwrap_or(tail.len());
+            tail[end..].starts_with('(')
+        })
+        .count()
+}
+
 /// The top-level declarations of an emitted file, in order — the seam the B33
 /// invariant is read off. A `const X = …` at column 0 is a module binding (or a
 /// chunk's registry read, which is why the chunk side asserts on absence).
@@ -169,6 +185,26 @@ fn the_split_fixture_emits_its_pinned_artifacts() {
         "a chunk reads the eager scope — a module binding included — \
          through the registry: {home}"
     );
+
+    // M20 (`bundle-boundaries.md` §1.6 fact 2, D5): a chunk's every non-std
+    // dependency is EAGER under the route partition, so its snapshot is sound
+    // and it pays no property read at a call. The emitter reads a name at the
+    // USE only when a sibling CHUNK owns it, which this partition cannot
+    // produce — so the count here is 0, and that zero is why the reference-form
+    // rule is latent on every plan v1 can make. The eager bundle's forwarders
+    // are the same read and are counted in `app.js`, deliberately not here.
+    for artifact in ARTIFACTS
+        .iter()
+        .filter(|name| name.starts_with("app.Route_"))
+    {
+        let chunk = read(&staged, artifact);
+        assert_eq!(
+            call_site_registry_reads(&chunk),
+            0,
+            "{artifact} must reach nothing but the eager scope, which it \
+             snapshots once: {chunk}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -310,6 +346,14 @@ fn run_under_node(staged: &Path, driver: &str) -> String {
     stdout
 }
 
+/// A99: the fixture writes its route match as the VALUE form
+/// (`.child(swap(route, |current| match current { .. }))`) — the only spelling
+/// there is now that the `View.swap` method is retired — so this IS the
+/// value-form recognizer pin. A recognizer that knew only the method would
+/// compile the fixture perfectly and simply stop splitting it: no error, no
+/// warning, the bundle merely whole again and the first load quietly bigger.
+/// (Order 36 folded the separate `a85_a_value_form_route_swap_splits_exactly_
+/// as_the_method_form_does` in here when its staging rewrite became a no-op.)
 #[test]
 fn a_split_bundle_runs_its_routes_and_fetches_one_chunk_at_a_time() {
     let staged = stage("run", true);
@@ -684,7 +728,8 @@ fn a_split_build_warns_when_the_gate_costs_more_than_it_defers() {
 /// prints and returns. `vilan run` needs a node leg to launch, and the fixture
 /// package (browser-only) has none.
 fn stage_workspace(tag: &str) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("vilan_split_run_{tag}_{}", std::process::id()));
+    let staged =
+        support::scratch_root().join(format!("vilan_split_run_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(staged.join("src")).expect("create the staging directory");
     std::fs::write(
@@ -825,6 +870,10 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
     // the round CLEARS the seed build's chunks, never that it clears them
     // quickly, and the 120 s that stood here was consumed outright on a box
     // running several overlapping suites.
+    // `Instant` is imported here, not at the top: this is its only reader and
+    // it is `cfg(unix)`, so a file-level import is unused on Windows, which
+    // `clippy -D warnings` over the tests there refuses (N130).
+    use std::time::Instant;
     let deadline = Instant::now() + support::WATCH_LIVENESS;
     let mut cleared = false;
     while Instant::now() < deadline {
@@ -851,27 +900,6 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
         "a watch round emits the leg whole, so the previous build's chunks must go \
          and its manifest must say so: {left:?}\n{manifest}"
     );
-}
-
-/// Bind an ephemeral port and release it — a free port for the served pin (the
-/// standard small TOCTOU window this suite's server tests all take).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
-}
-
-fn wait_for_port(port: u16, deadline: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 /// A plain HTTP GET, returning the response body bytes.
@@ -976,10 +1004,7 @@ fn a_split_builds_chunks_are_servable_through_the_manifest() {
         .expect("spawn the server");
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert!(
-            wait_for_port(port, Duration::from_secs(30)),
-            "the server should listen on {port}"
-        );
+        assert!(wait_for_port(port), "the server should listen on {port}");
         // Every chunk the build wrote is served, byte for byte, at the path the
         // embedded map will ask for — and the server was told none of their
         // names.
@@ -1054,121 +1079,79 @@ fn split_off_a_browser_leg_stops_the_build() {
 /// DOM MUTATION that puts `needle` on the page, so a slow box only waits longer,
 /// and a render that never comes fails loudly with the page it was left with —
 /// it can neither pass vacuously nor fail spuriously.
-const STUB: &str = r#"class StubElement {
-	constructor(tagName) {
-		this.tagName = tagName;
-		this.children = [];
-		this.parent = null;
-		this.listeners = {};
-		this._text = "";
-		this.className = "";
-		this.attributes = {};
-		this.style = { setProperty() {} };
-	}
-	get textContent() { return this._text; }
-	set textContent(value) { this._text = value; this.children = []; touched(); }
-	setAttribute(name, value) { this.attributes[name] = value; touched(); }
-	appendChild(child) {
-		if (child.parent) {
-			child.parent.children = child.parent.children.filter((c) => c !== child);
-		}
-		child.parent = this;
-		this.children.push(child);
-		touched();
-		return child;
-	}
-	remove() {
-		if (this.parent) {
-			this.parent.children = this.parent.children.filter((c) => c !== this);
-		}
-		this.parent = null;
-		touched();
-	}
-	replaceChildren() { this.children = []; touched(); }
-	addEventListener(name, handler) { (this.listeners[name] ||= []).push(handler); }
-	render() {
-		const inner = this.children.map((child) => child.render()).join("");
-		return `<${this.tagName}>${this._text}${inner}</${this.tagName}>`;
-	}
+const STUB: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/split.js"),
+);
+
+/// [`stage`] over an arbitrary source directory — the seam the directory-skip
+/// pin below drives, so that rule is asserted over a tree a test owns rather
+/// than by planting something in the committed fixture.
+fn stage_from(source: &Path, tag: &str, split: bool) -> PathBuf {
+    let staged = support::scratch_root().join(format!("vilan_split_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+    std::fs::create_dir_all(&staged).expect("create the staging directory");
+    for entry in std::fs::read_dir(source).expect("read the fixture") {
+        let entry = entry.expect("a fixture entry");
+        if entry.path().is_dir() {
+            eprintln!(
+                "split fixture: skipping the directory {} — the fixture is a flat \
+                 package, so this is something a tool left behind",
+                entry.path().display()
+            );
+            continue;
+        }
+        let mut text = std::fs::read_to_string(entry.path()).expect("read a fixture file");
+        if !split && entry.file_name() == "vilan.toml" {
+            text = text
+                .lines()
+                .filter(|line| !line.starts_with("split"))
+                .map(|line| format!("{line}\n"))
+                .collect();
+        }
+        std::fs::write(staged.join(entry.file_name()), text).expect("stage a fixture file");
+    }
+    staged
 }
 
-// Every write to the tree bumps `mutations` and wakes whoever is waiting on the
-// next render. This is the observable event a chunk's arrival ends in.
-let mutations = 0;
-const watchers = [];
-const touched = () => {
-	mutations += 1;
-	for (const watcher of watchers.splice(0)) watcher();
-};
+/// N92: a DIRECTORY in the source tree is skipped by name, not read as a file.
+///
+/// The loader used to `read_to_string` every entry, so a `dist/` left in the
+/// fixture — which `vilan check .` run in this tree wrote, before N92 moved a
+/// check's table out of the package — failed ten tests in this file with
+/// `IsADirectory` at "read a fixture file". The message named nothing a reader
+/// could act on, and the fixture it accused was innocent.
+#[test]
+fn the_loader_skips_a_directory_instead_of_reading_it_as_a_file() {
+    let source = support::scratch_root().join(format!("vilan_split_src_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&source);
+    std::fs::create_dir_all(source.join("dist/.cache")).expect("a left-behind build directory");
+    std::fs::write(source.join("dist/.cache/macro-expansions"), "x").expect("a cache file");
+    std::fs::write(
+        source.join("vilan.toml"),
+        "[package]\nname = \"p\"\nsplit\n",
+    )
+    .expect("a manifest");
+    std::fs::write(source.join("app.vl"), "fun main() {\n}\n").expect("an entry");
 
-const root = new StubElement("div");
-let first_element_saw_a_fetch = null;
-const fetching = () =>
-	globalThis.__vilan_chunks !== undefined &&
-	Object.keys(globalThis.__vilan_chunks.pending).length > 0;
-global.document = {
-	createElement: (tag) => {
-		if (first_element_saw_a_fetch === null) first_element_saw_a_fetch = fetching();
-		return new StubElement(tag);
-	},
-	createElementNS: (namespace, tag) => new StubElement(tag),
-	getElementById: (id) => (id === "app" ? root : null),
-	querySelector: () => null,
-	querySelectorAll: () => [],
-};
-global.location = { pathname: "/" };
-global.history = { pushState(state, title, path) { global.location.pathname = path; } };
-const popstate = [];
-global.window = { addEventListener: (event, handler) => { if (event === "popstate") popstate.push(handler); } };
-
-const page = () => root.children.map((child) => child.render()).join("");
-// One turn of the loop: `setImmediate` runs after every microtask queued so
-// far, and reactive's continuation segments settle on microtasks
-// (`std/reactive.vl`), so a turn boundary drains the whole render a resolved
-// chunk schedules. A turn is not a duration — this waits for the queue, not for
-// the clock.
-const turn = () => new Promise((resolve) => setImmediate(resolve));
-
-module.exports = {
-	page,
-	// Waits for the render that puts `needle` on the page. Returns after the
-	// mutation that lands it PLUS one turn, so the surrounding synchronous
-	// render batch and any microtask that follows it are complete before the
-	// page is sampled. The deadline is a failure mode, not the wait: nothing
-	// here passes because it expired.
-	rendered: (needle, deadline_ms = 30000) =>
-		new Promise((resolve, reject) => {
-			const done = () => turn().then(resolve);
-			if (page().includes(needle)) return done();
-			const timer = setTimeout(() => {
-				reject(new Error(
-					`the render carrying ${JSON.stringify(needle)} never arrived within ` +
-					`${deadline_ms}ms; the page is ${JSON.stringify(page())}`,
-				));
-			}, deadline_ms);
-			const watcher = () => {
-				if (!page().includes(needle)) return watchers.push(watcher);
-				clearTimeout(timer);
-				done();
-			};
-			watchers.push(watcher);
-		}),
-	// For an assertion that the page must NOT change: drains turns until one
-	// passes with no mutation at all. Used only after the event whose effect is
-	// being denied has already been observed (a chunk that landed by the
-	// harness's own hand), so this closes a window that is already open rather
-	// than standing in for the arrival itself.
-	quiet: async (turns = 3) => {
-		for (let index = 0; index < turns; index += 1) {
-			const before = mutations;
-			await turn();
-			if (mutations === before) return;
-		}
-	},
-	go: (path) => {
-		global.location.pathname = path;
-		for (const handler of popstate) handler({});
-	},
-	first_element_saw_a_fetch: () => first_element_saw_a_fetch,
-};
-"#;
+    let staged = stage_from(&source, "skips_a_directory", false);
+    let mut staged_names: Vec<String> = std::fs::read_dir(&staged)
+        .expect("read the staged directory")
+        .map(|entry| {
+            entry
+                .expect("a staged entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    staged_names.sort();
+    let _ = std::fs::remove_dir_all(&source);
+    let _ = std::fs::remove_dir_all(&staged);
+    assert_eq!(
+        staged_names,
+        vec!["app.vl".to_string(), "vilan.toml".to_string()],
+        "the files are staged and the directory is skipped, rather than the \
+         whole run failing on a read that was never going to work"
+    );
+}

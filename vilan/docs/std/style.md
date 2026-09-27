@@ -35,6 +35,7 @@ impl Color {
 	fun white(): Color
 	fun black(): Color
 	fun transparent(): Color
+	fun current(): Color           // currentColor — the element's own text colour
 	fun hex(value: str): Color     // "#663399"
 	fun var(name: str): Color      // a custom-property reference ("--accent"); the app declares it
 	fun gray(step: i32): Color     // ramps: 50…900
@@ -73,7 +74,11 @@ colour.
 `Color::var` is `Length::var`'s counterpart — the typed end of the
 dynamic-value channel. It renders `var(--name)` and **declares nothing**:
 the app owns the custom property's declaration (its emitted theme block,
-or `view.style_var` writing it at runtime). `.alpha()` composes over it
+or `view.style_var` writing it at runtime). Both spell the name with its
+**two leading dashes**, and both refuse one without them at const time:
+`var(button-color)` is not a broken reference, it is not a reference —
+`button-color` parses as a keyword, the browser drops the declaration, and
+nothing says so until the page is wrong. `.alpha()` composes over it
 through the same relative-colour form, so a variable-backed colour
 translucifies exactly like a ramp token.
 
@@ -124,6 +129,7 @@ Layout:
 | `align_items` | `AlignItems` |
 | `justify_content` | `JustifyContent` |
 | `flex` | `str` — the shorthand, `"1 1 auto"` |
+| `flex_grow` | `f64` |
 | `flex_shrink` | `f64` |
 | `grid_template_columns` | `str` — `"repeat(3, 1fr)"` |
 | `gap`, `padding`, `padding_x`, `padding_y`, `margin`, `margin_x`, `margin_y` | `Length` |
@@ -200,9 +206,92 @@ Pass the value, not its text: `space(4).text` is the string
 `var(--space-4)` with the declaration left behind, and a `str` carries no
 token.
 
+Two free functions sit beside `raw`, both ambient inside a `css` block:
+
+```vilan,fragment
+fun var(name: str): str             // a custom property READ: var("--brand-ink")
+fun piece<V: CssPiece>(value: V): str   // one part of a value built by hand
+```
+
+`var` is how a declaration reads a custom property — `--brand-ink` is not
+an expression, so CSS's `var(--x)` is spelled with the name as a string,
+and the dashes are checked (a name without them is not a reference at
+all). `Length::var` and `Color::var` are the same thing at those two
+types, for a position that wants the type.
+
+`piece` renders one part of a value and puts its `:root` line on the
+sheet on the way past — `CssPiece` is `CssValue`'s twin over `str`,
+`Length`, `Color` and the numbers, because a part sits inside text that
+supplies the unit while a whole value must carry its own. A declaration
+with SEVERAL arguments joins them with a space through `piece`
+automatically; write it yourself only where the parts are glued:
+`padding(i"calc({piece(space(4))} + 2px)");`.
+
 ## Conditions
 
-Each takes an inner `Style` and conditions all of its slots:
+A condition is a **value**, and a set of them is the same value. `on` puts a
+style under a set; every named combinator below is one condition's worth of
+sugar over it.
+
+```vilan,fragment
+fun on<C: IntoConditions>(self, conditions: C, inner: Style): Style
+```
+
+### The condition values
+
+Free functions in `std::style` (and in `std::style::prelude`, which is ambient
+inside a `css` block, along with `var`, `piece`, the `Length`/`Color`
+constructors, `s()`, and the keyword-property types `Length`, `Cursor`,
+`TextAlign` and `AlignItems` — so one file-level
+`import std::style::prelude::{ … };` answers a whole chain built outside a
+hole):
+
+```vilan,fragment
+fun hover(): Condition          // :hover
+fun focus(): Condition          // :focus
+fun active(): Condition         // :active
+fun disabled(): Condition       // :disabled
+fun first(): Condition          // :first-child
+fun last(): Condition           // :last-child
+fun pseudo(name: str): Condition        // any other pseudo-class; no ':' in the name
+fun element(name: str): Condition       // ::selection — a pseudo-ELEMENT, always last
+fun attribute(name: str): Condition     // [name] — PRESENCE on the element itself
+fun within(condition: Condition): Condition   // an ANCESTOR matching `condition`
+fun children(): Condition       // > * — every direct child
+fun divide(): Condition         // > :not(:first-child) — every child but the first
+fun media(min_width: str): Condition
+fun sm(): Condition             // 640px
+fun md(): Condition             // 768px
+fun lg(): Condition             // 1024px
+fun xl(): Condition             // 1280px
+```
+
+Two methods on a condition:
+
+```vilan,fragment
+fun not(self): Condition             // the condition negated, where it is written
+fun eq(self, value: str): Condition  // an attribute condition's exact value
+```
+
+`attribute("data-open")` is presence, `attribute("data-open").eq("true")` is
+`[data-open="true"]`. `.eq(..)` is deliberately not `PartialEq::eq`: a
+condition value is never compared by user code, and `PartialEq` is never
+derived on `Condition` so the two readings cannot collide.
+
+`+` is the **intersection** — "both of these at once" — and a set is a value
+you can name:
+
+```vilan,fragment
+let interactive = const hover() + active().not() + attribute("disabled").not();
+let panel = const style().on(interactive, style().opacity(1.0));
+```
+
+The binding is itself `const`: a `const` expression reads only
+compile-time-known bindings, so a named set has to be one.
+
+### The sugar
+
+Each of these is `.on(<that one condition>, inner)`:
 
 ```vilan,fragment
 fun hover(self, inner: Style): Style
@@ -211,12 +300,11 @@ fun active(self, inner: Style): Style
 fun disabled(self, inner: Style): Style
 fun first(self, inner: Style): Style      // :first-child
 fun last(self, inner: Style): Style       // :last-child
-fun within(self, name: str, value: str, inner: Style): Style     // [name="value"] .sX — an ancestor guard
-fun children(self, inner: Style): Style   // @layer vilan{.sX > *} — every direct child
-fun divide(self, inner: Style): Style     // @layer vilan{.sX > :not(:first-child)} — every child but the first
-fun attribute(self, name: str, value: str, inner: Style): Style  // .sX[name="value"] — the element itself
 fun pseudo(self, name: str, inner: Style): Style
-
+fun children(self, inner: Style): Style   // @layer vilan{.sX > *}
+fun divide(self, inner: Style): Style     // @layer vilan{.sX > :not(:first-child)}
+fun attribute(self, name: str, value: Option<str>, inner: Style): Style
+fun within(self, name: str, value: Option<str>, inner: Style): Style
 fun sm(self, inner: Style): Style          // breakpoints (min-width):
 fun md(self, inner: Style): Style          // 640px, 768px, 1024px, 1280px
 fun lg(self, inner: Style): Style
@@ -224,66 +312,108 @@ fun xl(self, inner: Style): Style
 fun media(self, min_width: str, inner: Style): Style
 ```
 
+The free constructor and the method of the same name coexist: `hover()` is the
+condition, `style().hover(inner)` is the sugar that puts a style under it.
+
+`Style::attribute` and `Style::within` take the `Option<str>` A89 gave them —
+`Some(v)` the exact match, `None` presence — and both are **deprecated**: the
+`Option` folds into the condition value, so write
+`.on(attribute(name).eq(value), inner)` and
+`.on(within(attribute(name).eq(value)), inner)`. They stay for one release.
+
 ### Stacking
 
-The four condition axes nest **outside-in, in the order the selector
-nests them** — media, then the relation (`within`, `children`, `divide`),
-then the attribute, then the pseudo-class:
+A set has no order. `hover() + md()` and `md() + hover()` are the same set,
+mint the same class, and emit one rule — the canonicaliser sorts the tokens
+into the order a selector is written in (breakpoint, ancestor guard, child
+relation, attributes, pseudo-classes, pseudo-element) and hashes that:
 
 ```vilan,fragment
-style().md(style().within("data-theme", "dark", style().hover(style().opacity(0.8))))
+style().on(md() + within(attribute("data-theme").eq("dark")) + hover(), style().opacity(0.8))
 // @media (min-width: 768px){[data-theme="dark"] .sX:hover{opacity:0.8}}
 
-style().md(style().within("data-theme", "dark", style().attribute("data-open", "true", style().hover(style().opacity(0.8)))))
-// @media (min-width: 768px){[data-theme="dark"] .sX[data-open="true"]:hover{opacity:0.8}}
+style().on(hover() + active().not(), style().opacity(0.8))
+// .sX:not(:active):hover{opacity:0.8}
+
+style().on(within(attribute("data-theme").eq("dark")) + children(), style().opacity(0.8))
+// @layer vilan{[data-theme="dark"] .sX > *{opacity:0.8}}
 ```
 
-Every other order is a compile-time-evaluation panic naming the fix
-(`hover(within(..))` says to write `within(.., hover(..))`), and no axis
-can wrap itself — one media, one relation, one attribute, one
-pseudo-class per slot. Media rules emit in ascending min-width order, so
-a chain like `.sm(x).lg(y)` is mobile-first: the widest matching
-breakpoint wins.
+Nesting `on` intersects: `a.on(X, b.on(Y, s))` gives `s` the set `X ∪ Y`.
+Media rules emit in ascending min-width order, so `.sm(x).lg(y)` is
+mobile-first — the widest matching breakpoint wins.
 
-`attribute` conditions on the element **itself** — `.sX[data-open="true"]`
-— where `within` is the ancestor form. It is the general spelling of state
-carried in markup: `data-state`, `data-open`, `aria-expanded` — any
-attribute rides, `aria-*` included, and the value matches exactly. The
-app owns *setting* the attribute on the element; the style only selects
-on it. Name and value refuse quotes, spaces and `:` at const time (they
-delimit the machinery underneath), and a styling hook is a single token
-in practice — the same fences guard `within`'s name and value.
+Five sets are refused at const time, each because it can never match or is not
+a selector CSS admits: a condition **and its negation**; two **breakpoints**;
+two **ancestor guards**; two **child relations**; two **pseudo-elements**.
+Two different values of one attribute (`attribute("x").eq("a") +
+attribute("x").eq("b")`) is admitted in this version and recorded — it matches
+nothing, and catching it would need the canonicaliser to reason about value
+equality.
 
-`within` prepends an ancestor selector, so a composed
-`within(.., hover(..))` rule is more specific than either `within(..)` or
-`hover(..)` alone and wins against both — and the same holds along the
-attribute axis: `attribute(.., hover(..))` outranks both of its parts.
-Between an *un*composed `within(.., x)` and `hover(y)` on the same
-property the guard wins — a theme shouldn't be undone by a hover — so use
-`within(.., hover(..))` when a dark theme needs its own hover.
+The SUGAR keeps its own nesting order, and that order is still the only legal
+one: `md(within(attribute(hover(..))))`. Any other order is refused naming
+both fixes — the nesting it wanted, and the set that has none.
+
+### Negation
+
+`.not()` is written on the condition it negates:
+
+```vilan,fragment
+style().on(attribute("disabled").not() + hover(), style().opacity(0.8))
+// .sX:not([disabled]):hover{opacity:0.8}   — hovered AND not disabled
+
+style().on(hover().not(), style().opacity(0.8))
+// .sX:not(:hover){opacity:0.8}
+
+style().on(within(attribute("data-theme").eq("dark")).not(), style().opacity(0.8))
+// :not([data-theme="dark"]) .sX{opacity:0.8}
+```
+
+`:not(x)` carries `x`'s own specificity, so nothing about the cascade story
+changes: `.sX:not([disabled]):hover` is (0,3,0) over both of its (0,2,0)
+parts, exactly as `.sX[disabled]:hover` is. A NEGATED ancestor guard is the
+one case that moves a rule's cascade *band*: the line opens with `:` rather
+than `[`, so it sorts among the pseudo rules.
+
+Three refusals: a **double** negation (`x.not().not()`) is a spelling mistake
+rather than a cancellation; a **breakpoint** cannot be negated (`@media not
+(..)` is a grammar of its own and no ruling has reached it); and a
+**pseudo-element** cannot be negated (`:not(::selection)` is not a selector
+CSS admits). `.not()` on a SET refuses too, naming the per-condition form.
 
 ### Relations
 
-`within` guards the element's own slots on an **ancestor's** attribute —
-the theme condition (`within("data-theme", "dark", ..)`, or any theme id
-under kolt-style n-ary theming) and every other "when an ancestor says
-so" state. Its rule is unlayered and beats the element's own base rule
-exactly when the guard matches. For colours, prefer declaring per-theme
+`within(condition)` guards the element's own slots on an **ancestor** matching
+`condition` — the theme condition
+(`within(attribute("data-theme").eq("dark"))`, or any theme id under
+kolt-style n-ary theming), an ancestor's presence flag
+(`within(attribute("data-collapsed"))`), or a pseudo-class the ancestor is in
+(`within(hover())`). Its rule is unlayered and beats the element's own base
+rule exactly when the guard matches. For colours, prefer declaring per-theme
 custom properties with a [declaration block](#declaration-blocks) and
 reading them with `Color::var(..)`; `within` covers the structural
 changes a value swap cannot.
 
-`children` and `divide` style the element's **children** — the
-parent-owned spacing idioms (Tailwind's `space-*`/`divide-*`). Their
-rules emit inside `@layer vilan`, and that is the whole cascade story:
-**a child's own `Style` always wins against a rule reaching in from an
-ancestor**, whatever the specificity — they set defaults the child may
-refuse, never force. (The cost is symmetric: a `children`/`divide` rule
-cannot override *any* unlayered CSS.) Where both touch one property,
+A guard holds ONE condition, and it must be one that selects an element: a
+breakpoint, another guard, a child relation and a pseudo-element are each
+refused naming where they belong instead.
+
+`children()` and `divide()` condition on the element's **children** — the
+parent-owned spacing idioms (Tailwind's `space-*`/`divide-*`). A rule carrying
+a child relation emits inside `@layer vilan` whatever else conditions it, and
+that is the whole cascade story: **a child's own `Style` always wins against a
+rule reaching in from an ancestor**, whatever the specificity — they set
+defaults the child may refuse, never force. (The cost is symmetric: such a
+rule cannot override *any* unlayered CSS.) Where both touch one property,
 `divide` outranks `children` on every child but the first, whichever was
-written first. Both take an **unconditioned** inner style in this
-version — a hover or attribute condition belongs on the child's own
-style — and a breakpoint wraps either (`md(children(..))`).
+written first.
+
+A guard and a child relation are not the same slot, so one set may hold both:
+`within(attribute("data-theme").eq("dark")) + children()` is
+`[data-theme="dark"] .sX > *`. The `.children(inner)`/`.divide(inner)` SUGAR
+still takes an unconditioned inner style — a pseudo-class under it would bind
+to the child's compound — and a breakpoint wraps either (`md(children(..))`).
 
 ## Declaration blocks
 
@@ -415,10 +545,32 @@ slot and may be sorted freely.
 
 ## Runtime-legal operations
 
-Construction emits rules and therefore lives in `const`; these do not emit
-and work anywhere:
+Construction records rules and therefore lives in `const`; these record
+nothing and work anywhere:
 
 ```vilan,fragment
 style_a + style_b          // merge: per-property, right side wins (impl Add)
+style.when(condition: bool, delta: Style): Style   // `self + delta` when true, `self` when not
 style.class_list(): str    // the space-joined class attribute (what `styled` uses)
 ```
+
+`when` is the conditional merge, written as a chain instead of a stack of
+`if`s:
+
+```vilan,fragment
+button_base
+	.when(is_selected, button_selected)
+	.when(is_disabled, button_disabled)
+```
+
+It never *constructs* a style — both sides were built, and emitted their rules,
+in their own `const` expressions — so the construct-in-const rule is untouched
+with a runtime flag in the middle. Chain order is **precedence**, exactly as
+with `+`: when two `when`s both fire, the later delta wins whatever properties
+they share.
+
+The chain reads best when each condition mentions its **own** flag —
+independent state axes, one link each. When one condition has to mention
+another link's flag (`!selected && !disabled`), the states are not independent,
+and a `match` states that exclusivity structurally where a chain only implies
+it. The compound condition is the tell; this is guidance, not a prohibition.

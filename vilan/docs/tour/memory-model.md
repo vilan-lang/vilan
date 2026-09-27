@@ -176,9 +176,17 @@ If you're reaching for `Shared` to "avoid a copy" on a hot path,
 don't: values are cheap, and the compiler already elides copies it can
 prove away. And you don't need one merely to let a closure write to its
 creator's binding — a closure captures the binding itself
-([Closures](functions-and-closures.md)). What the cell buys is state
-that outlives the frame the closure was made in, and state two closures
-reach that neither of them declared.
+([Closures](functions-and-closures.md)), and so do two sibling closures
+written in the same frame. What the cell buys is state a *value* carries
+across a copy: a struct handed around by value cannot hold mutable state
+in a plain field, so a field that several holders must agree about is a
+cell. That is what the whole standard library uses it for.
+
+So the line between the two tiers is not "does this have an owner" —
+reach for `Shared` when ownership is **diffuse** (several independent
+holders of one mutable value, no single place deciding when it dies), and
+for an `Arena` when what you need is a **graph** or a **stable identity**,
+below.
 
 ## `Arena` + `Handle`: graphs and cycles
 
@@ -190,8 +198,8 @@ you can store anywhere:
 
 ```vilan,fragment
 mut nodes: Arena<Node> = Arena::new();
-let a: Handle = nodes.insert(Node { … });
-let b: Handle = nodes.insert(Node { edges = [a] });
+let a: Handle<Node> = nodes.insert(Node { … });
+let b: Handle<Node> = nodes.insert(Node { edges = [a] });
 // `get` hands back a view; copy it out, add the edge, write it back.
 match nodes.get(a) {
 	Some(let node) => {

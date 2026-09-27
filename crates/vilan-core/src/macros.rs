@@ -30,16 +30,72 @@ use crate::error::Error;
 use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 use crate::interpreter::{self, Limits};
-use crate::node::{Func, ImportBranch, Node, NodeList, Pattern};
+use crate::node::{Func, GenericParameters, ImportBranch, Node, NodeList, Pattern, ServiceAttr};
 use crate::options::BuildOptions;
 use crate::span::{Span, Spanned};
 use crate::transformer::{JsProgram, js, transform_functions};
 use crate::{PackageSpec, Platform, Workspace, analyze_source};
 
-/// The derive names the RUST generators still serve when no macro is in
-/// scope (fixture stds without the std macros; the macro world's own nested
-/// compile). Frozen byte-identical copies of the migrated macros.
-const RUST_DERIVES: &[&str] = &["PartialEq", "Default", "Debug", "Json", "Wire", "Hashable"];
+/// The six derive names std declares a `macro fun` for, each with the std
+/// module that declares it — `Json` and `Wire` share `json.vl` (B301 split the
+/// impls, not the file).
+///
+/// This used to be a list of the names a RUST generator stood behind when no
+/// macro was in scope. There is no such generator any more (N79, and N70 before
+/// it for `[service]`): a std that does not declare the macro is told so.
+/// The table survives the generators because the REFUSAL needs it — the name
+/// alone cannot say which module a reader is missing.
+///
+/// B376: a name that is not here, with no macro of that name in scope, is
+/// REFUSED at the attribute ([`unknown_derive_refusal`]) — and this table is
+/// what that refusal prints as the derivable set, which is its second job and
+/// the reason `derives_are_the_macros_std_declares` holds it to std's own
+/// `macro fun`s in both directions. It used to expand to nothing and say
+/// nothing, on the reasoning that an unknown `[derive(Foo)]` is a missing
+/// `Foo` macro which the missing impl reports at the use site. It does, and
+/// that is the wrong place to learn it: `[derive(PartialOrd)]` was clean and
+/// the sentence arrived forty lines later, at a `<`, as advice to hand-write
+/// the impl the author believed they had just asked for — and a program with
+/// no comparison in it said nothing at all.
+const STD_DERIVE_MACROS: &[(&str, &str)] = &[
+    ("PartialEq", "compare.vl"),
+    ("Default", "default.vl"),
+    ("Debug", "debug.vl"),
+    ("Json", "json.vl"),
+    ("Wire", "json.vl"),
+    ("Hashable", "hash.vl"),
+];
+
+/// B376: what to say about `[derive(Name)]` where nothing declares a `Name`
+/// macro — not std, not this file, not an import.
+///
+/// One function, and the ONE place `STD_DERIVE_MACROS` is spelled to a reader:
+/// the refusal has to name what IS derivable or it is a "no" with no next
+/// step, and a hand-written list here would be the table's second copy.
+/// `derives_are_the_macros_std_declares` holds the table to std's own
+/// `macro fun`s, which is the other half of keeping one list.
+fn unknown_derive_refusal(derive: &str) -> String {
+    let derivable: Vec<String> = STD_DERIVE_MACROS
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect();
+    format!(
+        "`{derive}` is not a derivable trait: nothing declares a `{derive}` macro \
+         — not std, not this file, and nothing it imports. std derives {}; a \
+         derive of your own is a `macro fun {derive}` in this file or imported \
+         by name",
+        derivable.join(", ")
+    )
+}
+
+/// The std module declaring `derive`'s macro, or `None` for a name std has
+/// never declared one for.
+fn std_derive_module(derive: &str) -> Option<&'static str> {
+    STD_DERIVE_MACROS
+        .iter()
+        .find(|(name, _)| *name == derive)
+        .map(|(_, module)| *module)
+}
 
 /// The per-package expansion budgets (`vilan.toml [macro]`, macro-engine.md
 /// §5/§12): `fuel` bounds one macro run's interpreter steps; `depth` bounds
@@ -65,6 +121,18 @@ impl Default for MacroLimits {
 pub(crate) struct World {
     /// The `world_key` it was compiled under — `cached_run` keys expansions
     /// by it, so cached expansions too survive edits outside the macro spans.
+    /// The definition set's content hash this world was compiled under. Kept
+    /// beside the compiled program as the world's identity even though the
+    /// expansion key is now built from `MacroDef::world_key` instead (M33: the
+    /// key has to be reachable BEFORE the world exists, or a cache hit could
+    /// never skip the compile) — a compiled world with no name for what it was
+    /// compiled from is a thing no debugger and no future cache can address.
+    #[allow(
+        dead_code,
+        reason = "the world's identity, kept for debugging and for the next \
+                  cache layer; the expansion key reads `MacroDef::world_key` \
+                  because it must answer before the world is compiled"
+    )]
     key: u64,
     program: JsProgram<'static>,
     /// macro name → its emitted function name.
@@ -145,13 +213,19 @@ pub(crate) fn scope_for<'r>(
         }
     }
     // 2. The file's imports, resolved to registered macros by leaf name.
-    let mut imports: Vec<(Vec<&str>, &str)> = Vec::new();
-    fn collect_imports<'a>(node: &'a Spanned<Node<'a>>, out: &mut Vec<(Vec<&'a str>, &'a str)>) {
-        if let Node::Import(branch) | Node::Use(branch) = &node.0 {
+    // (module path, the leaf as the registry knows it, the name this FILE
+    // calls it by — the `as` alias when there is one, E142.)
+    let mut imports: Vec<(Vec<&str>, &str, &str)> = Vec::new();
+    fn collect_imports<'a>(
+        node: &'a Spanned<Node<'a>>,
+        out: &mut Vec<(Vec<&'a str>, &'a str, &'a str)>,
+    ) {
+        if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             crate::analyzer::flatten_namespace_branch(branch, Vec::new(), &mut entries);
-            for (path, leaf, _leaf_span) in entries {
-                out.push((path.iter().map(|(name, _)| *name).collect(), leaf));
+            for (path, leaf, _leaf_span, alias) in entries {
+                let local = alias.map_or(leaf, |(alias, _)| alias);
+                out.push((path.iter().map(|(name, _)| *name).collect(), leaf, local));
             }
         }
         node.0
@@ -160,7 +234,7 @@ pub(crate) fn scope_for<'r>(
     for node in nodes {
         collect_imports(node, &mut imports);
     }
-    for (path, leaf) in imports {
+    for (path, leaf, local) in imports {
         let Some(root) = path.first().copied() else {
             continue;
         };
@@ -192,7 +266,7 @@ pub(crate) fn scope_for<'r>(
         if let Some(target) = target
             && let Some(def) = registry.module(&target).and_then(|macros| macros.get(leaf))
         {
-            names.insert(leaf.to_string(), def);
+            names.insert(local.to_string(), def);
         }
     }
     // 3. The file's own macros (highest precedence).
@@ -272,11 +346,21 @@ impl MacroDef {
             Some(world) => world,
             None => {
                 let Some(macro_std) = resolve_macro_std(std) else {
+                    // B346: both paths, because "not found beside `std`" names
+                    // neither the `std` that was resolved nor the `macro_std`
+                    // that was wanted, and the whole mistake is WHICH `std`.
+                    let (package, macro_std) = crate::manifest::split_toolchain(std)
+                        .unwrap_or_else(|| (std.base_root.clone(), std.base_root.clone()));
                     return Err(vec![Error {
                         trace: Vec::new(),
                         note: None,
                         span: (0..0).into(),
-                        msg: "the `macro_std` package was not found beside `std`".to_string(),
+                        msg: format!(
+                            "the `macro_std` package was not found beside `std`: `std` resolved \
+                             to `{}`, so `macro_std` was looked for at `{}`",
+                            package.display(),
+                            macro_std.display(),
+                        ),
                     }]);
                 };
                 let world = compile_world(
@@ -307,17 +391,72 @@ impl MacroDef {
 }
 
 /// The `macro_std` package, resolved from its toolchain location beside `std`
-/// (`<roots>/std/src` → `<roots>/macro_std`). `None` when absent — an error is
+/// (`<root>/std/src` → `<root>/macro_std`). `None` when absent — an error is
 /// reported only when a program actually defines a macro.
+///
+/// The root is [`crate::manifest::toolchain_root`]'s and nothing else's (B346):
+/// one root answers for both packages, and a root carrying only `std` is
+/// refused by [`crate::manifest::split_toolchain`] rather than quietly served
+/// from a second one.
 pub(crate) fn resolve_macro_std(std: &PackageSpec) -> Option<PackageSpec> {
-    let dir = std.base_root.parent()?.parent()?.join("macro_std");
-    let manifest = dir.join("vilan.toml");
-    // Buffered counts as present, the same way it does for a source file: with
-    // no filesystem behind the compiler (the wasm build) the toolchain lives
-    // entirely in the overlay, and an `is_file()` gate alone would report
-    // `macro_std` missing for every program that defines a macro.
-    let present = manifest.is_file() || crate::analyzer::document_overlay_contains(&manifest);
-    present.then(|| crate::manifest::resolve_std(&dir))
+    let dir = crate::manifest::macro_std_dir(std)?;
+    if crate::manifest::split_toolchain(std).is_some() {
+        return None;
+    }
+    Some(crate::manifest::resolve_std(&dir))
+}
+
+/// The ONE refusal a split toolchain earns, or `None` when the toolchain is
+/// whole (B346, E212).
+///
+/// A toolchain is two packages, `std` and `macro_std`, and only the first has a
+/// discovery path a user can point at. A root carrying only `std` compiles no
+/// macro at all — not std's own derives, not a user's — so this is a fact about
+/// the configuration rather than about any file, and it is asked ONCE, before
+/// the first registration, and attributed to the entry at offset 0 so the
+/// actionable sentence is the first thing printed rather than the eleventh.
+/// [`split_toolchain_refusal`], pushed onto `diagnostics` unless the same
+/// sentence is already there.
+///
+/// One analysis can reach the registration seam twice — the load region builds
+/// the registry, and an entry expanded over a STORED world registers its own
+/// file again — and a fact about the configuration is one fact however many
+/// times it is asked. The de-duplication is by message rather than by a flag,
+/// because the two seams hold different analyzers and the message is what the
+/// reader would have seen twice.
+pub(crate) fn push_split_toolchain_refusal(std: &PackageSpec, diagnostics: &mut Vec<Error>) {
+    let Some(error) = split_toolchain_refusal(std) else {
+        return;
+    };
+    if diagnostics.iter().any(|existing| existing.msg == error.msg) {
+        return;
+    }
+    diagnostics.push(error);
+}
+
+pub(crate) fn split_toolchain_refusal(std: &PackageSpec) -> Option<Error> {
+    if resolve_macro_std(std).is_some() {
+        return None;
+    }
+    // Both paths, because "no `macro_std`" names nothing a reader can act on
+    // while "this `std`, that missing `macro_std`" names the mistake and the
+    // fix at once — and the whole mistake is WHICH `std`.
+    let (package, macro_std) = crate::manifest::split_toolchain(std)
+        .unwrap_or_else(|| (std.base_root.clone(), std.base_root.clone()));
+    Some(Error {
+        trace: Vec::new(),
+        note: None,
+        span: (0..0).into(),
+        msg: format!(
+            "the `macro_std` package was not found beside `std`: macros need the \
+             toolchain's `macro_std`, and this `std` has none — `std` resolved to `{}`, \
+             so `macro_std` was looked for at `{}`. A `std` moved away from its toolchain \
+             (a copy, a packaged std, `$VILAN_STD` pointing outside the checkout) is half \
+             a toolchain: point it at a `std` whose own directory has `macro_std` beside it",
+            package.display(),
+            macro_std.display(),
+        ),
+    })
 }
 
 /// The top-level `macro fun`s of a file, with each definition's full span.
@@ -325,9 +464,9 @@ fn macro_funs<'a, 'src>(nodes: &'a NodeList<'src>) -> Vec<(&'a Func<'src>, Span)
     nodes
         .iter()
         .filter_map(|(node, span)| match node {
-            Node::MacroFun(function) => Some((function, *span)),
-            Node::Export(inner) => match &inner.0 {
-                Node::MacroFun(function) => Some((function, inner.1)),
+            Node::MacroFun(function) => Some((&**function, *span)),
+            Node::Export(_, inner, _) => match &inner.0 {
+                Node::MacroFun(function) => Some((&**function, inner.1)),
                 _ => None,
             },
             _ => None,
@@ -410,15 +549,19 @@ pub(crate) fn register_file(
         .map(|(_, span)| *span)
         .or_else(|| blocks.first().map(|(_, span)| *span))
         .unwrap_or_else(|| (0..0).into());
+    let _ = first_span;
     let Some(macro_std) = resolve_macro_std(std) else {
-        diagnostics.push(Error {
-            trace: Vec::new(),
-            note: None,
-            span: first_span,
-            msg: "the `macro_std` package was not found beside `std`: macros need the \
-                  toolchain's `macro_std`"
-                .to_string(),
-        });
+        // E212: SILENT here, deliberately. B346's refusal used to be pushed
+        // from this arm, which runs once per macro-DEFINING file — and std
+        // declares macros in six of its own modules, so a split toolchain
+        // produced ten copies of one sentence, each anchored on a `macro fun`
+        // in a file the reader did not write and cannot fix, after a first
+        // diagnostic that blamed their own code for the consequence.
+        //
+        // The refusal is the CALLER's now, once, against the entry
+        // ([`split_toolchain_refusal`]): a half toolchain is a fact about the
+        // configuration, not about any one file that happens to define a
+        // macro. This arm stays as the guard it always was.
         return;
     };
 
@@ -515,12 +658,19 @@ fn check_hermetic_block_imports(
     }
 }
 
+/// The ROOT segment of an import path — the origin a hermetic macro world
+/// checks. A reach marker adds no segment, so it delegates.
+fn import_root<'src>(branch: &ImportBranch<'src>) -> Option<&'src str> {
+    match branch {
+        ImportBranch::Path(root, _, _) => Some(*root),
+        ImportBranch::Reach(_, inner) => import_root(inner),
+        ImportBranch::Set(_) | ImportBranch::Selector(_) => None,
+    }
+}
+
 fn check_hermetic_imports(node: &Spanned<Node>, diagnostics: &mut Vec<Error>, hermetic: &mut bool) {
-    if let Node::Import(branch) | Node::Use(branch) = &node.0 {
-        let root = match branch {
-            ImportBranch::Path(root, _, _) => Some(*root),
-            ImportBranch::Set(_) => None,
-        };
+    if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
+        let root = import_root(branch);
         if root != Some("macro_std") {
             diagnostics.push(Error {
                 trace: Vec::new(),
@@ -645,13 +795,128 @@ thread_local! {
     /// Set while a macro WORLD is being analyzed. A world's own analysis must
     /// not register macros (std's prelude modules contain `macro fun`s —
     /// registering them would recursively compile their worlds, unboundedly);
-    /// expansion still runs there, with an empty scope, so std's own derives
-    /// generate through the byte-identical Rust fallback.
+    /// expansion still runs there, with an empty scope. Nothing a world sees
+    /// carries a `[derive(..)]` today: the entry is BLANKED to its macro
+    /// definitions, macro_std declares none, and the std modules a world force-
+    /// loads are `boolean`/`list`/`null`/`promise`/`compare`/`default`/`debug`/
+    /// `json`/`hash`/`number`/`string`, none of which derives anything. So the
+    /// derive path below is not reached from inside a world — which matters
+    /// now, because N79 deleted the Rust generators that used to serve it and
+    /// a derive written into one of those eleven modules would be refused here
+    /// as a load-ordering bug it is not.
     static IN_MACRO_WORLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn in_macro_world() -> bool {
     IN_MACRO_WORLD.with(|flag| flag.get())
+}
+
+/// What the macro worlds of ONE top-level analysis cost, for the phase line
+/// (tracker M33).
+///
+/// A macro world is a nested analysis (macro-engine.md §3): the blanked copy of
+/// one macro-defining file, compiled against `macro_std`. Four of them run
+/// inside a cold `vilan check` of kolt's client — 18.2% of that entry's
+/// instructions, comparable to its own whole-program checks — and the phase
+/// line could not see them. A world's `load+walk`/`base`/`build`/`checks` are
+/// timed inside the same `analyze_over_world` the outer entry runs, but its
+/// line is suppressed (its own numbers inside the outer's would read as noise),
+/// so the four folded INTO the outer entry's `load+walk` with nothing saying
+/// so; the only trace they left was four bare `post-passes` lines with no
+/// heading, which reads as the compiler having run the post-passes five times.
+///
+/// So the worlds get a row of their own. It is a SLICE through the outer
+/// line, not a disjoint bucket — the same relationship `dispatch-refine` has to
+/// `const-pass`, and stated here for the same reason: subtracting the worlds
+/// out of `load+walk` would make the outer number stop being the wall the
+/// analysis took, which is what a reader uses it for.
+///
+/// Thread-local because a multi-entry `check` compiles its entries on their own
+/// threads (M35) and each prints its own phase line; a world compiled while
+/// serving entry A must not appear on entry B's row.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MacroWorldPhases {
+    /// How many worlds this analysis COMPILED. Zero is the interesting value:
+    /// a world served from the process cache (or, since M33's second half, from
+    /// the package's on-disk expansion table) compiles nothing and adds
+    /// nothing, so a warm run's row reads 0 and says exactly that.
+    pub(crate) compiled: usize,
+    pub(crate) load_walk: crate::PhaseSpan,
+    pub(crate) base: crate::PhaseSpan,
+    pub(crate) build: crate::PhaseSpan,
+    pub(crate) checks: crate::PhaseSpan,
+    pub(crate) post: crate::PhaseSpan,
+}
+
+thread_local! {
+    static WORLD_PHASES: std::cell::Cell<MacroWorldPhases> =
+        const { std::cell::Cell::new(MacroWorldPhases {
+            compiled: 0,
+            load_walk: crate::PhaseSpan::ZERO,
+            base: crate::PhaseSpan::ZERO,
+            build: crate::PhaseSpan::ZERO,
+            checks: crate::PhaseSpan::ZERO,
+            post: crate::PhaseSpan::ZERO,
+        }) };
+}
+
+/// Start a top-level analysis's tally. Called where the outer analysis begins,
+/// never inside a world.
+pub(crate) fn world_phases_reset() {
+    WORLD_PHASES.with(|phases| phases.set(MacroWorldPhases::default()));
+}
+
+/// One world COMPILED, counted where the compile happens rather than where its
+/// timings are read: the durations are only collected when `VILAN_PHASE_TIMING`
+/// asks, and the COUNT has to be true whether the instrument is on or not — it
+/// is what M33's warm-run pin asserts, and a pin that needs an environment
+/// variable to be meaningful is a pin on the instrument.
+pub(crate) fn world_phases_record_compiled() {
+    WORLD_PHASES.with(|cell| {
+        let mut phases = cell.get();
+        phases.compiled += 1;
+        cell.set(phases);
+    });
+}
+
+/// One world's analysis phases, added to this thread's tally. Called from the
+/// site that would have PRINTED the world's own line.
+pub(crate) fn world_phases_record_analysis(
+    load_walk: crate::PhaseSpan,
+    base: crate::PhaseSpan,
+    build: crate::PhaseSpan,
+    checks: crate::PhaseSpan,
+) {
+    WORLD_PHASES.with(|cell| {
+        let mut phases = cell.get();
+        phases.load_walk += load_walk;
+        phases.base += base;
+        phases.build += build;
+        phases.checks += checks;
+        cell.set(phases);
+    });
+}
+
+/// One world's post-passes, added to this thread's tally.
+pub(crate) fn world_phases_record_post(post: crate::PhaseSpan) {
+    WORLD_PHASES.with(|cell| {
+        let mut phases = cell.get();
+        phases.post += post;
+        cell.set(phases);
+    });
+}
+
+pub(crate) fn world_phases() -> MacroWorldPhases {
+    WORLD_PHASES.with(|phases| phases.get())
+}
+
+/// How many macro worlds the last top-level analysis on THIS thread compiled —
+/// the phase row's count, readable without parsing stderr (the `bindable_set_cost`
+/// probe shape, M30). The pin M33's second half needs: a warm `check` of an
+/// unchanged package must answer 0.
+#[doc(hidden)]
+pub fn macro_worlds_compiled() -> usize {
+    world_phases().compiled
 }
 
 /// The macro world's AMBIENT prelude vocabulary (macro-engine.md §3/§10): the
@@ -668,6 +933,7 @@ const AMBIENT_META_TYPES: &[&str] = &[
     "ServiceItem",
     "Field",
     "Variant",
+    "GenericParameter",
     "TypeExpr",
     "Arguments",
     "Source",
@@ -763,6 +1029,23 @@ fn record_cached_failure(errors: &[Error], displaced: Option<Arc<Vec<Error>>>) {
 
 #[doc(hidden)]
 pub fn macro_world_cache_clear() {
+    // The in-memory EXPANSION table goes with them (M33), and this is not a
+    // convenience: since the expansion key became reachable without the world
+    // (it is built from `MacroDef::world_key`, the blanked file's content
+    // hash), a cached expansion answers BEFORE `def.world(..)` is called — so
+    // dropping the compiled worlds alone no longer makes a world compile
+    // happen. It would make the world unreachable instead, which is the
+    // opposite of what this function is for, and it would quietly turn every
+    // "cold" measurement that calls it into a warm one.
+    if let Some(expansions) = EXPANSIONS.get() {
+        // No tally release: an expansion's text is genuinely `Box::leak`ed
+        // (`MacroExpansion`), so dropping the map gives back none of it — the
+        // same reason the worlds below release nothing.
+        expansions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
     if let Some(worlds) = WORLDS.get() {
         // No tally release: what a compiled world retains is genuinely
         // `Box::leak`ed (`MacroWorldText`/`MacroWorldProgram`/`MacroWorldAst`),
@@ -841,6 +1124,11 @@ fn compile_world(
         // ambient scope is `world_prelude_nodes`' meta vocabulary, and a
         // macro body talks to the compiler, not to `std::option`.
         entry_prelude: crate::manifest::PreludeSpec::Off,
+        // A macro world is a nested compile of the compiler's own vocabulary;
+        // no file of the user's is being coloured, so there is nothing to
+        // explain (E119) — and with no program prelude above, nothing for the
+        // web-set steer to offer a repair for either (E120).
+        ..Workspace::default()
     };
     let previously_in_world = IN_MACRO_WORLD.with(|flag| flag.replace(true));
     let (program, errors) = analyze_source(
@@ -861,6 +1149,10 @@ fn compile_world(
         &workspace,
     );
     IN_MACRO_WORLD.with(|flag| flag.set(previously_in_world));
+    // Counted here, at the one place a world's analysis actually runs: the two
+    // cache hits above returned before it, so a warm process — and, since the
+    // on-disk expansion table, a warm PROCESS — adds nothing (M33).
+    world_phases_record_compiled();
     if !errors.is_empty() {
         // The text above is already leaked; caching the failure bounds that to
         // one leak per distinct (definition set, layout) instead of one per
@@ -956,16 +1248,314 @@ fn compile_world(
     Ok(world)
 }
 
+// --- The cross-process expansion table (macro-engine.md §6.5, tracker M33) ---
+
+/// §6's expansion table, on disk under the package's build directory.
+///
+/// §6 settled the unit of caching — the expansion's SOURCE TEXT, id-free,
+/// span-free, analysis-independent, keyed by the macro's reachable definition
+/// set × the invocation's input source — and then made the store "in-memory per
+/// process, an on-disk cache a later, optional layer with the same key, safe
+/// because the key already covers everything". This is that layer.
+///
+/// What it buys is not a faster expansion: it is the WORLD the expansion would
+/// have needed. A cold `vilan check` of kolt's client compiles four macro
+/// worlds, 18.2% of that entry's instructions, for std files and a toolchain
+/// that do not change between runs — and every `check`, every `build` and every
+/// cold benchmark row paid all four again, because the world cache is
+/// process-global and a CLI process is born cold. An expansion served from
+/// here is served without compiling the world at all, since the key is built
+/// from `MacroDef::world_key` — the blanked file's content hash, computed at
+/// REGISTRATION — and never from the compiled world's identity.
+///
+/// **Why the unit is the expansion and not the world.** What a compiled world
+/// retains is `Box::leak`ed text, program and AST wired to this process's id
+/// counters and leaked buffers; serializing it is the incremental-analysis
+/// problem (§6's cached-OUTPUT problem, roadmap #12). The expansion text is
+/// exactly what §6 proved cacheable, and it is what the world exists to
+/// produce.
+///
+/// **Soundness.** The key covers the macro's definition set (`world_key`), the
+/// macro's name, the annotated item's source and the argument sources. The
+/// FILE covers what the key cannot see: the toolchain version and a hash of
+/// `macro_std`'s own sources, both stamped in a header. A mismatch on either
+/// discards the whole file rather than serving a single entry from it — the
+/// key does not name them, so no entry under an old stamp can be trusted, and a
+/// stale expansion is a miscompile, the worst outcome §6 names. `macro_std` is
+/// hashed rather than versioned because a toolchain built from a checkout can
+/// change it without changing a version number, and that is the tree everyone
+/// developing the compiler is standing in.
+///
+/// **A corrupt file is ignored, never fatal.** Every read failure — a truncated
+/// write, a half-written entry, bytes that are not UTF-8, a directory where a
+/// file should be — produces an EMPTY table, which recompiles exactly as a
+/// cold run does. A build must not fail because a cache did.
+struct DiskTable {
+    /// The file itself, canonical, resolved ONCE when the table is loaded.
+    /// Every read and write of the table goes through this path, so the
+    /// canonicalization the house rule asks for happens where the path is used
+    /// — and it happens once per package per process rather than once per
+    /// macro expansion, which is what it cost when the file was re-derived on
+    /// each lookup (63M instructions on a cold kolt client check, a fifth of
+    /// what the cache saves).
+    path: PathBuf,
+    /// The header the file was written under, and must be read back under.
+    stamp: String,
+    entries: HashMap<u64, &'static str>,
+    /// Whether this process added anything the file does not hold.
+    dirty: bool,
+}
+
+/// The file's first line. Bumping it is how a format change invalidates every
+/// cache in existence without needing to parse the old one.
+const DISK_FORMAT: &str = "vilan-macro-expansions 1";
+/// The most entries one package's table keeps. The table is rewritten whole on
+/// each flush, so this is a hard bound on the file rather than a policy about
+/// eviction — and the entries kept are the numerically smallest keys, which
+/// makes the file a deterministic function of its contents rather than of the
+/// order a build happened to visit macros in.
+const DISK_ENTRY_CAP: usize = 4096;
+
+static DISK_TABLES: OnceLock<Mutex<HashMap<PathBuf, DiskTable>>> = OnceLock::new();
+
+fn disk_tables() -> &'static Mutex<HashMap<PathBuf, DiskTable>> {
+    DISK_TABLES.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// The cache file inside a package's build directory. `dist/` and not
+/// `~/.vilan/`, for the reason the build hooks' stamp file is there: a
+/// machine-global cache keyed on a project path is the thing nobody can reason
+/// about from a fresh clone, and a stale one is unreachable to `rm -rf`. Here
+/// `rm -rf dist` means *recompile everything, macro worlds included*, which is
+/// a sentence a user already believes.
+///
+/// **Under `dist/.cache/`, which is where every on-disk cache lives** (tracker
+/// N63, ruled by the owner 2026-09-07). M33 wrote it as `dist/.macro-expansions`,
+/// one leaf beside the emitted artifacts, and the second cache would have been
+/// another leaf beside those — a `dist/` a reader has to sort by hand into "the
+/// build's output" and "something the compiler kept". One directory instead:
+/// `rm -rf dist/.cache` is *forget everything remembered and rebuild nothing*,
+/// one ignore line covers it, and `vilan check` — which emits no artifacts at
+/// all — creates `dist/.cache/` and writes nothing else, which is pinned.
+///
+/// Canonical at the source (the house rule for a path that will be compared):
+/// the file does not exist yet on a first run, so it goes through
+/// `canonical_path_of_unwritten`, and two spellings of one package share one
+/// table instead of racing two.
+pub(crate) fn expansion_cache_file(build_dir: &Path) -> PathBuf {
+    crate::util::canonical_path_of_unwritten(build_dir.join(".cache").join("macro-expansions"))
+}
+
+/// The header this compiler writes and will read back: the format line, the
+/// toolchain version, and a hash of `macro_std`'s own sources.
+fn disk_stamp(std: &PackageSpec) -> String {
+    static STAMP: OnceLock<String> = OnceLock::new();
+    // One `PackageSpec` per process in every real front end, and a wrong-but-
+    // conservative stamp in the pathological case would only over-invalidate.
+    STAMP
+        .get_or_init(|| {
+            let mut hasher = DefaultHasher::new();
+            if let Some(macro_std) = resolve_macro_std(std) {
+                let mut sources: Vec<PathBuf> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(macro_std.base_root.join("src")) {
+                    for entry in entries.flatten() {
+                        sources.push(entry.path());
+                    }
+                }
+                // Sorted: `read_dir` order is the filesystem's, and a stamp that
+                // depended on it would invalidate for no reason.
+                sources.sort();
+                for source in sources {
+                    if let Some(name) = source.file_name() {
+                        name.hash(&mut hasher);
+                    }
+                    if let Ok(text) = std::fs::read_to_string(&source) {
+                        text.hash(&mut hasher);
+                    }
+                }
+            }
+            format!(
+                "{DISK_FORMAT}\ntoolchain {}\nmacro_std {:016x}",
+                env!("CARGO_PKG_VERSION"),
+                hasher.finish(),
+            )
+        })
+        .clone()
+}
+
+/// Parse a written table. `None` for anything that is not exactly what this
+/// compiler wrote — a stale stamp, a truncated entry, non-UTF-8 bytes.
+fn parse_disk_table(text: &str, stamp: &str) -> Option<HashMap<u64, &'static str>> {
+    let body = text.strip_prefix(stamp)?.strip_prefix('\n')?;
+    let mut entries: HashMap<u64, &'static str> = HashMap::default();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (header, after) = rest.split_once('\n')?;
+        let (key, length) = header.split_once(' ')?;
+        let key = u64::from_str_radix(key, 16).ok()?;
+        let length: usize = length.parse().ok()?;
+        if after.len() < length + 1 {
+            return None;
+        }
+        let expansion = after.get(..length)?;
+        if after.as_bytes()[length] != b'\n' {
+            return None;
+        }
+        // Leaked like every other expansion: `ExpansionOutput` hands out
+        // `&'static str`, and the tally records it at the same site a freshly
+        // run expansion does, so a served-from-disk run reports what it retains.
+        let leaked: &'static str = Box::leak(expansion.to_string().into_boxed_str());
+        crate::leak_tally::record(crate::leak_tally::LeakSite::MacroExpansion, leaked.len());
+        entries.insert(key, leaked);
+        rest = &after[length + 1..];
+    }
+    Some(entries)
+}
+
+fn render_disk_table(stamp: &str, entries: &HashMap<u64, &'static str>) -> String {
+    let mut keys: Vec<u64> = entries.keys().copied().collect();
+    keys.sort_unstable();
+    keys.truncate(DISK_ENTRY_CAP);
+    let mut text = String::with_capacity(stamp.len() + 1);
+    text.push_str(stamp);
+    text.push('\n');
+    for key in keys {
+        let expansion = entries[&key];
+        text.push_str(&format!("{key:016x} {}\n", expansion.len()));
+        text.push_str(expansion);
+        text.push('\n');
+    }
+    text
+}
+
+/// Read this package's table, loading it from disk once per process.
+///
+/// Keyed by the build directory AS THE FRONT END SPELLED IT, which is an
+/// in-process memo and not a path comparison that decides anything: the file
+/// each table reads and writes is the canonical one it resolved on load, so two
+/// spellings of one package in one process would keep two tables over the same
+/// file and each would hold correct entries (they are content-keyed) — a
+/// redundancy, not a stale read. What the canonical path buys is the case that
+/// matters, which is the NEXT process finding what this one wrote.
+fn with_disk_table<T>(
+    build_dir: &Path,
+    std: &PackageSpec,
+    read: impl FnOnce(&mut DiskTable) -> T,
+) -> T {
+    let mut tables = disk_tables()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !tables.contains_key(build_dir) {
+        let path = expansion_cache_file(build_dir);
+        let stamp = disk_stamp(std);
+        let entries = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| parse_disk_table(&text, &stamp))
+            .unwrap_or_default();
+        tables.insert(
+            build_dir.to_path_buf(),
+            DiskTable {
+                path,
+                stamp,
+                entries,
+                dirty: false,
+            },
+        );
+    }
+    read(tables.get_mut(build_dir).expect("just inserted"))
+}
+
+/// Write this package's table back, if this process added to it. Called once
+/// per top-level analysis; a whole-file rewrite through a temporary and a
+/// rename, so a reader never sees a half-written table (and a failed write
+/// leaves the previous one intact). Every IO failure is ignored: a read-only
+/// checkout, a full disk and a missing directory must all mean "no cache",
+/// never "no build".
+pub(crate) fn flush_expansion_cache(build_dir: &Path) {
+    // The common case is an analysis that expanded no macro at all, and it must
+    // not pay for the path resolution to find that out: no table was ever
+    // loaded, so there is nothing to write.
+    let Some(tables) = DISK_TABLES.get() else {
+        return;
+    };
+    let (path, rendered) = {
+        let mut tables = tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(table) = tables.get_mut(build_dir) else {
+            return;
+        };
+        if !table.dirty {
+            return;
+        }
+        table.dirty = false;
+        (
+            table.path.clone(),
+            render_disk_table(&table.stamp, &table.entries),
+        )
+    };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    // Per-THREAD, not merely per-process: a workspace's legs compile on threads
+    // of their own (M35 for `check`, M51 for `build`) and several of them share
+    // one package's build directory, so two flushes of one table can be in
+    // flight at once. One temporary name between them would have the two writes
+    // interleave into the file the rename then publishes.
+    static FLUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = parent.join(format!(
+        "macro-expansions.{}.{}.tmp",
+        std::process::id(),
+        FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if std::fs::write(&temporary, rendered).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    }
+    if std::fs::rename(&temporary, &path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+/// Drop every loaded table, so the next expansion re-reads its file — the test
+/// surface that makes a second PROCESS's behaviour reachable inside one.
+///
+/// `macro_world_cache_clear`'s sibling, and to be used WITH it: this one
+/// forgets what was read from disk, that one forgets what this process
+/// computed, and only both together put a process back where it started.
+#[doc(hidden)]
+pub fn macro_expansion_cache_clear() {
+    if let Some(tables) = DISK_TABLES.get() {
+        tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
 // --- Expansion ---
+
+/// One generated item list, walked after the originating file's items.
+#[derive(Clone)]
+pub(crate) struct GeneratedItems {
+    /// The ORIGIN — the span of the attribute/invocation in the user's file
+    /// that produced this list. It is what a diagnostic raised INSIDE the
+    /// generated code re-anchors to (standard A2).
+    pub(crate) origin: Span,
+    /// The inline-`mod` path, outermost segment first, of the item that
+    /// produced this list — empty at a file's top level. The list walks into
+    /// THAT module's scope, because that is the only scope its subject is
+    /// declared in: a `[derive(..)]` inside a `mod` used to generate its impl
+    /// at the file's top level, where the type it names is out of scope (B201).
+    pub(crate) module_path: Vec<String>,
+    pub(crate) nodes: &'static NodeList<'static>,
+}
 
 /// One file's expansion results, ready for `analyze` to fold in.
 #[derive(Default)]
 pub(crate) struct ExpansionOutput {
-    /// Generated ITEM lists, each with its ORIGIN — the span of the
-    /// attribute/invocation in the user's file that produced it — walked
-    /// after the originating file's items. The origin is what a diagnostic
-    /// raised INSIDE the generated code re-anchors to (standard A2).
-    pub(crate) items: Vec<(Span, &'static NodeList<'static>)>,
+    pub(crate) items: Vec<GeneratedItems>,
     /// Expression splices: invocation node address → the replacement
     /// expression the walk substitutes.
     pub(crate) expressions: Vec<(usize, &'static Spanned<Node<'static>>)>,
@@ -979,22 +1569,22 @@ pub(crate) struct ExpansionOutput {
     pub(crate) world_errors: Vec<(SourceId, Error)>,
 }
 
-struct Expander<'r, 'd> {
-    scope: &'r MacroScope<'r>,
-    std: &'r PackageSpec,
-    limits: MacroLimits,
-    /// Rust-generated fallback text (derive/service names with no macro in
-    /// scope — fixture stds without the std macros). Flushed as ONE list,
-    /// prelude-first, ahead of the macro-generated lists — the shape the
-    /// pre-unification channel produced.
-    rust_source: String,
-    rust_traits: std::collections::HashSet<&'static str>,
-    rust_any_service: bool,
-    /// Whether this module declared a backed enum whose `value()`/`parse()` were
+/// One declaring scope's SYNTHESIZED members: the generated vilan text plus the
+/// prelude imports that text needs in scope. Bucketed per scope so a
+/// `mod`-nested enum's members and their imports land where its subject is
+/// (B201).
+///
+/// Only the backed-enum generators write here now. It used to carry the derive
+/// fallback's impls too, and a `traits` set naming which trait preludes those
+/// impls needed; N79 deleted the generators and the set went with them.
+#[derive(Default)]
+struct SynthesizedMembers {
+    source: String,
+    /// Whether this scope declared a backed enum whose `value()`/`parse()` were
     /// generated, so the generated block gets `Option` in scope for its `parse`
     /// (backed-enums.md §3.8).
     backed_enums: bool,
-    /// Whether this module declared a bare-lowered enum, so the generated block
+    /// Whether this scope declared a bare-lowered enum, so the generated block
     /// gets `Hashable`/`Hash`/`canonical_hash` in scope for its synthesized
     /// `impl .. with Hashable` (backed-enums.md §7.1). Tracked apart from
     /// `backed_enums` because the two are not the same set: `enum Level { Low =
@@ -1002,10 +1592,35 @@ struct Expander<'r, 'd> {
     /// declaration — but has no written literal for `Mid`/`High` to reprint, so
     /// it gets the Hashable impl and no conversions.
     bare_lowered_enums: bool,
+}
+
+struct Expander<'r, 'd> {
+    scope: &'r MacroScope<'r>,
+    std: &'r PackageSpec,
+    limits: MacroLimits,
+    /// Synthesized member text (a backed enum's `value()`/`parse()` and a
+    /// bare-lowered enum's `Hashable` impl — the members the LANGUAGE gives an
+    /// enum, which no macro declares), bucketed by the DECLARING scope's
+    /// inline-`mod` path. Each bucket is flushed as ONE list, prelude-first,
+    /// ahead of that scope's macro-generated lists — the shape the
+    /// pre-unification channel produced, per scope rather than per file
+    /// (B201: a backed enum inside a `mod` generated its `value()`/`parse()`
+    /// at the file's top level, where the enum is out of scope).
+    synthesized_members: Vec<(Vec<String>, SynthesizedMembers)>,
+    /// The inline-`mod` path currently being expanded, outermost first — empty
+    /// at a file's top level. Every generated list records it, so the walk can
+    /// place the list in the scope that declares its subject (B201).
+    module_path: Vec<String>,
     diagnostics: &'d mut Vec<Error>,
     /// The per-splice-site counter that stamps `__m<N>` gensym placeholders
     /// unique (§7): deterministic — sites are visited in file/node order.
     site_counter: &'d mut u32,
+    /// Where this package's on-disk expansion table lives, when the front end
+    /// named one (M33). `None` — the language server, the wasm playground, an
+    /// embedder, a macro world's own nested expansion — means the process
+    /// table only: a keystroke path has nothing to gain from a file it would
+    /// have to write on every edit, and the in-memory layer already serves it.
+    expansion_cache: Option<&'r Path>,
     output: ExpansionOutput,
 }
 
@@ -1014,6 +1629,14 @@ struct Expander<'r, 'd> {
 /// items; expression-position invocations (found at ANY depth, except inside
 /// macro definitions) record their spliced replacement. Nested uses in
 /// generated code are chased to the depth cap.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the expander's inputs are each a distinct fact about the file being \
+              expanded (its scope, its std, its budgets, its tree, its text) plus the \
+              two out-parameters the walk threads and the package's cache directory; \
+              bundling them into a struct would name the same seven things one level \
+              further from the two call sites that build them"
+)]
 pub(crate) fn expand_source(
     scope: &MacroScope,
     std: &PackageSpec,
@@ -1022,28 +1645,49 @@ pub(crate) fn expand_source(
     text: &str,
     diagnostics: &mut Vec<Error>,
     site_counter: &mut u32,
+    expansion_cache: Option<&Path>,
     depth: u32,
 ) -> ExpansionOutput {
     let mut expander = Expander {
         scope,
         std,
         limits,
-        rust_source: String::new(),
-        rust_traits: std::collections::HashSet::default(),
-        rust_any_service: false,
-        backed_enums: false,
-        bare_lowered_enums: false,
+        synthesized_members: Vec::new(),
+        module_path: Vec::new(),
         diagnostics,
         site_counter,
+        expansion_cache,
         output: ExpansionOutput::default(),
     };
     expander.collect_backed_enum_impls(nodes);
     expander.expand_list(nodes, text, depth);
-    expander.flush_rust_fallback();
+    expander.flush_synthesized_members();
     expander.output
 }
 
 impl Expander<'_, '_> {
+    /// The synthesized-member bucket for the scope being expanded — the file's
+    /// top level, or the inline `mod` the walk is inside (B201). Buckets are
+    /// kept in first-seen order so the flush is deterministic.
+    fn synthesized(&mut self) -> &mut SynthesizedMembers {
+        match self
+            .synthesized_members
+            .iter()
+            .position(|(path, _)| *path == self.module_path)
+        {
+            Some(index) => &mut self.synthesized_members[index].1,
+            None => {
+                self.synthesized_members
+                    .push((self.module_path.clone(), SynthesizedMembers::default()));
+                &mut self
+                    .synthesized_members
+                    .last_mut()
+                    .expect("the bucket just pushed")
+                    .1
+            }
+        }
+    }
+
     /// The synthesized members of every backed enum this module declares —
     /// `value()` / `parse()` (backed-enums.md §3.8) and `impl .. with Hashable`
     /// (§7.1) — collected in ONE pass over the item tree rather than inside the
@@ -1071,7 +1715,7 @@ impl Expander<'_, '_> {
     /// question, not this pass's to answer.)
     fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>, derived_hashable: bool) {
         match &node.0 {
-            Node::Export(inner)
+            Node::Export(_, inner, _)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner) => {
                 self.collect_backed_enum_impls_in(inner, derived_hashable)
@@ -1081,19 +1725,27 @@ impl Expander<'_, '_> {
                     derived_hashable || names.iter().any(|(name, _)| *name == "Hashable");
                 self.collect_backed_enum_impls_in(inner, derived_hashable)
             }
-            Node::Module(_, body) => self.collect_backed_enum_impls(&body.0),
+            Node::Module(name, body) => {
+                // The synthesized members belong to the `mod` that declares the
+                // enum, not to the file (B201).
+                self.module_path.push((*name).to_string());
+                self.collect_backed_enum_impls(&body.0);
+                self.module_path.pop();
+            }
             Node::Enum(..) => {
                 if !derived_hashable {
                     let hashable = crate::analyzer::backed_enum_hashable_source(node);
                     if !hashable.is_empty() {
-                        self.bare_lowered_enums = true;
-                        self.rust_source.push_str(&hashable);
+                        let bucket = self.synthesized();
+                        bucket.bare_lowered_enums = true;
+                        bucket.source.push_str(&hashable);
                     }
                 }
                 let source = crate::analyzer::backed_enum_impl_source(node);
                 if !source.is_empty() {
-                    self.backed_enums = true;
-                    self.rust_source.push_str(&source);
+                    let bucket = self.synthesized();
+                    bucket.backed_enums = true;
+                    bucket.source.push_str(&source);
                 }
             }
             _ => {}
@@ -1116,13 +1768,17 @@ impl Expander<'_, '_> {
         depth: u32,
     ) {
         match &node.0 {
-            Node::Export(inner) => self.expand_item_position(inner, siblings, text, depth),
+            Node::Export(_, inner, _) => self.expand_item_position(inner, siblings, text, depth),
             // `mod` bodies are item position too (a service there gathers its
-            // rpc surface from the mod's own items).
-            Node::Module(_, body) => {
+            // rpc surface from the mod's own items). What a derive there
+            // generates belongs to the `mod`'s scope, so the path is tracked
+            // across the recursion (B201).
+            Node::Module(name, body) => {
+                self.module_path.push((*name).to_string());
                 for child in &body.0 {
                     self.expand_item_position(child, &body.0, text, depth);
                 }
+                self.module_path.pop();
             }
             // A macro definition: its body is the macro world's, never
             // expanded (splice syntax is program-code-only).
@@ -1137,10 +1793,10 @@ impl Expander<'_, '_> {
                 self.sweep_expressions(item, text, depth);
             }
             // `[derive(Name)]`: a macro named `Name` in scope dispatches like
-            // an attribute with no arguments; the historical built-in names
-            // fall back to the Rust generators when no macro is in scope
-            // (fixture stds); unknown names keep today's behavior (skip — the
-            // missing impl surfaces at the use site).
+            // an attribute with no arguments; one of the six names std declares
+            // a macro for, with no macro in scope, is REFUSED (N79); unknown
+            // names keep today's behavior (skip — the missing impl surfaces at
+            // the use site).
             Node::Derive(names, item) => {
                 for (name, name_span) in names.iter() {
                     // `Wire`/`Json` on a `resource` type is refused HERE, above
@@ -1159,12 +1815,125 @@ impl Expander<'_, '_> {
                     }
                     if self.scope.get(name).is_some() {
                         self.run_attribute(name, *name_span, item, &[], text, depth);
-                    } else if let Some(known) =
-                        RUST_DERIVES.iter().find(|known| **known == *name).copied()
-                    {
-                        self.rust_traits.insert(known);
-                        self.rust_source
-                            .push_str(&crate::analyzer::derive_impl_source(&[name], item));
+                    } else if in_macro_world() {
+                        // B339: inside a macro WORLD the scope is EMPTY BY
+                        // DESIGN (see `IN_MACRO_WORLD`) — a world's own
+                        // analysis must not register macros, or std's prelude
+                        // `macro fun`s would recursively compile worlds of
+                        // their own, unboundedly. So "the macro is not in
+                        // scope" says nothing about the std here, and the two
+                        // sentences below — a load-ordering bug, or a std that
+                        // does not carry the derive — are both false of it.
+                        //
+                        // The reach is empty today, which is why this is a
+                        // guard and not a fix: the entry a world sees is
+                        // BLANKED to its macro definitions, `macro_std`
+                        // declares no derives, and none of the eleven std
+                        // modules a world force-loads (`boolean`, `list`,
+                        // `null`, `promise`, `compare`, `default`, `debug`,
+                        // `json`, `hash`, `number`, `string`) derives anything.
+                        // A derive written into one of them tomorrow is an
+                        // ordinary std change, and it would have been answered
+                        // with a "please report this" about a std that is
+                        // perfectly good. A world needs no derived impl — it
+                        // compiles one file against `macro_std` to read its
+                        // macro bodies — so the expansion is simply skipped.
+                    } else if let Some(module) = std_derive_module(name) {
+                        // B346: before either sentence below, the third
+                        // possibility — this toolchain is missing half of
+                        // itself, so std's `{module}` never got to register
+                        // anything. Both sentences are false of that state: the
+                        // std DOES carry the module, and nothing about the load
+                        // order went wrong. Blaming the compiler for a
+                        // configuration mistake is the worst of the three, and
+                        // it is what shipped: a `cp -a` of `vilan/std` answered
+                        // `[derive(PartialEq)]` with "a compiler load-ordering
+                        // bug (B21's class); please report how this module is
+                        // reached".
+                        if let Some((package, macro_std)) =
+                            crate::manifest::split_toolchain(self.std)
+                        {
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: *name_span,
+                                msg: format!(
+                                    "`[derive({name})]` could not expand: this toolchain has no \
+                                     `macro_std` beside its `std`, so std's own `{module}` never \
+                                     registered its `{name}` macro — `std` is at `{}`, and \
+                                     `macro_std` was looked for at `{}`",
+                                    package.display(),
+                                    macro_std.display(),
+                                ),
+                            });
+                            continue;
+                        }
+                        // There is no second generator to fall back to (N79).
+                        // There used to be — a Rust twin of the `Json`/`Wire`/
+                        // `PartialEq`/`Default`/`Debug`/`Hashable` macros std
+                        // declares — and it was N70's twin exactly: unpinned,
+                        // reachable only from a std missing the module, and
+                        // free to drift from the macro it stood in for with
+                        // nothing in the suite to notice. A silently DIFFERENT
+                        // expansion is the worst of the three outcomes here;
+                        // both remaining ones are a sentence.
+                        //
+                        // Which sentence depends on WHY the macro is missing,
+                        // exactly as it does for `[service]` below. A std that
+                        // HAS the module reaching here means the module was not
+                        // loaded before this expansion — the B21 ordering
+                        // class, and a compiler bug. A std with no such module
+                        // in it at all is not a bug: it is a std that does not
+                        // carry the derive, and the author of that std is the
+                        // reader.
+                        let msg = if self.std.base_root.join(module).is_file() {
+                            format!(
+                                "`[derive({name})]` expanded before std's `{module}` declared its \
+                                 `{name}` macro: a compiler load-ordering bug (B21's class); \
+                                 please report how this module is reached"
+                            )
+                        } else {
+                            format!(
+                                "`[derive({name})]` needs std's `{module}`, and the std this \
+                                 package resolves to does not carry one: the derive is expanded \
+                                 by the `{name}` macro that module declares, and there is no \
+                                 second generator behind it. Build against a std that has \
+                                 `{module}`, or write the impl by hand"
+                            )
+                        };
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: *name_span,
+                            msg,
+                        });
+                    } else {
+                        // B376: a name nothing declares a macro for. It used to
+                        // expand to NOTHING and say nothing, on the reasoning
+                        // recorded above `STD_DERIVE_MACROS` — the missing impl
+                        // would surface at the use site. It does, and the use
+                        // site is the wrong place: `[derive(PartialOrd)]` is
+                        // clean, and forty lines later `a < b` says "type `P`
+                        // does not implement the `PartialOrd` operator; add
+                        // `impl P with PartialOrd`", which is advice to write by
+                        // hand the impl the author believed they had just asked
+                        // for. A program with no comparison in it at all says
+                        // nothing whatsoever.
+                        //
+                        // The three states this arm is NOT are each handled
+                        // above and each has its own sentence: a macro in scope
+                        // (expand), a macro world (skip), and a std derive name
+                        // whose module did not register (a toolchain or
+                        // load-order report). What is left is a name, at a
+                        // derive, that expands to nothing — which is the
+                        // author's typo or a missing import, and both are said
+                        // here, at the attribute.
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: *name_span,
+                            msg: unknown_derive_refusal(name),
+                        });
                     }
                 }
                 self.sweep_expressions(item, text, depth);
@@ -1172,39 +1941,133 @@ impl Expander<'_, '_> {
             // `[service(Client)]`: the std `service` macro (in the prelude) —
             // or the Rust generator when absent. The compiler gathers the
             // same-module [rpc] surface either way.
-            Node::Service(client_name, item) => {
+            Node::Service(attribute, item) => {
+                // B266: a GENERIC subject is refused AT THE ATTRIBUTE, above the
+                // backend split and above the expansion — so nothing is generated
+                // to fail later inside a client the author never wrote (B117's
+                // rule, applied to the other attribute that generates a type).
+                // §9.3/R1: `client = H` where `H` is not a `[client_service]`
+                // sibling is refused here too — an unseen handler would fold an
+                // EMPTY reverse surface into the hash, which is a silent
+                // agreement about nothing rather than a loud disagreement.
+                let refusal = crate::analyzer::service_generic_refusal(item).or_else(|| {
+                    attribute.handler_name.and_then(|handler| {
+                        crate::analyzer::client_handler_refusal(handler, siblings)
+                    })
+                });
+                if let Some(refusal) = refusal {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: (node.1.start..item.1.start).into(),
+                        msg: refusal,
+                    });
+                    self.sweep_expressions(item, text, depth);
+                    return;
+                }
+                // B272: an `[rpc]` method taking `mut self` is refused here for
+                // the same reason, spanned on the METHOD — the receiver is what
+                // has to change, and the expansion is not where that is legible.
+                // `&mut self` is honoured by the generator instead (R-A38b(a)),
+                // so this is the only receiver a service refuses. B295 joins it
+                // with the `__` parameter-name reservation, spanned on the
+                // parameter, for the identical reason: the expansion would fail
+                // over a binding of its own that the author's name rebound.
+                let method_refusals =
+                    crate::analyzer::service_method_refusals(*attribute, item, siblings);
+                if !method_refusals.is_empty() {
+                    for (span, msg) in method_refusals {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg,
+                        });
+                    }
+                    self.sweep_expressions(item, text, depth);
+                    return;
+                }
+                // A120 S5: the `http` marker's three refusals, each spanned on
+                // the member that earned it. Answered here, above the
+                // expansion, for the reason the two walks above are: the
+                // expansion's only channel is a `panic`, and the far-away
+                // alternative — a client that cannot be built at the call
+                // site — is exactly what the marker exists to replace.
+                let http_refusals = service_http_refusals(
+                    *attribute,
+                    item,
+                    siblings,
+                    (node.1.start..item.1.start).into(),
+                );
+                if !http_refusals.is_empty() {
+                    for (span, msg) in http_refusals {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg,
+                        });
+                    }
+                    self.sweep_expressions(item, text, depth);
+                    return;
+                }
                 match self.scope.get("service") {
                     Some(def) => {
-                        self.run_service(def, *client_name, item, siblings, text, depth);
+                        self.run_service(def, *attribute, item, siblings, text, depth);
                     }
                     None => {
-                        // The Rust generator exists for FIXTURE stds that have
-                        // no rpc module at all. A real std reaching here means
-                        // `std::rpc` wasn't loaded before this expansion — the
-                        // B21 ordering class, whose symptom (a silently STALE
-                        // twin of the macro's template) is far worse than a
-                        // loud error. Every `[service]` site now seeds the rpc
-                        // load (entry, load loop, dependency surfaces), so
-                        // this firing again is a compiler bug to report.
-                        if self.std.base_root.join("rpc.vl").is_file() {
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: item.1,
-                                msg: "`[service]` expanded before std::rpc's `service` macro was \
-                                      loaded: a compiler load-ordering bug (B21's class); please \
-                                      report how this module is reached"
-                                    .to_string(),
-                            });
+                        // There is no second generator to fall back to (N70).
+                        // There used to be — a Rust twin of `std/src/rpc.vl`'s
+                        // `service` macro — and it had drifted far enough that
+                        // the two disagreed about the contract hash of any
+                        // keyed service, which is to say the halves it
+                        // generated could not have talked to each other. A
+                        // silently STALE expansion is the worst of the three
+                        // outcomes available here; both remaining ones are a
+                        // sentence.
+                        //
+                        // Which sentence depends on WHY the macro is missing. A
+                        // real std reaching here means `std::rpc` was not
+                        // loaded before this expansion — the B21 ordering
+                        // class, and a compiler bug, because every `[service]`
+                        // site seeds the rpc load (entry, load loop, dependency
+                        // surfaces). A std with no `rpc.vl` in it at all is not
+                        // a bug: it is a std that does not carry the attribute,
+                        // and the author of that std is the reader.
+                        //
+                        // B346: and before either of them, the third — a
+                        // toolchain with no `macro_std` beside its `std`, where
+                        // std's `service` macro never registered because no
+                        // macro in std could. The derive arm above carries the
+                        // same guard for the same reason.
+                        let msg = if let Some((package, macro_std)) =
+                            crate::manifest::split_toolchain(self.std)
+                        {
+                            format!(
+                                "`[service]` could not expand: this toolchain has no `macro_std` \
+                                 beside its `std`, so std::rpc's `service` macro never registered \
+                                 — `std` is at `{}`, and `macro_std` was looked for at `{}`",
+                                package.display(),
+                                macro_std.display(),
+                            )
+                        } else if self.std.base_root.join("rpc.vl").is_file() {
+                            "`[service]` expanded before std::rpc's `service` macro was loaded: \
+                             a compiler load-ordering bug (B21's class); please report how this \
+                             module is reached"
+                                .to_string()
                         } else {
-                            self.rust_any_service = true;
-                            self.rust_source
-                                .push_str(&crate::analyzer::service_impl_source(
-                                    *client_name,
-                                    item,
-                                    siblings,
-                                ));
-                        }
+                            "`[service]` needs std's `rpc.vl`, and the std this package resolves \
+                             to does not carry one: the attribute is expanded by the `service` \
+                             macro that module declares, and there is no second generator behind \
+                             it. Build against a std that has `rpc.vl`, or drop the attribute"
+                                .to_string()
+                        };
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: item.1,
+                            msg,
+                        });
                     }
                 }
                 self.sweep_expressions(item, text, depth);
@@ -1299,15 +2162,45 @@ impl Expander<'_, '_> {
     fn run_service(
         &mut self,
         def: &MacroDef,
-        client_name: Option<&str>,
+        attribute: ServiceAttr,
         item: &Spanned<Node>,
         siblings: &NodeList,
         text: &str,
         depth: u32,
     ) {
-        let Some((literal, input)) = construct_service(client_name, item, siblings, text) else {
+        let Some((literal, input, surface)) = construct_service(attribute, item, siblings, text)
+        else {
             return; // a bodyless struct generates nothing, like the Rust path
         };
+        // B375: a `[service]` whose CONTRACT SURFACE is empty — no `[rpc]`
+        // method, no `[expose]`d field, no `client = H` handler. The empty
+        // surface hashes to the empty-set hash on both generated sides, so the
+        // two AGREE, `verify()` answers true, and every call the client makes
+        // answers `unknown method` at runtime with nothing said at compile
+        // time. It is never what anyone meant. Said here rather than in the
+        // expansion because a macro's only error channel is a `panic`, which
+        // reads as "`service` failed at expansion time" — and this is a
+        // statement about the author's declaration, not about the generator.
+        //
+        // The expansion still runs: the client type and the dispatcher are what
+        // the rest of the file is written against, and refusing to generate
+        // them would bury this sentence under a cascade of unknown names.
+        if surface.is_empty() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: item.1,
+                msg: format!(
+                    "`[service]` on `{}` has an empty contract surface: it declares no `[rpc]` \
+                     method, no `[expose]`d field and no `client = ..` handler, so the client it \
+                     generates can call nothing and every call answers `unknown method` at \
+                     runtime — the two sides agree about the empty surface, so even `verify()` \
+                     says they match. Write an `[rpc]` method in an inherent `impl {}`, or drop \
+                     the attribute",
+                    surface.subject, surface.subject
+                ),
+            });
+        }
         // The input text (struct + gathered methods) is only `expand_call`'s
         // cache key, which hashes it transiently — `run_attribute` passes a
         // plain `slice(text, ..)` here for exactly that reason. So it need not
@@ -1325,70 +2218,64 @@ impl Expander<'_, '_> {
         );
     }
 
-    /// Flushes the Rust-generated fallback text (if any) as the FIRST items
-    /// list, prefixed with the trait-import prelude the Rust generators
-    /// assume — exactly the pre-unification channel's shape.
-    fn flush_rust_fallback(&mut self) {
-        if self.rust_source.trim().is_empty() {
-            return;
+    /// Flushes each declaring scope's synthesized member text (if any) as the
+    /// FIRST items list for that scope, prefixed with the import prelude that
+    /// text needs — exactly the pre-unification channel's shape, per scope
+    /// rather than per file (B201).
+    fn flush_synthesized_members(&mut self) {
+        let buckets = std::mem::take(&mut self.synthesized_members);
+        let mut flushed = Vec::new();
+        for (module_path, bucket) in buckets {
+            if let Some(items) = self.synthesized_member_items(&module_path, &bucket) {
+                flushed.push(items);
+            }
+        }
+        self.output.items.splice(0..0, flushed);
+    }
+
+    /// One bucket's parsed items — `None` when it generated nothing.
+    ///
+    /// The prelude is two lines at most now. It used to carry one import line
+    /// per derived trait, read off the bucket's `traits` set; N79 deleted the
+    /// derive generators that filled that set, and what a std macro's expansion
+    /// needs in scope is the macro's own business, written in the macro.
+    fn synthesized_member_items(
+        &mut self,
+        module_path: &[String],
+        bucket: &SynthesizedMembers,
+    ) -> Option<GeneratedItems> {
+        if bucket.source.trim().is_empty() {
+            return None;
         }
         let mut prelude = String::new();
-        if self.rust_traits.contains("PartialEq") {
-            prelude.push_str("import std::compare::PartialEq;\n");
-        }
-        if self.rust_traits.contains("Default") {
-            prelude.push_str("import std::default::Default;\n");
-        }
-        if self.rust_traits.contains("Json") || self.rust_traits.contains("Wire") {
-            // Mirrors the `Json`/`Wire` macro entry points: the validating
-            // `from_json` yields a `Result` (I3), so the output needs `Result`
-            // in scope; it reads JSON through methods (`try_parse_json`,
-            // `has_field`), so no `parse_json_value`/`panic` import.
-            prelude.push_str("import std::json::{ Json, FromJson, JsonValue };\n");
-            // A BACKED enum's decode reads the bare backing value out of the
-            // JSON rather than a variant tag (backed-enums.md §3.9), so the
-            // coercions come along.
-            prelude.push_str("import std::json::{ coerce_i32, coerce_i53, coerce_str };\n");
-            prelude.push_str("import std::result::Result;\n");
-        }
-        if self.rust_traits.contains("Wire") {
-            prelude.push_str(
-                "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n",
-            );
-        }
-        if self.rust_traits.contains("Debug") {
-            prelude.push_str("import std::debug::Debug;\n");
-        }
-        // One import line serves both producers of an `impl .. with Hashable`:
-        // the `[derive(Hashable)]` fallback generator and a bare-lowered enum's
-        // synthesized impl. A module with both must not import it twice.
-        if self.rust_traits.contains("Hashable") || self.bare_lowered_enums {
+        if bucket.bare_lowered_enums {
             prelude.push_str("import std::hash::{ Hashable, Hash, canonical_hash };\n");
         }
-        if self.backed_enums {
+        if bucket.backed_enums {
             prelude.push_str("import std::option::Option;\n");
         }
-        if self.rust_any_service {
-            prelude.push_str(
-                "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, call, arg, reply, decode_failed, session_of, connect_socket, SocketTransport, bridge, ReactiveClient };\n",
-            );
-            prelude.push_str("import std::wire::{ Codec, Serializer };\n");
-            prelude.push_str("import std::result::Result;\n");
-            prelude.push_str("import std::option::Option;\n");
-        }
-        let combined = format!("{prelude}{}", self.rust_source);
+        let combined = format!("{prelude}{}", bucket.source);
         // Deterministic per input (fixed prelude order, file-order source
         // accumulation, no gensyms), so it caches like any other generated
         // text: an unchanged program's re-analysis reuses the tree instead of
         // re-leaking one per analysis (the E23 sweep's uncached straggler).
         match parse_cached(&combined) {
-            Ok((parsed, _)) => self.output.items.insert(0, ((0..0).into(), parsed)),
-            Err(message) => self.diagnostics.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span: (0..0).into(),
-                msg: format!("the built-in derive generators produced invalid Vilan ({message})"),
+            Ok((parsed, _)) => Some(GeneratedItems {
+                origin: (0..0).into(),
+                module_path: module_path.to_vec(),
+                nodes: parsed,
             }),
+            Err(message) => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: (0..0).into(),
+                    msg: format!(
+                        "the built-in enum member generators produced invalid Vilan ({message})"
+                    ),
+                });
+                None
+            }
         }
     }
 
@@ -1561,49 +2448,64 @@ impl Expander<'_, '_> {
             return;
         }
 
-        // The RAW output is cached by (world, macro, item source, argument
-        // sources) — §6; sound because the interpreter is deterministic.
-        // Gensym stamping is per SITE, so it applies after the cache.
-        // Lazy world compile — errors carry the DEFINING file's spans.
-        let (world, entry) = match def.world(self.std) {
-            Ok(resolved) => resolved,
-            Err(errors) => {
-                self.output
-                    .world_errors
-                    .extend(errors.into_iter().map(|error| (def.source, error)));
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: site,
-                    msg: format!("{label}'s definition did not compile"),
-                });
-                if let Some(site_key) = expression_site {
-                    self.output.failed_sites.push(site_key);
+        // The RAW output is cached by (definition set, macro, item source,
+        // argument sources) — §6; sound because the interpreter is
+        // deterministic. Gensym stamping is per SITE, so it applies after the
+        // cache.
+        //
+        // The KEY IS ASKED FIRST, before the world (M33). `world_key` is the
+        // blanked file's content hash, computed at registration, so a hit —
+        // from this process's table or from the package's table on disk — is
+        // answered without compiling the world at all. That is the whole
+        // saving: a cold CLI process used to compile four of kolt's worlds for
+        // std files that had not changed since the last build.
+        let key = expansion_key(def.world_key, name, item_text, arguments);
+        let raw: &'static str = match cached_expansion(key, self.expansion_cache, self.std) {
+            Some(raw) => raw,
+            None => {
+                // A miss: the world is compiled now, and its errors carry the
+                // DEFINING file's spans.
+                let (world, entry) = match def.world(self.std) {
+                    Ok(resolved) => resolved,
+                    Err(errors) => {
+                        self.output
+                            .world_errors
+                            .extend(errors.into_iter().map(|error| (def.source, error)));
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: site,
+                            msg: format!("{label}'s definition did not compile"),
+                        });
+                        if let Some(site_key) = expression_site {
+                            self.output.failed_sites.push(site_key);
+                        }
+                        return;
+                    }
+                };
+                match run_and_record(
+                    key,
+                    &world,
+                    &entry,
+                    &call_arguments,
+                    self.limits.fuel,
+                    self.expansion_cache,
+                    self.std,
+                ) {
+                    Ok(raw) => raw,
+                    Err(message) => {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: site,
+                            msg: format!("{label} failed at expansion time: {message}"),
+                        });
+                        if let Some(site_key) = expression_site {
+                            self.output.failed_sites.push(site_key);
+                        }
+                        return;
+                    }
                 }
-                return;
-            }
-        };
-        let raw: &'static str = match cached_run(
-            &world,
-            &entry,
-            name,
-            item_text,
-            arguments,
-            &call_arguments,
-            self.limits.fuel,
-        ) {
-            Ok(raw) => raw,
-            Err(message) => {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: site,
-                    msg: format!("{label} failed at expansion time: {message}"),
-                });
-                if let Some(site_key) = expression_site {
-                    self.output.failed_sites.push(site_key);
-                }
-                return;
             }
         };
 
@@ -1715,7 +2617,11 @@ impl Expander<'_, '_> {
                 });
                 return;
             }
-            self.output.items.push((site, parsed));
+            self.output.items.push(GeneratedItems {
+                origin: site,
+                module_path: self.module_path.clone(),
+                nodes: parsed,
+            });
             // The generated code may carry derives, services, and further
             // macro uses — the unified item scan handles them all.
             self.expand_list(parsed, parsed_text, depth + 1);
@@ -1723,38 +2629,67 @@ impl Expander<'_, '_> {
     }
 }
 
-/// Runs one macro through the process-global expansion cache: key = (world,
-/// macro, item source, argument sources) — §6, sound because the interpreter
-/// is deterministic by construction.
-fn cached_run(
-    world: &World,
-    entry: &str,
-    name: &str,
-    item_text: &str,
-    arguments: &[Cow<'_, str>],
-    call_arguments: &[js::Node<'static>],
-    fuel: u64,
-) -> Result<&'static str, String> {
-    static EXPANSIONS: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
-    let key = {
-        let mut hasher = DefaultHasher::new();
-        world.key.hash(&mut hasher);
-        name.hash(&mut hasher);
-        item_text.hash(&mut hasher);
-        arguments.hash(&mut hasher);
-        hasher.finish()
-    };
-    let expansions = EXPANSIONS.get_or_init(|| Mutex::new(HashMap::default()));
+/// §6's expansion key: (the macro's definition set, the macro's name, the
+/// annotated item's source, the argument sources) — sound because the
+/// interpreter is deterministic by construction.
+///
+/// It is built from `world_key` and never from a compiled `World`, and that is
+/// the whole point (M33): the definition set's content hash is computed at
+/// REGISTRATION, so a cache hit is reachable without compiling the world the
+/// expansion would otherwise have needed.
+fn expansion_key(world_key: u64, name: &str, item_text: &str, arguments: &[Cow<'_, str>]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    world_key.hash(&mut hasher);
+    name.hash(&mut hasher);
+    item_text.hash(&mut hasher);
+    arguments.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The process-global expansion table (§6.5's in-memory layer).
+static EXPANSIONS: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
+
+fn expansions() -> &'static Mutex<HashMap<u64, &'static str>> {
+    EXPANSIONS.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// A cached expansion for `key`, from this process's table or — when the front
+/// end named a build directory — from the package's table on disk.
+///
+/// Answering here is what makes a warm `vilan check` compile ZERO macro worlds:
+/// the caller reaches `def.world(..)` only on a miss.
+fn cached_expansion(key: u64, build_dir: Option<&Path>, std: &PackageSpec) -> Option<&'static str> {
     // Recovering (E97): a poisoned expansion cache must not wedge the session,
     // and the values are `&'static str`s leaked before the lock is taken.
-    if let Some(raw) = expansions
+    if let Some(raw) = expansions()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
         .copied()
     {
-        return Ok(raw);
+        return Some(raw);
     }
+    let raw = with_disk_table(build_dir?, std, |table| table.entries.get(&key).copied())?;
+    // Promoted into memory, so the second use in this process costs a hash
+    // lookup rather than a lock on the disk table.
+    expansions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, raw);
+    Some(raw)
+}
+
+/// Runs one macro and records its output in both layers — §6, sound because
+/// the interpreter is deterministic by construction.
+fn run_and_record(
+    key: u64,
+    world: &World,
+    entry: &str,
+    call_arguments: &[js::Node<'static>],
+    fuel: u64,
+    build_dir: Option<&Path>,
+    std: &PackageSpec,
+) -> Result<&'static str, String> {
     let source = interpreter::run_entry(
         &world.program,
         entry,
@@ -1769,10 +2704,16 @@ fn cached_run(
     crate::leak_tally::record(crate::leak_tally::LeakSite::MacroExpansion, leaked.len());
     // Recovering (E97): the text is leaked before the lock, so the entry is
     // whole or absent.
-    expansions
+    expansions()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, leaked);
+    if let Some(build_dir) = build_dir {
+        with_disk_table(build_dir, std, |table| {
+            table.entries.insert(key, leaked);
+            table.dirty = true;
+        });
+    }
     Ok(leaked)
 }
 
@@ -1958,37 +2899,83 @@ fn void_type_expr() -> js::Node<'static> {
     array(vec![string_literal("void"), array(Vec::new())])
 }
 
+/// The `List<GenericParameter>` for a struct/enum declaration's own parameters:
+/// each name, its written trait bounds, and its default AS WRITTEN (`""` when
+/// it has none). A TUPLE-bounded parameter (`T: (2..)`) reads with no bounds —
+/// the tuple form replaces the trait-bound list and has no v1 spelling in the
+/// reflection surface.
+///
+/// This is what lets a generator spell its subject as an APPLICATION
+/// (`Handle<T>`) instead of bare (B194): a bare name in an applied position is
+/// an under-supplied application, which only B188's erasure ever let through.
+fn construct_generic_parameters(
+    parameters: Option<&GenericParameters>,
+    text: &str,
+) -> js::Node<'static> {
+    array(
+        parameters
+            .iter()
+            .flat_map(|parameters| &parameters.0)
+            .map(|parameter| {
+                array(vec![
+                    string_literal(parameter.name),
+                    array(
+                        parameter
+                            .bounds
+                            .iter()
+                            .map(|bound| construct_type_expr(bound, text))
+                            .collect(),
+                    ),
+                    string_literal(
+                        &parameter
+                            .default
+                            .as_ref()
+                            .map(|default| slice(text, default.1).to_string())
+                            .unwrap_or_default(),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// The `Item` value for the annotated node: `[0, StructItem]`, `[1, EnumItem]`,
 /// or `[2, FunctionItem]` — the variant order declared in `meta.vl`.
 fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
     match &item.0 {
-        Node::Struct(name, _generics, _external, _resource, fields) => {
+        Node::Struct(name, generics, _external, _resource, fields, _labels) => {
             let fields = fields
                 .iter()
                 .flat_map(|fields| &fields.0)
                 .map(|(field, _)| {
-                    let (field_name, field_type, exposed) = field;
+                    let (field_name, field_type, exposed, _internal) = field;
                     array(vec![
                         string_literal(field_name.0),
                         field_type
                             .as_ref()
                             .map(|type_| construct_type_expr(type_, text))
                             .unwrap_or_else(void_type_expr),
-                        js::Node::Bool(*exposed),
+                        js::Node::Bool(exposed.is_exposed()),
+                        js::Node::Bool(exposed.is_keyed()),
+                        string_literal(exposed.key_type()),
                     ])
                 })
                 .collect();
             array(vec![
                 discriminant(0),
-                array(vec![string_literal(name.0), array(fields)]),
+                array(vec![
+                    string_literal(name.0),
+                    array(fields),
+                    construct_generic_parameters(generics.as_deref(), text),
+                ]),
             ])
         }
-        Node::Enum(name, _generics, _resource, variants) => {
+        Node::Enum(name, generics, _resource, variants, _labels) => {
             let variants = variants
                 .0
                 .iter()
                 .map(|(variant, _)| {
-                    let (variant_name, payload, backing) = variant;
+                    let (variant_name, payload, backing, _internal) = variant;
                     array(vec![
                         string_literal(variant_name),
                         array(
@@ -2017,6 +3004,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                     string_literal(
                         crate::analyzer::backed_enum_backing_type_of(item).unwrap_or_default(),
                     ),
+                    construct_generic_parameters(generics.as_deref(), text),
                 ]),
             ])
         }
@@ -2035,6 +3023,11 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
 /// A `FunctionItem` value: name, parameters (as never-exposed `Field`s, `self`
 /// included — consumers skip it by name), and the written return type
 /// (`void` when omitted).
+///
+/// A parameter renders as a `Field` with all five slots written — `exposed`,
+/// `keyed` and `key` are meaningless on a parameter and are the false/empty
+/// constants. They used to be omitted, which left the last two slots `undefined`
+/// in the macro world: harmless only for as long as no macro read them.
 fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
     let parameters = function
         .parameters
@@ -2053,6 +3046,8 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
                     .map(|type_| construct_type_expr(type_, text))
                     .unwrap_or_else(void_type_expr),
                 js::Node::Bool(false),
+                js::Node::Bool(false),
+                string_literal(""),
             ])
         })
         .collect();
@@ -2073,41 +3068,176 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
 /// definition). Returns the literal plus the canonical INPUT text the
 /// expansion cache keys on: the output depends on the sibling impls, so the
 /// struct's own text alone would go stale when a method changes.
+/// What `[service]` found to put on the wire, for the one check `run_service`
+/// makes on it (B375). The three counts are the three kinds of contract-surface
+/// entry `service_hash` folds, and `is_empty` is exactly "this service hashes
+/// to the empty-set hash".
+pub(crate) struct ServiceSurface {
+    /// The annotated struct's name, for the refusal's sentence.
+    pub(crate) subject: String,
+    rpc_methods: usize,
+    exposed_fields: usize,
+    handler_methods: usize,
+}
+
+impl ServiceSurface {
+    fn is_empty(&self) -> bool {
+        self.rpc_methods == 0 && self.exposed_fields == 0 && self.handler_methods == 0
+    }
+}
+
 pub(crate) fn construct_service(
-    client_name: Option<&str>,
+    attribute: ServiceAttr,
     item: &Spanned<Node>,
     nodes: &NodeList,
     text: &str,
-) -> Option<(js::Node<'static>, String)> {
-    let Node::Struct(name, _generics, _external, _resource, Some(fields)) = &item.0 else {
+) -> Option<(js::Node<'static>, String, ServiceSurface)> {
+    let Node::Struct(name, _generics, _external, _resource, Some(fields), _labels) = &item.0 else {
         return None;
     };
     let service_name = name.0;
-    let client = client_name
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{service_name}Client"));
+    // A struct carrying only `[client_service]` generates no transport client,
+    // so it names none — the empty string is what the macro reads as "none"
+    // (§9.3). `[service]`, with or without an argument, always names one.
+    let client = if attribute.server_side {
+        attribute
+            .client_name
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{service_name}Client"))
+    } else {
+        String::new()
+    };
     let field_values = fields
         .0
         .iter()
         .map(|(field, _)| {
-            let (field_name, field_type, exposed) = field;
+            let (field_name, field_type, exposed, _internal) = field;
             array(vec![
                 string_literal(field_name.0),
                 field_type
                     .as_ref()
                     .map(|type_| construct_type_expr(type_, text))
                     .unwrap_or_else(void_type_expr),
-                js::Node::Bool(*exposed),
+                js::Node::Bool(exposed.is_exposed()),
+                js::Node::Bool(exposed.is_keyed()),
+                // `[expose(keyed = K)]`'s argument, as written — the key type
+                // the mirror is keyed by, or `""` for a field that is not keyed
+                // or whose key is read off a `Map<K, V>` element (A51).
+                string_literal(exposed.key_type()),
             ])
         })
         .collect();
-    let mut methods = Vec::new();
     let mut input = String::new();
     input.push_str(&slice(text, item.1));
     input.push('\u{0}');
     input.push_str(&client);
+    let methods = gather_rpc_methods(service_name, nodes, text, &mut input);
+    // `client = H`'s surface: the handler struct's own `[rpc]` methods, gathered
+    // the same way. They are the `client:` entries of THIS service's contract
+    // surface, which is why `H` must be a same-module sibling — the reflection
+    // that reaches them is the one the compiler already does for the service
+    // itself, and cross-module reflection stays future work (§9.3).
+    let handler_name = attribute.handler_name.unwrap_or_default();
+    input.push('\u{0}');
+    input.push_str(handler_name);
+    let handler_methods = if attribute.handler_name.is_some() {
+        gather_rpc_methods(handler_name, nodes, text, &mut input)
+    } else {
+        Vec::new()
+    };
+    let surface = ServiceSurface {
+        subject: service_name.to_string(),
+        rpc_methods: methods.len(),
+        exposed_fields: fields
+            .0
+            .iter()
+            .filter(|(field, _)| field.2.is_exposed())
+            .count(),
+        handler_methods: handler_methods.len(),
+    };
+    let literal = array(vec![
+        discriminant(3),
+        array(vec![
+            string_literal(service_name),
+            string_literal(&client),
+            array(field_values),
+            array(methods),
+            js::Node::Bool(attribute.client_side),
+            string_literal(handler_name),
+            array(handler_methods),
+        ]),
+    ]);
+    Some((literal, input, surface))
+}
+
+/// What `[service(.., http)]` refuses (A120 S5, `transport-rpc.md` §9.7.5, Q1
+/// RULED: an opt-in MARKER, not a mode) — one refusal per offending member.
+///
+/// Nothing here is needed for CORRECTNESS: the generated client's field list
+/// already refuses the first two shapes structurally (`over_http` is emitted
+/// only for a client that holds nothing but its transport and codec), and the
+/// third is simply not given `over_http`. What the marker buys is WHERE the
+/// author hears it: at the method, the field or the attribute that made the
+/// service unreachable over the connectionless leg, in the attribute's own
+/// vocabulary, instead of at a call site that could not build a client and
+/// names a field the author never wrote. It is opt-in because which transports
+/// reach a service is a property of its mount and its methods, not of the
+/// struct — a service may legitimately want both legs.
+///
+/// The handle test is the WRITTEN return spelling, the one the expansion reads
+/// (`std::rpc`'s `handle_element`): `SignalCell<T>` or `KeyedCell<K, T>`. A
+/// method returning some other `Source` is not a handle there either, and the
+/// `[rpc]` Wire rule refuses it in its own words.
+fn service_http_refusals(
+    attribute: ServiceAttr,
+    item: &Spanned<Node>,
+    nodes: &NodeList,
+    attribute_span: Span,
+) -> Vec<(Span, String)> {
+    if !attribute.http {
+        return Vec::new();
+    }
+    let Node::Struct(name, _generics, _external, _resource, fields, _labels) = &item.0 else {
+        return Vec::new();
+    };
+    let service_name = name.0;
+    let mut refusals = Vec::new();
+    if let Some(handler) = attribute.handler_name {
+        refusals.push((
+            attribute_span,
+            format!(
+                "an `http` service cannot name `client = {handler}`: the server calls a client \
+                 back over the CONNECTION that client holds open, and the connectionless POST \
+                 leg holds none, so every notification to `{handler}` would find no channel and \
+                 be dropped in silence. Drop `client = {handler}`, or drop `http` and reach \
+                 this service over the socket transport"
+            ),
+        ));
+    }
+    for ((field_name, _field_type, exposure, _internal), _span) in
+        fields.iter().flat_map(|fields| &fields.0)
+    {
+        if !exposure.is_exposed() {
+            continue;
+        }
+        let field = field_name.0;
+        refusals.push((
+            field_name.1,
+            format!(
+                "an `http` service's field `{field}` is `[expose]`d, and a mirror is attached \
+                 over a CONNECTION: the client's `__attach` names a channel in that \
+                 connection's capability table, which the connectionless POST leg has none of. \
+                 Return the value from an `[rpc]` method instead, or drop `http` and reach this \
+                 service over the socket transport"
+            ),
+        ));
+    }
     for (node, _span) in nodes {
-        let Node::Impl(subject, impl_traits, body) = node else {
+        let mut node = node;
+        while let Node::Export(_, inner, _) = node {
+            node = &inner.0;
+        }
+        let Node::Impl(subject, impl_traits, body, _) = node else {
             continue;
         };
         if !impl_traits.is_empty() {
@@ -2117,6 +3247,84 @@ pub(crate) fn construct_service(
             continue;
         };
         if *subject_name != service_name {
+            continue;
+        }
+        for (member, _member_span) in &body.0 {
+            let Node::Func(function) = member else {
+                continue;
+            };
+            if !function.rpc {
+                continue;
+            }
+            let Some(spelling) = function
+                .return_type
+                .as_deref()
+                .and_then(|returned| handle_spelling(&returned.0))
+            else {
+                continue;
+            };
+            let method = function.name.0;
+            refusals.push((
+                function.name.1,
+                format!(
+                    "an `http` service's method `{method}` returns a signal handle \
+                     (`{spelling}<..>`), and a handle's reply is a channel id minted in a \
+                     CONNECTION's capability table, which the connectionless POST leg has none \
+                     of: return the value, or drop `http` and reach this service over the \
+                     socket transport"
+                ),
+            ));
+        }
+    }
+    refusals
+}
+
+/// The handle type a written return spelling names, if it names one — the
+/// same test `std::rpc`'s `handle_element` applies at expansion.
+fn handle_spelling(returned: &Node) -> Option<&'static str> {
+    let Node::AccessorWithGenerics(name, arguments) = returned else {
+        return None;
+    };
+    match (*name, arguments.0.len()) {
+        ("SignalCell", 1) => Some("SignalCell"),
+        ("KeyedCell", 2) => Some("KeyedCell"),
+        _ => None,
+    }
+}
+
+/// Every `[rpc]` method declared on `subject` by an inherent impl in `nodes`,
+/// as `FunctionItem` literals — and each one's source text appended to `input`,
+/// the expansion cache's key (a method's signature changing must invalidate the
+/// expansion that hashed it).
+fn gather_rpc_methods(
+    subject: &str,
+    nodes: &NodeList,
+    text: &str,
+    input: &mut String,
+) -> Vec<js::Node<'static>> {
+    let mut methods = Vec::new();
+    for (node, _span) in nodes {
+        // `export impl Echo { .. }` is an `Impl` under an `Export` wrapper, and
+        // this walk used to look only for the bare node (B375): a service whose
+        // impl block carried `export` therefore found NO methods, generated a
+        // dispatcher with no routes and a contract hash over the empty surface,
+        // and — because both generated sides agreed about that empty surface —
+        // built, connected and answered every call `unknown method`, with
+        // nothing said at compile time. `export` is VISIBILITY, not shape.
+        let mut node = node;
+        while let Node::Export(_, inner, _) = node {
+            node = &inner.0;
+        }
+        let Node::Impl(impl_subject, impl_traits, body, _) = node else {
+            continue;
+        };
+        if !impl_traits.is_empty() {
+            continue;
+        }
+        let Node::Accessor(subject_name) = &impl_subject.0 else {
+            continue;
+        };
+        if *subject_name != subject {
             continue;
         }
         for (member, member_span) in &body.0 {
@@ -2131,16 +3339,7 @@ pub(crate) fn construct_service(
             input.push_str(&slice(text, *member_span));
         }
     }
-    let literal = array(vec![
-        discriminant(3),
-        array(vec![
-            string_literal(service_name),
-            string_literal(&client),
-            array(field_values),
-            array(methods),
-        ]),
-    ]);
-    Some((literal, input))
+    methods
 }
 
 /// `Arguments { values }` — the invocation's argument source texts.
@@ -2151,4 +3350,127 @@ fn construct_arguments(arguments: &[Cow<'_, str>]) -> js::Node<'static> {
             .map(|argument| string_literal(argument.trim()))
             .collect(),
     )])
+}
+
+/// B376: the derive table and std's own `macro fun`s are ONE list.
+///
+/// [`STD_DERIVE_MACROS`] exists so a refusal can name the module a reader is
+/// missing, and since B376 it is also what
+/// [`unknown_derive_refusal`] prints as "what IS derivable". Both readings are
+/// wrong the moment the table and std disagree — the first names a module that
+/// declares nothing, and the second offers a name that expands to nothing,
+/// which is the very defect the refusal exists to close. Nothing held them
+/// together: the table was hand-maintained beside a std that moves.
+///
+/// Held in BOTH directions, because either drift is a lie. A table row whose
+/// module declares no such `macro fun` is the first; a `macro fun` in one of
+/// those modules whose name is a derivable trait and is missing from the table
+/// would be the second, and is checked as the exact inverse — every name the
+/// table claims is found, and the count of found rows is the table's length.
+#[cfg(test)]
+mod derive_table_tests {
+    use super::STD_DERIVE_MACROS;
+    use std::path::{Path, PathBuf};
+
+    fn std_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src")
+    }
+
+    #[test]
+    fn derives_are_the_macros_std_declares() {
+        let mut missing: Vec<String> = Vec::new();
+        for (name, module) in STD_DERIVE_MACROS {
+            let path = std_src().join(module);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("`{}` is unreadable: {error}", path.display()));
+            let declared = source.lines().any(|line| {
+                let line = line.trim_start();
+                let line = line.strip_prefix("export ").unwrap_or(line);
+                line.strip_prefix("macro fun ")
+                    .and_then(|rest| rest.strip_prefix(*name))
+                    .is_some_and(|rest| rest.starts_with('('))
+            });
+            if !declared {
+                missing.push(format!("`{name}` in `std/src/{module}`"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "`STD_DERIVE_MACROS` names {} derive(s) std declares no `macro fun` for: {}. \
+             The table is what the refusal PRINTS as the derivable set, so a row std \
+             does not back offers a name that expands to nothing — which is B376.",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+
+    /// The inverse: a derive-shaped `macro fun` anywhere in std that the table
+    /// does not list. Without this the table could go stale by OMISSION — a
+    /// derive std grows and nothing offers it, refused by name as though it had
+    /// never existed, with the refusal's own list of what IS derivable leaving
+    /// it out.
+    ///
+    /// The walk is over the WHOLE of `std/src`, deliberately, and not over the
+    /// modules the table names: deriving the search set from the table is how
+    /// an omission hides, since dropping a row drops its module from the scan
+    /// with it. (Measured: it does — the first draft of this test passed with
+    /// `Hashable` deleted from the table.)
+    ///
+    /// `[service]` is the one exemption and it is spelled by name: it is an
+    /// attribute macro of the same shape, dispatched by `Node::Service` and
+    /// not by `Node::Derive`, so it is not a derive and must not be offered as
+    /// one.
+    #[test]
+    fn every_derive_shaped_macro_in_std_is_in_the_table() {
+        /// An `Item`-shaped `macro fun` that is deliberately NOT a derive.
+        const NOT_A_DERIVE: &[&str] = &["service"];
+
+        let mut unlisted: Vec<String> = Vec::new();
+        let mut directories = vec![std_src()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).expect("a readable std directory") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "vl") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("a readable std module");
+                for line in source.lines() {
+                    let line = line.trim_start();
+                    let line = line.strip_prefix("export ").unwrap_or(line);
+                    let Some(rest) = line.strip_prefix("macro fun ") else {
+                        continue;
+                    };
+                    let Some((name, signature)) = rest.split_once('(') else {
+                        continue;
+                    };
+                    // A derive macro is the one shape `[derive(..)]` dispatches
+                    // to: a single `Item` parameter. `struct_json_impls(target:
+                    // StructItem)` and its three siblings are ordinary macros
+                    // json.vl exports for its own derives to call.
+                    if !signature.starts_with("item: Item)") {
+                        continue;
+                    }
+                    if NOT_A_DERIVE.contains(&name) {
+                        continue;
+                    }
+                    if !STD_DERIVE_MACROS.iter().any(|(listed, _)| *listed == name) {
+                        unlisted.push(format!("`{name}` in `{}`", path.display()));
+                    }
+                }
+            }
+        }
+        unlisted.sort();
+        assert!(
+            unlisted.is_empty(),
+            "std declares {} derive-shaped macro(s) `STD_DERIVE_MACROS` does not list: {}. \
+             An unlisted derive is refused by name as though std had never declared it, \
+             and the refusal's own list of what IS derivable leaves it out.",
+            unlisted.len(),
+            unlisted.join(", ")
+        );
+    }
 }

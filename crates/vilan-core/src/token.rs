@@ -17,6 +17,12 @@ pub enum Token<'src> {
     External,
     For,
     Fun,
+    // `#` — the import REACH marker (B318 §2.3): `import a::{ #hidden };`
+    // deliberately imports an item its module does not export. It lexes
+    // unconditionally, like every other token: a `#` inside a `css` block is
+    // refused by the block's own parser, which is the only place that knows it
+    // is a colour (`lexical.md` §2.5 — lexing is context-free).
+    Hash,
     Ident(&'src str),
     If,
     Impl,
@@ -24,6 +30,12 @@ pub enum Token<'src> {
     In,
     Is,
     Jump,
+    // `lazy` — defer to first demand (proposal/lazy.md). A HARD keyword in two
+    // positions: the parameter modifier `fun expect(self, lazy message: str)`
+    // (§1) and the module binding `lazy let database: Database = …;` (§2). One
+    // semantic in both — evaluate at first demand, at most once, memoize — and
+    // one lowering (the memo cell + `__force`, §5).
+    Lazy,
     Let,
     Macro,
     Match,
@@ -39,10 +51,6 @@ pub enum Token<'src> {
     Own,
     Borrows,
     Ret,
-    // `resource` — the owned-resource declaration modifier (destruction.md §3),
-    // in `external`'s position: `resource struct`, `resource external struct`,
-    // `resource enum`.
-    Resource,
     String(&'src str),
     // A triple-quoted string's raw inner text (between the `\"\"\"` delimiters),
     // trimmed by `util::trim_multiline_string` past the parser.
@@ -52,6 +60,11 @@ pub enum Token<'src> {
     Type,
     Use,
     With,
+    // `dyn Trait` — the TRAIT OBJECT marker in type position (A124 R3,
+    // trait-objects.md §7.2's explicit spelling). A keyword rather than a
+    // contextual marker because the explicitness is the point: `dyn` must be
+    // impossible to write by accident and impossible to miss when reading.
+    Dyn,
 }
 
 impl std::fmt::Display for Token<'_> {
@@ -68,6 +81,7 @@ impl std::fmt::Display for Token<'_> {
             Token::External => write!(f, "external"),
             Token::For => write!(f, "for"),
             Token::Fun => write!(f, "fun"),
+            Token::Hash => write!(f, "#"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::If => write!(f, "if"),
             Token::Impl => write!(f, "impl"),
@@ -75,6 +89,7 @@ impl std::fmt::Display for Token<'_> {
             Token::In => write!(f, "in"),
             Token::Is => write!(f, "is"),
             Token::Jump => write!(f, "jump"),
+            Token::Lazy => write!(f, "lazy"),
             Token::Let => write!(f, "let"),
             Token::Macro => write!(f, "macro"),
             Token::Match => write!(f, "match"),
@@ -95,7 +110,6 @@ impl std::fmt::Display for Token<'_> {
             Token::Own => write!(f, "own"),
             Token::Borrows => write!(f, "borrows"),
             Token::Ret => write!(f, "ret"),
-            Token::Resource => write!(f, "resource"),
             Token::String(s) => write!(f, "{s}"),
             Token::MultilineString(s) => write!(f, "\"\"\"{s}\"\"\""),
             Token::Struct => write!(f, "struct"),
@@ -103,6 +117,7 @@ impl std::fmt::Display for Token<'_> {
             Token::Type => write!(f, "type"),
             Token::Use => write!(f, "use"),
             Token::With => write!(f, "with"),
+            Token::Dyn => write!(f, "dyn"),
         }
     }
 }

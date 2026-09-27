@@ -43,7 +43,7 @@ signal.update(mutate: sync |&mut T| void) // mutate in place + notify once
 ```
 
 Two names, one idea. **`Signal<T>` is a trait** — the writable half of the
-reactive contract, `set` and `notify` over `Source`'s `get` and `sub` — and
+reactive contract, `set` and `notify` over `Source`'s `get` and `on_change` — and
 **`SignalCell<T>` is the canonical type that implements it**, the cell
 `Signal::new` hands back. Day to day you write `Signal::new(0)` and never
 think about it. The split matters in two places: when a *component* wants to
@@ -107,9 +107,14 @@ feature.)
 
 ## Derived state: `map`, `combine`, `flatten`
 
-Build state as a graph and let it recompute itself:
+Build state as a graph and let it compute itself. Every combinator below
+returns a **node** — a description of a value, holding the source it reads and
+what it does to it, and nothing else. A node computes when it is READ: `get()`
+pulls through the chain, and a subscriber is told "something changed" and pulls
+too. Building one registers nothing and runs nothing.
 
-- `signal.map(transform)` gives a signal of the transformed value:
+- `signal.map(transform)` gives a source of the transformed value, computed
+  when it is read:
 
   ```vilan
   import std::reactive::{ Signal, SignalCell };
@@ -121,10 +126,14 @@ Build state as a graph and let it recompute itself:
   	print(doubled.get());
   }
   ```
-- `combine((a, b, …))` gives a signal of the tuple of several
-  signals' values. It fires when any of them changes. Takes two or more.
-- `nested.flatten()` on a `SignalCell<SignalCell<U>>` follows whichever inner
-  signal is current, and detaches from a replaced one.
+- `combine((a, b, …))` gives a source of the tuple of several sources'
+  values — cells, nodes and mirrors mixed freely. It fires when any of
+  them changes. Takes two or more.
+- `nested.flatten()` on **any source whose element is a source** follows
+  whichever inner signal is current, and detaches from a replaced one — a
+  `SignalCell<SignalCell<U>>`, a `map` result that picks between signals, a
+  mirror. An outer of `Option<inner>` joins too: `None` gives `None` and
+  detaches, `Some(inner)` follows that inner.
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, combine };
@@ -145,6 +154,154 @@ fun main() {
 A named function can stand in for the closure (`signal.map(parse)`).
 See [functions & closures](../tour/functions-and-closures.md).
 
+A dependency is **static** when the expression fixes what the result reads —
+that is `map` and `combine` — and **dynamic** when the current value decides
+*which* source to follow next, which is what "the selected channel's unread
+count" needs. `flatten` is the primitive underneath the dynamic half; two
+combinators are its everyday spelling, and each is one node rather than a
+chain:
+
+- `source.switch(select)` follows whichever source `select` answers for the
+  current value and re-follows when this one changes — Rx's `switchMap`. It
+  means `source.map(select).flatten()`.
+- `source.and_then(select)` is the same on a `Source<Option<T>>`, the total
+  encoding of a signal that may hold nothing yet: `None` on the outer is
+  `None` on the result, `Some(value)` follows the `Source<Option<U>>` that
+  `select` answers, and the two absences collapse into one. It is
+  `Option::and_then` one level up, and it replaces the
+  `map(|x| x.map(f)).flatten().map(|x| x.flatten())` a model layer of
+  optional cells otherwise writes by hand.
+
+```vilan
+import std::reactive::{ Signal, SignalCell };
+
+fun main() {
+	let which = Signal::new(0);
+	let first = Signal::new(10);
+	let second = Signal::new(20);
+	let picked = which.switch(|n: i32| if n == 0 { first } else { second });
+	print(picked.get());     // 10
+	first.set(11);
+	print(picked.get());     // 11 — the current inner drives the result
+	which.set(1);
+	print(picked.get());     // 20 — the switch follows the new inner
+	first.set(99);
+	print(picked.get());     // 20 — and detaches from the replaced one
+}
+```
+
+Both are nodes, like `map`, with one difference: subscribed, they keep a
+registration of their own on whichever inner is current, and re-wire it at
+every switch. The handle the subscriber holds owns that registration, so an
+effect made inside a boundary releases the outer and the live inner together
+when the boundary goes.
+
+### Where a derivation lives: `.cell()` and `dyn Source<T>`
+
+A derivation is a *description* of a value: the source it reads and what it does
+to it. It does not have to be stored anywhere. Read it with `get()` and it pulls
+through its chain; subscribe to it and it tells you when the source changed, and
+you pull. A chain nobody reads costs nothing, and a chain one reader reads costs
+one evaluation per change. Three rules cover where one should live:
+
+- **A chain is cold.** Leave a derivation with one reader as it is — no cell, no
+  cache, nothing to keep in step.
+- **`.cell()` where you share it or read it hot.** Two readers of a cold chain
+  each evaluate it; below a `.cell()` the chain above runs once and the readers
+  share the cached value. A `get()` in a loop pulls the whole chain every time;
+  after a `.cell()` it is one read. `.cell()` is a source again, so a chain can
+  go on through it, and it can sit anywhere in one — after the expensive part,
+  not at every step.
+- **`dyn Source<T>` where you store it.** A struct field names a type, and two
+  derivations built differently are two types. A field of type `dyn Source<T>`
+  holds any of them — a cell, a derivation, a mirror — and a list of such structs
+  mixes them freely.
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+struct Label {
+	text: dyn Source<str>,
+}
+
+fun main() {
+	let count = Signal::new(2);
+	let total = count.map(|n: i32| n * 100).cell();   // shared below: cache it
+	let labels: List<Label> = [
+		Label { text = Signal::new("fixed") },
+		Label { text = total.map(|cents: i32| i"{cents} cents") },
+	];
+	count.set(3);
+	for label in labels {
+		print(label.text.get());
+	}
+	print(total.get());
+}
+```
+
+`.cell()` does not compare: every change above it is a write, and a write always
+notifies. When an unchanged value should stay quiet, `.distinct()` is the node
+that compares (it asks `T: PartialEq`, and nothing else in the chain does).
+
+**What a node's type is, and where you write it.** `map` answers a
+`Map<S, T, U>`, `switch` and the total `flatten` a `Switch`, the `Option`
+`flatten` a `FlattenOption`, `and_then` an `AndThen`, `combine` a `Combine` —
+types you rarely spell. Leave a binding unannotated, take a parameter as a
+`Source<T>` bound (any node satisfies it), store one as `dyn Source<T>`, or
+`.cell()` it where a `SignalCell<T>` is what you mean. An annotation of
+`SignalCell<U>` on a `map` is the one spelling that no longer fits, and so is
+handing a node to a `Signal<T>` parameter, which is the WRITABLE half — a node
+cannot be written to; a `.cell()` of it can (and the next change overwrites
+what you wrote).
+
+**At module level, `.cell_global()`.** A `.cell()` ties its registration to the
+ambient owner, and a module binding's initializer has none, so there the
+compiler refuses `.cell()` and steers you to build it under the owner that reads
+it — or to write `.cell_global()`, which says the cell lives for the program:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+let path: SignalCell<str> = Signal::new("/docs/intro");
+let is_deep = path.map(|value: str| value.len() > 5);            // a node: fine anywhere
+let segments: SignalCell<usize> = path.map(|value: str| value.len()).cell_global();
+
+fun main() {
+	print(is_deep.get());
+	path.set("/");
+	print(segments.get());
+}
+```
+
+### Selection over a list: `selector`
+
+`map` is the wrong tool for one particular shape — "is *this* row the
+selected one?", asked once per row. A derivation per row means every row
+recomputes on every change: `n` notifications to move a highlight one
+row. `selector(source)` keeps one subscription and a cell per key, so a
+change writes exactly two of them — the key that left and the key that
+arrived.
+
+```vilan
+import std::reactive::{ Signal, SignalCell, selector };
+
+fun main() {
+	let current: SignalCell<i32> = Signal::new(1);
+	let selected = selector(current);
+	let first = selected.of(1);
+	let second = selected.of(2);
+	print(i"{first.get()} {second.get()}");   // true false
+	current.set(2);
+	print(i"{first.get()} {second.get()}");   // false true
+}
+```
+
+`selected.of(id)` hands back a `SignalCell<bool>` that drops into
+`.show`, `.when`, `.bind_class` or `.bind_styled`. Call it inside a
+`each` row and the key's entry is released when the row is — the
+map stays the size of the live list. Full reference:
+[`std::reactive`](../std/reactive.md#selector--per-key-selection).
+
 ## Reacting: `effect` and `sub`
 
 Two ways to run code on change. **Use `effect` by default.**
@@ -159,6 +316,27 @@ Two ways to run code on change. **Use `effect` by default.**
   (On a service mirror, `sub` is also **counted**: the first watcher
   opens the channel and disposing the last one closes it — see
   [Services: reading a mirror](services.md#reading-a-mirror).)
+- `signal.on_change(observer)` and `signal.effect_on_change(observer)`
+  are the same two, **without the immediate first call**. The eager pair
+  is what a UI wants — that first call is the initial paint — so reach
+  for these only when the current value is already accounted for: an
+  effect that must not fire on the state the program starts in (a
+  "you have unsaved changes" prompt, an analytics ping), or a derivation
+  that seeded its own first value.
+
+```vilan
+import std::reactive::{ Disposable, Signal, SignalCell, comp };
+
+fun main() {
+	let title: SignalCell<str> = Signal::new("untitled");
+	let (_built, scope) = comp(|| {
+		// Silent now; one line per rename after this.
+		title.effect_on_change(|value| print(i"renamed to {value}"));
+	});
+	title.set("plans");        // renamed to plans
+	scope.dispose();
+}
+```
 
 ## Ownership: who cleans up
 
@@ -179,6 +357,8 @@ For tests, or when you're building your own machinery:
   into it.
 - `get_owner()` reads the ambient owner, e.g. to attach custom cleanup
   with `owner.defer(…)`.
+- `on_cleanup(|| …)` is that last line without naming the owner — the
+  spelling to reach for.
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
@@ -194,6 +374,76 @@ fun main() {
 	source.set(2); // not printed: the effect died with its owner
 }
 ```
+
+### Who cleans up what
+
+Five rules, and they are the whole answer:
+
+| What you wrote | Who releases the observer | When |
+|---|---|---|
+| `signal.effect(..)` / `effect_on_change(..)` | the ambient owner (required, *statically*) | the boundary is disposed |
+| `signal.sub(..)` / `on_change(..)` / `observe(..)` | **nobody** — you hold the `Subscription` | you call `dispose()`, or the owner you gave it to is disposed |
+| `map` / `combine` / `flatten` / `switch` / `and_then` | nothing to release — a node registers nothing until a leaf subscribes | — |
+| `.cell()` / `selector` **inside** a boundary | the ambient owner | the boundary is disposed |
+| `.cell()` / `selector` **outside** every boundary (a function body), `.cell_global()` anywhere | nobody — it lives as long as its source | never (deliberate: see below) |
+| `signal.scoped_effect(..)`, and anything its body registers | that **run's** owner | before the next run, and with the boundary |
+
+Two of those rows are worth a sentence.
+
+**Dropping a `Subscription` does not unsubscribe it.** There are no
+destructors here, so a handle you forget about keeps firing. Hold it and
+`dispose()` it, hand it to an owner (`owner.take(..)`), or use `effect`,
+which does that for you — and `effect` is the one to reach for.
+
+**A cached derivation made outside every boundary lives as long as its
+source, on purpose.** `current_path().map(parse)` at the top of `main` is a
+node and costs nothing until something reads it; a `.cell()` of it there is
+meant to last as long as the program. Refusing that would be the stricter rule
+and would break the idiom, so vilan does not — except in a module binding's
+initializer, where the lifetime is spelled `.cell_global()`. Inside a boundary
+a `.cell()` dies with the boundary, which is what a component wants. A
+*mirror* is where the owner is asked strictly: an `effect` on a
+`RemoteSource` (or on a node over one) requires an owner, because its
+subscription costs a network frame.
+
+A disposed owner is **single-use**: a `take` or `defer` that arrives
+after it was disposed runs the cleanup on the spot rather than parking
+it on a list nothing will read again. That is what makes ownership hold
+across `await`.
+
+### An owner per run: `scoped_effect`
+
+An effect's body normally runs under the *boundary's* owner, so whatever
+it registers accumulates: one subscription, timer or lease per change,
+released all together when the boundary goes. That is right for a body
+that reads and writes, and wrong for a body that *opens* something.
+
+`scoped_effect` gives every run its own owner:
+
+```vilan
+import std::reactive::{ Owner, Signal, Source, on_cleanup, run_with_owner };
+
+fun main() {
+	let selected = Signal::new(1);
+	let detail = Signal::new("loading");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		selected.scoped_effect(|id: i32| {
+			on_cleanup(|| print(i"closing {id}"));
+			// One subscription on `detail` at a time, not one per selection.
+			detail.effect(|text: str| print(i"{id}: {text}"));
+		});
+	});
+	selected.set(2);   // closing 1 — then the new run subscribes
+	page.dispose();    // closing 2
+}
+```
+
+Everything the body registered is released **before the next run**, and
+the last run is released with the boundary. `on_cleanup` is one name
+whose meaning the ambient owner decides: inside a `scoped_effect` it is
+per run, inside any other boundary it is once, at teardown.
+`scoped_effect_on_change` is the same without the immediate first run.
 
 Creating reactive state *outside* any owner is a compile error. That
 sounds strict, but it's the property that makes leaks impossible by
@@ -412,7 +662,9 @@ not enough for the usual case: a button that should grey out while its
 write is in flight, and a banner that should say why it failed.
 
 `Optimistic::over(signal)` wraps the signal you already have — no binding
-changes — and adds a `state` signal to bind:
+changes — and adds a `state` signal to bind. Any `Signal<T>` fits, your own
+implementations included; the cell's type carries the signal's
+(`Optimistic<T, S>`), and inference fills both in from the call:
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Optimistic, WriteState };
@@ -460,10 +712,82 @@ catches the cell mid-transition.
 
 ## Keyed reconciliation
 
-`reconcile(old_keys, old_items, new_items, key)` computes a minimal
-update plan for keyed lists (keep this row, refresh that one, these are
-gone). It's the pure engine underneath `ui`'s `bind_each`. You'd only
-call it directly to build your own list-rendering primitive.
+`reconcile(old_keys, old_items, new_items, key, same)` computes a
+minimal update plan for keyed lists (keep this row, refresh that one,
+these are gone). It's the pure engine underneath `ui`'s `each`.
+You'd only call it directly to build your own list-rendering primitive.
+`key` decides identity — whether a row survives and moves — and `same`
+decides, for a surviving key, whether the row is reused or rebuilt;
+they're two questions, so they're two arguments.
+
+The key is `PartialEq + Hashable`. The plan is found through a hash index
+built over the old keys, so a key's hash must agree with its equality —
+`a == b` implies `a.hash() == b.hash()`, which is what `std::hash` already
+asks of a hand-written impl. Two keys that are *not* equal may share a
+hash; that is an ordinary collision and costs a step along the chain. It
+is the other direction — an equality coarser than the hash — that would
+hide a moved row, and the bound is there so it cannot be written.
+
+## Lists that know what changed: `ListCell` and `map_each`
+
+A derived list over a `SignalCell<List<T>>` re-runs its function for
+**every** element when one changes, because a `set` says only "the list is
+this now":
+
+```vilan,fragment
+let rows: SignalCell<List<str>> = Signal::new([]);
+let lengths = rows.map(|list: List<str>| list.map(|text: str| text.len()));
+// N calls of the inner function on every push
+```
+
+`ListCell<T>` is the same list with its writes recorded as *changes*, so a
+derivation can run once for the element that arrived:
+
+```vilan
+import std::reactive::{ ListCell, SequenceCell, map_each };
+
+fun main() {
+	let rows: ListCell<str> = ListCell<str>::new();
+	let lengths = map_each(rows, |text: str| text.len());
+	rows.push("hello");     // ONE call
+	rows.remove_at(0);      // none
+	print(lengths.get().len());
+}
+```
+
+It is an ordinary `Source<List<T>>` besides — `each`, `map`, `effect` all
+take it — and nothing that ignores the changes pays for them. `each`,
+`each_values` and `each_by` use them: a push into a 1,000-row `ListCell`
+builds one row, where the same push into a `SignalCell<List<T>>` re-reads
+every key to find it.
+
+Its mutators are `push`, `prepend`, `insert_at`, `insert_all`,
+`remove_at`, `remove_range`, `pop`, `extend`, `clear`, `set_all`,
+`truncate` and `is_empty`, and every one of them is a default over a
+single `splice`, which is why none of them can forget to record what it
+did. `edit` batches: hand it a body, make as many mutations as you like,
+and the cell publishes once with one change per mutation.
+
+```vilan
+import std::reactive::{ ListCell, Sequence };
+
+fun main() {
+	let rows: ListCell<str> = ListCell<str>::new();
+	rows.edit(|&mut list| {
+		list.push("a");
+		list.push("b");
+		list.remove_at(0);
+	});   // one notification, three changes
+	print(rows.get().len());
+}
+```
+
+Two things cost more, and say so: `set(whole_list)` records "the list
+became this", which is every element again, and `reconcile_to(whole_list)`
+diffs the ends and records only the span that moved — reach for it when a
+whole list arrives from somewhere (a fetch, a form) and you want the
+derivations to stay cheap. A `g` handed to `map_each` must be pure in its
+element: its result is kept, and nothing re-runs it.
 
 ## Traps
 
@@ -471,8 +795,11 @@ call it directly to build your own list-rendering primitive.
   and let the owner handle it.
 - Disposal stops *future* deliveries. A watcher already queued in the
   currently-settling turn may fire one final time.
-- Derived signals (`map`/`combine`/`flatten`) take the ambient owner when
-  there is one, so a derivation built inside a view dies with the view.
-  Built where no owner is ambient — module level, the top of `main` — it
-  lives as long as its source, which is what a module-level
-  `current_path().map(parse)` is for. Either way you never hold a handle.
+- Derivations (`map`/`combine`/`flatten`/`switch`/`and_then`) are nodes:
+  they register nothing, so there is nothing to dispose. A `.cell()` takes
+  the ambient owner when there is one, so one built inside a view dies with
+  the view; built at the top of `main` it lives as long as its source, and
+  at module level it is spelled `.cell_global()`. Either way you never hold
+  a handle.
+- Two readers of one node each evaluate it. When a derivation is expensive
+  or read in several places, `.cell()` it once and share the cell.

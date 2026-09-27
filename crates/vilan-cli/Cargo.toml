@@ -1,6 +1,6 @@
 [package]
 name = "vilan-cli"
-version = "0.40.0"
+version = "0.41.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The vilan language toolchain"
@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 vilan-core = { path = "../vilan-core" }
-vilan-embedded-std = { path = "../vilan-embedded-std" }
+vilan-ide = { path = "../vilan-ide" }
+vilan-rust = { path = "../vilan-rust" }
+vilan-embedded = { path = "../vilan-embedded" }
 ariadne = "0.6.0"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.5.2"

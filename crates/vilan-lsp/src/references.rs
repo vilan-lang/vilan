@@ -34,11 +34,52 @@
 //!    that cannot be narrowed is dropped rather than emitted wrong, and the drop
 //!    is *counted*, so an incomplete answer can be refused instead of silently
 //!    returned.
-//! 2. **No two rows share a span.** The analyzer records some references more
-//!    than once (a struct's constructor name lands in both `type_references` and
-//!    `struct_initializer_to_def`; a match pattern's segments are re-recorded on
-//!    every type-check pass), so the table is deduplicated at build time. This
-//!    is what makes a rename's edit set applicable.
+//!
+//!    It held with ONE exception until E145: an `as` alias was a second
+//!    spelling of its target, so an alias row's text was not its definition's
+//!    name. The exception was also a defect — an alias of a different LENGTH
+//!    from its target could not be narrowed at all, so every use of it was
+//!    dropped and the symbol vanished from the editor. An alias is a
+//!    definition of its own now (`Program::import_aliases`), and the invariant
+//!    has no LICENSED exception left.
+//!
+//!    It had two BREACHES, E158's find, and they are closed (B314). The
+//!    invariant's pin used to check only the entry file's rows, because the
+//!    entry's text was the only one it had in hand; it reads every loaded
+//!    module now, and over std's closure that turned up two texts that were
+//!    not their definition's name — `pkg` recorded against the package root
+//!    module, and `Self` recorded against its trait. Both are KEYWORDS, both
+//!    survived `narrow`'s exact check by being the same LENGTH as the name
+//!    they were attributed to (`pkg`/`std`, `Self`/`Wire`), and both would
+//!    have been rewritten by a rename. The fix is at the analyzer's recording
+//!    sites rather than here — this index has no source text at build time and
+//!    deliberately pays for none, so it cannot tell a keyword from an
+//!    identifier: `resolve_import` records nothing for a `pkg` origin segment,
+//!    and the written-type drain files a `Self` mention under no definition at
+//!    all (its type LABEL survives, so hover is unchanged). The invariant now
+//!    holds with NO exception and no enumeration beside it.
+//! 2. **No two rows share a span IN A FILE.** The analyzer records some
+//!    references more than once (a struct's constructor name lands in both
+//!    `type_references` and `struct_initializer_to_def`; a match pattern's
+//!    segments are re-recorded on every type-check pass), so the table is
+//!    deduplicated at build time. This is what makes a rename's edit set
+//!    applicable — and it is why the invariant stops at the file boundary.
+//!    Derive-generated rows index a TEMPLATE, and two expansions of one
+//!    template legitimately claim the same offsets (E144); no rename may touch
+//!    a generated span in the first place, so those rows are kept apart by
+//!    their definitions rather than collapsed onto one another.
+//!
+//!    One shape genuinely writes two DIFFERENT definitions at one span, and it
+//!    is not a duplicate to discard: the struct-init field shorthand
+//!    `A { x }`, whose single identifier is both the field key and a read of
+//!    the local `x` (E134). Dropping either half is a real loss — the local's
+//!    only surviving row became its declaration, so find-references missed the
+//!    use and the unused-local third faded a binding that is read. Such a row
+//!    carries the second definition as a CO-REFERENCE
+//!    ([`Occurrence::co_definition`]) instead: `occurrences_of` answers for
+//!    both names, [`ReferenceIndex::at`] still returns one row, and rename
+//!    REFUSES at the span, because a shorthand has no room to spell two names
+//!    and rewriting it would serve one of them.
 //!
 //! One table per PROGRAM, though — and a program reaches only its own import
 //! closure, the files below its entry. So a symbol queried in the file that
@@ -57,7 +98,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use vilan_core::Span;
-use vilan_core::analyzer::{Expr, Program, SourceId};
+use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Program, SourceId};
 use vilan_core::id::Id;
 
 /// A definition that identifiers can name.
@@ -107,10 +148,38 @@ pub struct DefinitionKey {
 }
 
 impl DefinitionKey {
+    /// The key of a declaration named directly: the declaring file, the
+    /// declaration name's span in it, and the name.
+    ///
+    /// M63's seam. A document whose `Program` was released still holds its
+    /// reference index and, beside it, the two facts [`key_of`] reads off a
+    /// program — the source list and the declaration names — so it can mint
+    /// the same key; this is the constructor it mints it with
+    /// (`Document::released_key_of`). Every other caller goes through
+    /// [`key_of`], which is the only one that can DERIVE the three parts.
+    ///
+    /// [`key_of`]: ReferenceIndex::key_of
+    pub fn new(path: PathBuf, span: Span, name: String) -> DefinitionKey {
+        DefinitionKey { path, span, name }
+    }
+
     /// The canonical path of the declaring file — what
     /// [`crate::document::Document::depends_on`] scopes the union by.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The declaration name's span in [`path`](DefinitionKey::path) — the
+    /// address half of the key, and what a resolution filters on first.
+    pub fn span(&self) -> Span {
+        self.span
+    }
+
+    /// The declared name — the consistency half: a program that read a
+    /// different text of [`path`](DefinitionKey::path) fails this and refuses
+    /// to match rather than linking two symbols that share an address.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -126,6 +195,9 @@ pub enum DefinitionKind {
     Variant,
     Trait,
     Module,
+    /// An `as` alias — a name the importing file declares for something
+    /// declared elsewhere (E145).
+    Alias,
 }
 
 impl DefinitionKind {
@@ -140,6 +212,7 @@ impl DefinitionKind {
             DefinitionKind::Variant => "enum variant",
             DefinitionKind::Trait => "trait",
             DefinitionKind::Module => "module",
+            DefinitionKind::Alias => "import alias",
         }
     }
 }
@@ -152,7 +225,44 @@ pub struct Occurrence {
     pub span: Span,
     pub definition: Definition,
     /// Whether this occurrence is the definition's own declaration name.
+    ///
+    /// Always about [`Occurrence::definition`], never about
+    /// [`Occurrence::co_definition`] — a co-referenced definition's own
+    /// declaration is a row elsewhere. Ask [`Occurrence::is_declaration_of`]
+    /// when the definition in hand may be either.
     pub is_declaration: bool,
+    /// A SECOND definition this same identifier names (E134).
+    ///
+    /// `Some` for exactly one shape: the struct-init field shorthand
+    /// `A { x }`, whose one identifier is both the field key of `A::x` and a
+    /// read of the local `x`. The analyzer records the field key at the name
+    /// span and synthesizes a local read whose span is the whole entry — for a
+    /// shorthand, the same bytes. Neither is a duplicate of the other, so the
+    /// dedup cannot just drop one, and the two cannot be two rows without
+    /// breaking invariant 2 (and with it every rename's edit set). So one row
+    /// carries both names, and every definition-keyed query sees it.
+    pub co_definition: Option<Definition>,
+}
+
+impl Occurrence {
+    /// Whether this row is `definition`'s own declaration name — the
+    /// [`Occurrence::is_declaration`] question asked safely of a definition
+    /// that may be reaching this row as a co-reference, where the flag belongs
+    /// to the OTHER name.
+    pub fn is_declaration_of(&self, definition: Definition) -> bool {
+        self.is_declaration && self.definition == definition
+    }
+
+    /// The other name this row carries, seen from `definition` — `None` when
+    /// this row names only `definition`.
+    pub fn shared_with(&self, definition: Definition) -> Option<Definition> {
+        let other = self.co_definition?;
+        if other == definition {
+            Some(self.definition)
+        } else {
+            Some(other)
+        }
+    }
 }
 
 /// Where in a recorded span the identifier sits.
@@ -204,6 +314,30 @@ fn narrow(span: Span, name: &str, anchor: Anchor) -> Option<Span> {
     })
 }
 
+/// Whether two definitions claiming one span are the two halves of a
+/// struct-init field shorthand `A { x }` (E134) — a field, and a binding that
+/// the shorthand reads under the same name.
+///
+/// It is a SHAPE test, not a guess: nothing else in the language puts a field
+/// key and a value read at identical bytes. `A { x = 1 }` records the key at
+/// `x` and the value elsewhere; `a.x` records only the field. Invariant 1 has
+/// already proved both spans spell their definition's name, so the two names
+/// being equal is the last thing left to check, and derive-generated code —
+/// where unrelated definitions collide on shared template offsets — is
+/// excluded outright, since a template's bytes are nobody's identifier.
+fn is_field_shorthand(program: &Program, left: Definition, right: Definition) -> bool {
+    let (field, entity) = match (left, right) {
+        (Definition::Field(..), Definition::Entity(id)) => (left, id),
+        (Definition::Entity(id), Definition::Field(..)) => (right, id),
+        _ => return false,
+    };
+    matches!(
+        kind_of(program, Definition::Entity(entity)),
+        Some(DefinitionKind::Binding)
+    ) && name_of(program, field).is_some()
+        && name_of(program, field) == name_of(program, Definition::Entity(entity))
+}
+
 /// The reference index for one analyzed program.
 #[derive(Default)]
 pub struct ReferenceIndex {
@@ -224,6 +358,30 @@ impl ReferenceIndex {
     pub fn build(program: &Program) -> Self {
         let mut rows: Vec<Occurrence> = Vec::new();
         let mut dropped: HashMap<Definition, usize> = HashMap::new();
+        // M27: `source_of` is a linear scan of the program's source ranges,
+        // and this build asks it once per declaration and once per use — on
+        // kolt's client that is tens of thousands of questions against ~60
+        // ranges, inside a table the editor rebuilds on every landed
+        // keystroke. The lookup is hoisted once and answers the identical
+        // question.
+        let source_of = program.source_lookup();
+        // B264: an alias row whose recorded span is ANCHORED rather than exact.
+        // `import_alias_spans` is keyed by the span the analyzer recorded, and a
+        // struct-literal head (`Spot { x = 1 }`) is recorded as the WHOLE
+        // initializer with the name at its start — so the exact-key lookup below
+        // misses it, `narrow` then takes the TARGET's name length from the
+        // start, and `Spot { … }` under `Point` came out as the five bytes
+        // `Spot ` : a row whose text is not its definition's name (INVARIANT 1,
+        // the exception E145 removed) and, worse, an edit a rename of `Point`
+        // applies, rewriting the alias's use into `zzz{ x = 1 }`. These two
+        // indexes let an anchored span ask the same question the exact one
+        // does: is the identifier at this END of the span an alias's name?
+        let mut alias_at_start: HashMap<(SourceId, usize), Id> = HashMap::new();
+        let mut alias_at_end: HashMap<(SourceId, usize), Id> = HashMap::new();
+        for ((source, span), alias_id) in &program.import_alias_spans {
+            alias_at_start.insert((*source, span.start), *alias_id);
+            alias_at_end.insert((*source, span.end), *alias_id);
+        }
 
         let push = |rows: &mut Vec<Occurrence>,
                     dropped: &mut HashMap<Definition, usize>,
@@ -240,27 +398,90 @@ impl ReferenceIndex {
                 *dropped.entry(definition).or_default() += 1;
                 return;
             };
+            // E145: this identifier may SPELL an `as` alias rather than the
+            // definition the scope bound it to. The alias is a declaration of
+            // its own, so the row names the alias — and it is narrowed against
+            // the ALIAS's name, which is the half that was silently fatal:
+            // `import pkg::helper::greet as hi` narrowed each `hi()` against
+            // `greet`, the lengths disagreed, and both uses were dropped, so
+            // find-references answered nothing and rename answered "there is
+            // no symbol to rename here". An alias whose name happened to be
+            // the same length survived — spelling its target's name back at
+            // INVARIANT 1, which is the exception this removes.
+            //
+            // An ANCHORED span (B264) asks the same question at the END the
+            // name sits at, and answers it only when the alias's target IS the
+            // definition this row claims — a coincidence of offsets can never
+            // relabel an unrelated symbol. The anchor is KEPT there: the row's
+            // span is the whole initializer, and it is the alias's name length
+            // that narrows it correctly.
+            let exact = program.import_alias_spans.get(&(source, span)).copied();
+            let anchored = match anchor {
+                Anchor::Exact => None,
+                Anchor::Start => alias_at_start.get(&(source, span.start)).copied(),
+                Anchor::End => alias_at_end.get(&(source, span.end)).copied(),
+            }
+            .filter(|alias_id| {
+                program
+                    .import_aliases
+                    .get(alias_id)
+                    .is_some_and(|alias| Definition::Entity(alias.target) == definition)
+            });
+            // An exact hit narrows to the alias's own span; an anchored one
+            // keeps the row's anchor and narrows by the alias's name.
+            let (name, anchor, definition) = match exact.or(anchored) {
+                Some(alias_id) if Definition::Entity(alias_id) != definition => {
+                    match program.import_aliases.get(&alias_id) {
+                        Some(alias) => {
+                            let anchor = if exact.is_some() {
+                                Anchor::Exact
+                            } else {
+                                anchor
+                            };
+                            (alias.name, anchor, Definition::Entity(alias_id))
+                        }
+                        None => (name, anchor, definition),
+                    }
+                }
+                _ => (name, anchor, definition),
+            };
             match narrow(span, name, anchor) {
                 Some(span) => rows.push(Occurrence {
                     source,
                     span,
                     definition,
                     is_declaration,
+                    co_definition: None,
                 }),
                 None => *dropped.entry(definition).or_default() += 1,
             }
         };
 
         // --- Declarations -------------------------------------------------
+        // An `as` alias declares a name (E145): `import a::b as c` is where `c`
+        // comes from, and `c` renames independently of `b` because it is not a
+        // second spelling of it — it is this file's own name for it.
         // Every declaration span comes from a table that stores a NAME span.
         // `span_map` is consulted only where its entry *is* the name (a
         // parameter), never as a general fallback — falling back to it is what
         // used to put a whole `fun … { … }` declaration into a rename.
+        for (id, alias) in &program.import_aliases {
+            push(
+                &mut rows,
+                &mut dropped,
+                Some(alias.source),
+                Some(alias.name_span),
+                alias.name,
+                Anchor::Exact,
+                Definition::Entity(*id),
+                true,
+            );
+        }
         for (id, variable) in &program.variables {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(variable.name_span),
                 variable.name,
                 Anchor::Exact,
@@ -273,7 +494,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 span_of(program, *id),
                 parameter.name,
                 Anchor::Exact,
@@ -285,7 +506,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(function.name_span),
                 function.name,
                 Anchor::Exact,
@@ -297,7 +518,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(function.name_span),
                 function.name,
                 Anchor::Exact,
@@ -309,7 +530,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(structure.name_span),
                 structure.name,
                 Anchor::Exact,
@@ -320,7 +541,7 @@ impl ReferenceIndex {
                 push(
                     &mut rows,
                     &mut dropped,
-                    program.source_of(*id),
+                    source_of.of(*id),
                     Some(field.name_span),
                     field.name,
                     Anchor::Exact,
@@ -333,7 +554,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(enumeration.name_span),
                 enumeration.name,
                 Anchor::Exact,
@@ -345,7 +566,7 @@ impl ReferenceIndex {
             push(
                 &mut rows,
                 &mut dropped,
-                program.source_of(*id),
+                source_of.of(*id),
                 Some(definition.name_span),
                 definition.name,
                 Anchor::Exact,
@@ -367,7 +588,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         span_of(program, *use_id),
                         name,
                         Anchor::Start,
@@ -399,7 +620,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         Some(span),
                         name,
                         anchor,
@@ -416,7 +637,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         program.member_name_spans.get(use_id).copied(),
                         name,
                         Anchor::Exact,
@@ -443,7 +664,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         Some(*member_span),
                         name,
                         Anchor::Exact,
@@ -465,7 +686,7 @@ impl ReferenceIndex {
                     push(
                         &mut rows,
                         &mut dropped,
-                        program.source_of(*use_id),
+                        source_of.of(*use_id),
                         span_of(program, *use_id),
                         name,
                         Anchor::Start,
@@ -528,25 +749,100 @@ impl ReferenceIndex {
             );
         }
 
-        // --- Deduplicate ---------------------------------------------------
+        // --- Collapse each span to one row ---------------------------------
         // Sort so declarations win the tie for a span recorded by both passes,
-        // then drop every repeat of a `(source, span)`. Without this a struct
-        // rename emits each constructor site twice and the client rejects the
-        // whole edit as overlapping.
+        // then reduce every `(source, span)` group to a single row. Invariant 2
+        // is what makes a rename's edit set applicable: a duplicate span
+        // reaches the client as an overlapping `TextEdit` and it rejects the
+        // whole edit ("Rename failed to apply edits").
+        //
+        // A group has one of three shapes.
+        //
+        //  - The SAME definition recorded twice — a struct's constructor name
+        //    landing in both `type_references` and `struct_initializer_to_def`,
+        //    a match pattern's segments re-recorded per type-check pass, a
+        //    declaration name that is also a `type_references` row. A true
+        //    duplicate: keep one, drop the rest.
+        //  - A FIELD KEY and a LOCAL READ, the struct-init shorthand `A { x }`
+        //    (E134). Two different definitions, one identifier, and both are
+        //    real: dropping either is the defect this arm exists to end. Keep
+        //    one row and give it the other name as a co-reference.
+        //  - DERIVE-GENERATED code, where two expansions of one `[derive(..)]`
+        //    template index the same template offsets: `[derive(PartialEq)]` on
+        //    two three-letter enums generates two `fun eq` declarations that
+        //    both claim `DERIVED_SOURCE` 63..65. Those are unrelated
+        //    definitions that merely share an address in a text NO FILE HOLDS,
+        //    so invariant 2 does not reach them: it is a claim about a span in
+        //    a file, and it exists so a rename's edit set is applicable, which
+        //    a generated span never is (rename refuses on `DERIVED_SOURCE`
+        //    outright). Collapsing them to one row was a real loss (E144): the
+        //    survivor kept ITS definition, so every OTHER expansion's member
+        //    lost its declaration row — `occurrences_of` came back short, and
+        //    rename, which refuses precisely when it sees a `DERIVED_SOURCE`
+        //    span in the set, stopped seeing one. Renaming `Tab`'s derived `eq`
+        //    refused as generated; renaming the next enum's returned a
+        //    one-edit rewrite of the call site alone, leaving the generated
+        //    declaration behind. So generated rows dedup by DEFINITION as well
+        //    as by span — the (template, expansion) key, since a definition
+        //    belongs to exactly one expansion — and never carry a
+        //    co-reference: a template's bytes are nobody's identifier.
         rows.sort_by(|left, right| {
             (left.source.0, left.span.start, left.span.end)
                 .cmp(&(right.source.0, right.span.start, right.span.end))
-                .then(right.is_declaration.cmp(&left.is_declaration))
                 .then(left.definition.sort_key().cmp(&right.definition.sort_key()))
+                .then(right.is_declaration.cmp(&left.is_declaration))
         });
-        rows.dedup_by(|left, right| left.source == right.source && left.span == right.span);
+        let mut collapsed: Vec<Occurrence> = Vec::with_capacity(rows.len());
+        // The index in `collapsed` where the current `(source, span)` group
+        // starts. It is only ever longer than one row for generated code, and
+        // a group's rows are contiguous because the sort put them there.
+        let mut group_start = 0usize;
+        for row in rows {
+            let same_span = collapsed
+                .last()
+                .is_some_and(|kept| kept.source == row.source && kept.span == row.span);
+            if !same_span {
+                group_start = collapsed.len();
+                collapsed.push(row);
+                continue;
+            }
+            if row.source == DERIVED_SOURCE {
+                if !collapsed[group_start..]
+                    .iter()
+                    .any(|kept| kept.definition == row.definition)
+                {
+                    collapsed.push(row);
+                }
+                continue;
+            }
+            let kept = &mut collapsed[group_start];
+            if kept.definition != row.definition
+                && kept.co_definition.is_none()
+                && !kept.is_declaration
+                && !row.is_declaration
+                && is_field_shorthand(program, kept.definition, row.definition)
+            {
+                kept.co_definition = Some(row.definition);
+            }
+        }
+        let rows = collapsed;
 
+        // A co-reference is indexed under BOTH names, which is what makes
+        // `occurrences_of(local)` see the shorthand use — the half the old
+        // dedup destroyed, and the reason the unused-local third faded a
+        // binding the program reads.
         let mut by_definition: HashMap<Definition, Vec<u32>> = HashMap::new();
         for (index, row) in rows.iter().enumerate() {
             by_definition
                 .entry(row.definition)
                 .or_default()
                 .push(index as u32);
+            if let Some(co_definition) = row.co_definition {
+                by_definition
+                    .entry(co_definition)
+                    .or_default()
+                    .push(index as u32);
+            }
         }
 
         ReferenceIndex {
@@ -562,14 +858,45 @@ impl ReferenceIndex {
     /// Because every row is identifier-exact, rows cannot nest, so there is at
     /// most one answer — which is precisely why this replaces the old resolution
     /// ladder rather than being another rung on it.
+    ///
+    /// A caret at the very END of an identifier — `name|`, where the user just
+    /// finished typing the word — is ON that identifier (E133). Every editor's
+    /// hover, go-to-definition and rename assume the convention, and a caret
+    /// there is where a rename is started FROM; the strict half-open
+    /// containment test alone answered `None`, `rename_edits` turned that into
+    /// `NotAnIdentifier`, and `prepare_rename` turned THAT into VS Code's "the
+    /// element can't be renamed" notice. The same `at` backs find-references,
+    /// so `name|` missed there too — only rename made it visible, because
+    /// renaming is the caret-driven one. The fallback cannot be ambiguous: rows
+    /// are identifier-exact and non-nesting, so at most one row ends at
+    /// `offset`, and it is the row immediately before the partition point.
+    /// Strict containment is still tried first, so a caret BETWEEN two adjacent
+    /// identifiers keeps naming the one it is inside.
     pub fn at(&self, source: SourceId, offset: usize) -> Option<&Occurrence> {
         let start = self
             .occurrences
             .partition_point(|row| (row.source.0, row.span.end) <= (source.0, offset));
-        self.occurrences[start..]
+        if let Some(inside) = self.occurrences[start..]
             .iter()
             .take_while(|row| row.source == source && row.span.start <= offset)
             .find(|row| row.span.start <= offset && offset < row.span.end)
+        {
+            return Some(inside);
+        }
+        let previous = self.occurrences.get(start.checked_sub(1)?)?;
+        (previous.source == source && previous.span.end == offset && previous.span.start < offset)
+            .then_some(previous)
+    }
+
+    /// Every DECLARATION row in the index, in `(source, span)` order.
+    ///
+    /// M63: the rows a cross-program [`DefinitionKey`] can address. A document
+    /// whose program was released resolves a key by scanning these — the same
+    /// scan [`definition_of_key`](ReferenceIndex::definition_of_key) does, with
+    /// the name and path read from the released document's own tables — and
+    /// captures their names when it releases.
+    pub fn declarations(&self) -> impl Iterator<Item = &Occurrence> {
+        self.occurrences.iter().filter(|row| row.is_declaration)
     }
 
     /// Every occurrence of `definition`, declaration included, in source order.
@@ -601,7 +928,7 @@ impl ReferenceIndex {
     pub fn key_of(&self, program: &Program, definition: Definition) -> Option<DefinitionKey> {
         let declaration = self
             .occurrences_of(definition)
-            .find(|occurrence| occurrence.is_declaration)?;
+            .find(|occurrence| occurrence.is_declaration_of(definition))?;
         let path = program
             .canonical_sources
             .get(declaration.source.0 as usize)?
@@ -660,6 +987,9 @@ pub fn name_of<'a>(program: &'a Program, definition: Definition) -> Option<&'a s
             .and_then(|structure| structure.fields.get(index))
             .map(|field| field.name),
         Definition::Entity(id) => {
+            if let Some(alias) = program.import_aliases.get(&id) {
+                return Some(alias.name);
+            }
             if let Some(variable) = program.variables.get(&id) {
                 return Some(variable.name);
             }
@@ -697,6 +1027,9 @@ pub fn kind_of(program: &Program, definition: Definition) -> Option<DefinitionKi
     match definition {
         Definition::Field(..) => Some(DefinitionKind::Field),
         Definition::Entity(id) => {
+            if program.import_aliases.contains_key(&id) {
+                return Some(DefinitionKind::Alias);
+            }
             if program.variables.contains_key(&id) || program.parameters.contains_key(&id) {
                 return Some(DefinitionKind::Binding);
             }
@@ -728,6 +1061,12 @@ pub fn kind_of(program: &Program, definition: Definition) -> Option<DefinitionKi
 /// this import reaches into?"
 pub fn declaration_source(program: &Program, definition: Definition) -> Option<SourceId> {
     match definition {
+        // An alias id is minted while the import queue drains, after the file
+        // walks that own the entity ranges, so `source_of` cannot place it —
+        // the alias records its own file (E145).
+        Definition::Entity(id) if program.import_aliases.contains_key(&id) => {
+            program.import_aliases.get(&id).map(|alias| alias.source)
+        }
         Definition::Entity(id) => program.source_of(id),
         Definition::Field(struct_id, _) => program.source_of(struct_id),
     }
@@ -840,21 +1179,211 @@ fun main(): i32 {
         let index = document.reference_index();
         assert!(!index.rows().is_empty(), "the pin needs a populated index");
         let mut checked = 0;
+        // EVERY source, not only the entry (E158). The entry's text was the
+        // only one "on hand" while this read `MATRIX` directly — but every
+        // other module the program loaded is a file on disk, `source_path`
+        // names it, and the rows that come from those files are the ones the
+        // derived-span tables produce most of. Reading them turns a
+        // one-fixture check into a sweep over the whole std closure: ~30k rows
+        // instead of ~70, and every `Anchor::Start` / `Anchor::End` narrowing
+        // in it verified against the bytes it claims.
+        let mut texts: HashMap<SourceId, String> = HashMap::new();
         for row in index.rows() {
-            if row.source != SourceId(0) {
-                continue; // only the entry file's text is on hand here
+            // A derive-generated row indexes a TEMPLATE no file holds (E144),
+            // so there are no bytes to check it against — the same boundary
+            // invariant 2 stops at.
+            if row.source == DERIVED_SOURCE {
+                continue;
             }
+            let text = match texts.get(&row.source) {
+                Some(text) => text,
+                None => {
+                    let Some(path) = program.source_path(row.source) else {
+                        continue;
+                    };
+                    let Ok(read) = std::fs::read_to_string(path) else {
+                        continue;
+                    };
+                    texts.entry(row.source).or_insert(read)
+                }
+            };
             let name = name_of(program, row.definition).expect("a named definition");
-            let text = MATRIX
-                .get(row.span.into_range())
-                .unwrap_or_else(|| panic!("span {:?} is outside the entry text", row.span));
+            let text = text.get(row.span.into_range()).unwrap_or_else(|| {
+                panic!(
+                    "span {:?} is outside {:?}'s text",
+                    row.span,
+                    program.source_path(row.source)
+                )
+            });
             assert_eq!(
                 text, name,
                 "row {row:?} covers {text:?}, which is not the identifier {name:?}",
             );
             checked += 1;
         }
-        assert!(checked > 20, "expected a broad sample, checked {checked}");
+        assert!(
+            checked > 1000,
+            "expected the whole loaded closure, checked {checked}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B314, the first of INVARIANT 1's two closed breaches: a `pkg` ORIGIN
+    /// SEGMENT is not a reference to the package root module.
+    ///
+    /// `resolve_import_root` maps `pkg` to the importing package's own
+    /// namespace, whose name is the PACKAGE's, so the row filed three bytes
+    /// spelling `pkg` against a definition spelled something else. A rename of
+    /// a three-letter package would have rewritten every one of them (the row
+    /// clears `narrow`'s exact length check by coincidence); a package of any
+    /// other length dropped the row instead and made rename refuse. Recording
+    /// nothing is the whole fix, and the segments AFTER the origin are
+    /// untouched — `library` and `Point` still index, so go-to-definition on an
+    /// import path is what it was.
+    #[test]
+    fn a_pkg_origin_segment_is_not_indexed_as_a_reference() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::library::Point;\n\nfun main(): i32 {\n\tlet p = Point { x = 1 };\n\tp.x\n}\n",
+            ),
+            ("library.vl", "struct Point {\n\tx: i32,\n}\n"),
+        ]);
+        let text = std::fs::read_to_string(dir.join("main.vl")).expect("the entry");
+        let index = document.reference_index();
+        let entry_texts: Vec<&str> = index
+            .rows()
+            .iter()
+            .filter(|row| row.source == SourceId(0))
+            .filter_map(|row| text.get(row.span.into_range()))
+            .collect();
+        assert!(
+            !entry_texts.contains(&"pkg"),
+            "the origin keyword is indexed as a reference: {entry_texts:?}"
+        );
+        assert!(
+            entry_texts.contains(&"library"),
+            "the module segment after the origin must still index: {entry_texts:?}"
+        );
+        assert!(
+            entry_texts.contains(&"Point"),
+            "the leaf must still index: {entry_texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B314, the second breach: `Self` is not a reference to the impl subject.
+    ///
+    /// A four-letter trait (`Wire` is std's own, and the row E158 found) shares
+    /// `Self`'s length exactly, so the keyword survived `narrow` and a rename
+    /// of the trait rewrote it into the new name — a broken build from a
+    /// refactor that was supposed to be mechanical. The written-type drain
+    /// files a `Self` mention under NO definition now: find-references over the
+    /// trait omits it, and rename rewrites only the spellings of the name.
+    #[test]
+    fn a_self_keyword_is_not_a_reference_to_the_impl_subject() {
+        const SOURCE: &str = "\
+trait Copy {
+\tfun duplicate(self): Self;
+}
+
+struct Cell {
+\tvalue: i32,
+}
+
+impl Cell with Copy {
+\tfun duplicate(self): Self {
+\t\tCell { value = self.value }
+\t}
+}
+
+fun main(): i32 {
+\tlet cell = Cell { value = 1 };
+\tcell.duplicate().value
+}
+";
+        let (dir, document) = analyze_workspace(&[("main.vl", SOURCE)]);
+        let trait_offset = SOURCE.find("trait Copy").expect("the trait") + "trait ".len();
+        let covered: Vec<&str> = document
+            .references(trait_offset)
+            .into_iter()
+            .filter_map(|(_, span)| SOURCE.get(span.into_range()))
+            .collect();
+        assert!(
+            !covered.is_empty(),
+            "the trait must still have references at all"
+        );
+        assert!(
+            covered.iter().all(|text| *text == "Copy"),
+            "find-references over the trait covers a keyword: {covered:?}"
+        );
+        let edits = document
+            .rename_edits(trait_offset, "Duplicable")
+            .expect("a four-letter trait renames");
+        for (_, span, _) in &edits {
+            assert_eq!(
+                SOURCE.get(span.into_range()),
+                Some("Copy"),
+                "rename rewrites something that is not the trait's name"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The DERIVED-span sweep, by name (E158, the enumeration B264 asked for).
+    ///
+    /// Every row's span comes from a table, and the tables fall into two kinds.
+    /// Most store a span that IS the identifier — a declaration's `name_span`,
+    /// `member_name_spans`, `type_references`, `struct_initializer_field_spans`
+    /// — and those rows are [`Anchor::Exact`]. Three DERIVE their identifier
+    /// from a longer span by arithmetic on a guaranteed syntactic shape, and
+    /// those are where a wrong assumption cannot be caught by a length check:
+    ///
+    ///   1. a payload variant DECLARATION (`Box2(i32, i32)`), whose `span_map`
+    ///      entry covers the payload — [`Anchor::Start`];
+    ///   2. a qualified reference (`Point::origin`, `Shape::Dot`), whose node
+    ///      ends at the member's own end token — [`Anchor::End`];
+    ///   3. a struct-initializer head (`Point { x = 1 }`), whose span is the
+    ///      whole initializer — [`Anchor::Start`].
+    ///
+    /// B264 was (3) getting an alias's bytes and a target's name length. This
+    /// pin is the record that the list is THREE and that each one lands on its
+    /// identifier, so a fourth derived table added later has an obvious place
+    /// to be added and an obvious pin to fail. The bytes themselves are checked
+    /// by [`every_indexed_span_covers_exactly_an_identifier`] above, over the
+    /// whole loaded closure; this one says WHICH SHAPES exist.
+    #[test]
+    fn every_derived_span_shape_lands_on_its_identifier() {
+        let (dir, document) = matrix();
+        let index = document.reference_index();
+        // (text, is_declaration) for the row at the offset `needle` + `delta`.
+        let row_at = |needle: &str, delta: usize| -> (String, bool) {
+            let offset = at(needle, delta);
+            let row = index
+                .at(SourceId(0), offset)
+                .unwrap_or_else(|| panic!("no row at {needle:?} + {delta}"));
+            (
+                MATRIX
+                    .get(row.span.into_range())
+                    .expect("a span inside the entry")
+                    .to_string(),
+                row.is_declaration,
+            )
+        };
+        // 1. The payload variant declaration: the name leads a span that runs
+        //    to the closing paren.
+        assert_eq!(row_at("Box2(i32, i32)", 1), ("Box2".to_string(), true));
+        // 2. The qualified reference: the identifier is the tail of the path,
+        //    and the segment BEFORE it is its own exact row.
+        assert_eq!(row_at("Point::origin()", 8), ("origin".to_string(), false));
+        assert_eq!(row_at("Point::origin()", 1), ("Point".to_string(), false));
+        assert_eq!(row_at("Shape::Dot;", 7), ("Dot".to_string(), false));
+        // 3. The struct-initializer head: the name leads a span that runs to
+        //    the closing brace — B264's own shape.
+        assert_eq!(
+            row_at("Point { x = 1, y = 2 }", 1),
+            ("Point".to_string(), false)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -864,19 +1393,511 @@ fun main(): i32 {
     // segments are re-recorded on every type-check pass), and a duplicate span
     // reaches the client as an overlapping `TextEdit` — which is what made a
     // struct rename fail with "Rename failed to apply edits".
+    //
+    // The invariant is about a span IN A FILE, and E144 is where that boundary
+    // started to matter: derive-generated rows index a TEMPLATE no file holds,
+    // two expansions of one template legitimately claim the same offsets, and
+    // no rename may touch a generated span in the first place. `MATRIX`
+    // derives nothing itself, but the `std` it loads does, so the rows are
+    // filtered here rather than the claim being weakened —
+    // `generated_rows_share_template_offsets_but_never_a_definition` states
+    // what holds on the other side of the line.
     #[test]
     fn no_two_indexed_occurrences_share_a_span() {
         let (dir, document) = matrix();
         let mut seen = std::collections::HashSet::new();
+        let mut checked = 0;
         for row in document.reference_index().rows() {
+            if row.source == vilan_core::analyzer::DERIVED_SOURCE {
+                continue;
+            }
             assert!(
                 seen.insert((row.source.0, row.span)),
                 "{:?} at {:?} is recorded twice",
                 row.span,
                 row.source,
             );
+            checked += 1;
+        }
+        assert!(checked > 20, "expected a broad sample, checked {checked}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E133. A caret at the very END of an identifier is ON it. `name|` is
+    // where a user's caret sits the moment they finish typing a word, and it
+    // is where a rename is started from; the strict half-open containment test
+    // alone answered `None` there, so find-references came back empty and
+    // rename refused with `NotAnIdentifier` — which `prepare_rename` renders
+    // as VS Code's "the element can't be renamed".
+    //
+    // Non-vacuous on both sides: the same offsets are asserted to give the
+    // same answer as a caret plainly INSIDE the word, and a caret one byte
+    // further on (past the identifier, into the punctuation that follows) is
+    // asserted to name nothing — so a fallback that swallowed the whole gap
+    // would red here rather than pass quietly.
+    #[test]
+    fn a_caret_at_the_end_of_an_identifier_names_it() {
+        let (dir, document) = matrix();
+        let index = document.reference_index();
+        for (label, needle, delta) in [
+            ("a local's declaration", "let total", 4),
+            ("a local's use", "helper(total)", 7),
+            ("a function's declaration", "fun helper", 4),
+            ("a struct's declaration", "struct Point", 7),
+            ("a field key", "Point { x = 1", 8),
+        ] {
+            let inside = at(needle, delta);
+            let name = index
+                .at(SourceId(0), inside)
+                .unwrap_or_else(|| panic!("{label}: the caret is inside the identifier"))
+                .span;
+            assert_eq!(
+                index.at(SourceId(0), name.end).map(|row| row.span),
+                Some(name),
+                "{label}: a caret at `name|` must name the same identifier",
+            );
+            assert_eq!(
+                references_at(&document, name.end),
+                references_at(&document, inside),
+                "{label}: and answer the same reference set",
+            );
+            assert!(
+                index
+                    .at(SourceId(0), name.end + 1)
+                    .is_none_or(|row| row.span != name),
+                "{label}: one byte past the end is not on the identifier",
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The other side of the convention: strict containment still wins, so a
+    // caret that is INSIDE one identifier and at the END of nothing is
+    // unaffected, and the end-of-word fallback can never shadow a real hit.
+    #[test]
+    fn strict_containment_still_decides_where_it_applies() {
+        let (dir, document) = matrix();
+        let index = document.reference_index();
+        // `p.sum()`: the caret between `p` and `.` ends `p`; the caret on `s`
+        // of `sum` is inside `sum`. Two neighbouring rows, two answers.
+        let p = at("\tlet total = p.sum();", 13);
+        let sum = at("p.sum()", 2);
+        assert_eq!(
+            MATRIX.get(
+                index
+                    .at(SourceId(0), p + 1)
+                    .expect("`p|`")
+                    .span
+                    .into_range()
+            ),
+            Some("p"),
+        );
+        assert_eq!(
+            MATRIX.get(
+                index
+                    .at(SourceId(0), sum)
+                    .expect("`|sum`")
+                    .span
+                    .into_range()
+            ),
+            Some("sum"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E144: derive-template double claims -----------------------------
+    //
+    // A `[derive(..)]` expansion is walked with its spans indexing the
+    // GENERATED TEMPLATE, under the `DERIVED_SOURCE` sentinel. Two expansions
+    // of one template produce the same text at the same offsets whenever the
+    // deriving types' names are the same LENGTH — `Ordering` and `JsonKind`
+    // both claim 304..312 in the tree that found this — so the index built two
+    // rows at one `(source, span)` and the collapse kept whichever won the
+    // sort. The survivor keeps its OWN definition, so nothing renders as the
+    // wrong type; what happens instead is that every other expansion's member
+    // silently loses its declaration row. That is not cosmetic: rename refuses
+    // exactly when it sees a `DERIVED_SOURCE` span in a definition's set, so
+    // the first enum's derived `eq` refused as generated and the second one's
+    // returned a one-edit rewrite of the CALL SITE alone — a rename that
+    // leaves the generated declaration behind and breaks the program.
+
+    /// Two enums whose names are the same length, deriving the same trait —
+    /// the shape that makes two expansions land on identical template offsets.
+    /// The lengths matter, so they are asserted rather than assumed: a later
+    /// edit that renamed one of them would make the fixture stop exercising
+    /// anything, silently.
+    const TWIN_DERIVES: &str = "import std::io::print;\n\n[derive(PartialEq)]\nenum Tab { A, B }\n\n[derive(PartialEq)]\nenum Hue { X, Y }\n\nfun main() {\n\tprint(Tab::A.eq(Tab::B));\n\tprint(Hue::X.eq(Hue::Y));\n}\n\nmain();\n";
+
+    #[test]
+    fn each_derive_expansion_keeps_its_own_members_declaration() {
+        assert_eq!("Tab".len(), "Hue".len(), "the fixture's whole premise");
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the fixture must analyze clean: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        let index = document.reference_index();
+        let mut generated_declarations: Vec<Definition> = Vec::new();
+        for (label, needle) in [("Tab", "Tab::A.eq"), ("Hue", "Hue::X.eq")] {
+            let offset = TWIN_DERIVES.find(needle).expect("fixture") + needle.len() - 1;
+            let definition = index
+                .at(SourceId(0), offset)
+                .unwrap_or_else(|| panic!("{label}: the caret is on `eq`"))
+                .definition;
+            let rows: Vec<_> = index.occurrences_of(definition).collect();
+            assert_eq!(
+                rows.len(),
+                2,
+                "{label}: the call site and the derived declaration, not one of them: {rows:?}",
+            );
+            let declaration = rows
+                .iter()
+                .find(|row| row.is_declaration_of(definition))
+                .unwrap_or_else(|| {
+                    panic!("{label}: this expansion's own `eq` declaration is missing: {rows:?}")
+                });
+            assert_eq!(
+                declaration.source,
+                vilan_core::analyzer::DERIVED_SOURCE,
+                "{label}: a derived member is declared in the template",
+            );
+            generated_declarations.push(definition);
+        }
+        // The two enums' `eq` are DIFFERENT definitions that happen to share a
+        // template address — the point of the fix is that both survive, not
+        // that they were merged.
+        assert_ne!(generated_declarations[0], generated_declarations[1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E144's own pin, and the half a user could feel. Renaming a derived
+    /// member refuses because its declaration lives in generated text; before
+    /// the fix only the expansion that WON the collapse refused, and the other
+    /// one handed back a partial edit set.
+    #[test]
+    fn renaming_a_derived_member_refuses_from_either_expansion() {
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        for (label, needle) in [("Tab", "Tab::A.eq"), ("Hue", "Hue::X.eq")] {
+            let offset = TWIN_DERIVES.find(needle).expect("fixture") + needle.len() - 1;
+            assert!(
+                matches!(
+                    document.rename_edits(offset, "same"),
+                    Err(crate::document::RenameRefusal::Generated { .. })
+                ),
+                "{label}: renaming a derived member must refuse, not emit a partial edit set: \
+                 {:?}",
+                document.rename_edits(offset, "same"),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Invariant 2, at the boundary the fix draws: no two rows share a span in
+    /// a FILE, and generated rows that share a template address never share a
+    /// definition. Stated over the fixture that actually has colliding
+    /// expansions, since `MATRIX` derives nothing.
+    #[test]
+    fn generated_rows_share_template_offsets_but_never_a_definition() {
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        let index = document.reference_index();
+        let mut by_span = std::collections::HashSet::new();
+        let mut by_span_and_definition = std::collections::HashSet::new();
+        let mut shared_template_spans = 0;
+        for row in index.rows() {
+            if row.source == vilan_core::analyzer::DERIVED_SOURCE {
+                if !by_span.insert((row.source.0, row.span)) {
+                    shared_template_spans += 1;
+                }
+            } else {
+                assert!(
+                    by_span.insert((row.source.0, row.span)),
+                    "{:?} in source {:?} is recorded twice",
+                    row.span,
+                    row.source,
+                );
+            }
+            assert!(
+                by_span_and_definition.insert((row.source.0, row.span, row.definition)),
+                "{row:?} is recorded twice for one definition",
+            );
+        }
+        assert!(
+            shared_template_spans > 0,
+            "the fixture is supposed to make two expansions collide; if it stopped, this pin \
+             and its two siblings prove nothing",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E134: the struct-init field shorthand ---------------------------
+    //
+    // `A { x }` is ONE identifier naming TWO definitions: the field key of
+    // `A::x`, and a read of the local `x` (the AST has no value node for a
+    // shorthand, so the analyzer synthesizes the read at the entry's span —
+    // for a shorthand, the same bytes as the name). The old dedup dropped
+    // whichever lost `Definition::sort_key()`, which is declaration order, so
+    // ONE of the two names was always destroyed: with the struct declared
+    // first the local kept only its declaration — find-references answered
+    // with just that, and the unused-local third faded a binding the program
+    // reads — and with the struct declared after, the field lost its rename
+    // site instead. The owner reported both halves as separate bugs.
+
+    const SHORTHAND_STRUCT_FIRST: &str =
+        "struct A { x: i32 }\n\nfun main(): i32 {\n\tlet x = 1;\n\tlet a = A { x };\n\ta.x\n}\n";
+    const SHORTHAND_STRUCT_LAST: &str =
+        "fun main(): i32 {\n\tlet x = 1;\n\tlet a = A { x };\n\ta.x\n}\n\nstruct A { x: i32 }\n";
+
+    /// The reference spans the cursor at `offset` answers with, as the text
+    /// they cover, in source order.
+    fn shorthand_references(document: &Document, source: &str, offset: usize) -> Vec<String> {
+        let mut found: Vec<(usize, String)> = document
+            .references(offset)
+            .into_iter()
+            .map(|(_, span)| {
+                (
+                    span.start,
+                    source.get(span.into_range()).unwrap_or("?").to_string(),
+                )
+            })
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, text)| text).collect()
+    }
+
+    // Both declaration orders, both halves. Nothing fades, and each name's
+    // reference set is COMPLETE from its own declaration: the local is the
+    // declaration plus the shorthand, the field is the declaration plus the
+    // shorthand plus `a.x`. Before the fix one of these two was short by the
+    // shorthand in each order, and `SHORTHAND_STRUCT_FIRST` faded `x`.
+    #[test]
+    fn a_field_shorthand_is_a_reference_to_both_names_in_either_order() {
+        for (label, source) in [
+            ("the struct declared first", SHORTHAND_STRUCT_FIRST),
+            ("the struct declared after", SHORTHAND_STRUCT_LAST),
+        ] {
+            let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+            assert!(
+                document.diagnostics.is_empty(),
+                "{label}: the fixture must analyze clean, got {:?}",
+                document
+                    .diagnostics
+                    .iter()
+                    .map(|e| &e.msg)
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                document
+                    .unused_local_spans()
+                    .into_iter()
+                    .map(|span| source.get(span.into_range()).unwrap_or("?"))
+                    .collect::<Vec<_>>(),
+                Vec::<&str>::new(),
+                "{label}: `x` is read by the shorthand initializer",
+            );
+            let local = source.find("let x = 1").expect("fixture") + 4;
+            let field = source.find("x: i32").expect("fixture");
+            assert_eq!(
+                shorthand_references(&document, source, local),
+                ["x", "x"],
+                "{label}: the local's declaration and the shorthand that reads it",
+            );
+            assert_eq!(
+                shorthand_references(&document, source, field),
+                ["x", "x", "x"],
+                "{label}: the field's declaration, the shorthand key, and `a.x`",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Invariant 2 is untouched by the fix: the shorthand is ONE row carrying a
+    // co-reference, not two rows at one span. The pin says so directly, since
+    // "no two rows share a span" would also be satisfied by going back to
+    // throwing one of the two names away.
+    #[test]
+    fn a_field_shorthand_is_one_row_carrying_both_names() {
+        let (dir, document) = analyze_workspace(&[("main.vl", SHORTHAND_STRUCT_FIRST)]);
+        let offset = SHORTHAND_STRUCT_FIRST.find("A { x }").expect("fixture") + 4;
+        let index = document.reference_index();
+        let row = index
+            .at(SourceId(0), offset)
+            .expect("a row at the shorthand");
+        assert_eq!(SHORTHAND_STRUCT_FIRST.get(row.span.into_range()), Some("x"),);
+        let other = row
+            .co_definition
+            .expect("the second name this span carries");
+        assert_ne!(other, row.definition);
+        assert_eq!(
+            index
+                .rows()
+                .iter()
+                .filter(|other| other.source == row.source && other.span == row.span)
+                .count(),
+            1,
+            "one span, one row — invariant 2",
+        );
+        // And the row is reachable from BOTH names.
+        assert!(
+            index
+                .occurrences_of(other)
+                .any(|found| found.span == row.span),
+        );
+        assert!(
+            index
+                .occurrences_of(row.definition)
+                .any(|found| found.span == row.span),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E143. Rename at a shorthand EXPANDS. E134 shipped a refusal here — one
+    // identifier cannot spell two names, and rewriting it serves one and
+    // silently breaks the other, which is what renaming the FIELD used to do —
+    // and the refusal named the expansion for the user to write by hand.
+    // Ruled 2026-09-05: emit it. Renaming the field gives `A { new = x }`,
+    // renaming the local gives `A { x = new }`, and the site is the one form
+    // in which the two names coincide, so writing them out is the removal of
+    // an abbreviation that has run out of room.
+    //
+    // This pin replaces `rename_refuses_at_a_field_shorthand_from_either_side`
+    // (E134), whose claim the ruling reversed. The fixture, both declaration
+    // orders and all three cursor positions are carried over unchanged, so
+    // what moved is the answer, not the coverage.
+    #[test]
+    fn rename_at_a_field_shorthand_expands_it_from_either_side() {
+        for (label, source) in [
+            ("the struct declared first", SHORTHAND_STRUCT_FIRST),
+            ("the struct declared after", SHORTHAND_STRUCT_LAST),
+        ] {
+            let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+            let shorthand = source.find("A { x }").expect("fixture") + 4;
+            // Each side is reached from its OWN declaration, where which name
+            // the user means is not in question.
+            for (side, offset, expansion, edits_expected) in [
+                (
+                    "the local",
+                    source.find("let x = 1").expect("fixture") + 4,
+                    "x = renamed",
+                    2,
+                ),
+                (
+                    "the field",
+                    source.find("x: i32").expect("fixture"),
+                    "renamed = x",
+                    3,
+                ),
+            ] {
+                let edits = document
+                    .rename_edits(offset, "renamed")
+                    .unwrap_or_else(|refusal| {
+                        panic!("{label}, {side}: {}", refusal.message());
+                    });
+                let at_shorthand = edits
+                    .iter()
+                    .find(|(_, span, _)| span.start == shorthand)
+                    .unwrap_or_else(|| panic!("{label}, {side}: the shorthand is in the set"));
+                assert_eq!(
+                    at_shorthand.2, expansion,
+                    "{label}, renaming {side}: the OTHER name keeps its spelling",
+                );
+                for (_, span, new_text) in &edits {
+                    if span.start != shorthand {
+                        assert_eq!(new_text, "renamed", "{label}, {side}: every other site");
+                    }
+                }
+                assert_eq!(edits.len(), edits_expected, "{label}, {side}: {edits:?}");
+            }
+            // A caret AT the shorthand renames whichever name the index row
+            // carries as its own — which is declaration order, since that is
+            // what `Definition::sort_key` breaks the tie by. Both spellings
+            // are correct expansions of this site; which one a caret there
+            // means is genuinely ambiguous, and the two declaration orders
+            // below cover both answers rather than either being asserted as
+            // the right one.
+            let at_caret = document
+                .rename_edits(shorthand, "renamed")
+                .unwrap_or_else(|refusal| {
+                    panic!("{label}, at the shorthand: {}", refusal.message())
+                });
+            let expansion = &at_caret
+                .iter()
+                .find(|(_, span, _)| span.start == shorthand)
+                .expect("the shorthand is its own rename site")
+                .2;
+            assert!(
+                expansion == "x = renamed" || expansion == "renamed = x",
+                "{label}, at the shorthand: {expansion:?}",
+            );
+            // A name with no shorthand in it renames as it always did — the
+            // expansion is about the shape, not about fields or locals.
+            let plain = document
+                .rename_edits(source.find("let a = A").expect("fixture") + 4, "renamed")
+                .unwrap_or_else(|refusal| {
+                    panic!("{label}: `a` has no shorthand site: {}", refusal.message())
+                });
+            assert!(
+                plain.iter().all(|(_, _, new_text)| new_text == "renamed"),
+                "{label}: {plain:?}",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The expansion is TEXT, so it is pinned as text: applying the edit set
+    /// to the buffer produces a program that says what the rename meant.
+    #[test]
+    fn applying_a_shorthand_rename_produces_the_expanded_program() {
+        for (label, source, from_the_field, expected) in [
+            (
+                "the local",
+                SHORTHAND_STRUCT_FIRST,
+                false,
+                "struct A { x: i32 }\n\nfun main(): i32 {\n\tlet renamed = 1;\n\tlet a = A { x = renamed };\n\ta.x\n}\n",
+            ),
+            (
+                "the field",
+                SHORTHAND_STRUCT_FIRST,
+                true,
+                "struct A { renamed: i32 }\n\nfun main(): i32 {\n\tlet x = 1;\n\tlet a = A { renamed = x };\n\ta.renamed\n}\n",
+            ),
+        ] {
+            let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+            let offset = if from_the_field {
+                source.find("x: i32").expect("fixture")
+            } else {
+                source.find("let x = 1").expect("fixture") + 4
+            };
+            let mut edits = document.rename_edits(offset, "renamed").expect("a rename");
+            // Applied back to front, so an earlier edit cannot move a later
+            // one's offsets — including the expansion, which is longer than
+            // what it replaces.
+            edits.sort_by_key(|(_, span, _)| std::cmp::Reverse(span.start));
+            let mut applied = source.to_string();
+            for (_, span, new_text) in &edits {
+                applied.replace_range(span.into_range(), new_text);
+            }
+            assert_eq!(applied, expected, "renaming {label}");
+            // And the expansion is valid vilan: the renamed program analyzes
+            // clean. A text edit that merely looked right would pass the
+            // comparison above and break the build.
+            let (applied_dir, applied_document) = analyze_workspace(&[("main.vl", &applied)]);
+            assert!(
+                applied_document.diagnostics.is_empty(),
+                "renaming {label} produced a program that does not analyze: {:?}",
+                applied_document
+                    .diagnostics
+                    .iter()
+                    .map(|error| &error.msg)
+                    .collect::<Vec<_>>(),
+            );
+            let _ = std::fs::remove_dir_all(&applied_dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // --- The per-symbol-kind matrix -------------------------------------
@@ -1146,6 +2167,15 @@ fun main(): i32 {
             .count()
     }
 
+    /// [`in_file`] for a rename's edit set, which carries a replacement text
+    /// per span (E143).
+    fn edits_in_file(found: &[(std::path::PathBuf, Span, String)], name: &str) -> usize {
+        found
+            .iter()
+            .filter(|(path, _, _)| path.ends_with(name))
+            .count()
+    }
+
     #[test]
     fn a_definition_sees_the_files_that_import_it() {
         let (dir, document, application_document) = library_and_application();
@@ -1246,16 +2276,19 @@ fun main(): i32 {
         let spans = document
             .rename_edits_across(offset, "Renamed", [&application_document])
             .expect("the cross-file rename");
-        assert_eq!(in_file(&spans, "library.vl"), 1, "{spans:?}");
-        assert_eq!(in_file(&spans, "application.vl"), 2, "{spans:?}");
-        // Every edit replaces exactly the identifier, in its own file's text.
-        for (path, span) in &spans {
+        assert_eq!(edits_in_file(&spans, "library.vl"), 1, "{spans:?}");
+        assert_eq!(edits_in_file(&spans, "application.vl"), 2, "{spans:?}");
+        // Every edit replaces exactly the identifier, in its own file's text,
+        // and writes the plain new name there (E143's per-span text is the
+        // expansion only at a field shorthand, and there is none here).
+        for (path, span, new_text) in &spans {
             let text = if path.ends_with("library.vl") {
                 LIBRARY
             } else {
                 APPLICATION
             };
             assert_eq!(&text[span.into_range()], "Point", "{path:?} {span:?}");
+            assert_eq!(new_text, "Renamed", "{path:?} {span:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1295,11 +2328,11 @@ fun main(): i32 {
     /// The rename edit set, rendered as the text each span currently covers, so
     /// a wrong span shows up as the wrong word rather than as a number.
     fn rename_at(document: &Document, offset: usize) -> Result<Vec<&'static str>, RenameRefusal> {
-        let mut spans = document.rename_edits(offset, "renamed")?;
-        spans.sort_by_key(|(source, span)| (source.0, span.start));
-        Ok(spans
+        let mut edits = document.rename_edits(offset, "renamed")?;
+        edits.sort_by_key(|(source, span, _)| (source.0, span.start));
+        Ok(edits
             .into_iter()
-            .map(|(_, span)| {
+            .map(|(_, span, _)| {
                 MATRIX
                     .get(span.into_range())
                     .expect("inside the entry text")
@@ -1370,10 +2403,14 @@ fun main(): i32 {
         ] {
             let spans = document.rename_edits(offset, "renamed").expect("a rename");
             let mut seen = std::collections::HashSet::new();
-            for (source, span) in &spans {
+            for (source, span, new_text) in &spans {
                 assert!(
                     seen.insert((source.0, *span)),
                     "{span:?} is emitted twice by the rename at {offset}",
+                );
+                assert_eq!(
+                    new_text, "renamed",
+                    "no shorthand in this fixture, so every edit is the plain name",
                 );
             }
         }
@@ -1455,6 +2492,722 @@ fun main(): i32 {
         assert_eq!(
             document.rename_edits(at("value + 1", 6), "renamed"),
             Err(RenameRefusal::NotAnIdentifier),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E149. `Document::references` handed back DERIVED_SOURCE rows, and
+    /// `references_across` did not — it goes through `canonical_sources`,
+    /// which has no entry for the template, so the drop was a side effect
+    /// rather than a decision. Two faces of one index disagreeing about what a
+    /// symbol's references ARE is the class the index exists to close, and a
+    /// generated row cannot become a client location in any case: its offsets
+    /// index a text no file holds.
+    #[test]
+    fn e149_references_never_hands_back_a_generated_row() {
+        let (dir, document) = analyze_workspace(&[("main.vl", TWIN_DERIVES)]);
+        let needle = "Tab::A.eq";
+        let offset = TWIN_DERIVES.find(needle).expect("fixture") + needle.len() - 1;
+        // The premise: this symbol HAS a generated row (its declaration is the
+        // derive template's), so the filter is doing work rather than passing.
+        assert!(
+            document
+                .reference_index()
+                .occurrences_of(
+                    document
+                        .reference_target(offset)
+                        .expect("the caret is on `eq`")
+                        .0,
+                )
+                .any(|row| row.source == vilan_core::analyzer::DERIVED_SOURCE),
+            "the fixture must carry a generated row",
+        );
+        let answered = document.references(offset);
+        assert!(
+            !answered.is_empty(),
+            "the call site is still reported: {answered:?}",
+        );
+        assert!(
+            answered
+                .iter()
+                .all(|(source, _)| *source != vilan_core::analyzer::DERIVED_SOURCE),
+            "a generated row reached the client: {answered:?}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E149. A caret ON a struct-init shorthand renamed whichever side
+    /// declaration order gave — the row carries one of its two definitions as
+    /// its own and the other as a co-reference, and `Definition::sort_key`
+    /// breaks the tie by entity id. So `A { x }` expanded to `x = renamed` in
+    /// one file and to `renamed = x` in another, for the same keystroke on the
+    /// same shape. Ruled 2026-09-07: the caret means the LOCAL. The binding is
+    /// one hop away by name — `A { x }` READS `x` — where the field is reached
+    /// only through the type, and a user who means the field has the field's
+    /// own declaration and every `a.x` to start from.
+    #[test]
+    fn e149_a_caret_on_a_shorthand_renames_the_local_in_either_declaration_order() {
+        for (label, source) in [
+            ("the struct declared first", SHORTHAND_STRUCT_FIRST),
+            ("the struct declared after", SHORTHAND_STRUCT_LAST),
+        ] {
+            let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+            let shorthand = source.find("A { x }").expect("fixture") + 4;
+            assert_eq!(
+                document.reference_target(shorthand).map(|(_, kind)| kind),
+                Some(DefinitionKind::Binding),
+                "{label}: the caret means the local",
+            );
+            let edits = document
+                .rename_edits(shorthand, "renamed")
+                .unwrap_or_else(|refusal| panic!("{label}: {}", refusal.message()));
+            let at_shorthand = &edits
+                .iter()
+                .find(|(_, span, _)| span.start == shorthand)
+                .unwrap_or_else(|| panic!("{label}: the shorthand is its own rename site"))
+                .2;
+            assert_eq!(
+                at_shorthand, "x = renamed",
+                "{label}: the LOCAL moves and the field keeps its spelling",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // --- E145: an `as` alias is a NAME OF ITS OWN ---------------------------
+    //
+    // E142 built the alias as a second SPELLING of one definition: the scope
+    // binds `c` to whatever `a::b` resolved to, so find-references and rename
+    // saw one symbol with two names and rewrote both. That answer had two
+    // costs, and the second one was fatal.
+    //
+    //  - A rename through the alias COLLAPSED it: `greet as hello` renamed to
+    //    `greeting as greeting`, a compiling program and a redundant one.
+    //  - Every use of the alias was narrowed against the TARGET's name, so an
+    //    alias of a different length simply vanished: `greet as hi` dropped
+    //    both `hi()` calls out of the index, find-references answered nothing
+    //    and rename answered "there is no symbol to rename here". The E142
+    //    fixture's `hello` is five letters, exactly as `greet` is, and that
+    //    coincidence is the only reason the shape looked like it worked.
+    //
+    // Ruled 2026-09-07: rename PRESERVES an alias. `import a::b as c` is a
+    // declaration this file makes — `c` is not another way of writing `b`, it
+    // is this file's own name for it — so the alias gets an entity id, a
+    // declaration span, and rows of its own (`Program::import_aliases` and
+    // `import_alias_spans`, filled from the SOURCE, since which of the two
+    // names an identifier carries is a fact about the text and not about the
+    // resolved program). The scope still binds the target directly, so nothing
+    // about typing or code generation moved: this is an editor identity.
+    //
+    // Renaming the definition rewrites its declaration and the import's path
+    // segment and leaves the alias standing; renaming the alias, or any use of
+    // it, rewrites the alias and its uses and never the definition. And with
+    // the alias naming itself, INVARIANT 1 above holds without exception —
+    // `an alias row's text is not its definition's name` was the one row class
+    // it could not describe, and there is no longer such a row.
+
+    const ALIASED: &str = "\
+import pkg::helper::greet as hello;
+
+fun main(): i32 {
+\thello();
+\thello();
+\t0
+}
+";
+
+    /// The same import with an alias SHORTER than the name it renames — the
+    /// shape that used to disappear from the index entirely.
+    const SHORT_ALIAS: &str = "\
+import pkg::helper::greet as hi;
+
+fun main(): i32 {
+\thi();
+\thi();
+\t0
+}
+";
+
+    const HELPER: &str = "fun greet(): i32 {\n\t1\n}\n";
+
+    fn aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[("main.vl", ALIASED), ("helper.vl", HELPER)])
+    }
+
+    fn short_aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[
+            ("main.vl", SHORT_ALIAS),
+            ("helper.vl", HELPER),
+        ])
+    }
+
+    /// The spans a query at `offset` reports, rendered as the text each covers
+    /// in `text` (the entry file's).
+    fn alias_texts(text: &'static str, spans: Vec<(SourceId, Span)>) -> Vec<&'static str> {
+        let mut found: Vec<(usize, &str)> = spans
+            .into_iter()
+            .filter(|(source, _)| *source == SourceId(0))
+            .map(|(_, span)| {
+                let range = span.into_range();
+                (range.start, text.get(range).expect("inside the fixture"))
+            })
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// The spans a query at `offset` reports, rendered as the text each covers.
+    fn aliased_texts(document: &Document, spans: Vec<(SourceId, Span)>) -> Vec<&'static str> {
+        let _ = document;
+        alias_texts(ALIASED, spans)
+    }
+
+    #[test]
+    fn e145_find_references_from_the_alias_side_lists_the_alias_and_its_uses() {
+        let (dir, document) = aliased();
+        // From a USE site spelled by the alias: the alias declaration and both
+        // calls — and NOT the path segment, which names the function.
+        let offset = ALIASED.find("\thello();").expect("fixture") + 1;
+        assert_eq!(
+            aliased_texts(&document, document.references(offset)),
+            vec!["hello", "hello", "hello"],
+            "the alias and its uses are one symbol; the path segment is not",
+        );
+        // And from the alias's own span, the same answer.
+        let on_alias = ALIASED.find("as hello").expect("fixture") + 3;
+        assert_eq!(
+            aliased_texts(&document, document.references(on_alias)),
+            vec!["hello", "hello", "hello"],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_find_references_from_the_definition_side_lists_the_path_segment() {
+        let (dir, document) = aliased();
+        // From the import's path segment, which is the one place this file
+        // writes the function's own name: the declaration in helper.vl (not in
+        // this text) and the segment itself.
+        let on_segment = ALIASED.find("::greet").expect("fixture") + 2;
+        assert_eq!(
+            aliased_texts(&document, document.references(on_segment)),
+            vec!["greet"],
+            "the alias and its uses spell another name and are not listed here",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_a_rename_at_the_definition_leaves_the_alias_standing() {
+        let (dir, document) = aliased();
+        let on_segment = ALIASED.find("::greet").expect("fixture") + 2;
+        let edits = document
+            .rename_edits(on_segment, "greeting")
+            .expect("a rename at the imported definition");
+        assert_eq!(
+            aliased_texts(
+                &document,
+                edits
+                    .iter()
+                    .map(|(source, span, _)| (*source, *span))
+                    .collect(),
+            ),
+            vec!["greet"],
+            "the path segment moves; `as hello` is this file's own name and stays",
+        );
+        assert!(
+            edits.iter().all(|(_, _, text)| text == "greeting"),
+            "every edit writes the new name plainly",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_a_rename_at_the_alias_moves_the_alias_and_its_uses() {
+        let (dir, document) = aliased();
+        let on_alias = ALIASED.find("as hello").expect("fixture") + 3;
+        let edits = document
+            .rename_edits(on_alias, "hi")
+            .expect("a rename at the alias");
+        assert_eq!(
+            aliased_texts(
+                &document,
+                edits
+                    .into_iter()
+                    .map(|(source, span, _)| (source, span))
+                    .collect(),
+            ),
+            vec!["hello", "hello", "hello"],
+            "the alias and both uses move; `greet` is not this file's to rename",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_a_rename_at_a_use_of_the_alias_moves_the_alias() {
+        let (dir, document) = aliased();
+        let offset = ALIASED.find("\thello();").expect("fixture") + 1;
+        let edits = document
+            .rename_edits(offset, "hi")
+            .expect("a rename at a use of the alias");
+        assert_eq!(
+            aliased_texts(
+                &document,
+                edits
+                    .into_iter()
+                    .map(|(source, span, _)| (source, span))
+                    .collect(),
+            ),
+            vec!["hello", "hello", "hello"],
+            "a use renames what it spells: the alias",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e145_an_alias_shorter_than_its_target_is_still_a_symbol() {
+        // The half that was silently fatal: every use narrowed against the
+        // TARGET's name, `hi` is not five bytes long, and both calls were
+        // DROPPED — `references` answered `[]` and `rename_edits` answered
+        // `Err(NotAnIdentifier)`, i.e. "there is no symbol to rename here".
+        let (dir, document) = short_aliased();
+        let offset = SHORT_ALIAS.find("\thi();").expect("fixture") + 1;
+        assert_eq!(
+            alias_texts(SHORT_ALIAS, document.references(offset)),
+            vec!["hi", "hi", "hi"],
+        );
+        let edits = document
+            .rename_edits(offset, "howdy")
+            .expect("a rename through a short alias");
+        assert_eq!(
+            alias_texts(
+                SHORT_ALIAS,
+                edits
+                    .into_iter()
+                    .map(|(source, span, _)| (source, span))
+                    .collect(),
+            ),
+            vec!["hi", "hi", "hi"],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e142_the_alias_is_an_indexed_occurrence_of_its_own() {
+        // The alias has a row: a caret ON it answers, and answers with the same
+        // symbol a caret on a use site does. Without the row the alias would be
+        // invisible — hover blank, go-to-definition dead, and rename silently
+        // incomplete.
+        let (dir, document) = aliased();
+        let on_alias = ALIASED.find("as hello").expect("fixture") + 3;
+        let on_use = ALIASED.find("\thello();").expect("fixture") + 1;
+        assert_eq!(
+            document
+                .reference_target(on_alias)
+                .map(|(target, _)| target),
+            document.reference_target(on_use).map(|(target, _)| target),
+            "the alias names the same definition its use sites do",
+        );
+        assert!(
+            document.reference_target(on_alias).is_some(),
+            "the alias must be an indexed occurrence",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // INVARIANT 1, UN-EXCEPTED (E145). The alias row was the one class the
+    // assertion above could not describe, so the matrix fixture deliberately
+    // carried no `as`. It holds over one now: every row in an aliasing file
+    // covers exactly its own definition's name.
+    #[test]
+    fn e145_every_indexed_span_covers_an_identifier_through_an_alias_too() {
+        for (text, (dir, document)) in [(ALIASED, aliased()), (SHORT_ALIAS, short_aliased())] {
+            let program = document.program.as_ref().expect("program");
+            let index = document.reference_index();
+            let mut checked = 0;
+            for row in index.rows() {
+                if row.source != SourceId(0) {
+                    continue;
+                }
+                let name = name_of(program, row.definition).expect("a named definition");
+                let covered = text
+                    .get(row.span.into_range())
+                    .unwrap_or_else(|| panic!("span {:?} is outside the entry text", row.span));
+                assert_eq!(
+                    covered, name,
+                    "row {row:?} covers {covered:?}, which is not the identifier {name:?}",
+                );
+                checked += 1;
+            }
+            assert!(checked >= 4, "expected the whole file, checked {checked}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // --- B264: an alias in TYPE position, and what a hover at an alias says --
+    //
+    // E145 gave an `as` alias an entity of its own, but only the two tables it
+    // filled from the source knew it: `type_references` (which covers a type
+    // annotation and an import path segment) and the value-position
+    // `Expr::Local`/`Variable`/`Parameter` reads. A STRUCT-LITERAL head is
+    // recorded neither way — the index derives it from
+    // `struct_initializer_to_def`, whose span is the whole `Spot { x = 1 }`
+    // with the name ANCHORED at its start — so the alias remap, which keys on
+    // an exact span, missed it. `narrow` then took the TARGET's name length
+    // from that start, and `Spot { x = 1 }` came out as the five bytes
+    // `Spot ` filed under `Point`: a row whose text is not its definition's
+    // name, which is INVARIANT 1's removed exception walking back in, and an
+    // edit that a rename of `Point` APPLIES — turning `Spot { x = 1 }` into
+    // `zzz{ x = 1 }`, a program that does not parse.
+    //
+    // Ruled 2026-09-07 (the owner): TypeScript is the reference. Driven over
+    // `tsserver`'s own API on `import { foo as bar, Foo as Bar } from "./m"`:
+    //
+    //  - go-to-definition at `bar()` and at `let x: Bar` both answer `m.ts`'s
+    //    DECLARATION — the alias resolves THROUGH;
+    //  - hover answers `(alias) bar(): number` and `(alias) type Bar = {…}` —
+    //    the alias's own name carrying the target's signature;
+    //  - rename at a use rewrites the alias binding and its uses and stops at
+    //    the module boundary; rename at the original's name (in `m.ts`, or the
+    //    `foo` before `as`) rewrites the declaration and the import's own
+    //    segment and leaves the alias standing.
+    //
+    // Vilan already answered the first and the third in VALUE position (E145)
+    // and the first in type position; the second was the target's name, and
+    // the third was the corrupting row above.
+
+    const B264_HELPER: &str = "struct Point {\n\tx: i32,\n}\n\nfun greet(): i32 {\n\t1\n}\n";
+
+    /// One import aliasing a TYPE and one aliasing a FUNCTION, each used twice:
+    /// the type in an annotation and as a struct-literal head (the shape the
+    /// index derives rather than records), the function as a call.
+    const B264_ALIASED: &str = "\
+import pkg::helper::Point as Spot;
+import pkg::helper::greet as hi;
+
+fun make(): Spot {
+\tSpot { x = 1 }
+}
+
+fun main(): i32 {
+\thi();
+\tmake().x
+}
+";
+
+    fn b264_aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[
+            ("main.vl", B264_ALIASED),
+            ("helper.vl", B264_HELPER),
+        ])
+    }
+
+    /// The text a `(source, span)` answer covers, read out of the file it
+    /// indexes into — the definition answers point into `helper.vl`, so the
+    /// entry's text alone cannot render them.
+    fn b264_text(document: &Document, source: SourceId, span: Span) -> String {
+        let text = if source == SourceId(0) {
+            B264_ALIASED.to_string()
+        } else {
+            let program = document.program.as_ref().expect("program");
+            std::fs::read_to_string(&program.canonical_sources[source.0 as usize])
+                .expect("the fixture file")
+        };
+        text.get(span.into_range())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("span {span:?} is outside source {}", source.0))
+    }
+
+    fn b264_at(needle: &str, delta: usize) -> usize {
+        B264_ALIASED
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in the pin source"))
+            + delta
+    }
+
+    /// TypeScript's first answer: go-to-definition at an aliased use resolves
+    /// THROUGH to the target's declaration — in type position and in value
+    /// position, and from the alias's own `as` span too.
+    #[test]
+    fn b264_go_to_definition_at_an_alias_resolves_through_to_the_target() {
+        let (dir, document) = b264_aliased();
+        for (label, offset, expected) in [
+            (
+                "the type alias in an annotation",
+                b264_at("): Spot", 3),
+                "Point",
+            ),
+            (
+                "the type alias as a literal head",
+                b264_at("\tSpot {", 1),
+                "Point",
+            ),
+            (
+                "the type alias's own `as` name",
+                b264_at("as Spot", 3),
+                "Point",
+            ),
+            ("the value alias at a call", b264_at("\thi();", 1), "greet"),
+            (
+                "the value alias's own `as` name",
+                b264_at("as hi", 3),
+                "greet",
+            ),
+        ] {
+            let (source, span) = document
+                .definition(offset)
+                .unwrap_or_else(|| panic!("{label}: an alias has a definition"));
+            assert_ne!(source, SourceId(0), "{label}: the target is in helper.vl");
+            assert_eq!(
+                b264_text(&document, source, span),
+                expected,
+                "{label}: go-to-definition lands on the target's declaration",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TypeScript's second answer: the hover carries the ALIAS's name and the
+    /// TARGET's signature, marked `(alias)`.
+    #[test]
+    fn b264_hover_at_an_alias_shows_the_alias_name_with_the_targets_signature() {
+        let (dir, document) = b264_aliased();
+        for (label, offset, expected) in [
+            (
+                "the type alias in an annotation",
+                b264_at("): Spot", 3),
+                "```vilan\n(alias) struct Spot {\n\tx: i32,\n}\n```",
+            ),
+            (
+                "the type alias as a literal head",
+                b264_at("\tSpot {", 1),
+                "```vilan\n(alias) struct Spot {\n\tx: i32,\n}\n```",
+            ),
+            (
+                "the type alias's own `as` name",
+                b264_at("as Spot", 3),
+                "```vilan\n(alias) struct Spot {\n\tx: i32,\n}\n```",
+            ),
+            (
+                "the value alias at a call",
+                b264_at("\thi();", 1),
+                "```vilan\n(alias) fun hi(): i32\n```",
+            ),
+            (
+                "the value alias's own `as` name",
+                b264_at("as hi", 3),
+                "```vilan\n(alias) fun hi(): i32\n```",
+            ),
+        ] {
+            assert_eq!(document.hover(offset).as_deref(), Some(expected), "{label}",);
+        }
+        // And the ORIGINAL's own name is not an alias: the import's path
+        // segment hovers as the declaration it names.
+        assert_eq!(
+            document.hover(b264_at("::Point", 2)).as_deref(),
+            Some("```vilan\nstruct Point {\n\tx: i32,\n}\n```"),
+            "the path segment spells the target, not the alias",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TypeScript's third answer, the alias side: every spelling of `Spot` —
+    /// its declaration, the annotation and the literal head — and nothing of
+    /// `Point`.
+    #[test]
+    fn b264_references_and_rename_at_a_type_position_alias_answer_the_alias() {
+        let (dir, document) = b264_aliased();
+        for (label, offset) in [
+            ("the annotation", b264_at("): Spot", 3)),
+            ("the literal head", b264_at("\tSpot {", 1)),
+            ("the `as` name", b264_at("as Spot", 3)),
+        ] {
+            let found: Vec<String> = document
+                .references(offset)
+                .into_iter()
+                .map(|(source, span)| b264_text(&document, source, span))
+                .collect();
+            assert_eq!(found, vec!["Spot", "Spot", "Spot"], "{label}: references");
+            let edits: Vec<String> = document
+                .rename_edits(offset, "Dot")
+                .expect("a rename at a type-position alias")
+                .into_iter()
+                .map(|(source, span, text)| {
+                    format!("{}->{text}", b264_text(&document, source, span))
+                })
+                .collect();
+            assert_eq!(
+                edits,
+                vec!["Spot->Dot", "Spot->Dot", "Spot->Dot"],
+                "{label}: rename rewrites the alias and its uses only",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same ruling from the ORIGINAL's side, and the row that made it a
+    /// bug rather than a gap: before the anchored-span remap, a query at
+    /// `::Point` listed a fourth "occurrence" covering the five bytes `Spot `
+    /// — the literal head narrowed by the TARGET's length — and a rename
+    /// applied it, producing `zzz{ x = 1 }`.
+    #[test]
+    fn b264_a_rename_at_the_original_leaves_the_type_alias_standing() {
+        let (dir, document) = b264_aliased();
+        let on_segment = b264_at("::Point", 2);
+        let found: Vec<String> = document
+            .references(on_segment)
+            .into_iter()
+            .map(|(source, span)| b264_text(&document, source, span))
+            .collect();
+        assert_eq!(
+            found,
+            vec!["Point", "Point"],
+            "the import's own segment and the declaration; the alias spells another name",
+        );
+        let edits: Vec<String> = document
+            .rename_edits(on_segment, "Dot")
+            .expect("a rename at the imported type")
+            .into_iter()
+            .map(|(source, span, text)| format!("{}->{text}", b264_text(&document, source, span)))
+            .collect();
+        assert_eq!(
+            edits,
+            vec!["Point->Dot", "Point->Dot"],
+            "no edit touches the alias or the literal head that spells it",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// INVARIANT 1 over the type-position fixture: the literal head was the one
+    /// row it could not describe.
+    #[test]
+    fn b264_every_indexed_span_covers_an_identifier_through_a_type_alias_too() {
+        let (dir, document) = b264_aliased();
+        let program = document.program.as_ref().expect("program");
+        let index = document.reference_index();
+        let mut checked = 0;
+        for row in index.rows() {
+            if row.source != SourceId(0) {
+                continue;
+            }
+            let name = name_of(program, row.definition).expect("a named definition");
+            let covered = B264_ALIASED
+                .get(row.span.into_range())
+                .unwrap_or_else(|| panic!("span {:?} is outside the entry text", row.span));
+            assert_eq!(
+                covered, name,
+                "row {row:?} covers {covered:?}, which is not the identifier {name:?}",
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8, "expected the whole file, checked {checked}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B317: a type's STATIC, imported under a bare name with an alias. The
+    /// free name binds the function's own entity, so every editor query that
+    /// travels an alias has to travel this one the same way.
+    const STATIC_ALIAS: &str = "\
+import pkg::helper::Length::rem as r;
+
+fun main(): i32 {
+\tlet _ = r(1);
+\tlet _ = r(2);
+\t0
+}
+";
+
+    const LENGTH_HELPER: &str = "\
+struct Length {
+\tsize: i32,
+}
+
+impl Length {
+\tfun rem(size: i32): Length {
+\t\tLength { size = size }
+\t}
+}
+";
+
+    fn static_aliased() -> (std::path::PathBuf, Document) {
+        crate::document::tests::analyze_workspace(&[
+            ("main.vl", STATIC_ALIAS),
+            ("helper.vl", LENGTH_HELPER),
+        ])
+    }
+
+    #[test]
+    fn b317_a_rename_at_the_alias_of_a_static_moves_the_alias_and_its_uses() {
+        // E145's invariant, over B317's new binding: the alias is this file's
+        // own name, so renaming it moves the alias and both uses and leaves
+        // `rem` — which is not this file's to rename — where it is.
+        let (dir, document) = static_aliased();
+        let on_alias = STATIC_ALIAS.find("as r").expect("fixture") + 3;
+        let edits = document
+            .rename_edits(on_alias, "rr")
+            .expect("a rename at the alias of a static");
+        assert_eq!(
+            alias_texts(
+                STATIC_ALIAS,
+                edits
+                    .iter()
+                    .map(|(source, span, _)| (*source, *span))
+                    .collect(),
+            ),
+            vec!["r", "r", "r"],
+            "the alias and both uses move",
+        );
+        assert!(
+            edits.iter().all(|(_, _, text)| text == "rr"),
+            "every edit writes the new name plainly",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b317_a_rename_at_the_static_path_segment_reaches_its_declaration() {
+        // The other direction, and the claim that the free name binds the
+        // FUNCTION'S OWN entity rather than a copy of it: renaming at the
+        // `::rem` segment reaches the declaration in the other file, and the
+        // alias — a different spelling — stays.
+        let (dir, document) = static_aliased();
+        let on_segment = STATIC_ALIAS.find("::rem").expect("fixture") + 2;
+        let edits = document
+            .rename_edits(on_segment, "rems")
+            .expect("a rename at the static's path segment");
+        assert_eq!(
+            alias_texts(
+                STATIC_ALIAS,
+                edits
+                    .iter()
+                    .map(|(source, span, _)| (*source, *span))
+                    .collect(),
+            ),
+            vec!["rem"],
+            "the path segment moves; `as r` is this file's own name and stays",
+        );
+        assert!(
+            edits.iter().any(|(source, _, _)| *source != SourceId(0)),
+            "and the declaration in `helper.vl` moves with it: {edits:#?}",
+        );
+        assert!(
+            edits.iter().all(|(_, _, text)| text == "rems"),
+            "every edit writes the new name plainly",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b317_find_references_from_a_use_of_an_aliased_static_lists_the_alias() {
+        // The reference index travels the alias like any other (E145): a use
+        // spelled `r` lists the alias declaration and both uses, and not the
+        // `rem` segment, which spells another name.
+        let (dir, document) = static_aliased();
+        let offset = STATIC_ALIAS.find("= r(1)").expect("fixture") + 2;
+        assert_eq!(
+            alias_texts(STATIC_ALIAS, document.references(offset)),
+            vec!["r", "r", "r"],
+            "the alias and both uses",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

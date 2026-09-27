@@ -4,17 +4,28 @@
 //!
 //! Safety: reprinting from the AST could, given a bug, silently change a program.
 //! So `format` re-lexes its own output and checks the token stream matches the
-//! input's (ignoring spans, whitespace, and comments); on any mismatch it returns
-//! the source unchanged rather than risk corrupting the file.
+//! input's (ignoring spans, whitespace, and comments), and then re-PARSES it, so
+//! a printer bug cannot write a file that does not read back (E209); on any
+//! failure it returns the source unchanged rather than risk corrupting the file.
+//! [`verify_reprint`] is where both checks live and why they are two.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 use crate::node::{
-    BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
-    NodeList, Pattern, StructInitializerField,
+    ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
+    GenericArguments, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
+    ItemLabels, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
+
+mod comment_reflow;
+
+/// The comment markers a paragraph may be written with — the reflow module's
+/// list, re-exported here because the paragraph GROUPING needs it too (a bare
+/// `//` is a paragraph break).
+use comment_reflow::MARKERS as MARKER_SPELLINGS;
 
 thread_local! {
     /// How many whole-buffer parses ([`parse`]) this thread has paid so far —
@@ -68,47 +79,298 @@ pub fn extract_comments(source: &str) -> Vec<(Span, &str)> {
 /// The lexer's token stream with spans stripped — the formatter's notion of "the
 /// same code", used to check a reprint didn't change anything but trivia.
 fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
+    Some(
+        code_tokens_spanned(source)?
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect(),
+    )
+}
+
+/// [`code_tokens`] with the spans kept — the source side of the net, where a
+/// decline has to say WHERE (E210). The reprint side never needs them: its
+/// spans point into a text the reader cannot see.
+fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
     let (tokens, lex_errors) = crate::lexing::tokenize(source);
-    lex_errors
-        .is_empty()
-        .then(|| tokens.into_iter().map(|(token, _)| token).collect())
+    lex_errors.is_empty().then_some(tokens)
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
-/// nothing but trivia and the three canonical orders. Four order-insensitivities
+/// nothing but trivia and the five canonical orders. Six order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
 /// (dropped), the canonical ordering of a top-level import run (see the
-/// canonical-import-order section below), the canonical ordering of a `style()`
-/// builder chain's links (see the canonical-style-chain-order section), and the
-/// canonical ordering of a `css` block's items (see the canonical-css-block-order
-/// section). Everything else must match token for token, so the net still catches
-/// every *other* reordering.
+/// canonical-import-order section below), the canonical ordering of an ELEMENT
+/// HEAD's items (see the canonical-element-head-order section), the canonical
+/// ordering of an `on` HEAD's condition values (see the canonical-on-head-order
+/// section), the canonical ordering of a `style()` builder chain's links (see the
+/// canonical-style-chain-order section), and the canonical ordering of a `css`
+/// block's items (see the canonical-css-block-order section). Everything else
+/// must match token for token, so the net still catches every *other*
+/// reordering.
 ///
 /// The css pass runs LAST so that a `style()` chain inside a hole is already
 /// canonical when a block's items are permuted around it — the block scan then
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    sort_css_blocks(sort_style_chains(sort_import_runs(&drop_trailing_commas(
-        tokens,
+    sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
+        sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
+            canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
+                collapse_field_shorthands(drop_trailing_commas(tokens)),
+            )),
+        ))),
     ))))
 }
 
-/// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
-/// Vilan treats such a trailing comma as insignificant (tuples need two or more
-/// elements, so there is no `(a,)` one-tuple to confuse it with), which lets the
-/// safety check accept the formatter normalizing trailing commas in or out.
+/// Moves every bare `export *;` to the FRONT of the token stream, so the safety
+/// net accepts the printer giving the marker its canonical place (E181) while
+/// still checking that the markers a file wrote all survive the reprint.
+///
+/// A relocation, deliberately, rather than a deletion. Dropping the three
+/// tokens from both streams would also accept a reprint that LOST the marker —
+/// a module-wide export silently deleted — and the net exists precisely to
+/// catch that class. Hoisting them all to one canonical position makes the two
+/// streams agree about where the marker is without making them agree about
+/// whether it is there: the count travels, and every other token keeps its
+/// order.
+///
+/// The one thing it gives up is a marker crossing a `mod` boundary, since the
+/// hoist does not respect block structure. That is the same concession
+/// [`sort_import_runs`] makes about a run's members, and the printer's move is
+/// TOP-LEVEL only, so nothing it does can reach the case.
+///
+/// `export *;` is the only production that lexes to this triple — the parser
+/// takes the `;` in its lookahead for exactly that reason (`export * helper;`
+/// is a deref, B321) — so the scan cannot mistake anything else for it.
+fn hoist_export_all_markers(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut markers = 0usize;
+    let mut rest: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == Token::Export
+            && tokens.get(index + 1) == Some(&Token::Op("*"))
+            && tokens.get(index + 2) == Some(&Token::Ctrl(';'))
+        {
+            markers += 1;
+            index += 3;
+            continue;
+        }
+        rest.push(tokens[index].clone());
+        index += 1;
+    }
+    if markers == 0 {
+        return rest;
+    }
+    let mut result = Vec::with_capacity(rest.len() + markers * 3);
+    for _ in 0..markers {
+        result.push(Token::Export);
+        result.push(Token::Op("*"));
+        result.push(Token::Ctrl(';'));
+    }
+    result.extend(rest);
+    result
+}
+
+/// Drops the `type` keyword in front of an ANONYMOUS binder — `type _` is `_`
+/// (B294) — so the safety check accepts the formatter canonicalizing the one
+/// into the other.
+///
+/// A deletion rather than a reordering, which is why it has to be folded in
+/// here at all: the net is token-for-token, so the printer's canonical `_`
+/// would otherwise fail to match the written `type _` and `format` would hand
+/// the source back unchanged.
+///
+/// The reduction is exact, not a concession. `type` reaches the lexer in
+/// exactly two productions, and the keyword carries no meaning in front of `_`
+/// in either. In a TYPE position it routes to the binder production, which `_`
+/// now reaches on its own. In a declared generic list (`fun f<type _>`) it sets
+/// `GenericParameter::is_type`, and nothing past the parser reads that flag
+/// except this printer — so the two spellings are one parameter there too.
+///
+/// Like [`drop_trailing_commas`] and [`collapse_field_shorthands`], it runs
+/// over BOTH streams, so the form reduces identically on each and the net still
+/// catches every other change.
+fn drop_anonymous_binder_keywords(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == Token::Type
+            && tokens.get(index + 1) == Some(&Token::Ident(ANONYMOUS_TYPE_BINDER))
+        {
+            index += 1;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Drops an import alias that renames a name to ITSELF — `import a::b as b;` is
+/// `import a::b;` — so the safety check accepts the formatter canonicalizing one
+/// into the other (E145's formatter third).
+///
+/// Recognized by shape, inside an import statement only: the three-token run
+/// `IDENT "as" IDENT` with both names equal, between an `import`/`use` head and
+/// its `;`. `as` reaches the lexer as a plain identifier and appears in exactly
+/// one production, so the statement bound is belt and braces rather than
+/// necessity — but it is what makes the pass unable to touch anything else.
+///
+/// An alias that renames to a DIFFERENT name is untouched, at every depth: it
+/// binds a name the module does not otherwise have, and dropping it would be a
+/// program change, not a canonicalization.
+fn drop_redundant_import_aliases(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut in_import = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        match &tokens[index] {
+            Token::Import | Token::Use => in_import = true,
+            Token::Ctrl(';') => in_import = false,
+            _ => {}
+        }
+        if in_import
+            && let (Some(Token::Ident(name)), Some(Token::Ident("as")), Some(Token::Ident(alias))) = (
+                tokens.get(index),
+                tokens.get(index + 1),
+                tokens.get(index + 2),
+            )
+            && name == alias
+        {
+            result.push(tokens[index].clone());
+            index += 3;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// Puts a declaration's two trailing clauses into the canonical order —
+/// `borrows p context c`, never `context c borrows p` — so the safety check
+/// accepts the formatter moving the clause across `borrows` (E146 rule 3).
+///
+/// Recognized by SHAPE, since a token stream has no tree to ask: the contextual
+/// keyword `context`, its clause (a bare name, or a parenthesised name list),
+/// and then `borrows` and its parameter name. `borrows` appears in exactly one
+/// production — a `fun` declaration's suffix — so a `context` clause followed
+/// immediately by it can only be that declaration's own pair. The closure-type
+/// clause a PARAMETER carries (`cb: (|| T) context c`) is followed by a `,` or
+/// a `)` and is never touched.
+///
+/// Like [`drop_trailing_commas`] and [`collapse_field_shorthands`], this runs
+/// over BOTH streams, so a form neither side produces reduces identically on
+/// both and the net still catches every other reordering.
+fn canonicalize_declaration_clauses(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == Token::Ident("context")
+            && let Some(after_clause) = context_clause_end(&tokens, index)
+            && tokens.get(after_clause) == Some(&Token::Borrows)
+            && matches!(tokens.get(after_clause + 1), Some(Token::Ident(_)))
+        {
+            result.push(Token::Borrows);
+            result.push(tokens[after_clause + 1].clone());
+            result.extend(tokens[index..after_clause].iter().cloned());
+            index = after_clause + 2;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// The index just past the `context` clause beginning at `index` (which the
+/// caller has checked holds the `context` word) — `context name` or
+/// `context (a, b)`. `None` if what follows is not a clause at all.
+fn context_clause_end(tokens: &[Token<'_>], index: usize) -> Option<usize> {
+    match tokens.get(index + 1) {
+        Some(Token::Ident(_)) => Some(index + 2),
+        Some(Token::Ctrl('(')) => {
+            let mut at = index + 2;
+            loop {
+                match tokens.get(at)? {
+                    Token::Ident(_) => at += 1,
+                    Token::Ctrl(',') => at += 1,
+                    Token::Ctrl(')') => return Some(at + 1),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Drops every comma that sits immediately before a closing `}`, `)`, `]`, or
+/// `>`. Vilan treats such a trailing comma as insignificant (tuples need two or
+/// more elements, so there is no `(a,)` one-tuple to confuse it with), which
+/// lets the safety check accept the formatter normalizing trailing commas in or
+/// out.
+///
+/// `>` is here for E217. A generic argument list is allow-trailing in the
+/// grammar, so `DeltaSource<List<T>, SeqOp<T>,>` is a spelling an author may
+/// write — and a HAND-WRAPPED `impl` header is exactly how one gets written.
+/// Without this the printer's answer (one line if it fits, and a trailing comma
+/// on every argument when it does not) token-drifted from the source and the
+/// whole FILE declined, so a header past the width had no formatted spelling at
+/// all. The comma and the `>` are adjacent in no other production: everywhere
+/// else a comma is followed by another argument, and a comparison's `>` follows
+/// an operand.
 fn drop_trailing_commas(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
     for token in tokens {
         if matches!(
             token,
-            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']')
+            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('>')
         ) {
             while let Some(Token::Ctrl(',')) = result.last() {
                 result.pop();
             }
         }
         result.push(token);
+    }
+    result
+}
+
+/// Collapses a struct-literal field written long — `x = x` — to the shorthand
+/// `x`, so the safety check accepts the formatter canonicalizing one into the
+/// other (E143). Recognized by SHAPE, since a token stream has no tree to ask:
+/// the three-token run `IDENT "=" IDENT` with both names equal, opened by a `{`
+/// or a `,` and closed by a `,` or a `}`.
+///
+/// That shape also covers a block whose tail expression is the self-assignment
+/// `{ x = x }`, which the printer never collapses. Being wider than the printer
+/// costs nothing and cannot hide a drift: the collapse runs over BOTH streams,
+/// so a form neither side produces reduces identically on both — exactly the
+/// looseness [`drop_trailing_commas`] carries for the trailing comma.
+pub fn collapse_field_shorthands(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let opened = matches!(result.last(), Some(Token::Ctrl('{') | Token::Ctrl(',')));
+        let long_form = match (
+            tokens.get(index),
+            tokens.get(index + 1),
+            tokens.get(index + 2),
+            tokens.get(index + 3),
+        ) {
+            (
+                Some(Token::Ident(name)),
+                Some(Token::Op("=")),
+                Some(Token::Ident(read)),
+                Some(Token::Ctrl(',') | Token::Ctrl('}')),
+            ) => name == read,
+            _ => false,
+        };
+        if opened && long_form {
+            result.push(tokens[index].clone());
+            index += 3;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
     }
     result
 }
@@ -165,10 +427,30 @@ enum RootRank {
 /// compare case-sensitively segment by segment, a shorter path sorts before a
 /// longer one extending it (`a` before `a::b`, via `End` < `Path`), and a brace
 /// set's branches are pre-sorted so the whole set compares canonically.
+///
+/// `SelfLeaf` is declared FIRST so a bare `self` member sorts ahead of every
+/// name in its group (E146). ASCII order put it last — `Option::{ self, None,
+/// Some }` reprinted as `Option::{ None, Some, self }` in 37 groups under N55's
+/// reformat, std's `prelude.vl` and `web.vl` among them — and `self` first is
+/// what a reader arrives with: it names the group's own namespace, so it reads
+/// as the head of the list rather than one more member of it. Only a bare
+/// `self` ranks: `self as name` is a rename and keys as one.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum BranchKey {
+    SelfLeaf,
     End,
     Path(String, Box<BranchKey>),
+    /// An `(impl TYPE)` selector (B318 S3): its subject's rendered type text
+    /// with every space removed, then its member set. Declared AFTER `Path` so
+    /// a selector sorts after every NAME in a brace set
+    /// (`visibility.md` §7.2 — B318's open (e), answered), and keyed on the
+    /// text rather than on a resolved type because the key is shared with the
+    /// token path, which has no analyzer and never will.
+    ///
+    /// Spaces are stripped so the two producers cannot disagree: the AST side
+    /// slices the subject's source text and the token side concatenates the
+    /// subject's tokens, and those differ in nothing else.
+    Selector(String, Box<BranchKey>),
     Set(Vec<BranchKey>),
 }
 
@@ -187,22 +469,59 @@ struct ImportSortKey {
 /// reduce to this shape, from which the shared key and the canonical token
 /// re-emission are derived.
 enum TokenBranch<'src> {
-    Path(&'src str, Option<Box<TokenBranch<'src>>>),
+    /// A segment: its name, an optional `::` continuation, and an optional
+    /// `as` alias (E142 — never both; the parser's tail type is what enforces
+    /// that, and this shape mirrors it flattened).
+    Path(&'src str, Option<Box<TokenBranch<'src>>>, Option<&'src str>),
     Set(Vec<TokenBranch<'src>>),
+    /// `#<branch>` — the B318 reach marker, kept in the key so `#hidden` and
+    /// `hidden` never reduce to one spelling.
+    Reach(Box<TokenBranch<'src>>),
+    /// An `(impl TYPE)` selector element (B318 S3): the subject's
+    /// space-stripped text, the subject's own tokens, and the members its
+    /// `::` tail names.
+    ///
+    /// The token vector is filled only by [`parse_token_branch`], which is the
+    /// only producer whose branches are ever re-emitted; [`branch_from_ast`]
+    /// leaves it empty, because an AST-derived branch exists to be KEYED and
+    /// the key reads the text.
+    Selector(String, Vec<Token<'src>>, Vec<&'src str>),
 }
 
 /// Drops the spans from an `ImportBranch`, giving the span-free [`TokenBranch`]
 /// the shared key operates on.
 fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
     match branch {
-        ImportBranch::Path(name, _, child) => TokenBranch::Path(
-            name,
-            child.as_ref().map(|child| Box::new(branch_from_ast(child))),
-        ),
+        ImportBranch::Path(name, _, tail) => match tail {
+            ImportTail::Leaf => TokenBranch::Path(name, None, None),
+            ImportTail::Continue(child) => {
+                TokenBranch::Path(name, Some(Box::new(branch_from_ast(child))), None)
+            }
+            // An alias that renames a name to itself is no alias at all, and
+            // reduces to the plain path here so the shared key cannot order the
+            // two spellings apart (E145).
+            ImportTail::Alias(alias, _) if alias == name => TokenBranch::Path(name, None, None),
+            ImportTail::Alias(alias, _) => TokenBranch::Path(name, None, Some(alias)),
+        },
+        // B318: the marker is part of the key. `#hidden` and `hidden` are two
+        // different statements about the author's intent, and a key that
+        // collapsed them would let the safety net reduce one to the other.
+        ImportBranch::Reach(_, inner) => TokenBranch::Reach(Box::new(branch_from_ast(inner))),
         ImportBranch::Set(branches) => {
             TokenBranch::Set(branches.iter().map(branch_from_ast).collect())
         }
+        ImportBranch::Selector(selector) => TokenBranch::Selector(
+            selector_key_text(&selector.subject_text),
+            Vec::new(),
+            selector.members.iter().map(|(name, _)| *name).collect(),
+        ),
     }
+}
+
+/// A selector subject's ORDER key: its text with every whitespace byte removed.
+/// See [`BranchKey::Selector`] for why the two producers meet here.
+fn selector_key_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// The canonical view of a branch for ordering and re-emission: a one-member
@@ -218,7 +537,12 @@ fn unwrap_singleton_set<'branch, 'src>(
     let mut current = branch;
     while let TokenBranch::Set(branches) = current {
         match branches.as_slice() {
-            [only @ TokenBranch::Path(name, _)] if *name != "self" => current = only,
+            [only @ TokenBranch::Path(name, ..)] if *name != "self" => current = only,
+            // B318: a marked singleton collapses too — `{ #hidden }` and
+            // `#hidden` are one import, and the printer collapses it, so the
+            // safety net has to reduce both to the same tokens or every marked
+            // brace set would make `vilan fmt` bail on its file.
+            [only @ TokenBranch::Reach(_)] => current = only,
             _ => break,
         }
     }
@@ -230,16 +554,47 @@ fn unwrap_singleton_set<'branch, 'src>(
 /// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
     match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, None) => {
-            BranchKey::Path((*name).to_string(), Box::new(BranchKey::End))
-        }
-        TokenBranch::Path(name, Some(child)) => {
+        // A bare `self` is the group's own namespace and sorts first (E146).
+        TokenBranch::Path("self", None, None) => BranchKey::SelfLeaf,
+        // An alias keys as the segment it renames plus the alias itself, so
+        // `a::b as c` and `a::b as d` are two imports the run orders stably
+        // rather than two spellings of one key (E142).
+        TokenBranch::Path(name, None, alias) => BranchKey::Path(
+            match alias {
+                Some(alias) => format!("{name} as {alias}"),
+                None => (*name).to_string(),
+            },
+            Box::new(BranchKey::End),
+        ),
+        TokenBranch::Path(name, Some(child), _) => {
             BranchKey::Path((*name).to_string(), Box::new(branch_key(child)))
         }
+        // The marker sorts with the name it marks — `#hidden` lands beside
+        // `hidden` rather than in a block of its own — and still keys apart,
+        // because the `#` is in the rendered name.
+        TokenBranch::Reach(inner) => match branch_key(inner) {
+            BranchKey::Path(name, rest) => BranchKey::Path(format!("#{name}"), rest),
+            other => other,
+        },
         TokenBranch::Set(branches) => {
             let mut keys: Vec<BranchKey> = branches.iter().map(branch_key).collect();
             keys.sort();
             BranchKey::Set(keys)
+        }
+        TokenBranch::Selector(subject, _, members) => {
+            let mut keys: Vec<BranchKey> = members
+                .iter()
+                .map(|name| BranchKey::Path((*name).to_string(), Box::new(BranchKey::End)))
+                .collect();
+            keys.sort();
+            BranchKey::Selector(
+                subject.clone(),
+                Box::new(if keys.is_empty() {
+                    BranchKey::End
+                } else {
+                    BranchKey::Set(keys)
+                }),
+            )
         }
     }
 }
@@ -250,7 +605,11 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
 /// collapsed reprint `import a;` land in the same place.
 fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey {
     let (root, rest) = match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, child) => {
+        // A bare selector has no root namespace to rank — it only reaches here
+        // through the unbraced form the parser refuses, and a refused file is
+        // never reprinted.
+        selector @ TokenBranch::Selector(..) => (RootRank::Unrooted, branch_key(selector)),
+        TokenBranch::Path(name, child, _) => {
             let root = match *name {
                 "std" => RootRank::Std,
                 "pkg" => RootRank::Pkg,
@@ -262,7 +621,7 @@ fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey 
             };
             (root, rest)
         }
-        TokenBranch::Set(_) => (RootRank::Unrooted, branch_key(branch)),
+        TokenBranch::Reach(_) | TokenBranch::Set(_) => (RootRank::Unrooted, branch_key(branch)),
     };
     ImportSortKey { kind, root, rest }
 }
@@ -275,9 +634,9 @@ fn import_kind_and_branch<'node, 'src>(
     node: &'node Node<'src>,
 ) -> Option<(ImportKind, &'node ImportBranch<'src>)> {
     match node {
-        Node::Import(branch) => Some((ImportKind::Import, branch)),
+        Node::Import(branch, ..) => Some((ImportKind::Import, branch)),
         Node::Use(branch) => Some((ImportKind::Use, branch)),
-        Node::Export(inner) => import_kind_and_branch(&inner.0),
+        Node::Export(_, inner, _) => import_kind_and_branch(&inner.0),
         _ => None,
     }
 }
@@ -313,6 +672,19 @@ fn token_name<'src>(tokens: &[Token<'src>], index: usize) -> Option<&'src str> {
     }
 }
 
+/// The contextual `as <name>` alias at `*index`, advancing past it when there
+/// is one (E142). Mirrors the parser's own two-token probe: `as` is an
+/// ordinary identifier everywhere else, so it only reads as an alias when a
+/// NAME follows it.
+fn token_alias<'src>(tokens: &[Token<'src>], index: &mut usize) -> Option<&'src str> {
+    if tokens.get(*index) != Some(&Token::Ident("as")) {
+        return None;
+    }
+    let alias = token_name(tokens, *index + 1)?;
+    *index += 2;
+    Some(alias)
+}
+
 /// Parses the `::`-separated import path beginning at `index` (mirroring the
 /// parser's `parse_namespace_path`: a name-headed path is tried before a brace
 /// set), returning the branch and the index just past it, or `None` if the
@@ -321,32 +693,66 @@ fn parse_token_branch<'src>(
     tokens: &[Token<'src>],
     index: usize,
 ) -> Option<(TokenBranch<'src>, usize)> {
+    // B318: the reach marker wraps whatever follows it, exactly as it does in
+    // the real grammar.
+    if tokens.get(index) == Some(&Token::Hash) {
+        let (inner, next) = parse_token_branch(tokens, index + 1)?;
+        return Some((TokenBranch::Reach(Box::new(inner)), next));
+    }
     if let Some(name) = token_name(tokens, index) {
         let mut next = index + 1;
+        let mut alias = None;
         let continuation = if tokens.get(next) == Some(&Token::Op("::")) {
             let (child, after) = parse_token_branch(tokens, next + 1)?;
             next = after;
             Some(Box::new(child))
         } else {
+            alias = token_alias(tokens, &mut next);
             None
         };
-        Some((TokenBranch::Path(name, continuation), next))
+        Some((TokenBranch::Path(name, continuation, alias), next))
     } else if tokens.get(index) == Some(&Token::Ctrl('{')) {
         let mut branches = Vec::new();
         let mut next = index + 1;
         // An empty set `{}` closes immediately; otherwise each element is a
-        // name-headed single path, comma-separated, allow-trailing.
+        // name-headed single path or an `(impl …)` SELECTOR (B318 S3),
+        // comma-separated, allow-trailing.
         while tokens.get(next) != Some(&Token::Ctrl('}')) {
+            if tokens.get(next) == Some(&Token::Hash) {
+                let (inner, after) = parse_token_branch(tokens, next)?;
+                branches.push(inner);
+                next = after;
+                match tokens.get(next) {
+                    Some(Token::Ctrl(',')) => {
+                        next += 1;
+                        continue;
+                    }
+                    Some(Token::Ctrl('}')) => break,
+                    _ => return None,
+                }
+            }
+            if let Some((selector, past)) = parse_token_selector(tokens, next) {
+                branches.push(selector);
+                next = past;
+                match tokens.get(next) {
+                    Some(Token::Ctrl(',')) => next += 1,
+                    Some(Token::Ctrl('}')) => break,
+                    _ => return None,
+                }
+                continue;
+            }
             let name = token_name(tokens, next)?;
             let mut after = next + 1;
+            let mut alias = None;
             let continuation = if tokens.get(after) == Some(&Token::Op("::")) {
                 let (child, past) = parse_token_branch(tokens, after + 1)?;
                 after = past;
                 Some(Box::new(child))
             } else {
+                alias = token_alias(tokens, &mut after);
                 None
             };
-            branches.push(TokenBranch::Path(name, continuation));
+            branches.push(TokenBranch::Path(name, continuation, alias));
             next = after;
             match tokens.get(next) {
                 Some(Token::Ctrl(',')) => next += 1,
@@ -360,6 +766,69 @@ fn parse_token_branch<'src>(
     }
 }
 
+/// Parses an `(impl TYPE)` selector element beginning at `index` — the token
+/// path's half of [`Parser::parse_impl_selector`] (B318 S3) — returning the
+/// branch and the index past it. `None` when the tokens are not a selector,
+/// which leaves the caller to read a path there instead.
+///
+/// The subject is taken as the balanced token run up to the selector's own `)`,
+/// which is all the safety net needs: it re-emits those tokens verbatim, and it
+/// keys on them with the spaces the source never had. Reading the type grammar
+/// a second time here would be a second grammar to keep in step, and the net's
+/// contract is that it cannot disagree with the parser — not that it
+/// understands types.
+fn parse_token_selector<'src>(
+    tokens: &[Token<'src>],
+    index: usize,
+) -> Option<(TokenBranch<'src>, usize)> {
+    if tokens.get(index) != Some(&Token::Ctrl('(')) || tokens.get(index + 1) != Some(&Token::Impl) {
+        return None;
+    }
+    let mut next = index + 2;
+    let mut depth = 0usize;
+    let mut subject: Vec<Token<'src>> = Vec::new();
+    loop {
+        match tokens.get(next)? {
+            Token::Ctrl(')') if depth == 0 => break,
+            token => {
+                match token {
+                    Token::Ctrl('(' | '[' | '{') => depth += 1,
+                    Token::Ctrl(')' | ']' | '}') => depth = depth.checked_sub(1)?,
+                    _ => {}
+                }
+                subject.push(token.clone());
+                next += 1;
+            }
+        }
+    }
+    if subject.is_empty() {
+        return None;
+    }
+    next += 1;
+    let mut members = Vec::new();
+    if tokens.get(next) == Some(&Token::Op("::")) {
+        next += 1;
+        if tokens.get(next) == Some(&Token::Ctrl('{')) {
+            next += 1;
+            while tokens.get(next) != Some(&Token::Ctrl('}')) {
+                members.push(token_name(tokens, next)?);
+                next += 1;
+                match tokens.get(next) {
+                    Some(Token::Ctrl(',')) => next += 1,
+                    Some(Token::Ctrl('}')) => break,
+                    _ => return None,
+                }
+            }
+            next += 1;
+        } else {
+            members.push(token_name(tokens, next)?);
+            next += 1;
+        }
+    }
+    let key = selector_key_text(&subject.iter().map(Token::to_string).collect::<String>());
+    Some((TokenBranch::Selector(key, subject, members), next))
+}
+
 /// Parses one import/use statement beginning at `index` into its kind, whether
 /// it is an `export` re-export, its path, and the index past its `;` — or `None`
 /// if the tokens do not match the import grammar (leaving the run unsorted, a
@@ -367,7 +836,7 @@ fn parse_token_branch<'src>(
 fn parse_import_statement<'src>(
     tokens: &[Token<'src>],
     index: usize,
-) -> Option<(ImportKind, bool, TokenBranch<'src>, usize)> {
+) -> Option<(ImportKind, bool, TokenBranch<'src>, bool, usize)> {
     let mut next = index;
     let export = tokens.get(next) == Some(&Token::Export);
     if export {
@@ -381,10 +850,17 @@ fn parse_import_statement<'src>(
     next += 1;
     let (branch, after) = parse_token_branch(tokens, next)?;
     next = after;
+    // B318's trailing `only`: read here and reported back, so the canonical
+    // re-emission puts it back where it was — dropping it would change what the
+    // statement MEANS, which is the one thing the safety net exists to catch.
+    let only = kind == ImportKind::Import && tokens.get(next) == Some(&Token::Ident("only"));
+    if only {
+        next += 1;
+    }
     if tokens.get(next) != Some(&Token::Ctrl(';')) {
         return None;
     }
-    Some((kind, export, branch, next + 1))
+    Some((kind, export, branch, only, next + 1))
 }
 
 /// Appends the canonical token form of an import path, brace sets sorted and a
@@ -393,11 +869,48 @@ fn parse_import_statement<'src>(
 /// braced source and the collapsed reprint to the same canonical tokens.
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
     match unwrap_singleton_set(branch) {
-        TokenBranch::Path(name, child) => {
+        TokenBranch::Path(name, child, alias) => {
             out.push(Token::Ident(name));
             if let Some(child) = child {
                 out.push(Token::Op("::"));
                 emit_branch_tokens(child, out);
+            }
+            if let Some(alias) = alias {
+                out.push(Token::Ident("as"));
+                out.push(Token::Ident(alias));
+            }
+        }
+        TokenBranch::Reach(inner) => {
+            out.push(Token::Hash);
+            emit_branch_tokens(inner, out);
+        }
+        TokenBranch::Selector(_, subject, members) => {
+            out.push(Token::Ctrl('('));
+            out.push(Token::Impl);
+            out.extend(subject.iter().cloned());
+            out.push(Token::Ctrl(')'));
+            let mut order: Vec<&'src str> = members.clone();
+            order.sort_unstable();
+            // One member has a canonical unbraced spelling — `(impl T)::{ m }`
+            // IS `(impl T)::m` — exactly as a one-member path set collapses
+            // ([`unwrap_singleton_set`], kolt.local 005).
+            match order.as_slice() {
+                [] => {}
+                [single] => {
+                    out.push(Token::Op("::"));
+                    out.push(Token::Ident(single));
+                }
+                many => {
+                    out.push(Token::Op("::"));
+                    out.push(Token::Ctrl('{'));
+                    for (position, member) in many.iter().enumerate() {
+                        if position > 0 {
+                            out.push(Token::Ctrl(','));
+                        }
+                        out.push(Token::Ident(member));
+                    }
+                    out.push(Token::Ctrl('}'));
+                }
             }
         }
         TokenBranch::Set(branches) => {
@@ -434,15 +947,15 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
         if depth == 0 && starts_import(tokens, index) {
             // Parse the maximal run of consecutive import statements. Each
             // statement consumes its own brace set, so depth stays 0 across it.
-            let mut statements: Vec<(ImportSortKey, ImportKind, bool, TokenBranch<'src>)> =
+            let mut statements: Vec<(ImportSortKey, ImportKind, bool, bool, TokenBranch<'src>)> =
                 Vec::new();
             let mut cursor = index;
             let mut parsed_cleanly = true;
             while cursor < tokens.len() && starts_import(tokens, cursor) {
                 match parse_import_statement(tokens, cursor) {
-                    Some((kind, export, branch, next)) => {
+                    Some((kind, export, branch, only, next)) => {
                         let key = import_sort_key(kind, &branch);
-                        statements.push((key, kind, export, branch));
+                        statements.push((key, kind, export, only, branch));
                         cursor = next;
                     }
                     None => {
@@ -453,7 +966,7 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
             }
             if parsed_cleanly && !statements.is_empty() {
                 statements.sort_by(|left, right| left.0.cmp(&right.0));
-                for (_, kind, export, branch) in &statements {
+                for (_, kind, export, only, branch) in &statements {
                     if *export {
                         result.push(Token::Export);
                     }
@@ -462,6 +975,9 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
                         ImportKind::Use => Token::Use,
                     });
                     emit_branch_tokens(branch, &mut result);
+                    if *only {
+                        result.push(Token::Ident("only"));
+                    }
                     result.push(Token::Ctrl(';'));
                 }
                 index = cursor;
@@ -546,18 +1062,25 @@ pub enum StyleCategory {
     Accessibility,
 }
 
-/// The four condition axes, in the order the selector nests them (and therefore
-/// the order the condition combinators require at the call site — see
-/// `render_rule` in `vilan/std/src/style.vl`). `Relation` is the axis
-/// `within`/`children`/`divide` write (ui-styling.md §0bis.6) — it holds the
-/// grammar seat the deleted `dark` held.
+/// The condition axes, in the order a selector writes them — which is both the
+/// order the nesting SUGAR requires at the call site and the canonical order the
+/// canonicaliser sorts a condition SET into (`token_axis` and `render_rule` in
+/// `vilan/std/src/style.vl`, style-conditions.md §2.1).
+///
+/// `Guard` and `Child` were one `Relation` axis while a relation was one slot.
+/// A95 splits them, because they are not the same position: an ancestor guard
+/// is a PREFIX (`[data-theme="dark"] .sX`) and a child relation a SUFFIX
+/// (`.sX > *`), and one set may hold both. `Element` is the pseudo-ELEMENT,
+/// which CSS puts last in a compound with nothing after it.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ConditionAxis {
     Media,
-    Relation,
+    Guard,
+    Child,
     Attribute,
     Pseudo,
+    Element,
 }
 
 /// One row of the canonical order table: a `Style` property method, the
@@ -605,6 +1128,7 @@ pub const STYLE_PROPERTY_METHODS: &[StyleMethod] = &[
     // it is its own family and may cross `flex`.
     StyleMethod { name: "flex_direction",        category: StyleCategory::FlexboxGrid,          family: "flex-direction",        properties: &["flex-direction"] },
     StyleMethod { name: "flex",                  category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex"] },
+    StyleMethod { name: "flex_grow",             category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex-grow"] },
     StyleMethod { name: "flex_shrink",           category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex-shrink"] },
     StyleMethod { name: "grid_template_columns", category: StyleCategory::FlexboxGrid,          family: "grid-template-columns", properties: &["grid-template-columns"] },
     StyleMethod { name: "gap",                   category: StyleCategory::FlexboxGrid,          family: "gap",                   properties: &["gap"] },
@@ -675,11 +1199,27 @@ pub const STYLE_PROPERTY_METHODS: &[StyleMethod] = &[
     StyleMethod { name: "user_select",           category: StyleCategory::Interactivity,        family: "user-select",           properties: &["user-select"] },
 ];
 
-/// The condition combinators, each with the axis it writes. Every condition
-/// sorts after every property method; among themselves they sort by axis, and
-/// two conditions on the SAME axis keep their written order (which is what lets
-/// `media`'s arbitrary min-width sit among `sm`/`md`/`lg`/`xl` without the
-/// formatter having to read its argument).
+/// The condition names, each with the axis it writes — read TWICE, and that is
+/// A95 S3's whole change to it (style-conditions.md §2.6).
+///
+/// As the **combinator** table it ranks a `.name(…)` LINK of a `style()` chain:
+/// every condition sorts after every property method, and among themselves by
+/// axis. As the **value** table it ranks the condition VALUES inside an
+/// `.on(<set>, …)` head, so `vilan fmt` rewrites `.on(md() + hover() +
+/// attribute("x"), ..)` to `.on(md() + attribute("x") + hover(), ..)` — the same
+/// order, one level down. One table for both because the free constructor and
+/// the `Style` method of a name are two spellings of one condition
+/// (`hover()` and `style().hover(inner)`), and a second table would be a second
+/// thing to keep in step.
+///
+/// Two conditions on the SAME axis keep their written order, which is what lets
+/// `media`'s arbitrary min-width sit among `sm`/`md`/`lg`/`xl`, and two
+/// `attribute(..)`s stay as written, without the formatter having to read an
+/// argument.
+///
+/// `element` is a VALUE with no method twin — there is no `Style::element` — and
+/// it is here because the value table needs it; a chain can never carry a link
+/// by that name, so the row costs the combinator reading nothing.
 #[doc(hidden)]
 #[rustfmt::skip]
 pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
@@ -688,9 +1228,9 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("lg",        ConditionAxis::Media),
     ("xl",        ConditionAxis::Media),
     ("media",     ConditionAxis::Media),
-    ("within",    ConditionAxis::Relation),
-    ("children",  ConditionAxis::Relation),
-    ("divide",    ConditionAxis::Relation),
+    ("within",    ConditionAxis::Guard),
+    ("children",  ConditionAxis::Child),
+    ("divide",    ConditionAxis::Child),
     ("attribute", ConditionAxis::Attribute),
     ("hover",     ConditionAxis::Pseudo),
     ("focus",     ConditionAxis::Pseudo),
@@ -699,7 +1239,38 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("first",     ConditionAxis::Pseudo),
     ("last",      ConditionAxis::Pseudo),
     ("pseudo",    ConditionAxis::Pseudo),
+    ("element",   ConditionAxis::Element),
 ];
+
+/// The canonical rank of ONE condition value written in an `on` head, by the
+/// constructor that opens it. `None` for a name the table does not know — a
+/// `let`-bound set (`interactive`), a user's own helper — which is a BARRIER
+/// exactly as an unknown chain link is: values sort only within the runs
+/// between barriers, so nothing known can cross something unknown.
+fn condition_value_rank(name: &str) -> Option<StyleLinkRank> {
+    STYLE_CONDITION_METHODS
+        .iter()
+        .find(|(condition, _)| *condition == name)
+        .map(|(_, axis)| StyleLinkRank::Condition(*axis))
+}
+
+/// The permutation that puts the condition values of one `on` head into the
+/// canonical order, or `None` when they are already in it (so an unchanged head
+/// stays on its existing code path, byte for byte) or when there is nothing to
+/// sort.
+///
+/// The reorder cannot change what is emitted, and the reason is the model's
+/// rather than a bet: a condition SET has no order. `canonical_condition` sorts
+/// the tokens itself before the slot key is built, so two spellings of one set
+/// already mint one class — which is exactly why the formatter can put the
+/// SOURCE in the order the selector reads in.
+fn condition_set_permutation(names: &[&str]) -> Option<Vec<usize>> {
+    let ranks: Vec<Option<StyleLinkRank>> = names
+        .iter()
+        .map(|name| condition_value_rank(name))
+        .collect();
+    canonical_permutation(&ranks)
+}
 
 /// The breakpoint combinators' own min-widths, as `style.vl` spells them: `md`
 /// is `self.media("768px", inner)`. Every row delegates to `media`, so this is
@@ -727,7 +1298,18 @@ pub const STYLE_BREAKPOINT_WIDTHS: &[(&str, &str)] = &[
 ///
 /// `add` (the `+` operator's method) and `class_list` are here for the same
 /// reason a user extension is: `add` merges an arbitrary right-hand `Style`,
-/// and `class_list` ends the chain.
+/// and `class_list` ends the chain. `when` (backlog A36) joins them: it merges
+/// an arbitrary right-hand `Style` exactly as `add` does, and its chain
+/// position is PRECEDENCE — two `when` links that set the same property resolve
+/// by which one comes last — so reordering it would change what renders.
+///
+/// `on` (A95) is the clearest case the category has: its condition is a VALUE
+/// in the argument list, so the axis the link belongs on is not in the name and
+/// the formatter would have to evaluate the call to find it. Sorting the
+/// condition values INSIDE an `on` head is a real job and a different one
+/// (style-conditions.md §2.6, slice 3) — this row says the LINK is a barrier
+/// until that lands, which is what keeps a chain around one from quietly
+/// reordering against a condition nobody can see.
 #[doc(hidden)]
 pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "rule",
@@ -735,8 +1317,9 @@ pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "with_length",
     "with_color",
     "with_border",
-    "child_relation",
+    "on",
     "add",
+    "when",
     "class_list",
 ];
 
@@ -938,6 +1521,148 @@ pub fn sort_style_chains<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
     result
 }
 
+// --- Canonical `on` head order ------------------------------------------------
+//
+// A95 S3. `Style::on(conditions, inner)` takes a condition SET, and a set has no
+// order — `canonical_condition` in `vilan/std/src/style.vl` sorts the tokens
+// itself before the slot key is built, so `md() + hover()` and `hover() + md()`
+// already mint one class. That is what lets the formatter put the SOURCE in the
+// order the selector reads in: the reorder cannot change the emitted stylesheet,
+// because the emitted stylesheet was never a function of the written order.
+//
+// The order is `STYLE_CONDITION_METHODS`' own, one level down from the chain
+// links it ranks (style-conditions.md §2.6). The degradation is the chain's:
+// a value the table does not know — a `let`-bound set, a helper of the author's
+// — is a BARRIER, so values sort only within the runs between barriers and
+// nothing known crosses something unknown.
+
+/// One `+`-separated segment of an `on` head, as the TOKEN scan sees it: the
+/// constructor name that opens it (`""` when the segment does not open with a
+/// path and a `(`, which makes it a barrier), and its token range.
+type ConditionSegment<'src> = (&'src str, std::ops::Range<usize>);
+
+/// The `+`-separated segments of the condition head that begins at `start` and
+/// ends before `end`, in written order. `None` when the run holds fewer than
+/// two segments, which is the overwhelmingly common single-condition head.
+fn condition_head_segments<'src>(
+    tokens: &[Token<'src>],
+    start: usize,
+    end: usize,
+) -> Option<Vec<ConditionSegment<'src>>> {
+    let mut segments = Vec::new();
+    let mut segment_start = start;
+    let mut depth = 0usize;
+    let mut scan = start;
+    while scan < end {
+        match tokens[scan] {
+            Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+            Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                depth = depth.checked_sub(1)?
+            }
+            Token::Op("+") if depth == 0 => {
+                segments.push((
+                    condition_segment_name(tokens, segment_start),
+                    segment_start..scan,
+                ));
+                segment_start = scan + 1;
+            }
+            _ => {}
+        }
+        scan += 1;
+    }
+    segments.push((
+        condition_segment_name(tokens, segment_start),
+        segment_start..end,
+    ));
+    (segments.len() > 1).then_some(segments)
+}
+
+/// The constructor a head segment opens with — the last name of its leading
+/// path, when that path is immediately called (`hover(`, `style::hover(`).
+/// `""` for anything else, which [`condition_value_rank`] reads as a barrier.
+fn condition_segment_name<'src>(tokens: &[Token<'src>], start: usize) -> &'src str {
+    let mut scan = start;
+    loop {
+        let Some(Token::Ident(segment)) = tokens.get(scan) else {
+            return "";
+        };
+        match tokens.get(scan + 1) {
+            Some(Token::Op("::")) => scan += 2,
+            Some(Token::Ctrl('(')) => return segment,
+            _ => return "",
+        }
+    }
+}
+
+/// Reorders the condition values of every `.on(<set>, …)` head into the
+/// canonical order, so that a source head and the printer's reordered reprint
+/// reduce to the same token sequence. Every other token keeps its position, so
+/// the safety net still catches every other reordering.
+///
+/// The head is the FIRST argument — up to the first top-level `,` — and the `css`
+/// block's own `.on(<set>) { … }` head is the same shape with no comma after it,
+/// so one scan covers both spellings.
+// `pub` (doc-hidden) for the same reason [`sort_style_chains`] is: the external
+// corpus tripwire mirrors the net's canonicalization through this ONE
+// implementation. Not part of the supported API.
+#[doc(hidden)]
+pub fn sort_on_heads<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
+    let mut result: Vec<Token<'src>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let permuted = on_head_span(&tokens, index).and_then(|(head_start, head_end)| {
+            let segments = condition_head_segments(&tokens, head_start, head_end)?;
+            let names: Vec<&str> = segments.iter().map(|(name, _)| *name).collect();
+            condition_set_permutation(&names).map(|order| (segments, order))
+        });
+        if let Some((segments, order)) = permuted {
+            // `.`, the name, `(` — everything up to the head itself.
+            result.extend_from_slice(&tokens[index..segments[0].1.start]);
+            for (at, segment) in order.into_iter().enumerate() {
+                if at > 0 {
+                    result.push(Token::Op("+"));
+                }
+                let range = segments[segment].1.clone();
+                result.extend(sort_on_heads(tokens[range].to_vec()));
+            }
+            index = segments
+                .last()
+                .map(|(_, range)| range.end)
+                .expect("a permutation implies at least two segments");
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// The token range of the condition head of the `. on (` that starts at
+/// `index` — from just after the `(` to the first top-level `,`, or to the `)`
+/// when the call takes no second argument (the `css` block's head).
+fn on_head_span(tokens: &[Token<'_>], index: usize) -> Option<(usize, usize)> {
+    if !matches!(tokens.get(index), Some(Token::Ctrl('.')))
+        || !matches!(tokens.get(index + 1), Some(Token::Ident("on")))
+        || !matches!(tokens.get(index + 2), Some(Token::Ctrl('(')))
+    {
+        return None;
+    }
+    let close = balanced_end(tokens, index + 2)?;
+    let start = index + 3;
+    let mut depth = 0usize;
+    for (offset, token) in tokens[start..close].iter().enumerate() {
+        match token {
+            Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+            Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                depth = depth.checked_sub(1)?
+            }
+            Token::Ctrl(',') if depth == 0 => return Some((start, start + offset)),
+            _ => {}
+        }
+    }
+    Some((start, close))
+}
+
 // --- Canonical `css` block order ---------------------------------------------
 //
 // A headless `css { … }` block gets the SAME canonical order a `style()` chain
@@ -1031,6 +1756,18 @@ fn css_body_items(tokens: &[Token<'_>], open: usize) -> Option<(Vec<CssTokenItem
                 if matches!(tokens.get(scan), Some(Token::Ctrl('('))) {
                     scan = balanced_end(tokens, scan)? + 1;
                 }
+                // A69: a `;` here is a CHAIN LINK, which ranks as a barrier —
+                // an opaque method may write any property, so nothing sorts
+                // across it, exactly as for an unknown declaration.
+                if matches!(tokens.get(scan), Some(Token::Ctrl(';'))) {
+                    items.push(CssTokenItem {
+                        rank: None,
+                        range: cursor..scan + 1,
+                        body_open: None,
+                    });
+                    cursor = scan + 1;
+                    continue;
+                }
                 if !matches!(tokens.get(scan), Some(Token::Ctrl('{'))) {
                     return None;
                 }
@@ -1043,9 +1780,10 @@ fn css_body_items(tokens: &[Token<'_>], open: usize) -> Option<(Vec<CssTokenItem
                 });
                 cursor = end + 1;
             }
-            // `property: value;` — the property is span-adjacent name and `-`
+            // `property(value);` — the property is span-adjacent name and `-`
             // tokens (`flex-direction` is three, `--color-ink` is five), which
-            // the parser has already proved adjacent by accepting the file.
+            // the parser has already proved adjacent by accepting the file, and
+            // then an ordinary argument list (A101).
             _ => {
                 let mut property = String::new();
                 let mut scan = cursor;
@@ -1063,23 +1801,12 @@ fn css_body_items(tokens: &[Token<'_>], open: usize) -> Option<(Vec<CssTokenItem
                     }
                     scan += 1;
                 }
-                if property.is_empty() || !matches!(tokens.get(scan), Some(Token::Op(":"))) {
+                if property.is_empty() || !matches!(tokens.get(scan), Some(Token::Ctrl('('))) {
                     return None;
                 }
-                // The value runs to the `;` at brace depth zero; a `{expr}` hole
-                // and a `calc(…)` both nest, and a `;` inside a string is a
-                // `Token::String`, not a `Ctrl`.
-                let mut depth = 0usize;
-                loop {
-                    match tokens.get(scan)? {
-                        Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
-                        Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
-                            depth = depth.checked_sub(1)?
-                        }
-                        Token::Ctrl(';') if depth == 0 => break,
-                        _ => {}
-                    }
-                    scan += 1;
+                scan = balanced_end(tokens, scan)? + 1;
+                if !matches!(tokens.get(scan), Some(Token::Ctrl(';'))) {
+                    return None;
                 }
                 items.push(CssTokenItem {
                     rank: css_item_rank(false, &property),
@@ -1112,8 +1839,8 @@ fn sorted_css_body<'src>(tokens: &[Token<'src>], open: usize) -> Option<(Vec<Tok
                 let (inner, _) = sorted_css_body(tokens, body_open)?;
                 body.extend(inner);
             }
-            // A declaration: a hole is an ordinary expression and may hold a
-            // block of its own.
+            // A declaration: an argument is an ordinary expression and may
+            // hold a block of its own.
             None => body.extend(sort_css_blocks(tokens[item.range.clone()].to_vec())),
         }
     }
@@ -1175,19 +1902,21 @@ pub struct ImportRunEdit {
     pub replacement: String,
 }
 
-/// A pruned import statement awaiting canonical rendering. A re-export is surface,
-/// not usage, so it is never pruned and renders from its original node; an
-/// `import`/`use` that survived (whole or in part) renders from a node rebuilt to
-/// carry only the leaves `keep` retained.
+/// A pruned import statement awaiting canonical rendering. Two statements
+/// render from their ORIGINAL node — a re-export, which is surface rather than
+/// usage and is never pruned, and E180's collision guard, whose whole answer is
+/// "this statement stands exactly as it was written" — and an `import`/`use`
+/// that survived whole or in part renders from a node rebuilt to carry only the
+/// leaves `keep` retained.
 enum PrunedStatement<'ast, 'src> {
-    ReExport(&'ast Node<'src>),
+    AsWritten(&'ast Node<'src>),
     Rebuilt(Node<'src>),
 }
 
 impl<'src> PrunedStatement<'_, 'src> {
     fn node(&self) -> &Node<'src> {
         match self {
-            PrunedStatement::ReExport(node) => node,
+            PrunedStatement::AsWritten(node) => node,
             PrunedStatement::Rebuilt(node) => node,
         }
     }
@@ -1204,11 +1933,42 @@ fn prune_import_branch<'src>(
     keep: &dyn Fn(Span) -> bool,
 ) -> Option<ImportBranch<'src>> {
     match branch {
-        ImportBranch::Path(name, span, None) => {
-            keep(*span).then_some(ImportBranch::Path(name, *span, None))
+        ImportBranch::Path(name, span, ImportTail::Leaf) => {
+            keep(*span).then_some(ImportBranch::Path(name, *span, ImportTail::Leaf))
         }
-        ImportBranch::Path(name, span, Some(child)) => prune_import_branch(child, keep)
-            .map(|pruned| ImportBranch::Path(name, *span, Some(Box::new(pruned)))),
+        // An aliased leaf is asked about at its ALIAS span, which is the name
+        // the file actually binds and therefore the one it can fail to use
+        // (E142); `collect_import_leaf_spans` offers the same span, so the
+        // organizer and the editor's fade go on asking one question.
+        ImportBranch::Path(name, span, ImportTail::Alias(alias, alias_span)) => keep(*alias_span)
+            .then_some(ImportBranch::Path(
+                name,
+                *span,
+                ImportTail::Alias(alias, *alias_span),
+            )),
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => {
+            prune_import_branch(child, keep).map(|pruned| {
+                ImportBranch::Path(name, *span, ImportTail::Continue(Box::new(pruned)))
+            })
+        }
+        // B318: a marked leaf prunes on the leaf's own question and keeps its
+        // marker. `#` is a fact about the author's intent, not a formatting
+        // decision, and stripping it would silently re-arm the §5 warning.
+        ImportBranch::Reach(marker, inner) => prune_import_branch(inner, keep)
+            .map(|pruned| ImportBranch::Reach(*marker, Box::new(pruned))),
+        // B318 S3: a selector is a TERMINAL kind, asked about at its own
+        // `(impl …)` span — the span the analyzer banked the selector's
+        // resolution under, so the editor's fade and the organizer's prune go
+        // on asking one question. The surviving copy drops the subject NODE: a
+        // pruned branch exists to be printed, and the text is what prints.
+        ImportBranch::Selector(selector) => keep(selector.span).then(|| {
+            ImportBranch::Selector(Box::new(ImplSelector {
+                subject: None,
+                subject_text: selector.subject_text.clone(),
+                members: selector.members.clone(),
+                span: selector.span,
+            }))
+        }),
         ImportBranch::Set(branches) => {
             let kept: Vec<ImportBranch<'src>> = branches
                 .iter()
@@ -1217,6 +1977,520 @@ fn prune_import_branch<'src>(
             (!kept.is_empty()).then_some(ImportBranch::Set(kept))
         }
     }
+}
+
+/// The MODULE an import statement reaches into: its path with the leaves
+/// removed, the span of that module's own segment, and how many segments the
+/// truncation left (E168).
+///
+/// `import pkg::a::b;` reaches into `pkg::a`; so does `import pkg::a::{ b, c };`
+/// — a brace set's common prefix IS the path before it, which is why one
+/// truncation answers both. A statement whose leaf is its second segment
+/// (`import pkg::a;`, `import std::json;`) truncates to the ORIGIN alone, and an
+/// origin is not a module whose file declares anything: the count is returned so
+/// the caller can refuse that case rather than rewrite `import pkg::a;` into
+/// `import pkg;`.
+fn import_module_branch<'src>(
+    branch: &ImportBranch<'src>,
+) -> Option<(ImportBranch<'src>, Span, usize)> {
+    match branch {
+        // This segment IS the leaf: there is no module path below it, and the
+        // parent turns itself into the terminal segment on the `None`.
+        ImportBranch::Path(_, _, ImportTail::Leaf | ImportTail::Alias(..)) => None,
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => {
+            match import_module_branch(child) {
+                Some((inner, module_span, depth)) => Some((
+                    ImportBranch::Path(name, *span, ImportTail::Continue(Box::new(inner))),
+                    module_span,
+                    depth + 1,
+                )),
+                None => Some((ImportBranch::Path(name, *span, ImportTail::Leaf), *span, 1)),
+            }
+        }
+        // A marked segment is the segment it marks, for the purpose of naming
+        // the module reached into.
+        ImportBranch::Reach(marker, inner) => {
+            import_module_branch(inner).map(|(branch, span, depth)| {
+                (ImportBranch::Reach(*marker, Box::new(branch)), span, depth)
+            })
+        }
+        // A brace set with no path before it has no module to name; neither
+        // does a bare selector.
+        ImportBranch::Set(_) | ImportBranch::Selector(_) => None,
+    }
+}
+
+/// What the organizer does with an `import` statement every one of whose leaves
+/// pruned away (E168, re-pointed at B318's selectors).
+///
+/// The statement may still be the only thing carrying an `impl` the file calls
+/// a method from, and the fix is the narrowest spelling that keeps it. Before
+/// selectors that was the whole module; with them it is the selector, when the
+/// file's uses of that module's blocks all come from ONE subject
+/// (`visibility.md` §7.2) — the precise statement of what the file actually
+/// needs, and the thing E168's own item said this would become.
+#[derive(Clone)]
+pub enum ModuleRescue {
+    /// The module brings the file nothing: the statement goes.
+    No,
+    /// `import <module>;` — the file uses more of the module than one block.
+    Module,
+    /// `import <module>::{ (impl <subject>) };` — it uses exactly one block's
+    /// members. The string is the subject as it should be rendered.
+    Selector(String),
+    /// E180: the module IS needed, but `import <module>;` would BIND the module
+    /// segment's name and the file has already taken it — kolt's generated
+    /// `src/lucide/lib.vl` declares `fun option()`, and the rescue
+    /// `import std::option;` bound `option` over it, so the organized file
+    /// stopped checking ("`option` is a module, not a value"). The organizer may
+    /// never write a statement whose new name collides, and the only edit that
+    /// is certainly safe on a file that builds is no edit: the statement is
+    /// printed exactly as written, and — E114/E173's contract, that what fades
+    /// is what the action removes — its leaves do NOT fade.
+    Keep,
+}
+
+/// E168: the statement `branch` becomes when every one of its leaves pruned
+/// away but `keep_module` says the module it reaches into is still needed —
+/// `import pkg::a;`, rendered through the canonical printer like any other
+/// surviving statement. [`RescuedImport::Dropped`] when the module is not
+/// wanted, or when the truncation would leave an ORIGIN rather than a module
+/// (see [`import_module_branch`]); [`RescuedImport::Verbatim`] when the rescue
+/// would bind a name this file has already taken (E180).
+///
+/// The predicate is asked at the module SEGMENT's span, which is the span the
+/// analyzer recorded the module's own reference at — so the editor answers it
+/// from the same table it answers the leaf question from, and the two cannot
+/// drift.
+fn module_only_import_branch<'src>(
+    branch: &ImportBranch<'src>,
+    keep_module: &dyn Fn(Span) -> ModuleRescue,
+) -> RescuedImport<'src> {
+    let Some((module, module_span, depth)) = import_module_branch(branch) else {
+        return RescuedImport::Dropped;
+    };
+    if depth < 2 {
+        return RescuedImport::Dropped;
+    }
+    match keep_module(module_span) {
+        ModuleRescue::No => RescuedImport::Dropped,
+        ModuleRescue::Module => RescuedImport::Narrowed(module),
+        ModuleRescue::Selector(subject) => {
+            RescuedImport::Narrowed(attach_selector(module, subject))
+        }
+        // E180's collision guard. The caller has the statement's own node and
+        // reprints that; the truncation computed above is thrown away, which is
+        // the point — a `Keep` is the organizer declining to narrow anything.
+        ModuleRescue::Keep => RescuedImport::Verbatim,
+    }
+}
+
+/// What [`module_only_import_branch`] decided about an import statement every
+/// one of whose leaves pruned away — the three-way answer [`ModuleRescue`]
+/// became once E180 added an outcome that is neither a deletion nor a rewrite.
+enum RescuedImport<'src> {
+    /// The module brings the file nothing (or the truncation would leave an
+    /// ORIGIN): the statement goes.
+    Dropped,
+    /// The narrower statement the rescue prints in its place.
+    Narrowed(ImportBranch<'src>),
+    /// The statement stands exactly as written (E180).
+    Verbatim,
+}
+
+/// `<module>` rewritten as `<module>::{ (impl <subject>) }` — the module path's
+/// terminal segment given a brace set holding one synthesized selector.
+///
+/// The selector carries no subject NODE: it exists to be printed, and the text
+/// is what prints ([`ImplSelector::subject`] says so).
+fn attach_selector<'src>(module: ImportBranch<'src>, subject: String) -> ImportBranch<'src> {
+    match module {
+        ImportBranch::Path(name, span, ImportTail::Continue(child)) => ImportBranch::Path(
+            name,
+            span,
+            ImportTail::Continue(Box::new(attach_selector(*child, subject))),
+        ),
+        ImportBranch::Path(name, span, _) => ImportBranch::Path(
+            name,
+            span,
+            ImportTail::Continue(Box::new(ImportBranch::Set(vec![ImportBranch::Selector(
+                Box::new(ImplSelector {
+                    subject: None,
+                    subject_text: Cow::Owned(subject),
+                    members: Vec::new(),
+                    span: Span::default(),
+                }),
+            )]))),
+        ),
+        other => other,
+    }
+}
+
+// --- Canonical element-head order --------------------------------------------
+//
+// `vilan fmt` canonicalizes the order of the items in an element HEAD (E151) —
+// the import sorter's and the style-chain sorter's third sibling, and the one
+// whose commuting groups are the easiest to state and the easiest to get wrong.
+//
+// An element head holds three kinds of item, and the desugar
+// (`crates/vilan-core/src/elements.rs`) is the whole argument about which of
+// them commute:
+//
+//   * an UNDOTTED attribute `name(value)` lowers to `.attr("name", value)`,
+//     which fills the attribute slot called `name` on the view and nothing
+//     else;
+//   * an `on:event(handler)` lowers to `.on("event", handler)` (or `.on_event`
+//     for a one-parameter handler), which fills the handler slot called
+//     `event` and nothing else;
+//   * a DOTTED item splices VERBATIM as a chain link — `.class(…)`,
+//     `.styled(…)`, `.bind_text(…)`, a user method — and the formatter knows
+//     nothing whatever about what slots it writes.
+//
+// So the first two kinds commute with each other and among themselves (two
+// distinct slots are independent; two items naming the SAME slot are a
+// last-wins pair the STABLE sort keeps in written order), and the third does
+// not commute with anything: `.styled(s)` writes `class`, `.child(…)` appends
+// in order, and a user method may write whatever it likes.
+//
+// The rule that follows is the style sorter's barrier rule, one construct over:
+// a dotted link is a BARRIER holding its position absolutely, items sort only
+// within the runs BETWEEN barriers, and no link ever moves relative to another
+// link. That is correct with zero knowledge of user code, and it degrades
+// gracefully — a head that is all links is left exactly as written.
+//
+// Within a run the order is [`ELEMENT_ATTRIBUTE_ORDER`] then everything else
+// alphabetically, and every `on:` handler after every attribute, alphabetically
+// among themselves. The six leading names are the ones a reader looks for first:
+// what the element IS (`id`, `name`, `type`), then what it POINTS AT (`for`,
+// `href`, `src`).
+//
+// What the reorder cannot change is what the element BUILDS. Every moved item
+// fills a slot named by its own first argument, so the surviving slot map is
+// identical across any permutation the rules above allow; only the order the
+// slots were INSERTED in differs, which HTML reads as a set exactly as CSS
+// reads a class list. `crates/vilan-cli/tests/element_head_order.rs` proves it
+// over a corpus, by building each element in written and in sorted order and
+// diffing the emitted JS.
+//
+// Refused outright: a head with a comment anywhere inside it. A reordered head
+// would carry its comments to the wrong item, and the comment cursor only moves
+// forward — the same refusal the style sorter makes, for the same reason.
+//
+// One consequence is worth naming rather than leaving to be discovered: an
+// attribute's VALUE is an arbitrary expression, so moving the item moves when
+// that expression is EVALUATED. Values in practice are literals and signal
+// reads, and a style chain's arguments are the same bargain that order shipped
+// with — but a value whose side effect has an order is outside what either
+// sorter promises.
+
+/// The undotted attribute names that lead an element head, in order. Everything
+/// else follows them alphabetically.
+///
+/// Deliberately short and deliberately not a category table: unlike a `Style`
+/// method, an attribute name is open (`data-*`, `aria-*`, a web component's
+/// own), so a table that tried to be exhaustive would be wrong the day someone
+/// wrote an attribute it had never heard of. These six are the ones a reader
+/// looks for first — what the element IS, then what it POINTS AT — and
+/// alphabetical is the rule for the rest.
+#[doc(hidden)]
+pub const ELEMENT_ATTRIBUTE_ORDER: &[&str] = &["id", "name", "type", "for", "href", "src"];
+
+/// One item of an element head, as the ORDER sees it: an undotted attribute by
+/// name, an `on:` handler by event name, or a dotted chain link — whose name is
+/// deliberately not read, because a link is a barrier whatever it is called.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElementHeadKind<'src> {
+    Attribute(&'src str),
+    Event(&'src str),
+    Link,
+}
+
+/// The canonical order of `items`, as a permutation of their indices — or
+/// `None` when they are already in it, so an unchanged head stays on its
+/// existing code path, byte for byte.
+///
+/// A [`ElementHeadKind::Link`] is a barrier: it keeps its index, and the items
+/// on either side of it sort within their own run. The sort is STABLE, so two
+/// items that rank equal — two attributes with the same name, two handlers on
+/// the same event, the last-wins pairs — keep their written order.
+#[doc(hidden)]
+pub fn element_head_permutation(items: &[ElementHeadKind<'_>]) -> Option<Vec<usize>> {
+    let mut order: Vec<usize> = Vec::with_capacity(items.len());
+    let mut run: Vec<usize> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        if matches!(item, ElementHeadKind::Link) {
+            run.sort_by_key(|index| element_head_sort_key(&items[*index]));
+            order.append(&mut run);
+            order.push(at);
+            continue;
+        }
+        run.push(at);
+    }
+    run.sort_by_key(|index| element_head_sort_key(&items[*index]));
+    order.append(&mut run);
+    (order != (0..items.len()).collect::<Vec<_>>()).then_some(order)
+}
+
+/// One head item's sort key within its run: attributes before handlers, the
+/// six leading names before every other attribute, alphabetical inside each
+/// band.
+fn element_head_sort_key<'src>(item: &ElementHeadKind<'src>) -> (u8, usize, &'src str) {
+    match item {
+        ElementHeadKind::Attribute(name) => (
+            0,
+            ELEMENT_ATTRIBUTE_ORDER
+                .iter()
+                .position(|leading| leading == name)
+                .unwrap_or(ELEMENT_ATTRIBUTE_ORDER.len()),
+            name,
+        ),
+        ElementHeadKind::Event(name) => (1, 0, name),
+        // Unreachable: a link is a barrier and never enters a run.
+        ElementHeadKind::Link => (2, 0, ""),
+    }
+}
+
+/// One head item as the order sees it. The one place an `ElementHeadItem` is
+/// classified, shared by the printer and by [`element_heads`], so the corpus
+/// proof and the formatter cannot disagree about what an item IS.
+fn element_head_kind<'src>(
+    item: &crate::node::ElementHeadItem<'src>,
+    source: &'src str,
+) -> ElementHeadKind<'src> {
+    match item {
+        crate::node::ElementHeadItem::Chain(_) => ElementHeadKind::Link,
+        crate::node::ElementHeadItem::Event((name, _), _) => ElementHeadKind::Event(name),
+        crate::node::ElementHeadItem::Attribute(name, _) => {
+            ElementHeadKind::Attribute(&source[name.into_range()])
+        }
+    }
+}
+
+/// Reorders the head items of every element in `tokens` into the canonical
+/// order — the TOKEN-level twin of the printer's own reorder, and the thing
+/// that lets the safety net accept it.
+///
+/// `format` re-lexes its output and compares the token stream with the input's,
+/// so a printer that MOVES tokens has to be matched by a pass that reduces both
+/// sides to one canonical sequence — exactly what [`sort_import_runs`] and
+/// [`sort_style_chains`] do for the other two orders. Everything else must
+/// still match token for token, so the net keeps catching every OTHER
+/// reordering.
+///
+/// The scan is deliberately conservative. A head it cannot read to a `>` or
+/// `/>` — a turbofish on a chain link, an unbalanced group, anything the shape
+/// below does not cover — is left exactly as written, which can only cost a
+/// reorder (the net then refuses the reprint and the file stays unformatted),
+/// never produce a wrong one. Two consequences of the token stream carrying no
+/// spans are worth naming: `<` is also less-than and a generic's bracket, and a
+/// hyphenated name is several tokens. The first is harmless because a head of
+/// two or more items that closes with `>` is an element by the same grammar the
+/// parser reads; the second is handled by joining `name - name` runs the way
+/// `Parser::element_name_text` does, which is what the printer emits.
+///
+/// Nesting is reached by recursion into each item's own tokens (a `.child(…)`
+/// link carrying an element) and by the outer scan continuing past the head
+/// (the element's children).
+#[doc(hidden)]
+pub fn sort_element_heads<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
+    let mut result: Vec<Token<'src>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if matches!(tokens[index], Token::Ctrl('<'))
+            && let Some((head_start, items, head_end)) = element_head_item_tokens(&tokens, index)
+            && items.len() >= 2
+        {
+            let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+            let kinds: Vec<ElementHeadKind<'_>> = items
+                .iter()
+                .zip(&names)
+                .map(|(item, name)| match item.group {
+                    HEAD_GROUP_ATTRIBUTE => ElementHeadKind::Attribute(name),
+                    HEAD_GROUP_EVENT => ElementHeadKind::Event(name),
+                    _ => ElementHeadKind::Link,
+                })
+                .collect();
+            let order = element_head_permutation(&kinds)
+                .unwrap_or_else(|| (0..items.len()).collect::<Vec<_>>());
+            result.extend(tokens[index..head_start].iter().cloned());
+            for at in order {
+                let range = items[at].range.clone();
+                result.extend(sort_element_heads(tokens[range].to_vec()));
+            }
+            index = head_end;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+const HEAD_GROUP_ATTRIBUTE: u8 = 0;
+const HEAD_GROUP_EVENT: u8 = 1;
+const HEAD_GROUP_LINK: u8 = 2;
+
+/// One head item as [`sort_element_heads`] reads it: which of the three kinds
+/// it is, the name the order sorts it by, and the token range that moves whole.
+struct HeadItemTokens {
+    group: u8,
+    name: String,
+    range: std::ops::Range<usize>,
+}
+
+/// Whether `token` can be part of an element or attribute NAME — the parser's
+/// own `peek_at_is_name`, which is "anything but punctuation and a literal", so
+/// that a keyword-spelled attribute (`type`, `for`) reads as the name it is.
+fn is_element_name_token(token: &Token<'_>) -> bool {
+    !matches!(
+        token,
+        Token::Ctrl(_)
+            | Token::Op(_)
+            | Token::String(_)
+            | Token::MultilineString(_)
+            | Token::Number(..)
+    )
+}
+
+/// The name beginning at `at` — one token, or a hyphenated run joined the way
+/// `Parser::element_name_text` joins it — and the index just past it.
+fn element_name_tokens(tokens: &[Token<'_>], at: usize) -> Option<(String, usize)> {
+    if !tokens.get(at).is_some_and(is_element_name_token) {
+        return None;
+    }
+    let mut text = tokens[at].to_string();
+    let mut index = at + 1;
+    while matches!(tokens.get(index), Some(Token::Op("-")))
+        && tokens.get(index + 1).is_some_and(is_element_name_token)
+    {
+        text.push('-');
+        text.push_str(&tokens[index + 1].to_string());
+        index += 2;
+    }
+    Some((text, index))
+}
+
+/// The index just past the group whose OPENING delimiter sits at `open`, or
+/// `None` when it never closes.
+fn balanced_group_end(tokens: &[Token<'_>], open: usize) -> Option<usize> {
+    if !matches!(tokens.get(open), Some(Token::Ctrl('(' | '[' | '{'))) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, token) in tokens[open..].iter().enumerate() {
+        match token {
+            Token::Ctrl('(' | '[' | '{') => depth += 1,
+            Token::Ctrl(')' | ']' | '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The head items of the element whose `<` sits at `open`: where the head
+/// begins (just past the tag), the items, and the index of the closing `>` or
+/// of the `/` of a `/>`. `None` when the tokens are not a head this pass reads.
+fn element_head_item_tokens(
+    tokens: &[Token<'_>],
+    open: usize,
+) -> Option<(usize, Vec<HeadItemTokens>, usize)> {
+    let (_, head_start) = element_name_tokens(tokens, open + 1)?;
+    let mut items: Vec<HeadItemTokens> = Vec::new();
+    let mut index = head_start;
+    loop {
+        match tokens.get(index) {
+            Some(Token::Ctrl('>')) => return Some((head_start, items, index)),
+            Some(Token::Op("/")) if matches!(tokens.get(index + 1), Some(Token::Ctrl('>'))) => {
+                return Some((head_start, items, index));
+            }
+            // A dotted chain link — the barrier. Read strictly: a dot, a name,
+            // a call. Anything else (a turbofish, a bare `.field`) declines the
+            // whole head rather than guessing where the item ends.
+            Some(Token::Ctrl('.')) => {
+                if !tokens.get(index + 1).is_some_and(is_element_name_token) {
+                    return None;
+                }
+                let after = balanced_group_end(tokens, index + 2)?;
+                items.push(HeadItemTokens {
+                    group: HEAD_GROUP_LINK,
+                    name: String::new(),
+                    range: index..after,
+                });
+                index = after;
+            }
+            Some(token) if is_element_name_token(token) => {
+                // `on:event(handler)` — read before the attribute form, which
+                // would otherwise take `on` as a bare boolean attribute.
+                if matches!(token, Token::Ident("on"))
+                    && matches!(tokens.get(index + 1), Some(Token::Op(":")))
+                    && tokens.get(index + 2).is_some_and(is_element_name_token)
+                {
+                    let after = balanced_group_end(tokens, index + 3)?;
+                    items.push(HeadItemTokens {
+                        group: HEAD_GROUP_EVENT,
+                        name: tokens[index + 2].to_string(),
+                        range: index..after,
+                    });
+                    index = after;
+                    continue;
+                }
+                let (name, past_name) = element_name_tokens(tokens, index)?;
+                // A bare name is a boolean attribute; a `(` opens its value.
+                let after = if matches!(tokens.get(past_name), Some(Token::Ctrl('('))) {
+                    balanced_group_end(tokens, past_name)?
+                } else {
+                    past_name
+                };
+                items.push(HeadItemTokens {
+                    group: HEAD_GROUP_ATTRIBUTE,
+                    name,
+                    range: index..after,
+                });
+                index = after;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Every element head in `source`, outermost first, each as its items' kinds —
+/// what `crates/vilan-cli/tests/element_head_order.rs` reads to assert a
+/// tracked fixture still carries a head worth ordering and is already in the
+/// canonical order. Returns an empty list when the source does not parse, which
+/// the caller reads as "decide nothing".
+#[doc(hidden)]
+pub fn element_heads(source: &str) -> Vec<Vec<ElementHeadKind<'_>>> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    let mut heads = Vec::new();
+    for item in &items {
+        collect_element_heads(item, source, &mut heads);
+    }
+    heads
+}
+
+fn collect_element_heads<'src>(
+    node: &Spanned<Node<'src>>,
+    source: &'src str,
+    heads: &mut Vec<Vec<ElementHeadKind<'src>>>,
+) {
+    if let Node::Element(body) = &node.0 {
+        heads.push(
+            body.head
+                .iter()
+                .map(|item| element_head_kind(item, source))
+                .collect(),
+        );
+    }
+    node.0
+        .for_each_child(&mut |child| collect_element_heads(child, source, heads));
 }
 
 /// The source spans of every TOP-LEVEL `import` / `use` / re-export statement.
@@ -1239,6 +2513,58 @@ pub fn import_statement_spans(source: &str) -> Vec<Span> {
         .collect()
 }
 
+/// Every top-level import LEAF's terminal-name span, in source order — the
+/// spans an editor asks about when it fades the imports nobody uses (E114).
+///
+/// The walk is [`prune_import_branch`]'s, so the editor and the organizer are
+/// asking about exactly one set of leaves: what the organizer would prune is
+/// what the editor fades, and nothing else can drift between them. A RE-EXPORT
+/// is excluded here for the same reason the organizer never prunes one —
+/// `export import` binds a name for somebody else, so this file not using it is
+/// the whole point rather than a mistake.
+///
+/// Empty when the source does not parse, which the caller reads as "decide
+/// nothing" — the same contract [`import_statement_spans`] has.
+pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    for item in items.iter() {
+        if matches!(item.0, Node::Export(..)) {
+            continue;
+        }
+        let Some((_, branch)) = import_kind_and_branch(&item.0) else {
+            continue;
+        };
+        collect_import_leaf_spans(branch, &mut spans);
+    }
+    spans
+}
+
+/// [`import_leaf_name_spans`]' recursion: a `Path` with a `::` continuation
+/// defers to the continuation, a brace `Set` yields every member's leaf, and a
+/// terminal `Path` IS the leaf.
+fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
+    match branch {
+        ImportBranch::Path(_, span, ImportTail::Leaf) => out.push(*span),
+        ImportBranch::Path(_, _, ImportTail::Alias(_, alias_span)) => out.push(*alias_span),
+        ImportBranch::Path(_, _, ImportTail::Continue(child)) => {
+            collect_import_leaf_spans(child, out)
+        }
+        ImportBranch::Reach(_, inner) => collect_import_leaf_spans(inner, out),
+        ImportBranch::Set(branches) => {
+            for branch in branches {
+                collect_import_leaf_spans(branch, out);
+            }
+        }
+        // A selector binds no name, but it IS a terminal the organizer prunes,
+        // so it is offered at its own span (`prune_import_branch`'s arm asks
+        // the same one).
+        ImportBranch::Selector(selector) => out.push(selector.span),
+    }
+}
+
 /// Organizes a file's *top-level* import runs: sorts each into canonical order
 /// (the shared [`import_sort_key`], identical to `vilan fmt`) and, per `keep`,
 /// prunes unused leaves. Returns one [`ImportRunEdit`] per run whose canonical
@@ -1247,22 +2573,26 @@ pub fn import_statement_spans(source: &str) -> Vec<Span> {
 /// `name_span` survives; pass `|_| true` for sort-only. `None` when the source
 /// doesn't parse cleanly (no edit would be safe). Block-scoped imports live
 /// inside item bodies, not the top-level list, so they are never considered.
+///
+/// `keep_module(module_span)` is the SECOND question, and it is asked only of a
+/// statement `keep` emptied out (E168): an `import` brings every `impl` in the
+/// module's file with it whatever leaf it names, so a statement whose leaves are
+/// all unused may still be the only thing carrying a method the file calls.
+/// Answering [`ModuleRescue::Module`] rewrites it to `import <module>;` instead
+/// of deleting it, and [`ModuleRescue::Selector`] to the narrower
+/// `import <module>::{ (impl T) };` (B318 S3) — the fade stays on the leaf,
+/// which is genuinely unused, and the build stays green. Pass
+/// `|_| ModuleRescue::No` to prune exactly as before.
 pub fn organize_import_runs(
     source: &str,
     keep: &dyn Fn(Span) -> bool,
+    keep_module: &dyn Fn(Span) -> ModuleRescue,
 ) -> Option<Vec<ImportRunEdit>> {
     let items = parse(source)?;
-    let mut printer = Printer {
-        out: String::new(),
-        indent: 0,
-        comments: extract_comments(source),
-        cursor: 0,
-        source,
-        bailed: false,
-        split: Split::Off,
-        probing: false,
-    };
-    Some(printer.organize_runs(&items, keep))
+    // The organizer rewrites import STATEMENTS, never the comments around them,
+    // so the comment width knob cannot reach its output.
+    let mut printer = Printer::new(source, FormatOptions::default());
+    Some(printer.organize_runs(&items, keep, keep_module))
 }
 
 // --- Insert an import (the add-import quickfix and auto-import completion) --
@@ -1291,6 +2621,9 @@ enum ImportLeafShape<'ast, 'src> {
     Single(&'src str, Span),
     /// A brace-set of trailing names (`import std::json::{ A, B }`).
     Set(&'ast [ImportBranch<'src>]),
+    /// An ALIASED leaf (`import std::json::Json as J`) — a shape the
+    /// add-import quickfix declines to extend (E142).
+    Aliased,
 }
 
 /// Splits a parsed import path into the segments leading to its terminal
@@ -1302,16 +2635,33 @@ fn decompose_import_branch<'ast, 'src>(
     branch: &'ast ImportBranch<'src>,
 ) -> (Vec<&'src str>, ImportLeafShape<'ast, 'src>) {
     match branch {
-        ImportBranch::Path(name, span, None) => (Vec::new(), ImportLeafShape::Single(name, *span)),
-        ImportBranch::Path(name, _, Some(child)) => match child.as_ref() {
+        ImportBranch::Path(name, span, ImportTail::Leaf) => {
+            (Vec::new(), ImportLeafShape::Single(name, *span))
+        }
+        // An aliased leaf is not a name the add-import quickfix may fold into a
+        // brace set — `{ Json as J, Encode }` would have to keep the alias with
+        // its own member and there is no span arithmetic that does — so it
+        // decomposes to a shape nothing matches.
+        ImportBranch::Path(_, _, ImportTail::Alias(..)) => (Vec::new(), ImportLeafShape::Aliased),
+        ImportBranch::Path(name, _, ImportTail::Continue(child)) => match child.as_ref() {
             ImportBranch::Set(branches) => (vec![*name], ImportLeafShape::Set(branches)),
+            // A selector binds no name, so a statement that is only a selector
+            // is not one the add-import quickfix may extend.
+            ImportBranch::Selector(_) => (Vec::new(), ImportLeafShape::Aliased),
             ImportBranch::Path(..) => {
                 let (mut prefix, shape) = decompose_import_branch(child);
                 prefix.insert(0, name);
                 (prefix, shape)
             }
+            // A marked continuation is not a shape the add-import quickfix may
+            // fold a new name into: the marker says something about the reach
+            // that a folded-in sibling does not share.
+            ImportBranch::Reach(..) => (Vec::new(), ImportLeafShape::Aliased),
         },
+        // Same, for a marked statement head.
+        ImportBranch::Reach(..) => (Vec::new(), ImportLeafShape::Aliased),
         ImportBranch::Set(branches) => (Vec::new(), ImportLeafShape::Set(branches)),
+        ImportBranch::Selector(_) => (Vec::new(), ImportLeafShape::Aliased),
     }
 }
 
@@ -1345,6 +2695,7 @@ fn try_extend_import<'src>(
         return ExtendOutcome::NoMatch;
     }
     match shape {
+        ImportLeafShape::Aliased => ExtendOutcome::NoMatch,
         ImportLeafShape::Single(name, span) => {
             if name == leaf {
                 return ExtendOutcome::AlreadyImported;
@@ -1360,7 +2711,7 @@ fn try_extend_import<'src>(
             let mut members: Vec<(&str, Span)> = Vec::with_capacity(branches.len());
             for member in branches {
                 match member {
-                    ImportBranch::Path(name, span, None) => {
+                    ImportBranch::Path(name, span, ImportTail::Leaf) => {
                         if *name == leaf {
                             return ExtendOutcome::AlreadyImported;
                         }
@@ -1398,7 +2749,7 @@ fn try_extend_import<'src>(
 /// which is not what an add-import quickfix asked for).
 fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node ImportBranch<'src>> {
     match node {
-        Node::Import(branch) => Some(branch),
+        Node::Import(branch, ..) => Some(branch),
         _ => None,
     }
 }
@@ -1407,9 +2758,9 @@ fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node Im
 /// would have, for finding where it belongs among a run's existing entries —
 /// without constructing a throwaway AST node to feed [`node_import_key`].
 fn fresh_import_sort_key(module_path: &[&str], leaf: &str) -> ImportSortKey {
-    let mut branch = TokenBranch::Path(leaf, None);
+    let mut branch = TokenBranch::Path(leaf, None, None);
     for segment in module_path.iter().rev() {
-        branch = TokenBranch::Path(segment, Some(Box::new(branch)));
+        branch = TokenBranch::Path(segment, Some(Box::new(branch)), None);
     }
     import_sort_key(ImportKind::Import, &branch)
 }
@@ -1564,9 +2915,455 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
     tree.filter(|_| errors.is_empty()).map(|(items, _)| items)
 }
 
+/// Why a reprint handed back the original bytes instead of a reprint
+/// (tracker N90).
+///
+/// A bail is not a diagnostic — it is the formatter declining to rewrite a file
+/// it does not fully understand, which is the right instinct and the wrong
+/// SILENCE: [`format`] hands the original back, so a caller comparing its
+/// answer to the file sees "already formatted" and a printer gap becomes
+/// invisible to the gate that exists to find it. `export let x = 1;` bailed
+/// through a whole order that way, green under `vilan fmt --check vilan/std`,
+/// and only an idempotency pin on one file caught it. So the four ways out are
+/// named, and [`reprint`] says which one it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The source does not lex. Not a printer gap: there is nothing to reprint.
+    DoesNotLex,
+    /// The source does not parse cleanly. Not a printer gap either.
+    DoesNotParse,
+    /// The printer met a construct it has no rule for — one of the three
+    /// `_ => self.decline(..)` fallbacks. This is the printer gap.
+    NoRule,
+    /// The reprint came out with a DIFFERENT token stream, so the safety net
+    /// threw it away. Also a printer gap, and a worse one: the rule exists and
+    /// is wrong.
+    WouldChangeTheCode,
+    /// The reprint carried the source's token stream — the net above was
+    /// satisfied — and is still not a Vilan file: it does not lex, or it does
+    /// not parse (E209). The worst printer gap of the four, because it is the
+    /// one the token-stream net cannot see; see [`verify_reprint`] for why the
+    /// two checks are independent.
+    ReprintDoesNotParse,
+    /// `[fmt] wrap_comments` re-filled a comment paragraph and the words came
+    /// out different (E205). Not a printer gap in the code — the CODE is
+    /// fine — but the one defect a token stream cannot see, since a comment is
+    /// trivia the lexer drops: so the reflow carries its own net, and a
+    /// failure declines the file rather than rewrite somebody's prose wrongly.
+    ReflowChangedTheWords,
+}
+
+/// What [`reprint`] declined on: the reason, and — for a printer gap — the
+/// construct in the words of the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decline {
+    pub reason: DeclineReason,
+    /// The first line of the construct the printer met, trimmed, or the empty
+    /// string when the decline names no construct (it did not lex or parse).
+    pub construct: String,
+    /// The 1-based line that construct starts on, when one is known.
+    pub line: Option<usize>,
+}
+
+impl Decline {
+    /// One line a tool can print after the file's name.
+    pub fn sentence(&self) -> String {
+        match self.reason {
+            DeclineReason::DoesNotLex => "it does not lex".to_string(),
+            DeclineReason::DoesNotParse => "it does not parse".to_string(),
+            DeclineReason::NoRule => format!(
+                "the printer has no rule for this construct yet: `{}`",
+                self.construct
+            ),
+            DeclineReason::WouldChangeTheCode => format!(
+                "reprinting it would have changed the code at this line, so the \
+                 reprint was thrown away (the formatter's own safety net): `{}`",
+                self.construct
+            ),
+            DeclineReason::ReflowChangedTheWords => format!(
+                "re-filling this comment to the line width would have changed its \
+                 WORDS, so nothing was rewritten (`[fmt] wrap_comments`, and the \
+                 formatter's own safety net): `{}`",
+                self.construct
+            ),
+            DeclineReason::ReprintDoesNotParse => format!(
+                "reprinting it produced text that is not a Vilan file, so the \
+                 reprint was thrown away (the formatter's own safety net): the \
+                 printer's output reads `{}` where it stops being readable",
+                self.construct
+            ),
+        }
+    }
+}
+
+/// What the printer declined on, recorded at the site that declined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclinedAt {
+    /// Which of the printer's OWN two declines this is:
+    /// [`DeclineReason::NoRule`] (a construct it cannot render) or
+    /// [`DeclineReason::ReflowChangedTheWords`] (E205's net).
+    reason: DeclineReason,
+    /// The span of the construct — the node the printer had no rule for, or
+    /// the first line of the comment the reflow would have rewritten.
+    span: Option<Span>,
+}
+
+/// The per-package knobs `vilan fmt` reads from a manifest's `[fmt]` section.
+///
+/// Deliberately tiny, and deliberately not a width for CODE: the formatter has
+/// ONE canonical layout for code (see [`LINE_BUDGET`]), and a code-width knob
+/// would fork the shape of every file in every project. What is here is what
+/// cannot be settled globally, and both of them are about PROSE — whether the
+/// formatter is allowed to rewrite the author's comments, and how wide the
+/// author writes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatOptions {
+    /// `[fmt] wrap_comments` (E205): re-fill a paragraph of `//` / `///` lines
+    /// to [`comment_width`](Self::comment_width), the way the printer already
+    /// lays out code.
+    ///
+    /// **Default OFF, for one release** (R8 at Order 39's GO, held by E215's
+    /// R3 until std has run under it for one order). Rewrapping somebody's
+    /// comments is the one thing the formatter does that no token comparison
+    /// can check, so it earns its default by being asked for first. With the
+    /// key off, `vilan fmt` is byte-for-byte what it was.
+    pub wrap_comments: bool,
+    /// `[fmt] comment_width` (E215's R1): the column budget one re-filled
+    /// comment line is laid out to, at that comment's own indentation.
+    ///
+    /// **Default [`DEFAULT_COMMENT_WIDTH`], the code width** — which is what
+    /// E205 shipped and what a package that says nothing keeps. It is a
+    /// separate width because prose is not code: std's comments are written to
+    /// ~84 columns, so re-filling them to the code width would move 6,719
+    /// comment lines to a width nobody chose. Read only when
+    /// [`wrap_comments`](Self::wrap_comments) is on — with the knob off no
+    /// comment is re-laid-out at any width.
+    pub comment_width: usize,
+}
+
+impl Default for FormatOptions {
+    fn default() -> Self {
+        Self {
+            wrap_comments: false,
+            comment_width: DEFAULT_COMMENT_WIDTH,
+        }
+    }
+}
+
+/// Formats `original`, returning the reprinted text — or the [`Decline`] that
+/// says why there is none.
+///
+/// This is [`format`]'s honest half, and the one a TOOL should call: `format`
+/// returns the input on every way out, which a caller cannot tell from a file
+/// that was already canonical.
+///
+/// Canonical Vilan is LF and carries no BOM (`windows-support.md` §2), so the
+/// whole reprint runs over the NORMALIZED text: a CRLF file formats to its LF
+/// form exactly once and is idempotent after, the same way indentation is
+/// canonicalized. Normalizing here rather than at each emission site is what
+/// keeps the verbatim slices — macro arguments, an `i"…"` literal, a plain or
+/// triple-quoted string's raw text — free of `\r`, and it keeps the token-stream
+/// safety net comparing like with like (both sides lex from LF text). A decline
+/// leaves the caller the ORIGINAL bytes to keep: a file the formatter does not
+/// fully understand is not one to rewrite, not even its line endings. The line
+/// a `Decline` reports is the same in both, since normalizing removes no lines.
+pub fn reprint(original: &str) -> Result<String, Decline> {
+    reprint_with(original, FormatOptions::default())
+}
+
+/// [`reprint`] under a package's own `[fmt]` options (E205).
+///
+/// The knobs are a SEPARATE entry point rather than a parameter on `reprint`,
+/// so that every existing caller — the language server, the playground, the
+/// tests — keeps the canonical output it had, and a tool that has read a
+/// manifest opts in explicitly.
+pub fn reprint_with(original: &str, options: FormatOptions) -> Result<String, Decline> {
+    let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
+    let source: &str = &normalized;
+    let Some(original_tokens) = code_tokens_spanned(source) else {
+        return Err(decline(source, DeclineReason::DoesNotLex, None));
+    };
+    let Some(items) = parse(source) else {
+        return Err(decline(source, DeclineReason::DoesNotParse, None));
+    };
+    let mut printer = Printer::new(source, options);
+    let prev_end = printer.print_items(&items, 0, true);
+    // Comments after the last item (trailing end-of-file comments).
+    printer.flush_comments_before(source.len(), prev_end);
+    printer.out.push('\n');
+    if let Some(declined) = printer.declined {
+        return Err(decline(source, declined.reason, declined.span));
+    }
+    verify_reprint(source, &original_tokens, &printer.out)?;
+    Ok(printer.out)
+}
+
+/// The safety net over a finished reprint: the two independent checks that
+/// stand between the printer and the file on disk. `Ok(())` means the reprint
+/// is safe to write.
+///
+/// **(a) The token stream.** The reprint must carry the source's tokens, up to
+/// trivia and the canonical orders [`normalize`] folds in.
+///
+/// **(b) The reprint must be a Vilan file** (E209). Not implied by (a), and
+/// that is the whole reason it exists: three of `normalize`'s
+/// canonicalizations are DELETIONS — [`drop_trailing_commas`],
+/// [`drop_anonymous_binder_keywords`], [`drop_redundant_import_aliases`] — so
+/// two streams that are not the same stream normalize to the same stream, by
+/// design. That is how (a) accepts the printer writing a trailing comma in or
+/// out, and it is also how a printer emitting `fun main() {,}` passes (a) with
+/// output the parser rejects: the stray comma is dropped from both sides.
+/// N108's real bug — a `const { … }` statement printed without its `;` — was
+/// caught by (a) only because that particular loss happened to be visible to
+/// it; the same loss inside a canonicalized shape would have shipped a file
+/// that does not parse. One more whole-buffer parse per format is the price,
+/// and it is paid only on (a)'s success path.
+fn verify_reprint(
+    source: &str,
+    original_tokens: &[Spanned<Token<'_>>],
+    reprinted: &str,
+) -> Result<(), Decline> {
+    let canonical_source = normalize(
+        original_tokens
+            .iter()
+            .map(|(token, _)| token.clone())
+            .collect(),
+    );
+    match code_tokens(reprinted).map(normalize) {
+        Some(canonical_reprint) if canonical_reprint == canonical_source => {}
+        Some(canonical_reprint) => {
+            let at = diverging_span(original_tokens, &canonical_source, &canonical_reprint);
+            return Err(decline_at_line(
+                source,
+                DeclineReason::WouldChangeTheCode,
+                at,
+            ));
+        }
+        // A reprint that does not even lex cannot be compared, and it is
+        // exactly (b)'s class — so it takes (b)'s answer rather than being
+        // reported as a token drift the net could not actually measure.
+        None => return Err(reprint_is_not_a_vilan_file(reprinted)),
+    }
+    if unreadable_line_of(reprinted).is_some() {
+        return Err(reprint_is_not_a_vilan_file(reprinted));
+    }
+    Ok(())
+}
+
+/// The position at which two streams stop agreeing — the length of their
+/// common prefix, which for streams of different length is where the shorter
+/// one ran out. Called only after the comparison FAILED, so the answer is
+/// always a real divergence.
+fn first_divergence(source: &[Token<'_>], reprint: &[Token<'_>]) -> usize {
+    source
+        .iter()
+        .zip(reprint)
+        .position(|(written, printed)| written != printed)
+        .unwrap_or_else(|| source.len().min(reprint.len()))
+}
+
+/// Where in the SOURCE the reprint stopped agreeing with it — E210's answer,
+/// in place of the file's first item.
+///
+/// The bisect runs over the two NORMALIZED streams, because those are what the
+/// net compares: bisecting the raw streams would report the first of the six
+/// canonical REORDERINGS the net deliberately accepts, which for a typical
+/// file is its import run — and "the file's first import" is exactly the
+/// wrong-place answer E210 exists to remove (it sent N108's investigation
+/// thirty lines off, into the wrong grammar).
+///
+/// Mapping a normalized position back to a written one needs the
+/// canonicalization's own alignment, and the alignment is read off rather than
+/// tracked: [`normalize`] both permutes and DELETES, so a normalized index is
+/// a written index only where the two streams still agree position for
+/// position. Both ends are tried, and each is exact where it applies.
+///
+/// * The common PREFIX covers every file whose canonicalization happens after
+///   the divergence — which is every already-canonical file, so the whole
+///   steady state of `vilan fmt --check`, and N108's repro among them.
+/// * The common SUFFIX covers the opposite and more interesting case: a file
+///   whose imports (at the top) reorder and whose printer bug is further down.
+///   Counting from the end walks past the canonicalization entirely.
+/// * Where neither reaches — a divergence *inside* a canonicalized region —
+///   the answer is the first token the canonicalization itself moved. That is
+///   honest ("the reprint and the file part company at or after here") and it
+///   is still a token rather than an item, so it never degrades to naming the
+///   file's first declaration.
+///
+/// A reprint that runs LONGER than the source has no diverging source token at
+/// all; it is named at the file's last one, which is where the extra output
+/// begins.
+fn diverging_span(
+    original: &[Spanned<Token<'_>>],
+    canonical_source: &[Token<'_>],
+    canonical_reprint: &[Token<'_>],
+) -> Option<Span> {
+    let at = first_divergence(canonical_source, canonical_reprint);
+    let span_of = |index: usize| original.get(index).map(|(_, span)| *span);
+    // How far the canonicalized stream is still the file's own stream, from
+    // each end. `position` over the zip stops at the shorter of the two, which
+    // is the bound either way.
+    let aligned_prefix = canonical_source
+        .iter()
+        .zip(original)
+        .position(|(canonical, (written, _))| canonical != written)
+        .unwrap_or_else(|| canonical_source.len().min(original.len()));
+    if at < aligned_prefix {
+        return span_of(at);
+    }
+    let aligned_suffix = canonical_source
+        .iter()
+        .rev()
+        .zip(original.iter().rev())
+        .position(|(canonical, (written, _))| canonical != written)
+        .unwrap_or_else(|| canonical_source.len().min(original.len()));
+    let from_the_end = canonical_source.len() - at.min(canonical_source.len());
+    if from_the_end > 0
+        && from_the_end <= aligned_suffix
+        && let Some(index) = original.len().checked_sub(from_the_end)
+    {
+        return span_of(index);
+    }
+    span_of(aligned_prefix).or_else(|| original.last().map(|(_, span)| *span))
+}
+
+/// The [`Decline`] for a net anchored at a TOKEN rather than at a node: the
+/// reason, the SOURCE LINE that token sits on, and that line's 1-based number.
+///
+/// The line rather than the token, because a token's own text names nothing —
+/// N108's lost terminator is a bare `;`, where the line it sits on is `};`,
+/// which is the construct to go and look at.
+fn decline_at_line(source: &str, reason: DeclineReason, span: Option<Span>) -> Decline {
+    Decline {
+        reason,
+        construct: span
+            .map(|span| line_text_at(source, span))
+            .unwrap_or_default(),
+        line: span.map(|span| line_of(source, span)),
+    }
+}
+
+/// The [`DeclineReason::ReprintDoesNotParse`] decline, naming the line of the
+/// PRINTER'S OWN OUTPUT where the output stops being readable.
+///
+/// The construct comes from the reprint, not the source, because that is where
+/// the defect is — and [`Decline::line`] is deliberately `None` for it: the
+/// number would be a line of a text the reader cannot see, and a tool printing
+/// `file:line` would send them to the wrong place in the file they can. The
+/// line's TEXT is what travels, since it is usually greppable in the source.
+fn reprint_is_not_a_vilan_file(reprinted: &str) -> Decline {
+    Decline {
+        reason: DeclineReason::ReprintDoesNotParse,
+        construct: unreadable_line_of(reprinted).unwrap_or_default(),
+        line: None,
+    }
+}
+
+/// The first line of `text` that the lexer or the parser refuses, trimmed —
+/// `None` when `text` is a Vilan file. The formatter's own output is the only
+/// caller: this is E209's check.
+///
+/// Lexing is asked first and separately, because [`crate::parsing`] tokenizes
+/// and then parses whatever tokens it got: a source that does not lex can
+/// still reach the parser with a clean-looking stream, so a parse alone would
+/// wave an unlexable reprint through.
+fn unreadable_line_of(text: &str) -> Option<String> {
+    let (_, lex_errors) = crate::lexing::tokenize(text);
+    if let Some(error) = lex_errors.first() {
+        let at = Span::new((), error.position..error.position);
+        return Some(line_text_at(text, at));
+    }
+    BUFFER_PARSES.with(|count| count.set(count.get() + 1));
+    let (_, parse_errors) = crate::parsing::parse_preserving_groups(text);
+    parse_errors
+        .first()
+        .map(|error| line_text_at(text, error.span))
+}
+
+/// Builds the [`Decline`] a reprint answers with: the reason, and the construct
+/// read out of `source` at `span` when the decline names one.
+fn decline(source: &str, reason: DeclineReason, span: Option<Span>) -> Decline {
+    Decline {
+        reason,
+        construct: span
+            .map(|span| first_line_at(source, span))
+            .unwrap_or_default(),
+        line: span.map(|span| line_of(source, span)),
+    }
+}
+
+/// The 1-based line `span` starts on. Sliced through `get`, never by index: a
+/// formatter that PANICS on a span is worse than one that declines, and the
+/// language server runs this behind a fence it should not need.
+fn line_of(source: &str, span: Span) -> usize {
+    let start = span.into_range().start.min(source.len());
+    source
+        .get(..start)
+        .unwrap_or_default()
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+/// The first line of the source at `span`, trimmed and clipped — what a tool
+/// shows a reader so they can go and look at the construct themselves.
+fn first_line_at(source: &str, span: Span) -> String {
+    let range = span.into_range();
+    let start = range.start.min(source.len());
+    let end = range.end.min(source.len()).max(start);
+    let text = source
+        .get(start..end)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    clip(text)
+}
+
+/// The whole source LINE `span` starts on, trimmed and clipped.
+///
+/// The companion to [`first_line_at`], for a decline anchored at a TOKEN
+/// rather than at a node. A token's own text is usually no help to a reader —
+/// N108's lost terminator is a bare `;`, and `` `;` `` names nothing — while
+/// the line it sits on is `};`, which is exactly the construct to go and look
+/// at. Sliced through `get` for the same reason [`line_of`] is: a formatter
+/// that panics on a span is worse than one that declines.
+fn line_text_at(source: &str, span: Span) -> String {
+    let at = span.into_range().start.min(source.len());
+    let start = source
+        .get(..at)
+        .unwrap_or_default()
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source
+        .get(start..)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    clip(line)
+}
+
+/// One line of a decline's construct, clipped so a tool's output stays one
+/// line however wide the source's was.
+fn clip(text: &str) -> String {
+    const CLIP: usize = 120;
+    if text.chars().count() > CLIP {
+        format!("{}…", text.chars().take(CLIP).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
 /// Formats `original`, returning the reprinted text. Returns the input unchanged
 /// if it doesn't lex/parse, if the printer hits a construct it doesn't yet handle,
 /// or if the reprint would change the code (see the safety note).
+///
+/// A caller that must tell "already canonical" from "declined" calls
+/// [`reprint`] instead — this one cannot say which happened, by construction.
 ///
 /// Canonical Vilan is LF and carries no BOM (`windows-support.md` §2), so the
 /// whole reprint runs over the NORMALIZED text: a CRLF file formats to its LF
@@ -1578,49 +3375,23 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
 /// still returns the ORIGINAL bytes: a file the formatter does not fully
 /// understand is not one to rewrite, not even its line endings.
 pub fn format(original: &str) -> String {
-    let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
-    let source: &str = &normalized;
-    let Some(original_tokens) = code_tokens(source) else {
-        return original.to_string();
-    };
-    let Some(items) = parse(source) else {
-        return original.to_string();
-    };
-    let mut printer = Printer {
-        out: String::new(),
-        indent: 0,
-        comments: extract_comments(source),
-        cursor: 0,
-        source,
-        bailed: false,
-        split: Split::Off,
-        probing: false,
-    };
-    let prev_end = printer.print_items(&items, 0, true);
-    // Comments after the last item (trailing end-of-file comments).
-    printer.flush_comments_before(source.len(), prev_end);
-    printer.out.push('\n');
-    if printer.bailed {
-        return original.to_string();
-    }
-    let matches = code_tokens(&printer.out)
-        .is_some_and(|reprinted| normalize(reprinted) == normalize(original_tokens));
-    if matches {
-        printer.out
-    } else {
-        original.to_string()
-    }
+    reprint(original).unwrap_or_else(|_| original.to_string())
 }
 
 /// The column budget for ONE rendered line. A line whose inline rendering is
 /// *wider* than this re-renders in split form when the construct on it has one
-/// (a postfix chain of at least two `.name(…)` call links breaks one link per
-/// line; a list literal breaks one element per line); at exactly the budget it
+/// (a postfix chain breaks one `.name(…)` call link per line, from one link up;
+/// a list literal breaks one element per line); at exactly the budget it
 /// stays inline. The budget applies to every line the printer emits — a
 /// statement's own line, and recursively each continuation line a split
 /// produced. Deliberately not a knob: the formatter has one canonical output,
 /// and a width knob would fork every file's shape.
 const LINE_BUDGET: usize = 100;
+
+/// What [`FormatOptions::comment_width`] is when a package does not say: the
+/// CODE width (E215's R1). A comment budget defaulting to anything else would
+/// make E205's shipped behavior depend on a key nobody had written.
+pub const DEFAULT_COMMENT_WIDTH: usize = LINE_BUDGET;
 
 /// The columns a tab occupies when measuring a line. Vilan indents with tabs,
 /// so the measurement has to agree with what an editor shows.
@@ -1670,15 +3441,72 @@ struct Printer<'src> {
     comments: Vec<(Span, &'src str)>,
     cursor: usize,
     source: &'src str,
-    bailed: bool,
+    /// What the printer had no rule for, if anything — N90's replacement for a
+    /// bare `bailed: bool`. The SPAN is the whole point: a tool that reports a
+    /// decline has to name the construct, and a boolean names nothing.
+    declined: Option<DeclinedAt>,
     /// The pending [`Split`] permission for the next expression printed.
     split: Split,
     /// True while a seam probe is rendering a chain link to see whether it spans
     /// lines ([`Printer::link_spans_lines`]). Probes do not nest.
     probing: bool,
+    /// True while E155's probe is rendering a chain with its ELEMENTS treated as
+    /// atomic: an element that would break only because its line is too wide
+    /// stays inline, so the probe measures the chain's own width rather than the
+    /// width an element's break left behind. An element that breaks
+    /// STRUCTURALLY — more than one child, an element child, a comment between
+    /// its items — breaks in the probe too, because that break is not a width
+    /// decision and flattening it would be a lie.
+    atomic_elements: bool,
+    /// The package's `[fmt]` knobs (E205).
+    options: FormatOptions,
+    /// Where the item being printed puts its DECLARATION line, when attribute
+    /// lines went above it (E219): the output offset just past that line's
+    /// indentation. An attribute line is a line of its own with a budget of
+    /// its own — it cannot be broken, so an over-long one is simply long — and
+    /// the width rule measures the declaration from here, so a long
+    /// `[deprecated("…")]` no longer splits the short signature beneath it.
+    /// Set by [`Printer::end_attribute_line`], taken by
+    /// [`Printer::begin_split_reprint`].
+    head_start: Option<usize>,
 }
 
 impl<'src> Printer<'src> {
+    /// A printer over `source` under `options`, at column zero with nothing
+    /// declined and no split armed — the state every entry point starts from,
+    /// in one place so a new field cannot be initialized two ways.
+    fn new(source: &'src str, options: FormatOptions) -> Self {
+        Printer {
+            out: String::new(),
+            indent: 0,
+            comments: extract_comments(source),
+            cursor: 0,
+            source,
+            declined: None,
+            split: Split::Off,
+            probing: false,
+            atomic_elements: false,
+            options,
+            head_start: None,
+        }
+    }
+
+    /// Records that the printer has no rule for the construct at `span`, which
+    /// makes [`reprint`] hand the original bytes back with a [`Decline`] naming
+    /// it (N90). The FIRST decline is kept: it is the one nearest the gap, and
+    /// a later one is usually the same construct met again on the way out.
+    fn decline(&mut self, span: Option<Span>) {
+        self.decline_with(DeclineReason::NoRule, span);
+    }
+
+    /// [`Self::decline`] for a reason other than a missing rule — E205's
+    /// words-in-order net. The FIRST decline is kept, whichever it is.
+    fn decline_with(&mut self, reason: DeclineReason, span: Option<Span>) {
+        if self.declined.is_none() {
+            self.declined = Some(DeclinedAt { reason, span });
+        }
+    }
+
     /// Whether the source between `from` and `to` contains a blank line (a run of
     /// only-whitespace with two or more newlines), used to preserve paragraph gaps.
     fn has_blank_between(&self, from: usize, to: usize) -> bool {
@@ -1717,9 +3545,16 @@ impl<'src> Printer<'src> {
         }
     }
 
-    /// Emits a blank line (used to preserve a paragraph gap before the next item).
+    /// Emits a blank line (used to preserve a paragraph gap before the next
+    /// item).
+    ///
+    /// IDEMPOTENT: a gap already opened is not opened again. E181's forced gap
+    /// below the `export *;` marker is asked for before the next item's
+    /// comments are flushed, and the source may have written a gap there too —
+    /// two asks must still be one blank line, exactly as two blank lines in the
+    /// source collapse to one.
     fn blank_line(&mut self) {
-        if !self.out.is_empty() {
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
             self.out.push('\n');
         }
     }
@@ -1728,6 +3563,11 @@ impl<'src> Printer<'src> {
     /// line, preserving a blank line before a comment that the source had one
     /// before. Returns the source offset just past the last comment emitted (or
     /// `start_from` if none), so the caller can judge the gap before the item.
+    ///
+    /// This is the ONE place a standalone comment is written, which is what
+    /// makes E205's reflow a local change: with `[fmt] wrap_comments` off the
+    /// loop is exactly what it always was, and with it on the run is taken a
+    /// PARAGRAPH at a time instead of a line at a time.
     fn flush_comments_before(&mut self, pos: usize, start_from: usize) -> usize {
         let mut at = start_from;
         while self.cursor < self.comments.len() {
@@ -1739,12 +3579,106 @@ impl<'src> Printer<'src> {
             if self.has_blank_between(at, range.start) {
                 self.blank_line();
             }
-            self.line();
-            self.out.push_str(text);
-            at = range.end;
-            self.cursor += 1;
+            if !self.options.wrap_comments {
+                self.line();
+                self.out.push_str(text);
+                at = range.end;
+                self.cursor += 1;
+                continue;
+            }
+            at = self.flush_comment_paragraph(pos);
         }
         at
+    }
+
+    /// Emits the paragraph beginning at the comment cursor, re-filled to the
+    /// line width when E205's rules allow it, and advances the cursor past it.
+    /// Returns the source offset just past the paragraph's last line.
+    ///
+    /// A paragraph is at least one line, so this always makes progress.
+    fn flush_comment_paragraph(&mut self, pos: usize) -> usize {
+        let length = self.comment_paragraph_length(pos);
+        let paragraph = &self.comments[self.cursor..self.cursor + length];
+        let first = paragraph[0].0;
+        let end = paragraph[length - 1].0.into_range().end;
+        let lines: Vec<&'src str> = paragraph.iter().map(|(_, text)| *text).collect();
+        self.emit_comment_paragraph(&lines, Some(first));
+        self.cursor += length;
+        end
+    }
+
+    /// Emits one paragraph of comment lines, each on its own line, re-filled
+    /// to the width when `[fmt] wrap_comments` is on and E205's rules allow
+    /// it. `at` is the span a decline would name.
+    ///
+    /// Shared by the two places a standalone comment reaches the output: the
+    /// comment stream, and E181's comments riding with an `export *;` marker.
+    fn emit_comment_paragraph(&mut self, lines: &[&'src str], at: Option<Span>) {
+        // The budget is the COMMENT width's, at the indentation this paragraph
+        // is being printed at — not the one it was written at, since the
+        // printer may have re-indented the block around it. It is the comment
+        // width and not [`LINE_BUDGET`] because prose has its own measure
+        // (E215): a package writing 84-column comments beside 100-column code
+        // says so once, and every paragraph in it is laid out to that.
+        let budget = self
+            .options
+            .comment_width
+            .saturating_sub(self.indent * TAB_COLUMNS);
+        let filled = match self.options.wrap_comments {
+            true => comment_reflow::reflow(lines, budget),
+            false => comment_reflow::Reflow::AsWritten,
+        };
+        if let comment_reflow::Reflow::Filled(filled) = filled {
+            for line in filled {
+                self.line();
+                self.out.push_str(&line);
+            }
+            return;
+        }
+        // The net caught a bug in the filler. The reprint still prints what
+        // was WRITTEN — so the output stays a faithful reprint and the token
+        // net has nothing to report — and the decline is what stops
+        // `vilan fmt` writing the file at all (N90's exit 2).
+        if filled == comment_reflow::Reflow::WordsChanged {
+            self.decline_with(DeclineReason::ReflowChangedTheWords, at);
+        }
+        for line in lines {
+            self.line();
+            self.out.push_str(line);
+        }
+    }
+
+    /// How many comments from the cursor form ONE paragraph: consecutive lines
+    /// before `pos`, separated by nothing but a single newline and whitespace,
+    /// and none of them an empty `//`.
+    ///
+    /// The three ways a paragraph ends are the three a reader sees: a blank
+    /// line, a blank `//` line (a paragraph break written INSIDE a comment
+    /// block, which is why it is a boundary here and never a line to re-fill),
+    /// and anything at all between the two lines that is not whitespace — code
+    /// the printer has yet to reach.
+    fn comment_paragraph_length(&self, pos: usize) -> usize {
+        let is_blank_marker = |text: &str| {
+            MARKER_SPELLINGS
+                .iter()
+                .any(|marker| text.trim_end() == *marker)
+        };
+        if is_blank_marker(self.comments[self.cursor].1) {
+            return 1;
+        }
+        let mut length = 1;
+        while let Some((span, text)) = self.comments.get(self.cursor + length) {
+            let range = span.into_range();
+            let previous_end = self.comments[self.cursor + length - 1].0.into_range().end;
+            let gap = self.source.get(previous_end..range.start).unwrap_or("x");
+            let contiguous = gap.chars().all(char::is_whitespace)
+                && gap.bytes().filter(|byte| *byte == b'\n').count() == 1;
+            if range.start >= pos || !contiguous || is_blank_marker(text) {
+                break;
+            }
+            length += 1;
+        }
+        length
     }
 
     /// Emits a trailing (same-line) comment if the next pending comment starts on
@@ -1802,17 +3736,59 @@ impl<'src> Printer<'src> {
         // there — `let age = now().since(t).describe();` at 54 columns split
         // three ways because the `fun` above it was 108.
         self.split = Split::Off;
+        // E181: the bare `export *;` marker has a canonical PLACE — the slot
+        // just below the file's leading import run — and the printer puts it
+        // there rather than printing it where it was written. Everything else
+        // about a marker is unchanged: a second one is an ordinary item printed
+        // in source order (the analyzer's business, and the formatter never
+        // hides a diagnosis), and `export import`, `export item` and
+        // `export(in …) item` are DECLARATIONS that stay exactly where they are.
+        let marker = top_level
+            .then(|| {
+                items
+                    .iter()
+                    .position(|item| matches!(item.0, Node::ExportAll))
+            })
+            .flatten();
+        let slot = marker.map(|at| self.export_all_marker_slot(items, at));
+        // Taken out of the comment stream BEFORE anything prints, so a comment
+        // written above the marker travels with it instead of being flushed
+        // where the marker used to be.
+        let marker_comments = match marker {
+            Some(at) => self.take_marker_comments(items, at),
+            None => Vec::new(),
+        };
         let mut prev_end = start_from;
         let mut index = 0;
+        // E181: the paragraph gap BELOW the marker, owed by whatever follows it
+        // whatever the source wrote between them.
+        let mut force_blank = false;
         while index < items.len() {
+            if slot == Some(index) {
+                let at = marker.expect("a slot exists only when a marker does");
+                prev_end =
+                    self.print_export_all_marker(items, at, index, prev_end, &marker_comments);
+                force_blank = true;
+            }
+            if marker == Some(index) {
+                index += 1;
+                continue;
+            }
             if top_level && import_kind_and_branch(&items[index].0).is_some() {
                 let run_end = self.import_run_end(items, index);
-                prev_end = self.print_import_run(&items[index..run_end], prev_end);
+                prev_end = self.print_import_run(&items[index..run_end], prev_end, force_blank);
+                force_blank = false;
                 index = run_end;
                 continue;
             }
             let item = &items[index];
             let range = item.1.into_range();
+            // E181's gap goes above the next item's COMMENTS, not between them
+            // and the item they document.
+            if force_blank {
+                self.blank_line();
+                force_blank = false;
+            }
             let after_comments = self.flush_comments_before(range.start, prev_end);
             if self.has_blank_between(after_comments, range.start) {
                 self.blank_line();
@@ -1827,6 +3803,10 @@ impl<'src> Printer<'src> {
             let statement_start = self.out.len();
             let comment_cursor = self.cursor;
             let terminated = Self::needs_semicolon(&item.0);
+            // E219: this statement's declaration line is its own; the item
+            // that ENCLOSES it (a function whose body this is) keeps its own
+            // until its own width rule reads it.
+            let enclosing_head = self.head_start.take();
             self.print_item(item);
             if terminated {
                 self.out.push(';');
@@ -1838,11 +3818,204 @@ impl<'src> Printer<'src> {
                     self.out.push(';');
                 }
             }
+            self.head_start = enclosing_head;
             self.flush_trailing_comment(range.end);
             prev_end = range.end;
             index += 1;
         }
+        if slot == Some(items.len()) {
+            let at = marker.expect("a slot exists only when a marker does");
+            prev_end =
+                self.print_export_all_marker(items, at, items.len(), prev_end, &marker_comments);
+        }
         prev_end
+    }
+
+    /// E181: where the bare `export *;` marker at `marker` PRINTS — an index
+    /// into `items`, read as "just before this item" (`items.len()` = last).
+    ///
+    /// The slot is the one below the file's LEADING import run: module comment,
+    /// the imports, the marker, then the items. B318 S1 introduced the marker
+    /// and left it wherever it was written — before the imports, mid-file, glued
+    /// to the next item — because the printer walks statements in source order
+    /// and only sorts imports WITHIN their run; S6's estate sweep is about to
+    /// write hundreds of them, so the rule lands first and the sweep's output is
+    /// already canonical.
+    ///
+    /// The block is measured with the marker LIFTED OUT, which is what makes a
+    /// marker written above the imports find the same slot as one written below
+    /// them: the imports are the file's leading block either way, and the marker
+    /// was never part of it. A file with no leading import at all puts the
+    /// marker before its first item — after the module comment, which is
+    /// [`Self::print_export_all_marker`]'s half of the answer.
+    ///
+    /// **The BLOCK, not the sort RUN.** [`Self::import_run_end`] stops at a
+    /// standalone comment, because imports may not reorder across one; the
+    /// marker's slot is not a sorting question and must not inherit that break.
+    /// kolt's `views.vl` is the exhibit: a `// FIXME:` line sits between its
+    /// first import and its second, so the sort run is ONE statement long and a
+    /// marker written correctly below all thirty of them was moved up into the
+    /// middle of the list — further from the canonical shape than where it
+    /// started. The block is every leading import, comments and blank lines and
+    /// all.
+    fn export_all_marker_slot(&self, items: &[Spanned<Node<'src>>], marker: usize) -> usize {
+        let mut slot = 0;
+        let mut index = 0;
+        while index < items.len() {
+            if index == marker {
+                index += 1;
+                continue;
+            }
+            if import_kind_and_branch(&items[index].0).is_none() {
+                break;
+            }
+            index += 1;
+            slot = index;
+        }
+        slot
+    }
+
+    /// Prints the marker at its slot, with a paragraph gap above it and its own
+    /// comments (already taken out of the stream by
+    /// [`Self::take_marker_comments`]) riding along. Returns the source offset
+    /// the caller should go on measuring gaps from.
+    ///
+    /// Two shapes. Below an import run there is nothing left to flush — the run
+    /// took its own comments and whatever follows belongs to the next item — so
+    /// the marker prints straight away. With no run above it the marker is the
+    /// file's first STATEMENT, and the module comment has to come out ahead of
+    /// it while a doc comment written against the first item must not: the split
+    /// between the two is the last blank line before that item, and
+    /// [`Self::module_comment_end`] finds it.
+    fn print_export_all_marker(
+        &mut self,
+        items: &[Spanned<Node<'src>>],
+        marker: usize,
+        slot: usize,
+        prev_end: usize,
+        comments: &[Spanned<&'src str>],
+    ) -> usize {
+        let mut prev_end = prev_end;
+        // No leading import at all: the marker is the file's first statement,
+        // so nothing has printed yet and the module comment is still pending.
+        if slot == 0 {
+            let until = self.module_comment_end(items, marker);
+            prev_end = self.flush_comments_before(until, prev_end);
+        }
+        self.blank_line();
+        // E181's comments travel with the marker, and they are a paragraph
+        // like any other: the same reflow rules reach them, so a long module
+        // comment above `export *;` is not a hole in the knob.
+        let lines: Vec<&'src str> = comments.iter().map(|(text, _)| *text).collect();
+        let first = comments.first().map(|(_, span)| *span);
+        self.emit_comment_paragraph(&lines, first);
+        self.line();
+        self.out.push_str("export *;");
+        prev_end
+    }
+
+    /// The offset [`Self::print_export_all_marker`] flushes comments up to when
+    /// the marker leads the file: past the module comment, and short of any
+    /// comment block written directly against the first item.
+    ///
+    /// A file's leading comments are one block or two. `// The WEB prelude — …`
+    /// followed by a blank line is the MODULE's comment and the marker goes
+    /// below it; `/// what this function does` with no blank line between it and
+    /// the `fun` is that item's, and a marker inserted between them would take
+    /// a doc comment off its declaration. The blank line is the whole
+    /// distinction, and it is the one the language's own files already draw.
+    fn module_comment_end(&self, items: &[Spanned<Node<'src>>], marker: usize) -> usize {
+        let Some(first) = items
+            .iter()
+            .enumerate()
+            .find(|(index, _)| *index != marker)
+            .map(|(_, item)| item.1.into_range().start)
+        else {
+            // A file whose only statement is the marker: every comment in it
+            // precedes the marker.
+            return self.source.len();
+        };
+        let pending: Vec<Span> = self.comments[self.cursor..]
+            .iter()
+            .map(|(span, _)| *span)
+            .filter(|span| span.into_range().start < first)
+            .collect();
+        let mut attached = pending.len();
+        let mut next_start = first;
+        while attached > 0 {
+            let range = pending[attached - 1].into_range();
+            if self.has_blank_between(range.end, next_start) {
+                break;
+            }
+            next_start = range.start;
+            attached -= 1;
+        }
+        pending
+            .get(attached)
+            .map(|span| span.into_range().start)
+            .unwrap_or(first)
+    }
+
+    /// E181: the comments written directly above the `export *;` marker, taken
+    /// OUT of the printer's comment stream so they travel to the marker's slot
+    /// instead of being flushed at the place the marker used to occupy.
+    ///
+    /// Directly above means: standalone (on its own line, not a trailing
+    /// comment of the item before), below the previous item, and reachable from
+    /// the marker with no blank line in between — the same attachment rule the
+    /// rest of the printer uses for a comment and the item under it.
+    fn take_marker_comments(
+        &mut self,
+        items: &[Spanned<Node<'src>>],
+        marker: usize,
+    ) -> Vec<Spanned<&'src str>> {
+        let marker_start = items[marker].1.into_range().start;
+        let floor = match marker {
+            0 => 0,
+            _ => items[marker - 1].1.into_range().end,
+        };
+        let candidates: Vec<usize> = (0..self.comments.len())
+            .filter(|index| {
+                let range = self.comments[*index].0.into_range();
+                floor <= range.start && range.end <= marker_start
+            })
+            .collect();
+        let mut attached = candidates.len();
+        let mut next_start = marker_start;
+        while attached > 0 {
+            let range = self.comments[candidates[attached - 1]].0.into_range();
+            if self.has_blank_between(range.end, next_start) {
+                break;
+            }
+            let above = match attached {
+                1 => floor,
+                _ => self.comments[candidates[attached - 2]].0.into_range().end,
+            };
+            // A comment sharing a line with whatever precedes it is that
+            // statement's trailing comment and stays with it.
+            let standalone = above == 0
+                || self
+                    .source
+                    .get(above..range.start)
+                    .is_some_and(|gap| gap.contains('\n'));
+            if !standalone {
+                break;
+            }
+            next_start = range.start;
+            attached -= 1;
+        }
+        let taken = &candidates[attached..];
+        let texts: Vec<Spanned<&'src str>> = taken
+            .iter()
+            .map(|index| {
+                let (span, text) = self.comments[*index];
+                (text, span)
+            })
+            .collect();
+        for index in taken.iter().rev() {
+            self.comments.remove(*index);
+        }
+        texts
     }
 
     /// The exclusive end of the import run starting at `start`: the longest span
@@ -1868,8 +4041,16 @@ impl<'src> Printer<'src> {
     /// [`import_sort_key`]): reordered by kind/root/path, brace sets sorted,
     /// blank lines coalesced into one block. Each item's trailing same-line
     /// comment travels with it. Returns the source offset past the run.
-    fn print_import_run(&mut self, run: &[Spanned<Node<'src>>], prev_end: usize) -> usize {
+    fn print_import_run(
+        &mut self,
+        run: &[Spanned<Node<'src>>],
+        prev_end: usize,
+        force_blank: bool,
+    ) -> usize {
         let first_start = run[0].1.into_range().start;
+        if force_blank {
+            self.blank_line();
+        }
         let after_comments = self.flush_comments_before(first_start, prev_end);
         if self.has_blank_between(after_comments, first_start) {
             self.blank_line();
@@ -1906,13 +4087,14 @@ impl<'src> Printer<'src> {
         &mut self,
         items: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> ModuleRescue,
     ) -> Vec<ImportRunEdit> {
         let mut edits = Vec::new();
         let mut index = 0;
         while index < items.len() {
             if import_kind_and_branch(&items[index].0).is_some() {
                 let run_end = self.import_run_end(items, index);
-                if let Some(edit) = self.organize_run(&items[index..run_end], keep) {
+                if let Some(edit) = self.organize_run(&items[index..run_end], keep, keep_module) {
                     edits.push(edit);
                 }
                 index = run_end;
@@ -1929,6 +4111,7 @@ impl<'src> Printer<'src> {
         &mut self,
         run: &[Spanned<Node<'src>>],
         keep: &dyn Fn(Span) -> bool,
+        keep_module: &dyn Fn(Span) -> ModuleRescue,
     ) -> Option<ImportRunEdit> {
         let run_start = run[0].1.into_range().start;
         // Reach this run's own trailing comments; a standalone comment before the
@@ -1947,9 +4130,25 @@ impl<'src> Printer<'src> {
             let end = item.1.into_range().end;
             let statement = match &item.0 {
                 // A re-export is surface, not usage — never pruned.
-                Node::Export(_) => Some(PrunedStatement::ReExport(&item.0)),
-                Node::Import(branch) => prune_import_branch(branch, keep)
-                    .map(|pruned| PrunedStatement::Rebuilt(Node::Import(pruned))),
+                Node::Export(..) => Some(PrunedStatement::AsWritten(&item.0)),
+                // E168: an `import` emptied of its leaves is offered to
+                // `keep_module` before it is dropped — the module it reaches
+                // into may be the only thing bringing an `impl` the file calls
+                // a method from. A `use` is not rewritten: it binds a name out
+                // of a namespace into this scope, and a namespace with no name
+                // taken out of it binds nothing at all.
+                Node::Import(branch, modifier) => match prune_import_branch(branch, keep) {
+                    Some(pruned) => Some(PrunedStatement::Rebuilt(Node::Import(pruned, *modifier))),
+                    None => match module_only_import_branch(branch, keep_module) {
+                        RescuedImport::Dropped => None,
+                        RescuedImport::Narrowed(pruned) => {
+                            Some(PrunedStatement::Rebuilt(Node::Import(pruned, *modifier)))
+                        }
+                        // E180: the original node, so the run reprints the
+                        // statement the file already has.
+                        RescuedImport::Verbatim => Some(PrunedStatement::AsWritten(&item.0)),
+                    },
+                },
                 Node::Use(branch) => prune_import_branch(branch, keep)
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Use(pruned))),
                 _ => None,
@@ -1983,6 +4182,25 @@ impl<'src> Printer<'src> {
                 Some(b'\n') => deletion_end += 1,
                 Some(b'\r') if bytes.get(deletion_end + 1) == Some(&b'\n') => deletion_end += 2,
                 _ => {}
+            }
+            // E186: the run's own line ending is enough only when the run was
+            // PART of a paragraph. When the run WAS the paragraph — a blank
+            // line (or the start of the file) above it, a blank line below —
+            // the separator below it belonged to the run and is left behind by
+            // the line above, so the two blanks collapse into one and the file
+            // keeps two where it had one. kolt's generated `lucide/lib.vl` is
+            // the exhibit: its two prelude-redundant imports are a paragraph of
+            // their own between the header comment and `export *;`, and
+            // organizing it printed two blank lines above the `export`.
+            //
+            // Asked as "was this a paragraph", not "is there a blank below",
+            // because the blank below is the paragraph SEPARATOR only if the
+            // run began one. A run under a header comment (`// header` then
+            // `import a;`) is the comment's own paragraph continuing, and its
+            // blank below separates that whole paragraph from the next — so it
+            // stays, and the comment keeps its spacing.
+            if self.line_above_is_blank(run_start) {
+                deletion_end = self.blank_line_end(deletion_end).unwrap_or(deletion_end);
             }
             return Some(ImportRunEdit {
                 span: Span::from(run_start..deletion_end),
@@ -2026,6 +4244,32 @@ impl<'src> Printer<'src> {
             span: Span::from(run_start..source_end),
             replacement,
         })
+    }
+
+    /// Whether the line ABOVE the one holding `pos` is blank, or `pos` is on the
+    /// file's first line (E186). Together with a blank line below, that is what
+    /// makes a run a whole PARAGRAPH rather than the tail of one.
+    fn line_above_is_blank(&self, pos: usize) -> bool {
+        let before = &self.source[..pos];
+        let Some(line_start) = before.rfind('\n') else {
+            // Nothing above at all: the run opens the file, and a paragraph
+            // separator below it is the run's own.
+            return true;
+        };
+        match before[..line_start].rfind('\n') {
+            Some(previous) => before[previous + 1..line_start].trim().is_empty(),
+            // One line above, and it is the file's first.
+            None => before[..line_start].trim().is_empty(),
+        }
+    }
+
+    /// The offset past the BLANK line beginning at `pos` (its own line ending
+    /// included, `\r\n` and all), or `None` when the line there is not blank —
+    /// E186's paragraph separator.
+    fn blank_line_end(&self, pos: usize) -> Option<usize> {
+        let rest = self.source.get(pos..)?;
+        let end = rest.find('\n').map(|at| at + 1).unwrap_or(rest.len());
+        rest[..end].trim().is_empty().then_some(pos + end)
     }
 
     /// Advances the comment cursor past every comment starting before `pos`,
@@ -2086,17 +4330,40 @@ impl<'src> Printer<'src> {
                 self.print_import_branch(branch, true);
                 self.out.push(';');
             }
-            Node::Import(branch) => {
+            Node::Import(branch, modifier) => {
                 self.out.push_str("import ");
                 self.print_import_branch(branch, true);
+                if matches!(modifier, ImportModifier::Only(_)) {
+                    self.out.push_str(" only");
+                }
                 self.out.push(';');
             }
-            Node::Export(inner) => {
-                self.out.push_str("export ");
+            Node::Export(scope, inner, labels) => {
+                self.out.push_str("export");
+                self.print_export_scope(scope.as_deref());
+                self.out.push(' ');
+                self.print_import_labels(labels);
                 self.print_import_like(&inner.0);
             }
             _ => {}
         }
+    }
+
+    /// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
+    /// space before the `(` (`export(in pkg) fun f()`). Nothing when the marker
+    /// carries no narrowing.
+    fn print_export_scope(&mut self, scope: Option<&ExportScope<'src>>) {
+        let Some(scope) = scope else {
+            return;
+        };
+        self.out.push_str("(in ");
+        for (index, (segment, _)) in scope.path.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str("::");
+            }
+            self.out.push_str(segment);
+        }
+        self.out.push(')');
     }
 
     /// Whether `node`, printed as a statement, takes a terminating `;`. Expression
@@ -2104,7 +4371,46 @@ impl<'src> Printer<'src> {
     /// control-flow forms (`if`/`for`/`match`/block), declarations (including a
     /// `macro fun`, a `macro { .. }` block, and a `[name] item` macro attribute),
     /// and `use`/`import` (which already emit their own `;`) do not.
+    ///
+    /// `export` ASKS THE ITEM UNDER IT (B318 S6). The marker is a statement
+    /// WRAPPER, not a statement kind: `export fun f()` takes no `;` because a
+    /// function does not, and `export let x = 1;` takes one for the same reason
+    /// a bare `let` does. Excluding every `Export` printed `export let x = 1`
+    /// without its terminator, which does not re-parse — so the printer's
+    /// verification bailed and the whole FILE came back unformatted, silently
+    /// (a bail is not a diagnostic, and `vilan fmt --check` reads a bailed file
+    /// as already-formatted). S6's curation is what made it reachable: five of
+    /// std's module-level `let`s carry the marker.
     fn needs_semicolon(node: &Node<'src>) -> bool {
+        if let Node::Export(_, inner, _) = node {
+            return Self::needs_semicolon(&inner.0);
+        }
+        // `const` asks the DECLARATION under it for the same reason (N89, G24):
+        // `const fun f()` takes no `;` and `const let x = 1;` takes one. Without
+        // this the printer wrote `const fun f() { .. };`, which does not
+        // re-parse — so the verification bailed and the whole FILE came back
+        // unformatted, exactly as `export let` did before B318 S6, and just as
+        // silently.
+        //
+        // ONLY the declaration forms, though (N108). `Node::Const` is two
+        // grammars under one variant: `parse_const_declaration`'s `const let` /
+        // `const fun`, which the statement funnel reads ahead of everything, and
+        // `parse_expression`'s weak-precedence `const` PREFIX, which wraps any
+        // expression at all. Forwarding for the prefix asks the wrong question —
+        // `const { .. }` is an expression statement whose expression happens to
+        // be block-shaped, and an expression statement takes its terminator
+        // however it is shaped — so the printer wrote a `const { .. }` block
+        // with no `;` after it. That does not re-parse either (kolt's
+        // `client.vl` has one at module level, and the whole file came back
+        // unformatted for it), and the two forwarding cases are exactly `Let`
+        // and `Func`: the funnel's declaration fork runs first, so no other
+        // inner node can have come from `const let` or `const fun`.
+        if let Node::Const(inner) = node {
+            return match &inner.0 {
+                Node::Let(..) | Node::Func(..) => Self::needs_semicolon(&inner.0),
+                _ => true,
+            };
+        }
         !matches!(
             node,
             Node::If(_)
@@ -2113,38 +4419,39 @@ impl<'src> Printer<'src> {
                 | Node::Match(_, _)
                 | Node::Block(_)
                 | Node::Func(_)
-                | Node::Struct(_, _, _, _, _)
-                | Node::Enum(_, _, _, _)
-                | Node::Impl(_, _, _)
-                | Node::Trait(_, _, _, _)
+                | Node::Struct(..)
+                | Node::Enum(..)
+                | Node::Impl(..)
+                | Node::Trait(..)
                 | Node::Module(_, _)
                 | Node::Derive(_, _)
                 | Node::Service(_, _)
-                | Node::Export(_)
                 | Node::Use(_)
-                | Node::Import(_)
+                | Node::Import(..)
                 | Node::MacroFun(_)
                 | Node::MacroBlock(_)
                 | Node::MacroAttribute(_, _, _, _)
         )
     }
 
-    /// Prints one top-level / block item. Sets `bailed` for anything not yet
+    /// Prints one top-level / block item. Declines anything not yet
     /// handled, so `format` falls back to the original source.
     fn print_item(&mut self, item: &Spanned<Node<'src>>) {
         match &item.0 {
-            // `[resource ][external ]struct Name[<…>][;|{ fields }]` — canonical
-            // modifier order is `resource external struct` (destruction.md §3).
-            Node::Struct(name, generics, external, resource, body) => {
+            // `[[resource] ][external ]struct Name[<…>][;|{ fields }]` — canonical
+            // order is `[resource] external struct` (destruction.md §3; B413's
+            // attribute, printed on the declaration's line as the keyword was).
+            Node::Struct(name, generics, external, resource, body, labels) => {
+                self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("resource ");
+                    self.out.push_str("[resource] ");
                 }
                 if *external {
                     self.out.push_str("external ");
                 }
                 self.out.push_str("struct ");
                 self.out.push_str(name.0);
-                self.print_generic_parameters(generics);
+                self.print_generic_parameters(generics.as_deref());
                 match body {
                     None => self.out.push(';'),
                     Some(fields) if fields.0.is_empty() => self.out.push_str(" {}"),
@@ -2152,15 +4459,38 @@ impl<'src> Printer<'src> {
                         self.out.push_str(" {");
                         self.indent += 1;
                         let mut prev_end = fields.1.into_range().start + 1;
-                        for ((field_name, field_type, exposed), span) in &fields.0 {
+                        for ((field_name, field_type, exposed, internal), span) in &fields.0 {
                             let range = span.into_range();
                             let after_comments = self.flush_comments_before(range.start, prev_end);
                             if self.has_blank_between(after_comments, range.start) {
                                 self.blank_line();
                             }
                             self.line();
-                            if *exposed {
-                                self.out.push_str("[expose] ");
+                            // E213's label leads the field, as it leads a
+                            // function — and it is PRINTED, or `vilan fmt`
+                            // would drop an attribute the author wrote (the
+                            // token net would catch it and decline the file,
+                            // which is a worse way to find out).
+                            if let Some(reason) = internal {
+                                self.out.push_str("[internal(\"");
+                                self.out.push_str(reason);
+                                self.out.push_str("\")] ");
+                            }
+                            match exposed {
+                                Exposure::None => {}
+                                Exposure::Whole => self.out.push_str("[expose] "),
+                                Exposure::Keyed(None) => {
+                                    self.out.push_str("[expose(keyed)] ");
+                                }
+                                // The key type is reprinted exactly as written
+                                // — it is source text, and normalizing it here
+                                // would be the formatter deciding a type's
+                                // spelling from a string it never parsed.
+                                Exposure::Keyed(Some((key, _))) => {
+                                    self.out.push_str("[expose(keyed = ");
+                                    self.out.push_str(key);
+                                    self.out.push_str(")] ");
+                                }
                             }
                             self.out.push_str(field_name.0);
                             if let Some(field_type) = field_type {
@@ -2178,27 +4508,35 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
-            // `[resource ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
-            Node::Enum(name, generics, resource, variants) => {
+            // `[[resource] ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
+            Node::Enum(name, generics, resource, variants, labels) => {
+                self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("resource ");
+                    self.out.push_str("[resource] ");
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
-                self.print_generic_parameters(generics);
+                self.print_generic_parameters(generics.as_deref());
                 if variants.0.is_empty() {
                     self.out.push_str(" {}");
                 } else {
                     self.out.push_str(" {");
                     self.indent += 1;
                     let mut prev_end = variants.1.into_range().start + 1;
-                    for ((variant_name, payload, backing), span) in &variants.0 {
+                    for ((variant_name, payload, backing, internal), span) in &variants.0 {
                         let range = span.into_range();
                         let after_comments = self.flush_comments_before(range.start, prev_end);
                         if self.has_blank_between(after_comments, range.start) {
                             self.blank_line();
                         }
                         self.line();
+                        // E221: a variant's label leads it on its line, as a
+                        // field's does.
+                        if let Some(reason) = internal {
+                            self.out.push_str("[internal(\"");
+                            self.out.push_str(reason);
+                            self.out.push_str("\")] ");
+                        }
                         self.out.push_str(variant_name);
                         if !payload.is_empty() {
                             self.out.push('(');
@@ -2234,25 +4572,43 @@ impl<'src> Printer<'src> {
                 self.print_import_branch(branch, false);
                 self.out.push(';');
             }
-            Node::Import(branch) => {
+            Node::Import(branch, modifier) => {
                 self.out.push_str("import ");
                 self.print_import_branch(branch, false);
+                if matches!(modifier, ImportModifier::Only(_)) {
+                    self.out.push_str(" only");
+                }
                 self.out.push(';');
             }
             Node::Func(func) => self.print_func(func),
             // `impl Subject[ with A + B] { items }`.
-            Node::Impl(subject, traits, body) => {
+            //
+            // E217: the header is a DECLARATION line and takes the declaration
+            // width rule. Over the budget it breaks the generic-argument list
+            // at its TAIL — the last trait of a `with` clause, else the
+            // subject — one argument per line with a trailing comma, exactly
+            // the shape `fun`'s parameter list takes. Before this the header
+            // had no split form at all, so a hand-wrapped one reprinted to a
+            // different token stream and the file declined.
+            Node::Impl(subject, traits, body, labels) => {
+                let split = std::mem::take(&mut self.split);
+                self.print_item_labels(labels);
                 self.out.push_str("impl ");
-                self.print_type(&subject.0);
-                self.print_with_clause(traits);
+                if traits.is_empty() {
+                    self.print_type_splitting_the_tail(&subject.0, split);
+                } else {
+                    self.print_type(&subject.0);
+                    self.print_with_clause_splitting_the_tail(traits, split);
+                }
                 self.out.push(' ');
                 self.print_braced_items(body);
             }
             // `trait Name[ with A + B] { items }`.
-            Node::Trait(name, generics, supertraits, body) => {
+            Node::Trait(name, generics, supertraits, body, labels) => {
+                self.print_item_labels(labels);
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
-                self.print_generic_parameters(generics);
+                self.print_generic_parameters(generics.as_deref());
                 self.print_with_clause(supertraits);
                 self.out.push(' ');
                 self.print_braced_items(body);
@@ -2263,24 +4619,76 @@ impl<'src> Printer<'src> {
                 let names: Vec<&str> = names.iter().map(|(name, _)| *name).collect();
                 self.out.push_str(&names.join(", "));
                 self.out.push_str(")]");
-                self.line();
+                self.end_attribute_line();
                 self.print_item(derived);
             }
-            // `[service]` / `[service(Client)]` likewise sits above its struct.
-            Node::Service(client_name, item) => {
-                self.out.push_str("[service");
-                if let Some(client_name) = client_name {
-                    self.out.push('(');
-                    self.out.push_str(client_name);
-                    self.out.push(')');
+            // `[service]` / `[service(Client, client = H)]` / `[client_service]`
+            // likewise sit above their struct, in the order they are written
+            // (`[service]` first, `[client_service]` under it for a peer).
+            Node::Service(attribute, item) => {
+                if attribute.server_side {
+                    self.out.push_str("[service");
+                    let arguments: Vec<String> = attribute
+                        .client_name
+                        .map(str::to_string)
+                        .into_iter()
+                        // A120 S5's marker, after the client's name (the
+                        // positional argument leads or is absent) and before
+                        // the one named argument.
+                        .chain(attribute.http.then(|| "http".to_string()))
+                        .chain(
+                            attribute
+                                .handler_name
+                                .map(|handler| format!("client = {handler}")),
+                        )
+                        .collect();
+                    if !arguments.is_empty() {
+                        self.out.push('(');
+                        self.out.push_str(&arguments.join(", "));
+                        self.out.push(')');
+                    }
+                    self.out.push(']');
+                    self.end_attribute_line();
                 }
-                self.out.push(']');
-                self.line();
+                if attribute.client_side {
+                    self.out.push_str("[client_service]");
+                    self.end_attribute_line();
+                }
                 self.print_item(item);
             }
-            Node::Export(exported) => {
-                self.out.push_str("export ");
+            Node::Export(scope, exported, labels) => {
+                self.out.push_str("export");
+                self.print_export_scope(scope.as_deref());
+                self.out.push(' ');
+                self.print_import_labels(labels);
                 self.print_item(exported);
+            }
+            // G24's `const fun` — a DECLARATION under a marker, printed the way
+            // `export` above prints one (N89). The expression printer's own
+            // `const` arm handles `const <expr>` and `const let`, and it prints
+            // its inner node as an OPERAND: a `fun` declaration is not one, so
+            // it fell to that printer's `_ => self.bailed = true` and the whole
+            // FILE came back unformatted while `--check` called it clean. No
+            // estate file writes the form, which is why nothing noticed —
+            // `formatter_never_silently_bails` asserts the bail set over the
+            // tree, and the tree had no exhibit.
+            Node::Const(inner) if matches!(inner.0, Node::Func(_)) => {
+                self.out.push_str("const ");
+                self.print_item(inner);
+            }
+            // `export *;` — the module-wide marker. It carries no inner item, so
+            // `needs_semicolon` leaves it out of its exclusion list and the
+            // statement printer supplies the `;`.
+            Node::ExportAll => self.out.push_str("export *"),
+            // B415: `[platform(..)] mod self` — the host of the file's own
+            // attributes (F27 R1's platform), on one line; its `;` is the
+            // statement loop's.
+            Node::ModulePlatform(patterns) => {
+                if !patterns.is_empty() {
+                    self.print_platform_attribute(patterns);
+                    self.out.push(' ');
+                }
+                self.out.push_str("mod self");
             }
             // `mod name { items }`.
             Node::Module(name, body) => {
@@ -2307,7 +4715,7 @@ impl<'src> Printer<'src> {
                     self.out.push(')');
                 }
                 self.out.push(']');
-                self.line();
+                self.end_attribute_line();
                 self.print_item(annotated);
             }
             // Anything else is an expression appearing as a statement.
@@ -2342,12 +4750,63 @@ impl<'src> Printer<'src> {
         // the `::` — and the set is what consumes it.
         let split = std::mem::take(&mut self.split);
         match branch {
-            ImportBranch::Path(name, _, child) => {
+            // B318: `#` is KEPT as written, on both the fmt and the organize
+            // paths. It is a fact about the author's intent rather than a
+            // formatting decision, and stripping it would silently re-arm the
+            // plain-reach warning.
+            ImportBranch::Reach(_, inner) => {
+                self.out.push('#');
+                self.split = split;
+                self.print_import_branch(inner, sort);
+            }
+            ImportBranch::Path(name, _, tail) => {
                 self.out.push_str(name);
-                if let Some(child) = child {
-                    self.out.push_str("::");
-                    self.split = split;
-                    self.print_import_branch(child, sort);
+                match tail {
+                    ImportTail::Leaf => {}
+                    ImportTail::Continue(child) => {
+                        self.out.push_str("::");
+                        self.split = split;
+                        self.print_import_branch(child, sort);
+                    }
+                    // `import a::b as b;` renames `b` to `b` — it binds
+                    // exactly what the plain import binds, so the plain import
+                    // is the canonical spelling and the alias is dropped
+                    // (E145). `as c` binds a name the module does not otherwise
+                    // have and is a program, not a spelling: untouched.
+                    ImportTail::Alias(alias, _) if alias == name => {}
+                    ImportTail::Alias(alias, _) => {
+                        self.out.push_str(" as ");
+                        self.out.push_str(alias);
+                    }
+                }
+            }
+            // B318 S3. The subject reprints VERBATIM: the selector's type is
+            // the one place `vilan fmt` does not canonicalize spacing, because
+            // the token safety net keys on the same text and re-lexing a
+            // canonical print here would be a second type renderer to hold in
+            // step with the first.
+            ImportBranch::Selector(selector) => {
+                self.out.push_str("(impl ");
+                self.out.push_str(&selector.subject_text);
+                self.out.push(')');
+                let mut members: Vec<&'src str> =
+                    selector.members.iter().map(|(name, _)| *name).collect();
+                if sort {
+                    members.sort_unstable();
+                }
+                match members.as_slice() {
+                    [] => {}
+                    // One member collapses to the unbraced spelling, exactly as
+                    // a one-member path set does (kolt.local 005).
+                    [single] => {
+                        self.out.push_str("::");
+                        self.out.push_str(single);
+                    }
+                    many => {
+                        self.out.push_str("::{ ");
+                        self.out.push_str(&many.join(", "));
+                        self.out.push_str(" }");
+                    }
                 }
             }
             ImportBranch::Set(branches) => {
@@ -2370,9 +4829,13 @@ impl<'src> Printer<'src> {
                 // `Option`), and a comment inside them, which is anchored to the
                 // set's split form. `emit_branch_tokens` mirrors this collapse so
                 // the safety net reduces both spellings to the same tokens.
+                // A selector has no unbraced spelling at all — the parser
+                // refuses `import a::(impl T);` — so a one-member set holding
+                // one keeps its braces, the way a lone `self` does.
                 if let [only] = order.as_slice()
                     && !inside_comment
                     && !matches!(only, ImportBranch::Path("self", ..))
+                    && !matches!(only, ImportBranch::Selector(_))
                 {
                     self.split = split;
                     self.print_import_branch(only, sort);
@@ -2415,6 +4878,12 @@ impl<'src> Printer<'src> {
     fn branch_span(branch: &ImportBranch<'src>) -> Option<Span> {
         match branch {
             ImportBranch::Path(_, span, _) => Some(*span),
+            // The marker is the head of what it marks, so a comment before a
+            // marked member anchors on the `#`.
+            ImportBranch::Reach(marker, _) => Some(*marker),
+            // A selector's head is its `(`, and its whole element span is what
+            // a comment before it attaches to.
+            ImportBranch::Selector(selector) => Some(selector.span),
             ImportBranch::Set(_) => None,
         }
     }
@@ -2463,14 +4932,18 @@ impl<'src> Printer<'src> {
             Node::Accessor(name) => self.out.push_str(name),
             Node::AccessorWithGenerics(name, arguments) => {
                 self.out.push_str(name);
-                self.out.push('<');
-                for (index, (argument, _)) in arguments.0.iter().enumerate() {
-                    if index > 0 {
-                        self.out.push_str(", ");
-                    }
-                    self.print_type(argument);
+                self.print_type_arguments(arguments);
+            }
+            // `style::Style`, `std::reactive::SignalCell<i32>` — a nominal type
+            // reached through the modules that declare it (B172). The spine is
+            // `StaticAccessor`s, the arguments (if any) sit on the last segment.
+            Node::StaticAccessor(namespace, name, arguments) => {
+                self.print_type(&namespace.0);
+                self.out.push_str("::");
+                self.out.push_str(name);
+                if let Some(arguments) = arguments {
+                    self.print_type_arguments(arguments);
                 }
-                self.out.push('>');
             }
             Node::Reference(mutable, inner) => {
                 self.out.push('&');
@@ -2486,6 +4959,13 @@ impl<'src> Printer<'src> {
             }
             Node::SyncType(inner) => {
                 self.out.push_str("sync ");
+                self.print_type(&inner.0);
+            }
+            // `dyn Source<i32>` — a trait object type. One space, exactly as
+            // the source must have written it; the keyword is never elided,
+            // because eliding it would change the type.
+            Node::DynType(inner) => {
+                self.out.push_str("dyn ");
                 self.print_type(&inner.0);
             }
             // `|A, B| Ret` (or `||` for no parameters) — a closure type.
@@ -2512,10 +4992,23 @@ impl<'src> Printer<'src> {
                 }
             }
             // `type T[: A + B]` — a generic binder inside an impl subject pattern.
-            Node::TypeBinder(name, bounds) => {
-                self.out.push_str("type ");
+            // The ANONYMOUS binder canonicalises to the bare wildcard (B294):
+            // `type _` and `_` are the same node, and `_` is the spelling the
+            // parameter actually has — the one `Some(_)` and `let _` already
+            // read as. A NAMED binder keeps its keyword; there the keyword is
+            // the only thing saying "this introduces a name" in a position that
+            // otherwise reads a type.
+            Node::TypeBinder((name, _name_span), bounds, tuple_bound) => {
+                if *name != ANONYMOUS_TYPE_BINDER {
+                    self.out.push_str("type ");
+                }
                 self.out.push_str(name);
                 self.print_bounds(bounds);
+                // A122: the tuple-family bound, printed as a generic
+                // parameter's is.
+                if let Some(tuple_bound) = tuple_bound {
+                    self.print_tuple_bound(tuple_bound);
+                }
             }
             // `(A, B)` — a tuple type.
             Node::Tuple(elements) => {
@@ -2580,8 +5073,102 @@ impl<'src> Printer<'src> {
                 self.print_type(&template.0);
                 self.out.push(')');
             }
-            _ => self.bailed = true,
+            // No span to offer: `print_type` takes a bare node, and every
+            // caller that has one is a type POSITION rather than the construct
+            // a reader would go and look at. The file is still named.
+            _ => self.decline(None),
         }
+    }
+
+    /// [`Self::print_type`] with a [`Split`] carried to the type's TAIL generic
+    /// argument list — the one an over-wide `impl` header breaks (E217).
+    ///
+    /// Only the forms an `impl` subject or a trait bound can take are walked,
+    /// and only through their tail: a nominal type's own argument list, and a
+    /// binder's LAST bound (`impl type S: Base + DeltaSource<…>`). Every other
+    /// type form has no list of its own to break and prints as it always did.
+    ///
+    /// The split is threaded rather than read from `self.split` so that
+    /// [`Self::print_type`] — reached from parameter types, return types and a
+    /// dozen other positions — keeps exactly the output it has.
+    fn print_type_splitting_the_tail(&mut self, node: &Node<'src>, split: Split) {
+        if split == Split::Off {
+            self.print_type(node);
+            return;
+        }
+        match node {
+            Node::AccessorWithGenerics(name, arguments) if !arguments.0.is_empty() => {
+                self.out.push_str(name);
+                self.print_split_type_arguments(arguments);
+            }
+            Node::StaticAccessor(namespace, name, Some(arguments)) if !arguments.0.is_empty() => {
+                self.print_type(&namespace.0);
+                self.out.push_str("::");
+                self.out.push_str(name);
+                self.print_split_type_arguments(arguments);
+            }
+            Node::TypeBinder((name, _name_span), bounds, None) if !bounds.is_empty() => {
+                if *name != ANONYMOUS_TYPE_BINDER {
+                    self.out.push_str("type ");
+                }
+                self.out.push_str(name);
+                self.out.push_str(": ");
+                self.print_bounds_splitting_the_tail(bounds, split);
+            }
+            // An empty list never breaks — `<⏎>` buys a line and no clarity —
+            // and a form with no argument list has nothing to break, so the
+            // header simply stays long. The same answer the empty parameter
+            // list gives.
+            _ => self.print_type(node),
+        }
+    }
+
+    /// The bounds of a binder, with `split` carried to the LAST one — the only
+    /// one whose argument list ends the header's line.
+    fn print_bounds_splitting_the_tail(&mut self, bounds: &[Spanned<Node<'src>>], split: Split) {
+        for (index, (bound, _)) in bounds.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(" + ");
+            }
+            if index + 1 == bounds.len() {
+                self.print_type_splitting_the_tail(bound, split);
+            } else {
+                self.print_type(bound);
+            }
+        }
+    }
+
+    /// The split form of a generic argument list: `<` closes the header's line,
+    /// every argument takes its own line one level in with a trailing comma —
+    /// the last included, so adding an argument is a one-line diff — and `>`
+    /// returns to the header's indent. `fun`'s parameter list, exactly.
+    ///
+    /// No line is re-measured here: a generic argument is a type, and a type
+    /// has no layout of its own, so an argument too wide for its line has
+    /// nowhere to break and simply stays wide.
+    fn print_split_type_arguments(&mut self, arguments: &GenericArguments<'src>) {
+        self.out.push('<');
+        self.indent += 1;
+        for (argument, _) in &arguments.0 {
+            self.line();
+            self.print_type(argument);
+            self.out.push(',');
+        }
+        self.indent -= 1;
+        self.line();
+        self.out.push('>');
+    }
+
+    /// Prints a `<A, B>` generic-argument list on a nominal type.
+    fn print_type_arguments(&mut self, arguments: &GenericArguments<'src>) {
+        self.out.push('<');
+        for (index, (argument, _)) in arguments.0.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(", ");
+            }
+            self.print_type(argument);
+        }
+        self.out.push('>');
     }
 
     /// Prints a `: A + B` trait-bound list, or nothing when `bounds` is empty.
@@ -2596,6 +5183,20 @@ impl<'src> Printer<'src> {
             }
             self.print_type(bound);
         }
+    }
+
+    /// [`Self::print_with_clause`] with a [`Split`] carried to the clause's LAST
+    /// trait — the one whose argument list ends an `impl` header's line (E217).
+    fn print_with_clause_splitting_the_tail(
+        &mut self,
+        traits: &[Spanned<Node<'src>>],
+        split: Split,
+    ) {
+        if traits.is_empty() {
+            return;
+        }
+        self.out.push_str(" with ");
+        self.print_bounds_splitting_the_tail(traits, split);
     }
 
     /// Prints a `with A + B` clause (the traits of an `impl`/`trait`), or nothing
@@ -2615,7 +5216,7 @@ impl<'src> Printer<'src> {
 
     /// Prints the `<T, U: Bound = Default>` parameter list of a generic item, or
     /// nothing when there are none.
-    fn print_generic_parameters(&mut self, parameters: &Option<GenericParameters<'src>>) {
+    fn print_generic_parameters(&mut self, parameters: Option<&GenericParameters<'src>>) {
         let Some((parameters, _)) = parameters else {
             return;
         };
@@ -2635,19 +5236,7 @@ impl<'src> Printer<'src> {
             // `(2..0)`. This was dropped entirely, which cost `reactive.vl` its
             // `combine<T: (2..)>` and, through the safety net, its whole file.
             if let Some(tuple_bound) = &parameter.tuple_bound {
-                self.out.push_str(": (");
-                if let Some(lo) = tuple_bound.lo {
-                    self.out.push_str(&lo.to_string());
-                }
-                self.out.push_str("..");
-                if let Some(hi) = tuple_bound.hi {
-                    self.out.push_str(&hi.to_string());
-                }
-                if let Some(element) = &tuple_bound.element {
-                    self.out.push_str(": ");
-                    self.print_type(&element.0);
-                }
-                self.out.push(')');
+                self.print_tuple_bound(tuple_bound);
             }
             if let Some(default) = &parameter.default {
                 self.out.push_str(" = ");
@@ -2674,40 +5263,116 @@ impl<'src> Printer<'src> {
         self.out.push('}');
     }
 
-    /// Prints a function declaration: its `[extern]`/`[must_use]`/`[rpc]`
-    /// attributes (if any) each on their own line, then
+    /// Prints a function declaration: its
+    /// `[deprecated]`/`[internal]`/`[extern]`/`[must_use]`/`[rpc]` attributes
+    /// (if any) each on their own line, then
     /// `[async ][external ]fun name[<…>](…)[: T][ borrows p]` followed by the
     /// body block, or a `;` for a signature with no body.
+    ///
+    /// The attribute prefix is ORDERED (`grammar.md` §"Structs and enums", the
+    /// `function` production), and `[deprecated("use …")]` leads it — so it is
+    /// printed first. The steer is the lexer's raw string text, re-emitted
+    /// between quotes exactly as `[extern(..)]`'s symbols are.
+    /// The labels an item carries about itself (E221), each on its own line
+    /// above it — the shape `print_func` gives a function's. PRINTED, never
+    /// skipped: an attribute with no printer arm makes the token net decline
+    /// every file carrying one.
+    fn print_item_labels(&mut self, labels: &ItemLabels<'src>) {
+        let Some(labels) = labels else {
+            return;
+        };
+        // B382: the ordered prefix a function's is — `[deprecated]` leads.
+        if let Some(steer) = labels.deprecated {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")]");
+            self.end_attribute_line();
+        }
+        if let Some(reason) = labels.internal {
+            self.out.push_str("[internal(\"");
+            self.out.push_str(reason);
+            self.out.push_str("\")]");
+            self.end_attribute_line();
+        }
+        if !labels.platform.is_empty() {
+            self.print_platform_attribute(&labels.platform);
+            self.end_attribute_line();
+        }
+    }
+
+    /// B382: a re-export's `[deprecated("…")]` (carried by the `export`), on
+    /// the statement's own line — a re-export is one line, and the attribute is
+    /// about the NAME it publishes.
+    fn print_import_labels(&mut self, labels: &ItemLabels<'src>) {
+        if let Some(steer) = labels.as_ref().and_then(|labels| labels.deprecated) {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")] ");
+        }
+    }
+
+    /// `: (lo..hi: element)` — a tuple-arity bound, on a generic parameter or
+    /// (A122) an impl subject's binder. Omitted endpoints stay omitted:
+    /// `(2..)` is not `(2..0)`.
+    fn print_tuple_bound(&mut self, tuple_bound: &crate::node::TupleBound<'src>) {
+        self.out.push_str(": (");
+        if let Some(lo) = tuple_bound.lo {
+            self.out.push_str(&lo.to_string());
+        }
+        self.out.push_str("..");
+        if let Some(hi) = tuple_bound.hi {
+            self.out.push_str(&hi.to_string());
+        }
+        if let Some(element) = &tuple_bound.element {
+            self.out.push_str(": ");
+            self.print_type(&element.0);
+        }
+        self.out.push(')');
+    }
+
+    /// `[platform("a", "b")]`, the patterns as written — a function's fence, an
+    /// item's label and a file's platform (F27 R1) all print through here.
+    fn print_platform_attribute(&mut self, patterns: &[Spanned<&'src str>]) {
+        let patterns = patterns
+            .iter()
+            .map(|(pattern, _)| format!("\"{pattern}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.out.push_str(&format!("[platform({patterns})]"));
+    }
+
     fn print_func(&mut self, func: &Func<'src>) {
+        if let Some(steer) = func.deprecated {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")]");
+            self.end_attribute_line();
+        }
+        if let Some(reason) = func.internal {
+            self.out.push_str("[internal(\"");
+            self.out.push_str(reason);
+            self.out.push_str("\")]");
+            self.end_attribute_line();
+        }
         if let Some(binding) = &func.extern_binding {
             self.print_extern_attribute(binding, func.extern_retains);
-            self.line();
+            self.end_attribute_line();
         }
         if func.must_use {
             self.out.push_str("[must_use]");
-            self.line();
+            self.end_attribute_line();
         }
         if func.rpc {
             self.out.push_str("[rpc]");
-            self.line();
+            self.end_attribute_line();
         }
         if func.trait_only {
             self.out.push_str("[trait_only]");
-            self.line();
-        }
-        if func.doc_hidden {
-            self.out.push_str("[doc(hidden)]");
-            self.line();
+            self.end_attribute_line();
         }
         if !func.platform_fence.is_empty() {
-            let patterns = func
-                .platform_fence
-                .iter()
-                .map(|(pattern, _)| format!("\"{pattern}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.out.push_str(&format!("[platform({patterns})]"));
-            self.line();
+            self.print_platform_attribute(&func.platform_fence);
+            self.end_attribute_line();
         }
         if func.is_async {
             self.out.push_str("async ");
@@ -2717,16 +5382,27 @@ impl<'src> Printer<'src> {
         }
         self.out.push_str("fun ");
         self.out.push_str(func.name.0);
-        self.print_generic_parameters(&func.generic_parameters);
+        self.print_generic_parameters(func.generic_parameters.as_ref());
         self.print_parameters(&func.parameters);
         if let Some(return_type) = &func.return_type {
             self.out.push_str(": ");
             self.print_type(&return_type.0);
         }
+        // B242's clause has ONE canonical position: last, after `borrows`
+        // (E146 rule 3). The grammar admits two — the type grammar's own
+        // `context` suffix (§3.9) puts it right after the return type and the
+        // declaration peels it back off, and the declaration's own clause puts
+        // it after `borrows` — and until this rule the printer reprinted
+        // whichever was written, because `format` bails on a token REORDERING
+        // and a canonical position would have left every such file untouched.
+        // `canonicalize_declaration_clauses` folds that one reordering into the
+        // safety net, the way the import order and the style-chain order are
+        // folded in, so the printer can have an answer.
         if let Some(borrows) = func.borrows {
             self.out.push_str(" borrows ");
             self.out.push_str(borrows);
         }
+        self.print_context_clause(func);
         match &func.body {
             Some(body) => {
                 self.out.push(' ');
@@ -2824,6 +5500,27 @@ impl<'src> Printer<'src> {
         self.out.push(')');
     }
 
+    /// ` context name` / ` context (a, b)` — a declaration's B242 clause, or
+    /// nothing when it carries none.
+    fn print_context_clause(&mut self, func: &crate::node::Func<'src>) {
+        let Some((names, _)) = &func.contexts else {
+            return;
+        };
+        self.out.push_str(" context ");
+        if let [(single, _)] = names.as_slice() {
+            self.out.push_str(single);
+            return;
+        }
+        self.out.push('(');
+        for (index, (name, _)) in names.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(", ");
+            }
+            self.out.push_str(name);
+        }
+        self.out.push(')');
+    }
+
     /// The split form: `(` closes the signature's line, every parameter takes its
     /// own line one level in with a trailing comma — the last included, so adding
     /// a parameter is a one-line diff — and `)` returns to the declaration's
@@ -2856,6 +5553,13 @@ impl<'src> Printer<'src> {
             let (binder, parameter_type) = (&parameter.pattern, &parameter.declared_type);
             if index > 0 {
                 self.out.push_str(", ");
+            }
+            // `lazy` is the outermost prefix: it says what the CALL SITE does
+            // with the argument, ahead of how the callee receives it
+            // (lazy.md §1). Exclusive with every prefix below it by the
+            // grammar, so writing it here cannot double up.
+            if parameter.lazy {
+                self.out.push_str("lazy ");
             }
             // `mut` (binder mutability) and the conventions are exclusive by
             // the grammar, so at most one prefix prints.
@@ -2911,11 +5615,13 @@ impl<'src> Printer<'src> {
             // block's value), so it takes the same width rule.
             let statement_start = self.out.len();
             let comment_cursor = self.cursor;
+            let enclosing_head = self.head_start.take();
             self.print_expr(tail);
             if self.begin_split_reprint(statement_start, comment_cursor) {
                 self.print_expr(tail);
                 self.split = Split::Off;
             }
+            self.head_start = enclosing_head;
             self.flush_trailing_comment(tail_range.end);
             prev_end = tail_range.end;
         }
@@ -2992,7 +5698,7 @@ impl<'src> Printer<'src> {
             | Node::Await(_)
             | Node::Async(_) => 10,
             Node::Assign(_, _, _)
-            | Node::Let(_, _, _, _)
+            | Node::Let(..)
             | Node::Closure(_)
             | Node::If(_)
             | Node::For(_, _)
@@ -3106,12 +5812,46 @@ impl<'src> Printer<'src> {
         display_width(&self.out[line_start..]) > LINE_BUDGET
     }
 
+    /// Whether the FIRST line of a rendering that starts at output offset
+    /// `start` overflows the budget — where `start` may be anywhere on its line,
+    /// not just past the indentation.
+    ///
+    /// [`Self::over_line_budget`] adds the current indent level back and so
+    /// needs its offset to be the first byte after the indentation;
+    /// [`Self::current_line_over_budget`] reads the indentation from the text
+    /// but measures the LAST line. A rendering probed mid-line that may span
+    /// lines needs both halves: the text's own indentation, and the first line,
+    /// which is the line the decision is about.
+    fn first_line_over_budget(&self, start: usize) -> bool {
+        let line_start = self.out[..start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let rendered = &self.out[line_start..];
+        let first_line = rendered.split('\n').next().unwrap_or(rendered);
+        display_width(first_line) > LINE_BUDGET
+    }
+
+    /// Ends an ATTRIBUTE line (`[derive(..)]`, `[deprecated(..)]`, a fence…)
+    /// and marks the line after it as the declaration's (E219).
+    fn end_attribute_line(&mut self) {
+        self.line();
+        self.head_start = Some(self.out.len());
+    }
+
     /// Rolls the output and the comment cursor back to the start of the
     /// statement just printed inline and arms the statement-level split, so the
     /// caller can print the same statement again in split form. Returns `false`
     /// — changing nothing — when the statement fits the budget.
+    ///
+    /// E219: the line measured is the DECLARATION's — the first one after any
+    /// attribute lines the item printed above it — not the statement's first.
+    /// The attribute lines are theirs alone and nothing breaks them.
     fn begin_split_reprint(&mut self, statement_start: usize, comment_cursor: usize) -> bool {
-        if !self.over_line_budget(statement_start) {
+        let measured = match self.head_start.take() {
+            Some(head) if head >= statement_start => head,
+            _ => statement_start,
+        };
+        if !self.over_line_budget(measured) {
             return false;
         }
         self.out.truncate(statement_start);
@@ -3139,6 +5879,40 @@ impl<'src> Printer<'src> {
         }
         spine.reverse();
         (subject, spine)
+    }
+
+    /// Whether a ONE-link chain may break on width at all: its single link's
+    /// LAST argument is a closure (E137). Whether it actually DOES is measured
+    /// at the door in [`Self::print_expr`] — this only says the shape is a
+    /// candidate.
+    ///
+    /// "One link is not a chain — breaking it would buy a line and no clarity"
+    /// is still the rule everywhere else, and it is right: `subject.long_name(1)`
+    /// gains nothing from a line that holds only the subject, and
+    /// `list.push(Task { … })` / `registry.register([ … ])` already break their
+    /// argument where it stands, through the argument-tail descent.
+    ///
+    /// A CLOSURE argument is the shape the rule was blind to. Its body is an
+    /// expression that can break in turn, but a body that is itself a chain can
+    /// only break usefully once it has an indentation level to break into — and
+    /// when the link IS the whole chain, the only thing that can give it one is
+    /// the link taking a line of its own. Left inline, `combine(x).map(|…|
+    /// a.b().c())` stayed one 220-column line at any width, because the width
+    /// rule had no site to hang the layout on.
+    fn breaks_as_a_single_link(expr: &Spanned<Node<'src>>) -> bool {
+        let (_, spine) = Self::postfix_spine(expr);
+        spine
+            .iter()
+            .rfind(|step| Self::is_call_link(&step.0))
+            .and_then(|step| match &step.0 {
+                Node::MemberAccessor(_, member) => Some(member),
+                _ => None,
+            })
+            .and_then(|member| match &member.0 {
+                Node::Call(_, _, arguments) => arguments.0.last(),
+                _ => None,
+            })
+            .is_some_and(|argument| matches!(argument.0, Node::Closure(_)))
     }
 
     /// Whether a spine step is a `.name(…)` call link — the unit the split form
@@ -3216,16 +5990,85 @@ impl<'src> Printer<'src> {
         Some(links)
     }
 
-    /// Whether `expr` is a postfix chain the split form breaks: two or more
-    /// `.name(…)` call links. One link is not a chain — breaking it would buy a
-    /// line and no clarity.
-    fn is_breakable_chain(expr: &Spanned<Node<'src>>) -> bool {
+    /// The condition VALUES of an `on` head in the canonical order, or `None`
+    /// when the head is not a sortable `+` run of condition constructors or is
+    /// already canonical — so an unchanged head stays on its existing code
+    /// path, byte for byte (A95 S3, style-conditions.md §2.6).
+    ///
+    /// Refused outright, like a chain: a head with a comment anywhere inside it.
+    /// A reordered head would carry its comments to the wrong value, and the
+    /// comment cursor only moves forward.
+    fn sorted_condition_values<'ast>(
+        &self,
+        head: &'ast Spanned<Node<'src>>,
+    ) -> Option<Vec<&'ast Spanned<Node<'src>>>> {
+        let values = Self::condition_sum_operands(head);
+        if values.len() < 2 {
+            return None;
+        }
+        let span = head.1.into_range();
+        if self.has_comment_in(span.start, span.end) {
+            return None;
+        }
+        let names: Vec<&str> = values
+            .iter()
+            .map(|value| Self::condition_value_name(value).unwrap_or(""))
+            .collect();
+        let order = condition_set_permutation(&names)?;
+        Some(order.into_iter().map(|value| values[value]).collect())
+    }
+
+    /// The operands of a left-nested `+` sum, in written order. A node that is
+    /// not a sum is a sum of one, which is what makes the single-condition head
+    /// fall out of the same walk.
+    fn condition_sum_operands<'ast>(
+        expr: &'ast Spanned<Node<'src>>,
+    ) -> Vec<&'ast Spanned<Node<'src>>> {
+        match &expr.0 {
+            Node::Binary(BinaryOp::Add, left, right) => {
+                let mut operands = Self::condition_sum_operands(left);
+                operands.push(right);
+                operands
+            }
+            _ => vec![expr],
+        }
+    }
+
+    /// The constructor one condition value opens with — the bare call at the
+    /// head of its postfix spine, so `active().not()` and
+    /// `attribute("x").eq("v").not()` both answer with the name that decides
+    /// the axis. `None` for anything else, which ranks as a barrier.
+    fn condition_value_name(expr: &Spanned<Node<'src>>) -> Option<&'src str> {
+        let (subject, _) = Self::postfix_spine(expr);
+        match &subject.0 {
+            Node::Call(callee, None, _) => match &callee.0 {
+                Node::Accessor(name) => Some(name),
+                Node::StaticAccessor(_, member, None) => Some(member),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// How many `.name(…)` call links `expr`'s postfix spine carries — the unit
+    /// the split form gives its own line, and the number the split doors are
+    /// graded on.
+    ///
+    /// The WIDTH door opens from ONE link up (E137). It used to require two —
+    /// "one link is not a chain, and breaking it would buy a line and no
+    /// clarity" — which was true of the case that rule was written for and
+    /// false of the case that motivated it: `combine(x).map(|…| <150 columns>)`
+    /// is one link, and the exemption held the whole statement inline at any
+    /// width, because the only place its layout could hang off was that link's
+    /// argument. The SEAM and COMMENT doors keep the two-link threshold: both
+    /// are about what sits BETWEEN links, so one link has nothing for them to
+    /// be about.
+    fn chain_call_links(expr: &Spanned<Node<'src>>) -> usize {
         let (_, spine) = Self::postfix_spine(expr);
         spine
             .iter()
             .filter(|node| Self::is_call_link(&node.0))
             .count()
-            >= 2
     }
 
     /// Prints a postfix chain in split form: the subject stays on the line the
@@ -3233,8 +6076,8 @@ impl<'src> Printer<'src> {
     /// indentation level in, carrying whatever non-call postfixes follow it
     /// (`a.b(x).c` keeps `.c` on `.b(x)`'s line). The statement's terminator is
     /// the caller's, so it glues to the last link. Only ever called for a chain
-    /// [`Self::is_breakable_chain`] accepted, so the spine holds at least the
-    /// two call links.
+    /// a split door accepted, so the spine holds at least ONE call link — two
+    /// through the seam and comment doors, one through the width door (E137).
     /// Prints a `style()` chain INLINE from an already-ordered link list — the
     /// rendering the recursive `MemberAccessor` arm of [`Self::print_expr`]
     /// produces, with the links taken from `links` instead of from the spine's
@@ -3360,7 +6203,7 @@ impl<'src> Printer<'src> {
     /// head item, each child. The gaps between them are where a markup comment
     /// sits (`proposal/split-comment-attachment.md`, extended to elements).
     fn element_item_spans(body: &crate::node::ElementBody<'src>) -> Vec<Span> {
-        let mut spans = vec![body.tag];
+        let mut spans = vec![body.head_anchor()];
         for item in &body.head {
             spans.push(match item {
                 crate::node::ElementHeadItem::Chain(link) => link.1,
@@ -3390,7 +6233,7 @@ impl<'src> Printer<'src> {
     /// belong together, and one canonical shape is the formatter's whole design.
     ///
     /// Whether the file formats at all still rides on this arm existing. There
-    /// are three `_ => self.bailed = true` fallbacks, the bail set is asserted
+    /// are three `_ => self.decline(..)` fallbacks, the bail set is asserted
     /// EMPTY by `parse_differential::formatter_never_silently_bails`, and a bail
     /// returns the whole FILE unformatted while `--check` calls it clean.
     fn print_css(&mut self, body: &crate::node::CssBody<'src>) {
@@ -3424,6 +6267,12 @@ impl<'src> Printer<'src> {
                     css_item_rank(false, &self.source[declaration.property.into_range()])
                 }
                 crate::node::CssItem::Nested(nested) => css_item_rank(true, nested.name.0),
+                // A69: a chain link is an opaque method — it may write any
+                // property at all (kolt's `.ghost()` writes `pointer-events`
+                // and a `within` rule in one call) — so it is a BARRIER, the
+                // same verdict an unknown property gets, and nothing sorts
+                // across it. Its position is what it means.
+                crate::node::CssItem::Link(_) => None,
             })
             .collect();
         match canonical_permutation(&ranks) {
@@ -3510,32 +6359,38 @@ impl<'src> Printer<'src> {
                 self.print_css_declaration(declaration)
             }
             crate::node::CssItem::Nested(nested) => self.print_css_nested(nested),
+            crate::node::CssItem::Link(link) => self.print_css_link(link),
         }
     }
 
-    /// `property: value;`. The property is a source slice (it spans several
-    /// tokens carrying no joined text), and so is every stretch of the value
-    /// between holes: a value is CSS, not vilan, so the formatter does not
-    /// respace it — a `url("a  b")` would lose its own bytes. What IS
-    /// canonicalized is each hole, which is an ordinary vilan expression:
-    /// `{space( 4 )}` prints `{space(4)}`.
+    /// `.name(a, b);` — a chain link (A69). The arguments are ordinary vilan
+    /// expressions and print as any call's do. The PARENS are reproduced as
+    /// written, not normalized: `.ghost;` and `.ghost();` are the same call
+    /// and the formatter may never invent or delete a token, so each reprints
+    /// as itself.
+    fn print_css_link(&mut self, link: &crate::node::CssLink<'src>) {
+        self.out.push('.');
+        self.out.push_str(link.name.0);
+        if link.parenthesized {
+            self.out.push('(');
+            self.print_expression_list(&link.arguments);
+            self.out.push(')');
+        }
+        self.out.push(';');
+    }
+
+    /// `property(value);` — a declaration, which is a CALL (A101). The property
+    /// is a source slice (it spans several tokens carrying no joined text) and
+    /// the arguments are ordinary vilan expressions, so they print as any
+    /// call's do: the value pass this printer used to carry — text runs
+    /// verbatim, holes canonicalized — is gone with the value grammar, and
+    /// `width( pct( 100 ) )` prints `width(pct(100))` for the ordinary reason.
     fn print_css_declaration(&mut self, declaration: &crate::node::CssDeclaration<'src>) {
         self.out
             .push_str(&self.source[declaration.property.into_range()]);
-        self.out.push_str(": ");
-        for piece in &declaration.value {
-            match piece {
-                crate::node::CssValuePiece::Text(text) => {
-                    self.out.push_str(&self.source[text.into_range()])
-                }
-                crate::node::CssValuePiece::Hole(expression, _) => {
-                    self.out.push('{');
-                    self.print_expr(expression);
-                    self.out.push('}');
-                }
-            }
-        }
-        self.out.push(';');
+        self.out.push('(');
+        self.print_expression_list(&declaration.arguments);
+        self.out.push_str(");");
     }
 
     /// `.name { … }` / `.name(a, b) { … }`. The head's arguments are ordinary
@@ -3551,6 +6406,86 @@ impl<'src> Printer<'src> {
         self.print_css_body(&nested.body, false);
     }
 
+    /// A closure whose body is an ELEMENT that splits (E118): the element takes
+    /// a line of its own, one level in from the statement, and its children and
+    /// closing tag hang off THAT line. Returns whether this arm printed the
+    /// body — `false` leaves the caller to print it inline as before.
+    ///
+    /// The exhibit is `overlays.attach(submenu, || <div .styled(s)>` with its
+    /// children and `</div>` below. Left inline, the split element inherits the
+    /// STATEMENT's indent for its children and its close, while its opening tag
+    /// starts wherever `|| ` happened to end — three anchors that answer to
+    /// nothing in common, and the wider the head the further apart they drift.
+    /// Breaking after `|| ` collapses them to one: the open tag, the close tag
+    /// and the children are all measured from a single column, which is exactly
+    /// how a BLOCK body already reads (`print_block` puts its statements one
+    /// level past the line the `{` opened and its `}` back on it).
+    ///
+    /// Width decides, as everywhere else. The element is printed inline first,
+    /// and only a rendering that actually broke is rolled back and re-printed —
+    /// so `|t| <li>{t}</li>` keeps its line, and the pins that hold an
+    /// expression-bodied closure argument inline keep holding.
+    fn print_closure_element_body(&mut self, body: &Spanned<Node<'src>>) -> bool {
+        if !matches!(body.0, Node::Element(_)) {
+            return false;
+        }
+        let inline_start = self.out.len();
+        let comment_cursor = self.cursor;
+        self.out.push(' ');
+        self.print_expr(body);
+        if !self.out[inline_start..].contains('\n') {
+            return true;
+        }
+        self.out.truncate(inline_start);
+        self.cursor = comment_cursor;
+        self.indent += 1;
+        self.line();
+        self.print_expr(body);
+        self.indent -= 1;
+        true
+    }
+
+    /// The order `body`'s head items print in: the canonical element-head order
+    /// (E151 — see the canonical-element-head-order section), or the written
+    /// order where that section refuses to reorder.
+    ///
+    /// Computed ONCE per element and handed to both renderings, so the inline
+    /// attempt and the split reprint cannot lay the head out in two different
+    /// orders.
+    ///
+    /// Two refusals. A head of fewer than two items has nothing to order. And a
+    /// head with a COMMENT anywhere inside it is left as written: a reordered
+    /// head would carry its comments to the wrong item, and the comment cursor
+    /// only ever moves forward — the style sorter's own refusal, for the same
+    /// reason.
+    fn element_head_order(&self, body: &crate::node::ElementBody<'src>) -> Vec<usize> {
+        let written = || (0..body.head.len()).collect::<Vec<usize>>();
+        if body.head.len() < 2 {
+            return written();
+        }
+        let spans = Self::element_item_spans(body);
+        let head_end = spans[body.head.len()].into_range().end;
+        if self.has_comment_in(body.head_anchor().into_range().end, head_end) {
+            return written();
+        }
+        let kinds: Vec<ElementHeadKind<'src>> = body
+            .head
+            .iter()
+            .map(|item| element_head_kind(item, self.source))
+            .collect();
+        element_head_permutation(&kinds).unwrap_or_else(written)
+    }
+
+    /// The tag's source text — the empty string for a FRAGMENT (A46), whose
+    /// head is nameless, so `<` + this + `>` prints `<>` and `</` + this + `>`
+    /// prints `</>` with no arm of its own in either rendering.
+    fn element_tag_text(&self, body: &crate::node::ElementBody<'src>) -> &'src str {
+        match body.tag {
+            Some(tag) => &self.source[tag.into_range()],
+            None => "",
+        }
+    }
+
     fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
         // A comment between the element's items forces the split — collapsed,
         // there is no line to keep it on — and the split loops below attach it
@@ -3561,25 +6496,28 @@ impl<'src> Printer<'src> {
                 .first()
                 .is_some_and(|child| matches!(child.node().0, Node::Element(_)))
             || self.comment_between_elements(&Self::element_item_spans(body));
+        let order = self.element_head_order(body);
         if !must_split {
             let element_start = self.out.len();
             let comment_cursor = self.cursor;
-            self.print_element_inline(body);
-            if !self.out[element_start..].contains('\n') && !self.current_line_over_budget() {
+            self.print_element_inline(body, &order);
+            if !self.out[element_start..].contains('\n')
+                && (self.atomic_elements || !self.current_line_over_budget())
+            {
                 return;
             }
             self.out.truncate(element_start);
             self.cursor = comment_cursor;
         }
-        self.print_element_split(body);
+        self.print_element_split(body, &order);
     }
 
-    fn print_element_inline(&mut self, body: &crate::node::ElementBody<'src>) {
+    fn print_element_inline(&mut self, body: &crate::node::ElementBody<'src>, order: &[usize]) {
         self.out.push('<');
-        self.out.push_str(&self.source[body.tag.into_range()]);
-        for item in &body.head {
+        self.out.push_str(self.element_tag_text(body));
+        for &at in order {
             self.out.push(' ');
-            self.print_element_head_item(item);
+            self.print_element_head_item(&body.head[at]);
         }
         if body.self_closing {
             self.out.push_str(" />");
@@ -3593,11 +6531,11 @@ impl<'src> Printer<'src> {
             self.print_element_child(child);
         }
         self.out.push_str("</");
-        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push_str(self.element_tag_text(body));
         self.out.push('>');
     }
 
-    fn print_element_split(&mut self, body: &crate::node::ElementBody<'src>) {
+    fn print_element_split(&mut self, body: &crate::node::ElementBody<'src>, order: &[usize]) {
         // Head-item source spans, for comment attachment between items.
         let head_spans: Vec<Span> = {
             let all = Self::element_item_spans(body);
@@ -3611,10 +6549,10 @@ impl<'src> Printer<'src> {
         let head_start = self.out.len();
         let comment_cursor = self.cursor;
         self.out.push('<');
-        self.out.push_str(&self.source[body.tag.into_range()]);
-        for item in &body.head {
+        self.out.push_str(self.element_tag_text(body));
+        for &at in order {
             self.out.push(' ');
-            self.print_element_head_item(item);
+            self.print_element_head_item(&body.head[at]);
         }
         let head_wide = self.out[head_start..].contains('\n') || self.current_line_over_budget();
         let split_head = (head_wide || comment_in_head) && !body.head.is_empty();
@@ -3622,10 +6560,15 @@ impl<'src> Printer<'src> {
             self.out.truncate(head_start);
             self.cursor = comment_cursor;
             self.out.push('<');
-            self.out.push_str(&self.source[body.tag.into_range()]);
+            self.out.push_str(self.element_tag_text(body));
             self.indent += 1;
-            let mut prev_end = body.tag.end;
-            for (item, item_span) in body.head.iter().zip(head_spans[1..].iter()) {
+            // The comment flushes below run over the head items in the order
+            // they PRINT. That is safe precisely because a head that reorders
+            // carries no comment inside it (`element_head_order` refuses one),
+            // so every flush here is a no-op unless the order is the written
+            // one — in which case the spans ascend as they always did.
+            let mut prev_end = body.head_anchor().end;
+            for (item, item_span) in order.iter().map(|&at| (&body.head[at], head_spans[1 + at])) {
                 let item_start = self.out.len();
                 let item_cursor = self.cursor;
                 self.flush_element_comments(item_span.start, prev_end);
@@ -3677,7 +6620,7 @@ impl<'src> Printer<'src> {
         self.indent -= 1;
         self.line();
         self.out.push_str("</");
-        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push_str(self.element_tag_text(body));
         self.out.push('>');
     }
 
@@ -3765,10 +6708,17 @@ impl<'src> Printer<'src> {
         self.out.push_str(" {");
         self.indent += 1;
         let mut prev_end = open;
-        for ((field_name, value), span) in fields {
+        for (field @ (field_name, value), span) in fields {
             let field_start = self.out.len();
             let comment_cursor = self.cursor;
-            self.flush_element_comments(span.into_range().start, prev_end);
+            // Up to the field's VALUE, not to the field: a comment written
+            // between the name and the value (`name = // why ⏎ value`) sits
+            // INSIDE the field span, and flushing only to the span's start
+            // would leave it for whatever flushes next — which is how it ended
+            // up below the whole statement, orphaned from the field it
+            // explains (E146 rule 4). Above the field is where it stays.
+            let anchor = Self::field_comment_anchor(field, *span);
+            self.flush_element_comments(anchor, prev_end);
             prev_end = span.into_range().end;
             self.line();
             let line_start = self.out.len();
@@ -3777,7 +6727,7 @@ impl<'src> Printer<'src> {
             if self.over_line_budget(line_start) {
                 self.out.truncate(field_start);
                 self.cursor = comment_cursor;
-                self.flush_element_comments(span.into_range().start, prev_end);
+                self.flush_element_comments(anchor, prev_end);
                 self.line();
                 self.split = Split::Tail;
                 self.print_struct_field(field_name, value);
@@ -3793,14 +6743,62 @@ impl<'src> Printer<'src> {
     /// the pending split the way `print_expr` does, so a shorthand field — which
     /// has no value position to hand it to — drops it rather than leaking an
     /// armed split onto whatever prints next.
+    ///
+    /// E143: `A { x = x }` and `A { x }` are ONE construct written two ways —
+    /// the analyzer synthesizes the same local read for the shorthand that the
+    /// long form spells out — and the formatter picks the shorthand as the
+    /// canonical spelling, the way it picks one import order and one style-chain
+    /// order. The collapse is a REPRINT of an equal field, not a rewrite of the
+    /// program: the tokens the safety net compares are normalized through
+    /// [`collapse_field_shorthands`] so both spellings reduce to the same
+    /// stream.
+    ///
+    /// A comment written between the name and the value (`x = // why⏎ x`) is
+    /// NOT a reason to keep the long form. The printer has no inline slot for
+    /// one there, and suppressing the collapse for it would make the reprint
+    /// non-idempotent: the first pass would keep `x = x` and move the comment,
+    /// and the second, with the comment now outside the field, would collapse
+    /// anyway. Where the comment GOES is E146 rule 4's answer — onto its own
+    /// line above the field, in the literal's split form, rather than out
+    /// below the whole statement.
     fn print_struct_field(&mut self, field_name: &str, value: &Option<Spanned<Node<'src>>>) {
         let split = std::mem::take(&mut self.split);
         self.out.push_str(field_name);
-        if let Some(value) = value {
-            self.out.push_str(" = ");
-            self.split = split;
-            self.print_expr(value);
+        let Some(value) = value else {
+            return;
+        };
+        if matches!(value.0, Node::Accessor(read) if read == field_name) {
+            return;
         }
+        self.out.push_str(" = ");
+        self.split = split;
+        self.print_expr(value);
+    }
+
+    /// The offset a split literal flushes a field's leading comments up to: the
+    /// field's VALUE when it has one, and otherwise the field itself.
+    ///
+    /// A comment between the name and the value is inside the field's own span,
+    /// so a flush bounded by that span's start would step over it. Bounded by
+    /// the value instead, it is emitted on its own line above the field — which
+    /// is where it belongs and, on the next pass, where it already is.
+    fn field_comment_anchor(field: &StructInitializerField<'src>, span: Span) -> usize {
+        let (_, value) = field;
+        value.as_ref().map_or_else(
+            || span.into_range().start,
+            |value| value.1.into_range().start,
+        )
+    }
+
+    /// Whether a standalone comment sits between one of `fields`' names and its
+    /// value — the trigger for forcing a struct literal into its split form
+    /// (E146 rule 4). Inline there is no line to hold such a comment, so it
+    /// fell out below the whole statement.
+    fn comment_inside_a_field(&self, fields: &[Spanned<StructInitializerField<'src>>]) -> bool {
+        fields.iter().any(|(field, span)| {
+            let anchor = Self::field_comment_anchor(field, *span);
+            self.has_comment_in(span.into_range().start, anchor)
+        })
     }
 
     /// Whether a standalone comment sits in one of the GAPS between the source
@@ -3899,6 +6897,73 @@ impl<'src> Printer<'src> {
         false
     }
 
+    /// Whether `expr`'s chain must break because it does not FIT — measured with
+    /// its element arguments treated as atomic (E155).
+    ///
+    /// The width rule judges a rendering by its first line, which is honest
+    /// everywhere except here: an element argument that breaks takes the rest of
+    /// the chain off the first line WITH it, so the line the rule measures is
+    /// short and the chain is left inline. On kolt's generated `src/lucide`
+    /// that turned a hand-broken four-link `.child` ladder into one 130-column
+    /// line whose THIRD `.child` then broke inside its `<path …/>` — the chain
+    /// rejoined and the element torn open, which is the wrong half to break.
+    ///
+    /// An element is atomic to this rule, so the probe renders the chain with
+    /// every width-driven element break suppressed and asks the ordinary
+    /// question of the ordinary line. Over budget means the chain breaks at its
+    /// LINKS first; each link is then measured on its own line, and an element
+    /// still too wide for one breaks there — one level further in, under a link
+    /// that fits, which is where a break reads.
+    ///
+    /// Only chains that carry an element argument are probed: nothing else can
+    /// have its measurement moved by an element, and the probe is a whole
+    /// rendering.
+    fn chain_overflows_with_atomic_elements(&mut self, expr: &Spanned<Node<'src>>) -> bool {
+        if self.probing {
+            return false;
+        }
+        let (_, spine) = Self::postfix_spine(expr);
+        if !spine
+            .iter()
+            .any(|step| Self::link_carries_an_element(&step.0))
+        {
+            return false;
+        }
+        let start = self.out.len();
+        let cursor = self.cursor;
+        let declined = self.declined.clone();
+        let split = self.split;
+        let indent = self.indent;
+        self.probing = true;
+        self.atomic_elements = true;
+        self.split = Split::Off;
+        self.print_expr(expr);
+        self.probing = false;
+        self.atomic_elements = false;
+        let over = self.first_line_over_budget(start);
+        self.out.truncate(start);
+        self.cursor = cursor;
+        self.declined = declined;
+        self.split = split;
+        self.indent = indent;
+        over
+    }
+
+    /// Whether a spine step is a call link one of whose arguments is an ELEMENT
+    /// — the shape [`Self::chain_overflows_with_atomic_elements`] is about.
+    fn link_carries_an_element(step: &Node<'src>) -> bool {
+        let Node::MemberAccessor(_, member) = step else {
+            return false;
+        };
+        let Node::Call(_, _, arguments) = &member.0 else {
+            return false;
+        };
+        arguments
+            .0
+            .iter()
+            .any(|argument| matches!(argument.0, Node::Element(_)))
+    }
+
     /// Renders one chain link and reports whether it spans lines, then takes the
     /// rendering back out. Measured rather than predicted from the AST, for the
     /// reason the width rule measures: only the printer knows what the printer
@@ -3907,7 +6972,7 @@ impl<'src> Printer<'src> {
     fn link_spans_lines(&mut self, step: &Spanned<Node<'src>>) -> bool {
         let start = self.out.len();
         let cursor = self.cursor;
-        let bailed = self.bailed;
+        let declined = self.declined.clone();
         let split = self.split;
         self.probing = true;
         self.print_postfix_suffix(step);
@@ -3915,7 +6980,7 @@ impl<'src> Printer<'src> {
         let spans = self.out[start..].contains('\n');
         self.out.truncate(start);
         self.cursor = cursor;
-        self.bailed = bailed;
+        self.declined = declined;
         self.split = split;
         spans
     }
@@ -3929,7 +6994,7 @@ impl<'src> Printer<'src> {
         }
         let start = self.out.len();
         let cursor = self.cursor;
-        let bailed = self.bailed;
+        let declined = self.declined.clone();
         let split = self.split;
         self.probing = true;
         self.print_expr(expr);
@@ -3937,7 +7002,7 @@ impl<'src> Printer<'src> {
         let spans = self.out[start..].contains('\n');
         self.out.truncate(start);
         self.cursor = cursor;
-        self.bailed = bailed;
+        self.declined = declined;
         self.split = split;
         spans
     }
@@ -3980,7 +7045,7 @@ impl<'src> Printer<'src> {
             Node::TryAssert(_) => self.out.push('!'),
             Node::Lifted(_) => self.out.push('?'),
             // `postfix_spine` yields only the four forms above.
-            _ => self.bailed = true,
+            _ => self.decline(Some(step.1)),
         }
     }
 
@@ -3990,6 +7055,87 @@ impl<'src> Printer<'src> {
     /// continuation line. This is the single way the split reaches past a
     /// statement's prefix (`let x = const …`, `ret …`, `await …`) and into the
     /// left operand of a binary.
+    /// The operands of a binary chain, flattened at ONE precedence level:
+    /// `expr`'s left spine is walked while it keeps binding at `precedence`,
+    /// and each step contributes the operator that joins it to what came
+    /// before. The first entry carries no operator — it is the chain's head.
+    ///
+    /// One level, because the root of a binary tree is its LOWEST-precedence
+    /// operator (that is what "binds loosest" means), and the lowest-precedence
+    /// operator is where a reader expects the break. `a || b && c` flattens to
+    /// `a` and `|| b && c`, never to three lines: the `&&` binds tighter and
+    /// belongs on one of them. Operators of the SAME precedence flatten
+    /// together (`a + b - c` is three lines), since a tier is one chain however
+    /// many spellings it mixes.
+    fn flatten_binary_chain<'ast>(
+        expr: &'ast Spanned<Node<'src>>,
+        precedence: u8,
+        out: &mut Vec<(Option<BinaryOp>, &'ast Spanned<Node<'src>>)>,
+    ) {
+        if let Node::Binary(operator, left, right) = &expr.0
+            && Self::binary_precedence(*operator) == precedence
+        {
+            Self::flatten_binary_chain(left, precedence, out);
+            out.push((Some(*operator), right));
+            return;
+        }
+        out.push((None, expr));
+    }
+
+    /// Prints a binary chain one operand per line, OPERATOR-LEADING and one
+    /// indentation level in — rustfmt's shape, and the shape the hand-wrapped
+    /// conditions in this tree were already written in before N55's reformat
+    /// joined them (E147):
+    ///
+    /// ```text
+    /// if text.contains(" ")
+    ///     || text.contains("\"")
+    ///     || text.contains("(")
+    /// {
+    /// ```
+    ///
+    /// The operator leads its line because that is what makes the chain
+    /// scannable: every continuation line answers "and how does this join?"
+    /// before it says anything else, and the operands line up under each other.
+    ///
+    /// Each operand's line is then measured in turn, exactly as a split list's
+    /// element is: over budget, the operand rolls back and reprints with
+    /// [`Split::Tail`] armed, so an operand that is itself a chain breaks with
+    /// its own lines one level past this one.
+    ///
+    /// The operand minimums are the inline form's: `precedence` for the head
+    /// (a left operand may re-bind at the same level) and `precedence + 1` for
+    /// every operand after it, so the reprint reparses to the same tree —
+    /// `a - (b - c)` keeps its parentheses.
+    fn print_split_binary_chain(
+        &mut self,
+        operands: &[(Option<BinaryOp>, &Spanned<Node<'src>>)],
+        precedence: u8,
+    ) {
+        self.indent += 1;
+        for (index, (operator, operand)) in operands.iter().enumerate() {
+            if let Some(operator) = operator {
+                self.line();
+                self.out.push_str(binary_operator_symbol(*operator));
+                self.out.push(' ');
+            }
+            let minimum = if index == 0 {
+                precedence
+            } else {
+                precedence + 1
+            };
+            let operand_start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_operand(operand, minimum);
+            if self.current_line_over_budget() {
+                self.out.truncate(operand_start);
+                self.cursor = comment_cursor;
+                self.print_split_operand(operand, minimum, Split::Tail);
+            }
+        }
+        self.indent -= 1;
+    }
+
     fn print_split_operand(&mut self, expr: &Spanned<Node<'src>>, minimum: u8, split: Split) {
         self.split = if Self::expression_precedence(&expr.0) >= minimum {
             split
@@ -4066,7 +7212,15 @@ impl<'src> Printer<'src> {
     /// the line stays long, because breaking there needs argument-list layout.
     /// A [`Split::Statement`] arming stops here too — a chain nested in an
     /// argument of a statement that is not itself a chain stays inline.
-    fn print_call_arguments(&mut self, arguments: &[Spanned<Node<'src>>], split: Split) {
+    /// `head`, when present, replaces the FIRST argument with its own operands
+    /// printed as a `+` sum — the canonical order of an `on` head's condition
+    /// values (A95 S3). Every other argument prints exactly as it always did.
+    fn print_call_arguments(
+        &mut self,
+        arguments: &[Spanned<Node<'src>>],
+        split: Split,
+        head: Option<&[&Spanned<Node<'src>>]>,
+    ) {
         for (index, argument) in arguments.iter().enumerate() {
             if index > 0 {
                 self.out.push_str(", ");
@@ -4078,7 +7232,18 @@ impl<'src> Printer<'src> {
             if split != Split::Off && index + 1 == arguments.len() {
                 self.split = Split::Tail;
             }
-            self.print_expr(argument);
+            match head {
+                Some(values) if index == 0 => {
+                    let precedence = Self::binary_precedence(BinaryOp::Add);
+                    for (at, value) in values.iter().enumerate() {
+                        if at > 0 {
+                            self.out.push_str(" + ");
+                        }
+                        self.print_operand(value, precedence + 1);
+                    }
+                }
+                _ => self.print_expr(argument),
+            }
         }
     }
 
@@ -4124,7 +7289,7 @@ impl<'src> Printer<'src> {
         self.source.get(range.start..end)
     }
 
-    /// Prints any expression. Sets `bailed` for forms not yet handled.
+    /// Prints any expression. Declines forms not yet handled.
     fn print_expr(&mut self, expr: &Spanned<Node<'src>>) {
         // Take the pending split permission here, so that every form *drops* it
         // by default and only the arms below re-arm it explicitly (via
@@ -4139,10 +7304,12 @@ impl<'src> Printer<'src> {
         }
         // Two doors into the split form: the width rule armed a split, or the
         // chain carries a `})` seam (`proposal/chain-seam-split.md`).
-        if Self::is_breakable_chain(expr)
+        let call_links = Self::chain_call_links(expr);
+        if call_links >= 2
             && (split != Split::Off
                 || self.chain_has_comment_between_links(expr)
-                || self.chain_has_spanning_seam(expr))
+                || self.chain_has_spanning_seam(expr)
+                || self.chain_overflows_with_atomic_elements(expr))
         {
             self.print_split_chain(expr);
             return;
@@ -4154,6 +7321,32 @@ impl<'src> Printer<'src> {
         // through untouched, so nothing else in the formatter moves.
         if let Some(links) = self.style_sorted_links(expr) {
             self.print_inline_chain(expr, &links, split);
+            return;
+        }
+        // The width door for a ONE-link chain (E137). Measured, not predicted,
+        // like every other width decision: the inline form is printed first —
+        // with the permission handed to the link, so the argument-tail descent
+        // still reaches whatever is inside it — and only if the FIRST line is
+        // still over budget does the link roll back onto a line of its own.
+        //
+        // That order is what keeps `raw.map(|entry| Entry { … })` reading the
+        // way it should. The struct literal breaks where it is, under a `raw.map(`
+        // that fits; splitting the chain first would put `raw` alone on a line
+        // and buy nothing. `combine(x).map(|…| a.b().c())` measures the other
+        // way — 105 columns with the closure broken — and takes the link's own
+        // line, which is what finally gives the closure body somewhere to indent
+        // into.
+        if split != Split::Off && call_links == 1 && Self::breaks_as_a_single_link(expr) {
+            let (_, spine) = Self::postfix_spine(expr);
+            let start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_inline_chain(expr, &spine, split);
+            if !self.first_line_over_budget(start) {
+                return;
+            }
+            self.out.truncate(start);
+            self.cursor = comment_cursor;
+            self.print_split_chain(expr);
             return;
         }
         match &expr.0 {
@@ -4217,7 +7410,10 @@ impl<'src> Printer<'src> {
                 self.split = split;
                 self.print_expr(member);
             }
-            Node::StaticAccessor(subject, member) => {
+            // An expression path never carries generic arguments on its member
+            // (they belong to the call that follows), so there are none to print
+            // here; the type printer below has the arm that does.
+            Node::StaticAccessor(subject, member, _) => {
                 self.print_operand(subject, 100);
                 self.out.push_str("::");
                 self.out.push_str(member);
@@ -4254,12 +7450,21 @@ impl<'src> Printer<'src> {
                     }
                     self.out.push('>');
                 }
+                // An `on` head's condition values print in the canonical order,
+                // not the written one (A95 S3) — the same rule a `style()`
+                // chain's links follow, one level down.
+                let head = matches!(callee.0, Node::Accessor("on"))
+                    .then(|| arguments.0.first())
+                    .flatten()
+                    .and_then(|first| self.sorted_condition_values(first));
                 self.out.push('(');
-                self.print_call_arguments(&arguments.0, split);
+                self.print_call_arguments(&arguments.0, split, head.as_deref());
                 self.out.push(')');
             }
             Node::Binary(operator, left, right) => {
                 let precedence = Self::binary_precedence(*operator);
+                let chain_start = self.out.len();
+                let chain_cursor = self.cursor;
                 let left_start = self.out.len();
                 self.print_split_operand(left, precedence, split);
                 // A split that broke the left operand across lines continues
@@ -4281,6 +7486,27 @@ impl<'src> Printer<'src> {
                 self.print_split_right(right, precedence + 1, split);
                 if continued {
                     self.indent -= 1;
+                }
+                // E147: the chain itself is the last thing that can break. The
+                // operand splits above got first refusal — a chain or a literal
+                // to one side of the operator breaks where it stands, and that
+                // is usually the better layout — and only when the line is
+                // STILL over budget does the chain break at its own operator.
+                //
+                // Two operators is the threshold, E137's rule one construct
+                // over: one link is not a chain, and neither is one operator.
+                // `base + s.aa("<90 columns>")` has nowhere useful to go —
+                // breaking it buys a line and leaves the operand just as wide —
+                // while `a || b || c` is a list of conditions and reads as one.
+                if split != Split::Off && !self.probing && self.first_line_over_budget(chain_start)
+                {
+                    let mut operands = Vec::new();
+                    Self::flatten_binary_chain(expr, precedence, &mut operands);
+                    if operands.len() >= 3 {
+                        self.out.truncate(chain_start);
+                        self.cursor = chain_cursor;
+                        self.print_split_binary_chain(&operands, precedence);
+                    }
                 }
             }
             // A prefix operator (`-x`, `!x`, `&x`, `*x`, `await x`) binds tighter
@@ -4368,7 +7594,17 @@ impl<'src> Printer<'src> {
                 self.out.push_str("const ");
                 self.print_split_operand(inner, 0, split);
             }
-            Node::Let(name, declared_type, value, mutable) => {
+            Node::Let(name, declared_type, value, mutable, lazy, labels) => {
+                // E221: a module binding's labels, each on its own line above
+                // it, as a function's are.
+                self.print_item_labels(labels);
+                // `lazy` precedes the binder word, as it does on a parameter
+                // (lazy.md §2). It is a keyword with no node of its own beyond
+                // the flag, so dropping it here would silently turn a deferred
+                // initializer into a load-time one.
+                if *lazy {
+                    self.out.push_str("lazy ");
+                }
                 self.out.push_str(if *mutable { "mut " } else { "let " });
                 self.out.push_str(name.0);
                 if let Some(declared_type) = declared_type {
@@ -4404,9 +7640,15 @@ impl<'src> Printer<'src> {
                 self.out.push_str("= ");
                 self.print_split_operand(value, 0, split);
             }
-            Node::If(branch) => self.print_if_branch(branch),
+            Node::If(branch) => self.print_if_branch(branch, split),
             Node::Match(subject, legs) => {
                 self.out.push_str("match ");
+                // The SUBJECT continues the measured line — `match <subject> {`
+                // is one line, and the subject is the only thing on it with a
+                // layout of its own — so it takes the split permission, exactly
+                // as an `if` condition does (E147, extended by E150 rule B).
+                // Without this an over-budget `match` had nowhere to break.
+                self.split = split;
                 self.print_expr(subject);
                 self.out.push_str(" {");
                 self.indent += 1;
@@ -4422,13 +7664,29 @@ impl<'src> Printer<'src> {
                         self.blank_line();
                     }
                     self.line();
-                    self.print_match_leg(leg);
                     // The arm separator comma is optional and not kept in the AST
                     // (the corpus mixes `=> { .. },` and `=> { .. }`), so preserve
                     // whatever the source had to round-trip either style faithfully.
                     let body_end = body.1.into_range().end;
-                    if self.source_has_comma_at(body_end) {
+                    let comma = self.source_has_comma_at(body_end);
+                    let leg_start = self.out.len();
+                    let leg_cursor = self.cursor;
+                    self.print_match_leg(leg, Split::Off);
+                    if comma {
                         self.out.push(',');
+                    }
+                    // A leg's line is a measured line, exactly as a split list's
+                    // element is: over budget, the leg rolls back and reprints
+                    // with the split armed, so its BODY has somewhere to break.
+                    // The patterns and the guard are not layout sites — the
+                    // permission reaches the body and nothing else.
+                    if self.over_line_budget(leg_start) {
+                        self.out.truncate(leg_start);
+                        self.cursor = leg_cursor;
+                        self.print_match_leg(leg, Split::Tail);
+                        if comma {
+                            self.out.push(',');
+                        }
                     }
                     self.flush_trailing_comment(body_end);
                     prev_end = body_end;
@@ -4442,15 +7700,33 @@ impl<'src> Printer<'src> {
                 self.out.push_str("for");
                 if let Some(condition) = condition {
                     self.out.push(' ');
+                    // `for <condition> {` — vilan's `while` — is one measured
+                    // line whose only layout site is the condition, so the
+                    // condition takes the split permission the `if` condition
+                    // takes (E147, extended by E150 rule B). A bare `for {` has
+                    // no condition and nothing to hand it to.
+                    self.split = split;
                     self.print_expr(condition);
                 }
                 self.out.push(' ');
                 self.print_block(body);
             }
-            Node::ForIn(variable, iterable, body) => {
+            Node::ForIn(binder, iterable, body) => {
                 self.out.push_str("for ");
-                self.out.push_str(variable);
+                // The binder is `let`'s (B368), so it prints through the same
+                // `print_binder` a destructuring `let` uses: a name, or a
+                // tuple/array of them.
+                self.print_binder(&binder.0);
                 self.out.push_str(" in ");
+                // `for <binder> in <iterable> {` is one measured line, and the
+                // ITERABLE is the only thing on it with a layout of its own —
+                // the binder is a name or a flat binder — so it takes the split
+                // permission the
+                // `for` condition and the `match` subject take (E147, E150
+                // rule B, E154). E150 rule B reached the two block-bearing
+                // heads it was written for and left the third sibling alone,
+                // so an over-budget iterable had nowhere to break at all.
+                self.split = split;
                 self.print_expr(iterable);
                 self.out.push(' ');
                 self.print_block(body);
@@ -4483,9 +7759,17 @@ impl<'src> Printer<'src> {
                 self.print_argument_spans(argument_spans);
                 self.out.push(')');
             }
-            Node::StructInitializer(name, generic_arguments, fields) => {
-                self.out.push_str(name);
-                if let Some((generic_arguments, _)) = generic_arguments {
+            Node::StructInitializer(namespace, name, generic_arguments, fields) => {
+                // The path as written (B190) — the namespace spine, then the
+                // name. The printer BAILS on a form it does not know, falling
+                // the whole file back to its source silently, so a qualified
+                // literal without this would have stopped being formatted.
+                for segment in namespace {
+                    self.out.push_str(segment);
+                    self.out.push_str("::");
+                }
+                self.out.push_str(name.0);
+                if let Some((generic_arguments, _)) = generic_arguments.as_deref() {
                     self.out.push('<');
                     for (index, (argument, _)) in generic_arguments.iter().enumerate() {
                         if index > 0 {
@@ -4505,6 +7789,7 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" {}");
                 } else if split != Split::Off
                     || self.comment_outside_elements(fields.1, &field_spans)
+                    || self.comment_inside_a_field(&fields.0)
                     || self.any_field_spans_lines(&fields.0)
                 {
                     self.print_split_struct(&fields.0, fields.1.into_range().start);
@@ -4558,8 +7843,17 @@ impl<'src> Printer<'src> {
                     self.out.push_str(": ");
                     self.print_type(&return_type.0);
                 }
-                self.out.push(' ');
-                self.print_expr(&closure.return_value);
+                if !self.print_closure_element_body(&closure.return_value) {
+                    self.out.push(' ');
+                    // A closure body continues the line the closure opened, so
+                    // it takes the same split permission every other
+                    // line-continuing position takes (E137). Without this the
+                    // body of `.map(|t| a.b(x).c(y))` was exempt from the
+                    // budget: the split arrived at the closure and stopped
+                    // there, and the two-link chain inside it never broke.
+                    self.split = split;
+                    self.print_expr(&closure.return_value);
+                }
             }
             Node::Is(subject, pattern) => {
                 self.print_operand(subject, 3);
@@ -4586,7 +7880,7 @@ impl<'src> Printer<'src> {
             }
             Node::Element(body) => self.print_element(body),
             Node::Css(body) => self.print_css(body),
-            _ => self.bailed = true,
+            _ => self.decline(Some(expr.1)),
         }
     }
 
@@ -4604,27 +7898,140 @@ impl<'src> Printer<'src> {
     }
 
     /// Prints an `if`/`else if`/`else` chain.
-    fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>) {
+    /// Prints an `if`/`else` chain, choosing ONCE for the whole chain between
+    /// the block form (every arm on its own lines) and the inline arm form
+    /// `if c { a } else { b }` (E146 rule 2).
+    ///
+    /// An `if` that begins its own line is a STATEMENT or a block's tail: it
+    /// owns those lines, and its arms take the block form, which is what the
+    /// tree has always been written in. An `if` reached mid-line is an operand
+    /// of something larger — a closure body inside a builder ladder, a match
+    /// leg's `=> `, the right of a `let` — and there expanding an arm whose
+    /// body is a single expression buys nothing and costs the ladder its shape:
+    /// `.bind_text(pending().map(|busy| if busy { "..." } else { "" }))` became
+    /// five lines mid-ladder under N55's reformat, and the enclosing chain then
+    /// measured a first line that fit and never broke, which is the layout that
+    /// should have happened instead.
+    ///
+    /// The `split` permission is the escape hatch: armed, the arms expand as
+    /// before, so an `if` too wide for its line still has somewhere to go. The
+    /// decision is made once at the head of the chain and threaded down, so an
+    /// `else if` never disagrees with the `if` it hangs off.
+    fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>, split: Split) {
+        let inline =
+            split == Split::Off && !self.at_line_start() && self.arms_are_expressions(branch);
+        self.print_if_chain(branch, inline, split);
+    }
+
+    fn print_if_chain(&mut self, branch: &NodeIfBranch<'src>, inline: bool, split: Split) {
         match branch {
             NodeIfBranch::If(if_) => {
                 self.out.push_str("if ");
+                // The condition CONTINUES the measured line — `if <cond> {` is
+                // one line, and the condition is the only thing on it with a
+                // layout of its own — so it takes the split permission, the way
+                // a binary's operand and a call's last argument do. Without
+                // this an over-budget `if` had nowhere to break at all (E147).
+                self.split = split;
                 self.print_expr(&if_.condition);
                 self.out.push(' ');
-                self.print_block(&if_.then);
+                self.print_arm_body(&if_.then, inline);
                 if let Some((else_branch, _)) = &if_.else_ {
                     self.out.push_str(" else ");
                     match else_branch {
-                        NodeIfBranch::If(_) => self.print_if_branch(else_branch),
-                        NodeIfBranch::Else(block) => self.print_block(block),
+                        NodeIfBranch::If(_) => self.print_if_chain(else_branch, inline, split),
+                        NodeIfBranch::Else(block) => self.print_arm_body(block, inline),
                     }
                 }
             }
-            NodeIfBranch::Else(block) => self.print_block(block),
+            NodeIfBranch::Else(block) => self.print_arm_body(block, inline),
         }
     }
 
+    /// Whether everything emitted since the last newline is indentation — i.e.
+    /// the printer is at the head of a line it has not written anything onto.
+    fn at_line_start(&self) -> bool {
+        let line_start = self.out.rfind('\n').map_or(0, |newline| newline + 1);
+        self.out[line_start..].bytes().all(|byte| byte == b'\t')
+    }
+
+    /// Whether EVERY arm of an `if`/`else` chain is a single expression the
+    /// inline form can hold ([`Self::arm_is_an_expression`]). One arm that is
+    /// legitimately a block keeps the whole chain in the block form: an `if`
+    /// with one inline arm and one expanded one reads worse than either.
+    fn arms_are_expressions(&mut self, branch: &NodeIfBranch<'src>) -> bool {
+        match branch {
+            NodeIfBranch::If(if_) => {
+                self.arm_is_an_expression(&if_.then)
+                    && match &if_.else_ {
+                        None => true,
+                        Some((else_branch, _)) => self.arms_are_expressions(else_branch),
+                    }
+            }
+            NodeIfBranch::Else(block) => self.arm_is_an_expression(block),
+        }
+    }
+
+    /// Whether one arm's block is an expression wearing braces: no statements,
+    /// a tail that is not `Void`, no comment anywhere inside it (a comment has
+    /// no slot on the inline line and would be relocated), and a tail that
+    /// renders on ONE line — a tail that is itself a `match` or an element tree
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not an inline arm.
+    ///
+    /// Shared with a `match` leg body written `{ expr }` (E150 rule A), so the
+    /// two constructs judge "an expression wearing braces" by one definition.
+    fn arm_is_an_expression(
+        &mut self,
+        block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+    ) -> bool {
+        let range = block.1.into_range();
+        let (statements, tail) = &block.0;
+        statements.is_empty()
+            && !matches!(tail.0, Node::Void)
+            && !self.has_comment_in(range.start, range.end)
+            && !self.expr_spans_lines(tail)
+    }
+
+    /// One arm, in whichever form the chain chose — or one `match` leg body
+    /// written `{ expr }` (E150 rule A), which reaches the same two forms.
+    fn print_arm_body(
+        &mut self,
+        block: &Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+        inline: bool,
+    ) {
+        if !inline {
+            self.print_block(block);
+            return;
+        }
+        // No statements and no comments, by construction — so nothing here has
+        // to flush a comment or advance the cursor; the tail IS the arm.
+        let (_, tail) = &block.0;
+        self.out.push_str("{ ");
+        self.print_expr(tail);
+        self.out.push_str(" }");
+    }
+
     /// Prints one `match` leg: `pattern[, pattern][ if guard] => body`.
-    fn print_match_leg(&mut self, leg: &crate::node::MatchLeg<'src>) {
+    ///
+    /// `split` is handed to the BODY and to nothing else: a pattern and a guard
+    /// have no layout of their own, so a leg whose line is over budget can only
+    /// break in its body.
+    ///
+    /// A body WRITTEN `=> { expr }` stays an expression on the leg's line
+    /// (E150 rule A) — E146 rule 2's shape one construct over. A leg's `=> ` is
+    /// a mid-line position by construction, exactly the position that keeps an
+    /// `if`'s arms inline, and the same argument applies: a body that is one
+    /// expression wearing braces buys nothing by expanding, and the three lines
+    /// it spends come off whatever the leg sits inside. The braces themselves
+    /// stay — dropping them would drift the token stream the safety net
+    /// compares — so this is a layout choice and not a rewrite.
+    ///
+    /// The escape hatches are E146 rule 2's, unchanged: an armed `split` (the
+    /// leg's line measured over budget and rolled back) takes the block form,
+    /// and so does a body that is legitimately a block —
+    /// [`Self::arm_is_an_expression`] is the one judge of that, shared with the
+    /// `if` arms so the two constructs cannot disagree.
+    fn print_match_leg(&mut self, leg: &crate::node::MatchLeg<'src>, split: Split) {
         let (patterns, guard, body) = leg;
         for (index, pattern) in patterns.iter().enumerate() {
             if index > 0 {
@@ -4637,6 +8044,14 @@ impl<'src> Printer<'src> {
             self.print_expr(guard);
         }
         self.out.push_str(" => ");
+        if split == Split::Off
+            && let Node::Block(block) = &body.0
+            && self.arm_is_an_expression(block)
+        {
+            self.print_arm_body(block, true);
+            return;
+        }
+        self.split = split;
         self.print_expr(body);
     }
 
@@ -4814,6 +8229,75 @@ mod reformats {
         assert_eq!(format(expected), expected, "output is not idempotent");
     }
 
+    // B242: a DECLARED `context` clause CLOSES the signature — it is the last
+    // thing on it, after `borrows` (E146 rule 3). The grammar admits two
+    // positions (the type grammar's own suffix takes it right after the return
+    // type; the declaration's own clause takes it after `borrows`) and the
+    // printer used to reprint whichever was written, because `format` bails on
+    // a token reordering. `normalize` folds that ONE reordering in now, so
+    // there is a canonical answer.
+    #[test]
+    fn a_declared_context_clause_closes_the_signature() {
+        assert_formats(
+            "fun render(x: i32): i32 context settings {\n\tx\n}\n",
+            "fun render(x: i32): i32 context settings {\n\tx\n}\n",
+        );
+        assert_formats(
+            "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
+            "fun render(x: i32) context (a, b) {\n\tx;\n}\n",
+        );
+        // With `borrows` on the signature, BOTH written orders reprint as the
+        // one canonical order: `borrows` first, the clause last.
+        assert_formats(
+            "fun slot(x: i32): i32 context turn borrows x {\n\tx\n}\n",
+            "fun slot(x: i32): i32 borrows x context turn {\n\tx\n}\n",
+        );
+        assert_formats(
+            "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
+            "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
+        );
+    }
+
+    // E146 rule 3, in full: both written orders in, ONE order out, for a
+    // declaration with a return type and for one without, for a single-name
+    // clause and for a list, and for a bodyless declaration (a trait
+    // requirement or an `external` intrinsic) as well as one with a body.
+    #[test]
+    fn the_context_clause_normalizes_after_borrows() {
+        let canonical = "fun slot(x: i32): i32 borrows x context (turn, log) {\n\tx\n}\n";
+        assert_formats(
+            "fun slot(x: i32): i32 context (turn, log) borrows x {\n\tx\n}\n",
+            canonical,
+        );
+        assert_formats(canonical, canonical);
+        let bodyless = "fun slot(x: i32): i32 borrows x context turn;\n";
+        assert_formats("fun slot(x: i32): i32 context turn borrows x;\n", bodyless);
+        assert_formats(bodyless, bodyless);
+        // No `borrows`: the clause is already last, and stays exactly where the
+        // return type leaves it.
+        assert_formats(
+            "fun render(x: i32): i32 context settings;\n",
+            "fun render(x: i32): i32 context settings;\n",
+        );
+    }
+
+    // The clause a PARAMETER's closure type carries (`transport.md` §3.9) is a
+    // different clause on a different production, and is untouched — including
+    // beside a declaration clause that IS reordered.
+    #[test]
+    fn a_closure_types_context_clause_is_untouched() {
+        assert_formats(
+            "fun run(cb: (|| i32) context turn): i32 {\n\tcb()\n}\n",
+            "fun run(cb: (|| i32) context turn): i32 {\n\tcb()\n}\n",
+        );
+        // The parameter's clause stays inside the parameter list; only the
+        // declaration's own pair reorders around it.
+        assert_formats(
+            "fun run(cb: (|| i32) context turn, x: i32): i32 context log borrows x {\n\tcb()\n}\n",
+            "fun run(cb: (|| i32) context turn, x: i32): i32 borrows x context log {\n\tcb()\n}\n",
+        );
+    }
+
     // The extern retention flag (`lifetimes.md` §6.4) round-trips. It is
     // recognized in TRAILING position only — the one place a flag can sit
     // without displacing a form word — so the printer reprints it exactly where
@@ -4908,24 +8392,24 @@ mod reformats {
     #[test]
     fn resource_struct_modifier_round_trips() {
         assert_formats(
-            "resource struct S{x:i32}\n",
-            "resource struct S {\n\tx: i32,\n}\n",
+            "[resource] struct S{x:i32}\n",
+            "[resource] struct S {\n\tx: i32,\n}\n",
         );
     }
 
     #[test]
     fn resource_external_struct_keeps_canonical_order() {
         assert_formats(
-            "resource external struct Database;\n",
-            "resource external struct Database;\n",
+            "[resource] external struct Database;\n",
+            "[resource] external struct Database;\n",
         );
     }
 
     #[test]
     fn resource_enum_modifier_round_trips() {
         assert_formats(
-            "resource enum E{A,B}\n",
-            "resource enum E {\n\tA,\n\tB,\n}\n",
+            "[resource] enum E{A,B}\n",
+            "[resource] enum E {\n\tA,\n\tB,\n}\n",
         );
     }
 
@@ -4983,6 +8467,17 @@ mod reformats {
         assert_formats(
             "fun f(){let x=i\"a \\{b\\} c\";x}\n",
             "fun f() {\n\tlet x = i\"a \\{b\\} c\";\n\tx\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_interpolated_string_whose_hole_holds_an_escaped_quote_round_trips() {
+        // B278. The literal is recovered from SOURCE, so the escaped spelling the
+        // author wrote is the spelling that comes back — the formatter neither
+        // unescapes it to `"k"` nor bails on it.
+        assert_formats(
+            "fun f(){print(i\"{g(\\\"k\\\")}\")}\n",
+            "fun f() {\n\tprint(i\"{g(\\\"k\\\")}\")\n}\n",
         );
     }
 
@@ -5053,6 +8548,81 @@ mod reformats {
             "impl Option<type T> {\n\tfun map<U>(self, fn: |T| U): Option<U> {\n\t\tmatch self {\n\t\t\tSome(let x) => Some(fn(x)),\n\t\t\tNone => None\n\t\t}\n\t}\n}\n",
         );
     }
+
+    /// B294: the ANONYMOUS binder has one canonical spelling, and it is the
+    /// wildcard. `type _` prints as `_`; a NAMED binder keeps its keyword; and
+    /// the canonical form is a fixed point (`assert_formats` re-formats its own
+    /// output). The keyword is dropped by the PRINTER, and the reprint safety
+    /// net is token-for-token — so `drop_anonymous_binder_keywords` folding the
+    /// two spellings together is what lets this land at all: without it,
+    /// `format` bails and hands the source straight back.
+    #[test]
+    fn an_anonymous_type_binder_canonicalises_to_the_wildcard() {
+        assert_formats(
+            "impl Source<Option<type _: Source<type U>>> {\n\tfun depth(self): i32 {\n\t\t2\n\t}\n}\n",
+            "impl Source<Option<_: Source<type U>>> {\n\tfun depth(self): i32 {\n\t\t2\n\t}\n}\n",
+        );
+        assert_formats(
+            "impl Pair<type _, type _> {\n\tfun blend(self): i32 {\n\t\t0\n\t}\n}\n",
+            "impl Pair<_, _> {\n\tfun blend(self): i32 {\n\t\t0\n\t}\n}\n",
+        );
+        // A named binder is untouched: there the keyword is the only thing
+        // saying the position introduces a name.
+        assert_formats(
+            "impl Option<type T> {\n\tfun held(self): i32 {\n\t\t0\n\t}\n}\n",
+            "impl Option<type T> {\n\tfun held(self): i32 {\n\t\t0\n\t}\n}\n",
+        );
+    }
+
+    /// A module-qualified TYPE path (B172) reprints as written, in every
+    /// position the type printer is reached from. The printer BAILS on a form
+    /// it does not know — falling the whole file back to its source, silently —
+    /// so a new type form without an arm here is a file that stops being
+    /// formatted rather than a failure anyone sees.
+    #[test]
+    fn a_module_qualified_type_path_round_trips() {
+        let source = "import std::reactive;\nimport std::style;\n\n\
+             struct Card {\n\
+             \tstyle: style::Style,\n\
+             \thits: reactive::SignalCell<i32>,\n\
+             \tdeep: List<std::style::Style>,\n\
+             }\n\n\
+             impl style::Style {\n\
+             \tfun tag(&self): str {\n\
+             \t\t\"s\"\n\
+             \t}\n\
+             }\n\n\
+             fun render(card: &Card, shape: (style::Style, i32)): style::Style {\n\
+             \tlet held: style::Style = card.style;\n\
+             \tshape.0\n\
+             }\n";
+        assert_formats(source, source);
+    }
+
+    /// A module-qualified struct LITERAL (B190) reprints as written. Same
+    /// hazard as the type path above, and pinned for the same reason: the
+    /// printer BAILS on a form it does not know, which turns a missing arm
+    /// into a file that quietly stops being formatted rather than a failure
+    /// anyone sees.
+    #[test]
+    fn a_module_qualified_struct_literal_round_trips() {
+        let source = "mod shapes {\n\
+             \tmod deep {\n\
+             \t\tstruct Ring {\n\
+             \t\t\tr: i32,\n\
+             \t\t}\n\
+             \t}\n\n\
+             \tstruct Dot {\n\
+             \t\tx: i32,\n\
+             \t}\n\
+             }\n\n\
+             fun main() {\n\
+             \tlet d = shapes::Dot { x = 1 };\n\
+             \tlet r = shapes::deep::Ring { r = 2 };\n\
+             \tprint(i\"{d.x}{r.r}\");\n\
+             }\n";
+        assert_formats(source, source);
+    }
 }
 
 #[cfg(test)]
@@ -5069,15 +8639,14 @@ mod idempotency {
         // `reactive_vl` is here precisely to catch a dropped `[must_use]`
         // tripping the safety net into a silent no-op, and it was tripped.
         //
-        // So assert non-bail first, the way `assert_construct` does: appending
-        // blank lines is pure trivia, and a formatter that actually ran
-        // canonicalizes it away, while a bail returns it verbatim.
-        let once = format(source);
-        assert_eq!(
-            format(&format!("{source}\n\n")),
-            once,
-            "formatter silently BAILED on {name} — its fixed-point pin proves nothing"
-        );
+        // So assert non-bail first — and since N90 that is a question with an
+        // answer rather than an inference: `reprint` says which way out it
+        // took, and names the construct when the printer had no rule for one.
+        // (The old detector appended blank lines and compared, which was sound
+        // and could not say WHAT it met.)
+        let once = super::reprint(source).unwrap_or_else(|declined| {
+            panic!("formatter DECLINED {name}: {}", declined.sentence())
+        });
         let twice = format(&once);
         assert_eq!(once, twice, "formatting {name} is not a fixed point");
     }
@@ -5097,6 +8666,13 @@ mod idempotency {
     // enums with payloads, matches, closures, and `[extern]` bindings —
     // `reactive.vl` also exercises `[must_use]` (which the formatter once
     // dropped, tripping its safety check into a silent no-op).
+    //
+    // The last three are std's MACRO-DECLARING modules (tracker N91): `hash.vl`
+    // (1 `export macro fun`), `json.vl` (6) and `rpc.vl` (8) — fifteen after
+    // the curation, and every one of them through the `Node::MacroFun` arm and
+    // the `export` wrapper above it. The item was filed against a printer that
+    // bailed on all three; this is the pin the item asked for, and with
+    // `assert_fixed_point` reading `reprint` it can no longer pass by bailing.
     fixed_point_tests! {
         null_vl => "null.vl",
         boolean_vl => "boolean.vl",
@@ -5110,6 +8686,9 @@ mod idempotency {
         shared_vl => "shared.vl",
         display_vl => "display.vl",
         reactive_vl => "reactive.vl",
+        hash_vl => "hash.vl",
+        json_vl => "json.vl",
+        rpc_vl => "rpc.vl",
     }
 
     /// The bitwise/shift operators and hex literals print back exactly —
@@ -5127,9 +8706,12 @@ mod idempotency {
     /// safety check, silently leaving the whole file unformatted.)
     #[test]
     fn attributes_round_trip() {
+        // B318 retired `[doc(hidden)]`, so it is no longer one of the
+        // attributes the formatter round-trips — it is a refusal, and a refused
+        // file bails here by design.
         let source = "trait Source {\n\t[must_use]\n\t[platform(\"@process\", \"browser\")]\n\tfun sub(self): i32;\n\
                       \t[trait_only]\n\tfun tag(self): str;\n\
-                      \t[doc(hidden)]\n\tfun internal(self): i32;\n}\n\
+                      \tfun internal(self): i32;\n}\n\
                       [service(Client)]\n\
                       struct Sess {\n\t[expose] status: SignalCell<str>,\n\thidden: i32,\n}\n\
                       impl Sess {\n\t[rpc]\n\tfun login(self, name: str): bool {\n\t\ttrue\n\t}\n}\n";
@@ -5155,11 +8737,190 @@ mod idempotency {
             formatted.contains("[trait_only]"),
             "trait_only attribute lost:\n{formatted}"
         );
-        assert!(
-            formatted.contains("[doc(hidden)]"),
-            "doc(hidden) attribute lost:\n{formatted}"
-        );
         assert_fixed_point("attributes", source);
+    }
+
+    /// `[deprecated("use …")]` had no printer arm at all, so `vilan fmt`
+    /// SILENTLY BAILED on any file carrying one — the whole file handed back
+    /// unchanged, and `--check` calling that clean. Nothing in std or the corpus
+    /// declared one until A95 S5 deprecated the `Option<str>` styling sugar,
+    /// which is what surfaced it (`tests/parse_differential.rs`'s
+    /// `formatter_never_silently_bails`, on `style.vl`).
+    ///
+    /// The attribute prefix is ORDERED and this one LEADS it, on a free function
+    /// and on an impl member alike.
+    #[test]
+    fn a_deprecated_attribute_survives_the_reprint() {
+        let source = "[deprecated(\"use two()\")]\nfun one(): i32 {\n\t1\n}\n\
+                      struct S {\n\tn: i32,\n}\n\
+                      impl S {\n\t[deprecated(\"use fresh()\")]\n\t[must_use]\n\
+                      \tfun stale(self): i32 {\n\t\tself.n\n\t}\n}\n";
+        let formatted = format(source);
+        assert!(
+            formatted.matches("[deprecated(").count() == 2,
+            "deprecated attribute lost:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("[deprecated(\"use fresh()\")]\n\t[must_use]"),
+            "the ordered prefix puts `deprecated` first:\n{formatted}"
+        );
+        assert_fixed_point("deprecated", source);
+    }
+
+    /// E213's `[internal("reason")]`, on both positions it takes. A printer
+    /// arm is not optional for an attribute: the token net compares the
+    /// reprint's stream with the source's, so an attribute that is not printed
+    /// is a DECLINED file, and `vilan fmt` would refuse every file std's own
+    /// `Region` lives in.
+    #[test]
+    fn an_internal_attribute_survives_the_reprint_on_a_function_and_a_field() {
+        let source = "struct Region {\n\t[internal(\"the end marker\")] anchor: str,\n\
+                      \tlabel: str,\n}\n\
+                      [internal(\"row bookkeeping\")]\nfun cut_row() {}\n\
+                      impl Region {\n\t[internal(\"row bookkeeping\")]\n\t[must_use]\n\
+                      \tfun hold_rows(self): str {\n\t\tself.label\n\t}\n}\n";
+        let formatted = format(source);
+        assert!(
+            formatted.matches("[internal(").count() == 3,
+            "internal attribute lost:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("[internal(\"the end marker\")] anchor: str,"),
+            "a field's label rides on its line, as `[expose]` does:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("[internal(\"row bookkeeping\")]\n\t[must_use]"),
+            "and a function's leads the ordered prefix:\n{formatted}"
+        );
+        assert_fixed_point("internal", source);
+    }
+
+    /// E219: the ITEM's repro. An attribute line has a width of its own and
+    /// nothing breaks it; the signature under it is measured on its own line,
+    /// so a 110-column steer no longer puts one parameter per line.
+    #[test]
+    fn a_long_attribute_line_leaves_the_short_signature_below_it_alone() {
+        let source = concat!(
+            "[deprecated(\"use two() instead, which takes the same arguments and returns the same sum, and is what every caller wants\")]\n",
+            "fun one(a: i32, b: i32): i32 {\n\tlet c = a;\n\tc + b\n}\n",
+        );
+        assert_eq!(format(source), source, "the repro reprints unchanged");
+        assert_fixed_point("e219_repro", source);
+    }
+
+    /// Every attribute-carrying position takes the rule: a method in an impl,
+    /// a labelled struct, a derive line, a user macro attribute, and a label
+    /// stacked on another.
+    #[test]
+    fn every_attribute_line_has_its_own_budget() {
+        let long = "an internal reason long enough on its own to run past the hundred-column budget of a line";
+        let source = format!(
+            concat!(
+                "[internal(\"{long}\")]\n",
+                "struct Pair<type T> {{\n\tleft: T,\n\tright: T,\n}}\n\n",
+                "impl Pair<type T> {{\n",
+                "\t[deprecated(\"{long}\")]\n",
+                "\t[must_use]\n",
+                "\tfun swap(self, extra: i32): i32 {{\n\t\textra\n\t}}\n",
+                "}}\n\n",
+                "[derive(Clone, PartialEq, Hashable, Json, Wire, Debug, Display, Default, Ord, PartialOrd, Eq)]\n",
+                "struct Key {{\n\tid: i32,\n}}\n",
+            ),
+            long = long
+        );
+        assert_eq!(format(&source), source);
+        assert_fixed_point("e219_positions", &source);
+    }
+
+    /// The control: the rule still applies to the DECLARATION. A signature
+    /// that is itself over the budget splits under a short attribute and under
+    /// a long one alike — the attribute line changes nothing either way.
+    #[test]
+    fn an_over_budget_signature_still_splits_under_any_attribute() {
+        let long_signature = "fun combine(first_argument: i32, second_argument: i32, third_argument: i32, fourth_argument: i32): i32 {\n\t0\n}\n";
+        for attribute in [
+            "[must_use]\n",
+            "[deprecated(\"use two() instead, which takes the same arguments and returns the same sum, and is what every caller wants\")]\n",
+        ] {
+            let formatted = format(&format!("{attribute}{long_signature}"));
+            assert!(
+                formatted.contains("fun combine(\n\tfirst_argument: i32,\n"),
+                "{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deprecated_steer_survives_the_reprint_on_a_type_and_a_re_export() {
+        // B382: a type's steer on its own line, leading the prefix; a
+        // re-export's on the statement's own line.
+        let source = concat!(
+            "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n\n",
+            "[deprecated(\"use Next\")]\n",
+            "[internal(\"old plumbing\")]\n",
+            "struct Previous {}\n\n",
+            "[deprecated(\"use Shape\")]\n",
+            "trait Shaped {\n\tfun area(self): i32;\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("deprecated_b382", source);
+    }
+
+    #[test]
+    fn a_platform_declaration_survives_the_reprint_at_every_f27_position() {
+        // F27 R1: the file's own line, an impl's label and a nominal's.
+        let source = concat!(
+            "[platform(\"browser\")] mod self;\n\n",
+            "import std::ui::Region;\n\n",
+            "[platform(\"browser\")]\n",
+            "struct Slot {}\n\n",
+            "[platform(\"browser\", \"@process\")]\n",
+            "impl Slot {\n\tfun f(self) {}\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("platform_f27", source);
+        // B415: a host with no attribute on it reprints as itself.
+        let bare = "mod self;\n\nfun f() {}\n";
+        assert_eq!(format(bare), bare);
+    }
+
+    #[test]
+    fn a_tuple_bounded_impl_binder_survives_the_reprint() {
+        // A122: the binder's tuple bound prints as a generic parameter's does.
+        let source = concat!(
+            "impl type T: (2..) with Tuple {\n\tfun f(self) {}\n}\n\n",
+            "impl _: (2..4: Display) with Show {\n\tfun g(self) {}\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("a122_binder", source);
+    }
+
+    #[test]
+    fn an_internal_label_survives_the_reprint_on_every_e221_position() {
+        // E221: a struct, an enum and its variant, a trait, a module binding —
+        // each printed where it was written, or the token net declines the
+        // file for an attribute the printer dropped.
+        let source = concat!(
+            "[internal(\"a struct\")]\n",
+            "struct Region {\n\tlabel: str,\n}\n\n",
+            "[internal(\"an enum\")]\n",
+            "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+            "[internal(\"a trait\")]\n",
+            "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+            "[internal(\"a binding\")]\n",
+            "let cache = 3;\n\n",
+            "export [internal(\"exported\")]\n",
+            "struct Marker {}\n\n",
+            "[derive(Clone)]\n",
+            "[internal(\"derived\")]\n",
+            "struct Point {\n\tx: i32,\n}\n",
+        );
+        let formatted = format(source);
+        assert_eq!(
+            formatted, source,
+            "the canonical spelling reprints byte-identically"
+        );
+        assert_fixed_point("internal_e221", source);
     }
 }
 
@@ -5245,8 +9006,8 @@ mod bailing_constructs {
         // A hole is an ordinary vilan expression and canonicalizes as one; the
         // value text around it is CSS and does not.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay:flex;\n\t\tgap: {space( 4 )};\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tgap(space( 4 ));\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tgap(space(4));\n\t}\n}\n",
         );
     }
 
@@ -5255,8 +9016,8 @@ mod bailing_constructs {
         // The `let active = const css { padding: {space(6)}; };` shape (§2):
         // one declaration, no comment, and it fits — so it stays on the line.
         assert_construct(
-            "fun f(){let a=css{color:red;};a}\n",
-            "fun f() {\n\tlet a = css { color: red; };\n\ta\n}\n",
+            "fun f(){let a=css{color(\"red\");};a}\n",
+            "fun f() {\n\tlet a = css { color(\"red\"); };\n\ta\n}\n",
         );
     }
 
@@ -5271,8 +9032,63 @@ mod bailing_constructs {
         // never collapses — not even the one-declaration one the OUTER block
         // would have collapsed. The head's arguments print as any call's do.
         assert_construct(
-            "fun f() {\n\tcss { .within(\"data-theme\",\"dark\") { color: red; } }\n}\n",
-            "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss { .within(\"data-theme\",\"dark\") { color(\"red\"); } }\n}\n",
+            "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor(\"red\");\n\t\t}\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_chain_link_prints_as_a_call_and_holds_its_place() {
+        // A69. A link is an opaque method — it may write any property at all —
+        // so it is a BARRIER: nothing sorts across it, exactly as for an
+        // unknown declaration. `display` stays after `.ghost();` here, though
+        // the canonical order would put it first.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t.ghost();\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t.ghost();\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_bare_link_member_keeps_its_spelling() {
+        // A bare member and an empty argument list are the same call on a
+        // `Style` and lower alike, but the formatter reproduces what was
+        // written: normalizing either way would invent or delete a token,
+        // which is the one thing it may never do.
+        assert_construct(
+            "fun f(){css{.ghost;}}\n",
+            "fun f() {\n\tcss { .ghost; }\n}\n",
+        );
+        assert_construct(
+            "fun f(){css{.ghost();}}\n",
+            "fun f() {\n\tcss { .ghost(); }\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_link_with_arguments_prints_them_as_a_call_does() {
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\t.inset( 1,2 );\n\t}\n}\n",
+            "fun f() {\n\tcss { .inset(1, 2); }\n}\n",
+        );
+    }
+
+    #[test]
+    fn a101_a_declaration_prints_as_a_call_and_its_arguments_as_expressions() {
+        // The value pass is gone with the value grammar: a declaration's
+        // arguments are ordinary vilan expressions and print as any call's do,
+        // so `pct( 100 )` canonicalizes where a value's text never could, and a
+        // multi-argument value keeps its commas and one space.
+        assert_construct(
+            "fun f(){css{width(pct( 100 ));margin(px(4),px(8));}}\n",
+            "fun f() {\n\tcss {\n\t\tmargin(px(4), px(8));\n\t\twidth(pct(100));\n\t}\n}\n",
+        );
+        // A custom property is a call head (R12), and a string value keeps its
+        // own bytes — the double spaces inside a `url()` are the string's, and
+        // a formatter that respaced them would change what reaches the sheet.
+        assert_construct(
+            "fun f(){css{--brand-ink(gray(900));background-image(\"url(\\\"a  b\\\")\");}}\n",
+            "fun f() {\n\tcss {\n\t\t--brand-ink(gray(900));\n\t\tbackground-image(\"url(\\\"a  b\\\")\");\n\t}\n}\n",
         );
     }
 
@@ -5284,8 +9100,8 @@ mod bailing_constructs {
         // (layout), `.md` (media) before `.hover` (pseudo), every condition
         // after every declaration.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tcolor: blue;\n\t\t}\n\t\tpadding: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t\tdisplay: flex;\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t\t.hover {\n\t\t\tcolor: blue;\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tcolor(\"blue\");\n\t\t}\n\t\tpadding(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t\t.hover {\n\t\t\tcolor(\"blue\");\n\t\t}\n\t}\n}\n",
         );
     }
 
@@ -5296,8 +9112,8 @@ mod bailing_constructs {
         // holds its index absolutely, exactly as an unknown METHOD does in a
         // chain. `padding` may not cross it to reach `display`.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t--brand-ink: red;\n\t\tdisplay: flex;\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t--brand-ink: red;\n\t\tdisplay: flex;\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t--brand-ink(\"red\");\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t--brand-ink(\"red\");\n\t\tdisplay(\"flex\");\n\t}\n}\n",
         );
     }
 
@@ -5314,16 +9130,16 @@ mod bailing_constructs {
         // swap, which is exactly the miscompile the family rule exists to
         // prevent. Written the other way round this pin would pass either way.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tpadding-left: {space(6)};\n\t\tpadding: {space(4)};\n\t\tdisplay: flex;\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding-left: {space(6)};\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding-left(space(6));\n\t\tpadding(space(4));\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding-left(space(6));\n\t\tpadding(space(4));\n\t}\n}\n",
         );
     }
 
     #[test]
     fn a_nested_rules_own_items_sort_too() {
         assert_construct(
-            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tpadding: {space(4)};\n\t\t\tdisplay: flex;\n\t\t}\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tdisplay: flex;\n\t\t\tpadding: {space(4)};\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tpadding(space(4));\n\t\t\tdisplay(\"flex\");\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tdisplay(\"flex\");\n\t\t\tpadding(space(4));\n\t\t}\n\t}\n}\n",
         );
     }
 
@@ -5333,7 +9149,7 @@ mod bailing_constructs {
         // wrong item — the comment cursor only moves forward — so a block with
         // a comment anywhere inside it prints canonically in WRITTEN order.
         // `padding` would otherwise sort after `display`.
-        let source = "fun f() {\n\tcss {\n\t\t// a note\n\t\tpadding: {space(4)};\n\t\tdisplay: flex;\n\t}\n}\n";
+        let source = "fun f() {\n\tcss {\n\t\t// a note\n\t\tpadding(space(4));\n\t\tdisplay(\"flex\");\n\t}\n}\n";
         assert_construct(source, source);
         assert_eq!(format(source).matches("// a note").count(), 1);
         // Anti-vacuity, built the way
@@ -5343,7 +9159,7 @@ mod bailing_constructs {
         let commentless = source.replace("\t\t// a note\n", "");
         assert_eq!(
             format(&commentless),
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding(space(4));\n\t}\n}\n",
             "the fixture must be out of canonical order, or the refusal proves nothing"
         );
     }
@@ -5353,7 +9169,7 @@ mod bailing_constructs {
         // The refusal is by the block's own braces, so a comment buried in a
         // nested rule pins the outer body too: reordering around it would move
         // the rule the comment is inside away from the comment above it.
-        let source = "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\t// a note\n\t\t\tcolor: red;\n\t\t}\n\t\tdisplay: flex;\n\t}\n}\n";
+        let source = "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\t// a note\n\t\t\tcolor(\"red\");\n\t\t}\n\t\tdisplay(\"flex\");\n\t}\n}\n";
         assert_construct(source, source);
     }
 
@@ -5363,16 +9179,16 @@ mod bailing_constructs {
         // first commit — so a comment written above the second declaration
         // prints above the second declaration, not below the statement.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// about the padding\n\t\tpadding: {space(4)};\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// about the padding\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// about the padding\n\t\tpadding(space(4));\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// about the padding\n\t\tpadding(space(4));\n\t}\n}\n",
         );
     }
 
     #[test]
     fn a_comment_after_the_last_item_stays_inside_the_braces() {
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// trailing\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// trailing\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// trailing\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// trailing\n\t}\n}\n",
         );
     }
 
@@ -5382,19 +9198,8 @@ mod bailing_constructs {
         // between items that no longer belong together, so the block has one
         // shape: item, item, item.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\n\t\tpadding: {space(4)};\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t}\n}\n",
-        );
-    }
-
-    #[test]
-    fn a_mixed_value_keeps_its_own_spacing() {
-        // A value is CSS, not vilan: the text between holes is a source slice,
-        // because respacing it would rewrite the bytes inside a `url("a  b")`.
-        // Only the holes canonicalize.
-        assert_construct(
-            "fun f() {\n\tcss {\n\t\tpadding: calc({ a } + 2px);\n\t\tbackground-image: url(\"tile.png\");\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tpadding: calc({a} + 2px);\n\t\tbackground-image: url(\"tile.png\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\n\t\tpadding(space(4));\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding(space(4));\n\t}\n}\n",
         );
     }
 
@@ -5405,8 +9210,8 @@ mod bailing_constructs {
         // block (the formatter reparses SOURCE and there is no `style ( )` token
         // run in one); the block has its own pair, reading the same tables.
         assert_construct(
-            "fun f() {\n\tlet a = style().padding(x).display(y);\n\tlet b = css {\n\t\tpadding: x;\n\t\tdisplay: y;\n\t};\n\tb\n}\n",
-            "fun f() {\n\tlet a = style().display(y).padding(x);\n\tlet b = css {\n\t\tdisplay: y;\n\t\tpadding: x;\n\t};\n\tb\n}\n",
+            "fun f() {\n\tlet a = style().padding(x).display(y);\n\tlet b = css {\n\t\tpadding(\"x\");\n\t\tdisplay(\"y\");\n\t};\n\tb\n}\n",
+            "fun f() {\n\tlet a = style().display(y).padding(x);\n\tlet b = css {\n\t\tdisplay(\"y\");\n\t\tpadding(\"x\");\n\t};\n\tb\n}\n",
         );
     }
 
@@ -5414,8 +9219,8 @@ mod bailing_constructs {
     fn a_block_inside_an_element_head_prints_canonically() {
         // The two sugars compose: a block in a head item is still a block.
         assert_construct(
-            "fun f() {\n\t<div .styled(const css{color:red;}) />\n}\n",
-            "fun f() {\n\t<div .styled(const css { color: red; }) />\n}\n",
+            "fun f() {\n\t<div .styled(const css{color(\"red\");}) />\n}\n",
+            "fun f() {\n\t<div .styled(const css { color(\"red\"); }) />\n}\n",
         );
     }
 
@@ -5585,6 +9390,30 @@ mod bailing_constructs {
         );
     }
 
+    // The EXPORTED spelling (tracker N91). Fifteen of std's macros carry it
+    // after S6's curation — `hash.vl`'s one, `json.vl`'s six, `rpc.vl`'s eight —
+    // and the wrapper is its own node: `export`'s arm prints the marker and
+    // recurses, and `needs_semicolon` has to look THROUGH it to find the
+    // `MacroFun` that takes none. `export let x = 1;` is the same rule seen
+    // from the other side, and getting it wrong there printed a statement with
+    // no terminator, which did not re-parse, which bailed the whole file
+    // silently.
+    #[test]
+    fn exported_macro_fun_definition() {
+        assert_construct(
+            "export macro fun make(): Source { source(\"\") }\n",
+            "export macro fun make(): Source {\n\tsource(\"\")\n}\n",
+        );
+    }
+
+    // A macro declared with an `Item` parameter, which is the derive shape all
+    // fifteen of std's exported macros are written in.
+    #[test]
+    fn exported_macro_fun_taking_an_item() {
+        let canonical = "export macro fun Marker(item: Item): Source {\n\tsource(\"\")\n}\n";
+        assert_construct(canonical, canonical);
+    }
+
     // A `macro { .. }` block in item position: its body is a statement block and
     // it takes no `;` (like an item declaration). A body with several statements
     // (a "family" of items stamped at expansion) reprints on its own lines.
@@ -5733,6 +9562,42 @@ mod bailing_constructs {
         );
     }
 
+    /// `lazy message: str` — a lazy parameter (lazy.md §1). It is a keyword with
+    /// no node of its own beyond the flag, so a dropped one is silent token
+    /// drift that would change the program's meaning (an argument that ran at
+    /// the call instead of inside the callee). Pinned in all three homes it is
+    /// legal in, and beside an eager parameter so the prefix is not printed for
+    /// the wrong one.
+    #[test]
+    fn lazy_parameters() {
+        assert_construct(
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n",
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n",
+        );
+        assert_construct(
+            "trait Complainer {\n\tfun complain(self, lazy message: str): str;\n}\n",
+            "trait Complainer {\n\tfun complain(self, lazy message: str): str;\n}\n",
+        );
+        assert_construct(
+            "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
+            "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
+        );
+    }
+
+    /// `lazy let name: T = init;` — a lazy MODULE binding (lazy.md §2). Same
+    /// token-drift risk as the parameter above, with a larger consequence: a
+    /// dropped `lazy` moves the initializer from first use back to module load.
+    #[test]
+    fn lazy_module_bindings() {
+        assert_construct(
+            "lazy let database: Database = Database::open(\"kolt.db\");\n",
+            "lazy let database: Database = Database::open(\"kolt.db\");\n",
+        );
+        assert_construct("lazy let count = 1;\n", "lazy let count = 1;\n");
+        // The eager neighbour is untouched.
+        assert_construct("let count = 1;\n", "let count = 1;\n");
+    }
+
     /// `void` written as a VALUE prints as `void`; the `Void` the parser
     /// synthesizes for a block with no tail expression is not text and prints as
     /// nothing. Printing both as nothing dropped the argument from
@@ -5744,6 +9609,92 @@ mod bailing_constructs {
             "fun voided(): Verdict<i32, void> {\n\tVerdict::Bad(void)\n}\n",
         );
         assert_construct("fun empty_tail() {\n}\n", "fun empty_tail() {}\n");
+    }
+}
+
+#[cfg(test)]
+mod const_declaration_printing {
+    //! G24's `const let` / `const fun`, and the `export` marker over them
+    //! (N89) — this module's family, found the way E13's constructs were: by
+    //! writing the form and watching the file come back unchanged.
+    //!
+    //! `const fun` reached the EXPRESSION printer's `const` arm, which prints
+    //! its inner node as an operand — and a `fun` declaration is not one, so it
+    //! fell to that printer's `_ => bailed` and the whole file returned
+    //! unformatted while `--check` called it clean. The `;` was wrong under it:
+    //! `needs_semicolon` asked the node under `export` and not the one under
+    //! `const`, so the printer wrote `const fun f() { .. };`, which does not
+    //! re-parse. Nothing caught either, because no file in the estate writes
+    //! the form and `formatter_never_silently_bails` asserts the bail set over
+    //! the tree.
+
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_const_declaration_prints_and_the_export_marker_rides_it() {
+        assert_construct(
+            "const fun answer():i32 {\n  42\n}\n",
+            "const fun answer(): i32 {\n\t42\n}\n",
+        );
+        assert_construct(
+            "export const fun answer():i32 {\n  42\n}\n",
+            "export const fun answer(): i32 {\n\t42\n}\n",
+        );
+        // The `const let` half already printed — through the expression
+        // printer, whose `let` arm IS an operand — and is pinned beside it so
+        // the pair cannot drift apart.
+        assert_construct(
+            "const let    value: i32 = 1;\n",
+            "const let value: i32 = 1;\n",
+        );
+        assert_construct(
+            "export const let    value: i32 = 1;\n",
+            "export const let value: i32 = 1;\n",
+        );
+    }
+
+    /// N108: the other half of `Node::Const` — the weak-precedence EXPRESSION
+    /// prefix, whose statement form takes its `;` like any other expression
+    /// statement.
+    ///
+    /// `needs_semicolon` forwarded through `Const` unconditionally, so a
+    /// `const { .. }` statement asked `Node::Block`'s question and got "no
+    /// terminator". It does not re-parse: a module-level `const { .. }` with no
+    /// `;` is a parse error, and so is a non-tail one inside a block. The
+    /// printer's own safety net caught it, which is why the failure looked like
+    /// an unrelated DECLINE naming the file's first item rather than a wrong
+    /// reprint — kolt's `client.vl` carries such a block (its asset bundle plus
+    /// the preflight styles) and the whole file was undeformattable on that
+    /// account, which is how the bug was found.
+    #[test]
+    fn a_const_expression_statement_keeps_its_terminator() {
+        // Module level, the kolt shape: a `const` block of build-time calls.
+        assert_construct(
+            "const {\n  bundle(\"static/robots.txt\");\n};\n",
+            "const {\n\tbundle(\"static/robots.txt\");\n};\n",
+        );
+        // Inside a block, NOT the tail — the position where the missing `;`
+        // stops the file parsing rather than quietly changing its meaning.
+        assert_construct(
+            "fun f() {\n  const { 1 };\n  let value = 2;\n}\n",
+            "fun f() {\n\tconst {\n\t\t1\n\t};\n\tlet value = 2;\n}\n",
+        );
+        // The block-bearing expressions under the prefix answer the same way:
+        // `const` makes them operands, and an operand statement is terminated.
+        assert_construct(
+            "fun f() {\n  const if true { 1 } else { 2 };\n  let value = 2;\n}\n",
+            "fun f() {\n\tconst if true { 1 } else { 2 };\n\tlet value = 2;\n}\n",
+        );
+        assert_construct(
+            "fun f() {\n  const match 1 { _ => 1, };\n  let value = 2;\n}\n",
+            "fun f() {\n\tconst match 1 {\n\t\t_ => 1,\n\t};\n\tlet value = 2;\n}\n",
+        );
+        // And a non-block `const` operand, which was already terminated — it is
+        // in the pin so the two halves of the variant cannot drift apart.
+        assert_construct(
+            "fun f() {\n  const 1 + 2;\n}\n",
+            "fun f() {\n\tconst 1 + 2;\n}\n",
+        );
     }
 }
 
@@ -5983,6 +9934,65 @@ mod chain_splitting {
         );
     }
 
+    /// E155, on kolt's generated `src/lucide/lib.vl`: an ELEMENT argument is
+    /// atomic to this rule.
+    ///
+    /// The width rule judges a statement by its FIRST line, which is honest
+    /// everywhere except here. The four-link `.child` ladder below is 129
+    /// columns inline; the formatter rejoined it, the third `.child`'s
+    /// `<path …/>` then broke because the line it landed on was too wide, and
+    /// the break took the rest of the chain off the first line WITH it — so the
+    /// line the rule measured was 92 columns, under the budget, and the chain
+    /// stayed collapsed with an element torn open inside it. The chain is
+    /// measured with its elements atomic now, breaks at its links, and each
+    /// link then fits on a line of its own.
+    ///
+    /// The file is generated and kolt excludes it from its own fmt gate, which
+    /// is the only reason this was survivable rather than noticed.
+    #[test]
+    fn an_element_argument_is_atomic_to_the_chain_break_rule() {
+        let source = "fun a_arrow_down(): View {\n\t\
+                      lucide_frame().child(<path d(\"m14 12 4 4 4-4\") />)\
+                      .child(<path d(\"M18 16V7\") />)\
+                      .child(<path d(\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\") />)\
+                      .child(<path d(\"M3.304 13h6.392\") />)\n}\n";
+        assert_over_budget(source.lines().nth(1).expect("the chain's line"));
+        assert_construct(
+            source,
+            "fun a_arrow_down(): View {\n\
+             \tlucide_frame()\n\
+             \t\t.child(<path d(\"m14 12 4 4 4-4\") />)\n\
+             \t\t.child(<path d(\"M18 16V7\") />)\n\
+             \t\t.child(<path d(\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\") />)\n\
+             \t\t.child(<path d(\"M3.304 13h6.392\") />)\n\
+             }\n",
+        );
+    }
+
+    /// The other side of the same rule, and what keeps its blast radius to the
+    /// shape it was written for: a chain whose element argument fits is left
+    /// alone. The measurement is the chain's OWN width with the element inline,
+    /// so an element that never needed to break cannot make a short chain split.
+    #[test]
+    fn a_chain_whose_element_argument_fits_stays_inline() {
+        let source = "fun icon(): View {\n\tview().child(<path d(\"M1 1\") />).child(<path d(\"M2 2\") />)\n}\n";
+        assert_construct(source, source);
+    }
+
+    /// And an element that breaks STRUCTURALLY — more than one child, which is
+    /// not a width decision at all — does not drag its chain apart with it. The
+    /// probe breaks it too, so the measured first line is short and the rule
+    /// answers exactly as it did before E155.
+    #[test]
+    fn a_structurally_split_element_does_not_break_its_chain() {
+        let source = "fun panel(): View {\n\tview().class(\"p\").child(<div>\n\t\t<span>\"a\"</span>\n\t\t<span>\"b\"</span>\n\t</div>)\n}\n";
+        let formatted = format(source);
+        assert!(
+            formatted.contains("view().class(\"p\").child(<div>"),
+            "the chain should stay inline around a structurally split element:\n{formatted:?}"
+        );
+    }
+
     /// The boundary, arithmetically: `let padded = s.aa("…").bb(2);` is 28
     /// columns of code around the padding string (13 for `let padded = `, 6 for
     /// `s.aa("`, 9 for `").bb(2);`), so 72 padding characters make exactly the
@@ -6132,6 +10142,69 @@ mod chain_splitting {
         assert_over_budget(plain_call.trim_end());
         assert_construct(single_link, single_link);
         assert_construct(plain_call, plain_call);
+    }
+
+    /// E137, the motivating line — from kolt's theme picker, 220 columns and
+    /// stable at 220 before this. ONE `.map(…)` link, so the width door was shut
+    /// and the whole statement was exempt from the budget at any width.
+    ///
+    /// The link takes a line of its own, and that is what gives the closure body
+    /// an indentation level to break its own two-link chain into. Every line of
+    /// the result is inside the budget.
+    #[test]
+    fn a_single_link_carrying_a_closure_chain_breaks_one_call_per_line() {
+        let source = "fun pick() {\n\
+                      \tlet selected_theme = combine((filtered_themes, selected_index))\
+                      .map(|(themes, selected_index)| themes.find(|theme| theme == \
+                      initial_theme).or_else(|| themes.get(selected_index.clamp(0, \
+                      themes.len()))));\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(
+            source,
+            "fun pick() {\n\
+             \tlet selected_theme = combine((filtered_themes, selected_index))\n\
+             \t\t.map(|(themes, selected_index)| themes\n\
+             \t\t\t.find(|theme| theme == initial_theme)\n\
+             \t\t\t.or_else(|| themes.get(selected_index.clamp(0, themes.len()))));\n\
+             }\n",
+        );
+    }
+
+    /// The other side of the same door: a one-link chain that FITS is left
+    /// alone, closure argument or not. The door is a width rule, and nothing
+    /// about carrying a closure makes a line that fits worth breaking.
+    #[test]
+    fn a_short_single_link_chain_with_a_closure_stays_inline() {
+        let source = "let picked = combine((a, b)).map(|(x, y)| x.find(|t| t == y));\n";
+        assert!(columns(source.trim_end()) <= LINE_BUDGET);
+        assert_construct(source, source);
+    }
+
+    /// And the narrowing that keeps the door honest: the one-link split is
+    /// MEASURED, not assumed. `raw.map(|entry| Entry { … })` is 156 columns and
+    /// breaks — but at the struct literal, where the descent already reaches,
+    /// under a `raw.map(` that fits. Splitting the chain first would put `raw`
+    /// alone on a line and buy nothing. (`vilan/std/src/process/fs.vl`.)
+    #[test]
+    fn a_single_link_whose_argument_breaks_in_place_keeps_the_link_inline() {
+        let source = "fun scan() {\n\
+                      \traw.map(|entry| Entry { name = entry.name(), is_directory = \
+                      entry.is_directory(), is_file = entry.is_file(), is_symlink = \
+                      entry.is_symlink() })\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(
+            source,
+            "fun scan() {\n\
+             \traw.map(|entry| Entry {\n\
+             \t\tname = entry.name(),\n\
+             \t\tis_directory = entry.is_directory(),\n\
+             \t\tis_file = entry.is_file(),\n\
+             \t\tis_symlink = entry.is_symlink(),\n\
+             \t})\n\
+             }\n",
+        );
     }
 
     /// WIDTH does not split a statement that spans lines: the budget is read from
@@ -6668,15 +10741,15 @@ mod struct_literal_layout {
     /// used to collapse onto one 357-column line.
     #[test]
     fn an_over_budget_struct_literal_splits_one_field_per_line() {
-        let source = "let store = KoltStore { workspaces = workspaces, tasks = tasks, \
+        let source = "let store = KoltStore { workspaces = all_workspaces, tasks = open_tasks, \
                       register_hook = Shared::new(register), login_hook = Shared::new(login), \
                       create_hook = Shared::new(create) };\n";
         assert_over_budget(source.trim_end());
         assert_construct(
             source,
             "let store = KoltStore {\n\
-             \tworkspaces = workspaces,\n\
-             \ttasks = tasks,\n\
+             \tworkspaces = all_workspaces,\n\
+             \ttasks = open_tasks,\n\
              \tregister_hook = Shared::new(register),\n\
              \tlogin_hook = Shared::new(login),\n\
              \tcreate_hook = Shared::new(create),\n\
@@ -6881,8 +10954,8 @@ mod struct_literal_layout {
         let source = "fun demo() {\n\
                       \tlet store = KoltStore {\n\
                       \t\t// the authoritative lists\n\
-                      \t\tworkspaces = workspaces,\n\
-                      \t\ttasks = tasks,\n\
+                      \t\tworkspaces = all_workspaces,\n\
+                      \t\ttasks = open_tasks,\n\
                       \t\tregister_hook = Shared::new(register),\n\
                       \t};\n\
                       }\n";
@@ -6896,14 +10969,117 @@ mod struct_literal_layout {
     fn a_file_mixing_split_and_inline_struct_literals_is_a_fixed_point() {
         let canonical = "let fits = Point { x = 1, y = 2 };\n\
                          let store = KoltStore {\n\
-                         \tworkspaces = workspaces,\n\
-                         \ttasks = tasks,\n\
+                         \tworkspaces = all_workspaces,\n\
+                         \ttasks = open_tasks,\n\
                          \tregister_hook = Shared::new(register),\n\
                          \tlogin_hook = Shared::new(login),\n\
                          \tcreate_hook = Shared::new(create),\n\
                          };\n";
         assert_construct(canonical, canonical);
         assert_eq!(format(canonical), canonical);
+    }
+}
+
+#[cfg(test)]
+mod struct_field_shorthand {
+    //! E143: `A { x = x }` and `A { x }` are one construct written two ways —
+    //! the analyzer synthesizes the same local read for the shorthand that the
+    //! long form spells out — and the formatter picks ONE, the way it picks one
+    //! import order and one style-chain order. The shorthand is the pick: it is
+    //! the spelling the language added the syntax for.
+    //!
+    //! There is no opt-out, and the census is why. Over the estate at the old
+    //! formatter's fixed point the rule reprints 91 fields across 23 of 228
+    //! `.vl` files, every one of them mechanical; a knob would fork every file's
+    //! shape for a spelling nobody has a reason to prefer, which is the same
+    //! ground `LINE_BUDGET` is not a knob on.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_field_written_long_collapses_to_the_shorthand() {
+        assert_construct(
+            "let point = Point { x = x, y = y };\n",
+            "let point = Point { x, y };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_whose_value_is_a_different_name_keeps_its_long_form() {
+        // The control: only a value that is the FIELD'S OWN name collapses. A
+        // rule keyed on "the value is a bare name" would eat this one.
+        assert_construct(
+            "let point = Point { x = origin, y = y };\n",
+            "let point = Point { x = origin, y };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_whose_value_is_not_a_bare_name_keeps_its_long_form() {
+        assert_construct(
+            "let point = Point { x = x.offset(), y = -y, z = z };\n",
+            "let point = Point { x = x.offset(), y = -y, z };\n",
+        );
+    }
+
+    #[test]
+    fn a_field_already_written_short_is_unchanged() {
+        assert_construct(
+            "let point = Point { x, y };\n",
+            "let point = Point { x, y };\n",
+        );
+    }
+
+    #[test]
+    fn the_collapse_reaches_the_split_form_too() {
+        // The split printer and the inline printer share one field printer, so
+        // a literal broken one field per line collapses exactly as an inline one
+        // does — and the collapse does not un-split a literal that is still over
+        // budget without it.
+        let source = "let store = Store { workspaces = workspaces, tasks = tasks, \
+                      register_hook = Shared::new(register), login_hook = Shared::new(login), \
+                      create_hook = Shared::new(create) };\n";
+        assert_construct(
+            source,
+            "let store = Store {\n\
+             \tworkspaces,\n\
+             \ttasks,\n\
+             \tregister_hook = Shared::new(register),\n\
+             \tlogin_hook = Shared::new(login),\n\
+             \tcreate_hook = Shared::new(create),\n\
+             };\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_a_collapsing_field_is_kept_and_the_reprint_is_idempotent() {
+        // A comment written between the name and the value has no inline slot
+        // in either spelling. It must still survive, and the reprint must
+        // settle in one pass: suppressing the collapse for it would collapse on
+        // the SECOND pass instead, with the comment then outside the field.
+        // Since E146 rule 4 it forces the literal's split form and lands on its
+        // own line ABOVE the field it explains, rather than below the whole
+        // statement — so the field collapses AND the comment stays put.
+        let source = "fun demo() {\n\
+                      \tlet point = Point {\n\
+                      \t\tx = // deliberately the same name\n\
+                      \t\t\tx,\n\
+                      \t\ty = y,\n\
+                      \t};\n\
+                      }\n";
+        let formatted = super::format(source);
+        assert!(
+            formatted.contains("deliberately the same name"),
+            "the comment was dropped:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("\t\t// deliberately the same name\n\t\tx,\n\t\ty,\n"),
+            "the comment left its field, or the fields did not collapse:\n{formatted}"
+        );
+        assert_eq!(
+            super::format(&formatted),
+            formatted,
+            "not idempotent:\n{formatted}"
+        );
     }
 }
 
@@ -7071,7 +11247,7 @@ mod import_set_layout {
     //! every save.
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::{assert_over_budget, columns};
-    use super::organize::organize;
+    use super::organize::{organize, organize_rescuing};
     use super::{LINE_BUDGET, format};
 
     /// The motivating line, from `std/src/rpc.vl`: an import at 184 columns.
@@ -7101,8 +11277,8 @@ mod import_set_layout {
     #[test]
     fn an_import_that_fits_stays_inline_without_a_trailing_comma() {
         assert_construct(
-            "import std::option::Option::{ self, Some, None };\n",
-            "import std::option::Option::{ None, Some, self };\n",
+            "import std::option::Option::{ Some, self, None };\n",
+            "import std::option::Option::{ self, None, Some };\n",
         );
         assert_construct(
             "import std::x::{ alpha, beta, };\n",
@@ -7265,6 +11441,20 @@ mod import_set_layout {
                 ]
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
+        );
+        // E168's rewrite rides the same printer: the module-only statement the
+        // rescue produces is what `fmt` would print for a hand-written
+        // `import std::rpc;`, and it sorts into the run at the place `fmt` puts
+        // it — before the deeper path, because `BranchKey` orders by segment.
+        // An action that rendered it any other way would be undone by the next
+        // format-on-save.
+        let run = "import std::rpc::{ Dispatcher, call };\nimport std::task::Task;\n";
+        let rewritten = organize_rescuing(run, &["Dispatcher", "call"], &["rpc"]);
+        assert_eq!(rewritten, "import std::rpc;\nimport std::task::Task;\n");
+        assert_eq!(
+            rewritten,
+            format(&rewritten),
+            "fmt leaves the rewrite alone"
         );
     }
 }
@@ -7443,6 +11633,71 @@ mod split_comment_attachment {
     //! already prints where it was written.
     use super::bailing_constructs::assert_construct;
 
+    // --- E146 rule 4: the gap INSIDE a field ---------------------------------
+    //
+    // The one interior the rule above did not reach. A comment between a
+    // field's name and its value sits inside the field's own span, so it forced
+    // no split and no flush claimed it — it fell out below the whole statement,
+    // exactly the orphaning backlog 41 closed everywhere else. The field's
+    // VALUE, not the field, is the boundary a split literal flushes up to now.
+
+    /// The comment stays with the field it explains, on its own line above it,
+    /// and the literal splits to make room. The fixture fits the budget, so
+    /// only the comment can be splitting it.
+    #[test]
+    fn a_comment_between_a_field_name_and_its_value_stays_with_the_field() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet t = Task { id = 1, name = // the row's label, not the display name\n\
+             \t\t\"x\", flag = true };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet t = Task {\n\
+             \t\tid = 1,\n\
+             \t\t// the row's label, not the display name\n\
+             \t\tname = \"x\",\n\
+             \t\tflag = true,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// The FIRST field's gap too — nothing before it in the literal but the
+    /// `{`, so the flush has to reach the value from the opening brace.
+    #[test]
+    fn a_comment_inside_the_first_field_attaches_to_it() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet t = Task { id = // always the row id\n\
+             \t\t1, flag = true };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet t = Task {\n\
+             \t\t// always the row id\n\
+             \t\tid = 1,\n\
+             \t\tflag = true,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// And the canonical form is where it settles: one pass, then nothing —
+    /// `assert_construct` asserts the idempotence the fmt gate depends on, and
+    /// the second pass sees a comment that is now BETWEEN fields, which rule A
+    /// splits on for its own reason. The two rules have to agree, and this is
+    /// where that is checked.
+    #[test]
+    fn the_moved_comment_is_a_fixed_point() {
+        let canonical = "fun demo() {\n\
+                         \tlet t = Task {\n\
+                         \t\tid = 1,\n\
+                         \t\t// the row's label, not the display name\n\
+                         \t\tname = \"x\",\n\
+                         \t};\n\
+                         }\n";
+        assert_construct(canonical, canonical);
+    }
+
     /// A comment before the FIRST element, which no between-elements gap covers —
     /// the case that needs the construct's own opening boundary. Fixture fits the
     /// budget, so only the comment can be splitting it.
@@ -7451,8 +11706,8 @@ mod split_comment_attachment {
         let source = "fun demo() {\n\
                       \tlet store = Store {\n\
                       \t\t// the authoritative lists\n\
-                      \t\tworkspaces = workspaces,\n\
-                      \t\ttasks = tasks,\n\
+                      \t\tworkspaces = all_workspaces,\n\
+                      \t\ttasks = open_tasks,\n\
                       \t};\n\
                       }\n";
         assert_construct(source, source);
@@ -7792,6 +12047,129 @@ mod signature_layout {
 }
 
 #[cfg(test)]
+mod impl_header_layout {
+    //! E217 — the `impl` header is a declaration line and takes the
+    //! declaration width rule.
+    //!
+    //! It had no split form at all, so a header past the budget had no
+    //! formatted spelling: written on one line it stayed over, and written
+    //! HAND-WRAPPED (the shape a reader reaches for) the reprint's single line
+    //! carried different tokens from the source's trailing comma and the whole
+    //! FILE declined — `vilan fmt` left every other construct in it unformatted
+    //! too.
+    //!
+    //! The rule is `fun`'s: one argument per line, trailing comma on every one,
+    //! `>` back at the header's indent — applied to the TAIL argument list,
+    //! which is the last trait of a `with` clause, else the subject's own.
+
+    use super::LINE_BUDGET;
+    use super::bailing_constructs::{assert_construct, code_tokens};
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::reprint;
+
+    /// The item's own fixture: collections-39 hand-wrapped this header and
+    /// `vilan fmt` declined the file.
+    const HAND_WRAPPED: &str = concat!(
+        "impl type S: DeltaSource<\n\tList<T>,\n\tSeqOp<T>,\n> {\n",
+        "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// Its canonical spelling: the header FITS, so it is one line.
+    const ONE_LINE: &str = concat!(
+        "impl type S: DeltaSource<List<T>, SeqOp<T>> {\n",
+        "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// The same header with names long enough to run past the budget.
+    const OVER_BUDGET: &str = concat!(
+        "impl type S: DeltaSource<List<ReconciledRowOfAnExtremelyLongName>, ",
+        "SeqOp<ReconciledRowOfAnExtremelyLongName>> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// And its canonical spelling: one argument per line, trailing comma on
+    /// every one, `>` back at the header's own indent.
+    const SPLIT: &str = concat!(
+        "impl type S: DeltaSource<\n",
+        "\tList<ReconciledRowOfAnExtremelyLongName>,\n",
+        "\tSeqOp<ReconciledRowOfAnExtremelyLongName>,\n",
+        "> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    #[test]
+    fn a_hand_wrapped_header_that_fits_is_printed_on_one_line() {
+        assert!(
+            columns(ONE_LINE.lines().next().expect("the header")) <= LINE_BUDGET,
+            "the fixture's canonical header must fit"
+        );
+        // Not a decline: the honest half says so, ahead of the byte claim.
+        assert_eq!(reprint(HAND_WRAPPED).as_deref(), Ok(ONE_LINE));
+        assert_construct(HAND_WRAPPED, ONE_LINE);
+    }
+
+    #[test]
+    fn an_over_budget_header_breaks_one_argument_per_line() {
+        assert_over_budget(OVER_BUDGET.lines().next().expect("the header"));
+        assert_construct(OVER_BUDGET, SPLIT);
+    }
+
+    #[test]
+    fn the_split_header_is_canonical_and_round_trips_unchanged() {
+        assert_eq!(reprint(SPLIT).as_deref(), Ok(SPLIT));
+    }
+
+    #[test]
+    fn a_with_clause_breaks_at_its_last_trait() {
+        // The tail of the header is the clause's last trait, so that is the
+        // list that breaks — the subject's own arguments stay inline, exactly
+        // as a call's earlier arguments do.
+        let source = concat!(
+            "export impl KeyedCell<type K: Hashable, type T: Keyed<K>> ",
+            "with DeltaSource<List<TableRowOfAVeryLongName>, SeqOp<TableRowOfAVeryLongName>> {\n",
+            "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+        );
+        assert_over_budget(source.lines().next().expect("the header"));
+        assert_construct(
+            source,
+            concat!(
+                "export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with DeltaSource<\n",
+                "\tList<TableRowOfAVeryLongName>,\n",
+                "\tSeqOp<TableRowOfAVeryLongName>,\n",
+                "> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_header_with_no_argument_list_to_break_stays_long() {
+        // The empty-parameter-list answer: there is nothing to break, so the
+        // line simply stays wide rather than growing a `<⏎>` that buys nothing.
+        let source = concat!(
+            "impl AnImplementationSubjectWhoseBareNameAloneRunsWellPastTheHundredColumn",
+            "BudgetWithNoGenericsAtAll {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+        );
+        assert_over_budget(source.lines().next().expect("the header"));
+        assert_construct(source, source);
+    }
+
+    #[test]
+    fn the_net_forgives_the_trailing_comma_and_nothing_more() {
+        // The net's new latitude is one comma before a `>`: the printer's own
+        // split form carries one and the source may too. Dropping an ARGUMENT
+        // still drifts, so the forgiveness cannot hide a printer bug.
+        assert_eq!(
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>,> {}\n"),
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>> {}\n"),
+            "the net must forgive a trailing comma before `>`"
+        );
+        assert_ne!(
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>> {}\n"),
+            code_tokens("impl type S: DeltaSource<List<T>> {}\n"),
+            "the net went blind to a lost generic argument"
+        );
+    }
+}
+
+#[cfg(test)]
 mod element_layout {
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::assert_over_budget;
@@ -7801,6 +12179,42 @@ mod element_layout {
         assert_construct(
             "fun demo(): View {\n\t<div/>\n}\n",
             "fun demo(): View {\n\t<div />\n}\n",
+        );
+    }
+
+    /// A46: the fragment's nameless head needs no rule of its own — the tag
+    /// text is empty, so `<` + it + `>` is `<>` and `</` + it + `>` is `</>`,
+    /// and every layout decision above (inline while one child fits, one child
+    /// per line otherwise) is the element's unchanged.
+    #[test]
+    fn a_fragment_with_one_hole_child_stays_inline() {
+        assert_construct(
+            "fun demo(): List<View> {\n\t<>{ row }</>\n}\n",
+            "fun demo(): List<View> {\n\t<>{row}</>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_fragment_with_several_children_splits_one_per_line() {
+        assert_construct(
+            "fun demo(): List<View> {\n\t<><i>\"a\"</i><b>\"b\"</b></>\n}\n",
+            "fun demo(): List<View> {\n\t<>\n\t\t<i>\"a\"</i>\n\t\t<b>\"b\"</b>\n\t</>\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_empty_fragment_prints_as_the_bare_pair() {
+        assert_construct(
+            "fun demo(): List<View> {\n\t<></>\n}\n",
+            "fun demo(): List<View> {\n\t<></>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_fragment_nested_in_an_element_splits_with_it() {
+        assert_construct(
+            "fun demo(): View {\n\t<ul>{head}<>{rows}</></ul>\n}\n",
+            "fun demo(): View {\n\t<ul>\n\t\t{head}\n\t\t<>{rows}</>\n\t</ul>\n}\n",
         );
     }
 
@@ -7842,9 +12256,13 @@ mod element_layout {
     fn an_over_budget_head_splits_one_item_per_line() {
         let source = "fun demo(): View {\n\t<input placeholder(\"What needs doing?\") disabled aria-label(\"A long label here to push the head far past the hundred column budget\") />\n}\n";
         assert_over_budget(source.lines().nth(1).unwrap());
+        // The items come out in the canonical element-head order (E151) —
+        // none of these three is a leading name, so they are alphabetical.
+        // What this pin is about is the LAYOUT: one item per line, `/>` back
+        // at the element's own indent.
         assert_construct(
             source,
-            "fun demo(): View {\n\t<input\n\t\tplaceholder(\"What needs doing?\")\n\t\tdisabled\n\t\taria-label(\"A long label here to push the head far past the hundred column budget\")\n\t/>\n}\n",
+            "fun demo(): View {\n\t<input\n\t\taria-label(\"A long label here to push the head far past the hundred column budget\")\n\t\tdisabled\n\t\tplaceholder(\"What needs doing?\")\n\t/>\n}\n",
         );
     }
 
@@ -7908,9 +12326,67 @@ mod element_layout {
 
     #[test]
     fn a_chain_link_holding_an_inline_element_stays_inline() {
+        // The keyed-run shape as it is written today: `each` is the free slot
+        // value and `child` places it at the parent's end (A99 retired the
+        // `bind_each` METHOD this pin used to spell).
         assert_construct(
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| <li>{t}</li>)) />\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| <li>{t}</li>)) />\n}\n",
+        );
+    }
+
+    // --- E118: a closure-argument element that SPLITS ------------------------
+
+    /// The owner's exhibit, verbatim. Inline, the element's three anchors
+    /// disagree: the open tag starts after `|| `, the children indent from the
+    /// STATEMENT, and the close tag sits at the statement's column. Breaking
+    /// after `|| ` puts all three on one column — the block body's rule.
+    #[test]
+    fn a_closure_argument_element_breaks_after_the_bar() {
+        assert_construct(
+            "fun demo() {\n\toverlays.attach(submenu, || <div .styled(example_padded_style)>\n\
+             \t\t<button>\"Sub item\"</button>\n\t</div>);\n}\n",
+            "fun demo() {\n\toverlays.attach(submenu, ||\n\
+             \t\t<div .styled(example_padded_style)>\n\
+             \t\t\t<button>\"Sub item\"</button>\n\t\t</div>);\n}\n",
+        );
+    }
+
+    /// One child, and it is an element — the shape that forces a split without
+    /// any help from the line budget.
+    #[test]
+    fn a_one_child_closure_argument_element_breaks_after_the_bar() {
+        assert_construct(
+            "fun demo() {\n\tattach(|| <div><span>\"x\"</span></div>);\n}\n",
+            "fun demo() {\n\tattach(||\n\t\t<div>\n\t\t\t<span>\"x\"</span>\n\
+             \t\t</div>);\n}\n",
+        );
+    }
+
+    /// Nested elements under one closure argument: every level indents from the
+    /// level above it, and each closing tag lands on its own opening tag's
+    /// column — the property the inline form could not have, since only the
+    /// outermost close had a column of its own.
+    #[test]
+    fn nested_children_indent_from_their_own_open_tag() {
+        assert_construct(
+            "fun demo() {\n\tattach(|| <div .styled(s)><section><span>\"x\"</span>\
+             </section></div>);\n}\n",
+            "fun demo() {\n\tattach(||\n\t\t<div .styled(s)>\n\t\t\t<section>\n\
+             \t\t\t\t<span>\"x\"</span>\n\t\t\t</section>\n\t\t</div>);\n}\n",
+        );
+    }
+
+    /// A closure argument nested INSIDE an element head — the keyed-run shape
+    /// the inline pin above uses, with a body that splits. The rule applies at
+    /// that depth too, measured from the head-item line the closure sits on.
+    #[test]
+    fn a_closure_argument_element_inside_an_element_head_breaks_too() {
+        assert_construct(
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| \
+             <li><b>{t}</b></li>)) />\n}\n",
+            "fun demo(): View {\n\t<ul\n\t\t.child(each(items, |t| t.id, |t|\n\
+             \t\t\t<li>\n\t\t\t\t<b>{t}</b>\n\t\t\t</li>))\n\t/>\n}\n",
         );
     }
 }
@@ -8254,9 +12730,128 @@ mod import_sorting {
         );
         // Case-sensitive: capitalized names sort before lowercase (ASCII).
         assert_sorts(
-            "import std::option::Option::{ self, Some, None };\n",
-            "import std::option::Option::{ None, Some, self };\n",
+            "import std::x::{ beta, Alpha, Delta };\n",
+            "import std::x::{ Alpha, Delta, beta };\n",
         );
+    }
+
+    // E146 rule 1: a bare `self` is the group's OWN namespace, not one more
+    // member of it, so it heads the group rather than landing wherever ASCII
+    // puts a lowercase four-letter word. Before this rule the sort was plain
+    // ASCII and `Option::{ self, Some, None }` reprinted as
+    // `{ None, Some, self }` — the shape N55's reformat wrote into 37 groups,
+    // `std/src/prelude.vl` and `web.vl` among them.
+    #[test]
+    fn self_sorts_first_in_its_group() {
+        assert_sorts(
+            "import std::option::Option::{ Some, None, self };\n",
+            "import std::option::Option::{ self, None, Some };\n",
+        );
+        assert_sorts(
+            "import std::result::Result::{ Err, Ok, self };\n",
+            "import std::result::Result::{ self, Err, Ok };\n",
+        );
+        // Already-first is a fixed point, and the net accepts the reordering:
+        // both spellings of the same group reduce to the same tokens.
+        assert_sorts(
+            "import std::option::Option::{ self, None, Some };\n",
+            "import std::option::Option::{ self, None, Some };\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens(
+                "import std::option::Option::{ Some, None, self };\n"
+            )),
+            normalize(raw_tokens(
+                "import std::option::Option::{ self, None, Some };\n"
+            )),
+            "the net must see the two orders of one group as one",
+        );
+    }
+
+    // Only a BARE `self` heads the group. `self as name` renames the namespace
+    // — a binding of its own — and keys by the text it writes, so it stays where
+    // the alias sorts it (E142's rule, unchanged).
+    #[test]
+    fn an_aliased_self_does_not_head_the_group() {
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None };\n",
+            "import std::option::Option::{ None, Some, self as Maybe };\n",
+        );
+        // A group carrying BOTH: the bare `self` heads it, the rename sorts by
+        // its own text.
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None, self };\n",
+            "import std::option::Option::{ self, None, Some, self as Maybe };\n",
+        );
+    }
+
+    // B318 S3. A selector sorts AFTER every name in a brace set, by its
+    // subject's rendered type text (`visibility.md` §7.2, B318's open (e)) —
+    // the shared `BranchKey::Selector` variant, so `vilan fmt` and Organize
+    // Imports order it identically and the token safety net agrees with both.
+    #[test]
+    fn a_selector_sorts_after_every_name_in_a_set() {
+        assert_sorts(
+            "import pkg::a::{ (impl Thing), Zeta, Thing };\n",
+            "import pkg::a::{ Thing, Zeta, (impl Thing) };\n",
+        );
+        // Two selectors order by their type text, not by source order.
+        assert_sorts(
+            "import pkg::a::{ (impl Zebra), (impl Alpha) };\n",
+            "import pkg::a::{ (impl Alpha), (impl Zebra) };\n",
+        );
+    }
+
+    // A selector has no unbraced spelling — `import a::(impl T);` is refused —
+    // so a one-member set holding one keeps its braces where a one-member set
+    // holding a NAME collapses (kolt.local 005).
+    #[test]
+    fn a_one_member_set_holding_a_selector_keeps_its_braces() {
+        assert_sorts(
+            "import pkg::a::{ (impl Style) };\n",
+            "import pkg::a::{ (impl Style) };\n",
+        );
+        assert_sorts("import pkg::a::{ Style };\n", "import pkg::a::Style;\n");
+    }
+
+    // A selector's METHOD set sorts like any other, and a lone member takes the
+    // unbraced spelling the same way `a::{ b }` does.
+    #[test]
+    fn selector_members_sort_and_a_lone_member_unbraces() {
+        assert_sorts(
+            "import pkg::a::{ (impl List<i32>)::{ last, first } };\n",
+            "import pkg::a::{ (impl List<i32>)::{ first, last } };\n",
+        );
+        assert_sorts(
+            "import pkg::a::{ (impl List<i32>)::{ first } };\n",
+            "import pkg::a::{ (impl List<i32>)::first };\n",
+        );
+    }
+
+    // B318 §2.4: `only` is part of what the statement MEANS, so the reprint
+    // carries it — and the token safety net, which reads the word on its own
+    // path, agrees rather than bailing.
+    #[test]
+    fn only_survives_the_reprint_and_sorts_by_its_path() {
+        assert_sorts(
+            "import pkg::z::y only;\nimport std::a;\n",
+            "import std::a;\nimport pkg::z::y only;\n",
+        );
+    }
+
+    // The placeholder round-trips in every position B318 gives it: an argument
+    // (`List<_>`), a nested one, an independent pair, and the whole-module
+    // `(impl _)`.
+    #[test]
+    fn the_selector_placeholder_round_trips() {
+        for source in [
+            "import pkg::a::{ (impl _) };\n",
+            "import pkg::a::{ (impl List<_>) };\n",
+            "import pkg::a::{ (impl List<Option<_>>) };\n",
+            "import pkg::a::{ (impl Map<_, _>) };\n",
+        ] {
+            assert_sorts(source, source);
+        }
     }
 
     // A `use` always sorts after every `import`, whatever the paths — the kind
@@ -8364,6 +12959,287 @@ mod import_sorting {
             "normalize must not reorder block-scoped imports"
         );
     }
+
+    // --- E142: `as` aliases ride the sort ------------------------------------
+
+    // An alias is part of the statement the run orders, and part of the member
+    // a brace set orders: both survive the reprint verbatim, in the position
+    // the path (not the alias) puts them in.
+    #[test]
+    fn an_aliased_import_sorts_by_its_path_and_keeps_its_alias() {
+        assert_sorts(
+            "import pkg::z::thing as t;\nimport std::io::print as say;\n\
+             import std::json::Json as Doc;\n",
+            "import std::io::print as say;\nimport std::json::Json as Doc;\n\
+             import pkg::z::thing as t;\n",
+        );
+    }
+
+    #[test]
+    fn an_aliased_brace_member_sorts_and_keeps_its_alias() {
+        assert_sorts(
+            "import std::option::Option::{ Some, self as Maybe, None };\n",
+            "import std::option::Option::{ None, Some, self as Maybe };\n",
+        );
+    }
+
+    // A one-member set still collapses to its unbraced spelling with the alias
+    // attached — `a::{ b as c }` IS `a::b as c` — and the net reduces both to
+    // the same tokens, which is what lets the reprint through.
+    #[test]
+    fn a_one_member_aliased_set_collapses_and_the_net_agrees() {
+        assert_sorts(
+            "import std::json::{ Json as Doc };\n",
+            "import std::json::Json as Doc;\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens("import std::json::{ Json as Doc };\n")),
+            normalize(raw_tokens("import std::json::Json as Doc;\n")),
+            "the net must see the braced and collapsed spellings as one",
+        );
+    }
+
+    // --- E145: a redundant alias collapses -----------------------------------
+
+    // `import a::b as b;` binds exactly what `import a::b;` binds — the alias
+    // renames a name to itself — so the plain import is the canonical spelling
+    // and the `as` is dropped. The net reduces both to the same tokens, which
+    // is what lets the reprint through.
+    #[test]
+    fn a_redundant_alias_collapses() {
+        assert_sorts(
+            "import std::json::Json as Json;\n",
+            "import std::json::Json;\n",
+        );
+        assert_sorts("use pkg::app::state as state;\n", "use pkg::app::state;\n");
+        // Inside a brace set, and beside a member that keeps its own alias.
+        assert_sorts(
+            "import std::json::{ Json as Json, Value as V };\n",
+            "import std::json::{ Json, Value as V };\n",
+        );
+        assert_eq!(
+            normalize(raw_tokens("import std::json::Json as Json;\n")),
+            normalize(raw_tokens("import std::json::Json;\n")),
+            "the net must see the aliased and plain spellings as one",
+        );
+    }
+
+    // An alias that renames to a DIFFERENT name binds a name the module does
+    // not otherwise have. It is a program, not a spelling, and is untouched —
+    // including one that differs only in case.
+    #[test]
+    fn a_real_alias_is_untouched() {
+        assert_sorts(
+            "import std::json::Json as Doc;\n",
+            "import std::json::Json as Doc;\n",
+        );
+        assert_sorts(
+            "import std::json::Json as json;\n",
+            "import std::json::Json as json;\n",
+        );
+        assert_ne!(
+            normalize(raw_tokens("import std::json::Json as Doc;\n")),
+            normalize(raw_tokens("import std::json::Json;\n")),
+            "a real alias is part of what the net compares",
+        );
+    }
+
+    // A BLOCK-SCOPED import is left as written in every other respect (its
+    // brace set is not even sorted — a deliberate placement), but a redundant
+    // alias is not a placement, and the net's pass reaches every depth, so the
+    // collapse holds there too rather than falling the whole file back.
+    #[test]
+    fn a_redundant_alias_collapses_inside_a_block() {
+        assert_sorts(
+            "fun demo() {\n\timport std::json::Json as Json;\n\tJson::parse(\"1\");\n}\n",
+            "fun demo() {\n\timport std::json::Json;\n\tJson::parse(\"1\");\n}\n",
+        );
+        assert_sorts(
+            "fun demo() {\n\timport std::json::Json as Doc;\n\tDoc::parse(\"1\");\n}\n",
+            "fun demo() {\n\timport std::json::Json as Doc;\n\tDoc::parse(\"1\");\n}\n",
+        );
+    }
+
+    // The net is not blind to the alias itself: two imports differing only by
+    // the name they bind are different programs and must stay distinct.
+    #[test]
+    fn net_does_not_forgive_a_changed_alias() {
+        assert_ne!(
+            normalize(raw_tokens("import a::b as c;\n")),
+            normalize(raw_tokens("import a::b as d;\n")),
+            "an alias is part of what the net compares"
+        );
+        assert_ne!(
+            normalize(raw_tokens("import a::b as c;\n")),
+            normalize(raw_tokens("import a::b;\n")),
+            "dropping an alias is a token drift, not a canonicalization"
+        );
+    }
+}
+
+#[cfg(test)]
+mod export_marker_placement {
+    //! E181: the bare `export *;` marker has a canonical PLACE — the slot just
+    //! below the file's leading import run, with a paragraph gap on both sides
+    //! — and `vilan fmt` puts it there. B318 S1 introduced the marker and the
+    //! printer left it wherever it was written (before the imports, mid-file,
+    //! glued to the next item — all four placements survived a reprint
+    //! unchanged on 9b22ec36), because statements print in source order and
+    //! only imports sort within their run. S6's estate sweep is about to write
+    //! hundreds of markers, so the rule lands first.
+    use super::{format, normalize};
+    use crate::lexing::tokenize;
+    use crate::token::Token;
+
+    /// The reprint puts the marker in its slot, is idempotent, and did not
+    /// silently bail — a bail returns the input verbatim, so the appended blank
+    /// lines would survive instead of being canonicalized away.
+    fn assert_places(source: &str, expected: &str) {
+        assert_eq!(format(source), expected, "the marker is not in its slot");
+        assert_eq!(format(expected), expected, "not idempotent");
+        assert_eq!(
+            format(&format!("{source}\n\n")),
+            expected,
+            "silently bailed on {source:?}"
+        );
+    }
+
+    fn raw_tokens(text: &str) -> Vec<Token<'_>> {
+        let (tokens, errors) = tokenize(text);
+        assert!(errors.is_empty(), "did not lex cleanly: {text:?}");
+        tokens.into_iter().map(|(token, _)| token).collect()
+    }
+
+    // Written ABOVE the imports — the shape the six benchmark modules carry —
+    // the marker moves below them. The imports are the file's leading run
+    // either way: the slot is measured with the marker lifted out.
+    #[test]
+    fn a_marker_above_the_imports_moves_below_them() {
+        assert_places(
+            "export *;\n\nimport std::io::print;\nimport pkg::a;\n\nfun main() {}\n",
+            "import std::io::print;\nimport pkg::a;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // Written MID-FILE, the marker comes back up to the slot — and the comment
+    // written directly above it travels with it, because that comment is about
+    // the marker and about nothing the marker left behind.
+    #[test]
+    fn a_marker_written_mid_file_comes_back_up_with_its_comment() {
+        assert_places(
+            "import std::io::print;\n\nfun main() {}\n\n// every item is surface\nexport *;\n",
+            "import std::io::print;\n\n// every item is surface\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // GLUED to the statements on either side, the marker earns its paragraph
+    // gaps: the slot is a place AND a shape, and a marker already at the right
+    // index is still printed with the gaps.
+    #[test]
+    fn a_glued_marker_earns_its_paragraph_gaps() {
+        assert_places(
+            "import std::io::print;\nexport *;\nfun main() {}\n",
+            "import std::io::print;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // With no imports the marker leads the file — after the MODULE comment,
+    // which is the block a blank line separates from the first item, and above
+    // a doc comment written against that item, which is not.
+    #[test]
+    fn with_no_imports_the_marker_follows_the_module_comment() {
+        assert_places(
+            "// what this module is\n\n/// what main does\nfun main() {}\n\nexport *;\n",
+            "// what this module is\n\nexport *;\n\n/// what main does\nfun main() {}\n",
+        );
+    }
+
+    // The block is not the sort RUN. `import_run_end` stops at a standalone
+    // comment (imports may not reorder across one), and inheriting that break
+    // here moved a correctly-placed marker UP into the middle of the import
+    // list — kolt's `views.vl`, whose second import carries a `// FIXME:` line
+    // above it and whose marker sits correctly below all thirty. Measured on
+    // the copy: `vilan fmt --check` flagged exactly that one file, and this is
+    // the pin that keeps it flagging nothing.
+    #[test]
+    fn a_comment_inside_the_import_block_does_not_end_it() {
+        let source = "import std::io::print;\n\
+                      // why the next one is here\n\
+                      import pkg::a;\n\n\
+                      export *;\n\n\
+                      fun main() {}\n";
+        assert_eq!(format(source), source, "the marker is already in its slot");
+        // And a marker written ABOVE that same block still lands below all of
+        // it, not between the comment and the import under it.
+        assert_places(
+            "export *;\nimport std::io::print;\n\
+             // why the next one is here\n\
+             import pkg::a;\n\nfun main() {}\n",
+            "import std::io::print;\n\
+             // why the next one is here\n\
+             import pkg::a;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // A file already in the canonical shape reprints byte-identically.
+    #[test]
+    fn a_file_already_in_the_shape_is_unchanged() {
+        let source = "// the module\n\nimport std::io::print;\n\nexport *;\n\nfun main() {}\n";
+        assert_eq!(format(source), source);
+    }
+
+    // A file whose only statement is the marker has nowhere to move it to.
+    #[test]
+    fn a_file_that_is_only_the_marker_is_unchanged() {
+        assert_eq!(format("export *;\n"), "export *;\n");
+    }
+
+    // A SECOND marker is the analyzer's business — the formatter never hides a
+    // diagnosis by tidying the evidence — so it is left exactly where it was
+    // written and only the first one moves.
+    #[test]
+    fn a_duplicate_marker_is_left_where_it_was_written() {
+        assert_places(
+            "import std::io::print;\nfun a() {}\nexport *;\nfun b() {}\nexport *;\n",
+            "import std::io::print;\n\nexport *;\n\nfun a() {}\n\nfun b() {}\nexport *;\n",
+        );
+    }
+
+    // Only the BARE marker moves. `export import` is a re-export and sorts
+    // inside the import run like any other statement; `export item` and
+    // `export(in PATH) item` are declarations and hold their place.
+    #[test]
+    fn the_export_declarations_stay_where_they_are() {
+        assert_places(
+            "export import std::io::print;\nexport fun surface() {}\n\n\
+             export(in pkg) fun narrowed() {}\n\nfun local() {}\n\nexport *;\n",
+            "export import std::io::print;\n\nexport *;\n\nexport fun surface() {}\n\n\
+             export(in pkg) fun narrowed() {}\n\nfun local() {}\n",
+        );
+    }
+
+    // The safety net accepts the move (the marker is hoisted to one canonical
+    // token position on both streams) and still refuses a marker being LOST or
+    // gained — which is the whole reason the normalization relocates the tokens
+    // rather than dropping them.
+    #[test]
+    fn the_net_forgives_the_move_and_not_a_lost_marker() {
+        assert_eq!(
+            normalize(raw_tokens("export *;\nimport a::b;\n")),
+            normalize(raw_tokens("import a::b;\n\nexport *;\n")),
+            "the relocation is what the net is being asked to forgive"
+        );
+        assert_ne!(
+            normalize(raw_tokens("import a::b;\n\nexport *;\n")),
+            normalize(raw_tokens("import a::b;\n")),
+            "a dropped marker is a token drift, not a canonicalization"
+        );
+        assert_ne!(
+            normalize(raw_tokens("import a::b;\n\nexport *;\n")),
+            normalize(raw_tokens("import a::b;\n\nexport *;\nexport *;\n")),
+            "the marker COUNT still travels"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8380,8 +13256,47 @@ mod organize {
     /// Applies the organizer's edits to `source`, treating every leaf named in
     /// `dead` as unused. Edits apply back-to-front so earlier offsets stay valid.
     pub(super) fn organize(source: &str, dead: &[&str]) -> String {
+        organize_rescuing(source, dead, &[])
+    }
+
+    /// [`organize`] with E168's second predicate wired: a statement every one of
+    /// whose leaves is dead, and whose MODULE segment is named in `rescued`, is
+    /// rewritten to `import <module>;` instead of being deleted.
+    pub(super) fn organize_rescuing(source: &str, dead: &[&str], rescued: &[&str]) -> String {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let mut edits = organize_import_runs(source, &keep).expect("source parses cleanly");
+        let keep_module = |span: Span| match rescued.contains(&&source[span.into_range()]) {
+            true => super::ModuleRescue::Module,
+            false => super::ModuleRescue::No,
+        };
+        let mut edits =
+            organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
+        let mut result = source.to_string();
+        for edit in edits {
+            result.replace_range(edit.span.into_range(), &edit.replacement);
+        }
+        result
+    }
+
+    /// [`organize`] with E168's rescue answering B318's SELECTOR form: a
+    /// statement every one of whose leaves is dead, and whose MODULE segment is
+    /// named in `selected`, is rewritten to
+    /// `import <module>::{ (impl <subject>) };`.
+    pub(super) fn organize_selecting(
+        source: &str,
+        dead: &[&str],
+        selected: &[(&str, &str)],
+    ) -> String {
+        let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
+        let keep_module = |span: Span| match selected
+            .iter()
+            .find(|(module, _)| *module == &source[span.into_range()])
+        {
+            Some((_, subject)) => super::ModuleRescue::Selector((*subject).to_string()),
+            None => super::ModuleRescue::No,
+        };
+        let mut edits =
+            organize_import_runs(source, &keep, &keep_module).expect("source parses cleanly");
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
         let mut result = source.to_string();
         for edit in edits {
@@ -8393,12 +13308,136 @@ mod organize {
     /// The organizer offers no edit at all (already organized / nothing to prune).
     fn assert_no_edit(source: &str, dead: &[&str]) {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
-        let edits = organize_import_runs(source, &keep).expect("source parses cleanly");
+        let edits = organize_import_runs(source, &keep, &|_| super::ModuleRescue::No)
+            .expect("source parses cleanly");
         assert!(
             edits.is_empty(),
             "expected no edit, got {} edit(s)",
             edits.len()
         );
+    }
+
+    // E168: a statement whose every leaf is dead but whose MODULE is still
+    // wanted is REWRITTEN, not deleted — `import pkg::a::b;` becomes
+    // `import pkg::a;`, rendered through the canonical printer and sorted into
+    // place like any other surviving statement. The `impl`s in `a.vl` travel
+    // with any import that reaches the module, so deleting the statement is what
+    // broke the build; the leaf `b` is unused either way.
+    #[test]
+    fn an_emptied_statement_whose_module_is_wanted_is_rewritten() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::b;\n", &["b"], &["a"]),
+            "import pkg::a;\n",
+        );
+    }
+
+    // B318 S3 re-points E168's rewrite: when everything the file gets from the
+    // module is one subject's `impl` blocks, the rescue is the SELECTOR — the
+    // precise statement of what the file actually needs — and not the whole
+    // module. `visibility.md` §7.2, and E168's own item ("re-pointed at B318's
+    // selectors later").
+    #[test]
+    fn an_emptied_statement_rescued_by_one_subject_becomes_a_selector() {
+        assert_eq!(
+            organize_selecting("import pkg::a::b;\n", &["b"], &[("a", "Style")]),
+            "import pkg::a::{ (impl Style) };\n",
+        );
+        // A brace set's common prefix is the path before it, so a set whose
+        // members all died rewrites the same way.
+        assert_eq!(
+            organize_selecting("import pkg::a::{ b, c };\n", &["b", "c"], &[("a", "Style")]),
+            "import pkg::a::{ (impl Style) };\n",
+        );
+    }
+
+    // A selector is a TERMINAL the organizer prunes: `keep` is asked at its own
+    // `(impl …)` span, so a selector whose implementation the file does not use
+    // goes, and one it does use stays — beside a name in the same set, which
+    // prunes on its own answer.
+    #[test]
+    fn an_unused_selector_prunes_and_a_used_one_survives() {
+        assert_eq!(
+            organize(
+                "import pkg::a::{ Thing, (impl Thing) };\n",
+                &["(impl Thing)"],
+            ),
+            "import pkg::a::Thing;\n",
+        );
+        assert_eq!(
+            organize("import pkg::a::{ Thing, (impl Thing) };\n", &["Thing"]),
+            "import pkg::a::{ (impl Thing) };\n",
+        );
+        // Every element dead: the statement goes, and the module rescue is a
+        // second question it was not offered here.
+        assert_eq!(
+            organize(
+                "import pkg::a::{ Thing, (impl Thing) };\n",
+                &["Thing", "(impl Thing)"],
+            ),
+            "",
+        );
+    }
+
+    // fmt/organize agreement, extended to the new elements: what the organizer
+    // renders for a run carrying a selector and an `only` is byte-for-byte what
+    // `vilan fmt` renders for it, which is the property `organize_run` depends
+    // on and the one `formatter.rs:1414` says must never break.
+    #[test]
+    fn organize_and_fmt_agree_on_selectors_and_only() {
+        let source =
+            "import pkg::z::y only;\nimport pkg::a::{ (impl Zebra), Thing, (impl Alpha) };\n";
+        assert_eq!(
+            super::organize::organize(source, &[]),
+            super::format(source)
+        );
+        assert_eq!(
+            super::organize::organize(source, &[]),
+            "import pkg::a::{ Thing, (impl Alpha), (impl Zebra) };\nimport pkg::z::y only;\n",
+        );
+    }
+
+    // The rewrite fires only when NOTHING survives: a brace set with a live
+    // member prunes to that member, exactly as before, and never widens back to
+    // the module.
+    #[test]
+    fn a_partly_live_brace_set_prunes_rather_than_widening_to_the_module() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::{ b, c };\n", &["b"], &["a"]),
+            "import pkg::a::c;\n",
+        );
+    }
+
+    // A module nobody wants still deletes — the rescue is a second question,
+    // not a second chance.
+    #[test]
+    fn an_emptied_statement_whose_module_is_unwanted_is_deleted() {
+        assert_eq!(organize_rescuing("import pkg::a::b;\n", &["b"], &[]), "");
+    }
+
+    // The truncation refuses to leave an ORIGIN: `import pkg::a;` reaches into
+    // `pkg`, which is not a module whose file declares anything, so a dead leaf
+    // there deletes rather than becoming `import pkg;`.
+    #[test]
+    fn an_emptied_statement_one_segment_deep_is_never_rewritten_to_its_origin() {
+        assert_eq!(organize_rescuing("import pkg::a;\n", &["a"], &["pkg"]), "");
+    }
+
+    // A brace set's common prefix IS the path before it, so a set whose members
+    // all died rewrites to that prefix.
+    #[test]
+    fn an_emptied_brace_set_rewrites_to_its_common_prefix() {
+        assert_eq!(
+            organize_rescuing("import pkg::a::{ b, c };\n", &["b", "c"], &["a"]),
+            "import pkg::a;\n",
+        );
+    }
+
+    // A `use` is NOT rewritten. It binds a name out of a namespace into this
+    // scope; a namespace with no name taken out of it binds nothing, so there
+    // is no module-only spelling to fall back to.
+    #[test]
+    fn an_emptied_use_is_deleted_rather_than_widened() {
+        assert_eq!(organize_rescuing("use pkg::a::b;\n", &["b"], &["a"]), "");
     }
 
     // Sort-only (nothing dead): a shuffled run reorders exactly as `vilan fmt`.
@@ -8500,6 +13539,68 @@ mod organize {
         );
     }
 
+    // E186: a run that WAS a whole paragraph takes its separator with it.
+    //
+    // kolt's generated `lucide/lib.vl` is the exhibit: a header comment, a
+    // blank, two prelude-redundant imports, a blank, `export *;`. Deleting the
+    // run and one line ending left the blank BELOW it standing beside the blank
+    // above, so organizing printed two blank lines before the `export`. A
+    // generated file is exactly where that matters — `vilan fmt` is kept off it
+    // by `[package] generated`, so nothing repairs it afterwards.
+    #[test]
+    fn a_fully_dead_paragraph_takes_its_separator_with_it() {
+        assert_eq!(
+            organize(
+                "// header\n\nimport std::dead;\n\nexport *;\n\nfun main() {}\n",
+                &["dead"],
+            ),
+            "// header\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // …and at the START of the file, where "the line above" is no line at all:
+    // the run opens the file, so the blank below it is its own separator and a
+    // deleted run must not leave the file starting on a blank line.
+    #[test]
+    fn a_fully_dead_opening_paragraph_leaves_no_leading_blank() {
+        assert_eq!(
+            organize("import std::dead;\n\nfun main() {}\n", &["dead"]),
+            "fun main() {}\n",
+        );
+    }
+
+    // The boundary the rule turns on: a run that was the TAIL of a paragraph
+    // keeps the separator, because that blank separates the paragraph it
+    // belonged to from the next one — not the run from anything.
+    #[test]
+    fn a_fully_dead_run_under_a_comment_keeps_the_paragraph_separator() {
+        assert_eq!(
+            organize("// header\nimport std::dead;\n\nfun main() {}\n", &["dead"]),
+            "// header\n\nfun main() {}\n",
+        );
+    }
+
+    // A run with no blank under it is unchanged by E186 — there is no separator
+    // to take, and the line below must not be eaten.
+    #[test]
+    fn a_fully_dead_paragraph_with_no_blank_below_eats_nothing_extra() {
+        assert_eq!(
+            organize("// header\n\nimport std::dead;\nfun main() {}\n", &["dead"]),
+            "// header\n\nfun main() {}\n",
+        );
+    }
+
+    // CRLF: the separator is a whole `\r\n` too, or a stray CR stands as an
+    // empty line exactly as it did before the line-break fix below.
+    #[test]
+    fn a_fully_dead_crlf_paragraph_takes_its_whole_separator() {
+        let organized = organize(
+            &crlf("// header\n\nimport std::dead;\n\nfun main() {}\n"),
+            &["dead"],
+        );
+        assert_eq!(organized, crlf("// header\n\nfun main() {}\n"));
+    }
+
     // Sort and prune compose: the run reorders and the dead leaf disappears in one
     // edit — and the surviving one-member set renders unbraced.
     #[test]
@@ -8575,6 +13676,31 @@ mod insert {
         let mut result = source.to_string();
         result.replace_range(edit.span.into_range(), &edit.replacement);
         Some(result)
+    }
+
+    // E181: a NEW leading import goes ABOVE the `export *;` marker, never
+    // below it — the marker's slot is the line under the import run, so an
+    // import inserted under it would be the one statement the next `vilan fmt`
+    // had to step over. The file whose only header line is the marker is the
+    // shape that says so: there is no run to insert into, and the fresh
+    // statement takes the first line.
+    #[test]
+    fn a_fresh_import_lands_above_the_export_marker() {
+        assert_eq!(
+            apply("export *;\n\nfun main() {}\n", &["std", "json"], "Json").as_deref(),
+            Some("import std::json::Json;\nexport *;\n\nfun main() {}\n"),
+        );
+        // And with a run already there, the new statement sorts into the run,
+        // which is itself above the marker.
+        assert_eq!(
+            apply(
+                "import std::io::print;\n\nexport *;\n\nfun main() {}\n",
+                &["std", "json"],
+                "Json",
+            )
+            .as_deref(),
+            Some("import std::io::print;\nimport std::json::Json;\n\nexport *;\n\nfun main() {}\n"),
+        );
     }
 
     // E83: auto-import completion probes MANY leaves against ONE buffer, so
@@ -8971,16 +14097,26 @@ mod style_chain_order {
         );
     }
 
-    /// The three relations share one axis, so they keep their written order —
-    /// `children`/`divide` never cross `within` or each other.
+    /// The two CHILD relations share one axis, so `children` and `divide` keep
+    /// their written order and never cross each other.
+    ///
+    /// The ancestor GUARD is a different axis from A95 S2 on, and sorts ahead of
+    /// them — a guard is a PREFIX (`[data-theme="dark"] .sX`) and a child
+    /// relation a SUFFIX (`.sX > *`), so the order the selector writes them in is
+    /// the order the links take. It is safe for the rule every condition link
+    /// follows: the two write different slots, so neither can override the
+    /// other, and `crates/vilan-cli/tests/style_chain_order.rs` proves the
+    /// emitted CSS is identical across the permutation.
     #[test]
-    fn relations_keep_their_written_order() {
-        for chain in [
+    fn child_relations_keep_their_written_order_and_the_guard_leads_them() {
+        assert_construct(
             "let s = const style().children(a).divide(b);\n",
+            "let s = const style().children(a).divide(b);\n",
+        );
+        assert_construct(
             "let s = const style().divide(a).within(\"data-theme\", \"dark\", b);\n",
-        ] {
-            assert_construct(chain, chain);
-        }
+            "let s = const style().within(\"data-theme\", \"dark\", b).divide(a);\n",
+        );
     }
 
     /// Two conditions on the SAME axis keep their written order, which is what
@@ -9361,5 +14497,1934 @@ mod style_chain_order {
                 method.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod on_head_order {
+    //! A95 S3 — `vilan fmt` sorts the condition VALUES inside an `.on(<set>, …)`
+    //! head into the canonical order, which is `STYLE_CONDITION_METHODS`' own
+    //! order read one level down from the chain links it ranks
+    //! (style-conditions.md §2.6).
+    //!
+    //! The reorder is safe for a reason the model gives rather than a bet a test
+    //! has to make: a condition SET has no order. `canonical_condition` in
+    //! `vilan/std/src/style.vl` sorts the tokens before the slot key is built,
+    //! so `md() + hover()` and `hover() + md()` already mint one class, and the
+    //! formatter is putting the SOURCE in the order the selector reads in.
+    //! `crates/vilan-core/tests/style_table_sync.rs` gate 6 holds the axis
+    //! column to the token each constructor actually builds.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn the_condition_values_sort_into_the_canonical_slot_order() {
+        // Written in exactly reverse slot order: the pseudo-element, a
+        // pseudo-class, an attribute, a child relation, an ancestor guard and a
+        // breakpoint. Out comes the order a selector is written in.
+        assert_construct(
+            "let s = const style().on(element(\"x\") + hover() + attribute(\"a\") + children() \
+             + within(attribute(\"t\")) + md(), inner);\n",
+            "let s = const style().on(md() + within(attribute(\"t\")) + children() \
+             + attribute(\"a\") + hover() + element(\"x\"), inner);\n",
+        );
+    }
+
+    #[test]
+    fn two_values_on_one_axis_keep_their_written_order() {
+        // The sort is STABLE, which is what lets two `attribute(..)`s and a
+        // negated pseudo-class stay exactly as the author wrote them — the
+        // formatter never reads an argument to rank a value.
+        assert_construct(
+            "let s = const style().on(hover() + active().not(), inner);\n",
+            "let s = const style().on(hover() + active().not(), inner);\n",
+        );
+        assert_construct(
+            "let s = const style().on(attribute(\"b\") + attribute(\"a\"), inner);\n",
+            "let s = const style().on(attribute(\"b\") + attribute(\"a\"), inner);\n",
+        );
+    }
+
+    #[test]
+    fn a_value_the_table_does_not_know_is_a_barrier() {
+        // A `let`-bound set, or a helper of the author's: values sort only
+        // within the runs BETWEEN barriers, so nothing known crosses it. The
+        // degradation is the chain's, for the same reason — the formatter
+        // cannot know what an unknown name contributes.
+        assert_construct(
+            "let s = const style().on(hover() + interactive + md(), inner);\n",
+            "let s = const style().on(hover() + interactive + md(), inner);\n",
+        );
+    }
+
+    #[test]
+    fn a_single_condition_head_is_left_exactly_as_written() {
+        assert_construct(
+            "let s = const style().on(hover(), inner);\n",
+            "let s = const style().on(hover(), inner);\n",
+        );
+    }
+
+    #[test]
+    fn a_sum_that_is_not_an_on_head_never_sorts() {
+        // `Style + Style` is a MERGE and its order is semantic — right wins.
+        // Only the first argument of `on` is a condition set.
+        assert_construct(
+            "let s = const hover_style + base_style;\n",
+            "let s = const hover_style + base_style;\n",
+        );
+        assert_construct(
+            "let s = const style().when(flag, md() + hover());\n",
+            "let s = const style().when(flag, md() + hover());\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_the_head_refuses_the_reorder() {
+        // A reordered head would carry its comments to the wrong value, and the
+        // comment cursor only moves forward — the refusal a chain makes, for
+        // the same reason.
+        let source =
+            "let s = const style().on(\n\thover() // the state\n\t\t+ md(),\n\tinner,\n);\n";
+        let formatted = super::format(source);
+        assert!(
+            formatted.contains("hover()") && formatted.find("hover()") < formatted.find("md()"),
+            "the head must keep its written order beside a comment: {formatted}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod if_arm_layout {
+    //! E146 rule 2 — an `if` reached MID-LINE keeps arms that are single
+    //! expressions on that line: `if busy { "..." } else { "" }`.
+    //!
+    //! Before this rule every arm expanded, whatever it held and wherever the
+    //! `if` sat, so N55's reformat turned a one-line closure body inside a
+    //! `.bind_text(…)` into five lines in the middle of a builder ladder — and
+    //! the enclosing chain, measuring a first line that now fit, never broke.
+    //! The arm was the wrong thing to spend the lines on: the CHAIN was.
+    //!
+    //! An `if` that begins its own line is a statement or a block's tail and is
+    //! untouched, which is what keeps the rule off every ordinary `if` in the
+    //! tree.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+
+    /// The item's own shape, from `crates/vilan-cli/tests/split/app.vl`. Before:
+    /// the arm expanded to five lines mid-ladder and `view("p")…` stayed one
+    /// link. After: the arm stays an expression and the ladder breaks, which is
+    /// the layout the budget was asking for all along.
+    #[test]
+    fn an_expression_arm_stays_one_mid_builder_ladder() {
+        let line = "\t\t.child(view(\"p\").class(\"pending\")\
+                    .bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))";
+        assert_over_budget(line);
+        assert_construct(
+            "fun app(): Element {\n\
+             \tview(\"main\")\n\
+             \t\t.child(link(\"Home\", Route::Home))\n\
+             \t\t.child(view(\"p\").class(\"pending\")\
+             .bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))\n\
+             }\n",
+            "fun app(): Element {\n\
+             \tview(\"main\")\n\
+             \t\t.child(link(\"Home\", Route::Home))\n\
+             \t\t.child(view(\"p\")\n\
+             \t\t\t.class(\"pending\")\n\
+             \t\t\t.bind_text(pending().map(|busy| if busy { \"...\" } else { \"\" })))\n\
+             }\n",
+        );
+    }
+
+    /// A `match` leg's `=> ` puts its body mid-line too, so an `if` there keeps
+    /// its arms — the second shape N55's reformat expanded, in the same file.
+    #[test]
+    fn an_if_in_a_match_leg_keeps_its_arms() {
+        assert_construct(
+            "fun label(reason: Option<str>): str {\n\
+             \tmatch reason {\n\
+             \t\tSome(let text) => if text.len() > 0 {\n\
+             \t\t\t\"!\"\n\
+             \t\t} else {\n\
+             \t\t\t\"?\"\n\
+             \t\t},\n\
+             \t\tNone => \"\",\n\
+             \t}\n\
+             }\n",
+            "fun label(reason: Option<str>): str {\n\
+             \tmatch reason {\n\
+             \t\tSome(let text) => if text.len() > 0 { \"!\" } else { \"?\" },\n\
+             \t\tNone => \"\",\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The right of a `let` is mid-line as well.
+    #[test]
+    fn an_if_in_value_position_keeps_its_arms() {
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 { \"positive\" } else { \"other\" };\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+
+    /// A body that is legitimately a block STAYS one: an arm holding a
+    /// statement is not an expression wearing braces, and one arm that must
+    /// expand expands the whole chain — an `if` with one inline arm and one
+    /// block arm reads worse than either form on its own.
+    #[test]
+    fn a_body_that_is_a_block_stays_a_block() {
+        // A statement in one arm keeps BOTH arms in the block form.
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tlog(\"positive\");\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tlog(\"positive\");\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+        // A comment inside an arm has no slot on the inline line, so the block
+        // form is what keeps it where it was written.
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t// the only interesting case\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\t// the only interesting case\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+
+    /// An `if` that BEGINS its own line owns those lines — a statement, or a
+    /// block's tail expression — and is untouched by the rule.
+    #[test]
+    fn an_if_at_the_head_of_a_line_keeps_the_block_form() {
+        assert_construct(
+            "fun classify(n: i32): str {\n\
+             \tif n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t}\n\
+             }\n",
+            "fun classify(n: i32): str {\n\
+             \tif n > 0 {\n\
+             \t\t\"positive\"\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The width rule still applies. A `match` leg's line is a measured line
+    /// like a split list's element, so a leg whose inline `if` puts it over the
+    /// budget rolls back and reprints with the split armed — and the arms
+    /// expand, because an armed split is what the inline form yields to. Found
+    /// in `vilan/std/src/rpc.vl`, where the inline arm made a 175-column leg.
+    #[test]
+    fn a_leg_over_the_budget_expands_its_arms_again() {
+        let inline = "\t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\" { RpcError::Unauthorized } else { RpcError::Transport(i\"refused by the server ({status})\") },";
+        assert_over_budget(inline);
+        assert_construct(
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\" { RpcError::Unauthorized } else { RpcError::Transport(i\"refused by the server ({status})\") },\n\
+             \t\tDialFailure::Other => RpcError::Transport(\"other\"),\n\
+             \t}\n\
+             }\n",
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\" {\n\
+             \t\t\tRpcError::Unauthorized\n\
+             \t\t} else {\n\
+             \t\t\tRpcError::Transport(i\"refused by the server ({status})\")\n\
+             \t\t},\n\
+             \t\tDialFailure::Other => RpcError::Transport(\"other\"),\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// An arm whose own rendering spans lines is not an inline arm: the tail
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not one expression on
+    /// one line.
+    #[test]
+    fn an_arm_whose_tail_spans_lines_expands() {
+        assert_construct(
+            "fun pick(n: i32, k: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tmatch k {\n\
+             \t\t\t0 => \"zero\",\n\
+             \t\t\t_ => \"more\",\n\
+             \t\t}\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+            "fun pick(n: i32, k: i32): str {\n\
+             \tlet label = if n > 0 {\n\
+             \t\tmatch k {\n\
+             \t\t\t0 => \"zero\",\n\
+             \t\t\t_ => \"more\",\n\
+             \t\t}\n\
+             \t} else {\n\
+             \t\t\"other\"\n\
+             \t};\n\
+             \tlabel\n\
+             }\n",
+        );
+    }
+}
+
+#[cfg(test)]
+mod element_head_layout {
+    //! E151 — the element-head ATTRIBUTE sorter, the import and style-chain
+    //! sorters' third sibling.
+    //!
+    //! Undotted attributes lead, in [`ELEMENT_ATTRIBUTE_ORDER`] and then
+    //! alphabetically; `on:` handlers follow them alphabetically; a DOTTED
+    //! chain link is a barrier that keeps its position absolutely, so nothing
+    //! ever crosses one and no link ever moves relative to another link. The
+    //! desugar is the whole argument: an attribute and a handler each lower to
+    //! a call that fills the slot named by its own first argument, and a dotted
+    //! link splices verbatim and may write anything at all.
+    //!
+    //! The commutation is proved rather than argued, over a corpus, in
+    //! `crates/vilan-cli/tests/element_head_order.rs` — which builds and RUNS
+    //! each element both ways and compares the document it renders.
+    use super::bailing_constructs::assert_construct;
+    use super::{ELEMENT_ATTRIBUTE_ORDER, ElementHeadKind, element_head_permutation, format};
+
+    /// The canonical order, in one head: the six leading names in their own
+    /// order, then everything else alphabetically. Written backwards on
+    /// purpose, with a keyword-spelled name (`for`, `type`) and hyphenated ones
+    /// among them.
+    #[test]
+    fn undotted_attributes_take_the_canonical_order() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<label for(\"f\") aria-y(\"2\") src(\"s\") name(\"n\") href(\"h\") \
+             type(\"t\") id(\"i\")>\"l\"</label>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<label id(\"i\") name(\"n\") type(\"t\") for(\"f\") href(\"h\") src(\"s\") \
+             aria-y(\"2\")>\"l\"</label>\n\
+             }\n",
+        );
+        // A hyphenated name is several TOKENS, and both the printer and the
+        // token twin have to read it as one name.
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<i data-x(\"1\") aria-y(\"2\") id(\"i\")>\"h\"</i>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<i id(\"i\") aria-y(\"2\") data-x(\"1\")>\"h\"</i>\n\
+             }\n",
+        );
+    }
+
+    /// Handlers sort AFTER every attribute, and alphabetically among
+    /// themselves. A bare boolean attribute is an attribute like any other.
+    #[test]
+    fn handlers_follow_the_attributes_alphabetically() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<a on:click(|| go()) href(\"/x\") class(\"nav\") disabled id(\"home\") \
+             on:blur(|| leave())>\"go\"</a>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<a id(\"home\") href(\"/x\") class(\"nav\") disabled on:blur(|| leave()) \
+             on:click(|| go())>\"go\"</a>\n\
+             }\n",
+        );
+    }
+
+    /// A DOTTED link is a barrier. The attributes on either side of it sort
+    /// within their own run and never cross it — which is not a nicety: a link
+    /// may write the very slot an attribute beside it writes, and the formatter
+    /// knows nothing about what any link writes.
+    #[test]
+    fn a_dotted_link_is_a_barrier() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div title(\"t\") .styled(shell) src(\"s\") id(\"i\") .child(inner()) \
+             name(\"n\")>\"x\"</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div title(\"t\") .styled(shell) id(\"i\") src(\"s\") .child(inner()) \
+             name(\"n\")>\"x\"</div>\n\
+             }\n",
+        );
+        // The shape the barrier rule exists for: the attribute and the link
+        // write one slot, and the one written LAST wins. Both spellings are
+        // left exactly as written.
+        let after = "fun demo(): View {\n\t<div .class(\"a\") class(\"b\")>\"x\"</div>\n}\n";
+        let before = "fun demo(): View {\n\t<div class(\"b\") .class(\"a\")>\"x\"</div>\n}\n";
+        assert_construct(after, after);
+        assert_construct(before, before);
+    }
+
+    /// A head that is ALL links is left exactly as written — the degradation
+    /// the barrier rule buys, with zero knowledge of user code.
+    #[test]
+    fn a_head_of_only_links_is_untouched() {
+        let source = "fun demo(): View {\n\
+                      \t<div .child(second()) .styled(shell) .child(first())>\"x\"</div>\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// Two items that rank EQUAL keep their written order, because the sort is
+    /// stable — which is the whole of the last-wins story: `class("first")`
+    /// then `class("second")` renders `second`, and the reverse renders
+    /// `first`.
+    #[test]
+    fn a_last_wins_pair_keeps_its_written_order() {
+        let source = "fun demo(): View {\n\
+                      \t<div class(\"first\") class(\"second\") id(\"i\")>\"x\"</div>\n\
+                      }\n";
+        assert_construct(
+            source,
+            "fun demo(): View {\n\
+             \t<div id(\"i\") class(\"first\") class(\"second\")>\"x\"</div>\n\
+             }\n",
+        );
+        // Two handlers on one event, likewise.
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<a on:click(|| second()) on:blur(|| leave()) on:click(|| first())>\"g\"</a>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<a on:blur(|| leave()) on:click(|| second()) on:click(|| first())>\"g\"</a>\n\
+             }\n",
+        );
+    }
+
+    /// A head with a COMMENT anywhere inside it is left as written: a reordered
+    /// head would carry its comments to the wrong item, and the comment cursor
+    /// only moves forward. The style sorter's refusal, for the same reason.
+    #[test]
+    fn a_comment_in_the_head_refuses_the_reorder() {
+        let source = "fun demo(): View {\n\
+                      \t<div\n\
+                      \t\t// the interesting one\n\
+                      \t\ttitle(\"t\")\n\
+                      \t\tid(\"i\")\n\
+                      \t>\n\
+                      \t\t\"x\"\n\
+                      \t</div>\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// A nested element's head sorts too — reached by the printer's own
+    /// recursion, and by the token twin's.
+    #[test]
+    fn a_nested_elements_head_sorts() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \t<div .child(<span type(\"a\") id(\"b\")>\"x\"</span>)>\"y\"</div>\n\
+             }\n",
+            "fun demo(): View {\n\
+             \t<div .child(<span id(\"b\") type(\"a\")>\"x\"</span>)>\"y\"</div>\n\
+             }\n",
+        );
+    }
+
+    /// The order function itself, at the unit: a barrier holds its INDEX, and
+    /// the runs on either side sort independently.
+    #[test]
+    fn the_permutation_sorts_only_within_the_runs() {
+        let head = [
+            ElementHeadKind::Attribute("title"),
+            ElementHeadKind::Link,
+            ElementHeadKind::Attribute("src"),
+            ElementHeadKind::Attribute("id"),
+            ElementHeadKind::Event("click"),
+            ElementHeadKind::Link,
+            ElementHeadKind::Attribute("name"),
+        ];
+        assert_eq!(
+            element_head_permutation(&head),
+            Some(vec![0, 1, 3, 2, 4, 5, 6])
+        );
+        // A head already in the order answers `None`, so an unchanged head
+        // stays on its existing code path.
+        let canonical: Vec<ElementHeadKind<'_>> = head
+            .iter()
+            .enumerate()
+            .map(|(at, _)| head[[0, 1, 3, 2, 4, 5, 6][at]])
+            .collect();
+        assert_eq!(element_head_permutation(&canonical), None);
+    }
+
+    /// The leading names are the ones the order names, in the order it names
+    /// them — a table this short is worth pinning against a typo.
+    #[test]
+    fn the_leading_names_are_the_six_the_order_names() {
+        assert_eq!(
+            ELEMENT_ATTRIBUTE_ORDER,
+            &["id", "name", "type", "for", "href", "src"]
+        );
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check`. Asserted from the UNFORMATTED side.
+    #[test]
+    fn every_head_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(): View {\n\t<input type(\"checkbox\") disabled aria-label(\"Done\") \
+                 name(\"n\") id(\"i\") />\n}\n",
+                true,
+            ),
+            (
+                "fun b(): View {\n\t<input id(\"i\") name(\"n\") type(\"checkbox\") \
+                 aria-label(\"Done\") disabled />\n}\n",
+                false,
+            ),
+            (
+                "fun c(): View {\n\t<div .class(\"a\") class(\"b\")>\"x\"</div>\n}\n",
+                false,
+            ),
+            (
+                "fun d(): View {\n\t<a on:click(|| go()) href(\"/x\") \
+                 on:blur(|| leave())>\"go\"</a>\n}\n",
+                true,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod loop_and_match_head_layout {
+    //! E150 rule B — a `for` (vilan's `while`) CONDITION, a `for … in`
+    //! ITERABLE (E154) and a `match` SUBJECT take the split permission an `if`
+    //! condition took at E147.
+    //!
+    //! E147 gave the `if` condition the permission on one argument: `if <cond> {`
+    //! is one measured line and the condition is the only thing on it with a
+    //! layout of its own, so without the permission an over-budget `if` had
+    //! nowhere to break at all. `for <cond> {`, `for <name> in <iterable> {` and
+    //! `match <subject> {` are the same sentence with a different keyword — one
+    //! measured line, one layout site, the binder being a name and no layout
+    //! site at all — and they were left out only because E147 was written for
+    //! `if`. E150 rule B then reached two of the three and left the iterable,
+    //! which is what E154 finishes.
+    //!
+    //! There is no over-budget instance of either in the tree, so these pins
+    //! WRITE one: the rule is a rule about the shape, not a rescue of a line
+    //! that happens to exist today.
+    //!
+    //! The permission reaches the head and stops there. A loop's body is a
+    //! statement list, which is a fresh layout context (`print_items` clears
+    //! the permission on entry); a `match`'s legs are printed with `Split::Off`
+    //! and earn their own permission from their own measured lines.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    /// The `while` shape. Before rule B this line stayed at 129 columns however
+    /// many operators it held; now it breaks at the lowest-precedence operator,
+    /// operator-leading, one level in — E147's rendering, reached from a second
+    /// keyword.
+    #[test]
+    fn a_loop_condition_over_the_budget_breaks() {
+        let joined = "\tfor text.contains(\" \") || text.contains(\"\\\"\") \
+                      || text.contains(\"(\") || text.contains(\".\") \
+                      || text.contains(\"+\") || text.contains(\"-\") {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun scan(text: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor text.contains(\" \") || text.contains(\"\\\"\") || text.contains(\"(\") \
+             || text.contains(\".\") || text.contains(\"+\") || text.contains(\"-\") {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+            "fun scan(text: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor text.contains(\" \")\n\
+             \t\t|| text.contains(\"\\\"\")\n\
+             \t\t|| text.contains(\"(\")\n\
+             \t\t|| text.contains(\".\")\n\
+             \t\t|| text.contains(\"+\")\n\
+             \t\t|| text.contains(\"-\") {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+        );
+    }
+
+    /// The `match` shape, and with it the boundary: the permission reaches the
+    /// SUBJECT and nothing else. The legs here are braced bodies E150 rule A
+    /// keeps inline, and they stay inline while the head above them breaks —
+    /// each leg earns its own permission from its own measured line.
+    #[test]
+    fn a_match_subject_over_the_budget_breaks_and_the_legs_do_not() {
+        let joined = "\tmatch name.contains(\"(\") || name.contains(\"[\") \
+                      || name.contains(\"|\") || name.contains(\"&\") \
+                      || name.contains(\",\") || name.contains(\" \") {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun classify(name: str): str {\n\
+             \tmatch name.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") {\n\
+             \t\ttrue => { \"opaque\" },\n\
+             \t\tfalse => { \"plain\" },\n\
+             \t}\n\
+             }\n",
+            "fun classify(name: str): str {\n\
+             \tmatch name.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\")\n\
+             \t\t|| name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \") {\n\
+             \t\ttrue => { \"opaque\" },\n\
+             \t\tfalse => { \"plain\" },\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The entry is width and nothing else, in both directions: a head that
+    /// fits stays on its line, and a hand-broken head that fits joins back.
+    #[test]
+    fn a_head_that_fits_stays_on_its_line() {
+        let source = "fun demo(a: bool, b: bool, c: bool): str {\n\
+                      \tfor a || b || c {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      \tmatch a || b || c {\n\
+                      \t\ttrue => \"y\",\n\
+                      \t\tfalse => \"n\",\n\
+                      \t}\n\
+                      }\n";
+        assert!(columns("\tfor a || b || c {") <= LINE_BUDGET);
+        assert!(columns("\tmatch a || b || c {") <= LINE_BUDGET);
+        assert_construct(source, source);
+        assert_construct(
+            "fun demo(a: bool, b: bool, c: bool): str {\n\
+             \tfor a\n\
+             \t\t|| b\n\
+             \t\t|| c {\n\
+             \t\tlog(\"x\");\n\
+             \t}\n\
+             \tmatch a\n\
+             \t\t|| b\n\
+             \t\t|| c {\n\
+             \t\ttrue => \"y\",\n\
+             \t\tfalse => \"n\",\n\
+             \t}\n\
+             }\n",
+            source,
+        );
+    }
+
+    /// E154 — the third sibling: `for <name> in <iterable> {`. The iterable is
+    /// the only layout site on the line (the binder is a name), and before this
+    /// the line stayed over budget however many operators the iterable held.
+    #[test]
+    fn a_for_in_iterable_over_the_budget_breaks() {
+        let joined = "\tfor word in first.words() + second.words() + third.words() \
+                      + fourth.words() + fifth.words() + sixth.words() {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun count(first: str, second: str, third: str, fourth: str, fifth: str, \
+             sixth: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor word in first.words() + second.words() + third.words() + fourth.words() \
+             + fifth.words() + sixth.words() {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+            "fun count(first: str, second: str, third: str, fourth: str, fifth: str, \
+             sixth: str): i32 {\n\
+             \tmut n = 0;\n\
+             \tfor word in first.words()\n\
+             \t\t+ second.words()\n\
+             \t\t+ third.words()\n\
+             \t\t+ fourth.words()\n\
+             \t\t+ fifth.words()\n\
+             \t\t+ sixth.words() {\n\
+             \t\tn += 1;\n\
+             \t}\n\
+             \tn\n\
+             }\n",
+        );
+    }
+
+    /// The entry is width, in both directions, for the iterable too: one that
+    /// fits stays on its line, and a hand-broken one that fits joins back.
+    #[test]
+    fn a_for_in_head_that_fits_stays_on_its_line() {
+        let source = "fun demo(a: List<i32>, b: List<i32>) {\n\
+                      \tfor x in a + b {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      }\n";
+        assert!(columns("\tfor x in a + b {") <= LINE_BUDGET);
+        assert_construct(source, source);
+        assert_construct(
+            "fun demo(a: List<i32>, b: List<i32>) {\n\
+             \tfor x in a\n\
+             \t\t+ b {\n\
+             \t\tlog(\"x\");\n\
+             \t}\n\
+             }\n",
+            source,
+        );
+    }
+
+    /// B368 — a binder pattern in the header reprints as written, through the
+    /// same `print_binder` a destructuring `let` uses. (The header's LAYOUT is
+    /// unchanged: the binder is still not a split site, the iterable is.)
+    #[test]
+    fn a_for_in_binder_pattern_reprints_as_written() {
+        let source = "fun demo(pairs: List<(i32, str)>) {\n\
+                      \tfor (number, label) in pairs {\n\
+                      \t\tlog(label);\n\
+                      \t}\n\
+                      \tfor ((left, right), label) in pairs {\n\
+                      \t\tlog(label);\n\
+                      \t}\n\
+                      \tfor [left, right] in pairs {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// A bare `for {` — the unconditional loop — has no condition to hand the
+    /// permission to, and the arm that would hand it over is not reached.
+    #[test]
+    fn a_bare_loop_has_no_condition_to_break() {
+        let source = "fun spin() {\n\
+                      \tfor {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check`. Asserted from the UNFORMATTED side, which is where
+    /// a two-pass rule would show.
+    #[test]
+    fn every_head_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(t: str): i32 {\n\tmut n = 0;\n\tfor t.contains(\" \") \
+                 || t.contains(\"q\") || t.contains(\"(\") || t.contains(\".\") \
+                 || t.contains(\"+\") || t.contains(\"-\") {\n\t\tn += 1;\n\t}\n\tn\n}\n",
+                true,
+            ),
+            (
+                "fun b(n: str): str {\n\tmatch n.contains(\"(\") || n.contains(\"[\") \
+                 || n.contains(\"|\") || n.contains(\"&\") || n.contains(\",\") \
+                 || n.contains(\" \") {\n\t\ttrue => \"y\",\n\t\tfalse => \"n\",\n\t}\n}\n",
+                true,
+            ),
+            (
+                "fun c(a: bool, b: bool, c: bool) {\n\tfor a || b || c {\n\t\tlog(\"x\");\n\t}\n}\n",
+                false,
+            ),
+            ("fun d() {\n\tfor {\n\t\tlog(\"x\");\n\t}\n}\n", false),
+            (
+                "fun e(first: str, second: str, third: str, fourth: str, fifth: str, sixth: str) {\n\tmut n = 0;\n\tfor w in first.words() + second.words() + third.words() + fourth.words() + fifth.words() + sixth.words() {\n\t\tn += 1;\n\t}\n}\n",
+                true,
+            ),
+            (
+                "fun f(a: List<i32>, b: List<i32>) {\n\tfor x in a + b {\n\t\tlog(\"x\");\n\t}\n}\n",
+                false,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod match_leg_layout {
+    //! E150 rule A — a `match` leg body WRITTEN `=> { expr }` stays an
+    //! expression on the leg's line: E146 rule 2's shape one construct over.
+    //!
+    //! A leg's `=> ` is a mid-line position by construction — there is no
+    //! reading of it where the body owns the lines below — so the argument that
+    //! keeps an `if`'s arms inline mid-line applies to a leg body without
+    //! qualification, and E146 rule 2 left the gap only because it was written
+    //! for `if`. Before this rule every braced leg body expanded to three lines
+    //! whatever it held, which is what N55's reformat did to the tree.
+    //!
+    //! The braces stay: dropping them would drift the token stream the
+    //! formatter's safety net compares, and the rule is a layout choice, not a
+    //! rewrite. `{ expr }` and a bare `expr` are two spellings the formatter
+    //! keeps apart, each canonical on one line.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+    use super::format;
+
+    /// The item's own shape. Before: three lines per leg, whatever the body
+    /// held. After: the leg is one line, the braces intact.
+    #[test]
+    fn a_braced_leg_body_stays_an_expression() {
+        assert_construct(
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => {\n\
+             \t\t\t\"more\"\n\
+             \t\t},\n\
+             \t}\n\
+             }\n",
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => { \"zero\" },\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// The braces are not dropped: the unbraced spelling is its own canonical
+    /// form, and the two round-trip to themselves rather than to each other —
+    /// which is what keeps the reprint token-identical to the source.
+    #[test]
+    fn the_braces_are_kept_not_dropped() {
+        let braced = "fun label(n: i32): str {\n\
+                      \tmatch n {\n\
+                      \t\t0 => { \"zero\" },\n\
+                      \t\t_ => { \"more\" },\n\
+                      \t}\n\
+                      }\n";
+        let bare = "fun label(n: i32): str {\n\
+                    \tmatch n {\n\
+                    \t\t0 => \"zero\",\n\
+                    \t\t_ => \"more\",\n\
+                    \t}\n\
+                    }\n";
+        assert_construct(braced, braced);
+        assert_construct(bare, bare);
+        assert_ne!(format(braced), format(bare));
+    }
+
+    /// The point of the rule, in the shape it costs the most: a leg body inside
+    /// a builder ladder. Expanded, the three lines land in the middle of the
+    /// chain and the chain's own first line measures short enough never to
+    /// break — the same inversion E146 rule 2 was written for.
+    #[test]
+    fn a_braced_leg_body_keeps_a_ladder_its_shape() {
+        assert_construct(
+            "fun view_for(route: Route): Element {\n\
+             \tview(\"main\").child(match route {\n\
+             \t\tRoute::Home => {\n\
+             \t\t\thome()\n\
+             \t\t},\n\
+             \t\tRoute::About => {\n\
+             \t\t\tabout()\n\
+             \t\t},\n\
+             \t})\n\
+             }\n",
+            "fun view_for(route: Route): Element {\n\
+             \tview(\"main\").child(match route {\n\
+             \t\tRoute::Home => { home() },\n\
+             \t\tRoute::About => { about() },\n\
+             \t})\n\
+             }\n",
+        );
+    }
+
+    /// A body that is legitimately a block STAYS one, by the same three tests
+    /// an `if` arm answers — a statement, a comment with no slot on the inline
+    /// line, and a `Void` tail (a leg written for its effect).
+    #[test]
+    fn a_body_that_is_a_block_stays_a_block() {
+        // A statement: not an expression wearing braces.
+        assert_construct(
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+        );
+        // A comment inside the body has no slot on the inline line, so the
+        // block form is what keeps it where it was written.
+        assert_construct(
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\t// the only interesting case\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+            "fun label(n: i32): str {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\t// the only interesting case\n\
+             \t\t\t\"zero\"\n\
+             \t\t},\n\
+             \t\t_ => { \"more\" },\n\
+             \t}\n\
+             }\n",
+        );
+        // A `Void` tail — a leg written for its effect — is not an expression
+        // either, so the statement keeps its own line.
+        assert_construct(
+            "fun note(n: i32) {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t},\n\
+             \t\t_ => {\n\
+             \t\t\tlog(\"more\");\n\
+             \t\t},\n\
+             \t}\n\
+             }\n",
+            "fun note(n: i32) {\n\
+             \tmatch n {\n\
+             \t\t0 => {\n\
+             \t\t\tlog(\"zero\");\n\
+             \t\t},\n\
+             \t\t_ => {\n\
+             \t\t\tlog(\"more\");\n\
+             \t\t},\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// A body whose own rendering spans lines is not an inline body: the tail
+    /// brings its own lines, and `{ match … ⏎ … ⏎ }` is not one expression on
+    /// one line.
+    #[test]
+    fn a_body_whose_tail_spans_lines_expands() {
+        let source = "fun pick(n: i32, k: i32): str {\n\
+                      \tmatch n {\n\
+                      \t\t0 => {\n\
+                      \t\t\tmatch k {\n\
+                      \t\t\t\t0 => \"zero\",\n\
+                      \t\t\t\t_ => \"more\",\n\
+                      \t\t\t}\n\
+                      \t\t},\n\
+                      \t\t_ => { \"other\" },\n\
+                      \t}\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// The width rule still decides. A leg's line is a measured line, so a leg
+    /// whose inline body puts it over the budget rolls back and reprints with
+    /// the split armed — and an armed split is exactly what the inline form
+    /// yields to, so the body expands again.
+    #[test]
+    fn a_leg_over_the_budget_expands_its_body_again() {
+        let inline = "\t\tDialFailure::Refused(let status) => { RpcError::Transport(i\"the server refused the connection ({status})\") },";
+        assert_over_budget(inline);
+        assert_construct(
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => {\n\
+             \t\t\tRpcError::Transport(i\"the server refused the connection ({status})\")\n\
+             \t\t},\n\
+             \t\tDialFailure::Other => { RpcError::Transport(\"other\") },\n\
+             \t}\n\
+             }\n",
+            "fun classify(status: str): RpcError {\n\
+             \tmatch dial(status) {\n\
+             \t\tDialFailure::Refused(let status) => {\n\
+             \t\t\tRpcError::Transport(i\"the server refused the connection ({status})\")\n\
+             \t\t},\n\
+             \t\tDialFailure::Other => { RpcError::Transport(\"other\") },\n\
+             \t}\n\
+             }\n",
+        );
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check`, so a two-pass rule is a red gate on a tree nobody
+    /// edited. Asserted from the UNFORMATTED side, which is where it would show.
+    #[test]
+    fn every_leg_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(n: i32): str {\n\tmatch n {\n\t\t0 => {\n\t\t\t\"zero\"\n\t\t},\n\
+                 \t\t_ => {\n\t\t\t\"more\"\n\t\t},\n\t}\n}\n",
+                true,
+            ),
+            (
+                "fun b(n: i32): str {\n\tmatch n {\n\t\t0 => { \"zero\" },\n\
+                 \t\t_ => { \"more\" },\n\t}\n}\n",
+                false,
+            ),
+            (
+                "fun c(n: i32): str {\n\tmatch n {\n\t\t0 => {\n\t\t\tlog(\"zero\");\n\
+                 \t\t\t\"zero\"\n\t\t},\n\t\t_ => { \"more\" },\n\t}\n}\n",
+                false,
+            ),
+            (
+                "fun d(status: str): RpcError {\n\tmatch dial(status) {\n\
+                 \t\tDialFailure::Refused(let status) => { RpcError::Transport(\
+                 i\"the server refused the connection ({status})\") },\n\
+                 \t\tDialFailure::Other => { RpcError::Transport(\"other\") },\n\t}\n}\n",
+                true,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod binary_chain_layout {
+    //! E147 — a binary-operator chain over the budget breaks one operand per
+    //! line, at the LOWEST-precedence operator, operator-leading, one
+    //! indentation level in.
+    //!
+    //! Before this rule a chain had no break rule at all, so the formatter
+    //! JOINED hand-wrapped conditions without a width bound: `macro_std`'s
+    //! three-line `text.contains(" ") || …` came out of N55's reformat as one
+    //! line of 182 characters, and four lines that reformat ADDED exceed 100 in
+    //! a tree whose own reflow target is 100.
+    //!
+    //! The lowest-precedence operator is the root of the tree — that is what
+    //! "binds loosest" means — so `a || b && c` is two lines and not three: the
+    //! `&&` binds tighter and belongs on one of them.
+    //!
+    //! Two operators is the threshold, E137's rule one construct over. One link
+    //! is not a chain; neither is one operator.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    /// `vilan/macro_std/src/meta.vl`'s condition, the line the item names: 182
+    /// columns joined onto one line by the reformat, and hand-wrapped over three
+    /// before it.
+    #[test]
+    fn the_meta_vl_condition_breaks_one_operand_per_line() {
+        let joined = "\t\t\t\tif text.contains(\" \") || text.contains(\"\\\"\") \
+                      || text.contains(\"(\") || text.contains(\".\") \
+                      || text.contains(\"+\") || text.contains(\"-\") \
+                      || text.contains(\"|\") || text.contains(\":\") {";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun classify(text: str): Option<str> {\n\
+             \tif text.contains(\" \") || text.contains(\"\\\"\") || text.contains(\"(\") \
+             || text.contains(\".\") || text.contains(\"+\") || text.contains(\"-\") \
+             || text.contains(\"|\") || text.contains(\":\") {\n\
+             \t\tret None;\n\
+             \t}\n\
+             \tSome(text)\n\
+             }\n",
+            "fun classify(text: str): Option<str> {\n\
+             \tif text.contains(\" \")\n\
+             \t\t|| text.contains(\"\\\"\")\n\
+             \t\t|| text.contains(\"(\")\n\
+             \t\t|| text.contains(\".\")\n\
+             \t\t|| text.contains(\"+\")\n\
+             \t\t|| text.contains(\"-\")\n\
+             \t\t|| text.contains(\"|\")\n\
+             \t\t|| text.contains(\":\") {\n\
+             \t\tret None;\n\
+             \t}\n\
+             \tSome(text)\n\
+             }\n",
+        );
+    }
+
+    /// The same file's other over-budget line, in the other position a chain
+    /// reaches the width rule from: a block's TAIL expression.
+    #[test]
+    fn a_chain_in_tail_position_breaks_too() {
+        let joined = "\tname.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+                      || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+                      || name.contains(\"*\")";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun opaque_type_text(name: str): bool {\n\
+             \tname.contains(\"(\") || name.contains(\"[\") || name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+             || name.contains(\"*\")\n\
+             }\n",
+            "fun opaque_type_text(name: str): bool {\n\
+             \tname.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\")\n\
+             \t\t|| name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \")\n\
+             \t\t|| name.contains(\"*\")\n\
+             }\n",
+        );
+    }
+
+    /// A short chain stays inline — the entry is width and nothing else.
+    #[test]
+    fn a_short_chain_stays_inline() {
+        let source = "fun demo(a: bool, b: bool, c: bool): bool {\n\ta || b || c\n}\n";
+        assert!(columns("\ta || b || c") <= LINE_BUDGET);
+        assert_construct(source, source);
+        // And the collapse direction: a hand-broken chain that fits joins back.
+        assert_construct(
+            "fun demo(a: bool, b: bool, c: bool): bool {\n\ta\n\t\t|| b\n\t\t|| c\n}\n",
+            source,
+        );
+    }
+
+    /// The break is at the LOWEST-precedence operator, so a tighter operator
+    /// inside an operand stays on that operand's line.
+    #[test]
+    fn the_break_is_at_the_lowest_precedence_operator() {
+        assert_construct(
+            "fun demo(name: str): bool {\n\
+             \tname.contains(\"(\") || name.contains(\"[\") && name.contains(\"|\") \
+             || name.contains(\"&\") || name.contains(\",\") || name.contains(\" \") \
+             || name.contains(\"*\")\n\
+             }\n",
+            "fun demo(name: str): bool {\n\
+             \tname.contains(\"(\")\n\
+             \t\t|| name.contains(\"[\") && name.contains(\"|\")\n\
+             \t\t|| name.contains(\"&\")\n\
+             \t\t|| name.contains(\",\")\n\
+             \t\t|| name.contains(\" \")\n\
+             \t\t|| name.contains(\"*\")\n\
+             }\n",
+        );
+    }
+
+    /// Operators of the SAME precedence are ONE chain however many spellings
+    /// they mix, and an operand that had parentheses keeps them — the reprint
+    /// reparses to the same tree, which is what the safety net checks.
+    #[test]
+    fn one_precedence_tier_is_one_chain_and_parentheses_survive() {
+        let joined = "\tlet nested = x + 1000000000 - (y - 2000000000) + 3000000000 - z \
+                      + 4000000000 - y + 5000000000 + z + 60000000;";
+        assert_over_budget(joined);
+        assert_construct(
+            "fun demo(x: i32, y: i32, z: i32) {\n\
+             \tlet nested = x + 1000000000 - (y - 2000000000) + 3000000000 - z \
+             + 4000000000 - y + 5000000000 + z + 60000000;\n\
+             }\n",
+            "fun demo(x: i32, y: i32, z: i32) {\n\
+             \tlet nested = x\n\
+             \t\t+ 1000000000\n\
+             \t\t- (y - 2000000000)\n\
+             \t\t+ 3000000000\n\
+             \t\t- z\n\
+             \t\t+ 4000000000\n\
+             \t\t- y\n\
+             \t\t+ 5000000000\n\
+             \t\t+ z\n\
+             \t\t+ 60000000;\n\
+             }\n",
+        );
+    }
+
+    /// Formatting twice is formatting once, for every shape above — the fmt
+    /// gate is a `--check` and depends on exactly this. `assert_construct`
+    /// asserts it per pin; this asserts it over the whole set at once, from the
+    /// UNFORMATTED side, which is where a two-pass rule would show.
+    #[test]
+    fn every_chain_shape_is_a_fixed_point() {
+        for (source, reflows) in [
+            (
+                "fun a(n: str): bool {\n\tn.contains(\"(\") || n.contains(\"[\") \
+                 || n.contains(\"|\") || n.contains(\"&\") || n.contains(\",\") \
+                 || n.contains(\" \") || n.contains(\"*\")\n}\n",
+                true,
+            ),
+            (
+                "fun b(a: bool, b: bool, c: bool): bool {\n\ta || b || c\n}\n",
+                false,
+            ),
+            (
+                "fun c(x: i32, y: i32, z: i32) {\n\tlet n = x + 1000000000 \
+                 - (y - 2000000000) + 3000000000 - z + 4000000000 - y + 5000000000 \
+                 + z + 60000000;\n}\n",
+                true,
+            ),
+            (
+                "fun d(t: str): bool {\n\tif t.contains(\" \") || t.contains(\"\\\"\") \
+                 || t.contains(\"(\") || t.contains(\".\") || t.contains(\"+\") \
+                 || t.contains(\"-\") || t.contains(\"|\") || t.contains(\":\") \
+                 {\n\t\ttrue\n\t} else {\n\t\tfalse\n\t}\n}\n",
+                true,
+            ),
+        ] {
+            let once = format(source);
+            assert_eq!(
+                once != source,
+                reflows,
+                "fixture did not reflow as expected: {once}"
+            );
+            assert_eq!(format(&once), once, "not a fixed point: {once}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod declines {
+    //! N90: `vilan fmt --check` could not tell "clean" from "BAILED".
+    //!
+    //! [`format`] answers the ORIGINAL bytes on every way out — a source that
+    //! does not lex, one that does not parse, a construct the printer has no
+    //! rule for, a reprint the safety net threw away — so a caller comparing
+    //! its answer to the file on disk sees "already formatted" in all four
+    //! cases. That is how `export let x = 1;` went a whole order unformatted
+    //! with `vilan fmt --check vilan/std` green over it, and how
+    //! `[deprecated(..)]` did the same until an idempotency pin on one file
+    //! caught it: a printer gap was invisible to the gate whose whole job is to
+    //! find one.
+    //!
+    //! [`reprint`] is the honest half, and these pin what it says.
+
+    use super::{
+        Decline, DeclineReason, DeclinedAt, FormatOptions, Printer, decline, first_line_at, format,
+        line_of, reprint,
+    };
+    use crate::node::Node;
+
+    #[test]
+    fn a_clean_file_reprints_and_a_reprint_is_not_a_decline() {
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        assert_eq!(reprint(source), Ok(source.to_string()));
+    }
+
+    #[test]
+    fn a_source_that_does_not_parse_declines_where_format_stayed_silent() {
+        let source = "fun main() {\n\tlet x = ;\n}\n";
+        // The silence the item is about: `format` hands back exactly what it
+        // was given, which a caller reads as "already formatted".
+        assert_eq!(format(source), source);
+        let declined = reprint(source).expect_err("a source that does not parse declines");
+        assert_eq!(declined.reason, DeclineReason::DoesNotParse);
+        assert_eq!(declined.sentence(), "it does not parse");
+    }
+
+    #[test]
+    fn a_source_that_does_not_lex_declines_too() {
+        // An unterminated string: the lexer, not the parser, is what refuses.
+        let source = "fun main() {\n\tlet x = \"open;\n}\n";
+        assert_eq!(format(source), source);
+        let declined = reprint(source).expect_err("a source that does not lex declines");
+        assert_eq!(declined.reason, DeclineReason::DoesNotLex);
+        assert_eq!(declined.sentence(), "it does not lex");
+    }
+
+    #[test]
+    fn a_printer_gap_is_recorded_with_the_span_of_what_it_met() {
+        // The bail set is EMPTY today (`parse_differential::
+        // formatter_never_silently_bails` holds it there), so the gap is
+        // PLANTED rather than found: `Node::Error` is a variant no printer arm
+        // handles and no clean parse produces. What is under test is not which
+        // construct is missing — it is that the printer RECORDS one, with the
+        // span a tool needs to name it. A bare `bailed: bool` could not.
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        let mut printer = Printer::new(source, FormatOptions::default());
+        // The span of `let x = 1;` on line 2, so the recorded construct is one
+        // a reader can go and look at.
+        let start = source.find("let x").expect("the fixture's second line");
+        let span = (start..start + "let x = 1;".len()).into();
+        printer.print_expr(&(Node::Error, span));
+        assert_eq!(
+            printer.declined,
+            Some(DeclinedAt {
+                reason: DeclineReason::NoRule,
+                span: Some(span)
+            })
+        );
+
+        let declined = decline(source, DeclineReason::NoRule, Some(span));
+        assert_eq!(
+            declined,
+            Decline {
+                reason: DeclineReason::NoRule,
+                construct: "let x = 1;".to_string(),
+                line: Some(2),
+            }
+        );
+        assert_eq!(
+            declined.sentence(),
+            "the printer has no rule for this construct yet: `let x = 1;`"
+        );
+    }
+
+    #[test]
+    fn a_probe_leaves_no_decline_behind() {
+        // The seam probes render and take the rendering back out, and the bail
+        // flag went with it. It still does, now that the flag carries a span:
+        // a probe that met a gap must not make the whole file decline.
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        let mut printer = Printer::new(source, FormatOptions::default());
+        let start = source.find("let x").expect("the fixture's second line");
+        let span = (start..start + "let x = 1;".len()).into();
+        assert!(!printer.expr_spans_lines(&(Node::Error, span)));
+        assert_eq!(printer.declined, None, "a probe leaves no trace");
+    }
+
+    #[test]
+    fn the_construct_a_decline_names_is_one_line_of_the_source() {
+        let source = "fun one() {\n}\n\nfun two() {\n}\n";
+        let span = (0..source.len()).into();
+        // The first line, trimmed — not the whole item, which would print a
+        // screenful into a tool's output.
+        assert_eq!(first_line_at(source, span), "fun one() {");
+        let second = source.find("fun two").expect("the second item");
+        assert_eq!(line_of(source, (second..source.len()).into()), 4);
+    }
+}
+
+#[cfg(test)]
+mod reprint_safety_net {
+    //! E209: the token-stream net is not the whole contract.
+    //!
+    //! [`verify_reprint`]'s check (a) compares two NORMALIZED streams, and
+    //! three of [`normalize`]'s canonicalizations are deletions — that is what
+    //! lets the printer write a trailing comma in or out. The same latitude
+    //! lets a printer bug through: `fun main() {,}` normalizes to
+    //! `fun main() {}`, satisfies (a), and does not parse. N108 shipped a
+    //! `const { … }` statement with no `;` and was caught only because that
+    //! loss happened to be visible to (a).
+    //!
+    //! So the printer reads its own output back. These pins plant the bug (a)
+    //! cannot see and hold the decline it now produces.
+
+    use super::{
+        Decline, DeclineReason, code_tokens, code_tokens_spanned, normalize, reprint,
+        verify_reprint,
+    };
+
+    /// The planted printer bug: what the printer WOULD have written, handed to
+    /// the safety net in place of its own output. The bug is planted rather
+    /// than found because the printer has no such gap today — and a pin that
+    /// waits for one to appear pins nothing.
+    pub(super) fn net(source: &str, planted: &str) -> Result<(), Decline> {
+        let tokens = code_tokens_spanned(source).expect("the fixture lexes");
+        verify_reprint(source, &tokens, planted)
+    }
+
+    #[test]
+    fn a_planted_stray_comma_slips_the_token_net_and_is_caught_by_the_re_read() {
+        let source = "fun main() {}\n";
+        let planted = "fun main() {,}\n";
+        // NON-VACUITY, asserted rather than assumed: check (a) — the only
+        // check there was — accepts this output. `drop_trailing_commas` takes
+        // the stray comma out of the reprint's stream, so the two streams are
+        // the same stream and the net has nothing to report.
+        assert_eq!(
+            normalize(code_tokens(planted).expect("the planted output lexes")),
+            normalize(code_tokens(source).expect("the fixture lexes")),
+            "the plant must pass the token net, or it pins nothing"
+        );
+        let declined = net(source, planted).expect_err("the re-read must decline");
+        assert_eq!(declined.reason, DeclineReason::ReprintDoesNotParse);
+        assert_eq!(declined.construct, "fun main() {,}");
+        // The line is withheld: it would be a line of a text the reader cannot
+        // see, and `file:1` would send them to the wrong place in the file
+        // they can.
+        assert_eq!(declined.line, None);
+        assert_eq!(
+            declined.sentence(),
+            "reprinting it produced text that is not a Vilan file, so the reprint \
+             was thrown away (the formatter's own safety net): the printer's output \
+             reads `fun main() {,}` where it stops being readable"
+        );
+    }
+
+    #[test]
+    fn the_construct_a_reprint_decline_names_is_the_output_line_that_stopped_parsing() {
+        // The defect is on the THIRD line of the plant, and that is the line
+        // the decline names — not the file's first item, and not the whole
+        // output.
+        let source = "fun main() {\n\tlet x = 1;\n\tlet y = [x];\n}\n";
+        let planted = "fun main() {\n\tlet x = 1;\n\tlet y = [x,,];\n}\n";
+        let declined = net(source, planted).expect_err("the re-read must decline");
+        assert_eq!(declined.reason, DeclineReason::ReprintDoesNotParse);
+        assert_eq!(declined.construct, "let y = [x,,];");
+    }
+
+    #[test]
+    fn a_planted_output_that_does_not_lex_takes_the_same_reason() {
+        // An unterminated string: the LEXER refuses, so there is no stream to
+        // compare at all. That is E209's class too — the printer wrote
+        // something that is not a Vilan file — and it must not be reported as
+        // a token drift the net never actually measured.
+        let source = "fun main() {\n\tlet x = \"ok\";\n}\n";
+        let planted = "fun main() {\n\tlet x = \"ok;\n}\n";
+        let declined = net(source, planted).expect_err("an unlexable output declines");
+        assert_eq!(declined.reason, DeclineReason::ReprintDoesNotParse);
+        assert_eq!(declined.construct, "let x = \"ok;");
+    }
+
+    #[test]
+    fn a_token_drift_keeps_its_own_reason() {
+        // The pre-existing net still answers first: a plant that CHANGES the
+        // token stream is `WouldChangeTheCode`, not the new reason, however
+        // badly it parses.
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        let planted = "fun main() {\n\tlet x = 2;\n}\n";
+        let declined = net(source, planted).expect_err("a token drift declines");
+        assert_eq!(declined.reason, DeclineReason::WouldChangeTheCode);
+    }
+
+    #[test]
+    fn the_printers_real_output_passes_both_checks() {
+        // The check that matters for every other file in the tree: the real
+        // printer's real output is a Vilan file, so nothing declines here and
+        // the second parse costs correctness nothing.
+        let source = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n";
+        assert_eq!(reprint(source), Ok(source.to_string()));
+        let formatted = reprint("fun  main( ) {\n let x=1;\n}\n").expect("reprints");
+        assert_eq!(formatted, "fun main() {\n\tlet x = 1;\n}\n");
+    }
+}
+
+#[cfg(test)]
+mod divergence_location {
+    //! E210: the net's decline named the WRONG construct.
+    //!
+    //! `WouldChangeTheCode` had no span — it compares two whole token streams —
+    //! so it reported the file's FIRST ITEM. On kolt's `client.vl` that was
+    //! line 7, an ordinary `import`, thirty lines and one whole grammar away
+    //! from the `const { … };` whose terminator the printer had lost; the
+    //! investigation it sent off was N108's.
+    //!
+    //! The two streams are bisected instead, and the decline names the line
+    //! the reprint stops agreeing with the file on.
+
+    use super::super::formatter::reprint_safety_net::net;
+    use super::{DeclineReason, code_tokens, code_tokens_spanned, diverging_span, normalize};
+
+    /// N108's repro, and the output the printer produced before the fix: the
+    /// `const { … }` expression statement printed with no terminator.
+    const N108_SOURCE: &str = "const {\n\tlet _unused = 1;\n};\n\nfun main() {}\n";
+    const N108_PRINTED: &str = "const {\n\tlet _unused = 1;\n}\n\nfun main() {}\n";
+
+    #[test]
+    fn n108s_lost_terminator_is_named_at_the_line_that_lost_it() {
+        let declined = net(N108_SOURCE, N108_PRINTED).expect_err("the loss is a token drift");
+        assert_eq!(declined.reason, DeclineReason::WouldChangeTheCode);
+        // The `};` on line 3 — the construct, not the bare `;` the diverging
+        // token is, and not the `const {` on line 1 that opens the file's
+        // first item.
+        assert_eq!(declined.construct, "};");
+        assert_eq!(declined.line, Some(3));
+        assert_eq!(
+            declined.sentence(),
+            "reprinting it would have changed the code at this line, so the reprint \
+             was thrown away (the formatter's own safety net): `};`"
+        );
+    }
+
+    #[test]
+    fn the_first_item_is_no_longer_the_answer() {
+        // The regression guard for what E210 removed. A file whose first item
+        // is an import — kolt's shape — with the loss far below it: the old
+        // net reported the import's line, which is what sent the reader into
+        // the wrong grammar.
+        let source = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n};\n";
+        let printed = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n}\n";
+        let declined = net(source, printed).expect_err("the loss is a token drift");
+        assert_eq!(declined.line, Some(9));
+        assert_eq!(declined.construct, "};");
+    }
+
+    #[test]
+    fn a_divergence_below_an_accepted_reordering_is_located_past_it() {
+        // The case the RAW streams cannot answer. The net deliberately accepts
+        // the printer sorting a top-level import run, so the raw streams part
+        // company at line 1 — legitimately. The bug is on line 7, and counting
+        // from the END of the stream walks past the reordering to reach it.
+        let source = "import std::json;\nimport std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n};\n";
+        let printed = "import std::io::print;\nimport std::json;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n}\n";
+        // The reordering really is one the net accepts on its own: the same
+        // reprint with the terminator kept verifies clean.
+        let sorted_only = "import std::io::print;\nimport std::json;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n};\n";
+        assert_eq!(
+            net(source, sorted_only),
+            Ok(()),
+            "the import reordering alone must pass the net, or this pin measures the wrong thing"
+        );
+        let declined = net(source, printed).expect_err("the loss is a token drift");
+        assert_eq!(declined.line, Some(10));
+        assert_eq!(declined.construct, "};");
+    }
+
+    #[test]
+    fn a_reprint_with_an_extra_token_is_named_at_the_files_last_line() {
+        // Nothing in the source diverges — the reprint simply runs on past its
+        // end — so the answer is where the extra output begins.
+        let source = "fun main() {}\n";
+        let printed = "fun main() {}\nfun extra() {}\n";
+        let declined = net(source, printed).expect_err("an extra item is a token drift");
+        assert_eq!(declined.reason, DeclineReason::WouldChangeTheCode);
+        assert_eq!(declined.construct, "fun main() {}");
+        assert_eq!(declined.line, Some(1));
+    }
+
+    #[test]
+    fn the_bisect_is_over_the_normalized_streams() {
+        // Directly: an insignificant trailing comma the file wrote and the
+        // reprint dropped is NOT a divergence, so the bisect must not see one
+        // there. The streams differ only at the `2`.
+        let source = "fun main() {\n\tlet x = [1,];\n\tlet y = 2;\n}\n";
+        let printed = "fun main() {\n\tlet x = [1];\n\tlet y = 3;\n}\n";
+        let written = code_tokens_spanned(source).expect("the fixture lexes");
+        let canonical_source = normalize(written.iter().map(|(token, _)| token.clone()).collect());
+        let canonical_reprint = normalize(code_tokens(printed).expect("the planted output lexes"));
+        let span = diverging_span(&written, &canonical_source, &canonical_reprint)
+            .expect("a divergence has a span");
+        assert_eq!(&source[span.into_range()], "2");
+    }
+}
+
+#[cfg(test)]
+mod comment_wrapping {
+    //! E205 end to end: `[fmt] wrap_comments` through [`reprint_with`].
+    //!
+    //! The unit rules live beside the filler in
+    //! [`super::comment_reflow`]; what these pin is the printer's half — that
+    //! the knob reaches the output, that the paragraph GROUPING is the one a
+    //! reader sees, and above all that every kind of comment on the
+    //! never-reflow list comes out BYTE-IDENTICAL with the knob on.
+    //!
+    //! Every fixture asserts its own canonicality first (`reprint` answers the
+    //! source unchanged), so "byte-identical under the knob" cannot be
+    //! satisfied by a fixture that was going to be rewritten anyway.
+
+    use super::{
+        Decline, DeclineReason, FormatOptions, LINE_BUDGET, decline, reprint, reprint_with,
+    };
+
+    /// The knob on.
+    const ON: FormatOptions = FormatOptions {
+        wrap_comments: true,
+        comment_width: super::DEFAULT_COMMENT_WIDTH,
+    };
+
+    /// Formats `source` with the knob on, asserting first that the fixture is
+    /// already canonical — so a byte-identity claim is about the REFLOW and
+    /// not about the rest of the printer.
+    fn wrapped(source: &str) -> String {
+        assert_eq!(
+            reprint(source).as_deref(),
+            Ok(source),
+            "the fixture must be canonical already"
+        );
+        reprint_with(source, ON).expect("the fixture reprints")
+    }
+
+    /// The whole never-reflow list, each entry a canonical file whose comment
+    /// must survive the knob byte for byte.
+    fn survives_byte_identical(source: &str) {
+        assert_eq!(wrapped(source), source);
+        // And idempotent: a second pass over the answer changes nothing.
+        assert_eq!(reprint_with(source, ON).as_deref(), Ok(source));
+    }
+
+    #[test]
+    fn with_the_key_off_the_formatter_is_byte_for_byte_what_it_was() {
+        // The first thing to pin, and the promise the default rests on: with
+        // `wrap_comments` unset, a comment far past the budget is left exactly
+        // where its author left it, and the answer is `reprint`'s own.
+        let source = "// this comment runs a very long way past the hundred-column budget the printer lays code out to, and it stays exactly as written\nfun main() {}\n";
+        assert_eq!(reprint(source).as_deref(), Ok(source));
+        assert_eq!(
+            reprint_with(source, FormatOptions::default()),
+            reprint(source)
+        );
+    }
+
+    #[test]
+    fn a_prose_paragraph_is_filled_and_the_fill_is_idempotent() {
+        let source = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed\n// which is\n// the asymmetry this closes\nfun main() {}\n";
+        let once = wrapped(source);
+        assert_eq!(
+            once,
+            "// the formatter has laid code out to a width since the day it existed and left every comment\n// exactly as typed which is the asymmetry this closes\nfun main() {}\n"
+        );
+        assert_eq!(
+            reprint_with(&once, ON).as_deref(),
+            Ok(once.as_str()),
+            "the fill must be idempotent"
+        );
+    }
+
+    #[test]
+    fn a_doc_comment_paragraph_is_filled_at_its_own_marker() {
+        let source = "/// what this function does, said at enough length that it runs past the budget the printer lays code out to, and then some\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled
+                .lines()
+                .filter(|line| line.starts_with("///"))
+                .count()
+                == 2,
+            "{filled}"
+        );
+        assert!(filled.lines().all(|line| line.chars().count() <= 100));
+    }
+
+    #[test]
+    fn a_comment_inside_a_block_fills_to_the_narrower_budget() {
+        // One tab of indentation is four columns off the budget, and the fill
+        // has to measure the line it is actually printing.
+        let source = "fun main() {\n\t// a comment inside a block has four fewer columns to work with than one at the top level, and the fill has to know that\n\tlet x = 1;\n}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled.lines().all(|line| line.chars().count()
+                + 3 * line.chars().take_while(|c| *c == '\t').count()
+                <= 100),
+            "{filled}"
+        );
+    }
+
+    #[test]
+    fn a_narrower_comment_width_is_the_one_the_fill_uses() {
+        // E215's R1, and the whole point of the key: the SAME paragraph, the
+        // same knob, two widths — and the answers differ. The default is the
+        // code width, so `AT_84` is what a package that writes prose narrower
+        // than its code gets, and nothing else moves with it.
+        const AT_84: FormatOptions = FormatOptions {
+            wrap_comments: true,
+            comment_width: 84,
+        };
+        let source = concat!(
+            "// the formatter has laid code out to a width since the day it existed and ",
+            "left every comment exactly as typed\n",
+            "// which is the asymmetry this closes\nfun main() {}\n"
+        );
+        let at_default = reprint_with(source, ON).expect("the fixture reprints");
+        let at_84 = reprint_with(source, AT_84).expect("the fixture reprints");
+        assert_ne!(
+            at_84, at_default,
+            "a width other than the code width must reach the output"
+        );
+        assert_eq!(
+            at_84,
+            concat!(
+                "// the formatter has laid code out to a width since the day it existed and left\n",
+                "// every comment exactly as typed which is the asymmetry this closes\n",
+                "fun main() {}\n"
+            )
+        );
+        assert!(
+            at_84
+                .lines()
+                .filter(|line| line.starts_with("//"))
+                .all(|line| line.chars().count() <= 84),
+            "{at_84}"
+        );
+        // Wider than 84 somewhere, or the two widths would be the same claim.
+        assert!(
+            at_default
+                .lines()
+                .filter(|line| line.starts_with("//"))
+                .any(|line| line.chars().count() > 84),
+            "{at_default}"
+        );
+        assert_eq!(
+            reprint_with(&at_84, AT_84).as_deref(),
+            Ok(at_84.as_str()),
+            "the fill at a declared width must be idempotent"
+        );
+    }
+
+    #[test]
+    fn the_declared_width_is_measured_at_the_comment_s_own_indentation() {
+        // The indentation comes off the COMMENT width, not off the code
+        // width — otherwise a nested paragraph in an 84-column package would
+        // be filled to 96.
+        const AT_84: FormatOptions = FormatOptions {
+            wrap_comments: true,
+            comment_width: 84,
+        };
+        let source = concat!(
+            "fun main() {\n\t// a comment inside a block has four fewer columns to work ",
+            "with than one at the top level, and the fill has to know that\n\tlet x = 1;\n}\n"
+        );
+        let filled = reprint_with(source, AT_84).expect("the fixture reprints");
+        assert!(
+            filled
+                .lines()
+                .filter(|line| line.trim_start().starts_with("//"))
+                .all(|line| line.chars().count()
+                    + 3 * line.chars().take_while(|c| *c == '\t').count()
+                    <= 84),
+            "{filled}"
+        );
+        assert_ne!(
+            filled,
+            reprint_with(source, ON).expect("the fixture reprints"),
+            "the nested paragraph must move with the declared width too"
+        );
+    }
+
+    #[test]
+    fn the_default_width_is_the_code_width_and_the_knob_still_gates_it() {
+        // R1's default, pinned as an identity rather than as a number that
+        // happens to match: the options a package with no `comment_width` gets
+        // fill exactly as E205 shipped. And the width alone changes nothing —
+        // `wrap_comments` is still the gate.
+        assert_eq!(
+            FormatOptions::default().comment_width,
+            LINE_BUDGET,
+            "the default comment width is the code width"
+        );
+        let source = concat!(
+            "// this comment runs a very long way past the eighty-four-column width std ",
+            "writes its prose to, and stays exactly as written\nfun main() {}\n"
+        );
+        let narrow_but_off = FormatOptions {
+            wrap_comments: false,
+            comment_width: 84,
+        };
+        assert_eq!(reprint_with(source, narrow_but_off).as_deref(), Ok(source));
+    }
+
+    #[test]
+    fn a_fence_survives_byte_identical() {
+        survives_byte_identical(
+            "// an example, and the fence is verbatim by definition:\n// ```\n// let x = 1;\n// ```\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_list_survives_byte_identical() {
+        // Each item is a line; joining two of them would make one item.
+        survives_byte_identical(
+            "// the three reasons, and not one of them may be joined to the next:\n// - the first, which is long enough on its own to tempt a filler into it\n// - the second\n// - the third\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn an_ordered_list_and_a_hanging_indent_survive_byte_identical() {
+        survives_byte_identical(
+            "// 1. the first item, written long enough that a filler would want to pull the\n//    continuation up into it\n// 2. the second\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_table_survives_byte_identical() {
+        survives_byte_identical(
+            "// | name | what it does |\n// | ---- | ------------ |\n// | fmt | lays the code out to a width, and now the comments too when asked |\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_heading_survives_byte_identical() {
+        survives_byte_identical(
+            "// # The section this file is about\n// and the prose under it, which is long enough that a filler would pull the heading into it given the chance\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_block_quote_survives_byte_identical() {
+        survives_byte_identical(
+            "// > the owner's words, quoted, and the line breaks in a quotation belong to whoever wrote it\n// > and not to this formatter\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn an_aligned_column_run_survives_byte_identical() {
+        // Two or more interior spaces is the rule that catches aligned
+        // columns, hand-laid tables and ASCII drawings in one.
+        survives_byte_identical(
+            "// node     the default host, and the one every example is written against\n// deno     the second\n// browser  the third\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_toolchain_directive_survives_byte_identical() {
+        // A directive is READ by a tool, so its line structure is a contract.
+        survives_byte_identical(
+            "// witness: the emitted bytes that carry this program's claim, at enough length to be past the budget\nfun main() {}\n",
+        );
+        survives_byte_identical(
+            "// witness-absent: the bytes this program's claim says are not in the golden at all, which is a long sentence\nfun main() {}\n",
+        );
+        survives_byte_identical(
+            "// GENERATED(mime-table): from crates/vilan-core/tests/mime-table.tsv, itself derived from the mime-db registry\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn commented_out_code_survives_byte_identical() {
+        survives_byte_identical(
+            "// let total = rows.iter().filter(|row| row.enabled).map(|row| row.weight).sum();\n// print(total);\nfun main() {}\n",
+        );
+        survives_byte_identical("// match value {\n// \tSome(let x) => x,\n// }\nfun main() {}\n");
+    }
+
+    #[test]
+    fn a_trailing_comment_is_never_reflowed() {
+        // A different emission path entirely — a trailing comment rides on the
+        // statement's own line — and the knob must not reach it.
+        survives_byte_identical(
+            "fun main() {\n\tlet x = 1; // what this binding is for, said at enough length to run well past the budget the printer keeps\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_license_header_survives_byte_identical() {
+        survives_byte_identical(
+            "// Copyright (c) 2026 the vilan authors. All rights reserved, and a legal notice's line breaks are the licence's\n// SPDX-License-Identifier: MIT OR Apache-2.0\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_blank_comment_line_breaks_the_paragraph_and_survives() {
+        // A bare `//` is a paragraph break written INSIDE a comment block: it
+        // is never a line to re-fill, and the halves fill independently.
+        let source = "// the first paragraph, which is long enough that the filler will take it and re-lay it across two lines of its own\n//\n// the second\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(filled.contains("\n//\n"), "the break survives: {filled}");
+        assert!(filled.contains("// the second\n"), "{filled}");
+        assert_eq!(
+            reprint_with(&filled, ON).as_deref(),
+            Ok(filled.as_str()),
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn a_long_url_and_a_long_code_span_are_never_broken() {
+        let source = "// the reference is https://example.com/a/path/long/enough/that/it/alone/exceeds/the/whole/budget/on/its/own and the rest follows\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled.contains(
+                "https://example.com/a/path/long/enough/that/it/alone/exceeds/the/whole/budget/on/its/own"
+            ),
+            "{filled}"
+        );
+        let span = "// the name is `a code span written long enough that the whole of it will not fit inside one line's budget` and then some more words\nfun main() {}\n";
+        let filled = wrapped(span);
+        assert!(
+            filled.contains(
+                "`a code span written long enough that the whole of it will not fit inside one line's budget`"
+            ),
+            "{filled}"
+        );
+    }
+
+    #[test]
+    fn the_comments_riding_with_an_export_marker_are_filled_too() {
+        // E181 takes these out of the comment stream so they travel to the
+        // marker's slot; they are a paragraph like any other and the knob must
+        // not have a hole there.
+        let source = "// the module comment for this file, written long enough that the filler has something to do with it here\nexport *;\n\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled.lines().filter(|line| line.starts_with("//")).count() == 2,
+            "{filled}"
+        );
+        assert_eq!(
+            reprint_with(&filled, ON).as_deref(),
+            Ok(filled.as_str()),
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn the_words_in_order_net_declines_by_name() {
+        // The net's own decline, shaped as N90's pins shape one: the filler
+        // cannot be made to fail from a source (the words-in-order property
+        // holds by construction — `comment_reflow::safety_net` plants a broken
+        // filler to prove the net catches one), so what is pinned here is what
+        // a tool is told when it does.
+        let source = "// the comment this would have rewritten\nfun main() {}\n";
+        let span = (0..source.find('\n').expect("the first line")).into();
+        let declined = decline(source, DeclineReason::ReflowChangedTheWords, Some(span));
+        assert_eq!(
+            declined,
+            Decline {
+                reason: DeclineReason::ReflowChangedTheWords,
+                construct: "// the comment this would have rewritten".to_string(),
+                line: Some(1),
+            }
+        );
+        assert_eq!(
+            declined.sentence(),
+            "re-filling this comment to the line width would have changed its WORDS, \
+             so nothing was rewritten (`[fmt] wrap_comments`, and the formatter's own \
+             safety net): `// the comment this would have rewritten`"
+        );
     }
 }

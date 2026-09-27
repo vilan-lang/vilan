@@ -1,5 +1,13 @@
 # A hand-written RPC example (roadmap P6 / proposal/transport-rpc.md), in-process so
 # it builds and runs with no network. `vilan run vilan/examples/rpc`.
+#
+# `prelude` names the ambient scope every file here resolves under — the names in
+# scope with no import (`proposal/prelude.md` §5). This is a process program, not
+# a web app, so it takes the base set (`print`, `Option` with `Some`/`None`,
+# `Result` with `Ok`/`Err`) — which is also what omitting the key means. That is
+# exactly the shape `src/main.vl` wants: it is dense with `Option` and `Result`
+# and reaches no view, so the web set (`"std::web"`) would buy it nothing.
 [package]
 name = "rpc"
 target = "node"
+prelude = "std::prelude"

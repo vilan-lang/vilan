@@ -11,10 +11,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// Writes a one-package project into a fresh temp directory and returns its
 /// `src/` (where the dumps land — `write_debug` puts them beside the source).
 fn stage_project(tag: &str, entry: &str) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("vilan_dumps_{tag}_{}", std::process::id()));
+    let staged = support::scratch_root().join(format!("vilan_dumps_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     let source = staged.join("src");
     std::fs::create_dir_all(&source).expect("create staged project");

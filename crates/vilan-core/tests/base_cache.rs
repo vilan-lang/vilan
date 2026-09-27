@@ -14,7 +14,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
+mod scratch;
+
+use vilan_core::{
+    BuildOptions, EntryMode, PackageSpec, Platform, Workspace, analyze_source, transform,
+};
 
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -120,9 +124,11 @@ fn a_distinct_import_set_misses() {
     let _ = misses_after_c;
 }
 
-/// The bypasses: entries the world-building loop would entangle — macro or
-/// derive text, `[service]` blocks — and any active overlay skip the cache
-/// entirely (neither hit nor store).
+/// The bypasses: entries the world-building loop would entangle — macro
+/// DEFINING text — skip the cache entirely (neither hit nor store). Derive
+/// USERS cache since the hoist (§6.13) and `[service]` entries since M72;
+/// an overlay outside std never blocked the cache and a std one is governed
+/// by CONTENT.
 #[test]
 fn world_entangling_entries_and_overlays_bypass() {
     let _guard = CACHE_LOCK
@@ -262,7 +268,7 @@ fn a_std_edit_evicts_by_content() {
 
     // A private, mutable copy of std.
     let scratch_parent =
-        std::env::temp_dir().join(format!("vilan_s3c_toolchain_{}", std::process::id()));
+        scratch::root().join(format!("vilan_s3c_toolchain_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch_parent);
     let scratch = scratch_parent.join("std");
     copy_tree(&std_root(), &scratch);
@@ -577,17 +583,22 @@ fn parse_clean_cache_clear_forces_a_reparse() {
     );
 }
 
-/// The M9 store gate (`leak-soak.md` §7.9.4a), the mechanism's stated proof
-/// obligation: an opted-in analysis that loaded an OVERLAY-SERVED source owns
-/// that text and tree — its program must be their only borrower — so
-/// `base_cache_store` refuses to store the world that borrows them. The
-/// consequence is deliberate: base-world caching is forfeited while a
-/// dependency (or std) file is open in the editor — repeat analyses keep
-/// missing — and resumes the moment the buffer closes. Without the gate the
-/// stored world would serve a later analysis borrows into freed memory (the
-/// §7.9.2 ctrl-Z shape, one seam over).
+/// M23 (`leak-soak.md` §7.9.4a, replaced): a base world built over an
+/// OVERLAY-SERVED source is stored, hits, and holds its own CLAIM on every
+/// analysis-owned copy it borrows.
+///
+/// M9 refused the store instead, because a stored world outliving the
+/// analysis that owns its module copies is §7.9.2's use-after-free — and it
+/// cost every entry that imports an open sibling the whole pre-entry world on
+/// every keystroke (kolt's `client.vl`: `base` 1.4–2.7 s, a miss every time).
+/// The world takes a reference count now. This pin covers the four things
+/// that makes true: the world hits while the buffer is open; the claim keeps
+/// the copy alive after the owning analysis has given its own back; the
+/// content the hit was validated against is the content the served world was
+/// built from (the ctrl-Z shape, which is where the naive eviction died); and
+/// an analysis with nowhere to keep a claim is served a MISS, not a borrow.
 #[test]
-fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes() {
+fn a_world_that_loaded_an_overlaid_source_is_stored_and_claims_its_copies() {
     use vilan_core::{MacroLimits, Workspace};
 
     let _guard = CACHE_LOCK
@@ -596,10 +607,10 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
     vilan_core::analyzer::base_cache_clear();
 
     // A workspace with one dependency package: dependency files are exactly
-    // the files a multi-package workspace has open in the editor, and —
-    // unlike a `pkg::` sibling, which bypasses the base cache anyway — they
-    // are loaded into the world the cache stores.
-    let root = std::env::temp_dir().join(format!("vilan_m9_gate_{}", std::process::id()));
+    // the files a multi-package workspace has open in the editor, and — like
+    // a `pkg::` sibling since M21 — they are loaded into the world the cache
+    // stores.
+    let root = scratch::root().join(format!("vilan_m23_claim_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).expect("app dir");
@@ -625,6 +636,7 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let source: &'static str = Box::leak(
         std::fs::read_to_string(&entry_path)
@@ -633,8 +645,11 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
     );
 
     // One opted-in analysis — the language server's shape — with the handles
-    // reclaimed the way their owner would.
-    let analyze_owning = || {
+    // reclaimed the way their owner would. Returns the diagnostics, because
+    // a world served with dangling borrows shows up as a WRONG answer (the
+    // M9 plant produced `cannot find 'greeting' in the imported path`), not
+    // as a crash.
+    let analyze_owning = || -> Vec<String> {
         let workspace = workspace.clone();
         let app_dir = app_dir.clone();
         let entry_path = entry_path.clone();
@@ -650,77 +665,151 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
                     Some(Platform::default()),
                     &workspace,
                 );
-                assert!(
-                    analyzed.diagnostics.is_empty(),
-                    "the gate fixture must compile clean, got {:#?}",
-                    analyzed.diagnostics
-                );
+                let diagnostics: Vec<String> = analyzed
+                    .diagnostics
+                    .iter()
+                    .map(|error| error.msg.clone())
+                    .collect();
                 drop(analyzed.program);
                 if let Some(ast) = analyzed.ast {
                     // SAFETY: the program — the tree's only borrower — was
                     // dropped on the line above.
                     unsafe { ast.reclaim() };
                 }
-                // SAFETY: as above; with the store refused, the program was
-                // the owned copies' only borrower.
+                // SAFETY: as above. This releases only THIS analysis's
+                // claims; a copy a stored world still claims survives, which
+                // is the whole M23 protocol.
                 unsafe { analyzed.owned_modules.reclaim() };
+                diagnostics
             })
             .expect("spawn worker")
             .join()
-            .expect("worker panicked");
+            .expect("worker panicked")
     };
 
     // Disk-served: the dependency world stores and hits — the baseline that
     // proves the fixture exercises the cache at all.
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_before, _) = stats();
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_disk, _) = stats();
     assert_eq!(
         hits_disk,
         hits_before + 1,
         "the disk-served dependency world must hit — the fixture is not \
-         reaching the base cache, so the gate assertions below are vacuous"
+         reaching the base cache, so the assertions below are vacuous"
+    );
+    assert_eq!(
+        vilan_core::analyzer::base_cache_overlay_claims(),
+        (0, 0),
+        "a disk-served world claims nothing: every source it borrows is in \
+         `parse_clean_cached`'s immortal cache"
     );
 
-    // The dependency's lib.vl is now OPEN in the editor, edited: every
-    // analysis loads it from the overlay into analysis-owned allocations, so
-    // no world may be stored — repeat analyses keep missing and never hit.
+    // The dependency's lib.vl is now OPEN in the editor: every analysis loads
+    // it from the overlay into analysis-owned allocations — and the world
+    // built over them is STORED, claims them, and hits.
     vilan_core::analyzer::base_cache_clear();
+    let open_text = "fun greeting(): i32 {\n\t42\n}\n".to_string();
+    let open_bytes = open_text.len();
+    vilan_core::analyzer::set_document_overlay(&dep_lib, Some(open_text.clone()));
+    let (hits_open_before, _) = stats();
+    assert!(analyze_owning().is_empty());
+    assert!(
+        analyze_owning().is_empty(),
+        "the second analysis over the open buffer must still resolve the \
+         dependency — a served world whose borrows were freed answers wrong"
+    );
+    let (hits_open, _) = stats();
+    assert_eq!(
+        hits_open,
+        hits_open_before + 1,
+        "M23: a world that loaded an overlay-served source must be stored \
+         and hit — this is the `base` cost kolt's client.vl paid on every \
+         keystroke"
+    );
+    let (claims, claim_bytes) = vilan_core::analyzer::base_cache_overlay_claims();
+    assert_eq!(
+        (claims, claim_bytes),
+        (1, open_bytes),
+        "the stored world must hold exactly one claim, on the overlaid \
+         module's text, or its borrows are not kept alive by anything"
+    );
+    // The ctrl-Z shape — §7.9.2's sharpest edge. Edit the open buffer (the
+    // stored world goes stale and is evicted), then UNDO back to the content
+    // the world was built from: the world that becomes valid again must
+    // still be pointing at live memory, and must answer correctly.
     vilan_core::analyzer::set_document_overlay(
         &dep_lib,
-        Some("fun greeting(): i32 {\n\t42\n}\n".to_string()),
+        Some("fun greeting(): i32 {\n\t43\n}\n".to_string()),
     );
-    let (hits_open_before, misses_open_before) = stats();
-    analyze_owning();
-    analyze_owning();
-    let (hits_open, misses_open) = stats();
-    assert_eq!(
-        hits_open, hits_open_before,
-        "a world that loaded an overlay-served source was stored and served — \
-         the M9 store gate is gone, and the served world borrows memory the \
-         owning analysis will free (leak-soak.md §7.9.4a)"
+    assert!(analyze_owning().is_empty());
+    vilan_core::analyzer::set_document_overlay(&dep_lib, Some(open_text));
+    let (hits_undo_before, _) = stats();
+    let after_undo = analyze_owning();
+    let (hits_undo, _) = stats();
+    assert!(
+        after_undo.is_empty(),
+        "after an undo the re-validated world must resolve the dependency, \
+         not read freed memory: {after_undo:?}"
     );
-    assert_eq!(
-        misses_open,
-        misses_open_before + 2,
-        "with the store refused, every analysis over the open buffer misses"
+    assert!(
+        hits_undo >= hits_undo_before,
+        "the undo must not corrupt the cache's accounting"
     );
 
-    // The buffer closes: loads come from disk again, the store resumes, and
-    // the very next repeat analysis hits.
+    // An analysis with NO collection scope has nowhere to keep a claim, so
+    // the claimed world is not served to it: a miss, and it loads the
+    // overlay through the process-global cache exactly as it always did.
+    let (hits_unscoped_before, misses_unscoped_before) = stats();
+    let workspace_for_plain = workspace.clone();
+    let app_dir_for_plain = app_dir.clone();
+    let entry_for_plain = entry_path.clone();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let std = vilan_core::manifest::resolve_std(&std_root());
+            let (program, errors) = analyze_source(
+                source,
+                &std,
+                &app_dir_for_plain,
+                &entry_for_plain,
+                Some(Platform::default()),
+                &workspace_for_plain,
+            );
+            assert!(errors.is_empty(), "the unscoped analysis must be clean");
+            drop(program);
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+    let (hits_unscoped, misses_unscoped) = stats();
+    assert_eq!(
+        hits_unscoped, hits_unscoped_before,
+        "a claimed world must NOT be served to an analysis with no scope to \
+         hold its claims — that borrow would be kept alive by nothing"
+    );
+    assert!(misses_unscoped > misses_unscoped_before);
+
+    // The buffer closes: loads come from disk again, so the world stored
+    // from then on claims nothing, and clearing gives every claim back.
     vilan_core::analyzer::set_document_overlay(&dep_lib, None);
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_closed_before, _) = stats();
-    analyze_owning();
+    assert!(analyze_owning().is_empty());
     let (hits_closed, _) = stats();
     assert_eq!(
         hits_closed,
         hits_closed_before + 1,
-        "once the buffer closes the world must store and hit again"
+        "once the buffer closes the disk-served world must store and hit"
     );
 
     vilan_core::analyzer::base_cache_clear();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_overlay_claims(),
+        (0, 0),
+        "clearing the cache gives every claim back"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -987,4 +1076,2106 @@ fn the_base_cache_grows_with_distinct_import_sets_not_with_keystrokes() {
         "three import sets revisited must retain three worlds — a revisit has to \
          HIT, not store a fourth"
     );
+}
+
+/// M21 — an entry with any `pkg::` import used to bypass the base cache
+/// OUTRIGHT.
+///
+/// The measured consequence on kolt: `views.vl` and `client.vl` rebuilt
+/// std's whole world on every keystroke (`base` 248–288 ms, and 758 ms
+/// median under lane load) while their sibling `theme.vl`, which imports no
+/// sibling, hit at 0.0 ms. The world is std's; the package is analyzed on
+/// top of it, and the sibling set is a KEY — the same thing the `std::`
+/// seeds and the dependency seeds already are — not a reason to refuse.
+///
+/// Four properties, in the order they matter: the second analysis HITS; a
+/// hit is observation-identical to a cache-cleared build (the cache may not
+/// change an answer); a DIFFERENT sibling set is a different world and
+/// misses; and an edited sibling evicts by CONTENT (the E12 rule), which is
+/// what keeps an editor from being served a stale sibling.
+#[test]
+fn a_pkg_importing_entry_hits_the_cache_on_its_second_analysis() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let root = scratch::root().join(format!("vilan_m21_pkg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("helper.vl"), "fun helper(): i32 {\n\t7\n}\n").expect("write helper");
+    std::fs::write(root.join("other.vl"), "fun other(): i32 {\n\t9\n}\n").expect("write other");
+
+    // Two entries with the SAME sibling set and the same std seeds, differing
+    // only in their bodies — a keystroke, in cache terms.
+    const FIRST: &str =
+        "import std::io::print;\nimport pkg::helper::helper;\nfun main() { print(helper()); }\n";
+    const SECOND: &str = "import std::io::print;\nimport pkg::helper::helper;\n\
+                          fun main() { print(helper() + 1); }\n";
+    // A different sibling set: a different world.
+    const BOTH: &str = "import std::io::print;\nimport pkg::helper::helper;\n\
+                        import pkg::other::other;\nfun main() { print(helper() + other()); }\n";
+
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let entry_path = root.join("main.vl");
+
+    fn observe_in(
+        spec: &PackageSpec,
+        pkg_root: &Path,
+        entry_path: &Path,
+        source: &'static str,
+    ) -> (String, Option<String>) {
+        let spec = spec.clone();
+        let pkg_root = pkg_root.to_path_buf();
+        let entry_path = entry_path.to_path_buf();
+        on_one_thread(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (diagnostics, javascript)
+        })
+    }
+
+    vilan_core::analyzer::base_cache_clear();
+    let retained_empty = vilan_core::analyzer::base_cache_retained();
+    let first = observe_in(&spec, &root, &entry_path, FIRST);
+    assert_eq!(first.0, "[]", "the fixture must analyze clean: {}", first.0);
+    let (hits_before, misses_before) = stats();
+    let retained_after_first = vilan_core::analyzer::base_cache_retained();
+
+    let cached = observe_in(&spec, &root, &entry_path, SECOND);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "an entry with one `pkg::` import must HIT on its second analysis \
+         (M21); it missed instead"
+    );
+    assert_eq!(misses_after, misses_before, "a hit is not also a miss");
+
+    // A `pkg::` world costs ONE retained world, like every other key shape —
+    // M11's number is what says so.
+    assert_eq!(
+        retained_after_first - retained_empty,
+        1,
+        "one sibling set must retain exactly one world, not \
+         {}",
+        retained_after_first - retained_empty
+    );
+
+    // The cache may not change an answer.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh = observe_in(&spec, &root, &entry_path, SECOND);
+    assert_eq!(cached.0, fresh.0, "diagnostics differ cached vs fresh");
+    assert_eq!(cached.1, fresh.1, "emitted JS differs cached vs fresh");
+    assert!(cached.1.is_some(), "the fixture must emit");
+
+    // A different sibling set is a different world.
+    let (hits_pre_both, misses_pre_both) = stats();
+    let both = observe_in(&spec, &root, &entry_path, BOTH);
+    let (hits_both, misses_both) = stats();
+    assert_eq!(both.0, "[]", "the two-sibling fixture must analyze clean");
+    assert_eq!(
+        (hits_both, misses_both),
+        (hits_pre_both, misses_pre_both + 1),
+        "a different `pkg::` sibling set must MISS — the world holds the \
+         siblings, so the set is part of the key"
+    );
+
+    // E12: an edited sibling evicts by content, and the rebuild sees the edit.
+    std::fs::write(root.join("helper.vl"), "fun helper(): i32 {\n\t8\n}\n").expect("edit helper");
+    let (hits_pre_edit, misses_pre_edit) = stats();
+    let edited = observe_in(&spec, &root, &entry_path, SECOND);
+    let (hits_edit, misses_edit) = stats();
+    assert_eq!(
+        (hits_edit, misses_edit),
+        (hits_pre_edit, misses_pre_edit + 1),
+        "an edited `pkg::` sibling must evict and miss, not serve a stale world"
+    );
+    assert_ne!(
+        edited.1, fresh.1,
+        "the rebuild after a sibling edit must carry the edit"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B341: the key carries the modules the entry's own SYNTAX seeds, not only the
+/// ones a `std::` path names.
+///
+/// An element desugars to `std::ui`'s `view`, and a `css` block makes
+/// `std::style::prelude` ambient inside itself — both are pushed into `to_load`
+/// beside the written imports, both load into the world, and neither is named
+/// by any `std::` path in the text. The key was `collect_module_paths(.., "std")`
+/// alone, so a plain entry and an element entry with the same import line minted
+/// the SAME key and the second was served the first's world: a world with no
+/// `std::ui` in it, in which `<div/>` fails with "cannot find 'view' in this
+/// scope". Not a cache curiosity — `vilan build` analyzes a package's entries in
+/// ONE process, so a two-entry package where one entry uses element syntax
+/// failed to build, and WHICH entry failed depended on the order the entries
+/// sorted in. Found by hygiene-36 chasing N84's shared-state flake, where two
+/// `inference` `modules::` tests read red under plain `cargo test` for the same
+/// reason.
+///
+/// Both orders, and both desugars, because the failure is asymmetric: the entry
+/// analyzed SECOND is the one that pays. The assertion is the DIAGNOSTICS and
+/// not a hit/miss delta — an element entry compiles macro worlds, and those
+/// consult the cache on their own account, so the counters here are counting two
+/// things at once (this file's opening note).
+#[test]
+fn an_entrys_desugar_seeds_are_part_of_its_world_key() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    const PLAIN: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"plain\");\n}\n";
+    const ELEMENT: &str =
+        "import std::io::print;\n\nfun main() {\n\tlet _x = <div/>;\n\tprint(\"element\");\n}\n";
+    const CSS: &str = "import std::io::print;\n\nfun main() {\n\tlet _s = css { color(\"\\\"red\\\"\"); };\n\t\
+         print(\"css\");\n}\n";
+
+    // The repro's own order: the plain entry sorts first, so it builds the
+    // world and the element entry is the one handed it.
+    vilan_core::analyzer::base_cache_clear();
+    let plain = observe(PLAIN);
+    assert_eq!(
+        plain.0, "[]",
+        "the plain entry must analyze clean: {}",
+        plain.0
+    );
+    let element = observe(ELEMENT);
+    assert_eq!(
+        element.0, "[]",
+        "an element entry analyzed after a plain one must analyze clean — it \
+         was served a world with no `std::ui` in it: {}",
+        element.0
+    );
+    assert!(
+        element.2.is_some(),
+        "and it must emit: an element entry served the plain entry's world \
+         produced no program at all"
+    );
+
+    // And the other way round, which is the order that already worked and must
+    // go on working: the element entry builds the world, the plain one misses.
+    vilan_core::analyzer::base_cache_clear();
+    let element = observe(ELEMENT);
+    assert_eq!(
+        element.0, "[]",
+        "the element entry must analyze clean alone"
+    );
+    let plain = observe(PLAIN);
+    assert_eq!(plain.0, "[]", "the plain entry must analyze clean second");
+
+    // The `css` twin, whose seed is `std::style::prelude` and whose failure
+    // said "cannot find 'style' in this scope".
+    vilan_core::analyzer::base_cache_clear();
+    let plain = observe(PLAIN);
+    assert_eq!(
+        plain.0, "[]",
+        "the plain entry must analyze clean: {}",
+        plain.0
+    );
+    let css = observe(CSS);
+    assert_eq!(
+        css.0, "[]",
+        "a `css` entry analyzed after a plain one must analyze clean: {}",
+        css.0
+    );
+    assert!(
+        css.2.is_some(),
+        "and it must emit: a `css` entry served the plain entry's world \
+         produced no program at all"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+}
+
+// ---------------------------------------------------------------------------
+// The OPEN MODULE's own world (backlog M70)
+// ---------------------------------------------------------------------------
+
+/// M70: a module a front end opened AS the entry, whose own package imports it
+/// back, builds an ENTRY-SHAPED world — `pkg::<entry>` aliases the entry's own
+/// (global) scope and the module itself is in the world nowhere — and B239
+/// answered that hazard by storing nothing at all. Seven of kolt's nineteen
+/// files are that shape, and each paid its package's whole pre-entry load on
+/// every keystroke because no other analysis ever minted their key.
+///
+/// The world is storable once the KEY says which module it excludes
+/// ([`vilan_core::analyzer`]'s `BaseCacheKey::entry_open_module`, the entry's
+/// own path). Three claims, and the third is the one the key exists for:
+///
+///  1. the cycle entry STORES a world and HITS on its second analysis, whose
+///     diagnostics and emitted JS are a fresh build's;
+///  2. an edited SIBLING evicts it by content — the E12 rule is untouched;
+///  3. a DIFFERENT file with the same seeds is NOT served it. Under the old key
+///     the two collide exactly, and `theme.vl`'s `import pkg::views::icon`
+///     would resolve into the second file's own scope, where `icon` is not.
+#[test]
+fn an_open_modules_world_is_stored_under_a_key_that_excludes_it() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let root = scratch::root().join(format!("vilan_m70_cycle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    // THREE modules with a cycle through the entry: the open file `views.vl`,
+    // the sibling `theme.vl` that imports it back, and `palette.vl` beneath
+    // them both (so the world has something in it that the cycle does not
+    // touch, and a sibling edit has somewhere to land that is not the cycle).
+    const THEME: &str = "export *;\n\nimport pkg::palette::base;\nimport pkg::views::icon;\n\n\
+                         fun color(): i32 {\n\tbase() + icon()\n}\n";
+    std::fs::write(root.join("theme.vl"), THEME).expect("write theme");
+    std::fs::write(
+        root.join("palette.vl"),
+        "export *;\n\nfun base(): i32 {\n\t1\n}\n",
+    )
+    .expect("write palette");
+
+    // The open file, twice — a keystroke apart. Its seeds do not move, so the
+    // key does not either.
+    const FIRST: &str = "export *;\n\nimport std::io::print;\nimport pkg::theme::color;\n\n\
+                         fun icon(): i32 {\n\t3\n}\n\n\
+                         fun total(): i32 {\n\tcolor() + icon()\n}\n\n\
+                         fun main() {\n\tprint(total());\n}\n";
+    const SECOND: &str = "export *;\n\nimport std::io::print;\nimport pkg::theme::color;\n\n\
+                          fun icon(): i32 {\n\t3\n}\n\n\
+                          fun total(): i32 {\n\tcolor() + icon() + 1\n}\n\n\
+                          fun main() {\n\tprint(total());\n}\n";
+    // A DIFFERENT file of the same package with the SAME seeds — one `std::io`
+    // reference and one `pkg::theme`, which is a byte-for-byte identical key
+    // everywhere but in the field this item added.
+    const OTHER: &str = "export *;\n\nimport std::io::print;\nimport pkg::theme::color;\n\n\
+                         fun shade(): i32 {\n\tcolor() + 2\n}\n\n\
+                         fun main() {\n\tprint(shade());\n}\n";
+
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    fn observe_open(
+        spec: &PackageSpec,
+        pkg_root: &Path,
+        entry_path: &Path,
+        source: &'static str,
+    ) -> (String, Option<String>) {
+        let spec = spec.clone();
+        let pkg_root = pkg_root.to_path_buf();
+        let entry_path = entry_path.to_path_buf();
+        on_one_thread(move || {
+            // The front end says this file is a MODULE it handed over as the
+            // entry — which is what makes `pkg::views` the alias and the world
+            // entry-shaped (B239).
+            let workspace = Workspace {
+                entry_mode: EntryMode::OpenFile {
+                    declared_entries: Vec::new(),
+                },
+                ..Workspace::default()
+            };
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &workspace,
+            );
+            let diagnostics = format!("{errors:?}");
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (diagnostics, javascript)
+        })
+    }
+
+    let views = root.join("views.vl");
+    let other = root.join("other.vl");
+    std::fs::write(&other, OTHER).expect("write other");
+    // The open file exists on DISK too — that is what makes `theme.vl`'s
+    // `import pkg::views::icon` resolve to the entry at all, and it is how
+    // every front end that opens a file has it. The analysis still reads the
+    // buffer it is handed; the disk copy is what the loader RESOLVES, and it
+    // recognises the entry by path.
+    std::fs::write(&views, FIRST).expect("write views");
+
+    vilan_core::analyzer::base_cache_clear();
+    let retained_empty = vilan_core::analyzer::base_cache_retained();
+    let first = observe_open(&spec, &root, &views, FIRST);
+    assert_eq!(
+        first.0, "[]",
+        "the cycle fixture must analyze clean: {}",
+        first.0
+    );
+    // (1a) B239 stored NOTHING here. The world is entry-shaped, and the key now
+    // says so rather than the store refusing.
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained() - retained_empty,
+        1,
+        "an open module's entry-shaped world must be STORED (M70), under the \
+         key that excludes it"
+    );
+
+    // The keystroke lands on disk too, as an editor's save would — the world
+    // is keyed on the entry, whose content it never validates (the entry is
+    // `sources[0]`, and a hit patches it).
+    std::fs::write(&views, SECOND).expect("save views");
+    let (hits_before, misses_before) = stats();
+    let cached = observe_open(&spec, &root, &views, SECOND);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "the second analysis of a cycle-reached open module must HIT; it missed"
+    );
+    assert_eq!(misses_after, misses_before, "a hit is not also a miss");
+
+    // (1b) And the cache may not change an answer — the hit re-runs the same
+    // deferred order the miss did, off the flag the world carries.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh = observe_open(&spec, &root, &views, SECOND);
+    assert_eq!(cached.0, fresh.0, "diagnostics differ cached vs fresh");
+    assert_eq!(cached.1, fresh.1, "emitted JS differs cached vs fresh");
+    assert!(cached.1.is_some(), "the fixture must emit");
+
+    // (3) The key's whole job: a DIFFERENT entry with the same seeds is not
+    // served this world. Its own analysis loads `views.vl` as a real module —
+    // which is exactly what the stored world does not have — so being served it
+    // would leave `theme.vl`'s `import pkg::views::icon` pointing at `other`'s
+    // own scope, and `icon` is not in it.
+    let (hits_pre_other, misses_pre_other) = stats();
+    let other_observed = observe_open(&spec, &root, &other, OTHER);
+    let (hits_other, misses_other) = stats();
+    assert_eq!(
+        (hits_other, misses_other),
+        (hits_pre_other, misses_pre_other + 1),
+        "a different file with the same seeds must MISS an open module's \
+         entry-shaped world"
+    );
+    assert_eq!(
+        other_observed.0, "[]",
+        "the sibling entry must analyze clean — it was served a world missing \
+         its own `views` module: {}",
+        other_observed.0
+    );
+
+    // (2) E12 is untouched: an edited sibling evicts by content.
+    std::fs::write(
+        root.join("palette.vl"),
+        "export *;\n\nfun base(): i32 {\n\t2\n}\n",
+    )
+    .expect("edit palette");
+    let (hits_pre_edit, misses_pre_edit) = stats();
+    let edited = observe_open(&spec, &root, &views, SECOND);
+    let (hits_edit, misses_edit) = stats();
+    assert_eq!(
+        (hits_edit, misses_edit),
+        (hits_pre_edit, misses_pre_edit + 1),
+        "an edited sibling must evict an open module's world and miss"
+    );
+    assert_ne!(
+        edited.1, fresh.1,
+        "the rebuild after a sibling edit must carry the edit"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// The byte budget (backlog M24)
+// ---------------------------------------------------------------------------
+
+/// M24: the base cache had no eviction but per-key overwrite, so a session
+/// that met N distinct key shapes retained N worlds until something cleared
+/// the map — and M21 multiplied the key set by a package's sibling sets, so
+/// an N-file package can now mint N keys from one editing session. M11 made
+/// the growth VISIBLE (`base_cache_retained`, the `BaseCacheWorld` tally);
+/// this makes it BOUNDED.
+///
+/// The three claims, each asserted below: the retained bytes stay inside the
+/// budget; a HIT refreshes recency, so eviction is least-recently-USED rather
+/// than oldest-stored; and an evicted world gives its bytes back to the tally
+/// (and, after M23, its overlay claims with them).
+#[test]
+fn the_base_cache_evicts_least_recently_hit_worlds_to_a_byte_budget() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // A synthetic package of many entries, GENERATED here rather than checked
+    // in: `entry_<i>.vl` imports `pkg::mod_<i>`, so each entry mints its own
+    // base-cache key (the sibling set is part of it since M21) while every
+    // world is the same size — the sibling texts are fixed-width, so the
+    // budget arithmetic below is exact rather than approximate.
+    const ENTRIES: usize = 6;
+    let root = scratch::root().join(format!("vilan_m24_budget_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch dir");
+    let mut entry_paths = Vec::new();
+    let mut entry_sources: Vec<&'static str> = Vec::new();
+    for index in 0..ENTRIES {
+        std::fs::write(
+            root.join(format!("mod_{index}.vl")),
+            format!("fun value_{index}(): i32 {{\n\t{:04}\n}}\n", 1000 + index),
+        )
+        .expect("write module");
+        let entry_path = root.join(format!("entry_{index}.vl"));
+        let source = format!(
+            "import pkg::mod_{index}::value_{index};\n\nfun main() {{\n\tlet _v = value_{index}();\n}}\n"
+        );
+        std::fs::write(&entry_path, &source).expect("write entry");
+        entry_sources.push(Box::leak(source.into_boxed_str()));
+        entry_paths.push(entry_path);
+    }
+
+    let analyze = |index: usize| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_paths[index].clone();
+        let source = entry_sources[index];
+        let diagnostics = on_one_thread(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            drop(program);
+            diagnostics
+        });
+        assert_eq!(diagnostics, "[]", "entry {index} must analyze clean");
+    };
+
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    assert_eq!(vilan_core::analyzer::base_cache_retained_bytes(), 0);
+
+    // Under the generous default, the growth M24 exists to bound is real:
+    // three distinct keys retain three worlds. (The vacuity guard — with no
+    // growth here the budget below would have nothing to bound.)
+    analyze(0);
+    let one_world = vilan_core::analyzer::base_cache_retained_bytes();
+    assert!(
+        one_world > 0,
+        "a stored world must be recorded as retaining something"
+    );
+    analyze(1);
+    analyze(2);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        3,
+        "three distinct sibling sets retain three worlds under the default \
+         budget — this is M24's finding, and the pin's vacuity guard"
+    );
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained_bytes(),
+        3 * one_world,
+        "the worlds are the same size by construction, so the budget \
+         arithmetic below is exact"
+    );
+
+    // The budget takes effect the moment it is set, not at the next store:
+    // two worlds' worth of budget keeps the two most recently used.
+    leak_tally::reset();
+    let budget = 2 * one_world;
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    assert_eq!(vilan_core::analyzer::base_cache_budget(), budget);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        2,
+        "the budget must evict down to what fits"
+    );
+    assert!(
+        vilan_core::analyzer::base_cache_retained_bytes() <= budget,
+        "retained {} B over a {budget} B budget",
+        vilan_core::analyzer::base_cache_retained_bytes(),
+    );
+    assert_eq!(
+        leak_tally::released(LeakSite::BaseCacheWorld),
+        one_world,
+        "an evicted world gives its recorded bytes back to the tally — the \
+         M11 site is what makes the bound checkable at all"
+    );
+
+    // Entry 0 was the least recently used, so it is the one that went.
+    let (hits_before, misses_before) = stats();
+    analyze(0);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        (hits_after, misses_after),
+        (hits_before, misses_before + 1),
+        "the least-recently-used world must be the evicted one"
+    );
+
+    // A HIT refreshes recency. The cache now holds {1, 2, 0} trimmed to the
+    // budget — re-analyze entry 2 to hit it, then store a fresh key, and the
+    // world that goes must be the one nothing has touched.
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    analyze(3);
+    analyze(4);
+    let (hits_pre_touch, _) = stats();
+    analyze(3); // the HIT that refreshes entry 3's recency
+    let (hits_post_touch, _) = stats();
+    assert_eq!(
+        hits_post_touch,
+        hits_pre_touch + 1,
+        "the refreshing analysis must actually hit"
+    );
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    analyze(5); // a third key: the budget evicts one, and it must be entry 4
+    assert_eq!(vilan_core::analyzer::base_cache_retained(), 2);
+    let (hits_pre_3, misses_pre_3) = stats();
+    analyze(3);
+    let (hits_post_3, misses_post_3) = stats();
+    assert_eq!(
+        (hits_post_3, misses_post_3),
+        (hits_pre_3 + 1, misses_pre_3),
+        "the world a hit refreshed must survive the eviction — otherwise the \
+         policy is oldest-stored, not least-recently-used"
+    );
+    let (hits_pre_4, misses_pre_4) = stats();
+    analyze(4);
+    let (hits_post_4, misses_post_4) = stats();
+    assert_eq!(
+        (hits_post_4, misses_post_4),
+        (hits_pre_4, misses_pre_4 + 1),
+        "the untouched world must be the one that was evicted"
+    );
+
+    // A budget smaller than a single world does not turn the cache off: the
+    // world just stored is exempt, so the bound is "the budget, or one
+    // world, whichever is more".
+    vilan_core::analyzer::set_base_cache_budget(1);
+    assert!(
+        vilan_core::analyzer::base_cache_retained() <= 1,
+        "a one-byte budget must evict everything it is allowed to"
+    );
+    let (hits_tiny, misses_tiny) = stats();
+    analyze(0);
+    analyze(0);
+    let (hits_tiny_after, misses_tiny_after) = stats();
+    assert_eq!(
+        (hits_tiny_after, misses_tiny_after),
+        (hits_tiny + 1, misses_tiny + 1),
+        "even at a one-byte budget the world just stored survives to serve \
+         the next analysis of the same key"
+    );
+
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// THE PIN (M67): the budget never evicts a world a LIVE entry is analyzed
+/// from — and does evict it the moment the entry stops being live.
+///
+/// M24's budget is least-recently-used, which is the right policy for a cache
+/// and the wrong one for the document the user is looking at: a session whose
+/// working set is one world larger than its budget evicts exactly what the next
+/// visit wants (measured on kolt, `base_cache_budget_walk`: 7 → 17 misses over
+/// a nineteen-file scan for a budget one world short of the cycle). The ruling
+/// carves out the front end's own retained set, and this holds the carve-out to
+/// both of its halves: exempt while live, ordinary the moment it is not.
+///
+/// Four entries, each importing a different sibling so each mints its own key
+/// (M21), and every world the same size by construction — so the budget
+/// arithmetic below is exact rather than approximate, exactly as
+/// [`the_base_cache_evicts_least_recently_hit_worlds_to_a_byte_budget`]'s is.
+#[test]
+fn a_live_entrys_world_is_never_the_budgets_victim() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    const ENTRIES: usize = 3;
+    let root = scratch::root().join(format!("vilan_m67_live_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch dir");
+    let mut entry_paths = Vec::new();
+    let mut entry_sources: Vec<&'static str> = Vec::new();
+    for index in 0..ENTRIES {
+        std::fs::write(
+            root.join(format!("live_mod_{index}.vl")),
+            format!(
+                "fun live_value_{index}(): i32 {{\n\t{:04}\n}}\n",
+                2000 + index
+            ),
+        )
+        .expect("write module");
+        let entry_path = root.join(format!("live_entry_{index}.vl"));
+        let source = format!(
+            "import pkg::live_mod_{index}::live_value_{index};\n\nfun main() {{\n\tlet _v = live_value_{index}();\n}}\n"
+        );
+        std::fs::write(&entry_path, &source).expect("write entry");
+        entry_sources.push(Box::leak(source.into_boxed_str()));
+        entry_paths.push(entry_path);
+    }
+
+    let analyze = |index: usize| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_paths[index].clone();
+        let source = entry_sources[index];
+        let diagnostics = on_one_thread(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let diagnostics = format!("{errors:?}");
+            drop(program);
+            diagnostics
+        });
+        assert_eq!(diagnostics, "[]", "entry {index} must analyze clean");
+    };
+
+    let fill = || {
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+        vilan_core::analyzer::base_cache_clear();
+        for index in 0..ENTRIES {
+            analyze(index);
+        }
+        assert_eq!(
+            vilan_core::analyzer::base_cache_retained(),
+            ENTRIES,
+            "three distinct sibling sets retain three worlds under the default \
+             budget — the vacuity guard this pin's arithmetic rests on",
+        );
+    };
+
+    // THE CONTROL, and it comes first: with nothing declared live, the budget
+    // takes the least recently used world, which is entry 0's. A pin that
+    // asserted only the exemption would pass over a policy that evicts nothing
+    // at all.
+    vilan_core::analyzer::set_base_cache_live_entries(&[]);
+    fill();
+    let one_world = vilan_core::analyzer::base_cache_retained_bytes() / ENTRIES;
+    assert!(one_world > 0, "a stored world must weigh something");
+    let budget = 2 * one_world;
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        2,
+        "the budget must evict down to what fits",
+    );
+    let (hits_before, misses_before) = stats();
+    analyze(0);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        (hits_after, misses_after),
+        (hits_before, misses_before + 1),
+        "without the exemption the least-recently-used world is the victim — \
+         M24's policy, and the control for the one below",
+    );
+
+    // THE PIN. Same three worlds, same budget, and entry 0 declared live: it is
+    // still the least recently used, and it is the one world that stays.
+    fill();
+    vilan_core::analyzer::set_base_cache_live_entries(&[entry_paths[0].clone()]);
+    // Declaring a path does not tell the cache which key it names — an
+    // admission does. Entry 0's next analysis is where it is learned (the
+    // refocus M63 schedules), and the two analyses after it put entry 0 back at
+    // the tail of the LRU, which is what makes the assertion below a claim
+    // about the exemption rather than about recency.
+    analyze(0);
+    analyze(1);
+    analyze(2);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_live_entries(),
+        (1, 1),
+        "one entry declared live, and its key learned at its next admission",
+    );
+    vilan_core::analyzer::set_base_cache_budget(budget);
+    assert_eq!(vilan_core::analyzer::base_cache_retained(), 2);
+    let (hits_before, misses_before) = stats();
+    analyze(0);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        (hits_after, misses_after),
+        (hits_before + 1, misses_before),
+        "the live entry's world must survive a budget that evicted the world \
+         next to it — the eviction the control just watched happen",
+    );
+
+    // THE BOUND. Every entry live and a one-byte budget: the cache keeps the
+    // exempt worlds and nothing else, and that is the stated bound — the
+    // budget, or the exempt set (the live entries plus the world just stored),
+    // whichever is more. Not a bound that can be exceeded quietly: it is
+    // exactly what the exemption promises to hold.
+    fill();
+    vilan_core::analyzer::set_base_cache_live_entries(&entry_paths);
+    for index in 0..ENTRIES {
+        analyze(index);
+    }
+    assert_eq!(
+        vilan_core::analyzer::base_cache_live_entries(),
+        (ENTRIES, ENTRIES),
+        "every entry declared live, every key learned",
+    );
+    vilan_core::analyzer::set_base_cache_budget(1);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        ENTRIES,
+        "a one-byte budget may not take a world a live entry names",
+    );
+    assert!(
+        vilan_core::analyzer::base_cache_retained_bytes() <= 1 + ENTRIES * one_world,
+        "retained {} B against the bound the exemption states: the budget (1 B) \
+         plus the exempt worlds",
+        vilan_core::analyzer::base_cache_retained_bytes(),
+    );
+
+    // And the other half of the carve-out: an entry that stops being live stops
+    // being exempt. The same one-byte budget, applied again with nothing
+    // declared, takes everything — so what held those worlds was the
+    // declaration and not some other reluctance to evict.
+    vilan_core::analyzer::set_base_cache_live_entries(&[]);
+    vilan_core::analyzer::set_base_cache_budget(1);
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        0,
+        "with the declaration withdrawn the budget evicts what it could not \
+         touch a moment ago",
+    );
+
+    vilan_core::analyzer::set_base_cache_budget(vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// M19 T1 — module reuse over a cached world
+// (`per-module-analysis-reuse.md` §4.1). The base cache decides WHICH world an
+// analysis gets; T1 decides whether that world's modules keep their checks.
+// The key is the same key — `BaseCacheKey` plus every loaded source's content
+// plus "the entry did not move this module's type slots" — so these pins
+// belong beside the ones above, and they are about the third term as much as
+// the first two.
+
+/// A package with two siblings and an entry that imports whichever the caller
+/// names. Returns the root and the entry path; the caller removes the root.
+fn write_reuse_package(name: &str) -> (PathBuf, PathBuf) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = scratch::root().join(format!(
+        "vilan_m19_reuse_{name}_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    // `loaded.vl` carries a MODULE-LOCAL Class A diagnostic — an assignment to
+    // an immutable `let`, which `check_readonly_mutation` refuses. It is the
+    // thing that has to survive being replayed.
+    std::fs::write(
+        root.join("loaded.vl"),
+        "export fun value(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal\n}\n",
+    )
+    .expect("write loaded");
+    std::fs::write(root.join("other.vl"), "export fun other(): i32 {\n\t9\n}\n")
+        .expect("write other");
+    // Never imported by any entry below: the world never loads it, so it is
+    // not in the key and not in the content validation.
+    std::fs::write(
+        root.join("unloaded.vl"),
+        "export fun spare(): i32 {\n\t3\n}\n",
+    )
+    .expect("write unloaded");
+    let entry = root.join("main.vl");
+    (root, entry)
+}
+
+/// What a reuse pin reads back: the published diagnostics, and the census
+/// `(reused, entry-dirty, world sources)` of the analysis that produced them.
+fn observe_reuse(
+    spec: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    source: &'static str,
+) -> (String, (usize, usize, usize)) {
+    let spec = spec.clone();
+    let pkg_root = pkg_root.to_path_buf();
+    let entry_path = entry_path.to_path_buf();
+    on_one_thread(move || {
+        let (_program, errors) = analyze_source(
+            source,
+            &spec,
+            &pkg_root,
+            &entry_path,
+            Some(Platform::default()),
+            &Workspace::default(),
+        );
+        (format!("{errors:?}"), vilan_core::analyzer::reuse_census())
+    })
+}
+
+const REUSE_ENTRY_A: &str = "import pkg::loaded::value;\nfun main() { let a = value(); }\n";
+const REUSE_ENTRY_B: &str = "import pkg::loaded::value;\nfun main() { let a = value() + 1; }\n";
+const REUSE_ENTRY_TWO: &str = "import pkg::loaded::value;\nimport pkg::other::other;\n\
+                               fun main() { let a = value() + other(); }\n";
+const REUSE_ENTRY_NONE: &str = "fun main() { let a = 1; }\n";
+
+/// The invalidation cases §4.1's key is built to answer, in one pin because
+/// they only mean anything against each other.
+///
+/// The claim under test is that reuse is exactly as invalidating as the world
+/// is — no more (an unloaded sibling is not in the world and must not cost
+/// anything) and no less (a loaded sibling's edit must take the record with
+/// it, never serve a stale diagnostic).
+#[test]
+fn module_reuse_follows_the_world_key_through_every_edit() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (root, entry) = write_reuse_package("key");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // 1. The first analysis is a MISS: it derives the module's diagnostic and
+    //    records it. Nothing is reused.
+    let first = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_A);
+    assert!(
+        first.0.contains("total"),
+        "the fixture must produce a module diagnostic: {}",
+        first.0
+    );
+    assert_eq!(first.1.0, 0, "a miss reuses nothing: {:?}", first.1);
+
+    // 2. EDIT THE ENTRY — the keystroke this tranche exists for. The world
+    //    hits, the modules are reused, and the module's diagnostic is
+    //    published from the record rather than re-derived.
+    let edited_entry = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        edited_entry.1.0 > 0,
+        "an entry-only edit must reuse the world's modules: {:?}",
+        edited_entry.1
+    );
+    assert_eq!(
+        first.0, edited_entry.0,
+        "the replayed diagnostic must be the derived one, byte for byte"
+    );
+
+    // 3. EDIT AN UNLOADED MODULE — a sibling no entry imports is not in the
+    //    world, not in the key, and not in the content validation, so it costs
+    //    nothing. This is the half of §4.1 that makes the coarse key
+    //    affordable.
+    std::fs::write(
+        root.join("unloaded.vl"),
+        "export fun spare(): i32 {\n\t4\n}\n",
+    )
+    .expect("edit unloaded");
+    let after_unloaded = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        after_unloaded.1.0 > 0,
+        "editing a sibling the world never loaded must not cost the reuse: \
+         {:?}",
+        after_unloaded.1
+    );
+
+    // 4. EDIT THE LOADED MODULE — the world is stale by content (E12), so it
+    //    is evicted, the analysis misses, nothing is reused, and the NEW text
+    //    is what gets checked. A replayed diagnostic here would be the stale
+    //    one, which is the failure this whole seam has to be incapable of.
+    std::fs::write(
+        root.join("loaded.vl"),
+        "export fun value(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal = 3;\n\ttotal\n}\n",
+    )
+    .expect("edit loaded");
+    let after_loaded = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert_eq!(
+        after_loaded.1.0, 0,
+        "an edited loaded module must evict the world AND the record: {:?}",
+        after_loaded.1
+    );
+    assert_ne!(
+        first.0, after_loaded.0,
+        "the analysis after a module edit must publish the EDITED module's \
+         diagnostics — two refusals now, not one"
+    );
+
+    // 5. ADD A MODULE — a different sibling set is a different world (M21), so
+    //    the record for the one-sibling world cannot be served to it.
+    let added = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_TWO);
+    assert_eq!(
+        added.1.0, 0,
+        "a new sibling is a new world: nothing to reuse yet ({:?})",
+        added.1
+    );
+    let added_again = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_TWO);
+    assert!(
+        added_again.1.0 > added.1.0,
+        "the two-sibling world's own second analysis must reuse: {:?}",
+        added_again.1
+    );
+    assert!(
+        added_again.1.2 > after_loaded.1.2,
+        "the two-sibling world must hold one more source than the one-sibling \
+         world ({} vs {})",
+        added_again.1.2,
+        after_loaded.1.2
+    );
+
+    // 6. REMOVE THE MODULES — an entry that imports no sibling is a std-only
+    //    world again, and the sibling's diagnostic goes with it.
+    let removed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_NONE);
+    assert!(
+        !removed.0.contains("total"),
+        "a module nobody imports must not be checked, let alone replayed: {}",
+        removed.0
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// The M24 / M26 interplay, which is about the record OUTLIVING or being
+/// TRUNCATED by the mechanisms either side of it.
+///
+/// M24 evicts a world for bytes. The record is a separate map, so it survives
+/// — and it must be harmless that it does: the world it described is gone, the
+/// next analysis misses and re-derives, and it publishes exactly what the
+/// replay would have.
+///
+/// M26 cancels an analysis at a phase boundary, which leaves the check phase a
+/// PREFIX of itself. A prefix recorded as if it were whole would publish a
+/// truncated module on every later hit, so a cancelled analysis records
+/// nothing at all.
+#[test]
+fn the_checks_record_survives_eviction_and_refuses_a_cancelled_phase() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (root, entry) = write_reuse_package("evict");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let budget_before = vilan_core::analyzer::base_cache_budget();
+
+    let derived = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_A);
+    assert!(derived.0.contains("total"), "{}", derived.0);
+    let replayed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        replayed.1.0 > 0,
+        "the warm analysis must reuse: {:?}",
+        replayed.1
+    );
+
+    // M24: a zero budget evicts everything the moment it is set. The record
+    // outlives the world it describes, and the next analysis — a MISS, since
+    // there is no world to hit — re-derives instead of replaying.
+    vilan_core::analyzer::set_base_cache_budget(0);
+    let after_eviction = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    vilan_core::analyzer::set_base_cache_budget(budget_before);
+    assert_eq!(
+        after_eviction.1.0, 0,
+        "reuse keys on the HIT: an evicted world cannot be reused over ({:?})",
+        after_eviction.1
+    );
+    assert_eq!(
+        derived.0, after_eviction.0,
+        "eviction may not change an answer"
+    );
+
+    // M26: an analysis cancelled before it starts stops at the PARSE boundary
+    // (`lib.rs`, `editor-latency.md` §4.2) — it never reaches `analyze`, so it
+    // stores no world and records no checks. That is the property asserted
+    // here, and it is the one that keeps the record safe: the store guard
+    // inside `analyze_over_world` refuses a cancelled phase because a
+    // truncated check sequence is a PREFIX of itself and a prefix recorded as
+    // a whole would silence a real refusal on every later hit — but nothing
+    // deterministic can reach that guard today, because the boundary above it
+    // fires first. So this leg pins the boundary: if M26 ever moves a
+    // checkpoint past the world store, the analysis after a cancel will HIT a
+    // world whose record is empty, and both assertions below go red before a
+    // truncated record can be published to anyone.
+    vilan_core::analyzer::base_cache_clear();
+    let cancelled = {
+        let spec = spec.clone();
+        let root = root.clone();
+        let entry = entry.clone();
+        on_one_thread(move || {
+            let token = vilan_core::cancel::CancelToken::new();
+            token.cancel();
+            let _scope = token.install();
+            let (program, _errors) = analyze_source(
+                REUSE_ENTRY_A,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            program.is_none()
+        })
+    };
+    assert!(
+        cancelled,
+        "the pre-cancelled analysis must produce no program"
+    );
+    let after_cancel = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert_eq!(
+        after_cancel.1.0, 0,
+        "a cancelled analysis must leave no world behind to reuse over: {:?}",
+        after_cancel.1
+    );
+    assert_eq!(
+        derived.0, after_cancel.0,
+        "a cancelled analysis must not record its truncated phase: the module \
+         reported nothing under it, and replaying that would silence a real \
+         refusal"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// M23's overlay, over the widened seam. A sibling served from the document
+/// overlay is analysis-owned; the world that loaded it takes a claim and is
+/// stored, which is what makes a keystroke in the entry hit at all. The record
+/// rides that same world — so an overlay EDIT to the sibling must evict both,
+/// exactly as a disk edit does, and the analysis after it must publish the
+/// overlay's text and not the record's memory of the previous one.
+#[test]
+fn an_overlay_served_sibling_edit_evicts_the_record_with_the_world() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (root, entry) = write_reuse_package("overlay");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let loaded = root.join("loaded.vl");
+
+    // The buffer the editor holds: the same module, one refusal.
+    vilan_core::analyzer::set_document_overlay(
+        &loaded,
+        Some("export fun value(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal\n}\n".to_string()),
+    );
+    let derived = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_A);
+    assert!(derived.0.contains("total"), "{}", derived.0);
+    let replayed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        replayed.1.0 > 0,
+        "an overlay-served world must still be hit and reused (M23): {:?}",
+        replayed.1
+    );
+    assert_eq!(derived.0, replayed.0, "the replay changed the answer");
+
+    // The editor fixes the module. Every load and every per-hit validation
+    // reads through the overlay, so the world hash-mismatches and goes — and
+    // the record goes with the answer.
+    vilan_core::analyzer::set_document_overlay(
+        &loaded,
+        Some(
+            "export fun value(): i32 {\n\tlet mut total = 1;\n\ttotal = 2;\n\ttotal\n}\n"
+                .to_string(),
+        ),
+    );
+    let fixed = observe_reuse(&spec, &root, &entry, REUSE_ENTRY_B);
+    assert!(
+        !fixed.0.contains("total"),
+        "the overlay edit must be seen: a replayed diagnostic here is the \
+         stale one, published over a buffer that no longer says it — {}",
+        fixed.0
+    );
+
+    vilan_core::analyzer::set_document_overlay(&loaded, None);
+    let _ = std::fs::remove_dir_all(&root);
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// M41: `type_id_sources` — T0's per-`TypeId` minting-source census — is
+/// ~4 bytes for every type a world ever minted, and `base_cache_world_bytes`
+/// could not see it. That made M24's LRU budget optimistic by exactly that
+/// much on every retained world, and the direction matters: a budget that
+/// under-counts what it retains is a budget the session exceeds silently.
+///
+/// Three claims, and the third is the item's:
+///
+/// 1. the split is EXHAUSTIVE — texts plus census is the very figure the
+///    budget is compared against, so neither half can quietly stop counting;
+/// 2. the census is a real, non-zero share of a std world (it is not a
+///    rounding error being accounted for form's sake);
+/// 3. **the tally MOVES when a world gains types, and moves on TYPES rather
+///    than on text.** The two sibling fixtures below are within a byte of the
+///    same length; one declares thirty-two nominals and the other is the same
+///    bulk in comments. If the tally were only a second reading of the text
+///    length — which is exactly what it was — the two worlds would be
+///    recorded as worth the same. They are not.
+#[test]
+fn the_world_tally_counts_the_type_id_census_and_moves_when_a_world_gains_types() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let root = scratch::root().join(format!("vilan_m41_census_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    // Type-dense: thirty-two nominals, each minting types of its own.
+    let mut dense = String::new();
+    for index in 0..32 {
+        dense.push_str(&format!("struct Dense{index:02} {{\n\tvalue: i32,\n}}\n"));
+    }
+    // Type-free, and the same bulk: comment lines, which mint nothing.
+    let mut sparse = String::new();
+    for index in 0..32 {
+        sparse.push_str(&format!("// sparse{index:02} .............\n//\n//\n"));
+    }
+    assert_eq!(
+        dense.len(),
+        sparse.len(),
+        "the fixtures must be the same length, or this pin reads a text \
+         difference and calls it a type difference"
+    );
+    std::fs::write(root.join("dense.vl"), &dense).expect("write dense");
+    std::fs::write(root.join("sparse.vl"), &sparse).expect("write sparse");
+    const DENSE: &str = "import std::io::print;\nimport pkg::dense::Dense00;\n\
+                         fun main() { print(1); }\n";
+    const SPARSE: &str = "import std::io::print;\nimport pkg::sparse;\n\
+                          fun main() { print(1); }\n";
+
+    let entry_path = root.join("main.vl");
+    let read_split = |spec: &PackageSpec, source: &'static str| {
+        let spec = spec.clone();
+        let pkg_root = root.clone();
+        let entry_path = entry_path.clone();
+        on_one_thread(move || {
+            // One world at a time, so the split belongs to a known program
+            // rather than to whatever an earlier test left behind.
+            vilan_core::analyzer::base_cache_clear();
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            drop(program);
+            let (texts, census) = vilan_core::analyzer::base_cache_retained_split();
+            (
+                vilan_core::analyzer::base_cache_retained_bytes(),
+                texts,
+                census,
+                format!("{errors:?}"),
+            )
+        })
+    };
+    let (dense_bytes, dense_texts, dense_census, dense_errors) = read_split(&spec, DENSE);
+    let (sparse_bytes, sparse_texts, sparse_census, sparse_errors) = read_split(&spec, SPARSE);
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+
+    println!(
+        "M41-CENSUS dense: {dense_bytes} B = {dense_texts} B texts + {dense_census} B census; \
+         sparse: {sparse_bytes} B = {sparse_texts} B texts + {sparse_census} B census"
+    );
+    assert_eq!(dense_errors, "[]", "the dense fixture must analyze clean");
+    assert_eq!(sparse_errors, "[]", "the sparse fixture must analyze clean");
+
+    // (1) Exhaustive: the two halves ARE the budgeted figure.
+    assert_eq!(
+        dense_texts + dense_census,
+        dense_bytes,
+        "the split must account for every byte the budget is compared against"
+    );
+    assert_eq!(sparse_texts + sparse_census, sparse_bytes);
+
+    // (2) Real: a std world mints thousands of types, so its census is tens of
+    // kilobytes — not zero, which is what the tally used to report.
+    assert!(
+        sparse_census > 10_000,
+        "a std world's `TypeId` census must be a real share of what it \
+         retains, not {sparse_census} B"
+    );
+
+    // (3) The item's pin. Same text, more types, bigger tally.
+    assert_eq!(
+        dense_texts, sparse_texts,
+        "the fixtures were written the same length, so the TEXT halves must \
+         agree — if they do not, the census comparison below proves nothing"
+    );
+    assert!(
+        dense_census > sparse_census,
+        "a world that gained thirty-two nominals must be recorded as worth \
+         more than one that gained the same bulk in comments: {dense_census} B \
+         is not more than {sparse_census} B"
+    );
+}
+
+/// The process CPU this process has burned, in milliseconds — every thread's,
+/// summed, read off `/proc/self/stat`'s `utime`/`stime` (fields 14 and 15).
+///
+/// Wall is not an instrument on this tree's box: the numbers below are taken
+/// beside other lanes and the load average swings by an order of magnitude
+/// between runs. `None` where the file is not there (every non-Linux host),
+/// which is why the measurement that reads it refuses rather than reporting a
+/// wall number and calling it CPU.
+fn process_cpu_ms() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The comm field can contain spaces and parentheses; everything after the
+    // LAST `)` is the space-separated remainder, whose first entry is `state`
+    // (field 3).
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    // `sysconf(_SC_CLK_TCK)` is 100 on every Linux this runs on; the value is
+    // fixed in the kernel ABI (USER_HZ), not a tunable.
+    Some((utime + stime) as f64 * 10.0)
+}
+
+fn loadavg_1m() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// M36: **the per-process floor an on-disk base cache would remove.**
+///
+/// The base cache is process-global and in memory. Inside one process the
+/// second analysis of an import set is a hit and costs almost nothing; across
+/// processes there is no cache at all, so every process that analyzes any
+/// program pays the whole cold `std` analysis again. That is what N52's split
+/// bought its schedulability with: one process per corpus program took the
+/// inference differential from 12.4 s as a single unit to 47.3 s across 128,
+/// and the release differential pays the same bill.
+///
+/// This measures the floor rather than asserting a budget on it. Cold is a
+/// cleared cache; warm is the very next analysis of the same import set,
+/// which is the cache hit an on-disk world would give the SECOND PROCESS. The
+/// difference is what a cross-process cache is worth per process, and the
+/// ratio is what says whether it is worth building.
+///
+/// **What it does not do, and why the item stays open.** Serving that hit
+/// across processes means writing a `World<'static>` to a file and reading it
+/// back. The world is a graph of `&'src str` into the parse cache's leaked
+/// module texts and of `Span` offsets into them, spread over some forty maps;
+/// nothing in the tree serializes it, and the design that would (texts plus
+/// offsets, keyed by M21's key — the std sources' content hashes and the
+/// toolchain hash — under M24's byte budget for eviction, M9's leak-soak rules
+/// for what a served world may retain, a temp-file-plus-rename write so a
+/// killed process cannot leave a half-file, and a checksum that turns a
+/// corrupt file into a MISS rather than into a wrong answer) is a tranche of
+/// its own. The number below is what that tranche would buy.
+#[test]
+#[ignore = "M36: a MEASUREMENT of the cross-process floor, not a budget — it prints the cold/warm split a cross-process world cache would remove; run deliberately"]
+fn the_cold_std_analysis_is_the_per_process_floor_an_on_disk_world_would_remove() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let load = loadavg_1m();
+
+    let (cold, warm, hits, misses) = on_one_thread(move || {
+        // Warm the process ONCE first and throw the result away: the parse
+        // cache, the interner and the allocator's arenas are per-process too,
+        // and this measurement is about the base cache alone.
+        // A realistic std closure, not a one-import toy: the floor an on-disk
+        // world removes is the BASE world's, and the base world is whatever
+        // `std` surface the program reaches. A corpus program reaches a good
+        // deal of it.
+        const WIDE_A: &str = "import std::io::print;\nimport std::list::List;\n\
+                              import std::map::Map;\nimport std::set::Set;\n\
+                              import std::json;\nimport std::math::PI;\n\
+                              fun main() { print(PI); }\n";
+        const WIDE_B: &str = "import std::io::print;\nimport std::list::List;\n\
+                              import std::map::Map;\nimport std::set::Set;\n\
+                              import std::json;\nimport std::math::PI;\n\
+                              fun main() { print(PI + 1.0); }\n";
+        vilan_core::analyzer::base_cache_clear();
+        analyze_on_this_thread(&spec, WIDE_A);
+
+        vilan_core::analyzer::base_cache_clear();
+        let (hits_before, misses_before) = stats();
+        let before = process_cpu_ms();
+        analyze_on_this_thread(&spec, WIDE_A);
+        let cold = before.zip(process_cpu_ms()).map(|(a, b)| b - a);
+        // Same import set, different body: the base-cache hit.
+        let before = process_cpu_ms();
+        analyze_on_this_thread(&spec, WIDE_B);
+        let warm = before.zip(process_cpu_ms()).map(|(a, b)| b - a);
+        let (hits_after, misses_after) = stats();
+        vilan_core::analyzer::base_cache_clear();
+        (
+            cold,
+            warm,
+            hits_after - hits_before,
+            misses_after - misses_before,
+        )
+    });
+
+    let (Some(cold), Some(warm)) = (cold, warm) else {
+        panic!(
+            "no process CPU clock on this host (no /proc/self/stat), so this \
+             measurement would be a wall number wearing a CPU label (M15)"
+        );
+    };
+    println!(
+        "M36-FLOOR profile={} cold={cold:.0} ms warm={warm:.0} ms floor={:.0} ms \
+         ({:.0}% of a cold analysis) hits={hits} misses={misses} load={load}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        cold - warm,
+        (cold - warm) / cold.max(1.0) * 100.0,
+    );
+    // The instrument, not the finding: one miss then one hit is the shape the
+    // two numbers are supposed to be, and without it they measure something
+    // else entirely.
+    assert_eq!(misses, 1, "the cold analysis must MISS exactly once");
+    assert_eq!(hits, 1, "the warm analysis must HIT exactly once");
+    // Non-vacuity: if a warm analysis cost what a cold one costs, there would
+    // be no floor to lift and nothing for M36 to build. A THIRD of a cold
+    // analysis is the bar, not half — the measured share is 46% and the point
+    // of the bar is to catch the day it goes to nothing, not to encode this
+    // run's figure as a budget.
+    assert!(
+        cold - warm > cold / 3.0,
+        "the base world is only {:.0} ms of a {cold:.0} ms cold analysis, so \
+         there is no per-process floor worth removing (warm {warm:.0} ms, \
+         loadavg {load})",
+        cold - warm,
+    );
+}
+
+// --- M44: the base cache's "under construction" claim -----------------------
+
+/// PROGRAM_C's import set with two different bodies: two members of one
+/// workspace, one base world. Deliberately the set this file already chose
+/// for reaching NO macro-defining std module — a nested macro world consults
+/// the cache on its own account, so a fixture that drags one makes the miss
+/// delta count two things at once and this pin's whole subject is the delta.
+const PROGRAM_D: &str =
+    "import std::io::print;\nimport std::math::PI;\nfun main() { print(PI); }\n";
+const PROGRAM_E: &str =
+    "import std::io::print;\nimport std::math::PI;\nfun main() { print(PI + 1.0); }\n";
+
+/// M35 put a workspace's members on their own threads and measured the price
+/// it did not pay for: every member starts cold, so N members build the SAME
+/// pre-entry world N times — 1.13× one entry's wall at +63% CPU. The world is
+/// not member-specific, so the second member should be waiting for the first's
+/// rather than racing it.
+///
+/// The window is OBSERVED rather than slept through:
+/// `base_cache_building()` reads the claim table, so the second analysis
+/// provably starts while the first is still inside its build. Without the
+/// claim this is two misses and no hit, which is what M35 measured.
+#[test]
+fn a_second_thread_waits_for_the_world_the_first_is_building() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    let waits_before = vilan_core::analyzer::base_cache_build_waits();
+
+    let first = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| observe(PROGRAM_D))
+        .expect("spawn the first member");
+
+    // Wait for the claim to exist, not for a duration: a sleep here would be
+    // a guess about how long a cold std analysis takes on a loaded box.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while vilan_core::analyzer::base_cache_building() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first analysis never claimed its key — the construction window \
+             this pin needs was never open"
+        );
+        std::thread::yield_now();
+    }
+
+    let second = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| observe(PROGRAM_E))
+        .expect("spawn the second member");
+
+    let first = first.join().expect("the first member panicked");
+    let second = second.join().expect("the second member panicked");
+
+    let (hits_after, misses_after) = stats();
+    let waits_after = vilan_core::analyzer::base_cache_build_waits();
+    assert_eq!(
+        misses_after - misses_before,
+        1,
+        "two cold members built two worlds: the second did not wait for the first's \
+         (hits +{}, misses +{}, waits +{})",
+        hits_after - hits_before,
+        misses_after - misses_before,
+        waits_after - waits_before
+    );
+    assert_eq!(
+        hits_after - hits_before,
+        1,
+        "the waiter was not served the world it waited for"
+    );
+    assert_eq!(
+        waits_after - waits_before,
+        1,
+        "nothing waited — this pin raced instead of measuring"
+    );
+    assert_eq!(
+        vilan_core::analyzer::base_cache_building(),
+        0,
+        "a claim outlived the analysis that took it"
+    );
+
+    // The waiter's answers are the answers, not just its timing.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh_first = observe(PROGRAM_D);
+    let fresh_second = observe(PROGRAM_E);
+    assert_eq!(first, fresh_first, "the builder's observations moved");
+    assert_eq!(second, fresh_second, "the waiter's observations moved");
+}
+
+/// The claim is released by a `Drop`, so an analysis that PANICS on its way
+/// out cannot leave a key claimed for the 120 s deadline — a waiter behind it
+/// would otherwise stall a whole `check`.
+#[test]
+fn a_panicking_analysis_releases_its_construction_claim() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+    let spec_for_worker = spec.clone();
+    let worker = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (program, _errors) = analyze_source(
+                    PROGRAM_D,
+                    &spec_for_worker,
+                    Path::new("."),
+                    Path::new("cache_probe.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                drop(program);
+                panic!("a deliberate unwind past the construction claim");
+            }));
+        })
+        .expect("spawn the unwinding analysis");
+    worker.join().expect("the worker itself must not abort");
+    assert_eq!(
+        vilan_core::analyzer::base_cache_building(),
+        0,
+        "the claim survived an unwind: every waiter behind it now sleeps to the deadline"
+    );
+    // And the cache still works afterwards.
+    let _ = observe(PROGRAM_E);
+}
+
+// --- M46: the recorded checks are bounded in BYTES, and evict ---------------
+
+/// Programs with distinct import sets, so each records its own world shape.
+/// Three distinct import sets, two of them distinct SIZES — 85,712 bytes of
+/// record for A and 85,712 for C, against 90,536 for B on this tree. A and B
+/// differing is what lets the eviction pin name WHICH record went: a survivors'
+/// total made of two equal weights would be satisfied by an LRU running
+/// backwards just as well.
+const RECORD_A: &str = "import std::io::print;\nfun main() { print(1); }\n";
+const RECORD_B: &str = "import std::time::sleep;\nfun main() { }\n";
+const RECORD_C: &str = "import std::math::PI;\nfun main() { let _x = PI; }\n";
+
+/// Analyzes each fixture once and clears, so the counts below are the OUTER
+/// analyses' and nothing else.
+///
+/// A first analysis of an import set that reaches a macro-DEFINING std module
+/// compiles a macro world, and that world records checks under a key of its
+/// own — so `std::time`'s first analysis adds two records where its second
+/// adds one (the macro world is served from `macro_world_cache` afterwards and
+/// re-records nothing). This file's header warns about exactly that instrument
+/// hazard for the hit/miss counters; the retained-byte counters have it too.
+fn warm_record_fixtures() {
+    for program in [RECORD_A, RECORD_B, RECORD_C] {
+        let _ = observe(program);
+    }
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// M19 T1b bounded the class D table slices by a ROW count of eight million,
+/// and said in its own comment that this was "on the order of a hundred
+/// megabytes" — a guess, because the eleven tables' rows differ in width by an
+/// order of magnitude. The bound is bytes now, and this is the accounting: a
+/// record costs what it costs, the figure comes back when the record goes, and
+/// the cache is non-empty in between (the guard against a vacuous budget pin).
+#[test]
+fn the_checked_cache_records_and_releases_what_it_retains() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let restore = vilan_core::analyzer::checked_cache_budget();
+    vilan_core::analyzer::set_checked_cache_budget(
+        vilan_core::analyzer::CHECKED_CACHE_DEFAULT_BUDGET,
+    );
+    warm_record_fixtures();
+    assert_eq!(
+        vilan_core::analyzer::checked_cache_retained(),
+        (0, 0),
+        "the clear left something behind"
+    );
+
+    let _ = observe(RECORD_A);
+    let (bytes_one, records_one) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(records_one, 1, "one world shape, one record");
+    assert!(
+        bytes_one > 0,
+        "a recorded world costs nothing, which the tables make impossible"
+    );
+
+    let _ = observe(RECORD_B);
+    let (bytes_two, records_two) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(records_two, 2, "a distinct import set is a distinct record");
+    assert!(
+        bytes_two > bytes_one,
+        "the second record retained nothing: {bytes_two} is not more than {bytes_one}"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    assert_eq!(
+        vilan_core::analyzer::checked_cache_retained(),
+        (0, 0),
+        "the bytes did not come back"
+    );
+    vilan_core::analyzer::set_checked_cache_budget(restore);
+}
+
+/// The bound EVICTS rather than clearing. The row budget's answer to pressure
+/// was `state.clear()`, so one oversized session threw away every other world
+/// shape's record and each of them paid a full class D phase again; M24 had
+/// already settled the shape for worlds and this is the same one — least
+/// recently USED goes, the record just written stays.
+///
+/// The budget is computed from the records' own measured sizes rather than
+/// guessed at, so exactly ONE record must go and which one is a claim: the
+/// budget fits A and C with half of B's bytes to spare, and B is the record
+/// nothing has touched since.
+#[test]
+fn the_checked_cache_budget_evicts_the_least_recently_used_record() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let restore = vilan_core::analyzer::checked_cache_budget();
+    vilan_core::analyzer::set_checked_cache_budget(
+        vilan_core::analyzer::CHECKED_CACHE_DEFAULT_BUDGET,
+    );
+
+    warm_record_fixtures();
+    // What each shape is worth ALONE, measured rather than assumed — the
+    // survivors' total is how this pin names WHICH record was evicted.
+    let mut alone = Vec::new();
+    for program in [RECORD_A, RECORD_B, RECORD_C] {
+        vilan_core::analyzer::base_cache_clear();
+        let _ = observe(program);
+        let (bytes, records) = vilan_core::analyzer::checked_cache_retained();
+        assert_eq!(records, 1, "one shape, one record");
+        assert!(bytes > 0, "a recorded world costs nothing");
+        alone.push(bytes);
+    }
+    let (bytes_a, bytes_b, bytes_c) = (alone[0], alone[1], alone[2]);
+    assert_ne!(
+        bytes_a, bytes_b,
+        "A and B weigh the same, so the survivors' total cannot say which one \
+         was evicted — this pin would be blind to an LRU that ran backwards"
+    );
+
+    // Three shapes under a budget that fits them all — the vacuity guard: a
+    // pin that evicts under a budget nothing could satisfy proves nothing.
+    vilan_core::analyzer::base_cache_clear();
+    let _ = observe(RECORD_A);
+    let _ = observe(RECORD_B);
+    let _ = observe(RECORD_C);
+    let (bytes_three, records_three) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(records_three, 3, "three shapes must fit the default budget");
+
+    // Touch A, so the least recently used of the three is B — and C is about
+    // to be re-written, which exempts it.
+    let _ = observe(RECORD_A);
+
+    // Room for A and C plus half of B: one record must go, and only one.
+    let budget = bytes_three - bytes_b / 2;
+    vilan_core::analyzer::set_checked_cache_budget(budget);
+    let _ = observe(RECORD_C);
+    let (bytes_after, records_after) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(
+        records_after, 2,
+        "expected exactly one eviction from {records_three} records \
+         ({bytes_three} bytes, budget {budget}), got {records_after} at {bytes_after}"
+    );
+    assert!(
+        bytes_after <= budget,
+        "the retained bytes {bytes_after} still exceed the budget {budget}"
+    );
+    // WHICH one went. The least recently used is B; evicting from the other
+    // end would have taken A, which weighs a different amount.
+    assert_eq!(
+        bytes_after,
+        bytes_a + bytes_c,
+        "the wrong record was evicted: {bytes_after} bytes survive, and A+C is \
+         {} while B+C is {} — the eviction ran from the wrong end of the \
+         recency order",
+        bytes_a + bytes_c,
+        bytes_b + bytes_c
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::set_checked_cache_budget(restore);
+}
+
+/// M24's vacuity clause, for this cache: a record larger than the whole budget
+/// bounds the map at ONE rather than switching the cache off. A one-byte
+/// budget must still serve the record just written.
+#[test]
+fn a_one_byte_checked_cache_budget_still_keeps_the_record_just_written() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let restore = vilan_core::analyzer::checked_cache_budget();
+    warm_record_fixtures();
+    vilan_core::analyzer::set_checked_cache_budget(1);
+    let _ = observe(RECORD_A);
+    let _ = observe(RECORD_B);
+    let (_, records) = vilan_core::analyzer::checked_cache_retained();
+    assert_eq!(
+        records, 1,
+        "a budget smaller than one record must bound the cache at one, not zero"
+    );
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::set_checked_cache_budget(restore);
+}
+
+/// **The measurement M46 replaced a guess with**, in the perf-baseline shape
+/// (`proposal/perf-baseline.md` §3): `#[ignore]`d, run deliberately, one
+/// `PERF {…}` JSON line per subject so two runs diff as text.
+///
+/// M19 T1b bounded the class D table slices at eight million ROWS and could
+/// only guess what that was worth ("on the order of a hundred megabytes"). The
+/// rows are counted in bytes now, and this prints them: what one world's record
+/// costs, how many of the world's modules carry a table slice, and therefore
+/// how many world shapes the default budget admits. It asserts only that the
+/// figures are non-vacuous — a measurement that fails is a measurement nobody
+/// runs.
+///
+/// ```text
+/// cargo nextest run -p vilan-core --test base_cache --run-ignored ignored-only \
+///     -E 'test(checked_cache_bytes)' --no-capture
+/// ```
+#[test]
+#[ignore = "M46: a measurement of the checked cache's bytes per world, not a gate: run deliberately (proposal/perf-baseline.md §3)"]
+fn checked_cache_bytes_per_world() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string());
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let budget = vilan_core::analyzer::CHECKED_CACHE_DEFAULT_BUDGET;
+    let mut widest = 0usize;
+    for (name, program) in [
+        ("io", RECORD_A),
+        ("time", RECORD_B),
+        ("math", RECORD_C),
+        (
+            "router",
+            "import std::router::current_path;\nfun main() { }\n",
+        ),
+        (
+            "web_wide",
+            "import std::io::print;\nimport std::router::current_path;\n\
+             import std::time::sleep;\nimport std::math::PI;\nfun main() { print(PI); }\n",
+        ),
+    ] {
+        vilan_core::analyzer::base_cache_clear();
+        let _ = observe(program);
+        let (bytes, records) = vilan_core::analyzer::checked_cache_retained();
+        widest = widest.max(bytes);
+        let worlds_in_budget = budget.checked_div(bytes).unwrap_or(0);
+        println!(
+            "PERF {{\"section\":\"checked_cache\",\"corpus\":\"{name}\",\
+             \"mode\":\"tables\",\"metric\":\"retained_bytes\",\"profile\":\"{profile}\",\
+             \"load\":\"{load}\",\"records\":{records},\"bytes\":{bytes},\
+             \"budget_bytes\":{budget},\"worlds_in_budget\":{worlds_in_budget},\
+             \"note\":\"one analysis of this import set, cache cleared first\"}}"
+        );
+    }
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        widest > 0,
+        "every subject recorded nothing — the measurement measured the harness"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M49: the enrolment record's restore condition, split.
+
+/// The shared module — and the world's OWN resource declaration, which is what
+/// makes the world half of the fingerprint non-empty and therefore worth
+/// comparing. Without it both entries agree on the empty digest and the pin
+/// would pass for a reason that has nothing to do with the split.
+/// The FNV-1a offset basis — the digest of an EMPTY nominal half, and the one
+/// value a world-half assertion must not be allowed to agree on vacuously.
+const M49_EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
+
+const M49_MODULE: &str = "[resource] struct Held { slot: i32 }\n\n\
+                          export fun make(slot: i32): Held {\n\tHeld { slot = slot }\n}\n\n\
+                          export fun value(): i32 {\n\tlet total = 1;\n\ttotal\n}\n\n\
+                          export fun doubled(): i32 {\n\tvalue() * 2\n}\n";
+/// The entry that DECLARES a resource. Its nominal set is std's plus `Handle`.
+const M49_ENTRY_RESOURCE: &str = "import pkg::loaded::value;\n\
+                                  [resource] struct Handle { slot: i32 }\n\
+                                  fun main() {\n\
+                                  \tlet held = Handle { slot = value() };\n}\n";
+/// The entry that declares NONE. Same world, same key, same world-declared
+/// nominals — and a different whole set, which is what used to reject the
+/// record above.
+const M49_ENTRY_PLAIN: &str = "import pkg::loaded::value;\n\
+                               fun main() {\n\tlet n = value() + 1;\n}\n";
+
+/// M49: **two entries of one package that differ in a `resource` declaration
+/// stop invalidating each other's enrolment record.**
+///
+/// M19 T1c's restore condition was one digest over the WHOLE resource-reaching
+/// nominal set, and that set is whole-program — so an entry that declares a
+/// `resource` and a sibling entry that does not mint different digests over the
+/// same world, and each analysis threw the other's per-module enrolment away
+/// and re-walked every module body in the program. The gate is the drop
+/// planner's whole price (M42: 950–1,230 ms of 1,095–1,385 on kolt's client),
+/// so "rejected" means "paid again".
+///
+/// The condition is the WORLD-declared half now. The pin states the split as a
+/// property rather than as its consequence — the two analyses agree on the
+/// world half and DIFFER on the entry half — and then asserts the consequence
+/// too, because the property alone would still hold if the condition quietly
+/// went back to comparing both halves.
+#[test]
+fn two_entries_differing_in_a_resource_declaration_share_one_enrolment_record() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let root = scratch::root().join(format!("vilan_m49_split_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("loaded.vl"), M49_MODULE).expect("write module");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // `(diagnostics, bodies the gate walked, (world, entry) fingerprints)` — the
+    // last two are thread-locals written by the analysis, so they are read on
+    // the analysis's own thread.
+    let observe = |entry_name: &'static str, source: &'static str| {
+        let spec = spec.clone();
+        let root = root.clone();
+        on_one_thread(move || {
+            let entry = root.join(entry_name);
+            let (_program, errors) = analyze_source(
+                source,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            (
+                format!("{errors:?}"),
+                vilan_core::drop_plan_stats::asked_roots(),
+                vilan_core::drop_plan_stats::nominals_fingerprints(),
+            )
+        })
+    };
+
+    // 1. The resource-declaring entry, cold: it derives every module's
+    //    enrolment and records it.
+    let first = observe("with_resource.vl", M49_ENTRY_RESOURCE);
+    assert_eq!(first.0, "[]", "the resource entry must analyze clean");
+    assert!(
+        first.1 > 100,
+        "a cold analysis walks the whole world's bodies, not {}",
+        first.1
+    );
+    assert_ne!(
+        first.2.0, M49_EMPTY_DIGEST,
+        "the world must declare a resource of its own, or the world halves \
+         agree vacuously: {:?}",
+        first.2
+    );
+
+    // 2. The sibling entry that declares nothing, over the same world.
+    let second = observe("plain.vl", M49_ENTRY_PLAIN);
+    assert_eq!(second.0, "[]", "the plain entry must analyze clean");
+
+    // The split, stated: same world-declared nominals, different entry-declared
+    // ones. If the halves are ever re-merged, this pair is exactly the input
+    // that makes the merged digest differ.
+    assert_eq!(
+        first.2.0, second.2.0,
+        "the two entries share a world, so the WORLD-declared nominal \
+         fingerprints must agree: {:?} vs {:?}",
+        first.2, second.2
+    );
+    assert_ne!(
+        first.2.1, second.2.1,
+        "one entry declares a resource and the other does not, so the \
+         ENTRY-declared fingerprints must differ — otherwise this fixture is \
+         not testing the split: {:?} vs {:?}",
+        first.2, second.2
+    );
+
+    // The consequence: the second entry's gate walks only what it brought.
+    assert!(
+        second.1 * 10 < first.1,
+        "the plain entry must restore the resource entry's enrolment rather \
+         than re-walking the world: {} bodies asked against {}",
+        second.1,
+        first.1
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// M52: what M44's "under construction" claim reaches, and what it does not.
+
+const M52_MODULE: &str = "export fun value(): i32 {\n\t7\n}\n";
+/// Three legs, ONE seed set: the shape M44 was measured on.
+const M52_SAME_A: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value()); }\n";
+const M52_SAME_B: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value() + 1); }\n";
+const M52_SAME_C: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                          fun main() { print(value() * 2); }\n";
+/// Three legs, THREE seed sets: kolt's shape. Same package, same sibling, and
+/// three different `std::` reference sets — `io`, `math`, and both.
+const M52_DIFFERENT_A: &str = "import std::io::print;\nimport pkg::shared::value;\n\
+                               fun main() { print(value()); }\n";
+const M52_DIFFERENT_B: &str = "import std::math::PI;\nimport pkg::shared::value;\n\
+                               fun main() { let x = PI; let y = value(); }\n";
+const M52_DIFFERENT_C: &str = "import std::io::print;\nimport std::math::PI;\n\
+                               import pkg::shared::value;\n\
+                               fun main() { print(value()); let x = PI; }\n";
+
+/// M52: **a package's legs share one base world exactly when their seed sets
+/// agree — which is the whole of what M44 reaches, and why it is inert on
+/// kolt.**
+///
+/// M44 gave the base cache an "under construction" claim so a second member
+/// starting cold WAITS for the first member's world instead of building a
+/// second copy of it, and measured a four-leg generated workspace at Ir −13.5%
+/// with two legs' `base` phase going 31/35 ms → 0. Every leg of that fixture
+/// had one seed set. A real application does not: kolt's three entries
+/// reference `{asset, json, router, rpc, storage}`, `{asset, build, document,
+/// http, json, range, rpc_server}` and `{json, range, rpc, time}` — one module
+/// in common — so they mint three keys and no leg ever waits for another.
+///
+/// A HIT is what "the `base` phase is ~0" means (M21: kolt's `views.vl` went
+/// `base` 156–586 ms miss-every-time to 0.0 ms from the second analysis), so
+/// the pin is stated in retained worlds and hit/miss deltas rather than in
+/// milliseconds: it needs no clock, and it says the same thing.
+///
+/// Both halves are here because either alone is misleading. The first is M44
+/// working; the second is the shape it does not reach, and it must red if a
+/// future coarser key ever makes three seed sets share one world — that would
+/// be a world holding modules a leg never imported, which is a different claim
+/// about observation identity from the one `a_distinct_import_set_misses`
+/// makes, and it should not happen quietly.
+#[test]
+fn a_packages_legs_share_one_world_exactly_when_their_seed_sets_agree() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = scratch::root().join(format!("vilan_m52_legs_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    std::fs::write(root.join("shared.vl"), M52_MODULE).expect("write module");
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let leg = |entry_name: &'static str, source: &'static str| {
+        let spec = spec.clone();
+        let root = root.clone();
+        on_one_thread(move || {
+            let entry = root.join(entry_name);
+            let (_program, errors) = analyze_source(
+                source,
+                &spec,
+                &root,
+                &entry,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            format!("{errors:?}")
+        })
+    };
+
+    // 1. Three legs, one seed set. The first misses and builds; the other two
+    //    are served its world, which is the `base` phase going to nothing.
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    assert_eq!(leg("same_a.vl", M52_SAME_A), "[]");
+    assert_eq!(leg("same_b.vl", M52_SAME_B), "[]");
+    assert_eq!(leg("same_c.vl", M52_SAME_C), "[]");
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        1,
+        "one seed set is one world, however many legs the package has"
+    );
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (2, 1),
+        "the first leg builds and the other two are served — that is what M44 \
+         measured and what a `base` phase of ~0 means"
+    );
+
+    // 2. Three legs, three seed sets — kolt's shape. Each builds its own world
+    //    and no leg waits for another, so M44's claim never fires.
+    vilan_core::analyzer::base_cache_clear();
+    let (hits_before, misses_before) = stats();
+    assert_eq!(leg("diff_a.vl", M52_DIFFERENT_A), "[]");
+    assert_eq!(leg("diff_b.vl", M52_DIFFERENT_B), "[]");
+    assert_eq!(leg("diff_c.vl", M52_DIFFERENT_C), "[]");
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained(),
+        3,
+        "three seed sets are three worlds — M44 is inert here, and a coarser \
+         key that made this 1 would be serving a leg a world holding modules it \
+         never imported"
+    );
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (0, 3),
+        "no leg is served another's world when the seed sets differ"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `[service]` ENTRY, twice: the second analysis is served from the cache.
+///
+/// M72. The bypass predates the derive/macro hoist (§6.13): a `[service]`
+/// expanded inside the world-building loop, so its generated impls would have
+/// been stored in the world and leaked into the next entry's analysis. Since
+/// the hoist a cacheable entry expands through `expand_entry_over_world`,
+/// AFTER the store, exactly as a `[derive]` user does — and the only thing a
+/// service asks of the LOAD is `std::rpc`, which is seeded into the key beside
+/// the entry's written `std::` references, so a service world is never handed
+/// to an entry that wrote no service.
+///
+/// The cost this pin protects is kolt's: `store.vl` is a `[service]` entry and
+/// paid its package's whole pre-entry world on every keystroke, with 0 hits and
+/// 0 misses because it never consulted the cache at all.
+const SERVICE_A: &str = "import std::reactive::{ Signal, SignalCell };\n\
+                         [service(TickClient)]\n\
+                         struct Ticker {\n\t[expose] latest: SignalCell<i53>,\n}\n\
+                         impl Ticker {\n\t[rpc]\n\tfun record(self, at: i53): i53 {\n\t\tat\n\t}\n}\n\
+                         fun main() {\n\tlet _ticker = Ticker { latest = Signal::new(0i53) };\n}\n";
+const SERVICE_B: &str = "import std::reactive::{ Signal, SignalCell };\n\
+                         [service(TickClient)]\n\
+                         struct Ticker {\n\t[expose] latest: SignalCell<i53>,\n}\n\
+                         impl Ticker {\n\t[rpc]\n\tfun record(self, at: i53): i53 {\n\t\tat + 1\n\t}\n}\n\
+                         fun main() {\n\tlet _ticker = Ticker { latest = Signal::new(1i53) };\n}\n";
+
+#[test]
+fn a_service_entry_hits_the_cache_on_its_second_analysis() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+
+    let first = observe(SERVICE_A);
+    assert_eq!(first.0, "[]", "the service fixture compiles");
+    let (hits_before, misses_before) = stats();
+    let cached = observe(SERVICE_B);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        hits_after - hits_before,
+        1,
+        "a `[service]` entry's second analysis must be SERVED, not bypassed \
+         (0 hits and 0 misses is the bypass this pin retires)"
+    );
+    assert_eq!(
+        misses_after, misses_before,
+        "a hit is not also a miss for a service entry"
+    );
+
+    // And the served world answers identically to a fresh one — the whole
+    // reason the bypass existed.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh = observe(SERVICE_B);
+    assert_eq!(cached.0, fresh.0, "diagnostics differ cached vs fresh");
+    assert_eq!(cached.1, fresh.1, "warnings differ cached vs fresh");
+    assert_eq!(cached.2, fresh.2, "emitted JS differs cached vs fresh");
+}
+
+/// A service world is never handed to an entry that wrote no service: the
+/// `std::rpc` the `[service]` scan seeds is part of the key, so the two entries
+/// below are two worlds even though their written imports are identical.
+const SERVICE_NEIGHBOUR: &str = "import std::reactive::{ Signal, SignalCell };\n\
+                                 fun main() {\n\tlet _cell: SignalCell<i53> = Signal::new(0i53);\n}\n";
+
+#[test]
+fn the_service_seed_is_part_of_the_world_key() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+
+    let _ = observe(SERVICE_A);
+    let (hits_before, misses_before) = stats();
+    let neighbour = observe(SERVICE_NEIGHBOUR);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(neighbour.0, "[]", "the neighbour fixture compiles");
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (0, 1),
+        "an entry with no `[service]` must not be served the service world \
+         (`std::rpc` is loaded there and nowhere in this entry's own seeds)"
+    );
+    vilan_core::analyzer::base_cache_clear();
 }

@@ -25,6 +25,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 /// The npm scope every package in this channel lives under — the bare name
 /// `vilan` is blocked by npm's similarity rule (distribution.md, amendment
 /// 2026-07-25).
@@ -92,7 +94,7 @@ struct Install {
 
 impl Install {
     fn new(name: &str, layout: Layout) -> Install {
-        let root = std::env::temp_dir().join(format!("vilan-npm-{name}-{}", std::process::id()));
+        let root = support::scratch_root().join(format!("vilan-npm-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let modules = root.join("node_modules").join(SCOPE);
         let meta = modules.join("vilan");

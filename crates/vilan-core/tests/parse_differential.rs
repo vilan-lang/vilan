@@ -160,18 +160,18 @@ fn collect_markdown(dir: &Path, into: &mut Vec<PathBuf>) {
 /// Whole-file S3 constructs that the repo corpus happens NOT to exercise (so the
 /// file-derived sweep never reaches them), each a clean program the parser must
 /// accept. Only PARSED here (types need not resolve), so bare type names are fine.
-/// This closes the corpus's coverage gaps — notably `[trait_only]` / `[doc(hidden)]`
-/// (zero corpus uses) and the tuple-bound endpoint variants — alongside the
-/// (durable) in-module pins in `parsing.rs`.
+/// This closes the corpus's coverage gaps — notably `[trait_only]` (zero corpus
+/// uses) and the tuple-bound endpoint variants — alongside the (durable)
+/// in-module pins in `parsing.rs`. (`[doc(hidden)]` was the other one until
+/// B318 retired it: it is a refusal now, pinned in `inference/generics.rs`.)
 fn corpus_absent_constructs() -> Vec<(String, String)> {
     [
-        // The two attributes with zero corpus uses.
+        // The attribute with zero corpus uses.
         ("trait_only", "trait Surface { [trait_only] fun hidden(&self): i32; }"),
-        ("doc_hidden", "[doc(hidden)] fun helper(): i32 { 0 }"),
         // Every function attribute at once, in the one legal (fixed) order.
         (
             "all_attributes",
-            "[extern(\"m\", \"s\")] [must_use] [rpc] [trait_only] [doc(hidden)] [platform(\"@process\", \"browser\")] external fun everything(): i32;",
+            "[extern(\"m\", \"s\")] [must_use] [rpc] [trait_only] [platform(\"@process\", \"browser\")] external fun everything(): i32;",
         ),
         // Tuple-bound endpoint variants: both, hi-only, and an element bound.
         ("tuple_bound_both", "fun a<T: (2..10)>(): T { default() }"),
@@ -208,8 +208,8 @@ fn corpus_absent_constructs() -> Vec<(String, String)> {
         ),
         // The `null`-named bodyless external struct and the full resource modifier.
         ("external_null", "external struct null;"),
-        ("resource_external", "resource external struct Handle;"),
-        ("resource_enum", "resource enum State { Open, Closed }"),
+        ("resource_external", "[resource] external struct Handle;"),
+        ("resource_enum", "[resource] enum State { Open, Closed }"),
         // An enum with negative + explicit discriminants alongside a payload.
         (
             "enum_discriminants",
@@ -318,12 +318,14 @@ fn normalized_tokens(source: &str) -> Option<Vec<Token<'_>>> {
     }
     let tokens: Vec<Token<'_>> = spanned.into_iter().map(|(token, _span)| token).collect();
     // A trailing comma before a closer is insignificant in vilan — the formatter
-    // may normalize it in or out, so the safety check ignores it.
+    // may normalize it in or out, so the safety check ignores it. `>` closes a
+    // generic argument list, which is allow-trailing in the grammar and which
+    // E217's split `impl` header writes a trailing comma into.
     let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
     for token in tokens {
         if matches!(
             token,
-            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']')
+            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('>')
         ) {
             while let Some(Token::Ctrl(',')) = result.last() {
                 result.pop();
@@ -331,7 +333,34 @@ fn normalized_tokens(source: &str) -> Option<Vec<Token<'_>>> {
         }
         result.push(token);
     }
-    Some(result)
+    // A struct-literal field written long — `x = x` — is the shorthand `x`
+    // (E143), and the formatter canonicalizes one into the other, so the check
+    // reduces both spellings. Recognized by shape, opened by `{` or `,` and
+    // closed by `,` or `}`; re-implemented here rather than imported, like
+    // everything else in this function, because a tripwire that shares the
+    // implementation it watches proves nothing.
+    let mut collapsed: Vec<Token<'_>> = Vec::with_capacity(result.len());
+    let mut index = 0;
+    while index < result.len() {
+        let opened = matches!(collapsed.last(), Some(Token::Ctrl('{') | Token::Ctrl(',')));
+        let long_form = matches!(
+            (
+                result.get(index),
+                result.get(index + 1),
+                result.get(index + 2),
+                result.get(index + 3),
+            ),
+            (
+                Some(Token::Ident(name)),
+                Some(Token::Op("=")),
+                Some(Token::Ident(read)),
+                Some(Token::Ctrl(',') | Token::Ctrl('}')),
+            ) if name == read
+        );
+        collapsed.push(result[index].clone());
+        index += if opened && long_form { 3 } else { 1 };
+    }
+    Some(collapsed)
 }
 
 fn corpus_files() -> Vec<PathBuf> {
@@ -441,23 +470,26 @@ fn formatter_output_token_matches_input() {
 
 /// The corpus files the formatter currently BAILS on, by base name (sorted).
 ///
-/// Detector: `format` is a total canonicalizer over parseable input, so it must
-/// map a source and a token-preserving perturbation of it to the SAME output.
-/// Appending blank lines is such a perturbation (trailing newlines are trivia,
-/// always normalized away, and change no comment). If `format(source)` and
-/// `format(source + "\n\n")` DIFFER, the formatter bailed on this file — it
-/// returned each input verbatim (with the extra newlines surviving) instead of
-/// canonicalizing. A truly-canonical file is NOT flagged: both map to itself.
-/// (Verified: every flagged file returns BOTH inputs verbatim — `format(x)==x` —
-/// while controls strip the perturbation, the clean bail-vs-canonical signal.)
+/// Detector: `formatter::reprint` — [`formatter::format`]'s honest half (N90).
+/// It answers the reprint, or the [`formatter::Decline`] saying which of the
+/// four ways out it took, so a bail is READ here rather than inferred.
+///
+/// It used to be inferred, and the inference was sound but indirect: `format`
+/// is a total canonicalizer over parseable input, so it must map a source and a
+/// token-preserving perturbation of it (two appended blank lines — trivia,
+/// always normalized away, changing no comment) to the SAME output; a file
+/// where the two DIFFER was returned verbatim, which is a bail. That flagged
+/// the right files and could not say WHAT the printer met, which is the half
+/// `Decline` adds — so a bail this gate reports now names its own construct and
+/// the line it is on, and a file that merely does not parse is told apart from
+/// a printer gap instead of being counted as one.
 fn current_bail_set() -> Vec<String> {
     let mut bails: Vec<String> = formattable_files()
         .into_iter()
         .filter_map(|path| {
             let source = std::fs::read_to_string(&path).ok()?;
-            let base = formatter::format(&source);
-            let perturbed = formatter::format(&format!("{source}\n\n"));
-            (base != perturbed).then(|| label(&path))
+            let declined = formatter::reprint(&source).err()?;
+            Some(format!("{} ({})", label(&path), declined.sentence()))
         })
         .collect();
     bails.sort();

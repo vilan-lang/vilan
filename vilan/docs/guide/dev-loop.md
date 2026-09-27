@@ -113,6 +113,15 @@ A swap re-evaluates the whole client bundle. Two things survive it:
   In a full-stack app that is *most* of your durable state, which is why the
   swap can afford to be simple about the rest.
 
+A `lazy let` carries its value too, once it *has* one. Its thunk never
+crosses — that closure belongs to the old bundle — so what travels is the
+forced value, written straight into the new bundle's own cell: the binding
+reads as already initialized and the new initializer never runs, exactly as
+an eager binding's does. A lazy binding nothing had forced yet carries
+nothing and stays deferred on the other side, which is the same answer as
+before it was touched: the first read after the swap is the first read, and
+it runs the *new* bundle's initializer.
+
 Top-level bindings like these keep their live values while you edit the view
 that renders them:
 
@@ -499,7 +508,7 @@ takes:
 import std::option::Option::{ None, Some, self };
 import std::reactive::{ Signal, SignalCell };
 import std::router::{ chunk_error, current_path, pending, segments };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, mount_root, swap, view };
 
 [derive(PartialEq)]
 enum Route {
@@ -531,10 +540,10 @@ fun main() {
 				Some(let reason) => "Could not load that page: " + reason,
 				None => "",
 			})))
-			.swap(route, |current| match current {
+			.child(swap(route, |current| match current {
 				Route::Home => home_page(),
 				Route::NotFound => missing_page(),
-			})
+			}))
 	});
 }
 ```

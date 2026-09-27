@@ -20,7 +20,16 @@ trait FromJson {                                           // decode
 ```
 
 `[derive(Json)]` implements both from a struct/enum's shape; scalars,
-`List`, and `Option` nest.
+`List`, `Option` and `Result` nest.
+
+`Result<T, E>` is Json when both arms are, and it is spelled the way the
+codecs spell it: externally tagged by variant NAME, `Ok(7)` as
+`{"Ok":7}` and `Err("nope")` as `{"Err":"nope"}`. That is the same text
+`[derive(Json)]` gives a one-payload variant and the same text the wire
+layer's `Result` writes, so one value crosses `to_json`, `encode_json`
+and the binary codec under one encoding. Decoding checks the shape
+before the tag: a document that is not an object, and a tag the type
+does not declare, are both decode errors.
 
 Encoding (`to_json`) is total, but **decoding is fallible**: the input is
 untrusted, so a missing field, a wrong-shaped value, or text that isn't
@@ -33,6 +42,14 @@ The two decode methods differ in what they take, not in what they answer:
 `from_json_value`, which validates an already-parsed value's shape. That
 is the one to call when a value is nested inside another decode, and the
 one to write when implementing the trait by hand.
+
+The scalar lanes check the VALUE and not only the JSON kind, and it is the
+same rule the codec reader applies: an integer lane wants a whole number
+(`i32::from_json("1.5")` is `Err`), and an unsigned one wants a
+non-negative one (`u32::from_json("-1")` is `Err`). A derived type's field
+decodes through its own type's `from_json_value`, so a struct field gets
+the rule too. The magnitude is deliberately not checked: `i32`/`u32` are
+the runtime's numeric lanes rather than hardware widths.
 
 ```vilan
 import std::json::{ Json, FromJson, JsonValue, parse_json_value };
@@ -176,9 +193,20 @@ fun main() {
 The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 
 - `trait Serialize` / `trait Deserialize`: visitor-style value
-  description (`begin_struct`/`field`/`str_value`/`i53_value`/…). The
-  wire scalars: `str`, `bool`, `i32`, `u32`, `i53`, `f64` (+ lists,
-  options, structs, enum variants).
+  description (`begin_struct`/`field`/`str_value`/`i53_value`/…), every
+  method on `&mut self` — a visitor is *written to* as a value narrates
+  itself. The
+  wire scalars are `str`, `bool` and the whole sized numeric family —
+  `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i53`, `u53`, `usize`, `f32`,
+  `f64` — plus lists, options, results, maps, structs and enum variants.
+  The visitor itself has six scalar lanes and the sized widths ride the
+  one that holds them exactly (`i8`/`i16` on `i32`, `u8`/`u16` on `u32`,
+  `u53` on `i53`, `f32` on `f64`), so every round trip is lossless and
+  no codec grows a method per width. `usize` is the exception, and a
+  deliberate one: it rides the **`i32`** lane, the width a length or a
+  position has always had on the wire, so a frame does not grow by four
+  bytes a position when a position is respelled `usize`. A `usize` past
+  `i32::MAX` cannot be described.
 - `Frame`: one encoded message.
 - `Codec`: a matched writer/reader pair, `json_codec()` (`std::json`,
   readable) or `binary_codec()` (`std::binary`, compact). Client and
@@ -187,6 +215,125 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 `[derive(Wire)]` requires every field to be Wire, recursively, checked at
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
 types with a custom encoding.
+
+**A reader ENFORCES the type it is asked for.** The frame is text a
+stranger chose, so a read whose value is of the wrong JSON kind poisons the
+reader with a reason naming what was expected and what was found —
+`expected a number, found a string` — and every later read answers its
+zero value. The integer lanes additionally want a WHOLE number, and the
+unsigned ones a non-negative one, because `1.5` typed `i32` is a value
+outside its own type. A list opened with `begin_list` and closed with
+`end_list` must have had all of its elements read; a list SHORTER than the
+reads is caught by the same gate, since the read runs into the enclosing
+value. `failed()` is where that shows up, and it is what the rpc route
+consults between decoding a call's arguments and running the handler — so
+a malformed call answers a `Decode` failure rather than running an
+implementation on zero values.
+
+### Writing a `Wire` impl by hand
+
+`Wire` is two methods, and the visitor is a `&mut` view in both:
+
+```vilan,fragment
+trait Wire {
+	fun describe<S: Serialize>(self, serializer: &mut S);
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Self;
+}
+```
+
+The VALUE is by-value `self` — describing reads it. The VISITOR is
+`&mut`, because narrating into it is what moves its cursor. Inside the
+body the parameter already *is* the view, so a nested `describe` or
+`rebuild` forwards it **bare**:
+
+```vilan,fragment
+impl Pair with Wire {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
+		serializer.begin_struct(2);
+		serializer.field("left");
+		self.left.describe(serializer);     // bare: already a view
+		serializer.field("right");
+		self.right.describe(serializer);
+		serializer.end_struct();
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Pair {
+		deserializer.begin_struct();
+		deserializer.field("left");
+		let left = i32::rebuild(deserializer);
+		deserializer.field("right");
+		let right = str::rebuild(deserializer);
+		deserializer.end_struct();
+		Pair { left = left, right = right }
+	}
+}
+```
+
+`&mut serializer` appears only where you hold the visitor by VALUE — a
+`Serializer`/`Deserializer` record handed to you by a `Codec`, or one of
+rpc's `|Serializer| void` describer closures. There the record is a bag
+of closures over the codec's own writer, so a `mut` re-binding costs a
+copy of the bag and writes through to the same writer:
+
+```vilan,fragment
+// An rpc describer closure: by value in, `&mut` at the call.
+[|mut serializer: Serializer| id.describe(&mut serializer)]
+```
+
+`encode_json`/`decode_json`/`encode_binary`/`decode_binary` do this for
+you and are the paths to prefer.
+
+It gives you the wire codec and nothing else: a type that also needs
+`to_json`/`from_json` asks for both, `[derive(Json, Wire)]`. The two are
+separate trait families with separate field rules — `Map` and any
+hand-written `impl … with Wire` type are Wire and are not Json — so a
+`Wire` derive that quietly emitted a JSON codec as well would refuse
+fields the wire boundary admits, in `to_json`'s vocabulary rather than
+Wire's.
+
+`Wire` is a trait like any other, and what counts as Wire is what an
+`impl … with Wire` applies to — the derive is one way to get one, not the
+definition. A conditional impl's own binder bounds are what recurse into
+the arguments, so `impl Pair<type A: Wire, type B: Wire> with Wire`
+demands both and `impl Handle<type T> with Wire` demands neither.
+
+`Result<T, E>` is Wire when both arms are, and narrates in `Option`'s
+vocabulary: an externally-tagged `{"Ok": …}` / `{"Err": …}` over JSON, a
+tagged variant over the binary codec. That makes a fallible reply an
+ordinary payload — `[rpc] fun lookup(self, id: u53): Result<Row, str>`
+needs nothing hand-written. An unrecognized tag is a sticky decode
+failure, so `decode` answers `Err(reason)` rather than panicking on a
+malformed frame. `std::json`'s direct pair writes the same tags, so the
+two spellings of a `Result` are one encoding.
+
+`Map<K, V>` is Wire when both its key and its value are (the key is
+already `Hashable` by the type's own bound). It narrates as a list of
+`{key, value}` pairs — codec-neutral, readable in JSON, and
+insertion-ordered in both directions.
+
+### Keyed collections
+
+Two more names carry the *keyed* half of the reactive protocol
+(`[expose(keyed)]`, see the [services guide](../guide/services.md#keyed-mirrors-exposekeyed)):
+
+```vilan,fragment
+trait Keyed<K> {
+	fun key(self): K;
+}
+
+enum Delta<K, T> {
+	Reset(List<T>),      // the collection BECOMES this
+	Insert(K, T, usize), // a new element at an index (on the wire at i32's width); a key already held is replaced
+	Update(K, T),        // the element under this key takes a new value
+	Remove(K),           // the element under this key is gone
+}
+```
+
+`Keyed` is what makes two snapshots of a collection comparable element by
+element: without it, the only thing a channel can say is "here is the
+whole value again". `Delta` is what it says instead. `Update` and `Remove`
+name a key that must already be present — an absent one is a protocol
+error, not a silent no-op.
 
 ### Backed enums on the wire
 
@@ -212,11 +359,11 @@ the binary codec, crypto, and websockets:
 ```vilan,fragment
 impl Bytes {
 	fun alloc(size: i32): Bytes
-	fun len(self): i32
-	fun get(self, index: i32): i32
-	fun set(self, index: i32, value: i32)
-	fun slice(self, from: i32, to: i32): Bytes
-	fun fill(self, value: i32, from: i32, to: i32): Bytes
+	fun len(self): usize
+	fun get(self, index: usize): i32
+	fun set(self, index: usize, value: i32)
+	fun slice(self, from: usize, to: usize): Bytes
+	fun fill(self, value: i32, from: usize, to: usize): Bytes
 	fun copy_into(self, source: Bytes, offset: i32)
 	fun concat(a: Bytes, b: Bytes): Bytes     // static
 	fun to_hex(self): str
@@ -239,8 +386,20 @@ fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str>
 struct BinaryWriter { … }   // write_byte / write_i32 / write_str / finish(): Bytes
 ```
 
+Its writers take `&mut self` and keep their state in plain fields, like
+`std::json`'s.
+
 Same model as JSON, compact layout. `i53` values ride as f64 bit patterns,
 exact to 2^53.
+
+**The reader validates too**, and the format is schema-ORDERED, so what it
+validates is the bytes rather than a kind: a read past the buffer, a length
+prefix claiming more than the frame holds, an `Option` marker or a `bool` byte
+that is neither `0` nor `1`, and a frame LONGER than the value it declares —
+bytes left over are bytes the two sides disagree about, and reading a prefix as
+the whole is how a caller gets a value that was never sent. Each is a sticky
+failure naming what was expected and what was found, exactly as the JSON
+reader's are.
 
 ## Base64 (`std::base64`)
 

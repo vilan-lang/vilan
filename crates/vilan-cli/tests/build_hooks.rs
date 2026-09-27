@@ -35,7 +35,7 @@ mod support;
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_hooks_cli_{tag}_{}_{unique}",
         std::process::id()
     ));
@@ -1130,6 +1130,19 @@ fn watch_manifest_failing(command: &str) -> String {
     )
 }
 
+/// A hook command that takes a few seconds, in the platform's shell — the
+/// widened round B208's queued-during-a-round pin needs, so an edit the test
+/// makes the moment it sees the hook START lands INSIDE the round rather than
+/// after it. `ping` rather than `timeout` on Windows: `timeout` refuses to run
+/// without a console, which a spawned hook does not have.
+fn slow_command() -> String {
+    if cfg!(windows) {
+        "ping -n 4 127.0.0.1 >nul".to_string()
+    } else {
+        "sleep 3".to_string()
+    }
+}
+
 /// A hook command that fails ONCE and then succeeds: while `marker` exists it
 /// removes it and exits non-zero, so the very next invocation passes. The
 /// transient failure G14 is about, made deterministic — no sleeps, no load
@@ -1162,12 +1175,20 @@ fn fail_while(marker: &str, attempts: &str) -> String {
 /// section has had was undiagnosable precisely for want of that log; the
 /// name is not `.vl` and not a declared input, so the watched set is
 /// unperturbed.
+///
+/// `VILAN_WATCH_LOG` turns on the loop's own trace beside it (B208): the
+/// narration says a round happened, and only the trace says what the POLL saw
+/// — which entries moved, which did not, and whether the loop was polling at
+/// all. N46's strike was "round 2 never fired", a symptom four different bugs
+/// share, and it was unfalsifiable without this. Both files are named so they
+/// are neither `.vl` nor a declared input, so the watched set is unperturbed.
 fn spawn_watch(dir: &Path) -> Watcher {
     let log = std::fs::File::create(dir.join("watch.log")).expect("create watch.log");
     Watcher(
         Command::new(env!("CARGO_BIN_EXE_vilan"))
             .args(["build", "--watch", dir.to_str().unwrap()])
             .env("NO_COLOR", "1")
+            .env("VILAN_WATCH_LOG", dir.join("watch-trace.log"))
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()
@@ -1183,7 +1204,7 @@ fn spawn_watch(dir: &Path) -> Watcher {
 /// verdict rather than a mystery (the first Windows red here cost a blind
 /// diagnosis for want of exactly this).
 fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duration {
-    wait_nudged(dir, label, || {}, condition)
+    wait_nudged(dir, label, |_attempt| {}, condition)
 }
 
 /// [`wait_for_in`], re-invoking `nudge` every ~20 s while it waits. A one-shot
@@ -1199,6 +1220,18 @@ fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duratio
 /// this is belt-and-braces against the shapes that remain (a filesystem whose
 /// mtime granularity swallows a rewrite, a snapshot read racing a write).
 ///
+/// **The nudge is handed its attempt number, and every file-writing caller
+/// uses it** (B208). A nudge that rewrote IDENTICAL BYTES could rescue a lost
+/// round only at the mtime gate, because that is the only gate identical bytes
+/// move: the watcher polls mtimes, but the freshness stamp digests CONTENT, so
+/// a hook whose stamp had swallowed the edit stayed `Fresh` through every
+/// re-touch — rounds firing, the hook never running, and re-touching provably
+/// unable to help however long the bound was. That is the shape of the strike
+/// B208 was filed on, and a rescue that cannot reach the second gate is a
+/// rescue that hides which gate failed. Writing new bytes each time re-triggers
+/// both and weakens nothing: every pin here asserts a COUNT of runs, never the
+/// content of the file it counted.
+///
 /// Two callers never use it, each for its own reason: the negative pin, whose
 /// whole claim is that nothing fires, and the retry pins, whose claim is that
 /// the RETRY landed the change — a re-touch there would start a fresh round
@@ -1206,24 +1239,27 @@ fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duratio
 fn wait_nudged(
     dir: &Path,
     label: &str,
-    nudge: impl Fn(),
+    nudge: impl Fn(u32),
     condition: impl Fn() -> bool,
 ) -> Duration {
     let started = Instant::now();
     let mut last_nudge = Instant::now();
+    let mut attempt = 0;
     while started.elapsed() < support::WATCH_LIVENESS {
         if condition() {
             return started.elapsed();
         }
         if last_nudge.elapsed() > Duration::from_secs(20) {
-            nudge();
+            attempt += 1;
+            nudge(attempt);
             last_nudge = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let log = std::fs::read_to_string(dir.join("watch.log")).unwrap_or_default();
+    let trace = std::fs::read_to_string(dir.join("watch-trace.log")).unwrap_or_default();
     panic!(
-        "timed out waiting for {label}\nrounds.txt: {} lines, ran.txt: {} lines\n--- watch.log ---\n{log}",
+        "timed out waiting for {label}\nrounds.txt: {} lines, ran.txt: {} lines\n--- watch.log ---\n{log}\n--- watch-trace.log (VILAN_WATCH_LOG, B208) ---\n{trace}",
         runs(dir, "rounds.txt"),
         runs(dir, "ran.txt"),
     );
@@ -1250,12 +1286,95 @@ fn an_edited_hook_input_starts_a_watch_round_and_reruns_the_hook() {
     wait_nudged(
         &dir,
         "the round the edited input starts",
-        || write(&dir, "input.txt", "two\n"),
+        |attempt| write(&dir, "input.txt", &format!("two {attempt}\n")),
         || runs(&dir, "rounds.txt") >= 2,
     );
     wait_for_in(&dir, "the hook the edited input re-runs", || {
         runs(&dir, "ran.txt") >= 2
     });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_edit_landing_while_a_round_runs_starts_exactly_one_more_round() {
+    // B208. The loop reads its snapshot BEFORE the action and consumes the
+    // difference only when the round succeeds (E20's rule), so an edit made
+    // while a round is compiling is still a difference at the next poll. That is
+    // the *loop's* half. The other half is the freshness STAMP, which digests a
+    // hook's declared inputs — and recorded them AFTER the hook ran until
+    // Order 25's seal, so an edit landing between the hook's last command and
+    // that re-hash was stamped as already consumed: the round fired, the stamp
+    // said `Fresh`, and the edit was gone. Re-touching could not rescue it,
+    // because a re-touch of the same bytes moves the mtime and not the digest.
+    //
+    // So the pin measures BOTH observables across one edit made mid-round: a
+    // ROUND started (`rounds.txt`, the undeclared `[build] run`) and the HOOK
+    // re-ran (`ran.txt`). And exactly one more of each — the edit must not
+    // start a cascade either.
+    //
+    // The hook's middle command is deliberately slow, so the edit the test
+    // makes on seeing `ran.txt` lands while round 1 is still executing the
+    // hook. The claim holds whichever side of the round's end the edit lands
+    // on, so a box too loaded to place it inside cannot make this flake; the
+    // assertion below records which case ran.
+    let dir = temp_project("watch_edit_during_round");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[build]\nrun = [{}]\n\n[[build.hook]]\nname = \"gen\"\n\
+             run = [{}, {}, {}]\ninputs = \"input.txt\"\noutputs = \"generated.txt\"\n",
+            toml_string(&append("rounds.txt")),
+            toml_string(&append("ran.txt")),
+            toml_string(&slow_command()),
+            toml_string(&write_line("generated.txt", "generated")),
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+    let _watcher = spawn_watch(&dir);
+
+    // `ran.txt` is the hook's FIRST command, so seeing it means the round is
+    // inside the hook and has not reached the stamp.
+    let first_round = wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
+    write(&dir, "input.txt", "two\n");
+    // Round 1 writes `generated.txt` as its LAST hook command, so its absence
+    // right now is the proof the edit landed mid-round.
+    let landed_mid_round = !dir.join("generated.txt").exists();
+
+    // Not nudged, and that is the whole pin: one edit, one round, one hook run.
+    // A re-touch would start a fresh round and prove nothing about the first.
+    wait_for_in(&dir, "the round the mid-round edit starts", || {
+        runs(&dir, "rounds.txt") >= 2
+    });
+    wait_for_in(&dir, "the hook the mid-round edit re-runs", || {
+        runs(&dir, "ran.txt") >= 2
+    });
+    assert!(
+        landed_mid_round,
+        "the edit was meant to land while round 1 was still running its hook — \
+         `generated.txt` already existed, so this run measured the ordinary \
+         between-rounds edit instead. The counts above still hold; only the \
+         mid-round case went unexercised."
+    );
+
+    // EXACTLY one more: the difference is consumed by the round that dealt with
+    // it, so nothing cascades. The window is this machine's own round scaled up
+    // (E32's rule), and it has to outlast the hook's own slow command.
+    let quiet = Instant::now();
+    let window = support::round_budget(first_round);
+    while quiet.elapsed() < window {
+        assert_eq!(
+            runs(&dir, "rounds.txt"),
+            2,
+            "one edit is one round: a second round here is a difference the \
+             successful round failed to consume"
+        );
+        assert_eq!(runs(&dir, "ran.txt"), 2, "and one hook run");
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1320,7 +1439,13 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
     wait_nudged(
         &dir,
         "the round the new icon starts",
-        || write(&dir, "icons/close.svg", "<svg/>\n"),
+        |attempt| {
+            write(
+                &dir,
+                "icons/close.svg",
+                &format!("<svg id=\"{attempt}\"/>\n"),
+            )
+        },
         || runs(&dir, "rounds.txt") >= 2,
     );
     wait_for_in(&dir, "the hook the new icon re-runs", || {
@@ -1359,8 +1484,10 @@ fn an_empty_directory_added_under_a_declared_input_rounds_and_reruns_the_hook() 
         "the round the empty subdirectory starts",
         // The re-touch N30's pin uses, for the same reason: remove and
         // re-create is the only edit an empty directory has, and either half is
-        // a difference on its own.
-        || {
+        // a difference on its own. The one nudge with no CONTENT to vary
+        // (B208's rule above): an empty directory has none, and its identity
+        // moving is what both consumers key on.
+        |_attempt| {
             let _ = std::fs::remove_dir(dir.join("icons/empty"));
             let _ = std::fs::create_dir(dir.join("icons/empty"));
         },
@@ -1521,8 +1648,9 @@ fn a_declared_directory_input_appearing_empty_starts_a_watch_round() {
         // The re-touch a lost round needs, in the one form available to a
         // directory with nothing in it: remove and re-create. Either half is a
         // snapshot difference on its own, so a poll landing between them is
-        // fine, and a missing declared input builds cleanly.
-        || {
+        // fine, and a missing declared input builds cleanly. No CONTENT to vary
+        // (B208's rule on `wait_nudged`): an empty directory has none.
+        |_attempt| {
             let _ = std::fs::remove_dir(dir.join("icons"));
             let _ = std::fs::create_dir(dir.join("icons"));
         },
@@ -2025,6 +2153,177 @@ fn fmt_follows_a_directory_link_that_stays_inside_the_project() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn fmt_counts_a_file_reached_under_two_names_once() {
+    // G22. G18 gave the walk a cycle guard keyed on DIRECTORY identity, which
+    // is the whole question for a cycle and only half of it for a link: a
+    // filesystem hands one FILE to a walk under as many names as point at it,
+    // and the collector took every one. `vilan fmt --check` then printed two
+    // `would reformat` lines for one file and counted it twice (so the exit
+    // code was right for the wrong reason), and `vilan fmt` formatted it twice.
+    //
+    // Two link shapes in one tree, and they are not the same measurement:
+    //
+    //   * a DIRECTORY link inside the project (`src/shared -> ../shared`) —
+    //     supported layout, walked since G19. G18's guard already covers it,
+    //     because the second name reaches a directory it has seen; this half is
+    //     the CONTROL that says the new guard did not break the old one.
+    //   * a FILE link beside its target (`src/alias.vl -> real.vl`) — one file,
+    //     two names, in one directory, and no directory-keyed guard can see it.
+    //     This is G22, and it is the half that was red: the old walk reported
+    //     `src/alias.vl` and `src/real.vl` as two files.
+    //
+    // Two distinct files need formatting, so the pin is not "reports once" — it
+    // is "reports each FILE once", and a guard that collapsed the two real files
+    // into one would fail it exactly as the missing guard did.
+    let dir = temp_project("two_names");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/main.vl", "fun main() {}\n");
+    write(&dir, "shared/helper.vl", "fun  helper( ) { }\n");
+    write(&dir, "src/real.vl", "fun  real( ) { }\n");
+    std::os::unix::fs::symlink("../shared", dir.join("src/shared"))
+        .expect("a directory link inside the project");
+    std::os::unix::fs::symlink("real.vl", dir.join("src/alias.vl"))
+        .expect("a file link beside its target");
+
+    let output = vilan(&["fmt", "--check", dir.to_str().unwrap()]);
+    let text = combined(&output);
+
+    assert_eq!(
+        text.matches("would reformat").count(),
+        2,
+        "two files need formatting and there are two of them however many names \
+         reach them — one through a directory link, one through a file link:\n{text}"
+    );
+    assert!(
+        text.contains("helper.vl"),
+        "the file under the linked directory is one of the two:\n{text}"
+    );
+    assert!(
+        text.contains("real.vl") || text.contains("alias.vl"),
+        "and the doubly-named file is the other, under whichever name the walk \
+         reached first:\n{text}"
+    );
+    assert!(
+        !output.status.success(),
+        "`--check` still fails when something would be reformatted:\n{text}"
+    );
+
+    // The rewrite agrees with the count: one file, formatted once, and reachable
+    // as formatted under BOTH names — the link is layout, not a second file.
+    let rewrite = fmt(&dir);
+    let rewritten = combined(&rewrite);
+    assert!(rewrite.status.success(), "{rewritten}");
+    assert_eq!(
+        rewritten.matches("formatted").count(),
+        2,
+        "the rewrite formats each file once:\n{rewritten}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/real.vl")).unwrap(),
+        "fun real() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/alias.vl")).unwrap(),
+        "fun real() {}\n",
+        "the link's spelling reaches the same formatted bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("shared/helper.vl")).unwrap(),
+        "fun helper() {}\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_counts_a_file_named_by_two_overlapping_roots_once() {
+    // B213 — G22's sibling by symptom, a different mechanism. G22 gave one
+    // WALK one identity set; `fmt` then built a fresh walk per command-line
+    // root, so the set did not span roots and `vilan fmt --check src src/pkg`
+    // printed `src/pkg/helper.vl` twice. No symlink is involved: `src/pkg` is
+    // simply named twice, once on its own and once inside `src`.
+    //
+    // Two files need formatting, so — like G22's pin — this is "each FILE
+    // once", not "one line": a fix that collapsed the two real files into one
+    // would fail it exactly as the missing guard did. Both root ORDERS are
+    // asserted, because the parent-first and child-first walks reach the shared
+    // subtree at different moments.
+    let dir = temp_project("overlapping_roots");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/top.vl", "fun  top( ) { }\n");
+    write(&dir, "src/pkg/helper.vl", "fun  helper( ) { }\n");
+    let src = dir.join("src");
+    let pkg = dir.join("src/pkg");
+
+    for roots in [
+        [src.to_str().unwrap(), pkg.to_str().unwrap()],
+        [pkg.to_str().unwrap(), src.to_str().unwrap()],
+    ] {
+        let output = vilan(&["fmt", "--check", roots[0], roots[1]]);
+        let text = combined(&output);
+        assert_eq!(
+            text.matches("would reformat").count(),
+            2,
+            "two files need formatting, and naming their directory twice on the \
+             command line does not make three: {roots:?}\n{text}"
+        );
+        assert_eq!(
+            text.matches("helper.vl").count(),
+            1,
+            "the file both roots reach is reported once: {roots:?}\n{text}"
+        );
+        assert!(
+            !output.status.success(),
+            "`--check` still fails when something would be reformatted:\n{text}"
+        );
+    }
+
+    // And the rewrite agrees: one file, formatted once.
+    let rewrite = vilan(&["fmt", src.to_str().unwrap(), pkg.to_str().unwrap()]);
+    let rewritten = combined(&rewrite);
+    assert!(rewrite.status.success(), "{rewritten}");
+    assert_eq!(
+        rewritten.matches("formatted").count(),
+        2,
+        "the rewrite formats each file once:\n{rewritten}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/pkg/helper.vl")).unwrap(),
+        "fun helper() {}\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_walks_every_disjoint_root_it_is_given() {
+    // The control for the pin above: sharing one identity set across roots must
+    // not make a LATER root a no-op. Two roots that overlap in nothing, each
+    // holding a file that needs formatting, and both are reported.
+    let dir = temp_project("disjoint_roots");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/alpha/one.vl", "fun  one( ) { }\n");
+    write(&dir, "src/beta/two.vl", "fun  two( ) { }\n");
+
+    let output = vilan(&[
+        "fmt",
+        "--check",
+        dir.join("src/alpha").to_str().unwrap(),
+        dir.join("src/beta").to_str().unwrap(),
+    ]);
+    let text = combined(&output);
+    assert_eq!(
+        text.matches("would reformat").count(),
+        2,
+        "disjoint roots are each walked whole:\n{text}"
+    );
+    assert!(text.contains("one.vl") && text.contains("two.vl"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_generated_root_outside_the_package_fails_the_build_naming_the_key() {
     // The refusal reaches the user, not just `Manifest::validate` (whose own
@@ -2039,4 +2338,600 @@ fn a_generated_root_outside_the_package_fails_the_build_naming_the_key() {
         "the refusal names the key and the rule:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── S8: the same layout, in Windows' spelling (audit run 7, Order 24) ──
+//
+// S7 above pins the symlink doctrine and says why every pin in it is
+// `cfg(unix)`: creating a symlink needs a privilege Windows does not grant by
+// default. That left the doctrine unmeasured on the platform whose link
+// semantics differ most from the ones it was written against, which is what
+// audit run 7 chartered. These are the other half. CI's Windows leg is the only
+// instrument that runs them — on a unix host they are compiled away, so a green
+// local suite says nothing about them at all.
+//
+// A JUNCTION does the work, because it needs no privilege: a directory reparse
+// point that `fs::metadata` resolves through, `fs::symlink_metadata().
+// is_symlink()` reports as a link, and `fs::read_link` reads — the same three
+// calls the CLI makes of a unix symlink, so it reaches every branch the S7 pins
+// do. Three differences are why these exist rather than being inferred from the
+// unix run:
+//
+// * the target a junction stores is ABSOLUTE (Windows resolves it when the link
+//   is made), where a unix symlink stores the bytes it was handed;
+// * `fs::canonicalize` answers with a VERBATIM (`\\?\`) path, so every
+//   containment and identity test here compares across a seam that does not
+//   exist on unix;
+// * the filesystem FOLDS CASE, so two spellings that are two paths on unix name
+//   one directory here.
+//
+// Only the last pin needs the privilege — a RELATIVE directory symlink is the
+// one shape a junction cannot stand in for — and it skips with a printed note
+// rather than failing when the machine does not grant it.
+//
+// Every pin here tears its links down BEFORE asserting. A leaked junction is not
+// the harmless litter a leaked temp directory is: the cycle fixture is a trap for
+// anything that later walks `%TEMP%` naively, and cleaning up first means a
+// failing assertion still leaves the runner clean.
+
+/// Creates a directory junction at `link` pointing at `target`, and asserts it
+/// exists afterwards — a fixture that silently failed to appear would make every
+/// pin below vacuously green.
+///
+/// Spawned as `cmd /S /C` rather than through `Command::args`, for two reasons
+/// that are both load-bearing. `mklink` is a `cmd` BUILTIN, so there is no
+/// executable to spawn and the shell is not a convenience. And `cmd` re-parses
+/// the command line with its own quoting rules: `/S` tells it to take everything
+/// after `/C` verbatim instead of running the quote-stripping pass that mangles a
+/// quoted path, and [`CommandExt::raw_arg`] is the matching half — `Command`'s
+/// ordinary quoting would backslash-escape the inner quotes for a C runtime that
+/// `cmd` is not, and `cmd` would pass the escapes through to `mklink` as part of
+/// the path. Temp paths here carry a process id, and a CI runner's carry spaces,
+/// so quoting them is not optional.
+///
+/// [`CommandExt::raw_arg`]: std::os::windows::process::CommandExt::raw_arg
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    use std::os::windows::process::CommandExt;
+
+    let output = Command::new("cmd")
+        .arg("/S")
+        .arg("/C")
+        .raw_arg(format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ))
+        .output()
+        .expect("run mklink");
+    assert!(
+        output.status.success() && link.exists(),
+        "mklink /J {} -> {} did not create a junction:\n{}",
+        link.display(),
+        target.display(),
+        combined(&output)
+    );
+}
+
+/// Removes `dir`, taking the named junctions out first.
+///
+/// `remove_dir` on a reparse point removes the LINK and never touches what it
+/// points at, which is the whole reason the order matters: the targets here are
+/// inside the same fixture, and one of them is a cycle. Doing it by name rather
+/// than trusting a recursive delete to recognize a reparse point keeps the
+/// cleanup a statement about this tree instead of a bet on `remove_dir_all`.
+#[cfg(windows)]
+fn remove_tree_with_junctions(dir: &Path, junctions: &[&str]) {
+    for link in junctions {
+        let _ = std::fs::remove_dir(dir.join(link));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Whether this machine can create a directory SYMLINK: Developer Mode, or the
+/// `SeCreateSymbolicLinkPrivilege` an elevated shell holds. Neither is on by
+/// default, which is why every other fixture here is a junction.
+///
+/// Probed by trying it rather than by reading a policy, because the privilege is
+/// precisely "did this call succeed" — a guess would be the wrong kind of green.
+#[cfg(windows)]
+fn windows_symlinks_available() -> bool {
+    let probe = temp_project("symlink_probe");
+    std::fs::create_dir_all(probe.join("target")).expect("probe fixture");
+    let available =
+        std::os::windows::fs::symlink_dir(probe.join("target"), probe.join("link")).is_ok();
+    let _ = std::fs::remove_dir(probe.join("link"));
+    let _ = std::fs::remove_dir_all(&probe);
+    available
+}
+
+#[cfg(windows)]
+#[test]
+fn fmt_terminates_on_a_junction_cycle_and_reports_each_file_once() {
+    // G18's cycle, and audit run 7's F6 — the SAME hazard, guarded by a
+    // different mechanism, which is why the unix twin
+    // (`fmt_terminates_on_a_directory_cycle_and_reports_each_file_once`) does
+    // not cover this. There the guard keys on `(device, inode)`, a number the
+    // kernel hands out; here `DirectoryIdentity` is a PATH, and the guard is
+    // only as good as the resolution behind it. F6 found that resolution was
+    // `util::canonical_path`, which never fails — where it cannot resolve, it
+    // degrades to a LEXICAL normalization, so `src/l1`, `src/l1/l1`,
+    // `src/l1/l1/l1` become three keys for one directory, `visited` never
+    // collides, and the arm that stops the walk cannot run. Nothing else stands
+    // behind it: `TreeWalk::walk` has no depth cap, and there is no ELOOP here.
+    //
+    // Worth being exact about what this pin does and does not discriminate. The
+    // fixture below is caught by BOTH spellings, because a shallow junction
+    // resolves fine and the two helpers agree while it does; the fix matters in
+    // the corner where resolution FAILS, which no portable fixture can force.
+    // So this is a regression pin on the guard as a whole — remove it, or let
+    // junctions read as ordinary directories, and it goes red — rather than the
+    // discriminating pin for F6, which is a defect of expressiveness (`Some` was
+    // the only value the old arm could return) and is argued at its own site.
+    //
+    // The TIMEOUT is the instrument, exactly as in the unix twin. This pin has
+    // to prove the hang is gone, and "the test passed" is not that proof if it
+    // could pass by hanging the harness instead. Generous (60 s against a walk
+    // that now visits three directories) because the suite runs it under full
+    // lane load.
+    let dir = temp_project("junction_cycle");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    // Deliberately unformatted, so "the walk finished" and "the walk found it"
+    // are distinguishable from the output alone.
+    write(&dir, "src/main.vl", "fun  main( ) { }\n");
+    let src = dir.join("src");
+    junction(&src.join("l1"), &src);
+    junction(&src.join("l2"), &src);
+
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["fmt", "--check", dir.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run vilan fmt");
+    let output = loop {
+        match child.try_wait().expect("wait on vilan fmt") {
+            Some(_) => break child.wait_with_output().expect("collect vilan fmt"),
+            None if started.elapsed() > Duration::from_secs(60) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                remove_tree_with_junctions(&dir, &["src/l1", "src/l2"]);
+                panic!("`vilan fmt --check` did not terminate on a junction cycle");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let text = combined(&output);
+    remove_tree_with_junctions(&dir, &["src/l1", "src/l2"]);
+    assert_eq!(
+        text.matches("would reformat").count(),
+        1,
+        "one file, reported once — a cycle re-walked is the same directory \
+         under another name, whatever name reached it:\n{text}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_inside_a_declared_tree_is_digested_unfollowed() {
+    // The fence `collect_tree` draws: the TOP-LEVEL declared path is resolved
+    // through a link, a link found INSIDE the tree is not, and it digests as its
+    // own target path. Its unix twin
+    // (`a_symlink_inside_a_declared_tree_is_digested_unfollowed`) pins the rule;
+    // what it cannot pin is that a JUNCTION is seen at all. The branch turns on
+    // `symlink_metadata().is_symlink()`, which on Windows answers for two
+    // reparse tags rather than one — a junction is `IO_REPARSE_TAG_MOUNT_POINT`,
+    // not `IO_REPARSE_TAG_SYMLINK` — and on `read_link`, which has to strip the
+    // NT-internal `\??\` prefix off the absolute target Windows stored. Read as
+    // an ordinary directory instead, a junction would be FOLLOWED here, and a
+    // cycle or an escape would follow from that.
+    //
+    // Both halves are sharp because the fixture makes following and not
+    // following disagree: `static/a` and `static/b` are byte-identical trees, so
+    // re-pointing the junction is invisible to a walk that follows it and is a
+    // change to one that reads the link.
+    let dir = temp_project("tree_junction");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"copy\"\nrun = {}\n\
+             inputs = \"static\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "static/a/x.txt", "same\n");
+    write(&dir, "static/b/x.txt", "same\n");
+    write(&dir, "outside/note.txt", "one\n");
+    junction(&dir.join("static/link"), &dir.join("static/a"));
+    junction(&dir.join("static/escape"), &dir.join("outside"));
+
+    build(&dir);
+    let cold = runs(&dir, "ran.txt");
+    build(&dir);
+    let untouched = runs(&dir, "ran.txt");
+
+    std::fs::remove_dir(dir.join("static/link")).unwrap();
+    junction(&dir.join("static/link"), &dir.join("static/b"));
+    build(&dir);
+    let repointed = runs(&dir, "ran.txt");
+
+    write(&dir, "outside/note.txt", "two\n");
+    build(&dir);
+    let after_escape = runs(&dir, "ran.txt");
+    remove_tree_with_junctions(&dir, &["static/link", "static/escape"]);
+
+    assert_eq!(cold, 1);
+    assert_eq!(untouched, 1, "an untouched tree is fresh");
+    assert_eq!(
+        repointed, 2,
+        "the junction's target PATH is its content: re-pointing it at a \
+         byte-identical tree is still a change"
+    );
+    assert_eq!(
+        after_escape, 2,
+        "and the tree does not extend through a junction that leaves it"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_declared_directory_input_reached_through_a_junction_stays_fresh() {
+    // G15's alignment, in Windows' spelling: the stamp and the watcher resolve
+    // a declared path the same way, so a declared name that IS a link to a
+    // directory digests as that directory's tree instead of failing to read and
+    // re-running the hook on every build, silently, forever. The unix twin
+    // (`a_declared_directory_input_reached_through_a_symlink_stays_fresh`) pins
+    // the alignment; it cannot pin that `fs::metadata` resolves THROUGH a
+    // junction while `fs::symlink_metadata` stops at it, which is the distinction
+    // the whole fix rests on and is a separate implementation on this platform.
+    let dir = temp_project("directory_input_junction");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"copy\"\nrun = {}\n\
+             inputs = \"linked_static\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "static/a.txt", "a\n");
+    junction(&dir.join("linked_static"), &dir.join("static"));
+
+    build(&dir);
+    let first = runs(&dir, "ran.txt");
+    build(&dir);
+    let second = runs(&dir, "ran.txt");
+    build(&dir);
+    let third = runs(&dir, "ran.txt");
+
+    // And it is fresh rather than frozen: the tree behind the junction is still
+    // the content, so a change through it re-runs the hook.
+    write(&dir, "static/a.txt", "changed\n");
+    build(&dir);
+    let after_edit = runs(&dir, "ran.txt");
+    remove_tree_with_junctions(&dir, &["linked_static"]);
+
+    assert_eq!(first, 1);
+    assert_eq!(
+        second, 1,
+        "a declared junction to a directory digests as that directory's tree"
+    );
+    assert_eq!(third, 1, "and stays fresh, build after build");
+    assert_eq!(
+        after_edit, 2,
+        "an edit behind the junction is an edit to the declared input"
+    );
+}
+
+/// G17's tree in Windows' spelling: the package's declared `generated` root is a
+/// JUNCTION to a tree outside it. Returns `(outer, package)` — the products live
+/// at `outer/outside/icons`, reachable as `package/src/icons`.
+#[cfg(windows)]
+fn junctioned_generated_project(tag: &str) -> (PathBuf, PathBuf) {
+    let outer = temp_project(tag);
+    let package = outer.join("package");
+    std::fs::create_dir_all(outer.join("outside/icons")).unwrap();
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    write(
+        &package,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\ngenerated = \"src/icons\"\n\n[[build.hook]]\n\
+             name = \"icons\"\nrun = [{}, {}]\ninputs = \"icons.lock\"\n\
+             outputs = \"src/icons/lib.vl\"\n",
+            toml_string(&append("ran.txt")),
+            toml_string(&generate_module("src/icons/lib.vl"))
+        ),
+    );
+    write(
+        &package,
+        "src/main.vl",
+        "import std::io::print;\nimport pkg::icons::generated;\n\
+         fun main() { print(generated() + 1) }\nmain();\n",
+    );
+    write(&package, "icons.lock", "v1\n");
+    junction(&package.join("src/icons"), &outer.join("outside/icons"));
+    (outer, package)
+}
+
+#[cfg(windows)]
+#[test]
+fn fmt_leaves_a_product_under_a_junctioned_generated_root_alone() {
+    // G17's fail-OPEN: the containment check missed through a link, so `vilan
+    // fmt` rewrote the product and re-staled the hook that digests it — §12.1's
+    // loop, live. `generated_root_covering` closes it with two ladders (the
+    // SPELLED ancestry the walk reached the file through, and the RESOLVED one
+    // an editor opens it by), and both are driven here: the directory walk, then
+    // the explicit path.
+    //
+    // What the unix twin (`fmt_leaves_a_product_under_a_symlinked_generated_
+    // root_alone`) cannot reach is the `\\?\` seam. Every comparison in both
+    // ladders is between a path `fs::canonicalize` produced — verbatim — and one
+    // built by joining, and they only meet because `util::strip_verbatim_prefix`
+    // takes the prefix off first. On unix that helper is a no-op and the seam is
+    // not there to get wrong; here it is the difference between the exclusion
+    // holding and the loop coming back.
+    let (outer, package) = junctioned_generated_project("fmt_junction");
+    build(&package);
+    let product = package.join("src/icons/lib.vl");
+    let before = std::fs::read(&product).unwrap();
+
+    let output = fmt(&package);
+    let walked = combined(&output);
+    let after_walk = std::fs::read(&product).unwrap();
+
+    let named = vilan(&["fmt", product.to_str().unwrap()]);
+    let by_name = combined(&named);
+    let after_name = std::fs::read(&product).unwrap();
+    remove_tree_with_junctions(&package, &["src/icons"]);
+    let _ = std::fs::remove_dir_all(&outer);
+
+    assert!(output.status.success(), "{walked}");
+    assert_eq!(
+        after_walk, before,
+        "a product behind a junctioned root is not formatted:\n{walked}"
+    );
+    assert!(
+        walked.contains("generated file") && walked.contains("not formatted"),
+        "and the exclusion says so — silence is how the loop came back:\n{walked}"
+    );
+    assert!(named.status.success(), "{by_name}");
+    assert_eq!(
+        after_name, before,
+        "however the file is reached, junctions included:\n{by_name}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_relative_directory_symlink_inside_the_project_is_followed() {
+    // The one shape a junction cannot stand in for, and so the one pin here that
+    // needs the privilege: a junction always stores an ABSOLUTE target, resolved
+    // when it was created, while a symlink can store `..\shared` and be resolved
+    // against the link's own directory on every open. That is a different code
+    // path in the OS, and it is the shape a project checked out of git on a
+    // machine with Developer Mode on actually has.
+    //
+    // The behavior is G19's ruling — a link inside the project is ordinary
+    // layout, and is walked — pinned on unix by
+    // `fmt_follows_a_directory_link_that_stays_inside_the_project`. The green
+    // negative matters as much as the cycle pin above: a scope that terminated by
+    // refusing every link would pass that one and fail the doctrine.
+    if !windows_symlinks_available() {
+        eprintln!(
+            "SKIPPED a_relative_directory_symlink_inside_the_project_is_followed: \
+             creating a directory symlink needs Developer Mode or \
+             SeCreateSymbolicLinkPrivilege, which this machine does not grant. \
+             Every other Windows link pin uses an unprivileged junction and ran."
+        );
+        return;
+    }
+    let dir = temp_project("inside_symlink");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/main.vl", "fun main() {}\n");
+    write(&dir, "shared/helper.vl", "fun  helper( ) { }\n");
+    std::os::windows::fs::symlink_dir(r"..\shared", dir.join("src/shared"))
+        .expect("a relative directory symlink inside the project");
+
+    let output = vilan(&["fmt", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    let helper = std::fs::read_to_string(dir.join("shared/helper.vl")).unwrap();
+    // A symlink comes out with `remove_dir` for the same reason a junction does.
+    remove_tree_with_junctions(&dir, &["src/shared"]);
+
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        helper, "fun helper() {}\n",
+        "a relative link inside the project is layout, and its tree formats:\n{text}"
+    );
+    assert!(
+        !text.contains("outside this project"),
+        "and nothing is said about it:\n{text}"
+    );
+}
+
+// ── The wall-clock waits' suite placement (tracker N46) ───────────────────────
+//
+// Every test that drives a live `--watch` session and then waits for a ROUND
+// belongs to `.config/nextest.toml`'s `wall-clock-waits` group, which runs them
+// one at a time. The reason is the 301 s red this file's own pins have paid
+// three times: watch sessions, each spawning a watcher and a compile, all
+// eligible to run at once inside an interleave already 16 wide. The language
+// server's `package_recolor_tests` are in the group for the same reason and
+// join it from the other side of the workspace; they are named directly in the
+// filterset, and this file's scan does not reach them.
+//
+// The group is selected by a filterset, and part of that filterset is a NAME
+// pattern — which is exactly the kind of thing that rots when somebody adds a
+// pin (or renames one) without knowing the pattern exists. This is the check
+// that keeps it honest, and it is not theoretical: it is what found the two
+// members outside the HMR suites, `split`'s `a_watch_round_clears_the_chunks_a
+// _build_left` and `serve_build`'s `run_watch_tells_its_child_it_is_watching`.
+
+/// Binaries whose every test is a watch session, so the filterset takes them
+/// whole.
+const WATCH_SESSION_BINARIES: &[&str] = &[
+    "hmr",
+    "hmr_swap",
+    "hmr_css_matrix",
+    "watch_lifecycle",
+    "watch_leg_reuse",
+];
+
+/// Binaries with a watch family inside a larger suite, selected by name.
+const MIXED_BINARIES: &[&str] = &[
+    "build_hooks",
+    "assets",
+    "asset_bundle",
+    "split",
+    "serve_build",
+    "parallel_build",
+];
+
+/// The name substrings the filterset's `test(/watch|round/)` matches.
+const NAME_MARKERS: &[&str] = &["watch", "round"];
+
+/// How a test says it drives a live session: the local spawner, or the flag
+/// handed straight to the binary.
+const SPAWNS_A_WATCHER: &[&str] = &["spawn_watch(", "\"--watch\""];
+
+fn suite_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
+}
+
+/// Every `#[test]` in `source` that drives a watch session, by name.
+///
+/// Line oriented, and comments are dropped first: three of this tree's tests
+/// only MENTION `--watch` in the prose above them (`asset_bundle`'s containment
+/// refusal is one), and counting those would put the gate in the business of
+/// arguing about doc comments.
+fn tests_that_drive_a_watch_session(source: &str) -> Vec<String> {
+    let mut driving = Vec::new();
+    let mut current: Option<String> = None;
+    let mut recent_attributes = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            recent_attributes.push(trimmed.to_string());
+        }
+        if let Some(rest) = line.strip_prefix("fn ") {
+            let is_test = recent_attributes
+                .iter()
+                .any(|line| line.starts_with("#[test]"));
+            recent_attributes.clear();
+            current = is_test
+                .then(|| {
+                    rest.split('(')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                })
+                .filter(|name| !name.is_empty());
+            continue;
+        }
+        if line.starts_with('}') {
+            current = None;
+            continue;
+        }
+        if let Some(name) = &current
+            && SPAWNS_A_WATCHER.iter().any(|marker| line.contains(marker))
+            && !driving.contains(name)
+        {
+            driving.push(name.clone());
+        }
+    }
+    driving
+}
+
+#[test]
+fn every_test_that_drives_a_watch_session_is_in_the_group() {
+    let mut stray = Vec::new();
+    let entries = std::fs::read_dir(suite_root()).expect("the CLI's tests directory");
+    for entry in entries {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let binary = path
+            .file_stem()
+            .expect("a file stem")
+            .to_string_lossy()
+            .into_owned();
+        if WATCH_SESSION_BINARIES.contains(&binary.as_str()) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read a suite");
+        for name in tests_that_drive_a_watch_session(&source) {
+            let selected = MIXED_BINARIES.contains(&binary.as_str())
+                && NAME_MARKERS.iter().any(|marker| name.contains(marker));
+            if !selected {
+                stray.push(format!("  {binary}::{name}"));
+            }
+        }
+    }
+    assert!(
+        stray.is_empty(),
+        "these tests drive a live `--watch` session but are not selected by \
+         `.config/nextest.toml`'s `watch-rounds` filterset, so they run against the \
+         full 16-wide interleave and pay N46's 301 s bound. Either name the test so \
+         `test(/watch|round/)` reaches it and add its binary to MIXED_BINARIES here, \
+         or add the whole binary to both this list and the filterset:\n{}",
+        stray.join("\n")
+    );
+}
+
+/// Members the scan above cannot reach, because they live outside this crate's
+/// suite directory: the language server's package-recolor pins, which wait on a
+/// debounced re-analysis instead of on a watch round, and M26's cancellation
+/// pins, which wait on the same thing plus a keystroke burst of debounce
+/// windows. Named here so the config check below covers them, and so dropping
+/// either from the filterset is a red rather than a silence.
+const MEMBERS_OUTSIDE_THIS_CRATE: &[&str] = &[
+    "binary(vilan-lsp) & test(/package_recolor_tests|cancellation_tests|watched_files_tests|dead_item_clock_tests/)",
+];
+
+#[test]
+fn the_group_is_declared_the_way_this_file_reads_it() {
+    // The other half. The check above is worth nothing if the filterset it
+    // describes is not the filterset that ships — a group renamed, a binary
+    // dropped from the union, `max-threads` raised back to the default — so the
+    // config is read and held against the same lists.
+    let config = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.config/nextest.toml"),
+    )
+    .expect("the committed nextest profile");
+    assert!(
+        config.contains("wall-clock-waits = { max-threads = 1 }"),
+        "the group must exist and must be ONE thread — that is the whole fix:\n{config}"
+    );
+    assert!(
+        config.contains("test-group = 'wall-clock-waits'"),
+        "an override must actually join the group:\n{config}"
+    );
+    assert!(
+        config.contains("test(/watch|round/)"),
+        "the name pattern this file reimplements must be the one in the filterset"
+    );
+    for binary in WATCH_SESSION_BINARIES.iter().chain(MIXED_BINARIES) {
+        assert!(
+            config.contains(&format!("binary({binary})")),
+            "`{binary}` holds watch sessions but the filterset does not name it"
+        );
+    }
+    for member in MEMBERS_OUTSIDE_THIS_CRATE {
+        assert!(
+            config.contains(member),
+            "`{member}` waits on a wall clock for another thread's work and the \
+             filterset does not select it"
+        );
+    }
 }

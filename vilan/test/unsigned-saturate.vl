@@ -1,0 +1,37 @@
+// A negative converted to an unsigned width that does not fold — `u53` and
+// `usize` — SATURATES to 0 on every backend (tracker I6, RULED 2026-09-25).
+// Natively that is Rust's own `f64 as u64`; on JS the conversion used to keep
+// the sign. Every source width that can be negative, both targets, and the
+// non-negative side of the clamp, which converts exactly as before.
+fun main() {
+	let small = -5i8;
+	let middle = -300i16;
+	let word = -1;
+	let wide = -9007199254740000i53;
+	let single = -2.5f32;
+	let double = -7.9f;
+	let big = -3n;
+	print(i"i8 {small.as_u53()} {small.as_usize()}");
+	print(i"i16 {middle.as_u53()} {middle.as_usize()}");
+	print(i"i32 {word.as_u53()} {word.as_usize()}");
+	print(i"i53 {wide.as_u53()} {wide.as_usize()}");
+	print(i"f32 {single.as_u53()} {single.as_usize()}");
+	print(i"f64 {double.as_u53()} {double.as_usize()}");
+	print(i"BigInt {big.as_u53()} {big.as_usize()}");
+
+	// A fraction just below zero truncates to zero, not to a signed zero.
+	let fraction = -0.5f;
+	print(i"fraction {fraction.as_u53()} {fraction.as_usize()}");
+
+	// The other side of the clamp.
+	let zero = 0;
+	let positive = 7.9f;
+	let large = 9007199254740000i53;
+	print(i"zero {zero.as_u53()} {zero.as_usize()}");
+	print(i"positive {positive.as_u53()} {positive.as_usize()}");
+	print(i"large {large.as_u53()} {large.as_usize()}");
+
+	// The narrow unsigned widths FOLD, identically on both backends — not this
+	// ruling's, and printed so the difference stays visible.
+	print(i"fold {word.as_u8()} {word.as_u16()} {word.as_u32()}");
+}

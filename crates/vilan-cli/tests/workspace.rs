@@ -14,11 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod support;
+
 /// A fresh temp directory for one test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_ws_cli_{tag}_{}_{unique}",
         std::process::id()
     ));
@@ -786,8 +788,8 @@ fn a_post_build_violation_in_a_module_renders_in_that_module() {
     write(
         dir.as_path(),
         "src/store.vl",
-        "import std::io::print;\nimport std::drop::Drop;\n\
-         resource struct Guard { label: str }\n\
+        "export *;\n\nimport std::io::print;\nimport std::drop::Drop;\n\
+         [resource] struct Guard { label: str }\n\
          impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\n\
          fun keep() {\n\tmut arr: List<Guard> = [];\n}\n",
     );
@@ -1649,6 +1651,25 @@ const BROWSER_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
      export fun attach(): View {\n\tlet root = view(\"div\");\n\t\
      root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
 
+/// F27: a module over `std::ui`'s `Region` — every name it imports exists in
+/// BOTH twins, so it has no import evidence at all and takes the process one,
+/// where `anchor` is a field the browser twin alone declares.
+///
+/// Written on ONE line: `cargo fmt` joins a `\`-continued literal and leaves
+/// its indentation inside the string, which is a line of a `.vl` program
+/// pushed seventeen columns inward (`diagnostics_ledger.rs`'s
+/// `no_prose_literal_swallows_a_line_continuation`).
+const REGION_FIELD_MODULE: &str =
+    "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+/// The same over a METHOD the browser twin alone declares.
+const REGION_METHOD_MODULE: &str =
+    "import std::ui::Region;\n\nexport fun host_of(region: Region) {\n\tregion.host();\n}\n";
+
+/// And the control: a member NO twin declares.
+const REGION_TYPO_MODULE: &str =
+    "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchorr;\n}\n";
+
 /// The mirror: the PROCESS `View`'s `tag` field — clean under node, "no field
 /// 'tag'" under `browser`.
 const PROCESS_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
@@ -1820,6 +1841,284 @@ fn file_mode_falls_back_to_the_default_entry_for_an_unreached_module() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── E119: a miss on an OVERLAID std type names the overlay and WHY ──
+//
+// E113 gets the colour right. That leaves the case where the colour is right
+// and the author still cannot read the message: the platform selects `std`'s
+// layer overlay, so it decides what `View` IS, and `struct 'View' has no field
+// 'element'` says nothing about WHICH `View` or why this file is under it. The
+// colour is a conclusion the author did not write — which entry reaches the
+// file, or which one the manifest designates — so the reason has to be printed
+// beside the type, and it comes from the same function that chose the colour.
+
+#[test]
+fn an_unreached_module_names_the_default_entry_fallback_it_took() {
+    // The E119 report itself: nothing loads `orphan.vl`, so the designated
+    // `default-entry` colours it — and the process twin's `View` has no
+    // `element`. The refusal is correct; without the reason it reads as a
+    // compiler mistake, because the file imports `std::ui` and uses it exactly
+    // as the browser leg would.
+    let dir = temp_project("e119_unreached_reason");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/orphan.vl", BROWSER_ONLY_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/orphan.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("has no field 'element'"),
+        "the miss itself is unchanged:\n{text}"
+    );
+    assert!(
+        text.contains("`View` here is std's process twin"),
+        "the overlay is named:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "this file is analyzed under node: no entry reaches it (default-entry is `server`)"
+        ),
+        "and the fallback and the entry it designates:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_reached_module_names_the_leg_that_reaches_it() {
+    // The other half: a module BOTH legs load is reported under each, and the
+    // browser leg's verdict is the one that fails. `client` is why this file is
+    // being read as browser, and naming it is what tells the author which leg's
+    // rules the line has to satisfy.
+    let dir = temp_project("e119_reached_reason");
+    let reach = "import pkg::shared::labelled;\n\nfun main() {\n\tlabelled(\"app\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            (
+                "src/shared.vl",
+                "import std::ui::{ View, view };\n\n\
+                 export fun labelled(text: str): str {\n\tlet root = view(text);\n\t\
+                 root.tag\n}\n",
+            ),
+            ("src/client.vl", reach),
+            ("src/server.vl", reach),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/shared.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`View` here is std's browser twin"),
+        "the browser overlay is named:\n{text}"
+    );
+    assert!(
+        text.contains("this file is analyzed under browser: the `client` entry reaches it"),
+        "and the leg that put it there:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_explicit_platform_flag_is_its_own_reason() {
+    // `--platform` overrides the colouring, so it is also the whole answer to
+    // "why this platform" — reporting the file's own situation there would name
+    // a rule that did not apply.
+    let dir = temp_project("e119_flag_reason");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "client",
+        &[
+            ("src/orphan.vl", BROWSER_ONLY_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&[
+        "check",
+        "--platform",
+        "node",
+        dir.join("src/orphan.vl").to_str().unwrap(),
+    ]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("this file is analyzed under node: `--platform` was passed"),
+        "the flag is the reason:\n{text}"
+    );
+    assert!(
+        !text.contains("default-entry"),
+        "and the designation it overrode is not offered as one:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_single_entry_package_names_its_target() {
+    // The classic form: the package's own `target` colours every file under the
+    // root, whatever reaches what. The author DID write this one, so the clause
+    // is short — but it still says which of the four rules answered.
+    let dir = temp_project("e119_single_entry_reason");
+    write(&dir, "vilan.toml", "[package]\nname = \"solo\"\n");
+    write(&dir, "src/widget.vl", BROWSER_ONLY_MODULE);
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n",
+    );
+    let output = vilan_plain(&["check", dir.join("src/widget.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "this file is analyzed under node: the package's `target` colors every file in it"
+        ),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── F27 R6: and WHICH twin has the member the reader asked for ───────────
+//
+// E119 tells the reader which twin this type is and why the file is under it.
+// The owner's question was the one fact left: `region.anchor` is not a typo and
+// not a missing field — the OTHER twin has it. Three facts, all already known
+// to the analyzer at the point it refuses: the platform in force, the reason it
+// was chosen, and the twin that does declare the member.
+
+#[test]
+fn a_field_the_other_twin_declares_is_named_as_such() {
+    // The owner's `conditional_value.vl` shape: a module nothing imports, a
+    // `Region` that exists in both twins, and a field only the browser one has.
+    let dir = temp_project("f27_twin_field");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/slot.vl", REGION_FIELD_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`Region` here is std's process twin")
+            && text.contains("no entry reaches it (default-entry is `server`)"),
+        "E119's two facts are unchanged:\n{text}"
+    );
+    assert!(
+        text.contains("The `browser` twin of `std::ui` declares `anchor`"),
+        "and the third one answers the question the reader actually asked:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_method_the_other_twin_declares_is_named_too() {
+    // The METHOD half. `has no method` carried no overlay note at all before
+    // F27 — only the un-callable-receiver arm beside it did — so a
+    // browser-only method on an overlaid type refused with nothing to read.
+    let dir = temp_project("f27_twin_method");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/slot.vl", REGION_METHOD_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("has no method 'host'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`Region` here is std's process twin")
+            && text.contains("The `browser` twin of `std::ui` declares `host`"),
+        "the method miss gets the same three facts:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_member_neither_twin_declares_is_still_just_a_miss() {
+    // The control: the third fact is only stated when it is a fact. A field no
+    // twin has is a plain miss, and telling the reader about twins there would
+    // be noise on top of a typo.
+    let dir = temp_project("f27_twin_absent");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/slot.vl", REGION_TYPO_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("has no field 'anchorr'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`Region` here is std's process twin"),
+        "the overlay is still named:\n{text}"
+    );
+    assert!(
+        !text.contains("twin of `std::ui` declares"),
+        "but no twin is claimed to have it:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_users_own_type_gets_no_overlay_note() {
+    // The control the note rests on: the overlay touches `std`'s LAYER modules
+    // and nothing else, so an ordinary field mistake on the author's own struct
+    // is an ordinary field mistake and must not be told about platforms.
+    let dir = temp_project("e119_own_type_control");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            (
+                "src/orphan.vl",
+                "struct Box { width: i32 }\n\n\
+                 export fun grow(): i32 {\n\tlet b = Box { width = 1 };\n\tb.height\n}\n",
+            ),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/orphan.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("has no field 'height'"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("twin") && !text.contains("analyzed under"),
+        "a user struct has no overlay to name:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn package_mode_still_checks_every_leg() {
     // The invariant beside the fix: `vilan check .` is unchanged — one compile
@@ -1910,6 +2209,114 @@ fn file_mode_does_not_ask_a_module_for_a_main() {
     assert!(
         !entry.status.success() && entry_text.contains("without a main function"),
         "an entry that lost its `main` still says so:\n{entry_text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── F27 R1: the file says which platform it is analyzed under ─────────────
+//
+// R6 answered the owner's question on the spot; R1 is the line that makes the
+// answer unnecessary. The owner's own case is a module nothing reaches in a
+// package whose `default-entry` is the server: it takes the server's colour,
+// and `default-entry` OUTRANKS inference, so R2's member evidence could not
+// reach it. A declaration outranks both.
+
+/// The owner's shape, declared.
+const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+/// The same body under a function FENCE — which, before R1, changed nothing
+/// about how its body resolved.
+const FENCED_REGION_MODULE: &str = "import std::ui::Region;\n\nexport [platform(\"browser\")]\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+fn f27_package(tag: &str, slot: &str, server: &str) -> PathBuf {
+    let dir = temp_project(tag);
+    let client = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/slot.vl", slot),
+            ("src/client.vl", client),
+            ("src/server.vl", server),
+        ],
+    );
+    dir
+}
+
+const PLAIN_SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+
+#[test]
+fn f27_a_declared_module_is_analyzed_under_its_platform_over_the_default_entry() {
+    let dir = f27_package("f27_declared_module", DECLARED_REGION_MODULE, PLAIN_SERVER);
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("has no field"),
+        "the declaration outranks `default-entry = \"server\"`:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_a_function_fence_resolves_its_body_under_its_platform() {
+    let dir = f27_package("f27_fenced_module", FENCED_REGION_MODULE, PLAIN_SERVER);
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("has no field"),
+        "the fence gains the declaration's resolution meaning:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_reaching_a_declared_module_from_a_server_entry_reports_the_chain() {
+    // A module that types under both twins, so the only thing wrong with the
+    // server reaching it is the reach.
+    let declared =
+        "[platform(\"browser\")] mod self;\n\nexport fun when_value(): str {\n\t\"x\"\n}\n";
+    let server = "import std::io::print;\nimport pkg::slot::when_value;\n\nfun render(): str {\n\twhen_value()\n}\n\nfun main() {\n\tprint(render());\n}\nmain();\n";
+    let dir = f27_package("f27_chain", declared, server);
+    let output = vilan_plain(&["check", dir.join("src/server.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`when_value` requires the `browser` platform its file declares")
+            && text.contains("main → render → when_value"),
+        "the colouring chain, from the server's `main`:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
+    // No package at all: the CLI's `node` default used to answer, while the
+    // editor inferred. A declaration is the one answer both give.
+    let dir = temp_project("f27_bare_file");
+    write(
+        &dir,
+        "slot.vl",
+        "[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n\nfun main() {}\n",
+    );
+    let output = vilan_plain(&["check", dir.join("slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("has no field"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_the_twin_note_names_the_attribute_that_moves_the_file() {
+    let dir = f27_package("f27_note_attribute", REGION_FIELD_MODULE, PLAIN_SERVER);
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        text.contains(
+            "`[platform(\"browser\")] mod self;` at the top of the file analyzes it under that platform"
+        ),
+        "R6's note now names the line R1 added:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

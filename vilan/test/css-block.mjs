@@ -20,6 +20,15 @@ function __map_values(map) {
 function hash(self) {
 	return __hash(self);
 }
+function slot_of(key) {
+	const parts = key.split(":");
+	if (parts.length !== 3) {
+		(() => {
+			throw "this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read";
+		})();
+	}
+	return [ __at(parts, 0), __at(parts, 1), __at(parts, 2) ];
+}
 function family_longhands(property) {
 	const $i = property;
 	let $j = null;
@@ -57,8 +66,8 @@ function without_covered(rules, media, condition, property) {
 	}
 	let out = __clone(rules);
 	for (const key of $c(rules)) {
-		const parts = key.split(":");
-		if (__at(parts, 0) === media && __at(parts, 1) === condition && longhands.includes(";" + __at(parts, 2) + ";")) {
+		const slot = slot_of(key);
+		if (slot[0] === media && slot[1] === condition && longhands.includes(";" + slot[2] + ";")) {
 			$k(out, key);
 		}
 	}
@@ -85,8 +94,8 @@ function add(self, b) {
 		let $h = null;
 		if ($g[0] === 0) {
 			const entry = $g[1];
-			const parts = key.split(":");
-			rules = without_covered(rules, __at(parts, 0), __at(parts, 1), __at(parts, 2));
+			const slot = slot_of(key);
+			rules = without_covered(rules, slot[0], slot[1], slot[2]);
 			$l(rules, key, entry);
 			$h = undefined;
 		} else {
@@ -99,7 +108,7 @@ function add(self, b) {
 function $a(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[1]));
+		result.push(__clone(entry.slice(1, 3)));
 	}
 	return result;
 }
@@ -115,7 +124,7 @@ function $d(self, key) {
 	let $f = null;
 	if ($e[0] === 0) {
 		const entry = $e[1];
-		$f = [ 0, __clone(entry[1]) ];
+		$f = [ 0, __clone(entry.slice(1, 3)) ];
 	} else {
 		$f = [ 1 ];
 	}
@@ -125,13 +134,13 @@ function $k(self, key) {
 	self[0].delete(hash(key));
 }
 function $l(self, key, value) {
-	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
+	self[0].set(hash(key), [ __clone(key), ...__clone(value) ]);
 }
-const block = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ], [ "::flex-direction", [ "::flex-direction", [ "s1atdsbb", "flex-direction:column" ] ] ], [ "::gap", [ "::gap", [ "s8myyrk", "gap:var(--space-4)" ] ] ], [ "::padding", [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ] ], [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ "::border-radius", [ "::border-radius", [ "s94jklx", "border-radius:8px" ] ] ], [ "768px::padding", [ "768px::padding", [ "s1wyflm5", "padding:var(--space-6)" ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ]) ] ];
-const chain = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ], [ "::flex-direction", [ "::flex-direction", [ "s1atdsbb", "flex-direction:column" ] ] ], [ "::gap", [ "::gap", [ "s8myyrk", "gap:var(--space-4)" ] ] ], [ "::padding", [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ] ], [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ "::border-radius", [ "::border-radius", [ "s94jklx", "border-radius:8px" ] ] ], [ "768px::padding", [ "768px::padding", [ "s1wyflm5", "padding:var(--space-6)" ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ]) ] ];
+const block = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "::flex-direction", "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "::gap", "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "::border-radius", "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "768px::padding", "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
+const chain = [ [ new Map([ [ "::display", [ "::display", "sbiovxm", "display:flex" ] ], [ "::flex-direction", [ "::flex-direction", "s1atdsbb", "flex-direction:column" ] ], [ "::gap", [ "::gap", "s8myyrk", "gap:var(--space-4)" ] ], [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::background-color", [ "::background-color", "siolu0w", "background-color:var(--gray-50)" ] ], [ "::border-radius", [ "::border-radius", "s94jklx", "border-radius:8px" ] ], [ "768px::padding", [ "768px::padding", "s1wyflm5", "padding:var(--space-6)" ] ], [ ":hover:background-color", [ ":hover:background-color", "s1c7l5ao", "background-color:var(--gray-100)" ] ] ]) ] ];
 console.log(class_list(block));
 console.log(class_list(chain));
 console.log("sflnbwj sgdl28p sw0ajwn s9bu6v3 s16sw83c s1e7dqf5 s17s8g64");
 console.log("s1hbuywq s1dwvy7w s3s9k3d scur295 sxzag36 skr9oll");
-const wider = [ [ new Map([ [ "::padding", [ "::padding", [ "s1ufvsw", "padding:var(--space-6)" ] ] ] ]) ] ];
+const wider = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvsw", "padding:var(--space-6)" ] ] ]) ] ];
 console.log(class_list(add(block, wider)));

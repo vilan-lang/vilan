@@ -3,17 +3,29 @@
 // invariants (CI pins them), not timings.
 
 import std::io::print;
-import std::shared::Shared;
 import std::json::{ Json, json_codec };
-import std::wire::Serializer;
-import std::option::Option::{ Some, None };
-import std::result::Result::{ self, Ok, Err };
-import std::reactive::{ batch, Signal, SignalCell };
+import std::option::Option::{ None, Some };
+import std::reactive::{ Signal, SignalCell, batch };
+import std::result::Result::{ self, Err, Ok };
 import std::rpc::{
-	duplex_pair, local_rpc, Dispatcher, RpcError, RpcOutcome, call, arg, reply, decode_failed,
-	ReactiveServer, ReactiveClient, RemoteSource,
+	Dispatcher,
+	ReactiveClient,
+	ReactiveServer,
+	RemoteSource,
+	RpcError,
+	RpcOutcome,
+	arg,
+	call,
+	decode_failed,
+	duplex_pair,
+	local_rpc,
+	reply,
 };
+import std::shared::Shared;
+import std::wire::Serializer;
 import pkg::report::section;
+
+export *;
 
 fun run() {
 	section("coalescing (update frames counted at the wire)");
@@ -87,7 +99,9 @@ fun run() {
 	});
 	let transport = local_rpc(dispatcher.into_protocol(json_codec()));
 	let amount = 1;
-	let outcome: Result<i32, RpcError> = call(transport, json_codec(), "bump", [|s: Serializer| amount.describe(s)]);
+	let outcome: Result<i32, RpcError> = call(transport, json_codec(), "bump", [
+		|mut s: Serializer| amount.describe(&mut s),
+	]);
 	match outcome {
 		Ok(let value) => {},
 		Err(let error) => print("bump failed"),

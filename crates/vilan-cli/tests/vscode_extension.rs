@@ -239,3 +239,367 @@ fn the_listing_page_has_no_relative_links() {
         broken.join("\n")
     );
 }
+
+// --- E194: the client's word pattern ----------------------------------------
+
+/// The word at the END of `text`, as the CLIENT would compute it: the
+/// language configuration's own `wordPattern`, run by node's RegExp (the same
+/// engine VS Code uses), asked for the match that touches the cursor.
+///
+/// This is the whole of the bug E194 closed, and it can only be seen from the
+/// client's side: the server's candidate list is right — `stroke-width` is in
+/// it, and `crates/vilan-ide`'s pins assert so — but VS Code filters that list
+/// against the word under the cursor, and with no `wordPattern` declared its
+/// DEFAULT excludes `-`. At `<svg stroke-w|` the word was `w`, which
+/// `stroke-width` does not match, so the one candidate the author was typing
+/// towards was the one that disappeared. The `Completion` type carries no
+/// `filter_text` and the server sends no edit range, so nothing server-side
+/// could override it.
+fn word_at_end(text: &str) -> Option<String> {
+    let script = "const fs = require('fs');\n\
+         const config = JSON.parse(fs.readFileSync(process.env.VILAN_JSON, 'utf8'));\n\
+         if (!config.wordPattern) { console.log('NO-WORD-PATTERN'); process.exit(0); }\n\
+         const text = process.env.VILAN_TEXT;\n\
+         const pattern = new RegExp(config.wordPattern, 'g');\n\
+         let answer = '';\n\
+         let match;\n\
+         while ((match = pattern.exec(text)) !== null) {\n\
+         \x20   if (match.index + match[0].length === text.length) answer = match[0];\n\
+         \x20   if (match[0].length === 0) break;\n\
+         }\n\
+         console.log(answer);";
+    let output = Command::new("node")
+        .args(["-e", script])
+        .env(
+            "VILAN_JSON",
+            extension_dir().join("language-configuration.json"),
+        )
+        .env("VILAN_TEXT", text)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "the word pattern must be a valid RegExp: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    assert_ne!(
+        answer, "NO-WORD-PATTERN",
+        "the language configuration must declare a `wordPattern` — without one \
+         the client's default excludes `-`, and every hyphenated attribute and \
+         css property is filtered out of its own completion list (E194)"
+    );
+    (!answer.is_empty()).then_some(answer)
+}
+
+/// The item's own position: `<svg stroke-w|`. The word must be `stroke-w`, so
+/// the client keeps `stroke-width` in the list and replaces the whole prefix
+/// when it is accepted.
+#[test]
+fn the_word_pattern_reads_a_hyphenated_attribute_prefix_whole() {
+    assert_eq!(
+        word_at_end("\t\tview(\"svg\") <svg stroke-w").as_deref(),
+        Some("stroke-w"),
+        "an attribute prefix in element-head position is ONE word"
+    );
+    // A css property is the same shape one syntax over (E153's vocabulary),
+    // and a CUSTOM property keeps its leading dashes (A101 R12).
+    assert_eq!(
+        word_at_end("\tcss {\n\t\tfont-fam").as_deref(),
+        Some("font-fam")
+    );
+    assert_eq!(word_at_end("\t\t--card-ga").as_deref(), Some("--card-ga"));
+}
+
+/// The pattern WIDENS the default and narrows nothing: every word the default
+/// reads whole is still one word. A word pattern is not only completion — it
+/// is double-click, `Ctrl+D` and word-wise motion — so a regression here is
+/// felt on every keystroke in the editor, which is why the pin is a table
+/// rather than the one case the item names.
+#[test]
+fn the_word_pattern_keeps_every_word_the_default_read() {
+    for (text, expected) in [
+        // Ordinary identifiers and paths: `.` and `::` still break a word.
+        ("foo.bar", Some("bar")),
+        ("Route::Home", Some("Home")),
+        ("view(\"svg\").stroke_width", Some("stroke_width")),
+        // Numbers, suffixed numbers, and decimals.
+        ("let a = 1.5", Some("1.5")),
+        ("padding(px(4", Some("4")),
+        ("let width = 4px", Some("4px")),
+        ("let n: i53", Some("i53")),
+        // NON-ASCII, the case a hand-written ASCII identifier class breaks:
+        // a comment or a string in any language must still have words.
+        ("// le café", Some("café")),
+        // A SPACED binary minus — what the formatter writes — is untouched.
+        ("let d = x - 1", Some("1")),
+        // And a position that is not in a word has none.
+        ("let a = ", None),
+    ] {
+        assert_eq!(
+            word_at_end(text).as_deref(),
+            expected,
+            "word at the end of {text:?}"
+        );
+    }
+    // The one deliberate widening beyond attribute position: an UNSPACED
+    // binary minus reads as one word. Canonical vilan spaces it (`vilan fmt`
+    // is authoritative), so this is reachable only in text the formatter has
+    // not seen — and it is the price of the hyphen, named rather than hidden.
+    assert_eq!(word_at_end("let d = a-b").as_deref(), Some("a-b"));
+}
+
+// --- E202 / E203: the pairs the configuration declares -----------------------
+
+/// The language configuration, as node parses it, printed as JSON so a pin can
+/// assert over the whole list rather than one field.
+fn language_configuration() -> String {
+    json_field(
+        &extension_dir().join("language-configuration.json"),
+        "JSON.stringify(JSON.parse(require('fs').readFileSync(process.env.VILAN_JSON, 'utf8')))",
+    )
+}
+
+/// E202 (R9): `<`/`>` is a SURROUNDING pair — select a type name, type `<`, and
+/// the selection is wrapped — and deliberately NOT an auto-closing one.
+///
+/// The two are different questions. Surrounding a SELECTION is unambiguous:
+/// there is no reading of "wrap this in `<>`" that means a comparison. Typing
+/// `<` on its own is ambiguous, and a static auto-closing pair cannot tell
+/// `List<` from `a < b` (its only filter is `notIn: [string, comment]`), so
+/// that half is the SERVER's — `onTypeFormatting`, which knows which names are
+/// types. A `<` entry here would grow a `>` in every comparison anybody typed.
+///
+/// **What the server half costs, written down because the pin cannot hold it.**
+/// VS Code types OVER a closing character only when it auto-inserted that
+/// character itself (`editor.autoClosingOvertype: "auto"`), and an edit the
+/// server returned is not that — so typing the `>` of `List<i32>` by hand
+/// yields `List<i32>>`, and an `onTypeFormatting` answer cannot fix it because
+/// a text edit cannot move the caret past a character it leaves in place
+/// (`List<List<i32>>` needs the caret between the two, not before them). The
+/// only configuration that buys overtype is an `autoClosingPairs` entry for
+/// `<`, which is the hazard this pin exists to keep out. So the overtype is
+/// the extension's (E222, ruled): a client-side `type` override that asks the
+/// server, places the `>` and swallows the next one — pinned below.
+#[test]
+fn e202_the_angle_pair_surrounds_but_does_not_auto_close() {
+    let config = language_configuration();
+    assert!(
+        config.contains(r#"["<","<>"#) || config.contains(r#"["<",">"]"#),
+        "`surroundingPairs` must carry [\"<\", \">\"]: {config}"
+    );
+    assert_eq!(
+        config.matches(r#""open":"<""#).count(),
+        0,
+        "`<` must NOT be an autoClosingPair — `a < b` would grow a `>` (E202): {config}"
+    );
+}
+
+/// E203 (R9): the backtick is a GLOBAL pair with `notIn: ["string"]`.
+///
+/// Global — not scoped to comments — because a backtick means nothing to the
+/// lexer, so there is no position where pairing one breaks code. `notIn:
+/// ["string"]` is the one exclusion that matters: a string body is text the
+/// author is writing literally, and a second backtick appearing inside one is
+/// a character they did not type. Doc prose is where backticks live (every std
+/// `///` uses them), and it is a comment, which the exclusion does not cover.
+#[test]
+fn e203_the_backtick_is_a_global_pair_outside_strings() {
+    let config = language_configuration();
+    assert!(
+        config.contains(r#"{"open":"`","close":"`","notIn":["string"]}"#),
+        "the backtick must auto-close everywhere but inside a string body: {config}"
+    );
+    assert!(
+        config.contains(r#"["`","`"]"#),
+        "and surround a selection, which is the other half of the ask: {config}"
+    );
+}
+
+/// E203: a pair is placed only BEFORE one of a conservative set of characters,
+/// stated rather than inherited.
+///
+/// VS Code's `autoCloseBefore` decides whether an auto-closing pair fires at
+/// all: it fires only when the character AFTER the cursor is one of these (or
+/// the line ends there). Without the field a language inherits exactly this
+/// set, so declaring it changes nothing today — and that is the point. The
+/// behaviour a backtick needs (typing one before a WORD character must not
+/// pair, because `` `word `` is somebody quoting a word that is already
+/// written) now reads off this file instead of off a default that could move
+/// under it.
+#[test]
+fn e203_a_pair_fires_only_before_the_conservative_set() {
+    let config = language_configuration();
+    assert!(
+        config.contains(r#""autoCloseBefore":";:.,=}])> \n\t""#),
+        "the language declares its own `autoCloseBefore`: {config}"
+    );
+    // The characters a backtick must NOT pair before are the ones absent from
+    // that set, and a word character is the case the item names.
+    for character in ['a', 'Z', '0', '_', '`'] {
+        assert!(
+            !";:.,=}])> \n\t".contains(character),
+            "`{character}` must stay out of the set, or a backtick pairs before a word"
+        );
+    }
+}
+
+/// The premise a GLOBAL backtick pair rests on: the lexer has no backtick
+/// token at all, so a backtick is never syntax and pairing one can never
+/// change what a program means (E203).
+///
+/// A grep, deliberately — the claim is about the absence of a token, and an
+/// absence has no behavior to observe. It COUNTS rather than `contains`-es, so
+/// the day someone adds a template-literal token this pin reds and the pair's
+/// scope is re-decided with the real case in hand.
+#[test]
+fn e203_the_lexer_still_has_no_backtick_token() {
+    let lexing = std::fs::read_to_string(repo_root().join("crates/vilan-core/src/lexing.rs"))
+        .expect("read lexing.rs");
+    // Doc comments quote code with backticks by the hundred, so the search is
+    // for the CHARACTER LITERAL a lexer arm would have to match on, not for the
+    // character.
+    let literal = format!("'{}'", '`');
+    assert_eq!(
+        lexing.matches(&literal).count(),
+        0,
+        "the lexer now matches a backtick: E203's global pair assumed it could not, \
+         and the pair's `notIn` list must be re-decided (tracker E203)"
+    );
+    let token = std::fs::read_to_string(repo_root().join("crates/vilan-core/src/token.rs"))
+        .expect("read token.rs");
+    assert_eq!(
+        token.to_lowercase().matches("backtick").count(),
+        0,
+        "a `Backtick` token appeared: see above"
+    );
+}
+
+// --- E222: the extension's `type` override -----------------------------------
+//
+// The TS half is not run by this suite (it needs a VS Code host), so what it
+// promises is pinned TEXTUALLY, one claim per pin: the setting, the override's
+// shape, the two strings it must share with other files, and the declaration
+// the server stands down on (that half is `book_sync`'s, beside the request
+// name; the server's own stand-down is pinned in `vilan-lsp`).
+
+fn extension_source() -> String {
+    std::fs::read_to_string(extension_dir().join("src/extension.ts")).expect("read extension.ts")
+}
+
+/// A `'…'` literal's value, with the two escapes the file uses.
+fn single_quoted_constant(source: &str, name: &str) -> String {
+    let head = format!("const {name} = '");
+    let start = source
+        .find(&head)
+        .unwrap_or_else(|| panic!("extension.ts declares {name}"))
+        + head.len();
+    let end = start + source[start..].find('\'').expect("the closing quote");
+    source[start..end].replace("\\n", "\n").replace("\\t", "\t")
+}
+
+/// The setting exists, is on by default, and says WHY it is a setting — the
+/// one fact a user reaching for it (a Vim user whose `type` it collides with)
+/// needs.
+#[test]
+fn e222_the_generic_pairing_is_a_setting_on_by_default_that_names_vim() {
+    assert_eq!(
+        manifest_field(
+            "contributes.configuration.properties['vilan.autoClosing.generics'].default"
+        ),
+        "true"
+    );
+    let description = manifest_field(
+        "contributes.configuration.properties['vilan.autoClosing.generics'].description",
+    );
+    for needed in ["`type`", "Vim", "type over"] {
+        assert!(
+            description.contains(needed),
+            "the description must say {needed:?} — why this is a setting: {description}"
+        );
+    }
+}
+
+/// The override TYPES THROUGH: every keystroke still reaches VS Code's own
+/// `default:type`, and the override only looks at `<` and `>` — so a
+/// keystroke it has no business with behaves exactly as without it.
+#[test]
+fn e222_the_override_types_every_character_through_default_type() {
+    let source = extension_source();
+    assert!(
+        source.contains("commands.registerCommand('type', typeThrough)"),
+        "the override is registered on `type`"
+    );
+    assert!(
+        source.contains("await commands.executeCommand('default:type', args);"),
+        "and forwards the keystroke to `default:type`"
+    );
+    // Keystrokes queue: a `<` awaiting its answer must not let the next
+    // character land before its `>`.
+    assert!(
+        source.contains("const turn = typing.then(() => typeOne(args));"),
+        "keystrokes are serialised behind the pending `<`"
+    );
+    // Only while the setting asks for it — and a registration refused
+    // (another extension owns `type`) leaves the override absent, not broken.
+    assert!(source.contains("get<boolean>('autoClosing.generics', true)"));
+    assert!(source.contains("another extension already owns the `type` command"));
+}
+
+/// The overtype: a `>` typed onto one the override placed moves the caret and
+/// inserts nothing — the thing an `onTypeFormatting` edit could never do.
+#[test]
+fn e222_a_placed_closer_is_typed_over_not_doubled() {
+    let source = extension_source();
+    assert!(source.contains("if (args.text === '>' && pairsIn(editor) && typeOverClosing(editor)) {\n        return;\n    }"));
+    assert!(source.contains("editor.selection = new Selection(past, past);"));
+    // The placed `>` rides the `<`'s own undo step.
+    assert!(source.contains("undoStopBefore: false"));
+    // And the placed set follows the text (an edit elsewhere shifts it; an edit
+    // over it forgets it), which is what keeps the swallow on THE `>`.
+    assert!(source.contains("workspace.onDidChangeTextDocument(trackClosers)"));
+}
+
+/// The override places a `>` only where VS Code would fire any other pair —
+/// the language configuration's `autoCloseBefore` — so the two lists are ONE
+/// list, held equal here.
+#[test]
+fn e222_the_override_fires_before_the_configurations_own_set() {
+    let source = extension_source();
+    let config = json_field(
+        &extension_dir().join("language-configuration.json"),
+        "JSON.parse(require('fs').readFileSync(process.env.VILAN_JSON, 'utf8')).autoCloseBefore",
+    );
+    // node prints the value itself: the newline and tab come out raw, and a
+    // trailing tab is trimmed by `json_field`'s `trim_end` — compare on the
+    // trimmed form of both.
+    assert_eq!(
+        single_quoted_constant(&source, "AUTO_CLOSE_BEFORE").trim_end(),
+        config.trim_end(),
+        "extension.ts's AUTO_CLOSE_BEFORE and language-configuration.json's autoCloseBefore disagree"
+    );
+}
+
+// --- F27 R1/R6: the platform status line --------------------------------------
+
+/// The status bar says which platform the active vilan file is analyzed under
+/// and which kind of fact chose it — `analyzed as: browser — declared` — with
+/// the whole reason as its tooltip, and it follows the file as it is edited.
+#[test]
+fn f27_the_status_line_names_the_platform_and_the_kind_of_fact() {
+    let source = extension_source();
+    assert!(source.contains("window.createStatusBarItem(StatusBarAlignment.Right, 100)"));
+    assert!(
+        source.contains("`analyzed as: ${answer.platform} — ${answer.kind}`"),
+        "the line's text"
+    );
+    assert!(source.contains("platformStatus.tooltip = answer.reason"));
+    // Shown for a vilan file only, and re-asked after edits settle.
+    assert!(source.contains("editor.document.languageId !== 'vilan'"));
+    assert!(
+        source.contains("window.onDidChangeActiveTextEditor(() => void refreshPlatformStatus())")
+    );
+    assert!(source.contains("schedulePlatformRefresh();"));
+}

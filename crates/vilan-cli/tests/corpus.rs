@@ -7,10 +7,42 @@
 //! under test is always the one Cargo just built from this tree, so a stale
 //! binary can no longer write or check goldens. A deliberate output change
 //! still regenerates goldens by hand; this gate then verifies the commit.
+//!
+//! # What belongs in the corpus (tracker N51)
+//!
+//! **A corpus program TERMINATES, and its output is the claim.** This gate reads
+//! the bytes a program compiles to, and the `// witness:` rule below makes the
+//! load-bearing ones nameable — but the differentials over the same directory
+//! (`vilan-core/tests/{release,infer}_differential.rs`) read what it PRINTS,
+//! and that is the claim the corpus rests on: two builds of one program are the
+//! same program if and only if they print the same thing. A program that never
+//! exits has no stdout for anything to compare, so it is not a weaker corpus
+//! entry, it is not one at all — and its cost is paid whether or not anyone
+//! notices, since a runner has nothing to wait for but its own deadline.
+//! `watch.vl` was exactly that for as long as it existed: it blocked on
+//! `flat.next()` for a change nothing ever made, and when the release
+//! differential first ran it, both builds were killed at 300 s and the gate
+//! compared two identical "node did not exit" strings and passed — 600 s of a
+//! 607 s critical path spent on a verdict that could not come out any other way.
+//! It now makes its own bounded change and observes it (`created probe.txt`,
+//! `modified probe.txt`, exit 0, ~1 s at loadavg 126); the endless form is
+//! `vilan/examples/watch`, where a program that runs until you stop it is the
+//! thing being shown.
+//!
+//! The rule does not ask a program to be FAST, and shortening a wait to make one
+//! terminate is the other disease (E32: the observation becomes "what had it
+//! printed when we gave up", which load decides). It asks the program to reach
+//! its own end on its own — to make the event it waits for, or to stop waiting
+//! for one. Programs whose output is not a function of their source alone — a
+//! clock, a random draw, the host environment — are still corpus programs and
+//! are compiled by every gate; they simply do not reach the node leg
+//! (`corpus_harness::NOT_RUN` names them, with the reason each).
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod scratch;
 
 /// The extension a corpus golden carries. Corpus programs are bare files with
 /// no manifest, so `vilan build` compiles them for the default platform (Node)
@@ -191,7 +223,7 @@ fn every_corpus_golden_is_byte_identical() {
     // A full copy: corpus programs may import sibling modules — and may bundle
     // sibling RESOURCES — and building in place would overwrite the goldens
     // under comparison.
-    let work = std::env::temp_dir().join(format!("vilan_corpus_gate_{}", std::process::id()));
+    let work = scratch::root().join(format!("vilan_corpus_gate_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).expect("create corpus work dir");
     let mut programs: Vec<String> = Vec::new();
@@ -292,6 +324,393 @@ fn every_corpus_golden_is_byte_identical() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// The directive a corpus program uses to name the bytes that carry a claim.
+const WITNESS_DIRECTIVE: &str = "// witness:";
+
+/// The negative form: bytes a claim says are ABSENT.
+const WITNESS_ABSENT_DIRECTIVE: &str = "// witness-absent:";
+
+/// The shortest a normalized POSITIVE witness may be. A one- or two-character
+/// witness (`(`, `;`) is in every golden and therefore pins nothing; the floor
+/// stops a directive from being written down as a no-op.
+///
+/// It applies to the positive form only, because the strength argument inverts
+/// for the negative one: a SHORT absent-witness is the harder claim (more
+/// goldens contain `finally` than contain `} finally { $a(r); }`), so the
+/// short-is-vacuous reasoning does not carry over, and `resource_exit.vl`'s
+/// seven-character `finally` is the strongest form of its own sentence.
+const SHORTEST_WITNESS: usize = 8;
+
+/// Collapses every run of ASCII whitespace to one space and trims, so a witness
+/// may be written on one comment line and still match bytes that the emitter
+/// spread over several indented lines.
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every `// witness:` / `// witness-absent:` line in `source`, normalized, as
+/// `(line number, present, witness)`.
+fn witnesses(source: &str) -> Vec<(usize, bool, String)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim_start();
+            // The two prefixes diverge before either colon (`witness:` against
+            // `witness-`), so neither is a prefix of the other and this order is
+            // a readability choice rather than a correctness one.
+            let (present, rest) = if let Some(rest) = trimmed.strip_prefix(WITNESS_ABSENT_DIRECTIVE)
+            {
+                (false, rest)
+            } else {
+                (true, trimmed.strip_prefix(WITNESS_DIRECTIVE)?)
+            };
+            Some((index + 1, present, normalize_whitespace(rest)))
+        })
+        .collect()
+}
+
+/// One piece of a parsed witness: either bytes that must appear verbatim, or a
+/// GENERATED name, which is a hole (N110).
+#[derive(Debug, PartialEq, Eq)]
+enum WitnessPiece {
+    Literal(String),
+    /// The generated name as the witness SPELLS it — the spelling is the hole's
+    /// identity, not a byte to match: two occurrences of one spelling must bind
+    /// to one name in the golden, and two spellings must bind to two.
+    Generated(String),
+}
+
+/// A generated name at the start of `text`: `$` and the identifier run after
+/// it. `None` if `text` does not start one.
+///
+/// Every `$`-prefixed identifier in emitted JavaScript is the name generator's
+/// — the runtime helpers are `__`-prefixed and source names are the author's —
+/// so the test needs no table of which names are generated.
+fn generated_name_at(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('$')?;
+    let length = rest
+        .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .unwrap_or(rest.len());
+    (length > 0).then(|| &text[..length + 1])
+}
+
+/// Splits a normalized witness into literal bytes and generated-name holes.
+fn parse_witness(witness: &str) -> Vec<WitnessPiece> {
+    let mut pieces = Vec::new();
+    let mut literal = String::new();
+    let mut rest = witness;
+    while !rest.is_empty() {
+        if let Some(name) = generated_name_at(rest) {
+            if !literal.is_empty() {
+                pieces.push(WitnessPiece::Literal(std::mem::take(&mut literal)));
+            }
+            pieces.push(WitnessPiece::Generated(name.to_string()));
+            rest = &rest[name.len()..];
+            continue;
+        }
+        let mut characters = rest.chars();
+        let character = characters.next().expect("the loop guard");
+        literal.push(character);
+        rest = characters.as_str();
+    }
+    if !literal.is_empty() {
+        pieces.push(WitnessPiece::Literal(literal));
+    }
+    pieces
+}
+
+/// Whether the normalized `golden` carries the bytes `witness` names, reading
+/// every generated name in the witness as a HOLE (N110).
+///
+/// **Why a hole and not a byte.** A generated name is minted from one monotonic
+/// counter, so a temporary added anywhere upstream shifts every name after it
+/// and nothing about the program changes. The byte gate is judged against that
+/// — the integrator's diff is gensym-normalized — but this gate was literal
+/// substring containment, so a pure shift reddened it with a message that tells
+/// the reader the CLAIM is unwitnessed and forbids relaxing the witness.
+/// `reactive-on-change.vl:60` was re-keyed once in Order 38 and survived the
+/// merged-tree regeneration by luck. A gate whose failure means "the counter
+/// moved" and whose text means "your claim is false" is worse than no gate.
+///
+/// **What the hole still pins.** The shape, and the IDENTITY relation: the
+/// binding map is one-to-one both ways, so `$a = 7; process.exit($a);` still
+/// says "the same generated name is assigned and then read", and `function
+/// $j($k) { $b($k[0]); }` still says the parameter is what the third name is
+/// called with — three distinct names, in those positions. What it drops is
+/// exactly what the counter decides. A witness that names no generated name is
+/// matched byte for byte as before.
+fn witness_is_in(golden: &str, witness: &str) -> bool {
+    let pieces = parse_witness(witness);
+    // No hole: the old path, and the common one.
+    if pieces
+        .iter()
+        .all(|piece| matches!(piece, WitnessPiece::Literal(_)))
+    {
+        return golden.contains(witness);
+    }
+    // A hole cannot be the anchor, so every start offset is tried. The witness
+    // is one comment line and the golden one file, so this is cheap.
+    (0..=golden.len()).any(|start| {
+        golden.is_char_boundary(start) && witness_matches_at(&golden[start..], &pieces)
+    })
+}
+
+/// One attempt: the pieces in order from the head of `text`, holes binding to
+/// generated names one-to-one.
+fn witness_matches_at(text: &str, pieces: &[WitnessPiece]) -> bool {
+    let mut rest = text;
+    let mut by_witness: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut by_golden: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for piece in pieces {
+        match piece {
+            WitnessPiece::Literal(bytes) => match rest.strip_prefix(bytes.as_str()) {
+                Some(tail) => rest = tail,
+                None => return false,
+            },
+            WitnessPiece::Generated(spelling) => {
+                let Some(found) = generated_name_at(rest) else {
+                    return false;
+                };
+                if *by_witness.entry(spelling.as_str()).or_insert(found) != found {
+                    return false; // one spelling, two names
+                }
+                if *by_golden.entry(found).or_insert(spelling.as_str()) != spelling.as_str() {
+                    return false; // two spellings, one name
+                }
+                rest = &rest[found.len()..];
+            }
+        }
+    }
+    true
+}
+
+/// Audit run 7's F7/F8 rule, mechanized: a corpus program's prose claim is
+/// checked against the bytes it claims.
+///
+/// The finding that minted this: `resource.vl` said "Two locals drop in reverse
+/// declaration order at the scope end" and, since c8609287 moved disposal from
+/// the scope end to the LAST USE, neither local was read — so both dropped at
+/// their declaration, in declaration order, and the golden beside the sentence
+/// proved the opposite of it. The inference twins were adjusted in that commit;
+/// the corpus twins were not. Nothing was red, because a golden gate checks that
+/// the bytes are the bytes the compiler emits, never that they are the bytes the
+/// comment above them describes.
+///
+/// A `// witness:` line closes that gap by making the load-bearing bytes
+/// nameable. It is deliberately NOT a second copy of the golden: a witness names
+/// the FRAGMENT a claim rests on — the `finally` that has to close after the
+/// last statement, the drop that has to precede the write — so a regeneration
+/// that moves that fragment fails here with the claim's own words beside it,
+/// where the byte gate would only have said "regenerate". The negative form
+/// (`// witness-absent:`) carries the claims that are about an emission NOT
+/// happening, which `resource_exit.vl`'s "no `finally` in the emitted bytes at
+/// all" is one of and which no positive substring can express.
+///
+/// Matching is whitespace-normalized on both sides, so a witness fits on one
+/// comment line and still spans the emitter's indented multi-line shapes. It is
+/// substring containment rather than a regex: a witness should be readable as
+/// the JS it names. The one exception is a GENERATED name (`$a`, `$S`), which
+/// is a hole — see [`witness_is_in`] for why the counter is not part of any
+/// claim, and what the hole still pins.
+///
+/// The rejected weaker design, recorded because it looks adequate: "every corpus
+/// program's leading comment mentions a token the emitted JS contains". It is
+/// vacuous against the very finding it would answer — `resource.vl`'s stale
+/// header mentioned "drop", the golden contains `drop`, and the check stays
+/// green through the whole regression. A claim is only checkable when the
+/// program says WHICH bytes are the claim.
+///
+/// The floors below keep the mechanism from rotting to nothing while it is still
+/// being adopted file by file; they rise as programs are annotated.
+#[test]
+fn every_declared_witness_is_in_its_golden() {
+    const FEWEST_ANNOTATED_PROGRAMS: usize = 2;
+    const FEWEST_WITNESSES: usize = 12;
+
+    let corpus = corpus_dir();
+    let mut annotated = 0usize;
+    let mut total = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&corpus)
+        .expect("corpus directory")
+        .map(|entry| entry.expect("corpus entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("vl") {
+            continue;
+        }
+        let golden_path = path.with_extension(GOLDEN_EXTENSION);
+        let Ok(golden) = std::fs::read_to_string(&golden_path) else {
+            continue;
+        };
+        let source = std::fs::read_to_string(&path).expect("read a corpus program");
+        let declared = witnesses(&source);
+        if declared.is_empty() {
+            continue;
+        }
+        annotated += 1;
+        total += declared.len();
+        let normalized_golden = normalize_whitespace(&golden);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        for (line, present, witness) in declared {
+            if present && witness.len() < SHORTEST_WITNESS {
+                failures.push(format!(
+                    "{name}:{line}: witness {witness:?} is shorter than {SHORTEST_WITNESS} \
+                     characters, so it pins nothing"
+                ));
+                continue;
+            }
+            if witness.is_empty() {
+                failures.push(format!("{name}:{line}: the witness is empty"));
+                continue;
+            }
+            if witness_is_in(&normalized_golden, &witness) != present {
+                let complaint = if present {
+                    "is not in"
+                } else {
+                    "is in (and the claim above says it is absent from)"
+                };
+                failures.push(format!(
+                    "{name}:{line}: the declared witness {witness:?} {complaint} \
+                     {} — the claim above it is unwitnessed. Fix the program until \
+                     the claim holds, or correct the claim; do NOT relax the \
+                     witness to whatever the golden happens to say.",
+                    golden_path.display()
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} corpus witness(es) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert!(
+        annotated >= FEWEST_ANNOTATED_PROGRAMS && total >= FEWEST_WITNESSES,
+        "the witness mechanism has rotted: {annotated} annotated program(s) \
+         (floor {FEWEST_ANNOTATED_PROGRAMS}) carrying {total} witness(es) \
+         (floor {FEWEST_WITNESSES})"
+    );
+}
+
+/// The witness gate's own parsing, pinned: the two directives are told apart,
+/// whitespace normalization spans lines, and a bare `//` comment is not a
+/// witness.
+#[test]
+fn witness_directives_parse() {
+    let source = "// a claim\n\
+                  // witness: } finally {\t$a(a);\n\
+                  \t// witness-absent: finally\n\
+                  // witnessing something is not a directive\n";
+    let parsed = witnesses(source);
+    assert_eq!(
+        parsed,
+        vec![
+            (2, true, "} finally { $a(a);".to_string()),
+            (3, false, "finally".to_string()),
+        ],
+        "witness parsing changed"
+    );
+    assert_eq!(
+        normalize_whitespace("\ttry {\n\t\t$a(r);\n"),
+        "try { $a(r);",
+        "whitespace normalization must let a one-line witness span emitted lines"
+    );
+}
+
+/// N110, the mechanism: a generated name in a witness is a hole, and the hole
+/// is exactly as wide as the counter.
+///
+/// Both directions are pinned, because the fix's failure mode is a gate that
+/// has stopped saying anything. A pure counter SHIFT must pass; a changed
+/// SHAPE, a changed identity relation, and a witness that names no generated
+/// name at all must all still fail.
+#[test]
+fn n110_a_generated_name_in_a_witness_is_a_hole_and_nothing_wider() {
+    // The parse, first: a witness is literal bytes around `$`-prefixed holes,
+    // and the hole carries its own spelling.
+    assert_eq!(
+        parse_witness("$a = 7; process.exit($a);"),
+        vec![
+            WitnessPiece::Generated("$a".to_string()),
+            WitnessPiece::Literal(" = 7; process.exit(".to_string()),
+            WitnessPiece::Generated("$a".to_string()),
+            WitnessPiece::Literal(");".to_string()),
+        ],
+        "a witness must split into literals and generated-name holes"
+    );
+    assert_eq!(
+        parse_witness("console.log(a[0]);"),
+        vec![WitnessPiece::Literal("console.log(a[0]);".to_string())],
+        "a witness with no generated name is one literal"
+    );
+
+    // THE DEFECT. `reactive-on-change.vl:60`'s witness, against a golden whose
+    // counter has moved — a temporary minted anywhere upstream does this, and
+    // nothing about the program has changed.
+    let witness =
+        "const subscription = $S(self, observer); observer($T(self)); return subscription;";
+    let shifted =
+        "const subscription = $W(self, observer); observer($X(self)); return subscription; }";
+    assert!(
+        witness_is_in(shifted, witness),
+        "a pure counter shift must not red the witness gate"
+    );
+    assert!(
+        witness_is_in(
+            "const subscription = $S(self, observer); observer($T(self)); return subscription;",
+            witness
+        ),
+        "the unshifted golden must still match"
+    );
+
+    // And nothing wider. The SHAPE:
+    assert!(
+        !witness_is_in(
+            "const subscription = $W(self); observer($X(self)); return subscription;",
+            witness
+        ),
+        "a dropped argument must still fail"
+    );
+    // The IDENTITY relation, both ways round. One spelling, two names:
+    assert!(
+        !witness_is_in("$b = 7; process.exit($c);", "$a = 7; process.exit($a);"),
+        "one witness spelling must bind to one generated name"
+    );
+    assert!(
+        witness_is_in("$c = 7; process.exit($c);", "$a = 7; process.exit($a);"),
+        "the same name twice is what the witness says"
+    );
+    // Two spellings, one name:
+    assert!(
+        !witness_is_in("function $q($q) { }", "function $j($k) { }"),
+        "two witness spellings must bind to two generated names"
+    );
+    assert!(
+        witness_is_in("function $q($r) { }", "function $j($k) { }"),
+        "two distinct names in those positions is what the witness says"
+    );
+    // A hole is ONE name, never a wildcard over arbitrary bytes:
+    assert!(
+        !witness_is_in("drop2(payload); ", "drop2($d); "),
+        "a hole must not match a source name"
+    );
+    assert!(
+        !witness_is_in("drop2($d, $e); ", "drop2($d); "),
+        "a hole must not swallow the bytes after the name"
+    );
+    // And the literal path is untouched, in both directions.
+    assert!(witness_is_in("a } finally { b", "} finally {"));
+    assert!(!witness_is_in("a } catch { b", "} finally {"));
 }
 
 /// The equivalence-gate rationale for HMR (A13, `hmr.md` §5): the `build` path
@@ -396,7 +815,7 @@ fn emitted_js_is_independent_of_import_order() {
         "{display_import}{base64_import}{print_import}{bytes_import}{math_import_shuffled}{body}"
     );
 
-    let work = std::env::temp_dir().join(format!("vilan_import_order_{}", std::process::id()));
+    let work = scratch::root().join(format!("vilan_import_order_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     // Same basename in separate directories, so nothing but the import order
     // varies (the emitted JS embeds no source path — verified: identical dirs
@@ -468,8 +887,7 @@ fn concurrent_builds_of_one_program_agree_byte_for_byte() {
     const WORKERS: usize = 4;
 
     let corpus = corpus_dir();
-    let root =
-        std::env::temp_dir().join(format!("vilan_corpus_concurrency_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_corpus_concurrency_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     // A private copy per worker — corpus programs import sibling modules, and
     // two workers writing one directory would race on the output, not on the
@@ -534,4 +952,270 @@ fn concurrent_builds_of_one_program_agree_byte_for_byte() {
             );
         }
     }
+}
+
+/// N54 — the filesystem program's scratch path belongs to its RUN, not to the
+/// working directory.
+///
+/// `file.vl` opens, reads, rewrites and removes a file it creates itself, and it
+/// used to create it as `file-corpus.txt` relative to the process working
+/// directory — one name, one directory, for every run of the program that ever
+/// happens at once. The two differentials in `vilan-core` each run every corpus
+/// program, in processes that know nothing about each other, so overlapping runs
+/// are not a hazard the program might meet: they are how it is run. Shared, the
+/// run that gets to `remove` first deletes the file another run is still
+/// reading, and the loser fails on an `ENOENT` about a file that was never its
+/// own — a red that says nothing about the handle tier this program exists to
+/// pin. `watch.vl` was given a random-suffixed scratch directory for the same
+/// reason one item earlier (tracker N51); this is that fix on the sibling that
+/// still had the disease.
+///
+/// The pin is the property, not the mechanism: eight copies of the emitted
+/// program, started together **in one directory** — the arrangement that makes
+/// a fixed name collide — must each print the same bytes and exit 0. It is not a
+/// timing claim; eight runs that never overlapped would pass it too, and every
+/// run that DOES overlap is a run this would have caught.
+#[test]
+fn eight_concurrent_runs_of_the_filesystem_program_agree_byte_for_byte() {
+    const COPIES: usize = 8;
+
+    let work = scratch::root().join(format!("vilan_file_corpus_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("create the work directory");
+    let source = work.join("file.vl");
+    std::fs::copy(corpus_dir().join("file.vl"), &source).expect("stage the program");
+    let built = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("build")
+        .arg(&source)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan build");
+    assert!(
+        built.status.success(),
+        "file.vl must build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let program = source.with_extension(GOLDEN_EXTENSION);
+
+    // Started together, and all eight in the SAME working directory: a
+    // scratch path built from the working directory alone is one path for all of
+    // them, which is the collision under test.
+    let children: Vec<_> = (0..COPIES)
+        .map(|_| {
+            Command::new("node")
+                .arg(&program)
+                .current_dir(&work)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn node")
+        })
+        .collect();
+    let runs: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("wait for node"))
+        .collect();
+
+    let failures: Vec<String> = runs
+        .iter()
+        .enumerate()
+        .filter(|(_, run)| !run.status.success())
+        .map(|(which, run)| {
+            format!(
+                "copy {which} exited {:?}: {}",
+                run.status.code(),
+                String::from_utf8_lossy(&run.stderr)
+            )
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {COPIES} concurrent runs failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let first = String::from_utf8_lossy(&runs[0].stdout).into_owned();
+    assert!(
+        first.contains("data.txt") && !first.contains("file-corpus-"),
+        "the program prints the BASENAME of its scratch file, so the random \
+         suffix that keeps the runs apart never reaches stdout: {first:?}"
+    );
+    for (which, run) in runs.iter().enumerate().skip(1) {
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            first,
+            "copy {which} printed something else — the runs are sharing a path"
+        );
+    }
+
+    // Every run removes what it made: nothing of the program's is left beside
+    // the sources, so a leftover directory is a teardown that did not run.
+    let leftovers: Vec<String> = std::fs::read_dir(&work)
+        .expect("read the work directory")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            (name != "file.vl" && name != format!("file.{GOLDEN_EXTENSION}")).then_some(name)
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the program left {leftovers:?} behind — the scratch tree is removed on exit"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+// --- N83: what a corpus build leaves in the tree -----------------------------
+
+/// Every file a corpus build EMITS beside the sources is named by the
+/// repository's `.gitignore`.
+///
+/// The byte gate above stages the corpus into a work directory, so
+/// `--test corpus` never dirties the tree. The regeneration RITUAL does not:
+/// rebuilding a golden is `vilan build vilan/test/<program>.vl` **in place**
+/// (`AGENTS.md` §2, and the reason is that a stale binary writes wrong
+/// goldens). The three programs that reach `std::asset` write four files
+/// beside the corpus when they are built there — `.vilan-bundled`,
+/// `icons/close.svg`, `logo.<hash>.svg` and `robots.txt` — and none of them
+/// was ignored, so `git add -A` after a regeneration swept all four into the
+/// commit.
+///
+/// A test must not build in place either, so this one builds the asset
+/// programs in a staged copy, diffs the directory against the staging, and
+/// asks `git check-ignore` about the path each emitted file WOULD have under
+/// `vilan/test/`. That keeps the list honest in both directions: a new bundled
+/// asset reds until `.gitignore` names it, and an ignore line deleted reds the
+/// asset that needed it. The content hash in `logo.<hash>.svg` is exactly why
+/// the question is asked of git rather than of a list written here.
+#[test]
+fn every_asset_a_corpus_build_emits_beside_the_sources_is_gitignored() {
+    let corpus = corpus_dir();
+    let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "corpus_emissions_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("create the emissions work dir");
+
+    // The staging the byte gate uses, minus the goldens: the programs and the
+    // resource trees they bundle from.
+    let mut asset_programs: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&corpus).expect("corpus directory") {
+        let path = entry.expect("corpus entry").path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            stage_tree(&path, &work.join(name));
+            continue;
+        }
+        let Some(extension) = path.extension() else {
+            continue;
+        };
+        if extension == GOLDEN_EXTENSION || extension == "css" {
+            continue;
+        }
+        std::fs::copy(&path, work.join(name)).expect("stage a corpus file");
+        if extension == "vl"
+            && std::fs::read_to_string(&path).is_ok_and(|text| text.contains("std::asset"))
+        {
+            asset_programs.push(name.to_string());
+        }
+    }
+    asset_programs.sort();
+    assert!(
+        !asset_programs.is_empty(),
+        "no corpus program reaches `std::asset`, so this pin measures nothing"
+    );
+
+    let staged = files_under(&work);
+    for name in &asset_programs {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .arg("build")
+            .arg(work.join(name))
+            .env("VILAN_STD", std_dir())
+            .output()
+            .expect("run vilan build");
+        assert!(
+            output.status.success(),
+            "{name}: build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // What appeared, minus the compiler's own outputs for the program itself.
+    let emitted: Vec<PathBuf> = files_under(&work)
+        .into_iter()
+        .filter(|path| !staged.contains(path))
+        .filter(|path| {
+            !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "mjs" | "js" | "css" | "json" | "map"))
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&work);
+    assert!(
+        !emitted.is_empty(),
+        "the asset programs emitted nothing, so this pin measures nothing: \
+         {asset_programs:?}"
+    );
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let probe = Command::new("git")
+        .arg("check-ignore")
+        .arg("--no-index")
+        .arg("-q")
+        .arg("vilan/test/.vilan-bundled")
+        .current_dir(&repository)
+        .status();
+    let Ok(_) = probe else {
+        // No git on this host: the question cannot be asked, and a pin that
+        // cannot ask its question declines rather than fails.
+        eprintln!("no `git` on this host, so the ignore rules are not checked (N83)");
+        return;
+    };
+    let mut unignored: Vec<String> = Vec::new();
+    for relative in &emitted {
+        let in_tree = Path::new("vilan/test").join(relative);
+        let display = in_tree.to_string_lossy().replace('\\', "/");
+        let status = Command::new("git")
+            .arg("check-ignore")
+            .arg("--no-index")
+            .arg("-q")
+            .arg(&display)
+            .current_dir(&repository)
+            .status()
+            .expect("run git check-ignore");
+        if !status.success() {
+            unignored.push(display);
+        }
+    }
+    assert!(
+        unignored.is_empty(),
+        "a corpus build writes these beside the sources and `.gitignore` names \
+         none of them, so `git add -A` after a golden regeneration commits \
+         them: {unignored:#?}"
+    );
+}
+
+/// Every file under `root`, as paths relative to it.
+fn files_under(root: &Path) -> std::collections::BTreeSet<PathBuf> {
+    fn walk(root: &Path, at: &Path, into: &mut std::collections::BTreeSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, into);
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                into.insert(relative.to_path_buf());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(root, root, &mut out);
+    out
 }

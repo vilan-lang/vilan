@@ -1,67 +1,69 @@
-// `std::binary` — the compact codec pair (transport-rpc.md §6.2): schema-
-// ordered, length-prefixed bytes over `std::bytes`. The shared Wire type IS
-// the schema, so structs write no field names or counts; lists write a `u32`
-// count then bare elements; enum variants write their tag as a length-prefixed
-// name (a numeric-index compaction is a later step); `Option` is one marker
-// byte. Little-endian throughout. A truncated or over-declared frame fails
-// sticky (`unexpected end of frame`) — validating decode, same as JSON's.
+// `std::binary` — the compact codec pair (transport-rpc.md §6.2): schema- ordered,
+// length-prefixed bytes over `std::bytes`. The shared Wire type IS the schema, so
+// structs write no field names or counts; lists write a `u32` count then bare
+// elements; enum variants write their tag as a length-prefixed name (a
+// numeric-index compaction is a later step); `Option` is one marker byte.
+// Little-endian throughout. A truncated or over-declared frame fails sticky
+// (`unexpected end of frame`) — validating decode, same as JSON's.
 
 import pkg::bytes::{ Bytes, data_view, decode_utf8, encode_utf8 };
-import pkg::option::Option::{ None, Some, self };
-import pkg::result::Result::{ Err, Ok, self };
-import pkg::shared::Shared;
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
 import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializer, Wire };
 
 // --- The write side ----------------------------------------------------------
 
-/// A growable byte sink: amortized-doubling buffer, `finish` slices to the
-/// written length.
-struct BinaryWriter {
-	buffer: Shared<Bytes>,
-	used: Shared<i32>,
+/// A growable byte sink: amortized-doubling buffer, `finish` slices to the written
+/// length.
+///
+/// PLAIN FIELDS behind `&mut self` (A108) — see `json.vl`'s `JsonWriter` for why
+/// these two were `Shared` cells until the visitor's receivers moved.
+export struct BinaryWriter {
+	buffer: Bytes,
+	used: usize,
 }
 
-impl BinaryWriter {
+export impl BinaryWriter {
 	fun new(): BinaryWriter {
-		BinaryWriter { buffer = Shared::new(Bytes::alloc(64)), used = Shared::new(0) }
+		BinaryWriter { buffer = Bytes::alloc(64), used = 0 }
 	}
 
 	/// Grow (doubling) until `extra` more bytes fit.
-	fun ensure(self, extra: i32) {
-		let needed = self.used.read() + extra;
-		mut capacity = self.buffer.read().len();
+	fun ensure(&mut self, extra: usize) {
+		let needed = self.used + extra;
+		mut capacity = self.buffer.len();
 		if needed > capacity {
 			for needed > capacity {
 				capacity = capacity * 2;
 			}
 			let grown = Bytes::alloc(capacity);
-			grown.copy_into(self.buffer.read(), 0);
-			self.buffer.write() = grown;
+			grown.copy_into(self.buffer, 0);
+			self.buffer = grown;
 		}
 	}
 
-	fun write_byte(self, value: i32) {
+	fun write_byte(&mut self, value: i32) {
 		self.ensure(1);
-		self.buffer.read().set(self.used.read(), value);
-		self.used.write() = self.used.read() + 1;
+		self.buffer.set(self.used, value);
+		self.used = self.used + 1;
 	}
 
-	/// 4 bytes little-endian (i32 and u32 share the two's-complement bit
-	/// pattern; `set` stores `& 0xFF`, so bare shifts suffice).
-	fun write_i32(self, value: i32) {
+	/// 4 bytes little-endian (i32 and u32 share the two's-complement bit pattern;
+	/// `set` stores `& 0xFF`, so bare shifts suffice).
+	fun write_i32(&mut self, value: i32) {
 		self.write_byte(value);
 		self.write_byte(value >> 8);
 		self.write_byte(value >> 16);
 		self.write_byte(value >> 24);
 	}
 
-	fun write_byte_u32(self, value: u32) {
+	fun write_byte_u32(&mut self, value: u32) {
 		self.ensure(1);
-		self.buffer.read().set_u32(self.used.read(), value);
-		self.used.write() = self.used.read() + 1;
+		self.buffer.set_u32(self.used, value);
+		self.used = self.used + 1;
 	}
 
-	fun write_u32(self, value: u32) {
+	fun write_u32(&mut self, value: u32) {
 		self.write_byte_u32(value & 0xFF);
 		self.write_byte_u32(value >> 8 & 0xFF);
 		self.write_byte_u32(value >> 16 & 0xFF);
@@ -69,108 +71,82 @@ impl BinaryWriter {
 	}
 
 	/// 8 bytes IEEE-754 LE, via a DataView over a scratch buffer.
-	fun write_f64(self, value: f64) {
+	fun write_f64(&mut self, value: f64) {
 		let scratch = Bytes::alloc(8);
 		data_view(scratch.buffer()).write_f64(0, value, true);
 		self.ensure(8);
-		self.buffer.read().copy_into(scratch, self.used.read());
-		self.used.write() = self.used.read() + 8;
+		self.buffer.copy_into(scratch, self.used);
+		self.used = self.used + 8;
 	}
 
 	/// `u32` byte length + UTF-8 bytes.
-	fun write_str(self, value: str) {
+	fun write_str(&mut self, value: str) {
 		let encoded = encode_utf8(value);
-		self.write_i32(encoded.len());
+		self.write_i32(encoded.len().as_i32());
 		self.ensure(encoded.len());
-		self.buffer.read().copy_into(encoded, self.used.read());
-		self.used.write() = self.used.read() + encoded.len();
+		self.buffer.copy_into(encoded, self.used);
+		self.used = self.used + encoded.len();
 	}
 
-	fun finish(self): Bytes {
-		self.buffer.read().slice(0, self.used.read())
-	}
-
-	/// The closure record a `Codec` hands out — thin delegates to the trait
-	/// methods below (direct `encode_binary` skips it).
-	fun serializer(self): Serializer {
-		Serializer {
-			begin_struct = |fields| self.begin_struct(fields),
-			field = |name| self.field(name),
-			end_struct = || self.end_struct(),
-			begin_list = |length| self.begin_list(length),
-			end_list = || self.end_list(),
-			begin_variant = |name, arity| self.begin_variant(name, arity),
-			end_variant = || self.end_variant(),
-			null_value = || self.null_value(),
-			some_value = || self.some_value(),
-			str_value = |value| self.str_value(value),
-			i32_value = |value| self.i32_value(value),
-			u32_value = |value| self.u32_value(value),
-			i53_value = |value| self.i53_value(value),
-			f64_value = |value| self.f64_value(value),
-			bool_value = |value| self.bool_value(value),
-		}
+	fun finish(&self): Bytes {
+		self.buffer.slice(0, self.used)
 	}
 }
 
-// The visitor's write half, natively. Structure calls the schema already
-// carries (struct shape, list/variant ends) write nothing.
-impl BinaryWriter with Serialize {
-	fun begin_struct(self, fields: i32) {}
+// The visitor's write half, natively. Structure calls the schema already carries
+// (struct shape, list/variant ends) write nothing.
+export impl BinaryWriter with Serialize {
+	fun begin_struct(&mut self, fields: i32) {}
 
-	fun field(self, name: str) {}
+	fun field(&mut self, name: str) {}
 
-	fun end_struct(self) {}
+	fun end_struct(&mut self) {}
 
-	fun begin_list(self, length: i32) {
+	fun begin_list(&mut self, length: i32) {
 		self.write_i32(length);
 	}
 
-	fun end_list(self) {}
+	fun end_list(&mut self) {}
 
-	fun begin_variant(self, name: str, arity: i32) {
+	fun begin_variant(&mut self, name: str, arity: i32) {
 		self.write_str(name);
 	}
 
-	fun end_variant(self) {}
+	fun end_variant(&mut self) {}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		self.write_byte(0);
 	}
 
-	fun some_value(self) {
+	fun some_value(&mut self) {
 		self.write_byte(1);
 	}
 
-	fun str_value(self, value: str) {
+	fun str_value(&mut self, value: str) {
 		self.write_str(value);
 	}
 
-	fun i32_value(self, value: i32) {
+	fun i32_value(&mut self, value: i32) {
 		self.write_i32(value);
 	}
 
-	fun u32_value(self, value: u32) {
+	fun u32_value(&mut self, value: u32) {
 		self.write_u32(value);
 	}
 
-	/// Eight bytes, as the f64 bit pattern — the runtime's i53 IS an integral
-	/// f64 (exact to 2^53), so the round-trip is lossless for every
-	/// representable value.
-	fun i53_value(self, value: i53) {
+	/// Eight bytes, as the f64 bit pattern — the runtime's i53 IS an integral f64
+	/// (exact to 2^53), so the round-trip is lossless for every representable
+	/// value.
+	fun i53_value(&mut self, value: i53) {
 		self.write_f64(value.as_f64());
 	}
 
-	fun f64_value(self, value: f64) {
+	fun f64_value(&mut self, value: f64) {
 		self.write_f64(value);
 	}
 
-	fun bool_value(self, value: bool) {
-		self.write_byte(if value {
-			1
-		} else {
-			0
-		});
+	fun bool_value(&mut self, value: bool) {
+		self.write_byte(if value { 1 } else { 0 });
 	}
 }
 
@@ -178,241 +154,302 @@ impl BinaryWriter with Serialize {
 
 /// A bounds-checked cursor over one frame, with the sticky error the visitor
 /// contract requires: past the first failure every read is a zero-value no-op.
+///
+/// Plain fields behind `&mut self`, for the reason `json.vl`'s `JsonWriter`
+/// headnote gives (A108).
 struct BinaryReader {
 	bytes: Bytes,
-	cursor: Shared<i32>,
-	error: Shared<Option<str>>,
+	cursor: usize,
+	error: Option<str>,
 }
 
 impl BinaryReader {
 	fun new(bytes: Bytes): BinaryReader {
-		BinaryReader { bytes = bytes, cursor = Shared::new(0), error = Shared::new(None) }
+		BinaryReader { bytes, cursor = 0, error = None }
 	}
 
-	fun ok(self): bool {
-		match self.error.read() {
+	fun ok(&self): bool {
+		match self.error {
 			Some(let _reason) => false,
 			None => true,
 		}
 	}
 
-	fun report(self, reason: str) {
-		match self.error.read() {
+	fun report(&mut self, reason: str) {
+		match self.error {
 			Some(let _first) => {},
 			None => {
-				self.error.write() = Some(reason);
+				self.error = Some(reason);
 			},
 		}
 	}
 
 	/// Whether `count` more bytes exist; fails sticky when they don't.
-	fun expect(self, count: i32): bool {
+	fun expect(&mut self, count: usize): bool {
 		if !self.ok() {
 			ret false;
 		}
-		if self.cursor.read() + count > self.bytes.len() {
+		if self.cursor + count > self.bytes.len() {
 			self.report("unexpected end of frame");
 			ret false;
 		}
 		true
 	}
 
-	fun read_byte(self): i32 {
+	fun read_byte(&mut self): i32 {
 		if !self.expect(1) {
 			ret 0;
 		}
-		let value = self.bytes.get(self.cursor.read());
-		self.cursor.write() = self.cursor.read() + 1;
+		let value = self.bytes.get(self.cursor);
+		self.cursor = self.cursor + 1;
 		value
 	}
 
-	fun read_i32(self): i32 {
+	fun read_i32(&mut self): i32 {
 		if !self.expect(4) {
 			ret 0;
 		}
-		let at = self.cursor.read();
-		let value = self.bytes.get(at) | self.bytes.get(at + 1) << 8 | self.bytes.get(at + 2) << 16 | self.bytes.get(at + 3) << 24;
-		self.cursor.write() = at + 4;
+		let at = self.cursor;
+		let value = self.bytes.get(at)
+			| self.bytes.get(at + 1) << 8
+			| self.bytes.get(at + 2) << 16
+			| self.bytes.get(at + 3) << 24;
+		self.cursor = at + 4;
 		value
 	}
 
-	fun read_u32(self): u32 {
+	fun read_u32(&mut self): u32 {
 		if !self.expect(4) {
 			ret 0;
 		}
-		let at = self.cursor.read();
-		let value = self.bytes.get_u32(at) | self.bytes.get_u32(at + 1) << 8 | self.bytes.get_u32(at + 2) << 16 | self.bytes.get_u32(at + 3) << 24;
-		self.cursor.write() = at + 4;
+		let at = self.cursor;
+		let value = self.bytes.get_u32(at)
+			| self.bytes.get_u32(at + 1) << 8
+			| self.bytes.get_u32(at + 2) << 16
+			| self.bytes.get_u32(at + 3) << 24;
+		self.cursor = at + 4;
 		value
 	}
 
-	fun read_f64(self): f64 {
+	fun read_f64(&mut self): f64 {
 		if !self.expect(8) {
 			ret 0.0;
 		}
-		let at = self.cursor.read();
+		let at = self.cursor;
 		let scratch = self.bytes.slice(at, at + 8);
-		self.cursor.write() = at + 8;
+		self.cursor = at + 8;
 		data_view(scratch.buffer()).read_f64(0, true)
 	}
 
-	/// A length prefix that must fit the remaining frame (each prefixed item is
-	/// at least one byte, so a larger claim is hostile or truncated).
-	fun read_length(self): i32 {
+	/// A length prefix that must fit the remaining frame (each prefixed item is at
+	/// least one byte, so a larger claim is hostile or truncated).
+	fun read_length(&mut self): usize {
 		let length = self.read_i32();
-		if length < 0 || self.cursor.read() + length > self.bytes.len() {
+		if length < 0 || self.cursor + length.as_usize() > self.bytes.len() {
 			self.report("length prefix exceeds frame");
 			ret 0;
 		}
-		length
+		length.as_usize()
 	}
 
-	fun read_str(self): str {
+	fun read_str(&mut self): str {
 		let length = self.read_length();
 		if !self.expect(length) {
 			ret "";
 		}
-		let at = self.cursor.read();
+		let at = self.cursor;
 		let piece = self.bytes.slice(at, at + length);
-		self.cursor.write() = at + length;
+		self.cursor = at + length;
 		decode_utf8(piece)
-	}
-
-	/// The closure record a `Codec` hands out — thin delegates to the trait
-	/// methods below (direct `decode_binary` skips it).
-	fun deserializer(self): Deserializer {
-		Deserializer {
-			begin_struct = || self.begin_struct(),
-			field = |name| self.field(name),
-			end_struct = || self.end_struct(),
-			begin_list = || self.begin_list(),
-			end_list = || self.end_list(),
-			variant_tag = || self.variant_tag(),
-			begin_variant = |name, arity| self.begin_variant(name, arity),
-			end_variant = || self.end_variant(),
-			is_null = || self.is_null(),
-			null_value = || self.null_value(),
-			str_value = || self.str_value(),
-			i32_value = || self.i32_value(),
-			u32_value = || self.u32_value(),
-			i53_value = || self.i53_value(),
-			f64_value = || self.f64_value(),
-			bool_value = || self.bool_value(),
-			fail = |reason| self.fail(reason),
-			failed = || self.failed(),
-		}
 	}
 }
 
 // The visitor's read half, natively. `variant_tag` consumes the tag (so
-// `begin_variant` is a no-op — the mirror of the write side, where
-// `begin_variant` writes it); `is_null` peeks the Option marker and consumes
-// it only for `Some`, leaving `None`'s `0x00` for `null_value`.
-impl BinaryReader with Deserialize {
-	fun begin_struct(self) {}
+// `begin_variant` is a no-op — the mirror of the write side, where `begin_variant`
+// writes it); `is_null` peeks the Option marker and consumes it only for `Some`,
+// leaving `None`'s `0x00` for `null_value`. EXPORTED deliberately, and B354 is the
+// reason: a `[derive(Wire)]` visitor is generated code, and its admitting file is
+// the file the ATTRIBUTE was written in - a USER's file, which cannot reach a
+// private std block and cannot be asked to write `#(impl BinaryReader)` for one.
+// The Order 36 sweep exported these under the sentinel rule; they stay exported
+// under the right one. The plain blocks above/below need no export: a derived body
+// only ever calls the VISITOR methods.
+export impl BinaryReader with Deserialize {
+	fun begin_struct(&mut self) {}
 
-	fun field(self, name: str) {}
+	fun field(&mut self, name: str) {}
 
-	fun end_struct(self) {}
+	fun end_struct(&mut self) {}
 
-	fun begin_list(self): i32 {
-		self.read_length()
+	fun begin_list(&mut self): i32 {
+		self.read_length().as_i32()
 	}
 
-	fun end_list(self) {}
+	fun end_list(&mut self) {}
 
-	fun variant_tag(self): str {
+	fun variant_tag(&mut self): str {
 		self.read_str()
 	}
 
-	fun begin_variant(self, name: str, arity: i32) {}
+	fun begin_variant(&mut self, name: str, arity: i32) {}
 
-	fun end_variant(self) {}
+	fun end_variant(&mut self) {}
 
-	fun is_null(self): bool {
+	/// The `Option` marker is `0x00` or `0x01` and NOTHING ELSE (N117): every other
+	/// byte used to read as "present", so a frame whose marker is `0x07` decoded as
+	/// a `Some` whose value starts one byte later — a shifted read of whatever
+	/// followed, silently, with `failed()` answering `None`. This is the binary
+	/// twin of the JSON reader's kind gate: a frame is not trusted just because the
+	/// schema says what should be at this offset.
+	fun is_null(&mut self): bool {
 		if !self.expect(1) {
 			ret false;
 		}
-		if self.bytes.get(self.cursor.read()) == 0 {
-			true
-		} else {
-			// A present Option: consume the `0x01` marker; the value follows.
-			self.cursor.write() = self.cursor.read() + 1;
-			false
+		let marker = self.bytes.get(self.cursor);
+		if marker == 0 {
+			ret true;
 		}
+		if marker != 1 {
+			self.report(i"expected an Option marker (0 or 1), found {marker}");
+			ret false;
+		}
+		// A present Option: consume the `0x01` marker; the value follows.
+		self.cursor = self.cursor + 1;
+		false
 	}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		let _ = self.read_byte();
 	}
 
-	fun str_value(self): str {
+	fun str_value(&mut self): str {
 		self.read_str()
 	}
 
-	fun i32_value(self): i32 {
+	fun i32_value(&mut self): i32 {
 		self.read_i32()
 	}
 
-	fun u32_value(self): u32 {
+	fun u32_value(&mut self): u32 {
 		self.read_u32()
 	}
 
-	fun i53_value(self): i53 {
+	fun i53_value(&mut self): i53 {
 		self.read_f64().as_i53()
 	}
 
-	fun f64_value(self): f64 {
+	fun f64_value(&mut self): f64 {
 		self.read_f64()
 	}
 
-	fun bool_value(self): bool {
-		self.read_byte() != 0
+	/// A `bool` is `0x00` or `0x01` (N117), for `is_null`'s reason: the writer
+	/// emits exactly those two, so any other byte is a frame that disagrees with
+	/// the schema, and reading it as `true` is a coercion where the contract asks
+	/// for a refusal.
+	fun bool_value(&mut self): bool {
+		let byte = self.read_byte();
+		if byte > 1 {
+			self.report(i"expected a boolean (0 or 1), found {byte}");
+			ret false;
+		}
+		byte == 1
 	}
 
-	fun fail(self, reason: str) {
+	fun fail(&mut self, reason: str) {
 		self.report(reason);
 	}
 
-	fun failed(self): Option<str> {
-		self.error.read()
+	fun failed(&mut self): Option<str> {
+		self.error
 	}
 }
 
 /// Encode a `Wire` value as compact bytes — the direct path (no record).
-fun encode_binary<T: Wire>(value: T): Bytes {
-	let writer = BinaryWriter::new();
-	value.describe(writer);
+export fun encode_binary<T: Wire>(value: T): Bytes {
+	mut writer = BinaryWriter::new();
+	value.describe(&mut writer);
 	writer.finish()
 }
 
-/// Decode compact bytes as a `Wire` value; `Err(reason)` names the first
-/// structural failure (truncation, an over-declared length, unknown variant).
-fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
-	let reader = BinaryReader::new(bytes);
-	let value: T = T::rebuild(reader);
-	match reader.error.read() {
+/// Decode compact bytes as a `Wire` value; `Err(reason)` names the first structural
+/// failure (truncation, an over-declared length, unknown variant).
+///
+/// A frame LONGER than the value it declares is a failure too (N117), and it is the
+/// binary twin of the JSON reader's unread-element check: the schema says how many
+/// bytes this type occupies, so bytes left over are bytes the two sides disagree
+/// about. Nothing legitimate produces them — `encode_binary` writes exactly one
+/// value — and reading a prefix of a frame as the whole of it is how a caller gets
+/// a value that was never sent.
+export fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
+	mut reader = BinaryReader::new(bytes);
+	let value: T = T::rebuild(&mut reader);
+	if reader.ok() && reader.cursor < bytes.len() {
+		let unread = bytes.len() - reader.cursor;
+		reader.report(i"frame has {unread} byte(s) left unread");
+	}
+	match reader.error {
 		None => Ok(value),
 		Some(let reason) => Err(reason),
 	}
 }
 
-/// The binary codec (§6.2): byte frames over the writer/reader pair. A text
-/// frame poisons the reader — a sticky decode error, never a crash.
-fun binary_codec(): Codec {
+/// The binary codec (§6.2): byte frames over the writer/reader pair. A text frame
+/// poisons the reader — a sticky decode error, never a crash.
+///
+/// The records are built here, over the `mut` local each arm mints, for the reason
+/// `json_codec` states: the visitor's state is in plain fields now, so the closures
+/// must capture the BINDING of the frame that owns it.
+export fun binary_codec(): Codec {
 	Codec {
 		writer = || {
-			let writer = BinaryWriter::new();
-			(writer.serializer(), || Frame::Binary(writer.finish()))
+			mut writer = BinaryWriter::new();
+			let record = Serializer {
+				begin_struct = |fields| writer.begin_struct(fields),
+				field = |name| writer.field(name),
+				end_struct = || writer.end_struct(),
+				begin_list = |length| writer.begin_list(length),
+				end_list = || writer.end_list(),
+				begin_variant = |name, arity| writer.begin_variant(name, arity),
+				end_variant = || writer.end_variant(),
+				null_value = || writer.null_value(),
+				some_value = || writer.some_value(),
+				str_value = |value| writer.str_value(value),
+				i32_value = |value| writer.i32_value(value),
+				u32_value = |value| writer.u32_value(value),
+				i53_value = |value| writer.i53_value(value),
+				f64_value = |value| writer.f64_value(value),
+				bool_value = |value| writer.bool_value(value),
+			};
+			(record, || Frame::Binary(writer.finish()))
 		},
 		reader = |frame| {
-			match frame {
-				Frame::Binary(let bytes) => BinaryReader::new(bytes).deserializer(),
+			mut reader = match frame {
+				Frame::Binary(let bytes) => BinaryReader::new(bytes),
 				Frame::Text(let text) => {
-					let reader = BinaryReader::new(Bytes::alloc(0));
-					reader.report("binary codec: received a text frame");
-					reader.deserializer()
+					mut poisoned = BinaryReader::new(Bytes::alloc(0));
+					poisoned.report("binary codec: received a text frame");
+					poisoned
 				},
+			};
+			Deserializer {
+				begin_struct = || reader.begin_struct(),
+				field = |name| reader.field(name),
+				end_struct = || reader.end_struct(),
+				begin_list = || reader.begin_list(),
+				end_list = || reader.end_list(),
+				variant_tag = || reader.variant_tag(),
+				begin_variant = |name, arity| reader.begin_variant(name, arity),
+				end_variant = || reader.end_variant(),
+				is_null = || reader.is_null(),
+				null_value = || reader.null_value(),
+				str_value = || reader.str_value(),
+				i32_value = || reader.i32_value(),
+				u32_value = || reader.u32_value(),
+				i53_value = || reader.i53_value(),
+				f64_value = || reader.f64_value(),
+				bool_value = || reader.bool_value(),
+				fail = |reason| reader.fail(reason),
+				failed = || reader.failed(),
 			}
 		},
 	}

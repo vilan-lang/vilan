@@ -2,6 +2,10 @@
 // http + rpc on one port — one `Server::builder()` chain the service is
 // installed on rather than a boot function that owns the whole port.
 // Everything stateful lives in `pkg::store`, next to its database.
+//
+// This file shares the package's `prelude = "std::web"` — that is what gives
+// `print` below with no import. Everything a server reaches beyond it is
+// one-layer and in no prelude by rule, so the process modules are named.
 
 import std::build::require_build;
 import std::document::require_shell;
@@ -27,7 +31,10 @@ async fun main() {
 		.port(4600)
 		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
 		.serve_build(build)
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_request(|request| Response::builder()
+			.set_header("Content-Type", "text/html")
+			.body(page)
+			.build())
 		.on_start(|server| print(i"notes server listening on {server.url()}"))
 		.build()
 		.start();

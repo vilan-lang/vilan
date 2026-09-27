@@ -5,7 +5,9 @@ import std::io::print;
 // through, `*e` reads the value), `&list` yields readonly ones. A scalar element
 // pairs to `[list, i]`;
 // an aggregate is its own reference. Plain `for x in list` still copies.
-struct P { v: i32 }
+struct P {
+	v: i32,
+}
 
 fun main() {
 	// `&mut` scalar elements: double each in place.

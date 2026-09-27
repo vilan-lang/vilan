@@ -24,7 +24,7 @@ fun main() {
 
 	// Keyword and hyphenated attribute names; a bare boolean attribute; a
 	// void element, self-closing with the conventional space.
-	print(render(<input type("checkbox") disabled aria-label("Done") />));
+	print(render(<input type("checkbox") aria-label("Done") disabled />));
 
 	// Components are calls in holes.
 	print(render(<ul>

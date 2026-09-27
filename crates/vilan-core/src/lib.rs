@@ -6,13 +6,17 @@ pub mod analyzer;
 pub mod async_infer;
 pub mod bindgen;
 pub mod call_graph;
+pub mod cancel;
 pub mod chunks;
 pub mod closest_name;
 pub mod const_eval;
 pub mod context;
 pub mod css;
+pub mod css_properties;
+pub mod dead_items;
 pub(crate) mod depth_stats;
 pub mod dispatch_refine;
+pub mod drop_plan_stats;
 pub mod elements;
 pub mod error;
 pub mod formatter;
@@ -22,17 +26,20 @@ pub mod id;
 pub mod impl_select;
 pub mod init_order;
 pub mod interpreter;
+pub mod labels;
 pub mod leak_tally;
 pub mod lexing;
 pub mod lift;
 pub(crate) mod macros;
 pub mod manifest;
+pub mod mono;
 pub mod node;
 pub mod options;
 pub mod owned_modules;
 pub mod parsing;
 pub mod platform_color;
 pub mod span;
+pub mod stack_guard;
 pub mod target;
 pub mod token;
 pub mod transformer;
@@ -40,52 +47,87 @@ pub mod type_;
 pub mod util;
 
 // The common pipeline + core types, re-exported for convenience.
-pub use analyzer::{Layer, PackageSpec, Program, Workspace, analyze};
+pub use analyzer::{EntryMode, Layer, PackageSpec, PreludeRepair, Program, Workspace, analyze};
 pub use error::Error;
 pub use macros::MacroLimits;
 #[doc(hidden)]
+pub use macros::macro_expansion_cache_clear;
 pub use macros::macro_world_cache_clear;
+/// How many macro WORLDS the last top-level analysis on this thread compiled
+/// (M33) — the `macro-worlds` phase row's count, readable without parsing
+/// stderr. Re-exported rather than left inside the private `macros` module for
+/// the same reason `macro_world_cache_clear` is: it is a fact about the
+/// compiler's own work that a gate has to be able to assert.
+pub use macros::macro_worlds_compiled;
 pub use manifest::Manifest;
 pub use options::{BuildOptions, Preset};
 pub use owned_modules::OwnedModules;
 pub use span::{Span, Spanned};
 pub use target::{Backend, Platform, PlatformPattern};
 pub use transformer::{
-    EmittedChunk, JsProgram, SplitProgram, transform, transform_split, transform_to_ast,
+    EmittedChunk, JsProgram, SplitProgram, diagnose, transform, transform_split,
+    transform_split_with_plan, transform_to_ast,
 };
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use node::{Func, ImportBranch, Node, NodeList};
+use node::{Func, ImportBranch, ImportTail, Node, NodeList};
 use target::PlatformPattern as Pattern;
 
-/// Infers a build platform for editor analysis (which has no `--platform`) from a
-/// file's top-level imports. Evidence, per `import std::<module>` reference:
+/// What [`infer_platform`] concluded, and WHY: the platform this file is
+/// analyzed under plus the reason clause E119's overlay note prints after it
+/// (F27 R6). The reason is written in [`target::PlatformReason::clause`]'s
+/// voice — it lands in the same sentence, one surface over.
+struct InferredPlatform {
+    platform: Platform,
+    reason: String,
+    /// The one word the editor's status line shows (F27 R1): `declared`,
+    /// `inferred` or `default`.
+    kind: &'static str,
+}
+
+/// Infers a build platform for editor analysis (which has no `--platform`) from
+/// a file's own text. Evidence, per `import std::<module>` reference:
 ///
 /// - a module served ONLY by a browser layer (`std::dom`) is browser evidence —
 ///   the file cannot mean anything else;
 /// - a module served by a browser layer AND another root — a platform TWIN,
-///   like `std::ui` — is evidence only through the NAMES imported from it: a
+///   like `std::ui` — is evidence through the NAMES imported from it: a
 ///   name declared by just the browser twin (`mount`) says browser, one
 ///   declared by just the other side (`render`) says process, and a name both
 ///   declare says nothing. B36: the old rule read *any* `std::ui` import as
 ///   browser evidence, so a two-entry package's shared file importing the
 ///   process twin's `render` analyzed as browser in the editor and its import
 ///   red-flagged, while `vilan build` was clean on every entry.
+/// - and, when no import settles it, the MEMBERS the file reads off those twins
+///   (F27 R2). `region.anchor` and `region.cut_row()` are declared by the
+///   browser `ui` and by nothing on the process side, so a file that writes
+///   them is a browser file as surely as one that imports `mount` — and that is
+///   the case B36's name rule cannot see, because every name such a file
+///   imports (`Region`, `Row`, `Slot`) exists in BOTH twins. The evidence is
+///   syntactic and untyped, as the name rule is: the member names the file
+///   uses, matched against the members each twin file DECLARES (struct fields,
+///   `impl` methods, trait members), counting only a name one twin declares and
+///   the other does not. A name both declare, or neither, says nothing.
 ///
 /// Any browser evidence wins (the old bias, kept for a file whose imports
 /// contradict each other); otherwise Node, whose layer set serves the process
 /// twins. Layer directories are read from `std`'s manifest, not a hardcoded
 /// list.
-fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
+fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
+    let defaulted = |reason: &str| InferredPlatform {
+        platform: Platform::default(),
+        reason: reason.to_string(),
+        kind: "default",
+    };
     let Some(browser_root) = std
         .layers
         .iter()
         .find(|layer| layer.patterns.iter().any(|p| matches!(p, Pattern::Browser)))
         .map(|layer| layer.root.as_path())
     else {
-        return Platform::default();
+        return defaulted("no project sets its platform and std declares no browser layer");
     };
     // Every root that could serve a module to a NON-browser build: the other
     // layers, then the base.
@@ -111,9 +153,12 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     fn declares(path: &Path, name: &str) -> bool {
         fn node_declares(node: &Node, name: &str) -> bool {
             match node {
-                Node::Export(inner) | Node::Derive(_, inner) | Node::Service(_, inner) => {
-                    node_declares(&inner.0, name)
-                }
+                // N89: `const` is a wrapper like the rest — `const fun f()`
+                // declares `f`.
+                Node::Export(_, inner, _)
+                | Node::Derive(_, inner)
+                | Node::Service(_, inner)
+                | Node::Const(inner) => node_declares(&inner.0, name),
                 Node::Func(function) => function.name.0 == name,
                 Node::Struct(declared, ..)
                 | Node::Enum(declared, ..)
@@ -131,12 +176,68 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
         };
         tree.0.iter().any(|node| node_declares(&node.0, name))
     }
+    /// The MEMBER names the module at `path` declares (F27 R2): a struct's
+    /// fields, an `impl` block's functions, a trait's members — the names that
+    /// can follow a dot on one of this module's values. Free functions are not
+    /// members and are not here; the name rule above is what weighs those. A
+    /// file that fails to read or parse declares nothing, as above.
+    fn declared_members(path: &Path) -> HashSet<String> {
+        fn walk(node: &Node, in_member_position: bool, into: &mut HashSet<String>) {
+            match node {
+                Node::Export(_, inner, _)
+                | Node::Derive(_, inner)
+                | Node::Service(_, inner)
+                | Node::Const(inner) => walk(&inner.0, in_member_position, into),
+                Node::Struct(_, _, _, _, Some(fields), _) => {
+                    for field in &fields.0 {
+                        into.insert(field.0.0.0.to_string());
+                    }
+                }
+                Node::Impl(_, _, body, _) => {
+                    for item in body.0.iter() {
+                        walk(&item.0, true, into);
+                    }
+                }
+                Node::Trait(_, _, _, body, _) => {
+                    for item in body.0.iter() {
+                        walk(&item.0, true, into);
+                    }
+                }
+                Node::Module(_, body) => {
+                    for item in body.0.iter() {
+                        walk(&item.0, false, into);
+                    }
+                }
+                Node::Func(function) if in_member_position => {
+                    into.insert(function.name.0.to_string());
+                }
+                _ => {}
+            }
+        }
+        let mut members = HashSet::new();
+        let Ok(source) = util::read_source(path) else {
+            return members;
+        };
+        let Some((tree, _)) = parse_clean_cached(&source) else {
+            return members;
+        };
+        for node in tree.0.iter() {
+            walk(&node.0, false, &mut members);
+        }
+        members
+    }
     // The names an import branch takes from its module: the immediate segment
     // of each leaf path (`render`, or `Option` of `Option::{ self, Some }`) —
     // the identifier the module must declare at its top level.
     fn leaf_names<'a>(branch: &'a ImportBranch, into: &mut Vec<&'a str>) {
         match branch {
             ImportBranch::Path(name, _, _) => into.push(name),
+            // The reach marker adds no segment: the name a module must declare
+            // is the one under it.
+            ImportBranch::Reach(_, inner) => leaf_names(inner, into),
+            // A selector takes no NAME out of the module (B318 S3), so it is
+            // not evidence about which layer the file wants.
+            ImportBranch::Selector(_) => {}
             ImportBranch::Set(branches) => {
                 for branch in branches {
                     leaf_names(branch, into);
@@ -144,43 +245,89 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
             }
         }
     }
-    // Browser evidence for one `std::<module>` reference (see the doc comment).
+    // Browser evidence for one `std::<module>` reference, as the reason clause
+    // it justifies (see the doc comment).
     fn child_is_browser_evidence(
         branch: &ImportBranch,
         browser_root: &Path,
         other_roots: &[&Path],
-    ) -> bool {
+    ) -> Option<String> {
         match branch {
             ImportBranch::Path(module, _, sub) => {
-                let Some(browser_file) = module_file(browser_root, module) else {
-                    return false;
-                };
+                let browser_file = module_file(browser_root, module)?;
                 let twin_files: Vec<std::path::PathBuf> = other_roots
                     .iter()
                     .filter_map(|root| module_file(root, module))
                     .collect();
                 if twin_files.is_empty() {
                     // Browser-exclusive — the module itself is the evidence.
-                    return true;
+                    return Some(format!(
+                        "it imports `std::{module}`, which only the browser layer serves"
+                    ));
                 }
                 // A twin: only a name the browser side alone declares says
-                // browser. A bare `import std::ui;` names nothing — neutral.
-                let Some(sub) = sub else {
-                    return false;
+                // browser. A bare `import std::ui;` names nothing — neutral,
+                // and so is an aliased one (`import std::ui as u;`), which
+                // takes the module and no name out of it.
+                let ImportTail::Continue(sub) = sub else {
+                    return None;
                 };
                 let mut names = Vec::new();
                 leaf_names(sub, &mut names);
-                names.iter().any(|name| {
-                    declares(&browser_file, name)
-                        && !twin_files.iter().any(|file| declares(file, name))
-                })
+                names
+                    .iter()
+                    .find(|name| {
+                        declares(&browser_file, name)
+                            && !twin_files.iter().any(|file| declares(file, name))
+                    })
+                    .map(|name| {
+                        format!(
+                            "it imports `{name}` from `std::{module}`, which only the browser \
+                             twin declares"
+                        )
+                    })
             }
+            ImportBranch::Reach(_, inner) => {
+                child_is_browser_evidence(inner, browser_root, other_roots)
+            }
+            ImportBranch::Selector(_) => None,
             ImportBranch::Set(branches) => branches
                 .iter()
-                .any(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
+                .find_map(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
         }
     }
-    let imports_browser_layer = |branch: &ImportBranch| matches!(branch, ImportBranch::Path("std", _, Some(child)) if child_is_browser_evidence(child, browser_root, &other_roots));
+    // The TWIN `std` modules one `std::<module>` reference names — each with
+    // the browser file and the files the other roots serve for it. F27 R2's
+    // subjects: a module with no twin is already decided by the rule above.
+    fn twin_modules(
+        branch: &ImportBranch,
+        browser_root: &Path,
+        other_roots: &[&Path],
+        into: &mut Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)>,
+    ) {
+        match branch {
+            ImportBranch::Path(module, _, _) => {
+                let Some(browser_file) = module_file(browser_root, module) else {
+                    return;
+                };
+                let twin_files: Vec<std::path::PathBuf> = other_roots
+                    .iter()
+                    .filter_map(|root| module_file(root, module))
+                    .collect();
+                if twin_files.is_empty() || into.iter().any(|(name, _, _)| name == module) {
+                    return;
+                }
+                into.push(((*module).to_string(), browser_file, twin_files));
+            }
+            ImportBranch::Reach(_, inner) => twin_modules(inner, browser_root, other_roots, into),
+            ImportBranch::Selector(_) => {}
+            ImportBranch::Set(branches) => {
+                for branch in branches {
+                    twin_modules(branch, browser_root, other_roots, into);
+                }
+            }
+        }
+    }
     // Imports are block-scoped statements (backlog H2), so scan at every depth —
     // a browser import inside a function body flags the file too.
     fn any_node(nodes: &NodeList, matches: &mut dyn FnMut(&Node) -> bool) -> bool {
@@ -195,15 +342,81 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
         }
         nodes.iter().any(|node| walk(node, matches))
     }
-    let references_browser = any_node(root, &mut |node| match node {
-        Node::Import(branch) | Node::Use(branch) => imports_browser_layer(branch),
-        _ => false,
+    let mut import_reason: Option<String> = None;
+    any_node(root, &mut |node| {
+        let branch = match node {
+            Node::Import(branch, ..) | Node::Use(branch) => branch,
+            _ => return false,
+        };
+        let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch else {
+            return false;
+        };
+        import_reason = child_is_browser_evidence(child, browser_root, &other_roots);
+        import_reason.is_some()
     });
-    if references_browser {
-        Platform::Browser
-    } else {
-        Platform::default()
+    if let Some(reason) = import_reason {
+        return InferredPlatform {
+            platform: Platform::Browser,
+            reason,
+            kind: "inferred",
+        };
     }
+    // F27 R2: no import settles it, so ask what the file DOES with the twins it
+    // imported. Only reached for a file that imports a twin module at all, and
+    // each twin's two member sets are read once.
+    let mut twins: Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)> = Vec::new();
+    any_node(root, &mut |node| {
+        if let Node::Import(branch, ..) | Node::Use(branch) = node
+            && let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch
+        {
+            twin_modules(child, browser_root, &other_roots, &mut twins);
+        }
+        false
+    });
+    if !twins.is_empty() {
+        // The member names the file uses, in source order — `region.anchor`,
+        // `region.cut_row()`. Untyped: which VALUE they are read off is the
+        // analyzer's question, and this runs before it.
+        let mut used: Vec<String> = Vec::new();
+        any_node(root, &mut |node| {
+            if let Node::MemberAccessor(_, member) = node {
+                let name = match &member.0 {
+                    Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
+                    Node::Call(callee, _, _) => match &callee.0 {
+                        Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(name) = name
+                    && !used.iter().any(|seen| seen == name)
+                {
+                    used.push(name.to_string());
+                }
+            }
+            false
+        });
+        for (module, browser_file, twin_files) in &twins {
+            let browser_members = declared_members(browser_file);
+            let twin_members: HashSet<String> = twin_files
+                .iter()
+                .flat_map(|file| declared_members(file))
+                .collect();
+            if let Some(member) = used.iter().find(|name| {
+                browser_members.contains(name.as_str()) && !twin_members.contains(name.as_str())
+            }) {
+                return InferredPlatform {
+                    platform: Platform::Browser,
+                    kind: "inferred",
+                    reason: format!(
+                        "it reads `.{member}`, which only the browser twin of `std::{module}` \
+                         declares"
+                    ),
+                };
+            }
+        }
+    }
+    defaulted("no project sets its platform and nothing in it is browser-only")
 }
 
 /// [`parse_clean_cached`]'s store: clean parses by content hash. At module
@@ -366,10 +579,12 @@ pub struct AnalyzedEntry {
     pub program: Option<Program<'static>>,
     pub diagnostics: Vec<Error>,
     pub ast: Option<LeakedEntryAst>,
-    /// The overlay-served module allocations this analysis OWNS (M9,
-    /// `leak-soak.md` §7.9.4) — drained from the collection scope, reclaimable
-    /// with `ast` once the program is dropped. Empty unless the analysis
-    /// opted in ([`analyze_source_owning_overlay_modules`]).
+    /// The claims this analysis holds on overlay-served module allocations
+    /// (M9, `leak-soak.md` §7.9.4; M23's claim protocol) — drained from the
+    /// collection scope, reclaimable with `ast` once the program is dropped.
+    /// One per module the analysis parsed, plus one per module a base-cache
+    /// hit served it out of a stored world. Empty unless the analysis opted
+    /// in ([`analyze_source_owning_overlay_modules`]).
     pub owned_modules: OwnedModules,
 }
 
@@ -434,14 +649,26 @@ pub fn analyze_source_reclaimable(
     }))
     .unwrap_or_else(|_| AnalyzedEntry {
         program: None,
-        diagnostics: vec![Error { trace: Vec::new(),
-            note: None,
-            span: crate::span::Span::new((), 0..0),
-            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
-        }],
+        diagnostics: vec![panicked_analysis()],
         ast: None,
         owned_modules: OwnedModules::none(),
     })
+}
+
+/// The one diagnostic both fences in this file answer a caught panic with —
+/// the outer one around lex/parse/lift and the inner one around the analysis.
+/// ONE constructor, because until N121 the inner fence answered with NOTHING:
+/// a panicked analysis came back as no program and no diagnostic at all, so
+/// the playground and the language server showed a file that had silently
+/// stopped being analyzed. `stack_guard`'s probe made that the common panic
+/// (a runaway recursion refused on a declared stack), which is how it showed.
+fn panicked_analysis() -> Error {
+    Error {
+        trace: Vec::new(),
+        note: None,
+        span: crate::span::Span::new((), 0..0),
+        msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
+    }
 }
 
 /// [`analyze_source_reclaimable`] with the M9 opt-in active (`leak-soak.md`
@@ -459,10 +686,14 @@ pub fn analyze_source_reclaimable(
 /// end serves everything from the overlay and must keep the global caches,
 /// as must every transient reader. A macro-world compile inside the analysis
 /// keeps the global caches too — its world outlives every analysis
-/// (§7.9.4b) — and a base world is never stored for an analysis that loaded
-/// an overlay-served source (§7.9.4a, `base_cache_store`'s gate), which is
-/// what makes the returned handles' reclaim sound: the program is their only
-/// borrower.
+/// (§7.9.4b).
+///
+/// What makes the returned handles' reclaim sound is a reference count, not
+/// exclusivity (M23): a base world stored for this analysis DOES borrow these
+/// allocations, and holds its own claim on each, so `reclaim` frees only what
+/// nothing else still claims. §7.9.4a's outright refusal to store such a
+/// world is what this replaces — it cost every entry importing an open
+/// sibling the whole pre-entry world on every keystroke.
 pub fn analyze_source_owning_overlay_modules(
     source: &'static str,
     std: &PackageSpec,
@@ -549,34 +780,38 @@ fn analyze_source_unfenced(
                 block_ordinal += 1;
                 let start = node.1.into_range().start;
                 let head: Span = (start..start).into();
-                node.0 = Node::Func(Func {
+                node.0 = Node::Func(Box::new(Func {
                     name: (name, head),
                     is_async: false,
                     external: false,
                     deprecated: None,
+                    internal: None,
                     extern_binding: None,
                     extern_retains: false,
                     must_use: false,
                     platform_fence: Vec::new(),
                     rpc: false,
                     trait_only: false,
-                    doc_hidden: false,
                     generic_parameters: None,
                     parameters: (Vec::new(), head),
                     return_type: Some(Box::new((Node::Accessor("Source"), head))),
                     borrows: None,
+                    contexts: None,
+                    signature_end: None,
                     body: Some(body),
-                });
+                }));
             }
         }
         let mut defined = std::collections::HashSet::new();
         for (node, _span) in root.0.iter() {
+            // N89: through the wrappers — `export`, `const`, or both — because
+            // what the prelude must not shadow is the NAME, whatever marks it.
+            let mut node = node;
+            while let Node::Export(_, inner, _) | Node::Const(inner) = node {
+                node = &inner.0;
+            }
             let function = match node {
                 Node::Func(function) => Some(function),
-                Node::Export(inner) => match &inner.0 {
-                    Node::Func(function) => Some(function),
-                    _ => None,
-                },
                 _ => None,
             };
             if let Some(function) = function {
@@ -633,17 +868,67 @@ fn analyze_source_unfenced(
     // false-flagging valid `std::dom` usage while still catching a genuine
     // cross-platform import (e.g. `std::http` in a file that also reaches for
     // `std::dom`).
-    let platform = platform.unwrap_or_else(|| infer_platform(&root.0, std));
+    // F27 R6: an inferred platform carries its own reason, so the overlay note
+    // can say why this file is under this twin even where no front end resolved
+    // the colour (a bare file, a `[library]` module, a test harness). The
+    // workspace is cloned only on that path — a front end that resolved a
+    // platform already stamped its own reason.
+    // F27 R1: what the file DECLARES outranks every heuristic below — a
+    // front end that resolved a platform has already applied it
+    // (`platform_color::file_platform_choices`), so this is the no-project path.
+    let inferred =
+        platform
+            .is_none()
+            .then(|| match platform_color::declared_platform_in(&root.0) {
+                Some(declared) => InferredPlatform {
+                    platform: declared.hosts[0],
+                    reason: platform_color::PlatformReason::Declared(declared.written).clause(),
+                    kind: "declared",
+                },
+                None => infer_platform(&root.0, std),
+            });
+    let platform = platform.unwrap_or_else(|| {
+        inferred
+            .as_ref()
+            .map(|inferred| inferred.platform)
+            .unwrap_or_default()
+    });
+    let inferred_workspace = inferred.map(|inferred| Workspace {
+        platform_reason: Some(inferred.reason),
+        platform_kind: Some(inferred.kind),
+        ..workspace.clone()
+    });
+    let workspace = inferred_workspace.as_ref().unwrap_or(workspace);
+    // M26's PARSE boundary (`editor-latency.md` §4.2): the first of the
+    // checkpoints, and the cheapest place to stop — the tree is parsed and the
+    // analysis proper has not begun. The handle rides out with the (empty)
+    // entry so the caller reclaims the tree exactly as it does on the panic
+    // path below; skipping the analysis is the whole saving.
+    if cancel::cancelled() {
+        return AnalyzedEntry {
+            program: None,
+            diagnostics,
+            ast: Some(ast),
+            owned_modules: OwnedModules::none(),
+        };
+    }
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut program = analyze(root, source, std, pkg_root, entry_path, platform, workspace);
+        // M26: `None` is a CANCELLED analysis — a newer revision of this
+        // document arrived while it ran, so it stopped at a checkpoint and
+        // there is no program. It reaches the caller the same way the panic
+        // path below does: no program, and the tree handle still in hand to
+        // reclaim.
+        let mut program = analyzer::analyze_cancellable(
+            root, source, std, pkg_root, entry_path, platform, workspace,
+        )?;
         // The post-pass half of the `VILAN_PHASE_TIMING` split prints inside
         // `post_analysis_passes` itself (backlog M5), so BOTH pipelines —
         // this one (LSP, wasm, the test harnesses) and the CLI's — show it.
         post_analysis_passes(&mut program, platform, &options::BuildOptions::default());
-        program
+        Some(program)
     }));
     match analyzed {
-        Ok(program) => {
+        Ok(Some(program)) => {
             diagnostics.extend(program.diagnostics.iter().cloned());
             AnalyzedEntry {
                 program: Some(program),
@@ -652,12 +937,23 @@ fn analyze_source_unfenced(
                 owned_modules: OwnedModules::none(),
             }
         }
-        // The analysis unwound inside its fence: every analyzer local went
-        // with it and nothing global borrowed the tree (leak-soak.md §7.2),
-        // so the handle is still the caller's to reclaim.
-        Err(_) => AnalyzedEntry {
+        // Cancelled inside the analyzer, past the parse checkpoint above.
+        Ok(None) => AnalyzedEntry {
             program: None,
             diagnostics,
+            ast: Some(ast),
+            owned_modules: OwnedModules::none(),
+        },
+        // The analysis unwound inside its fence: every analyzer local went
+        // with it and nothing global borrowed the tree (leak-soak.md §7.2),
+        // so the handle is still the caller's to reclaim. The parse's own
+        // diagnostics stand, and the panic is SAID, not swallowed (N121).
+        Err(_) => AnalyzedEntry {
+            program: None,
+            diagnostics: {
+                diagnostics.push(panicked_analysis());
+                diagnostics
+            },
             ast: Some(ast),
             owned_modules: OwnedModules::none(),
         },
@@ -709,10 +1005,65 @@ pub fn post_analysis_passes(
     // here rather than in `analyze_source` so both pipelines (the LSP/test
     // path AND the CLI's) show it.
     let phase_post_start = PhaseClock::now();
-    let phase_graph_start = PhaseClock::now();
+    // N43: `dispatch_refine::refined_edges` is reached from two of the buckets
+    // below (`contexts+graph` and `const-pass`), and on kolt it was most of
+    // both. Zero the accumulator here — the top of the only region that calls
+    // it — so the `dispatch-refine` bucket is this analysis's total.
+    dispatch_refine::reset_refine_time();
+    // B318 S4: the per-importer method namespace, resolved against the FINISHED
+    // program because the question a selector asks is
+    // `impl_select::subject_applies`, which reads one — and resolved HERE,
+    // ahead of every pass below, because `context::thread_contexts`'
+    // candidate lists and emission's `impl_select` both read the map. Returns
+    // immediately for a program whose files wrote neither `only` nor a
+    // selector, which is the whole estate.
+    analyzer::build_impl_admission(program);
+    // B336: `export(in <general PATH>)`, decided where the source paths are —
+    // the subtree test the analyzer's own walk cannot make. Returns immediately
+    // for a program that wrote no general narrowing, which is the whole estate.
+    analyzer::check_scoped_exports(program);
+    // B360 (R4): an `external fun` with neither an `[extern]` binding nor a
+    // compiler lowering names no body at all, and a call to one emitted a
+    // dangling name. Refused at the declaration, which needs the FINISHED
+    // program: the compiler's own lowerings are resolved by name in `build`.
+    analyzer::check_unlowered_externals(program);
+    // N113 (the fourth edge): a global host PROPERTY bound in the FUNCTION
+    // form emits a call to it — `[extern("document.activeElement")]` reaches
+    // the host as `document.activeElement()`. Same table, same question about
+    // a declaration, so it runs beside the check above.
+    analyzer::check_global_property_externs(program);
+    // E221: a label on a local binding is refused, and the opt-in
+    // `[lints] internal_use` warns at each use of an `[internal]` item — here,
+    // over the finished program, so both pipelines carry it.
+    labels::check(program);
+    // F27 R1: the files' and impls' `[platform(..)]` declarations, resolved
+    // once, ahead of every pass that asks what a function requires.
+    platform_color::record_declared_platforms(program);
+    // M26's POST-PASS boundary, the outermost of the three the phase line names
+    // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
+    // through the first two, so cancelling either cancels it). The passes are
+    // 0.31–0.46 s of a superseded analysis on kolt, and every one of them
+    // writes only diagnostics and result tables onto a `Program` this analysis
+    // owns and the caller is about to drop — so returning here leaves nothing
+    // half-written that anyone else can read. `call_graph_memo` is a memo: a
+    // consumer that asks an uninstalled program for the graph builds it, so
+    // skipping the install below is a missing OPTIMISATION, not a missing fact.
+    if cancel::cancelled() {
+        return;
+    }
+    let phase_contexts_start = PhaseClock::now();
     let call_graph =
         context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
-    let phase_graph = phase_graph_start.elapsed();
+    let phase_contexts = phase_contexts_start.elapsed();
+    // M26's `contexts+graph` boundary, the first the phase line names and the
+    // largest post-pass (171–242 ms on kolt): a cancel that arrived while the
+    // graph was being built stops here rather than paying the six passes that
+    // read it. The graph is dropped with the frame — it is installed on the
+    // program only at the bottom of this function, which a cancelled analysis
+    // never reaches.
+    if cancel::cancelled() {
+        return;
+    }
     let phase_async_start = PhaseClock::now();
     async_infer::infer(program, &call_graph);
     let phase_async = phase_async_start.elapsed();
@@ -727,6 +1078,10 @@ pub fn post_analysis_passes(
     // `drop` must be synchronous (destruction.md §5): reject an async drop
     // body now that `async_functions` is settled — an awaiting body is async
     // only by inference, so this cannot run inside `analyze`.
+    // B318 S3: the file-level impl admission refusal — a call answered by an
+    // `impl` this file's `only` or selector declined. The MAP it reads was
+    // built at the top of this function, before the passes that consult it.
+    analyzer::check_call_site_admission(program);
     let phase_async_drops_start = PhaseClock::now();
     analyzer::check_async_drops(program);
     let phase_async_drops = phase_async_drops_start.elapsed();
@@ -736,9 +1091,23 @@ pub fn post_analysis_passes(
     let phase_context_drops_start = PhaseClock::now();
     analyzer::check_context_drops(program);
     let phase_context_drops = phase_context_drops_start.elapsed();
+    // lazy.md §1's sync-only and context-free restrictions on a THUNKED
+    // argument, in the same seam and for the same reason as the two `drop`
+    // rules above: a forcing point threads no context and must not suspend,
+    // and both facts are settled only here. Returns immediately for a program
+    // that thunked nothing.
+    analyzer::check_lazy_argument_effects(program);
     let phase_platform_start = PhaseClock::now();
     platform_color::check(program, platform, &call_graph);
     let phase_platform = phase_platform_start.elapsed();
+    // M26's `const-pass` boundary, the second the phase line names: the pass
+    // costs 65–158 ms on kolt and most of it is `check_const_only`'s dispatch
+    // refinement (N43). Skipping it leaves `const_results` and its siblings
+    // empty, which for a cancelled analysis is the same nothing the whole
+    // program is about to become.
+    if cancel::cancelled() {
+        return;
+    }
     // The const pass (proposal/const-eval.md): evaluate `const`-marked
     // expressions in dependency order; results serialize in place at
     // transform time, failures are ordinary diagnostics. Runs here so
@@ -751,6 +1120,7 @@ pub fn post_analysis_passes(
     program.const_input_files = evaluated.input_files;
     program.const_bundled_files = evaluated.bundled;
     program.const_facts = evaluated.facts;
+    program.const_snapshot_bindings = evaluated.snapshot_bindings;
     for (error, source) in evaluated.errors {
         program.push_diagnostic(error, source);
     }
@@ -762,6 +1132,11 @@ pub fn post_analysis_passes(
     // declaration order (b33-emission-order.md §3), so it is an error
     // rather than a load-time `ReferenceError`. Runs last: the relation is
     // only meaningful for a program that analyzed cleanly.
+    // A130: a `.cell()` in a module binding's initializer, refused with its
+    // steer. It reads the installed graph's initializer calls, and — unlike the
+    // cycle check below — it does not need a clean program to be meaningful: a
+    // resolved call to std's `.cell()` is a fact whatever else failed.
+    init_order::check_module_level_cells(program);
     let phase_init_start = PhaseClock::now();
     init_order::check_cycles(program);
     let phase_init = phase_init_start.elapsed();
@@ -776,30 +1151,52 @@ pub fn post_analysis_passes(
     // line, stderr for the same reason. The named buckets do not sum to the
     // `post-passes` total — the residual is the seam glue (the graph install,
     // diagnostic-order normalization) — and `const-lower`/`const-interp` are a
-    // SUB-split of `const-eval`: the shared world's lowering + per-site
+    // SUB-split of `const-pass`: the shared world's lowering + per-site
     // assembly against the interpreter's evaluation, the two thirds/one third
-    // `const-eval.md` §10.2 had to hand-measure. Printed for macro worlds too,
-    // exactly as the aggregate line this extends was.
-    if phase_timing_enabled() {
-        let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+    // `const-eval.md` §10.2 had to hand-measure. A macro WORLD's post-passes no
+    // longer print a line of their own (M33): four unheaded `post-passes` lines
+    // ahead of the outer entry's read as the compiler having run the passes
+    // five times, when what they are is the worlds' share — so they are tallied
+    // into `macro-worlds`' `post-passes` field instead, on the row that says
+    // how many worlds there were.
+    //
+    // N43 — TWO buckets are named after what they TIME, not after the pass a
+    // reader assumed. `contexts+graph` is `context::thread_contexts` (which
+    // builds its own call graph when it rewrites, and falls back to
+    // `CallGraph::build` when it does not); calling it `call-graph` sent the
+    // editor-perf lane looking at graph construction for a cost that was
+    // dispatch refinement. `const-pass` is the whole const pass, of which
+    // `const-lower + const-interp` is the actual const EVALUATION: on kolt the
+    // bucket read 1,189 ms while the evaluation inside it was 11 ms, the rest
+    // being `check_const_only`'s dispatch refinement. `dispatch-refine` is
+    // that shared constant, summed across both call sites, so the next lane
+    // reads the split off the line instead of a profiler. It is deliberately
+    // NOT disjoint from the two buckets it explains — it is a slice through
+    // them, and the comment above already says the buckets do not sum.
+    if phase_timing_enabled() && macros::in_macro_world() {
+        macros::world_phases_record_post(phase_post_start.elapsed());
+    }
+    if phase_timing_enabled() && !macros::in_macro_world() {
         let (const_lower, const_interp) = const_eval::phase_split();
         eprintln!(
-            "[vilan phase] post-passes {:.1}ms call-graph {:.1}ms async-infer {:.1}ms \
-             view-suspensions {:.1}ms async-drops {:.1}ms context-drops {:.1}ms \
-             platform-color {:.1}ms const-eval {:.1}ms const-lower {:.1}ms \
-             const-interp {:.1}ms const-fuel-max {} init-order {:.1}ms",
-            milliseconds(phase_post_start.elapsed()),
-            milliseconds(phase_graph),
-            milliseconds(phase_async),
-            milliseconds(phase_views),
-            milliseconds(phase_async_drops),
-            milliseconds(phase_context_drops),
-            milliseconds(phase_platform),
-            milliseconds(phase_const),
-            milliseconds(const_lower),
-            milliseconds(const_interp),
+            "[vilan phase] post-passes {} contexts+graph {} async-infer {} \
+             view-suspensions {} async-drops {} context-drops {} \
+             platform-color {} const-pass {} const-lower {} \
+             const-interp {} const-fuel-max {} init-order {} \
+             dispatch-refine {}",
+            phase_post_start.elapsed(),
+            phase_contexts,
+            phase_async,
+            phase_views,
+            phase_async_drops,
+            phase_context_drops,
+            phase_platform,
+            phase_const,
+            const_lower,
+            const_interp,
             const_eval::max_fuel_used(),
-            milliseconds(phase_init),
+            phase_init,
+            dispatch_refine::refine_time(),
         );
     }
     // The depth line (B138), after the last pass that recurses: macro worlds
@@ -828,6 +1225,24 @@ pub fn begin_depth_stats() {
     }
 }
 
+/// Release the `VILAN_DEPTH_STATS` instrument for a front end that anchored
+/// with [`begin_depth_stats`] and will NOT reach `post_analysis_passes`.
+///
+/// The report normally rides the end of the analysis, which is the only place
+/// that knows every recursive family has unwound. A front end can anchor and
+/// then decline to analyse, though, and `vilan build` does exactly that on a
+/// parse error: the tree is dropped and the parse diagnostics are reported, so
+/// the depth line went missing for precisely the analyses the PARSER's own
+/// bound exists for (B142's 500-level refusal, N111). Calling this on that
+/// path prints the line the anchored parse measured; calling it on a path that
+/// did analyse would print a second one, so it belongs only where no
+/// `post_analysis_passes` follows.
+pub fn report_depth_stats() {
+    if !macros::in_macro_world() {
+        depth_stats::report();
+    }
+}
+
 /// Whether `VILAN_LEAK_REPORT` asks for the per-analysis leak line (any value
 /// but empty or `0`). Read once and cached: an env var does not change under a
 /// live process, and the LSP asks on every keystroke.
@@ -836,6 +1251,165 @@ pub(crate) fn leak_report_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("VILAN_LEAK_REPORT").is_ok_and(|value| !value.is_empty() && value != "0")
     })
+}
+
+/// The thread CPU clock the phase marks read beside the wall (backlog M78).
+///
+/// THREAD, not process: every phase these marks bracket is single-threaded
+/// (the analyzer, the transformer, the const interpreter, and a macro world,
+/// which is a nested analysis on this same thread), and an analysis runs on
+/// its own spawned thread — so the thread clock is both the tightest bracket
+/// available and immune to what the rest of the box is doing to the load
+/// average, which is the whole reason M78 exists.
+///
+/// Declared rather than depended on: `vilan-core`'s four dependencies are a
+/// deliberate list and `libc` is not on it — the language server, which does
+/// depend on it, holds the same reader for its own request clocks
+/// (`keystroke::gate::thread_cpu_now`). `clock_gettime` is in libc, which is
+/// linked into every Linux build already, so this costs no dependency edge,
+/// no notices row and no audit. Linux and LP64 only, because that is where
+/// the two ABI facts below are facts; everywhere else the clock DECLINES and
+/// the phase line prints `?cpu` rather than a zero pretending to be a
+/// measurement.
+///
+/// Measured on the development host: ~0.6 µs per call with ~0.8 µs of
+/// resolution — against `/proc/thread-self/schedstat`, whose
+/// `sum_exec_runtime` advances only at the scheduler tick (4 ms here, which
+/// made every sub-tick stage read either 0.0 or one whole tick).
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn thread_cpu_now() -> Option<std::time::Duration> {
+    /// `struct timespec` as every LP64 Linux ABI lays it out: `time_t` and
+    /// `long`, both 64-bit signed.
+    #[repr(C)]
+    struct Timespec {
+        seconds: i64,
+        nanoseconds: i64,
+    }
+
+    /// `CLOCK_THREAD_CPUTIME_ID`, `include/uapi/linux/time.h` — part of the
+    /// kernel's stable ABI, the same constant glibc and musl both re-export.
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+
+    unsafe extern "C" {
+        fn clock_gettime(clock_id: i32, timespec: *mut Timespec) -> i32;
+    }
+
+    let mut timespec = Timespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    // SAFETY: `clock_gettime` writes the `timespec` it is handed and reads
+    // nothing else; the pointer is to a live local of the correct layout, and
+    // the return code is checked before the value is believed.
+    let result = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &raw mut timespec) };
+    (result == 0).then(|| {
+        std::time::Duration::new(
+            timespec.seconds.max(0) as u64,
+            timespec.nanoseconds.clamp(0, 999_999_999) as u32,
+        )
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn thread_cpu_now() -> Option<std::time::Duration> {
+    None
+}
+
+/// Whether this host exposes the thread CPU clock the phase line's `cpu`
+/// figures are taken on. Read once and cached, like the switch itself.
+///
+/// It answers the question "is the clock there", not "does it advance": the
+/// compiler is the wrong place to burn CPU proving the second. The PIN does
+/// that — it reads the line and DECLINES on a host whose figures stay at zero
+/// under work it knows costs CPU.
+pub fn phase_cpu_clock_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| thread_cpu_now().is_some())
+}
+
+/// The CPU reading a phase mark takes, or zero when the instrument is off.
+///
+/// Gated on the switch because the marks in [`post_analysis_passes`] and the
+/// const pass's per-site sub-split are UNCONDITIONAL — one cached `bool` load
+/// is the price of the instrument being off, and a `/proc` read per const site
+/// would not be.
+fn phase_cpu_mark() -> std::time::Duration {
+    if !phase_timing_enabled() {
+        return std::time::Duration::ZERO;
+    }
+    thread_cpu_now().unwrap_or(std::time::Duration::ZERO)
+}
+
+/// One phase's cost on BOTH clocks: the wall it took and the CPU it burned
+/// (backlog M78).
+///
+/// Every `[vilan phase]` figure used to be wall alone, so under load it was a
+/// SHARE and never an absolute — M73's stage split had to be reported as
+/// percentages for exactly that reason, and E121's ledger could take no
+/// absolute figure on a box with nine other lanes on it. Both numbers print,
+/// `wall/cpu`, because both are wanted: wall is what a user waits, CPU is what
+/// the work costs, and the gap between them is the load.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseSpan {
+    pub wall: std::time::Duration,
+    pub cpu: std::time::Duration,
+}
+
+impl PhaseSpan {
+    pub const ZERO: PhaseSpan = PhaseSpan {
+        wall: std::time::Duration::ZERO,
+        cpu: std::time::Duration::ZERO,
+    };
+}
+
+impl std::ops::Add for PhaseSpan {
+    type Output = PhaseSpan;
+
+    fn add(self, other: PhaseSpan) -> PhaseSpan {
+        PhaseSpan {
+            wall: self.wall + other.wall,
+            cpu: self.cpu + other.cpu,
+        }
+    }
+}
+
+impl std::ops::AddAssign for PhaseSpan {
+    fn add_assign(&mut self, other: PhaseSpan) {
+        *self = *self + other;
+    }
+}
+
+/// SATURATING, and deliberately: `load+walk` is printed as the whole
+/// pre-build span MINUS the base-cache leg, and a base-cache HIT once left a
+/// cold `base` to be subtracted from a warm span — the `Duration` underflow
+/// panicked inside `analyze_source`'s fence and turned every analysis after
+/// the first into `None` (`tests/phase_timing.rs` is that regression's pin).
+/// An instrument may print a zero; it may not eat the program.
+impl std::ops::Sub for PhaseSpan {
+    type Output = PhaseSpan;
+
+    fn sub(self, other: PhaseSpan) -> PhaseSpan {
+        PhaseSpan {
+            wall: self.wall.saturating_sub(other.wall),
+            cpu: self.cpu.saturating_sub(other.cpu),
+        }
+    }
+}
+
+/// `460.7ms/455.1cpu` — the wall figure with the CPU beside it, one token so
+/// a reader (and the positional parsers in `macro_world_phase.rs`) still finds
+/// the name and its number at a fixed offset. `?cpu` where the host has no
+/// thread CPU clock: a missing measurement says so rather than reading zero.
+impl std::fmt::Display for PhaseSpan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+        write!(formatter, "{:.1}ms/", milliseconds(self.wall))?;
+        if phase_cpu_clock_available() {
+            write!(formatter, "{:.1}cpu", milliseconds(self.cpu))
+        } else {
+            write!(formatter, "?cpu")
+        }
+    }
 }
 
 /// Whether `VILAN_PHASE_TIMING` asks for the per-analysis phase line (any
@@ -850,32 +1424,40 @@ pub(crate) fn leak_report_enabled() -> bool {
 /// crashed on its first compile. The smoke gate caught it pre-publish; this
 /// keeps the instrument for hosts and makes wasm report zeros.
 #[derive(Clone, Copy)]
-pub(crate) struct PhaseClock {
+pub struct PhaseClock {
     #[cfg(not(target_arch = "wasm32"))]
     started: std::time::Instant,
+    cpu_started: std::time::Duration,
 }
 
 impl PhaseClock {
-    pub(crate) fn now() -> Self {
+    pub fn now() -> Self {
         PhaseClock {
             #[cfg(not(target_arch = "wasm32"))]
             started: std::time::Instant::now(),
+            cpu_started: phase_cpu_mark(),
         }
     }
 
-    pub(crate) fn elapsed(&self) -> std::time::Duration {
+    pub fn elapsed(&self) -> PhaseSpan {
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.started.elapsed()
-        }
+        let wall = self.started.elapsed();
         #[cfg(target_arch = "wasm32")]
-        {
-            std::time::Duration::ZERO
+        let wall = std::time::Duration::ZERO;
+        PhaseSpan {
+            wall,
+            cpu: phase_cpu_mark().saturating_sub(self.cpu_started),
         }
     }
 }
 
-pub(crate) fn phase_timing_enabled() -> bool {
+/// Whether the `VILAN_PHASE_TIMING` instrument is on — public so a FRONT END
+/// can add its own phases to the same line under the same switch. The language
+/// server does (`document::analyze_on_this_thread`): the costs it owns —
+/// project resolution, the editor tables, a shared module's further legs — all
+/// sit outside `analyze`, so the core line above cannot see them, and a second
+/// switch would mean two half-pictures.
+pub fn phase_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("VILAN_PHASE_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
