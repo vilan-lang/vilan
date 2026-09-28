@@ -488,6 +488,21 @@ fn b385_the_owners_signal_mapper_shape_checks_clean() {
 }
 
 #[test]
+fn b385_a_generic_recursive_struct_through_option_checks_clean() {
+    // Order 43's verification on 762c6aa5: the overflow does not reproduce. The
+    // item listed the STRUCT and `Option` spellings beside the enum and `List`
+    // one; this is that pin, so the guard is held on every wrapper it named.
+    assert_compiles(
+        r#"
+        import std::reactive::SignalCell;
+        struct Tree<type T> { value: T, children: Option<List<Tree<T>>> }
+        enum Chain<type T> { End, Link(T, Option<Chain<T>>) }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
 fn b385_a_mutually_recursive_generic_pair_checks_clean() {
     // Two heads, each reached through the other: the head set must hold BOTH
     // while the walk is inside them, or the pair alternates forever.
