@@ -5654,6 +5654,52 @@ mod snapshot_consistency_tests {
         );
     }
 
+    // E228, through the real handler: the owner's shape — a module-level
+    // `let cell: Shared<Option<..>>`, and `cell.read().` typed on a line the
+    // landed analysis has not seen (the request inside the debounce). Before
+    // E228 the popup was empty: the live walk declined `read`'s bare `T` and
+    // the analyzed arm is gated off on the edited line.
+    #[tokio::test]
+    async fn e228_completion_after_a_shared_read_typed_since_the_landing() {
+        const BASE: &str = "import std::shared::Shared;\n\
+             let cell: Shared<Option<i32>> = Shared::new(None);\n\
+             fun main() {\n\tlet _n = 1;\n}\n";
+        let live = BASE.replace("\tlet _n = 1;\n", "\tcell.read().\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(BASE));
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: position_at(&live, "cell.read().", "cell.read().".len()),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion");
+        let labels: Vec<String> = match response {
+            Some(CompletionResponse::Array(items)) => {
+                items.into_iter().map(|item| item.label).collect()
+            }
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        for member in ["is_some", "map", "unwrap_or"] {
+            assert!(
+                labels.iter().any(|label| label == member),
+                "`cell.read().` must offer Option's `{member}`: {labels:?}"
+            );
+        }
+    }
+
     // E52, member-completion variant: the RECEIVER's type also resolves
     // through a `program` lookup (`entity_at`, off a complex/chained receiver
     // rather than a bare name — `widget` is a FIELD, not a binding, so
