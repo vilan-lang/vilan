@@ -32,4 +32,6 @@ reactive-on-change	4	33
 reactive-flatten	2	8
 list-cell	66	174
 reactive-selector	10	26
+f64-print-boundary	0	0
+non-bmp-string-length	0	0
 native_probe_board	1	20
