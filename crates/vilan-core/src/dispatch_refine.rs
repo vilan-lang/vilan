@@ -402,6 +402,56 @@ pub fn known_receiver_candidates(program: &Program, call_id: Id) -> Option<Vec<I
     (!selected.is_empty()).then_some(selected)
 }
 
+/// B425: the candidates of a GENERIC-MEMBER dispatch (`OnConstraint`) —
+/// [`candidates_of`] restricted to the traits the parameter's bounds name,
+/// transitively through supertraits. A member of the same NAME on an
+/// unrelated trait cannot be reached through the bound, and admitting it made
+/// the context pass declare hidden parameters no call could supply. `None`
+/// for any other site, and for an unbounded parameter (nothing to narrow by).
+pub fn bound_candidates(program: &Program, call_id: Id) -> Option<Vec<Id>> {
+    let Some(GenericDispatch::OnConstraint(constraint, member)) =
+        crate::async_infer::dispatch_at(program, call_id)
+    else {
+        return None;
+    };
+    let traits = bound_traits(program, constraint);
+    if traits.is_empty() {
+        return None;
+    }
+    let scope = program
+        .admitting_file(call_id)
+        .filter(|file| program.impl_admission.restricts(*file));
+    let mut candidates = Vec::new();
+    for trait_id in &traits {
+        let Some(trait_) = program.traits.get(trait_id) else {
+            continue;
+        };
+        let Some(&declaration_id) = trait_.declarations.get(member) else {
+            continue;
+        };
+        if program
+            .functions
+            .get(&declaration_id)
+            .is_some_and(|function| function.has_body)
+        {
+            candidates.push(declaration_id);
+        }
+        for implementation in &program.implementations {
+            if implementation.trait_ids.contains(trait_id)
+                && let Some(&member_id) = implementation.declarations.get(member)
+                && scope.is_none_or(|file| {
+                    program
+                        .impl_admission
+                        .admits_member(file, implementation, member_id)
+                })
+            {
+                candidates.push(member_id);
+            }
+        }
+    }
+    Some(candidates)
+}
+
 /// The traits a generic parameter's constraint names, transitively through
 /// supertraits — the impls a call through that parameter may reach.
 ///

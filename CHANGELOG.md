@@ -73,6 +73,9 @@ written down.
 <!-- family: diagnostics -->
 **The regime-3 `;` steer reaches a closure down a method chain: `let doubled: SignalCell<i32> = count.map(|n| { n * 2; }).cell();` says "Expected i32, but got void instead: the `;` discards this body's last value." at the closure's `}`, where it said "Expected SignalCell<i32>, but got SignalCell<void>" over the whole chain.** The expectation stops at `.cell()`'s receiver, so the closure's own check never had a target; the binding's mismatch now walks the two types to the position where the value is `void` and finds the `;`-ended closure among the chain's calls. Tracker E226.
 
+<!-- family: fix -->
+**A generic function calling through its own trait bound no longer takes hidden context parameters from an unrelated trait's same-named member: `badge<V: MaybeSignal<str>>(label: V) { label.bind(..) }` over a program's OWN `MaybeSignal` threads no ambient owner, where it declared one because std's `MaybeSignal::bind` (whose reactive impl registers an effect) shares the name — and a top-level call supplied nothing for it (JS passed `undefined`; the native build refused the arity).** The context pass read a call through a bounded parameter as reaching every member of that NAME in the program; it now reads the members of the bound's traits (and their supertraits), the same narrowing a known receiver already got. `blanket-impl.vl` builds natively and prints what JS prints; its golden loses the two unused parameters and renames minified locals, runtime-identical. Tracker B425.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

@@ -3479,24 +3479,25 @@ const ENCODE_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F36's boundary, named: `blanket-impl.vl` got past the interpolation and met
-/// a call that threads FEWER context arguments than its callee's instance
-/// declares (`badge("static")` from `main`, whose instance takes the ambient
-/// `Owner` because one impl of the trait member it dispatches through reaches
-/// it; JavaScript passes `undefined`). rustc refused that as E0061 — a BROKEN
-/// verdict — so it is refused by name instead, which is what the whole-set
-/// sweep's zero-broken gate needs. The context pass is the analyzer's, and the
-/// fix that makes the call emittable is there.
+/// F36's boundary, CLOSED by B425: `blanket-impl.vl` met a call that threaded
+/// FEWER context arguments than its callee's instance declared
+/// (`badge("static")` from `main`). The instance declared the ambient `Owner`
+/// because the context pass read `label.bind(..)` — a dispatch through `V:
+/// MaybeSignal<str>`, the program's OWN trait — as reaching every member
+/// NAMED `bind`, std's `MaybeSignal::bind` (whose reactive impl registers an
+/// effect) among them, while coverage, which narrows, found no need. A
+/// generic-member site's candidates are now the bound's traits' members only,
+/// so nothing is declared that no caller supplies: the program is identical
+/// on both backends (it was refused by name here, and before that rustc's
+/// E0061).
 #[test]
 fn a_call_missing_a_context_argument_is_refused_by_name() {
     let staged = stage();
-    match compare(&staged, "blanket-impl.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("a call to `badge` that threads fewer context arguments"),
-            "{reason}"
-        ),
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "blanket-impl.vl"),
+        Verdict::Identical,
+        "`blanket-impl.vl` must mean the same thing on both backends"
+    );
 }
 
 /// **F38**: `and_then<U>`'s `U` — a callee's OWN generic parameter that no
