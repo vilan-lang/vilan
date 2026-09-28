@@ -159,6 +159,18 @@ const DEFAULT_SUITE: &[&str] = &[
     // F36: `i"{one.get()}"` — a generic call's result, interpolated, judged at
     // the type the call binds its parameter to.
     "reactive-selector.vl",
+    // N106: `vilan_rt::js_number`'s four documented departures from Rust's
+    // own `{}` — 1e21's exponential switch, the 1e-6 linear floor, and the
+    // two infinities — pinned identical on a corpus program rather than left
+    // unrecorded (negative zero is the one departure that is NOT identical;
+    // it is `f64-print-negative-zero.vl`, outside this differential by name).
+    "f64-print-boundary.vl",
+    // N106: `str::len` counts UTF-16 code units to match JavaScript's
+    // `.length`; a character outside the BMP is a surrogate pair on JS and
+    // `char::len_utf16` counts it the same way natively — verified here
+    // rather than left as an unverified claim in `vilan_rt::str_len`'s doc
+    // comment.
+    "non-bmp-string-length.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -171,10 +183,18 @@ const DEFAULT_SUITE: &[&str] = &[
 /// corpus keeps its JS golden, and
 /// [`an_underflowing_usize_is_outside_the_differential_by_name`] pins the
 /// native half.
-const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[(
-    "usize-underflow.vl",
-    "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
-)];
+const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[
+    (
+        "usize-underflow.vl",
+        "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
+    ),
+    (
+        "f64-print-negative-zero.vl",
+        "negative zero prints \"-0\" through node's `console.log` (a `util.inspect` \
+         special case) but \"0\" through every JS stringification `vilan_rt::js_number` \
+         implements instead (`String(x)`, a template literal, `JSON.stringify`) — N106",
+    ),
+];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
 ///
@@ -282,7 +302,36 @@ pub fn platform_free_programs() -> Vec<String> {
 /// still leads the name, so two concurrent runs of this binary cannot meet
 /// either. The shared cargo target directory stays shared on purpose; cargo
 /// locks it itself.
-fn stage() -> PathBuf {
+///
+/// Nothing removed the directory at the test's end, so a run that started
+/// clean left every staged corpus copy behind: 2,788 of them after one day of
+/// Order 42's runs, and CI's `vilan-fmt` leg — walking `./target` locally —
+/// tripped on 5,556 stale `resource struct` copies from before B413 (N133).
+/// `StagedDir` removes its directory on drop, at the end of the test function
+/// that called `stage()`, whether the test passed, failed, or panicked.
+struct StagedDir(PathBuf);
+
+impl std::ops::Deref for StagedDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for StagedDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn stage() -> StagedDir {
     static STAGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let call = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staged = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -291,7 +340,7 @@ fn stage() -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&staged);
     copy_tree(&corpus_dir(), &staged);
-    staged
+    StagedDir(staged)
 }
 
 /// Copies the corpus tree, DIRECTORIES INCLUDED.
@@ -449,6 +498,52 @@ fn an_underflowing_usize_is_outside_the_differential_by_name() {
          stdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&native.stdout)
     );
+}
+
+/// N106: the other [`OUTSIDE_THE_DIFFERENTIAL`] program — negative zero is
+/// the one `vilan_rt::js_number` departure from `console.log` that is NOT
+/// identical: node's `console.log` special-cases it to `"-0"` (`util.inspect`),
+/// while every JS *stringification* (`String(x)`, a template literal,
+/// `JSON.stringify`) answers `"0"`, which is what `js_number` — and so the
+/// native backend's `print` — implements. Both backends do what the book
+/// says; the sweep leaves the program out so it is not called broken.
+#[test]
+fn negative_zero_prints_differently_on_each_backend_by_name() {
+    for (program, _) in OUTSIDE_THE_DIFFERENTIAL {
+        assert!(
+            corpus_dir().join(program).is_file(),
+            "{program} is named outside the differential but is not a corpus program"
+        );
+        assert!(
+            !platform_free_programs().contains(&program.to_string()),
+            "{program} is named outside the differential but the sweep still enumerates it"
+        );
+        assert!(
+            !DEFAULT_SUITE.contains(program),
+            "{program} is outside the differential and cannot be in its default suite"
+        );
+    }
+    let staged = stage();
+    let javascript = vilan(&staged)
+        .args(["run", "f64-print-negative-zero.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert!(
+        javascript.status.success(),
+        "the JS leg runs clean: {}",
+        String::from_utf8_lossy(&javascript.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "-0\n");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "f64-print-negative-zero.vl"])
+        .output()
+        .expect("run the native backend");
+    assert!(
+        native.status.success(),
+        "the native leg runs clean: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "0\n");
 }
 
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.

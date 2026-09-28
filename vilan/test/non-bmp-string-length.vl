@@ -1,0 +1,14 @@
+import std::io::print;
+
+fun main() {
+	// N106: `str::len` counts UTF-16 code units to match JavaScript's
+	// `.length`, which `vilan_rt::str_len`'s own comment once claimed only
+	// for the BMP — a character outside it (this emoji, U+1F600) is a
+	// surrogate PAIR on JS, two UTF-16 units, and `char::len_utf16` counts
+	// it the same way natively, so this pins the two backends agreeing
+	// rather than leaving the claim unverified.
+	let with_astral: str = "a😀b";
+	print(with_astral.len()); // 4 — 'a' + the pair + 'b'
+	let astral_only: str = "😀😀";
+	print(astral_only.len()); // 4 — two pairs
+}

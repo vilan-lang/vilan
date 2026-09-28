@@ -222,16 +222,24 @@ pub fn js_of<T: Js + ?Sized>(value: &T) -> Str {
 
 /// `print(message)` — `std::io`'s one universal output, bound to
 /// `console.log` on the JS backend and to this here.
+///
+/// NOT an exact match at one value: node's `console.log` special-cases
+/// negative zero to `"-0"` (a `util.inspect` behaviour), where [`js_number`]
+/// answers `"0"`, the `String(x)`/template-literal/`JSON.stringify` reading —
+/// `f64-print-negative-zero.vl` pins the divergence by name, OUTSIDE the
+/// native differential (N106).
 pub fn print<T: Js + ?Sized>(value: &T) {
     println!("{}", value.js());
 }
 
-/// ECMA-262's `Number::toString` for the cases a compiled program reaches.
+/// ECMA-262's `Number::toString` for the cases a compiled program reaches —
+/// **not** `console.log`'s rendering, which [`print`]'s doc comment carries
+/// the one departure of (negative zero).
 ///
 /// Rust's own `{}` is already the shortest round-tripping decimal, which is
 /// what JavaScript specifies too, so the body below is only the four places the
 /// two disagree — and each is a real difference a corpus program can print, not
-/// a hypothetical.
+/// a hypothetical (`f64-print-boundary.vl`, N106).
 pub fn js_number(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -242,7 +250,8 @@ pub fn js_number(value: f64) -> String {
     }
     if value == 0.0 {
         // JavaScript's `String(-0)` is `"0"`; Rust's is `"-0"`. The sign is
-        // observable through `1/x`, and nothing in scope prints that.
+        // observable through `1/x`, and through `print` specifically, whose
+        // `console.log` DOES show it — see `print`'s doc comment.
         return "0".to_string();
     }
     let magnitude = value.abs();
@@ -1822,9 +1831,15 @@ pub fn list_insert<T>(list: &mut Vec<T>, index: usize, value: T) {
 // ---------------------------------------------------------- str intrinsics --
 
 pub fn str_len(text: &str) -> usize {
-    // JavaScript's `.length` counts UTF-16 code units, and the corpus's strings
-    // are ASCII, where the two agree. A non-ASCII program is a KNOWN divergence
-    // and the differential reports it rather than this pretending otherwise.
+    // JavaScript's `.length` counts UTF-16 code units. `char::len_utf16`
+    // answers exactly that per Unicode scalar value — 1 within the BMP, 2 for
+    // a character JS stores as a surrogate pair — so this agrees with `.length`
+    // for any valid string, not only ASCII or the BMP; `non-bmp-string-length.vl`
+    // pins a surrogate-pair character identical on both backends (N106). The
+    // one string JS can hold that this cannot is one with an UNPAIRED
+    // surrogate: Rust's `char` (and so `str`) admits no such code point, and
+    // no vilan source can spell one either, so it is not a program either
+    // backend need answer for.
     text.chars().map(char::len_utf16).sum()
 }
 

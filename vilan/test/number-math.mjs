@@ -10,21 +10,6 @@ function diff(self, other) {
 function clamp(self, min, max) {
 	return Math.max(Math.min(self, max), min);
 }
-function compare(self, b2) {
-	let $d = null;
-	if (self < b2) {
-		$d = -1;
-	} else {
-		let $e = null;
-		if (self > b2) {
-			$e = 1;
-		} else {
-			$e = 0;
-		}
-		$d = $e;
-	}
-	return $d;
-}
 function is_even(self) {
 	return (self & 1) === 0;
 }
@@ -52,26 +37,8 @@ function parity() {
 	console.log(is_even2(8));
 	console.log(is_odd2(9));
 }
-function $c(self, b2) {
-	let $f = null;
-	if (compare(self, b2) <= 0) {
-		$f = self;
-	} else {
-		$f = b2;
-	}
-	return $f;
-}
-function $g(self, b2) {
-	let $h = null;
-	if (compare(self, b2) >= 0) {
-		$h = self;
-	} else {
-		$h = b2;
-	}
-	return $h;
-}
 function $b(self, min, max) {
-	return $g($c(self, max), min);
+	return Math.max(Math.min(self, max), min);
 }
 parity();
 const n = -(5);

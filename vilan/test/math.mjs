@@ -5,19 +5,19 @@ function __clone(value) {
 	return value;
 }
 function compare(self, b) {
-	let $h = null;
+	let $d = null;
 	if (self < b) {
-		$h = -1;
+		$d = -1;
 	} else {
-		let $i = null;
+		let $e = null;
 		if (self > b) {
-			$i = 1;
+			$e = 1;
 		} else {
-			$i = 0;
+			$e = 0;
 		}
-		$h = $i;
+		$d = $e;
 	}
-	return $h;
+	return $d;
 }
 function rem(self, m) {
 	return self - Math.trunc(self / m) * m;
@@ -46,59 +46,35 @@ function is_nan(self) {
 function is_infinite(self) {
 	return !(Number.isFinite(self)) && !(is_nan(self));
 }
-function compare2(self, b) {
-	let $c = null;
-	if (self < b) {
-		$c = -1;
-	} else {
-		let $d = null;
-		if (self > b) {
-			$d = 1;
-		} else {
-			$d = 0;
-		}
-		$c = $d;
-	}
-	return $c;
-}
 function rem4(self, m) {
 	return self - Math.trunc(self / m) * m;
 }
 function rem5(self, m) {
 	return self - Math.trunc(self / m) * m;
 }
-function $b(self, b) {
-	let $e = null;
-	if (compare2(self, b) <= 0) {
-		$e = self;
-	} else {
-		$e = b;
-	}
-	return $e;
-}
 function $a(a, b) {
-	return $b(a, b);
+	return Math.min(a, b);
 }
-function $g(self, b) {
-	let $j = null;
+function $c(self, b) {
+	let $f = null;
 	if (compare(self, b) >= 0) {
-		$j = self;
+		$f = self;
 	} else {
-		$j = b;
+		$f = b;
 	}
-	return $j;
+	return $f;
 }
-function $f(a, b) {
-	return $g(a, b);
+function $b(a, b) {
+	return $c(a, b);
 }
-function $k(a, b) {
-	let $l = null;
+function $g(a, b) {
+	let $h = null;
 	if (a <= b) {
-		$l = [ __clone(a), __clone(b) ];
+		$h = [ __clone(a), __clone(b) ];
 	} else {
-		$l = [ __clone(b), __clone(a) ];
+		$h = [ __clone(b), __clone(a) ];
 	}
-	return $l;
+	return $h;
 }
 const PI = 3.141592653589793;
 const TAU = 6.283185307179586;
@@ -113,10 +89,10 @@ console.log(EPSILON === Math.pow(2, 0 - 52));
 console.log(INFINITY > 0 && is_infinite(INFINITY));
 console.log(is_nan(NAN));
 console.log($a(3, 9));
-console.log($f("ant", "bee"));
-const $m = $k(9, 3);
-const low = $m[0];
-const high = $m[1];
+console.log($b("ant", "bee"));
+const $i = $g(9, 3);
+const low = $i[0];
+const high = $i[1];
 console.log("" + low + " " + high);
 console.log(Math.sin(0));
 console.log(Math.cos(0));
