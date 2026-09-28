@@ -7864,16 +7864,16 @@ impl<'src> Printer<'src> {
             // `body` evaluated for each element of the tuple `source`, with
             // `binder` naming the element. Like its type-level counterpart
             // `MappedType`, the parentheses are the form's own.
-            Node::TupleComprehension {
-                binder,
-                source,
-                body,
-                ..
-            } => {
+            Node::TupleComprehension { bindings, body } => {
                 self.out.push('(');
-                self.out.push_str(binder);
-                self.out.push_str(" in ");
-                self.print_expr(source);
+                for (index, binding) in bindings.iter().enumerate() {
+                    if index > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.out.push_str(binding.binder);
+                    self.out.push_str(" in ");
+                    self.print_expr(&binding.source);
+                }
                 self.out.push_str(" => ");
                 self.print_expr(body);
                 self.out.push(')');
@@ -9522,6 +9522,19 @@ mod bailing_constructs {
             "fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {\n\
              \tlet snapshot = || (source in sources => source.get());\n\
              \tSignal::new(snapshot())\n\
+             }\n",
+        );
+    }
+
+    /// B183's zip form keeps every binding, in order, comma-separated.
+    #[test]
+    fn zipped_tuple_comprehension() {
+        assert_construct(
+            "fun pairs<T: (2..)>(a: (U in T: Option<U>), b: T): (U in T: bool) {\n\
+             \t(x in a,   y in b => x.is_some())\n\
+             }\n",
+            "fun pairs<T: (2..)>(a: (U in T: Option<U>), b: T): (U in T: bool) {\n\
+             \t(x in a, y in b => x.is_some())\n\
              }\n",
         );
     }

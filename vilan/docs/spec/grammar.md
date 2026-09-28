@@ -479,13 +479,16 @@ Read the elements positionally (`t.0`, `t.1`) or destructure the tuple
 array binder destructures each ELEMENT — `for (index, item) in
 list.iter().enumerate()` — with exactly the rules a destructuring `let`
 takes; any other pattern is refused by name, and the element is bound and
-destructured in the body instead. The same holds for a **mapped tuple**
-`(U in T: F<U>)`, whose elements have no positions to read while `T` is
-abstract: its element-wise
-form is the tuple comprehension. *Whether such a loop should instead be
-UNROLLED — the body checked and emitted once per element, at that element's
-own type — is recorded future work; the refusal is forward-compatible with
-it.*
+destructured in the body instead. A tuple **family** is the exception
+(§5.9): a loop over a mapped tuple `(U in T: F<U>)`, or over a value of a
+tuple-bounded parameter `T: (2..)` (read as `(U in T: U)`), binds the element
+template `F<U>` at a `U` fresh to the loop and checks the body ONCE,
+parametrically — the binder has a type, and the body may use only what `U`
+promises. A `&mut` walk over a family is still refused: a family has
+elements, not element views. *Whether a loop over a CONCRETE tuple should
+instead be UNROLLED — the body checked and emitted once per element, at that
+element's own type — is recorded future work; the refusal is
+forward-compatible with it.*
 
 ## 3.6 Chain expressions (postfix)
 
@@ -516,7 +519,9 @@ tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
 entry   = spread | expression ;
 spread  = ".." expression ;
 list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
-tuple-comprehension = "(" IDENT "in" secondary-expr "=>" expression ")" ;
+tuple-comprehension = "(" comprehension-binding { "," comprehension-binding }
+                      "=>" expression ")" ;
+comprehension-binding = IDENT "in" secondary-expr ;
 
 element      = "<" element-name { head-item }
                ( "/>" | ">" { child } "</" element-name ">" )

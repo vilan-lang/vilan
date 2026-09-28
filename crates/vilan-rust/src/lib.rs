@@ -1329,7 +1329,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 | Expr::ForEach(_, _, _)
                 | Expr::Closure(_)
                 | Expr::Async(_)
-                | Expr::TupleComprehension(_, _, _)
+                | Expr::TupleComprehension(_, _)
         )
     }
 
@@ -1390,10 +1390,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 children.extend(steps.iter().map(|(step, _, _)| *step));
                 children.push(*body);
             }
-            Expr::TupleComprehension(a, b, c) => {
-                children.push(*a);
-                children.push(*b);
-                children.push(*c);
+            Expr::TupleComprehension(bindings, body) => {
+                for (binder, source) in bindings {
+                    children.push(*binder);
+                    children.push(*source);
+                }
+                children.push(*body);
             }
             Expr::Call(call_id) => {
                 if let Some(function_call) = self.program.function_calls.get(call_id) {
@@ -10508,7 +10510,7 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
         Expr::TryAssert(_) => "a `!` assertion",
         Expr::Lift(_, _, _) | Expr::LiftBinder | Expr::LiftRegion(_, _) => "a `?` lift",
         Expr::Destructure(_, _) => "a destructuring binding",
-        Expr::TupleComprehension(_, _, _) => "a tuple comprehension",
+        Expr::TupleComprehension(_, _) => "a tuple comprehension",
         Expr::Repeat(_, _) => "a `[value; n]` literal",
         Expr::ArrayLen(_, _) => "a fixed-array `len()`",
         Expr::Generic(_) => "a generic type reference",

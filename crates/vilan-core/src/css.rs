@@ -483,17 +483,15 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             desugar_boxed(continuation, source),
         ),
         Node::Is(subject, pattern) => Node::Is(desugar_boxed(subject, source), pattern),
-        Node::TupleComprehension {
-            binder,
-            binder_span,
-            source: comprehension_source,
-            body,
-        } => Node::TupleComprehension {
-            binder,
-            binder_span,
-            source: desugar_boxed(comprehension_source, source),
-            body: desugar_boxed(body, source),
-        },
+        Node::TupleComprehension { mut bindings, body } => {
+            for binding in &mut bindings {
+                take_and_desugar(&mut binding.source, source);
+            }
+            Node::TupleComprehension {
+                bindings,
+                body: desugar_boxed(body, source),
+            }
+        }
         // Everything else cannot contain an expression, or the prefilter
         // already ruled it css-free.
         other => other,

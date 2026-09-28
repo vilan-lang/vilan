@@ -7,6 +7,7 @@ import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, Weak };
 import pkg::time::Timer;
+import pkg::tuple::Tuple;
 
 // === The change structure (A112 S1) ==========================================
 //
@@ -1612,6 +1613,25 @@ export impl type S: Source<type T> with MaybeSignal<T> {
 /// `combine((name, name.map(len)))` mixes kinds freely.
 export fun combine<T: (2..)>(sources: (U in T: dyn Source<U>)): Combine<T> {
 	Combine<T> { sources }
+}
+
+/// The reverse of `combine`: one derived source per position of a tuple-valued
+/// source — `divorce(pair)` over a `Source<(A, B)>` is a pair of sources of `A` and
+/// of `B`, and `divorce(combine((a, b)))` re-derives `a`'s and `b`'s values.
+///
+/// Each output is a cold `map` node reading its own position (`whole.get(key)`,
+/// `std::tuple`), so nothing is evaluated or registered until a leaf reads or
+/// subscribes; `.cell()` an output where it is shared or read hot. Every output
+/// subscribes to the WHOLE source, so each one fires on every change of the
+/// source — including a change to another position, and a `set` that changes
+/// nothing. Where a consumer wants to fire only when ITS position moved, it
+/// gates that output: `divorce(pair).0.distinct()` (A124 Q3 — `.distinct()` is
+/// the node that compares, and it asks `PartialEq` of that one element only).
+///
+/// The source is read once here, for its POSITIONS only: `keys()` needs a value of
+/// the tuple to count them.
+export fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Map<S, T, U>) {
+	source.get().keys().map(|key| source.map(|whole| whole.get(key)))
 }
 
 // === Per-key selection (backlog A44; Solid's `createSelector`) ===============

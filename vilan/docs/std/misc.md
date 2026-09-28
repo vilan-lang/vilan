@@ -2,7 +2,7 @@
 
 The small modules that don't need a page of their own: `std::io`,
 `std::task`, `std::promise`, `std::context`, `std::crypto`, `std::jwt`,
-`std::asset`.
+`std::asset`, `std::tuple`.
 
 ## std::io
 
@@ -419,3 +419,39 @@ The digested file is a tracked build input like a read one, so an edit
 re-mints the url. Listings charge fuel per entry; `digest` charges per
 byte at an eighth of `read`'s rate, since its bytes never enter the
 program and its result is 64 characters whatever the file weighs.
+
+## std::tuple
+
+A tuple you can walk, keyed by position (types.md §5.9). Every tuple of
+arity two or more — concrete, a value of `T: (2..)`, or a mapped tuple over
+one — implements `Tuple`:
+
+```vilan,fragment
+external struct TupleKey<T, U>;   // a position in the family T, at element type U
+
+trait Tuple {
+	fun len(self): usize                                // the arity
+	fun keys(self): (U in Self: TupleKey<Self, U>)      // one key per position
+	fun entries(self): (U in Self: (TupleKey<Self, U>, U))
+	fun get<U>(self, key: TupleKey<Self, U>): U         // the element a key names
+	fun map<F>(self, transform: F): Self                // `(x in t => e)`: see below
+}
+```
+
+A key for `T` reads every tuple MAPPED from `T` too, at the mapped element
+type — the key from `whole.keys()` reads `cells.get(key)` as a
+`SignalCell<U>` when `cells: (V in T: SignalCell<V>)`. Keys come only from
+`keys()`/`entries()`; the type is opaque, so a key always names a position
+its family has.
+
+`map` is the comprehension spelled as a call: `t.map(|x| e)` IS `(x in t =>
+e)`. It takes a closure literal — its body is checked once, with `x` at the
+element template — and answers the tuple of the body's type per position;
+its signature above is a placeholder the compiler does not read. A `for`
+over `entries()` binds each `(key, value)` the same way:
+
+```vilan,fragment
+for (key, value) in fresh.entries() {
+	cells.get(key).set(value);   // key: TupleKey<T, U>, value: U
+}
+```

@@ -373,6 +373,7 @@ std/misc.md h2 stdcrypto
 std/misc.md h2 stdjwt
 std/misc.md h2 stdasset
 std/misc.md h3 bundling-a-whole-estate
+std/misc.md h2 stdtuple
 std/net.md h1 networking-reference
 std/net.md h2 stdfetch
 std/net.md h2 stdws
@@ -417,6 +418,7 @@ std/reactive.md h2 selector--per-key-selection
 std/reactive.md h2 writing-a-signal
 std/reactive.md h2 maybesignal
 std/reactive.md h2 combine
+std/reactive.md h2 divorce
 std/reactive.md h2 subscription-disposable
 std/reactive.md h2 owner
 std/reactive.md h2 turns

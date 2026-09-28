@@ -231,33 +231,33 @@ function $i(sources, $j) {
 	});
 	return derived;
 }
-function $H(self, $q) {
-	const $I = $q;
-	let $J = null;
-	if ($I[0] === 0) {
-		const turn = $I[1];
-		$J = enqueue(turn, self[1].v);
+function $I(self, $q) {
+	const $J = $q;
+	let $K = null;
+	if ($J[0] === 0) {
+		const turn = $J[1];
+		$K = enqueue(turn, self[1].v);
 	} else {
-		const $K = $v(draining_turns.v);
-		let $L = null;
-		if ($K[0] === 0) {
-			const draining = $K[1];
-			$L = enqueue(draining, self[1].v);
+		const $L = $v(draining_turns.v);
+		let $M = null;
+		if ($L[0] === 0) {
+			const draining = $L[1];
+			$M = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$L = undefined;
+			$M = undefined;
 		}
-		$J = $L;
+		$K = $M;
 	}
-	return $J;
+	return $K;
 }
-function $G(self, value, $o) {
+function $H(self, value, $o) {
 	self[0].v = __clone(value);
-	$H(self, $o);
+	$I(self, $o);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -274,6 +274,6 @@ const count = $e(20);
 const name = $g("hi");
 const both = $i([ __clone(count), name ], [ 1 ]);
 console.log($k(both)[0]);
-$G(count, 21, [ 1 ]);
+$H(count, 21, [ 1 ]);
 console.log($k(both)[0]);
 console.log($k(both)[1]);

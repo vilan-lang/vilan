@@ -1008,10 +1008,12 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
                     self.value_bodies(*element, bodies, seen);
                 }
             }
-            Expr::TupleComprehension(first, second, third) => {
-                self.value_bodies(*first, bodies, seen);
-                self.value_bodies(*second, bodies, seen);
-                self.value_bodies(*third, bodies, seen);
+            Expr::TupleComprehension(bindings, body) => {
+                for (binder, source) in bindings {
+                    self.value_bodies(*binder, bodies, seen);
+                    self.value_bodies(*source, bodies, seen);
+                }
+                self.value_bodies(*body, bodies, seen);
             }
             Expr::StructInitializer(_struct_id, fields) => {
                 for value in fields.values() {

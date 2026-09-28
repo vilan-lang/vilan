@@ -349,17 +349,15 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             Node::Lift(seal_boxed(subject), seal_boxed(continuation))
         }
         Node::Is(subject, pattern) => Node::Is(seal_boxed(subject), pattern),
-        Node::TupleComprehension {
-            binder,
-            binder_span,
-            source,
-            body,
-        } => Node::TupleComprehension {
-            binder,
-            binder_span,
-            source: seal_boxed(source),
-            body: seal_boxed(body),
-        },
+        Node::TupleComprehension { mut bindings, body } => {
+            for binding in &mut bindings {
+                take_and_seal(&mut binding.source);
+            }
+            Node::TupleComprehension {
+                bindings,
+                body: seal_boxed(body),
+            }
+        }
         // Everything else either cannot contain an expression (leaves,
         // types, declarations without expression positions) or is a position
         // v1 does not lift in — the mark survives and the walk reports it.

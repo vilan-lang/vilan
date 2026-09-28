@@ -33,6 +33,15 @@ pub struct TupleBound<'src> {
 
 pub type GenericArguments<'src> = Spanned<Vec<Spanned<Node<'src>>>>;
 
+// One `binder in source` of a tuple comprehension — the first of its bindings,
+// or one more that ZIPS with it (B183: `(a in aa, b in bb => e)`).
+#[derive(Debug)]
+pub struct ComprehensionBinding<'src> {
+    pub binder: &'src str,
+    pub binder_span: Span,
+    pub source: Spanned<Node<'src>>,
+}
+
 // How an `external` function is bound to the host (JS): a `[extern(..)]`
 // attribute selects the form. The receiver of a method/property is the
 // function's first parameter.
@@ -669,12 +678,12 @@ pub enum Node<'src> {
         source: Box<Spanned<Node<'src>>>,
         template: Box<Spanned<Node<'src>>>,
     },
-    // A tuple comprehension `(x in xs = e)`: build a tuple by evaluating the body
-    // `e` for each element of the source tuple `xs`, with the element bound as `x`.
+    // A tuple comprehension `(x in xs => e)`: build a tuple by evaluating the
+    // body `e` for each element of the source tuple `xs`, with the element bound
+    // as `x`. Two or more bindings ZIP (B183): `(a in aa, b in bb => e)` walks
+    // one family's positions in step, binding each source's element there.
     TupleComprehension {
-        binder: &'src str,
-        binder_span: Span,
-        source: Box<Spanned<Node<'src>>>,
+        bindings: Vec<ComprehensionBinding<'src>>,
         body: Box<Spanned<Node<'src>>>,
     },
     // A `css { … }` block (proposal/css-block.md) — CSS-shaped sugar over the
@@ -1231,8 +1240,10 @@ impl<'src> Node<'src> {
                 visit(source);
                 visit(template);
             }
-            Node::TupleComprehension { source, body, .. } => {
-                visit(source);
+            Node::TupleComprehension { bindings, body } => {
+                for binding in bindings {
+                    visit(&binding.source);
+                }
                 visit(body);
             }
             Node::Enum(_, generic_parameters, _resource, variants, _) => {

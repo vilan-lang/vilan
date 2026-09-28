@@ -57,11 +57,12 @@ use std::cell::Cell;
 
 use crate::lexing;
 use crate::node::{
-    ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
-    CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExportScope,
-    Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
-    ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels, Labels, MatchLeg, Node,
-    NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField, TupleBound,
+    ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, ComprehensionBinding, Convention,
+    CssBody, CssDeclaration, CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem,
+    EnumVariant, ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
+    GenericParameters, If, ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels,
+    Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField,
+    TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -7714,24 +7715,34 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `(binder in source => body)` — a tuple comprehension. The `in` distinguishes
     /// it from a tuple/group atom (and the `=>` from the mapped *type* `(U in T:
     /// F)`); `source` is a secondary expression, `body` a full expression.
-    /// Backtracks when the `(binder in` shape is absent.
+    /// Further `, binder in source` bindings ZIP with the first (B183): `(a in
+    /// aa, b in bb => a + b)`. Backtracks when the `(binder in` shape is absent.
     fn parse_tuple_comprehension(&mut self) -> Option<Spanned<Node<'src>>> {
         self.attempt(|parser| {
             let start = parser.position;
             parser.expect_ctrl('(')?;
-            let binder_start = parser.position;
-            let binder = parser.eat_ident()?;
-            let binder_span = parser.span_from(binder_start);
-            parser.expect(&Token::In)?;
-            let source = parser.parse_secondary(false)?;
+            let mut bindings = Vec::new();
+            loop {
+                let binder_start = parser.position;
+                let binder = parser.eat_ident()?;
+                let binder_span = parser.span_from(binder_start);
+                parser.expect(&Token::In)?;
+                let source = parser.parse_secondary(false)?;
+                bindings.push(ComprehensionBinding {
+                    binder,
+                    binder_span,
+                    source,
+                });
+                if !parser.eat_ctrl(',') {
+                    break;
+                }
+            }
             parser.expect_op("=>")?;
             let body = parser.parse_expression()?;
             parser.expect_ctrl(')')?;
             Some((
                 Node::TupleComprehension {
-                    binder,
-                    binder_span,
-                    source: Box::new(source),
+                    bindings,
                     body: Box::new(body),
                 },
                 parser.span_from(start),
@@ -9471,7 +9482,7 @@ mod tests {
     fn tuple_comprehension_atom_parses() {
         // `(x in xs => e)` — the deferred S2 atom, now live.
         match &expr("(x in items => x + 1)").0 {
-            Node::TupleComprehension { binder, .. } => assert_eq!(*binder, "x"),
+            Node::TupleComprehension { bindings, .. } => assert_eq!(bindings[0].binder, "x"),
             other => panic!("expected TupleComprehension, got {other:?}"),
         }
         // The `in` is what forks it from a group / tuple — `(a + b)` still dissolves.
