@@ -8753,12 +8753,15 @@ pub(crate) mod tests {
     /// `crates/vilan-lsp/../..`), the server pins resolve std through
     /// `discover_std_dir`, which for a document under the temp directory is the
     /// MATERIALIZED embedded std (`~/.vilan/std-cache/<hash>`). The two are
-    /// byte-identical, and the base-cache key carries no std root, so both
-    /// analyses file under one key; a checks record written from one root's
+    /// byte-identical, and the base-cache key carried no std root, so both
+    /// analyses filed under one key; a checks record written from one root's
     /// world was read on a hit of the other's. Measured, not inferred: the
     /// panic's two fingerprints are exactly those of `sources[1..]` for
     /// `import std::io::print` under the tree std (5909227631414359650) and
-    /// under the materialized std (3214450399013780599).
+    /// under the materialized std (3214450399013780599). B422 put the std
+    /// roots in the key (`BaseCacheKey::std_roots`), so the two roots are two
+    /// worlds and two records;
+    /// `b422_two_byte_identical_std_roots_are_two_base_worlds` pins it.
     pub(crate) static BASE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Takes [`BASE_CACHE_LOCK`], recovering from a poisoned one: a pin that
@@ -8902,6 +8905,78 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&entry).unwrap();
         let document = Document::analyze(&text, &std_root(), &entry);
         (dir, document)
+    }
+
+    /// Copies the directory tree `from` into `to` (created), files only.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the copy's directory");
+        for entry in std::fs::read_dir(from).expect("read a std directory") {
+            let entry = entry.expect("a directory entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("a file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy a std file");
+            }
+        }
+    }
+
+    /// B422: two BYTE-IDENTICAL std roots are two base worlds. The base-cache
+    /// key carried no std root, so the tree's std (`std_root()`, what an open
+    /// file inside a checkout analyzes against) and a second copy of the same
+    /// bytes (the materialized `~/.vilan/std-cache/<hash>` std, what a file
+    /// OUTSIDE a checkout gets) filed under one key: the second analysis was
+    /// served the first root's world — its std modules at the first root's
+    /// paths — and M19's replay record, written from one root's `sources`,
+    /// was read on a hit of the other's, which is the hard assertion N131
+    /// measured firing in-suite ("the world's `sources` vector moved"). One
+    /// LSP session with documents inside and outside a checkout is exactly
+    /// this shape.
+    #[test]
+    fn b422_two_byte_identical_std_roots_are_two_base_worlds() {
+        let _guard = base_cache_guard();
+        let scratch = std::env::temp_dir().join(format!("vilan_lsp_b422_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let copy = scratch.join("std");
+        copy_tree(&std_root(), &copy);
+        let copy_canonical = vilan_core::util::canonical_path(&copy);
+        let text = "import std::io::print;\nfun main() { print(1); }\n";
+        let (tree_sources, copy_sources) = on_big_stack({
+            let copy = copy.clone();
+            move || {
+                let std_sources = |document: &Document| -> Vec<PathBuf> {
+                    let program = document.program.as_ref().expect("an analyzed program");
+                    program.sources[1..]
+                        .iter()
+                        .map(vilan_core::util::canonical_path)
+                        .collect()
+                };
+                // The tree's root first, then the copy — twice each, so the
+                // second pass of each is a hit on its OWN world.
+                let tree = Document::analyze(text, &std_root(), Path::new("b422.vl"));
+                let copied = Document::analyze(text, &copy, Path::new("b422.vl"));
+                let _ = Document::analyze(text, &std_root(), Path::new("b422.vl"));
+                let copied_again = Document::analyze(text, &copy, Path::new("b422.vl"));
+                assert_eq!(std_sources(&copied), std_sources(&copied_again));
+                (std_sources(&tree), std_sources(&copied))
+            }
+        });
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(!copy_sources.is_empty(), "the program loads std modules");
+        for source in &copy_sources {
+            assert!(
+                source.starts_with(&copy_canonical),
+                "an analysis against the copy must read the copy's std, not the tree's: {}",
+                source.display()
+            );
+        }
+        for source in &tree_sources {
+            assert!(
+                !source.starts_with(&copy_canonical),
+                "and the tree's analysis reads the tree's: {}",
+                source.display()
+            );
+        }
     }
 
     /// M27's `source_lookup` is a BINARY SEARCH standing in for

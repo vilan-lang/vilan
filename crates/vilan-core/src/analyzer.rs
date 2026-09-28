@@ -58254,6 +58254,17 @@ fn interned_display_name(name: String) -> &'static str {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BaseCacheKey {
     platform: Platform,
+    /// B422: the std package's ROOTS, canonical — its base root, then each
+    /// layer's, in the spec's order. A world's std modules are loaded FROM
+    /// these paths (its `sources` name them), so two roots are two worlds even
+    /// when their bytes agree: the tree's std and the materialized
+    /// `~/.vilan/std-cache/<hash>` copy are byte-identical, and without this
+    /// field an analysis against one was served the other's world — its std
+    /// at the wrong paths, and M19's replay record (keyed by this same key)
+    /// read against a `sources` vector it was not written from, which is the
+    /// hard assertion N131 measured firing in one process. One LSP session
+    /// with a document inside a checkout and one outside is that process.
+    std_roots: Vec<PathBuf>,
     /// The entry's sorted, deduped `std::` reference names.
     std_seeds: Vec<String>,
     /// The workspace, rendered: one row per dependency package (its roots,
@@ -60360,14 +60371,19 @@ fn analyze_inner<'src>(
                     .module_path()
                     .is_some_and(|path| path.starts_with("pkg::"))))
         .then(|| crate::util::canonical_path(entry_path));
+    // The std package's roots, canonical — the key's (B422) and the
+    // inside-std test's one reading of them.
+    let std_package_roots: Vec<PathBuf> = std::iter::once(&std.base_root)
+        .chain(std.layers.iter().map(|layer| &layer.root))
+        .map(crate::util::canonical_path)
+        .collect();
     let entry_is_inside_std = {
         let pkg_root_canonical = crate::util::canonical_path(pkg_root);
-        std::iter::once(&std.base_root)
-            .chain(std.layers.iter().map(|layer| &layer.root))
-            .any(|root| crate::util::canonical_path(root) == pkg_root_canonical)
+        std_package_roots.contains(&pkg_root_canonical)
     };
     let base_cache_key = BaseCacheKey {
         platform,
+        std_roots: std_package_roots,
         std_seeds: entry_seed_names,
         workspace: workspace_fingerprint(workspace, &entry_dependency_seeds),
         macro_limits: (workspace.macro_limits.fuel, workspace.macro_limits.depth),
