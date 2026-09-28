@@ -582,6 +582,62 @@ fn e222_the_override_fires_before_the_configurations_own_set() {
     );
 }
 
+// --- E214: the two halves, pinned where each lives ---------------------------
+//
+// With the override installed, a `>` typed onto one it placed steps over it:
+// that is the map's behaviour (`closers.ts`), run as keystrokes by `npm test`
+// (`src/test/closers.test.ts`, `List<i32>` typed by hand stays `List<i32>`),
+// which `the_extensions_own_tests_pass` gates. With the setting OFF the
+// override is absent and the server's `onTypeFormatting` places the `>` again:
+// the chain below, whose server end is `vilan-lsp`'s
+// `a_client_that_closes_generics_itself_gets_no_on_type_edit` (the edit comes
+// back when `autoClosing.generics` is declared false) and
+// `the_on_type_trigger_is_the_generic_open`.
+
+/// The map the override steps over with is `closers.ts`'s, the module the
+/// keystroke tests run.
+#[test]
+fn e214_the_override_steps_over_with_the_tested_map() {
+    let source = extension_source();
+    assert!(source.contains("import { PlacedClosers } from './closers';"));
+    assert!(source.contains("const placedClosers = new PlacedClosers();"));
+    assert!(source.contains(
+        "if (!placedClosers.typeOver(document.uri.toString(), document.offsetAt(caret), following)) {"
+    ));
+    assert!(
+        source.contains("placedClosers.place(document.uri.toString(), document.offsetAt(caret));")
+    );
+    assert!(
+        source.contains(
+            "placedClosers.track(changed.document.uri.toString(), changed.contentChanges);"
+        )
+    );
+}
+
+/// `vilan.autoClosing.generics: false` leaves `onTypeFormatting` in charge:
+/// the override is removed (and its closers forgotten), the server is told
+/// the INSTALLED state — not the setting — live, and VS Code asks
+/// `onTypeFormatting` in vilan files because the extension defaults
+/// `editor.formatOnType` on there.
+#[test]
+fn e214_the_setting_off_leaves_on_type_formatting_in_charge() {
+    let source = extension_source();
+    assert!(source.contains("autoClosing: { generics: typeOverride !== undefined },"));
+    assert!(source.contains(
+        "if (!wanted && typeOverride !== undefined) {\n        typeOverride.dispose();\n        typeOverride = undefined;\n        placedClosers.clear();"
+    ));
+    assert!(
+        source.contains("event.affectsConfiguration('vilan.autoClosing') && syncTypeOverride()")
+    );
+    assert!(source.contains("settings: { vilan: readFeatureConfig() },"));
+    assert_eq!(
+        manifest_field("contributes.configurationDefaults['[vilan]']['editor.formatOnType']"),
+        "true",
+        "without formatOnType VS Code never asks the server, and the setting's off \
+         position would place no `>` at all"
+    );
+}
+
 // --- F27 R1/R6: the platform status line --------------------------------------
 
 /// The status bar says which platform the active vilan file is analyzed under

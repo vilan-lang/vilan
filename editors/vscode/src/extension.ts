@@ -23,6 +23,7 @@ import {
     TextEditor,
     Uri,
 } from 'vscode';
+import { PlacedClosers } from './closers';
 import { versionGap } from './versions';
 import {
     DidChangeConfigurationNotification,
@@ -276,10 +277,10 @@ let typeOverride: Disposable | undefined;
 /// characters typed after it, so they land after its `>` rather than before.
 let typing: Promise<void> = Promise.resolve();
 
-/// The `>`s this override placed and may type over, as document offsets per URI.
-/// Kept current through every edit, and forgotten once the caret leaves their
+/// The `>`s this override placed and may type over (`closers.ts`, E214's pins):
+/// kept current through every edit, and forgotten once the caret leaves their
 /// line — VS Code's own overtype forgets an auto-closed character the same way.
-const placedClosers = new Map<string, number[]>();
+const placedClosers = new PlacedClosers();
 
 /// Install or remove the override to match `vilan.autoClosing.generics`.
 /// Returns whether the installed state changed, which is when the server must
@@ -341,15 +342,9 @@ async function typeOne(args: { text: string }): Promise<void> {
 /// A `>` typed onto one this override placed: move past it, insert nothing.
 function typeOverClosing(editor: TextEditor): boolean {
     const document = editor.document;
-    const closers = placedClosers.get(document.uri.toString());
     const caret = editor.selection.active;
-    const offset = document.offsetAt(caret);
-    const index = closers?.indexOf(offset) ?? -1;
-    if (closers === undefined || index < 0) {
-        return false;
-    }
-    closers.splice(index, 1);
-    if (document.getText(new Range(caret, caret.translate(0, 1))) !== '>') {
+    const following = document.getText(new Range(caret, caret.translate(0, 1)));
+    if (!placedClosers.typeOver(document.uri.toString(), document.offsetAt(caret), following)) {
         return false;
     }
     const past = caret.translate(0, 1);
@@ -403,10 +398,7 @@ async function closeGenericList(editor: TextEditor): Promise<void> {
         return;
     }
     editor.selection = new Selection(caret, caret);
-    const key = document.uri.toString();
-    const closers = placedClosers.get(key) ?? [];
-    closers.push(document.offsetAt(caret));
-    placedClosers.set(key, closers);
+    placedClosers.place(document.uri.toString(), document.offsetAt(caret));
 }
 
 // --- F27 R1/R6: the platform a file is analyzed under -------------------------
@@ -483,42 +475,17 @@ function schedulePlatformRefresh(): void {
 /// Keep every placed `>` at its character through edits; one an edit replaces
 /// is gone.
 function trackClosers(changed: TextDocumentChangeEvent): void {
-    const key = changed.document.uri.toString();
-    const closers = placedClosers.get(key);
-    if (closers === undefined) {
-        return;
-    }
-    for (const change of changed.contentChanges) {
-        const start = change.rangeOffset;
-        const end = start + change.rangeLength;
-        const delta = change.text.length - change.rangeLength;
-        for (let index = closers.length - 1; index >= 0; index--) {
-            if (closers[index] >= end) {
-                closers[index] += delta;
-            } else if (closers[index] >= start) {
-                closers.splice(index, 1);
-            }
-        }
-    }
-    if (closers.length === 0) {
-        placedClosers.delete(key);
-    }
+    placedClosers.track(changed.document.uri.toString(), changed.contentChanges);
 }
 
 /// Forget the placed `>`s once the caret leaves their line.
 function forgetDistantClosers(editor: TextEditor): void {
-    const key = editor.document.uri.toString();
-    const closers = placedClosers.get(key);
-    if (closers === undefined) {
-        return;
-    }
-    const line = editor.selection.active.line;
-    const kept = closers.filter((offset) => editor.document.positionAt(offset).line === line);
-    if (kept.length === 0) {
-        placedClosers.delete(key);
-    } else {
-        placedClosers.set(key, kept);
-    }
+    const document = editor.document;
+    placedClosers.keepLine(
+        document.uri.toString(),
+        editor.selection.active.line,
+        (offset) => document.positionAt(offset).line,
+    );
 }
 
 // --- E229: one version on both halves ---------------------------------------
@@ -752,7 +719,7 @@ export function activate(context: ExtensionContext): void {
         workspace.onDidChangeTextDocument(trackClosers),
         window.onDidChangeTextEditorSelection((event) => forgetDistantClosers(event.textEditor)),
         workspace.onDidCloseTextDocument((document) =>
-            placedClosers.delete(document.uri.toString()),
+            placedClosers.forget(document.uri.toString()),
         ),
     );
 

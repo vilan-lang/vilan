@@ -6480,6 +6480,17 @@ mod generic_pairing_tests {
         );
     }
 
+    /// E214: the server's half of the setting's OFF position — `<` is what
+    /// VS Code sends `onTypeFormatting` for, so with the client's override
+    /// absent the server still places the `>`.
+    #[test]
+    fn the_on_type_trigger_is_the_generic_open() {
+        let on_type = server_capabilities()
+            .document_on_type_formatting_provider
+            .expect("onTypeFormatting is advertised");
+        assert_eq!(on_type.first_trigger_character, "<");
+    }
+
     #[tokio::test]
     async fn the_question_is_the_on_type_rule() {
         let (service, _socket) = backend();
