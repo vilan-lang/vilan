@@ -159,7 +159,8 @@ fun main() {
 		index -= 1;
 	}
 	let past_the_end = store.key_at(99).is_some();
-	let before_the_start = store.key_at(0 - 1).is_some();
+	let zero: usize = 0;
+	let before_the_start = store.key_at(zero - 1).is_some();
 	print(i"key-at-out-of-range {past_the_end}");
 	print(i"key-at-negative {before_the_start}");
 
