@@ -51,8 +51,8 @@ name answers.
 
 Hovering a call to a GENERIC function shows two signatures in one block:
 the declaration as it is written, then the same signature under the
-bindings this call solved — `fun get_or(self, key: K, make: || V): V`
-above `fun get_or(self, key: UserId, make: || SignalCell<Option<User>>):
+bindings this call solved — `fun get_or_insert(self, key: K, make: || V): V`
+above `fun get_or_insert(self, key: UserId, make: || SignalCell<Option<User>>):
 SignalCell<Option<User>>`. A call that substitutes nothing, and a hover on
 the declaration itself, show the one line they always did.
 
