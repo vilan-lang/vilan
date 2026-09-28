@@ -1163,6 +1163,14 @@ fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T>
 A **tuple comprehension** `(x in xs => e)` is the value-level mapping
 form.
 
+A mapped type's binder carries its pack's **element bound**: over `T:
+(2..: PartialEq)`, the `U` of `(U in T: F<U>)` is `PartialEq`, because it
+ranges over exactly the elements the bound constrains — so a
+comprehension body may compare two `U`s, or call what the bound
+provides, and each element dispatches to its own implementation. The
+bound is the pack's alone: a mapped type over a second, unbounded pack
+gets nothing from it.
+
 Tuple bounds are **enforced** at every binding site, alongside trait
 bounds: the bound value must be a tuple, its arity must fall inside the
 declared range (endpoints inclusive), and every element must satisfy the

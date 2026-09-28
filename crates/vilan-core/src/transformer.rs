@@ -7955,9 +7955,15 @@ impl<'src> Transformer<'src> {
                 layout.push((element, source_width, result_is_tuple));
             }
         }
-        if layout
-            .iter()
-            .all(|(_, width, result_is_tuple)| *width == 1 && !*result_is_tuple)
+        // B399: a binder that inherits an ELEMENT bound (`T: (2..:
+        // PartialEq)`) lets the body dispatch through it — `==`, `to_string()`
+        // — and a dispatch is chosen per element type. One shared `.map` body
+        // has no element type to choose by, so a bounded binder always unrolls.
+        let binder_is_bounded = self.program.generic_bounds.contains_key(&binder);
+        if !binder_is_bounded
+            && layout
+                .iter()
+                .all(|(_, width, result_is_tuple)| *width == 1 && !*result_is_tuple)
         {
             return None;
         }

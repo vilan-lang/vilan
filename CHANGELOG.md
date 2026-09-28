@@ -139,6 +139,9 @@ written down.
 <!-- family: miscompile -->
 **A written type argument on a method call fixes the method's own generic before its closure is typed: `built.map<dyn Src>(|element| element)` erases each element into the object, where the list held bare `Root`s behind a `List<dyn Src>` type and JS stopped with `x.get is not a function`.** The free-function path always seeded written type arguments first; the method path took them only when it wired the call, after the closure had typed and bound the generic from its own body. Found beside B435; the native build still refuses a closure body erased to `dyn` at rustc (reported). Tracker B435 (family).
 
+<!-- family: feature -->
+**A tuple pack's ELEMENT bound reaches the binder of every mapped type over it: over `T: (2..: PartialEq)`, `(c in cells => c.get() == c.get())` compiles and each element compares through its own `eq`, where `U` was refused as unbounded.** The bound promises every element of `T` satisfies it, and `U` ranges over exactly those elements, so the binder carries it — for `==`, for a method the bound provides by name (`.eq(..)`, `.to_string()` under `(2..: Display)`), and in every body over the family. A body that dispatches through the bound is emitted UNROLLED, one element type at a time: a shared `.map` body has no element type to choose an implementation by (compared structurally, a `Loose { value = 1, noise = 2 }` whose `eq` ignores `noise` answered `false` against itself; through `Display` it was an internal error). A mapped type over a second, unbounded pack gets nothing from the first's bound. Tracker B399.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

@@ -7330,3 +7330,151 @@ fn e223_a_concrete_tuple_source_keeps_the_plain_refusal() {
         "a type parameter bounded",
     );
 }
+
+// --- B399: the ELEMENT bound of a tuple-family bound (`T: (2..: PartialEq)`)
+// --- reaches the binder `U` of every mapped type over `T` — the bound says
+// --- every element of `T` satisfies it, and `U` ranges over exactly those.
+// --- A body that dispatches through it is emitted unrolled, one element type
+// --- at a time, because a shared `.map` body has no element type to pick an
+// --- implementation by.
+
+/// The item's probe (papers-41 P12), over an element whose `eq` is NOT
+/// structural: `Loose` compares `value` and ignores `noise`, so a structural
+/// `===`/deep compare answers differently from the impl. Red before: ``==` on
+/// `U` needs `U: PartialEq` … `U` is unbounded``.
+#[test]
+fn b399_an_element_bound_reaches_the_comprehension_binder() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::compare::PartialEq;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "struct Loose {\n",
+            "\tvalue: i32,\n",
+            "\tnoise: i32,\n",
+            "}\n",
+            "\n",
+            "impl Loose with PartialEq {\n",
+            "\tfun eq(self, other: Loose): bool {\n",
+            "\t\tself.value == other.value\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun matches<T: (2..: PartialEq)>(cells: (U in T: SignalCell<U>), probe: T): (U in T: bool) {\n",
+            "\t(c in cells => c.get() == c.get())\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (a, b) = matches(\n",
+            "\t\t(SignalCell::new(Loose { value = 1, noise = 2 }), SignalCell::new(3)),\n",
+            "\t\t(Loose { value = 1, noise = 9 }, 3),\n",
+            "\t);\n",
+            "\tprint(i\"{a} {b}\");\n",
+            "}\n",
+        ),
+        "true true\n",
+    );
+}
+
+/// A `Display` element bound: `to_string()` through the bound, over a struct
+/// with its own impl beside an `i32`. Before the unroll rule this reached the
+/// emitter as an unresolved requirement (`internal: a call resolved to
+/// `Display`'s requirement `to_string`, which has no body`) — the shared
+/// `.map` body had no element type to dispatch by.
+#[test]
+fn b399_a_display_element_bound_dispatches_per_element() {
+    let source = concat!(
+        "import std::io::print;\n",
+        "import std::display::Display;\n",
+        "import std::reactive::SignalCell;\n",
+        "\n",
+        "struct Point {\n",
+        "\tx: i32,\n",
+        "\ty: i32,\n",
+        "}\n",
+        "\n",
+        "impl Point with Display {\n",
+        "\tfun to_string(self): str {\n",
+        "\t\ti\"<{self.x},{self.y}>\"\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "fun render<T: (2..: Display)>(cells: (U in T: SignalCell<U>)): (U in T: str) {\n",
+        "\t(c in cells => c.get().to_string())\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet (a, b, c) = render((SignalCell::new(Point { x = 1, y = 2 }), SignalCell::new(7), SignalCell::new(\"s\")));\n",
+        "\tprint(i\"{a} {b} {c}\");\n",
+        "}\n",
+    );
+    assert_compiles_and_runs(source, "<1,2> 7 s\n");
+}
+
+/// A METHOD the bound provides, called by name on a `U` (`.eq(..)`), resolves
+/// through the inherited bound exactly as `==` does.
+#[test]
+fn b399_a_method_of_the_element_bound_resolves_on_the_binder() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::compare::PartialEq;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun steady<T: (2..: PartialEq)>(cells: (U in T: SignalCell<U>)): (U in T: bool) {\n",
+            "\t(c in cells => c.get().eq(c.get()))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (a, b) = steady((SignalCell::new(1), SignalCell::new(\"b\")));\n",
+            "\tprint(i\"{a} {b}\");\n",
+            "}\n",
+        ),
+        "true true\n",
+    );
+}
+
+/// The control papers-41 P12b's first half already held: WITHOUT an element
+/// bound the binder promises nothing, and `==` on it stays refused.
+#[test]
+fn b399_a_pack_without_an_element_bound_still_refuses_the_binder() {
+    assert_fails_with(
+        concat!(
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun steady<T: (2..)>(cells: (U in T: SignalCell<U>)): (U in T: bool) {\n",
+            "\t(c in cells => c.get() == c.get())\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet _pair = steady((SignalCell::new(1), SignalCell::new(\"b\")));\n",
+            "}\n",
+        ),
+        "`U` is unbounded",
+    );
+}
+
+/// The bound belongs to the family it is written on: a mapped type over a
+/// SECOND, unbounded pack `S` gets nothing from `T`'s element bound.
+#[test]
+fn b399_an_element_bound_does_not_reach_another_packs_binder() {
+    assert_fails_with(
+        concat!(
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun steady<T: (2..: PartialEq), S: (2..)>(\n",
+            "\tbounded: (U in T: SignalCell<U>),\n",
+            "\tfree: (U in S: SignalCell<U>),\n",
+            "): (U in S: bool) {\n",
+            "\t(c in free => c.get() == c.get())\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet one = (SignalCell::new(1), SignalCell::new(2));\n",
+            "\tlet _pair = steady(one, (SignalCell::new(1), SignalCell::new(\"b\")));\n",
+            "}\n",
+        ),
+        "`U` is unbounded",
+    );
+}

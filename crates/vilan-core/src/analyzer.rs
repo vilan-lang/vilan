@@ -3745,6 +3745,14 @@ pub struct Analyzer<'src> {
     // (`check_generic_bound_satisfaction`); the element bound's type id is
     // stored unresolved like `generic_bounds` entries.
     tuple_bounds: HashMap<TypeId, TupleBoundRequirement>,
+    // B399: a mapped type's binder (`U` in `(U in T: F<U>)`), keyed by its
+    // constraint id, -> the SOURCE type id it ranges over. A binder is
+    // registered with no bound of its own, but when its source is a parameter
+    // carrying a tuple bound with an ELEMENT bound (`T: (2..: PartialEq)`),
+    // every element `U` stands for satisfies that bound — so the binder has
+    // it. Read at USE time by [`Self::generic_bound_traits`], like
+    // `generic_bounds`' entries, because the source resolves in `build()`.
+    mapped_binder_sources: HashMap<TypeId, TypeId>,
     // For an impl whose subject is a generic application (`impl Option<(type T,
     // type U)>`), the impl body scope -> the subject's type id. Lets `self`'s
     // variant patterns substitute the subject enum's declared parameters for the
@@ -6068,6 +6076,7 @@ impl<'src> Analyzer<'src> {
             defaulted_parameter_types: HashSet::default(),
             defaulted_parameter_mentions: HashMap::default(),
             tuple_bounds: HashMap::default(),
+            mapped_binder_sources: HashMap::default(),
             impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
             implementations_by_member: HashMap::default(),
@@ -30177,6 +30186,10 @@ impl<'src> Analyzer<'src> {
             .generic_bounds
             .get(&constraint_id)
             .cloned()
+            .or_else(|| {
+                self.mapped_binder_element_bound(constraint_id)
+                    .map(|element| vec![element])
+            })
             .unwrap_or_else(|| vec![constraint_id]);
         bound_type_ids
             .iter()
@@ -30185,6 +30198,22 @@ impl<'src> Analyzer<'src> {
                 _ => None,
             })
             .collect()
+    }
+
+    /// B399: the element bound a mapped type's binder inherits from its
+    /// source. `(U in T: F<U>)` over `T: (2..: PartialEq)` ranges `U` over
+    /// `T`'s elements, and the tuple bound promises every one of them is
+    /// `PartialEq` — so `U` is, and `a == b` on two `U`s inside a comprehension
+    /// (or a `for`) over it dispatches through the bound instead of being
+    /// refused as unbounded. Only a source that IS the bounded parameter
+    /// passes its bound on: over a mapped source (`(U in (V in T: G<V>): ..)`)
+    /// `U` ranges over `G<X>`, which the element bound says nothing about.
+    fn mapped_binder_element_bound(&self, binder_id: TypeId) -> Option<TypeId> {
+        let source_id = self.mapped_binder_sources.get(&binder_id)?;
+        let Type::Generic(source_constraint_id) = source_id.get_type(self) else {
+            return None;
+        };
+        self.tuple_bounds.get(&source_constraint_id)?.element_bound
     }
 
     /// Registers a single generic parameter named `name` (bound by the
@@ -34091,6 +34120,7 @@ impl<'src> Analyzer<'src> {
                 // The binder `U` is a synthetic type-level generic; its name span
                 // isn't needed (it isn't a go-to-definition target).
                 let binder_id = self.register_binder(binder, &EMPTY_SPAN, &[], mapping_scope_id);
+                self.mapped_binder_sources.insert(binder_id, source_id);
                 let template_id = self.walk_type_node(template, mapping_scope_id);
                 // Stay symbolic: the source/template ids may be deferred (resolved
                 // only in `build()`), so expansion happens lazily on consumption.
@@ -65449,6 +65479,25 @@ fn analyze_over_world<'src>(
         })
         .map(|(&id, &type_id)| (id, type_id))
         .collect();
+
+    // B399: a mapped binder's inherited ELEMENT bound, written into
+    // `generic_bounds` for the emitters. The analyzer reads it at use time
+    // (`mapped_binder_element_bound`); the transformer reads the one table, and
+    // a bounded binder is what tells it a comprehension's body dispatches per
+    // element — so it is emitted unrolled, never as one shared `.map` body.
+    let inherited_element_bounds: Vec<(TypeId, TypeId)> = analyzer
+        .mapped_binder_sources
+        .keys()
+        .filter(|binder_id| !analyzer.generic_bounds.contains_key(binder_id))
+        .filter_map(|binder_id| {
+            analyzer
+                .mapped_binder_element_bound(*binder_id)
+                .map(|element| (*binder_id, element))
+        })
+        .collect();
+    for (binder_id, element) in inherited_element_bounds {
+        analyzer.generic_bounds.insert(binder_id, vec![element]);
+    }
 
     // B318 S4, the `export impl` ruling (owner, 2026-09-13): `export` on an
     // `impl` means what it means on every other declaration, so an impl block a
