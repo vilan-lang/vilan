@@ -779,21 +779,27 @@ jobs:
         # check and fail at the push.) Each run mints a short-lived installation
         # token instead.
         env:
-          TAP_APP_ID: ${{ secrets.TAP_APP_ID }}
+          TAP_APP_CLIENT_ID: ${{ secrets.TAP_APP_CLIENT_ID }}
           TAP_APP_PRIVATE_KEY: ${{ secrets.TAP_APP_PRIVATE_KEY }}
         run: |
-          if [ -n "$TAP_APP_ID" ] && [ -n "$TAP_APP_PRIVATE_KEY" ]; then
+          if [ -n "$TAP_APP_CLIENT_ID" ] && [ -n "$TAP_APP_PRIVATE_KEY" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Homebrew tap not updated::TAP_APP_ID / TAP_APP_PRIVATE_KEY are not configured, so vilan-lang/homebrew-vilan still points at the previous release. Create a GitHub App with contents read-write installed on vilan-lang/homebrew-vilan and store its id and private key as these secrets. The rest of the release is unaffected."
+            echo "::notice title=Homebrew tap not updated::TAP_APP_CLIENT_ID / TAP_APP_PRIVATE_KEY are not configured, so vilan-lang/homebrew-vilan still points at the previous release. Create a GitHub App with contents read-write installed on vilan-lang/homebrew-vilan and store its CLIENT ID (the App's settings page, not its numeric app id) and private key as these secrets. The rest of the release is unaffected."
           fi
       - name: Mint the tap token
         id: app
         if: steps.brew.outputs.publish == 'true'
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        # v2's `app-id` input is deprecated as of v3.1.0 (2026-04-11) in
+        # favour of `client-id` — the App's CLIENT ID (the `Iv…` string on its
+        # settings page), a different value from the numeric app id L22 used
+        # to pass here. v3.0.0's other breaking change (custom proxy handling
+        # removed, `NODE_USE_ENV_PROXY=1` required beside `HTTP(S)_PROXY`)
+        # does not apply: this runs on a GitHub-hosted runner with no proxy.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.TAP_APP_ID }}
+          client-id: ${{ secrets.TAP_APP_CLIENT_ID }}
           private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
           owner: vilan-lang
           # Scoped to the tap alone: the token this mints can reach nothing

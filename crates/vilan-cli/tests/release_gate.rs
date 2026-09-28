@@ -213,3 +213,59 @@ fn the_formatter_and_clippy_legs_pin_through_the_toolchain_file_on_both_sides() 
         }
     }
 }
+
+/// L22 — the lint a v2 → v3 bump of `actions/create-github-app-token` would
+/// have failed: the action's `app-id` input was deprecated in favour of
+/// `client-id` at v3.1.0, and a bare version bump (Dependabot's own kind of
+/// PR) does not change a step's `with:` block, so the deprecated spelling
+/// would have kept working — with a warning on every release — until a later
+/// major removed it outright, mid-release, after the GitHub Release and npm
+/// publishes were already out.
+///
+/// This does not detect deprecation in general (that needs the action's own
+/// changelog, which is `L22.md`'s "read it online" step, not a fleet lint);
+/// it pins the ONE fact a future bump of this exact action must keep true:
+/// `app-id` is v2's input name and `client-id` is v3's, and the pin comment
+/// says which major is checked out. A PR that bumps the sha to a v3.x tag
+/// without renaming the input reds here instead of at release time.
+#[test]
+fn the_tap_token_mint_step_pairs_its_action_major_with_its_input_name() {
+    let release = workflow("release.yml");
+    let body = job_body(&release, "publish-brew");
+    let mint = body
+        .lines()
+        .skip_while(|line| !line.contains("Mint the tap token"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !mint.is_empty(),
+        "release.yml's publish-brew job has no \"Mint the tap token\" step \
+         any more — this lint has nothing left to check and should be retired \
+         with it"
+    );
+    let pinned_to_v3_or_later = mint
+        .lines()
+        .find(|line| line.contains("actions/create-github-app-token@"))
+        .map(|line| {
+            let comment = line.split('#').nth(1).unwrap_or("").trim();
+            let major: String = comment
+                .trim_start_matches('v')
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            major.parse::<u32>().unwrap_or(0) >= 3
+        })
+        .unwrap_or(false);
+    assert!(
+        pinned_to_v3_or_later,
+        "the mint step's `actions/create-github-app-token` pin has no `# vN.M.P` \
+         comment naming a major of 3 or later — L22's own fix needs it to reason \
+         about which input name is current:\n{mint}"
+    );
+    assert!(
+        mint.contains("client-id:") && !mint.contains("app-id:"),
+        "the mint step is pinned to `actions/create-github-app-token` v3 or later, \
+         which deprecated `app-id` in favour of `client-id` at v3.1.0 (2026-04-11) — \
+         the step still needs to pass `client-id:`, not the old input:\n{mint}"
+    );
+}
