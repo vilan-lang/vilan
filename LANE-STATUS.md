@@ -34,7 +34,7 @@ Worktree: `vilan/.claude/worktrees/hygiene-43`, branch `hygiene-43` off `origin/
   v3+ without carrying `client-id:`. **Owner-owed**: add `TAP_APP_CLIENT_ID` as a repo
   secret (the App's CLIENT ID, not `TAP_APP_ID`'s numeric id) before the next tag.
 - **L18** — NOT BUILT, already done. Verified against
-  `/home/reed/code/vilan-lang/vilan-lang.github.io` (reachable locally): `origin/main`
+  the `vilan-lang.github.io` checkout beside this repo (reachable locally): `origin/main`
   (local main is at the tip) already has commit `fe81d5c` "ci: docs.yml actions SHA-pinned,
   dependabot added (vilan L18)" — both `actions/checkout` calls in `docs.yml` are pinned by
   sha with a version comment, and `.github/dependabot.yml` exists. An OPEN, unmerged

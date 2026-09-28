@@ -106,7 +106,7 @@ Gates: `cargo test -p vilan-cli --test release_gate` (4/4, including the new lin
 
 ### L18 — NOT BUILT, already resolved on the tip
 
-The pages repo (`/home/reed/code/vilan-lang/vilan-lang.github.io`) is reachable locally.
+The pages repo (the `vilan-lang.github.io` checkout beside this repo) is reachable locally.
 `origin/main` — which the local checkout's `main` already sits at — carries commit
 `fe81d5c` ("ci: docs.yml actions SHA-pinned, dependabot added (vilan L18)"): both
 `actions/checkout` calls in `.github/workflows/docs.yml` are pinned by full sha with a
