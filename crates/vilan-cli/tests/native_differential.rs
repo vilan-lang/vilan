@@ -1052,6 +1052,71 @@ const KEYED_CELL_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F44: a closure stored where nothing names its type is the counted
+/// `dyn Fn` its vilan type renders as — including one pushed into the list it
+/// READS.
+///
+/// `Shared::new([])` gives Rust's inference nothing, so the first closure
+/// pushed decided the element type: its own anonymous one. A second closure
+/// was then "a different closure", and a closure that reads the list it is
+/// pushed into was "a cyclic type of infinite size" — the closure's type held
+/// the list that held the closure. Every closure literal is now built AS
+/// `Rc<dyn Fn(..) -> _>`, so the element type is the one the vilan type
+/// names. The three shapes: a self-reading closure beside a second one in a
+/// `Shared<List<..>>`, two closures grown into an empty `List`, and an
+/// `Option` holding a closure that reads the cell holding the option.
+#[test]
+fn a_closure_stored_in_what_it_reads_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_stored_closure.vl"),
+        STORED_CLOSURE_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_stored_closure.vl"),
+        Verdict::Identical,
+        "a closure stored in a collection it reads must build and answer the same on both backends"
+    );
+}
+
+const STORED_CLOSURE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun main() {\n",
+    "\t// A closure pushed into the very list it reads, then a second closure.\n",
+    "\tlet cell: Shared<List<|| usize>> = Shared::new([]);\n",
+    "\tlet same = cell;\n",
+    "\tcell.write().push(|| same.read().len());\n",
+    "\tcell.write().push(|| 40);\n",
+    "\tmut total: usize = 0;\n",
+    "\tfor call in cell.read() {\n",
+    "\t\ttotal += call();\n",
+    "\t}\n",
+    "\tprint(total);\n",
+    "\n",
+    "\t// A plain list of two different closures, built empty and grown.\n",
+    "\tmut steps: List<|i32| i32> = [];\n",
+    "\tsteps.push(|n| n + 1);\n",
+    "\tsteps.push(|n| n * 10);\n",
+    "\tmut value = 1;\n",
+    "\tfor step in steps {\n",
+    "\t\tvalue = step(value);\n",
+    "\t}\n",
+    "\tprint(value);\n",
+    "\n",
+    "\t// An `Option` holding a closure that reads the cell holding the option.\n",
+    "\tlet hook: Shared<Option<|| str>> = Shared::new(None);\n",
+    "\tlet seen = hook;\n",
+    "\thook.write() = Some(|| if seen.read().is_some() { \"set\" } else { \"unset\" });\n",
+    "\tmatch hook.read() {\n",
+    "\t\tSome(let call) => print(call()),\n",
+    "\t\tNone => print(\"none\"),\n",
+    "\t}\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's

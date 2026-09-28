@@ -3295,8 +3295,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn parameter_declaration(&mut self, id: Id, span: Span) -> Result<String, Error> {
+        let (binder, rendered) = self.parameter_parts(id, span)?;
+        Ok(format!("{binder}: {rendered}"))
+    }
+
+    /// A parameter's declaration in its two halves: the BINDER (`mut name`)
+    /// and the Rust TYPE it is received at. The type alone is what a closure's
+    /// `dyn Fn(..)` signature is written from (F44), so it is rendered once, by
+    /// the same rules the declaration uses, and the two cannot disagree.
+    fn parameter_parts(&mut self, id: Id, span: Span) -> Result<(String, String), Error> {
         if self.program.context_hidden_parameters.contains_key(&id) {
-            return self.context_parameter_declaration(id, span);
+            return self.context_parameter_parts(id, span);
         }
         let parameter = self
             .program
@@ -3314,10 +3323,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // is an ordinary parameter here too.
         if parameter.lazy && !self.program.lazy_eager_parameters.contains(&id) {
             let rendered = self.rust_type(parameter.type_id, span)?;
-            return Ok(format!(
-                "{}: vilan_rt::Lazy<{rendered}>",
-                self.binding_name(id)
-            ));
+            return Ok((self.binding_name(id), format!("vilan_rt::Lazy<{rendered}>")));
         }
         // A parameter declared `async |T| U` (J2's `async_values`, which the
         // inference also fills for an unannotated binding that holds one) —
@@ -3347,10 +3353,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Receiving::ByValue => "mut ",
             _ => "",
         };
-        Ok(format!("{binder}{}: {declaration}", self.binding_name(id)))
+        Ok((format!("{binder}{}", self.binding_name(id)), declaration))
     }
 
-    /// A HIDDEN CONTEXT parameter's declaration (J6).
+    /// A HIDDEN CONTEXT parameter's declaration (J6), in
+    /// [`Self::parameter_parts`]' two halves.
     ///
     /// `context::thread_contexts` rewrites every ambient read into a parameter
     /// and every call into one that passes the value — so by the time a program
@@ -3366,9 +3373,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// [`Emitter::context_parameter_type`] decides. The binder is `mut` because
     /// nothing in the IR says whether the plumbing writes it, and an unused
     /// `mut` is in `PRELUDE`'s allow list.
-    fn context_parameter_declaration(&mut self, id: Id, span: Span) -> Result<String, Error> {
+    fn context_parameter_parts(&mut self, id: Id, span: Span) -> Result<(String, String), Error> {
         let rendered = self.context_parameter_type(id, span)?;
-        Ok(format!("mut {}: {rendered}", self.binding_name(id)))
+        Ok((format!("mut {}", self.binding_name(id)), rendered))
     }
 
     /// The native type a context-threaded hidden parameter carries — the
@@ -6144,9 +6151,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return rendered;
         }
         let mut parameters = Vec::new();
+        let mut signature = Vec::new();
         for parameter_id in &closure.parameters {
-            parameters.push(self.parameter_declaration(*parameter_id, span)?);
+            let (binder, rendered) = self.parameter_parts(*parameter_id, span)?;
+            parameters.push(format!("{binder}: {rendered}"));
+            signature.push(rendered);
         }
+        // F44: the literal IS the counted `dyn Fn` every closure type renders
+        // as (F16), from the moment it is built — not an `Rc` of its own
+        // anonymous closure type that coerces only where the position happens
+        // to name the target. Where nothing names it, Rust's inference takes
+        // the anonymous type: `Shared::new([])` pushed a closure became a
+        // `Vec<Rc<{closure}>>`, so a second closure was "a different closure"
+        // and one that READ the list it was pushed into was "a cyclic type of
+        // infinite size" (the closure's type contained the list that contained
+        // the closure). The parameter types are the literal's own, so a view
+        // parameter keeps its higher-ranked `&mut`; the return is left to
+        // inference, which the body answers.
+        let as_counted = format!(" as std::rc::Rc<dyn Fn({}) -> _>", signature.join(", "));
         // A `move` closure takes its captures by value, so a captured CELL has
         // to be a handle of its own — otherwise the binding outside is moved
         // into the closure and every later read of it is a use-after-move.
@@ -6249,7 +6271,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let inner =
                 self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
             return Ok(format!(
-                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}) }}",
+                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}){as_counted} }}",
                 parameters.join(", ")
             ));
         }
@@ -6262,7 +6284,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
             let origin = rust_string(self.current_origin.unwrap_or("a floating handler"));
             return Ok(format!(
-                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}) }}",
+                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}){as_counted} }}",
                 parameters.join(", ")
             ));
         }
@@ -6270,7 +6292,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // here whether the position it lands in stores it. `Rc::new` is the
         // shape the probe's R-1 finding forced.
         Ok(format!(
-            "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}) }}",
+            "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}){as_counted} }}",
             parameters.join(", ")
         ))
     }
