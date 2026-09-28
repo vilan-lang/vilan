@@ -7695,3 +7695,31 @@ fn b411_a_switch_shaped_node_reads_its_value_type_from_the_selected_source() {
         "w2!\nw2?\n",
     );
 }
+
+// --- B417: a member named `Self` is refused at its declaration ---------------
+
+#[test]
+fn b417_a_method_named_self_is_refused_where_it_is_declared() {
+    assert_fails_once_with(
+        r#"
+        struct Point { x: i32 }
+        impl Point {
+            fun Self(self): i32 { self.x }
+        }
+        fun main() {}
+        "#,
+        "a function cannot be named `Self`",
+    );
+    // The refusal is the one report: the body still reads the real `Self`, so
+    // `self.x` is not a second, confusing error.
+    assert_fails_without(
+        r#"
+        struct Point { x: i32 }
+        impl Point {
+            fun Self(self): i32 { self.x }
+        }
+        fun main() {}
+        "#,
+        "cannot access field",
+    );
+}

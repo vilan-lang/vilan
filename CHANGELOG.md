@@ -67,6 +67,9 @@ written down.
 <!-- family: fix -->
 **`[derive(Wire)]` on a struct with a field named `deserializer` (or any other name the expansion binds) builds and round-trips, where it stopped with five errors inside the generated `rebuild`.** The expansion bound each field's value to a local spelled like the FIELD, so such a field shadowed the parameter every later read went through. The locals now take the `__` prefix the expansions reserve for their own bindings (the `[service]` expansion's `__request` is the precedent). Two corpus goldens move by that rename alone (`crypto.mjs`, `time.mjs`: `const user = …` is `const __user = …`), runtime-identical. Tracker B416.
 
+<!-- family: diagnostics -->
+**A method named `Self` is refused where it is declared ("a function cannot be named `Self`: `Self` names the type an `impl` or `trait` is about, so `value.Self()` reads as that type and never reaches this member"), where it was accepted and then unreachable — and its declaration shadowed the impl's own `Self`, so the body's `self.x` failed with a confusing "cannot access field 'x' on type unknown".** Tracker B417.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

@@ -31419,7 +31419,25 @@ impl<'src> Analyzer<'src> {
             }
             Node::Func(function) => {
                 let name = function.name.0;
-                self.declare_scope_item(scope_id, name, id);
+                // B417: `Self` names the type an `impl` or `trait` is about, so
+                // a member spelled that way could never be reached — `x.Self()`
+                // parses `Self` as the type — and declaring it shadowed the
+                // type's own `Self` in the body scope (`self.x` lost its type).
+                // Refused at the declaration, and left undeclared so the body
+                // still reads the real `Self`.
+                if name == "Self" {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: function.name.1,
+                        msg: "a function cannot be named `Self`: `Self` names the type an `impl` \
+                              or `trait` is about, so `value.Self()` reads as that type and \
+                              never reaches this member. Give it another name"
+                            .to_string(),
+                    });
+                } else {
+                    self.declare_scope_item(scope_id, name, id);
+                }
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
