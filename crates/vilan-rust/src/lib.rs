@@ -1045,6 +1045,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 });
             }
             Some(Expr::If(branch)) => self.walk_if_liveness(&branch, depth, state),
+            // F46: a LOANED place argument — a `&self` / `&mut self` receiver
+            // above all — is read for as long as the call runs, not at the
+            // moment it is evaluated: the borrow outlives every argument after
+            // it. So it is walked LAST, and a by-value argument that hands the
+            // same binding on (`source.on_settle(pulling(source, observer))`)
+            // is not its last use and copies, where it had moved the binding
+            // out from under the live borrow (rustc: E0505, or E0382 behind
+            // F35's hoist). Only a bare place is deferred: taking one has no
+            // effect of its own, so walking it late changes no evaluation
+            // order — a loaned argument that COMPUTES something keeps its
+            // place, because its reads really happen first.
+            Some(Expr::Call(call_id))
+                if let Some(deferred) = self.loaned_place_arguments(call_id)
+                    && !deferred.is_empty() =>
+            {
+                for child in self.children_of(expr_id) {
+                    if !deferred.contains(&child) {
+                        self.walk_liveness(child, depth, state);
+                    }
+                }
+                for argument in deferred {
+                    self.walk_liveness(argument, depth, state);
+                }
+            }
             Some(Expr::Match(subject, legs)) if legs.iter().all(|leg| leg.guard.is_none()) => {
                 self.walk_liveness(subject, depth, state);
                 let before = state.clone();
@@ -1115,6 +1139,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             None => {}
         }
+    }
+
+    /// The arguments of a call that the callee LOANS (`&`/`&mut`, a plain
+    /// `self` receiver among them) and that are bare places — a binding, a
+    /// field spine over one, or a written `&` of either. `None` when the call's
+    /// callee is not a declaration this emitter can read conventions off (a
+    /// closure value, a variant constructor). See [`Self::walk_liveness`]'s
+    /// call arm (F46).
+    fn loaned_place_arguments(&self, call_id: Id) -> Option<Vec<Id>> {
+        let function_call = self.program.function_calls.get(&call_id)?;
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let function = self.program.functions.get(target)?;
+        let is_a_place = |argument: Id| match self.program.entity_map.get(&argument) {
+            Some(Expr::Reference(inner, _)) => self.place_spine(*inner).is_some(),
+            _ => self.place_spine(argument).is_some(),
+        };
+        Some(
+            function
+                .parameters
+                .iter()
+                .zip(&function_call.argument_ids)
+                .filter(|(parameter_id, argument)| {
+                    self.program
+                        .parameters
+                        .get(*parameter_id)
+                        .is_some_and(|parameter| {
+                            self.receiving_form(parameter) != Receiving::ByValue
+                        })
+                        && is_a_place(**argument)
+                })
+                .map(|(_, argument)| *argument)
+                .collect(),
+        )
     }
 
     /// One `if` / `else if` chain, arm by arm (F37). The condition is read on

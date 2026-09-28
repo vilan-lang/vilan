@@ -1117,6 +1117,94 @@ const STORED_CLOSURE_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F46: an argument that hands the RECEIVER's binding on by value copies it,
+/// because the receiver's loan outlives every argument.
+///
+/// `source.on_settle(pulling(source, observer))` — `std::reactive`'s
+/// `subscribe_pulling`, which reactive-42 wrote as two statements to dodge
+/// this. The last-use pass walked the receiver first, so the argument's read
+/// was the binding's last use and MOVED it while `&source` was live (rustc
+/// E0505; E0382 behind F35's hoist for a `&mut` receiver). A loaned bare
+/// place is now walked after the call's other arguments, so the argument
+/// copies. Four shapes, each the binding's last use: a `&self` method, a
+/// `&mut self` method (F35's hoist), a trait default, and the std shape
+/// through a generic bound.
+#[test]
+fn an_argument_handing_on_the_borrowed_receiver_copies_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_loaned_receiver.vl"),
+        LOANED_RECEIVER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_loaned_receiver.vl"),
+        Verdict::Identical,
+        "an argument moving the borrowed receiver must build and print identically"
+    );
+}
+
+const LOANED_RECEIVER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Counter {\n",
+    "\thits: List<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Counter {\n",
+    "\tfun absorb(self, other: Counter): i32 {\n",
+    "\t\tself.hits.len().as_i32() + other.hits.len().as_i32()\n",
+    "\t}\n",
+    "\n",
+    "\tfun grow(&mut self, other: Counter): i32 {\n",
+    "\t\tself.hits.push(other.hits.len().as_i32());\n",
+    "\t\tself.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun twice(counter: Counter): Counter {\n",
+    "\tmut hits = counter.hits;\n",
+    "\thits.push(0);\n",
+    "\tCounter { hits }\n",
+    "}\n",
+    "\n",
+    "trait Source {\n",
+    "\tfun size(self): i32;\n",
+    "\tfun settle(self, witness: Counter): i32 {\n",
+    "\t\tself.size() * 100 + witness.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Counter with Source {\n",
+    "\tfun size(self): i32 {\n",
+    "\t\tself.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun witness<S: Source>(source: S): Counter {\n",
+    "\tCounter { hits = [source.size(), source.size()] }\n",
+    "}\n",
+    "\n",
+    "// `std::reactive`'s `subscribe_pulling` shape: through a BOUND, the receiver\n",
+    "// is borrowed while the argument hands the same parameter on by value.\n",
+    "fun generic<S: Source>(source: S): i32 {\n",
+    "\tsource.settle(witness(source))\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet counter = Counter { hits = [1, 2] };\n",
+    "\t// The argument MOVES the receiver's binding at its last use, while the\n",
+    "\t// receiver is borrowed for the call.\n",
+    "\tprint(counter.absorb(twice(counter)));\n",
+    "\tmut growing = Counter { hits = [3] };\n",
+    "\tprint(growing.grow(twice(growing)));\n",
+    "\tlet source = Counter { hits = [4, 5, 6] };\n",
+    "\tprint(source.settle(twice(source)));\n",
+    "\tlet again = Counter { hits = [7] };\n",
+    "\tprint(generic(again));\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
