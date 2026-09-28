@@ -3551,7 +3551,21 @@ impl Document {
                 "**`[{word}]`**: {sentence}\n\n[The vilan book →]({BOOK_BASE}{path})"
             ));
         }
-        let lexeme = keyword_lexeme(token)?;
+        // B414: a CONTEXTUAL keyword is an identifier token, and it hovers as
+        // the keyword only where the parser READ it as one — `with` in an
+        // `impl` head, never the method `list.with(..)` (contextual-keywords.md
+        // Q5: the demotion keeps the hover). The raw parse answers even for a
+        // document that does not analyze.
+        let lexeme = match token {
+            vilan_core::token::Token::Ident(word)
+                if vilan_core::lexing::is_contextual_keyword(word)
+                    && vilan_core::parsing::contextual_keyword_readings(self.analyzed_text())
+                        .contains(_span) =>
+            {
+                *word
+            }
+            _ => keyword_lexeme(token)?,
+        };
         let (_, sentence, path) = KEYWORD_DOCS
             .iter()
             .find(|(keyword, _, _)| *keyword == lexeme)?;
@@ -14968,15 +14982,25 @@ pub(crate) mod tests {
     }
 
     // A keyword hovers even on a document that does not compile — the lookup is
-    // purely lexical, ahead of any analysis.
+    // lexical (a contextual keyword's, a raw parse), ahead of any analysis.
     #[test]
     fn hover_on_a_keyword_works_without_a_program() {
-        let text = "fun main() {\n\town\n}\n"; // `own` misused — analysis fails.
+        // `mut` with no binder — analysis fails.
+        let text = "fun main() {\n\tmut\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let offset = text.find("mut").unwrap() + 1;
+        let hover = document
+            .hover(offset)
+            .expect("keyword hover without a program");
+        assert!(hover.contains("Binds a mutable value"), "{hover}");
+        // B414: a contextual keyword in its keyword position hovers from the
+        // raw parse too — `own` on a parameter whose body does not check.
+        let text = "fun take(own list: List<i32>): i32 {\n\t\"no\"\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let offset = text.find("own").unwrap() + 1;
         let hover = document
             .hover(offset)
-            .expect("keyword hover without a program");
+            .expect("contextual keyword hover without a program");
         assert!(hover.contains("moves ownership into the callee"), "{hover}");
         // B413: `resource` is a NAME now, so a bare one is no keyword and
         // hovers no keyword sentence; only the attribute does.
@@ -15003,10 +15027,78 @@ pub(crate) mod tests {
             let (tokens, errors) = tokenize(keyword);
             assert!(errors.is_empty(), "{keyword} lexed with errors: {errors:?}");
             assert_eq!(tokens.len(), 1, "{keyword} should lex to one token");
+            // B414: a contextual keyword is an identifier to the lexer and
+            // documented all the same (its hover rides the raw parse).
+            if vilan_core::lexing::is_contextual_keyword(keyword) {
+                assert_eq!(tokens[0].0, vilan_core::token::Token::Ident(keyword));
+                continue;
+            }
             assert_eq!(
                 keyword_lexeme(&tokens[0].0),
                 Some(*keyword),
                 "{keyword} must classify back to itself"
+            );
+        }
+    }
+
+    /// B414 (contextual-keywords.md Q5): a demoted keyword keeps its hover in
+    /// its KEYWORD position and hovers as nothing of the kind where it is a
+    /// NAME — one file holding both readings of each of the six.
+    #[test]
+    fn b414_a_contextual_keyword_hovers_as_the_keyword_only_where_it_is_one() {
+        let text = concat!(
+            "trait Show { fun show(self): str; }\n",
+            "struct Point { with: i32, own: i32 }\n",
+            "impl Point with Show { fun show(self): str { \"p\" } }\n",
+            "impl Point { fun with(self): i32 { self.with } }\n",
+            "fun take(own list: List<i32>, lazy dyn: i32): i32 { list.len().as_i32() + dyn }\n",
+            "fun pick(xs: &List<i32>): &i32 borrows xs { xs.get(0usize).unwrap() }\n",
+            "fun boxed(value: dyn Show): str { value.show() }\n",
+            "fun main() {\n",
+            "\tlet own = 1;\n",
+            "\tlet borrows = own + 1;\n",
+            "\tlet jump = borrows;\n",
+            "\tfor x in [ 1 ] { if x == jump { jump break; } }\n",
+            "\tlet lazy = Point { with = 1, own = 2 }.with();\n",
+            "}\n",
+        );
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let hover_at = |needle: &str, nth: usize| {
+            let offset = text.match_indices(needle).nth(nth).expect(needle).0;
+            document.hover(offset + 1)
+        };
+        let keyword_hover = |needle: &str, nth: usize| {
+            hover_at(needle, nth)
+                .filter(|hover| hover.starts_with("**`"))
+                .unwrap_or_default()
+        };
+        assert!(keyword_hover("with Show", 0).contains("Names the trait"));
+        assert!(keyword_hover("own list", 0).contains("moves ownership"));
+        assert!(keyword_hover("lazy dyn", 0).contains("Defers"));
+        assert!(keyword_hover("borrows xs", 0).contains("view into"));
+        assert!(keyword_hover("dyn Show", 0).contains("trait OBJECT"));
+        assert!(keyword_hover("jump break", 0).contains("Transfers control"));
+        for (needle, nth) in [
+            ("with: i32", 0),
+            ("own: i32", 0),
+            ("with(self)", 0),
+            ("dyn: i32", 0),
+            ("own = 1", 0),
+            ("borrows = own", 0),
+            ("jump = borrows", 0),
+            ("lazy = Point", 0),
+        ] {
+            let offset = text.match_indices(needle).nth(nth).expect(needle).0;
+            let at_word = &text[offset..];
+            let word = at_word
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .unwrap();
+            assert!(
+                hover_at(needle, nth)
+                    .is_none_or(|hover| !hover.starts_with(&format!("**`{word}`**"))),
+                "`{word}` as a NAME at {needle:?} must not hover as the keyword: {:?}",
+                hover_at(needle, nth)
             );
         }
     }
@@ -18464,6 +18556,11 @@ pub(crate) mod tests {
             let (tokens, errors) = tokenize(keyword);
             assert!(errors.is_empty(), "{keyword} lexed with errors: {errors:?}");
             assert_eq!(tokens.len(), 1, "{keyword} should lex to one token");
+            // B414: the contextual keywords are offered too, and are
+            // identifiers to the lexer.
+            if vilan_core::lexing::is_contextual_keyword(keyword) {
+                continue;
+            }
             assert_eq!(keyword_lexeme(&tokens[0].0), Some(keyword.as_str()));
         }
         assert!(

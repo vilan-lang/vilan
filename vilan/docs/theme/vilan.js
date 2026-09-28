@@ -18,7 +18,7 @@
 	hljs.registerLanguage("vilan", function (hljs) {
 		const KEYWORDS = {
 			// GENERATED(keyword-groups): lexing.rs KEYWORDS split by grammar_sync.rs's KEYWORD_ROLES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-			keyword: "async await borrows const css dyn else enum export external for fun if impl import in is jump lazy let macro match mod mut own ret struct trait type use with",
+			keyword: "async await const css else enum export external for fun if impl import in is let macro match mod mut ret struct trait type use",
 			literal: "true false null void self Self",
 			// END GENERATED(keyword-groups)
 			built_in: "print panic assert",
@@ -101,6 +101,25 @@
 			className: "keyword",
 			begin: "(?<=[A-Za-z0-9_]\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_])",
 		};
+		// B414: the six contextual keywords the lexer demoted, each painted
+		// only where it reads as the keyword. `with` and `borrows` follow a
+		// TYPE (an `impl`/`trait` head, a return type) and precede a name —
+		// guarded on both sides, like `context`. `own`, `lazy`, `dyn` and
+		// `jump` are PREFIXES of a name: the keyword exactly when a name
+		// follows (never `in`/`is`/`as`, which make the word a binder or an
+		// operand). `let own = 1`, `list.with(f)`, `jump.height` stay plain.
+		const CONTEXTUAL_WITH = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_>\\)\\]]\\s{1,8})with\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_(&|])",
+		};
+		const CONTEXTUAL_BORROWS = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_>\\)\\]]\\s{1,8})borrows\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])",
+		};
+		const CONTEXTUAL_OWN = { className: "keyword", begin: "\\bown\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		const CONTEXTUAL_LAZY = { className: "keyword", begin: "\\blazy\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		const CONTEXTUAL_DYN = { className: "keyword", begin: "\\bdyn\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		const CONTEXTUAL_JUMP = { className: "keyword", begin: "\\bjump\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
 		const TYPE = {
 			className: "type",
 			begin: "\\b[A-Z][a-zA-Z0-9_]*",
@@ -157,6 +176,12 @@
 				CONTEXT_CLAUSE,
 				SYNC_MARKER,
 				IMPORT_ALIAS,
+				CONTEXTUAL_WITH,
+				CONTEXTUAL_BORROWS,
+				CONTEXTUAL_OWN,
+				CONTEXTUAL_LAZY,
+				CONTEXTUAL_DYN,
+				CONTEXTUAL_JUMP,
 				ELEMENT_TAG,
 				ELEMENT_EVENT,
 				FUNCTION,

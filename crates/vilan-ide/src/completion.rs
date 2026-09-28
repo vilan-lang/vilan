@@ -210,8 +210,10 @@ const EXPRESSION_TYPE_DEPTH_LIMIT: usize = 8;
 /// same URL as the marketplace listing's and the tap's homepage.)
 pub const BOOK_BASE: &str = "https://vilan-lang.org/docs/";
 
-/// Every keyword the lexer classifies (`token.rs`), each with a one-line
-/// meaning and a deep link into the book: `(keyword, sentence, page#anchor)`.
+/// Every keyword the lexer classifies (`token.rs`), and every CONTEXTUAL
+/// keyword (B414 — `with`, `borrows`, `own`, `dyn`, `lazy`, `jump`, which hover
+/// where the parser read them as keywords), each with a one-line meaning and a
+/// deep link into the book: `(keyword, sentence, page#anchor)`.
 /// Semantics-bearing keywords point at the specification; the rest point where
 /// the book teaches them best. The set is kept in lockstep with the lexer by
 /// [`keyword_lexeme`], whose every keyword arm has an entry here. Every
@@ -449,7 +451,10 @@ const FILE_HEAD_SNIPPET: (&str, &str, &str, &str) = (
 /// The keyword lexeme a token spells, or `None` for non-keyword tokens
 /// (identifiers, literals, operators, punctuation). Exhaustive over `Token`
 /// deliberately: a new keyword variant must be classified here, which forces
-/// the matching [`KEYWORD_DOCS`] entry it needs.
+/// the matching [`KEYWORD_DOCS`] entry it needs. A CONTEXTUAL keyword (B414,
+/// `lexing::CONTEXTUAL_KEYWORDS`) is an identifier token and answers `None`
+/// here — whether a given `with` is the keyword is a question about its
+/// position, which `parsing::contextual_keyword_readings` answers.
 pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
     Some(match token {
         Token::Async => "async",
@@ -469,23 +474,17 @@ pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
         Token::Import => "import",
         Token::In => "in",
         Token::Is => "is",
-        Token::Jump => "jump",
-        Token::Lazy => "lazy",
         Token::Let => "let",
         Token::Macro => "macro",
         Token::Match => "match",
         Token::Mod => "mod",
         Token::Mut => "mut",
         Token::Null => "null",
-        Token::Own => "own",
-        Token::Borrows => "borrows",
         Token::Ret => "ret",
-        Token::Dyn => "dyn",
         Token::Struct => "struct",
         Token::Trait => "trait",
         Token::Type => "type",
         Token::Use => "use",
-        Token::With => "with",
         Token::Ident(_)
         | Token::Ctrl(_)
         // B318 §2.3: `#` is the import reach marker — punctuation, not a
@@ -1591,7 +1590,7 @@ fn head_is_not_an_initializer(token: &Token<'_>) -> bool {
             | Token::Enum
             | Token::Trait
             | Token::Impl
-            | Token::With
+            | Token::Ident("with")
             | Token::If
             | Token::Else
             | Token::Match

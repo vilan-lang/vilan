@@ -3,7 +3,7 @@
  "information_for_contributors": [
   "The word-list halves of this grammar (the keyword, primitive-type, attribute-marker and operator lists) are GENERATED from the compiler's exported tables by crates/vilan-cli/tests/grammar_sync.rs, which byte-gates them on every suite run. Do not hand-edit a generated `match`/`begin` value; change the compiler table (or grammar_sync.rs's role tables) and regenerate:",
   "VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated",
-  "The structural rules (strings, number shapes, elements, generic argument lists, `css` blocks, captures, the contextual `context`/`sync` anchors) are hand-written."
+  "The structural rules (strings, number shapes, elements, generic argument lists, `css` blocks, captures, the contextual-keyword anchors \u2014 `context`, `sync`, `as`, and B414's `with`, `borrows`, `own`, `lazy`, `dyn`, `jump`) are hand-written."
  ],
  "name": "Vilan",
  "scopeName": "source.vilan",
@@ -295,7 +295,7 @@
    "patterns": [
     {
      "name": "keyword.control.vilan",
-     "match": "\\b(if|else|match|for|in|is|jump|ret|await)\\b"
+     "match": "\\b(if|else|match|for|in|is|ret|await)\\b"
     },
     {
      "name": "keyword.control.import.vilan",
@@ -308,12 +308,12 @@
     },
     {
      "name": "storage.modifier.vilan",
-     "match": "\\b(let|mut|own|external|export|async|const|lazy)\\b"
+     "match": "\\b(let|mut|external|export|async|const)\\b"
     },
     {
      "comment": "`with` (trait impl / bound), the `borrows` return clause, and `css` (the head of a `css { … }` block).",
      "name": "keyword.other.vilan",
-     "match": "\\b(dyn|with|borrows|css)\\b"
+     "match": "\\b(css)\\b"
     },
     {
      "comment": "The `context` CLAUSE \u2014 on a closure type (`(|| void) context owner_scope`, multi `context (a, b)`) and on a `fun` DECLARATION, where it sits after the RETURN type (`fun f(): i32 context settings`, contexts.md \u00a73; B343/R9 keeps that position). It is a contextual keyword (a value or module may be NAMED `context`), so it is guarded on BOTH sides: something a type or a parameter list can END with before it, and a NAME or the multi form's `(` after it \u2014 which is what keeps `context.run(..)` and `context.get()` plain.",
@@ -339,6 +339,60 @@
      "captures": {
       "1": {
        "name": "keyword.control.import.vilan"
+      }
+     }
+    },
+    {
+     "comment": "B414: the POSITIONAL contextual keywords `with` (an `impl` or `trait` head's trait list) and `borrows` (a declaration's return clause). Each follows a TYPE and precedes a name, so the guard is both sides, as for `context`: something a type can end with before it, and a name (or a bound's `(`, `&`, `|`) after it \u2014 never `in`/`is`/`as`, which would make it a binder (`for with in xs`). `let with = 1`, `list.with(f)` and `fun with(self)` all fail the guard and stay names.",
+     "match": "(?<=[A-Za-z0-9_>\\)\\]])\\s+(with)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_(&|])",
+     "captures": {
+      "1": {
+       "name": "keyword.other.vilan"
+      }
+     }
+    },
+    {
+     "comment": "B414: `borrows` \u2014 see `with` above; the same two-sided guard.",
+     "match": "(?<=[A-Za-z0-9_>\\)\\]])\\s+(borrows)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "keyword.other.vilan"
+      }
+     }
+    },
+    {
+     "comment": "B414: the PREFIX contextual keywords \u2014 each is the keyword only when a NAME follows it (the parser's LL(2) test: vilan never puts two names side by side), so `own x`, `lazy let`, `dyn Show` and `jump break` paint and `let own = 1`, `own: Owner`, `jump.height` do not. `in`/`is`/`as` after it make it a binder or an operand, never the keyword.",
+     "match": "\\b(own)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "storage.modifier.vilan"
+      }
+     }
+    },
+    {
+     "comment": "B414: `lazy` \u2014 see `own` above.",
+     "match": "\\b(lazy)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "storage.modifier.vilan"
+      }
+     }
+    },
+    {
+     "comment": "B414: `dyn` \u2014 see `own` above; the trait-object marker in type position.",
+     "match": "\\b(dyn)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "keyword.other.vilan"
+      }
+     }
+    },
+    {
+     "comment": "B414: `jump` \u2014 see `own` above; loop control before its target.",
+     "match": "\\b(jump)\\b(?=\\s+(?!i[ns]\\b|as\\b)[A-Za-z_])",
+     "captures": {
+      "1": {
+       "name": "keyword.control.vilan"
       }
      }
     },

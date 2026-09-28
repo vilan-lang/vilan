@@ -26,23 +26,22 @@ thing. If that sounds strange coming from JavaScript, start with
 ## Reserved words
 
 These words are the language's own; none of them can be a binding, a
-parameter, a field or a type name. Most you will meet as you go, but two
-are worth knowing before you hit them: `own` (a parameter that takes
-ownership — see [the memory model](memory-model.md)) and `jump` (the
-prefix on `break` and `continue`), because both are short, ordinary
-English words that make good variable names in every other language.
+parameter, a field or a type name. Most you will meet as you go.
 
 ```text
-async    await    borrows  const    css      dyn      else     enum
-export   external false    for      fun      if       impl     import
-in       is       jump     lazy     let      macro    match    mod
-mut      null     own      ret      struct   trait    true     type
-use      with
+async    await    const    css      else     enum     export   external
+false    for      fun      if       impl     import   in       is
+let      macro    match    mod      mut      null     ret      struct
+trait    true     type     use
 ```
 
-A few more words — `self`, `Self`, `void`, `context`, `sync`, `as`, and
-the attribute names in `[...]` — mean something only in one position and
-are ordinary identifiers everywhere else. Spec
+A few more words mean something only in one position and are ordinary
+identifiers everywhere else: `own` (a parameter that takes ownership —
+see [the memory model](memory-model.md)), `jump` (the prefix on `break`
+and `continue`), `lazy`, `dyn`, `with`, `borrows`, `self`, `Self`, `void`,
+`context`, `sync`, `as`, and the attribute names in `[...]`. So `let own =
+owner();`, a field called `with` and a method called `jump` are all fine,
+beside the keyword readings in the same file. Spec
 [§2.2](../spec/lexical.md#22-identifiers-and-keywords) lists them, and
 [§A.2](../spec/appendix.md#a2-reserved-words) is the table.
 

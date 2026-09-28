@@ -34,17 +34,21 @@ Identifiers are ASCII. The following words are **reserved**; they lex as
 keyword tokens and are never `IDENT`:
 
 ```text
-async     await     borrows  const   css    dyn     else  enum
-export    external  for      fun     if     impl    import in
-is        jump      lazy     let     macro  match   mod   mut
-null      own       ret      struct  trait  type    use   with
-true      false
+async     await     const    css     else    enum    export
+external  for       fun      if      impl    import  in
+is        let       macro    match   mod     mut     null
+ret       struct    trait    type    use     true    false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
 
 **Contextual keywords** lex as `IDENT` and take meaning only by position:
-`context` (the clause after a closure type, §3.9), `sync` (the marker
+`with` (the trait list of an `impl` or `trait` head, §3.3), `borrows` (the
+return clause after a declaration's return type, §3.3), `own` and `lazy`
+(a parameter's prefix when a binder follows it, §3.3; `lazy` also before
+`let`, §3.4), `dyn` (the trait-object marker in type position, §3.9, where
+`dyn::` is a path instead), `jump` (loop control when its target follows,
+§3.4), `context` (the clause after a closure type, §3.9), `sync` (the marker
 opening a closure type, §3.9), `void` (the unit value/type), `self` and
 `Self` (receiver and receiver type; `self` is also the file's own module
 in `mod self;`, §3.1), `as` (the alias on an import path leaf, §3.2),

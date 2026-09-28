@@ -46633,6 +46633,16 @@ impl<'src> Analyzer<'src> {
     /// the SAME name (a layered std twin) keep the steer, genuinely
     /// different modules make it ambiguous and it stays silent.
     fn import_steer(&mut self, name: &str) -> Option<String> {
+        // B414: `jump` is a CONTEXTUAL keyword — the jump only when its target
+        // follows — so a forgotten target reads a name `jump` and misses here.
+        // The miss is the old "expected a jump target" in other words.
+        if name == "jump" {
+            return Some(
+                "; `jump` is loop control and names its target: `jump break;` or \
+                 `jump continue;`"
+                    .to_string(),
+            );
+        }
         if let Some(steer) = self.web_prelude_steer(name) {
             return Some(steer);
         }

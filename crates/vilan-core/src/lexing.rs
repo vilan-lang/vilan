@@ -45,8 +45,10 @@ pub fn tokenize(source: &str) -> (Vec<Spanned<Token<'_>>>, Vec<LexError>) {
     (lexer.tokens, lexer.errors)
 }
 
-/// The keyword table: every identifier spelling the lexer classifies as a keyword
-/// rather than a [`Token::Ident`], with the token it becomes. This is the one
+/// The RESERVED keyword table: every identifier spelling the lexer classifies as
+/// a keyword rather than a [`Token::Ident`], with the token it becomes. The
+/// words that are keywords only by position are [`CONTEXTUAL_KEYWORDS`]; the
+/// two together are the language's keyword table (`crate::keyword_table`). This is the one
 /// source of truth for "what is a keyword" — [`Lexer::read_identifier`] looks its
 /// text up here, and `crates/vilan-cli/tests/grammar_sync.rs` GENERATES the
 /// keyword word lists of the TextMate grammar
@@ -63,7 +65,6 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("await", Token::Await),
     ("const", Token::Const),
     ("css", Token::Css),
-    ("dyn", Token::Dyn),
     ("else", Token::Else),
     ("enum", Token::Enum),
     ("export", Token::Export),
@@ -76,24 +77,101 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("import", Token::Import),
     ("in", Token::In),
     ("is", Token::Is),
-    ("jump", Token::Jump),
-    ("lazy", Token::Lazy),
     ("let", Token::Let),
     ("macro", Token::Macro),
     ("match", Token::Match),
     ("mod", Token::Mod),
     ("mut", Token::Mut),
     ("null", Token::Null),
-    ("own", Token::Own),
-    ("borrows", Token::Borrows),
     ("ret", Token::Ret),
     ("struct", Token::Struct),
     ("trait", Token::Trait),
     ("type", Token::Type),
     ("true", Token::Bool(true)),
     ("use", Token::Use),
-    ("with", Token::With),
 ];
+
+/// The CONTEXTUAL keywords (B414, `proposal/contextual-keywords.md`): words
+/// that read as a keyword at one position and are an ordinary name everywhere
+/// else. The lexer hands every one of them back as [`Token::Ident`] — they are
+/// NOT in [`KEYWORDS`] — and the parser reads each by its text at the position
+/// its keyword reading occupies, with the test named beside it:
+///
+/// - POSITIONAL — the word's reading sits where no name can: `with` after an
+///   `impl` subject or a `trait` head, `borrows` and `context` after a return
+///   type, `only` after an import path, `as` between an import leaf and its
+///   alias, `sync` right after the `(` of a closure type.
+/// - LL(2) — the reading is a PREFIX that is always followed by a name, and
+///   vilan's expression grammar never puts two names side by side, so the
+///   word followed by a name is the keyword and followed by anything else is a
+///   name: `own`/`lazy` at a parameter head, `lazy` before `let`/`mut` at a
+///   statement head, `jump` before its target, `dyn` in type position (where
+///   `dyn::` is a path instead).
+/// - NAMES with a fixed meaning: `self`, `Self`, `void`.
+///
+/// This table and [`KEYWORDS`] together are the ONE keyword table:
+/// `crate::keyword_table` exports both (`vilan --print-keywords` prints
+/// them, the contextual ones flagged — E225, K24), the editor
+/// grammars and the book's highlighter are gated against them by
+/// `grammar_sync.rs`, the EBNF by `grammar_ebnf.rs`, and the lexical spec's
+/// two lists (§2.2) by `docs.rs`. A word moves from [`KEYWORDS`] to here
+/// only by a ruling (the six of B414 did), and each row says where its keyword
+/// reading sits — the sentence the spec and the editor's hover repeat.
+pub const CONTEXTUAL_KEYWORDS: &[(&str, &str)] = &[
+    (
+        "as",
+        "the alias on an import path leaf: `import a::b as c;`",
+    ),
+    (
+        "borrows",
+        "the return clause of a declaration, after its return type: `fun first(xs: &List<T>): &T borrows xs`",
+    ),
+    (
+        "context",
+        "the clause after a closure type or a declaration's return type: `(|| void) context owner`, `fun f(): i32 context settings`",
+    ),
+    (
+        "dyn",
+        "the trait-object marker in type position: `dyn Source<i32>` (`dyn::` is a path)",
+    ),
+    (
+        "jump",
+        "loop control, followed by its target: `jump break`, `jump continue`",
+    ),
+    (
+        "lazy",
+        "deferral, before a binding or a parameter: `lazy let config = load();`, `fun expect(self, lazy message: str)`",
+    ),
+    (
+        "only",
+        "the trailing modifier on an import: `import a::{ b } only;`",
+    ),
+    (
+        "own",
+        "the ownership convention at a parameter head: `fun take(own list: List<i32>)`",
+    ),
+    (
+        "self",
+        "the receiver parameter, and the file's own module in `mod self;`",
+    ),
+    ("Self", "the implementing type inside an `impl` or `trait`"),
+    (
+        "sync",
+        "the marker opening a closure type: `(sync || View)`",
+    ),
+    ("void", "the unit type and value; never a binder's name"),
+    (
+        "with",
+        "the trait list of an `impl` head or a `trait` head: `impl Point with Show`",
+    ),
+];
+
+/// Whether `word` is a contextual keyword (see [`CONTEXTUAL_KEYWORDS`]).
+pub fn is_contextual_keyword(word: &str) -> bool {
+    CONTEXTUAL_KEYWORDS
+        .iter()
+        .any(|(contextual, _)| *contextual == word)
+}
 
 /// The two-character operator table: every character pair [`Lexer::read_operator`]
 /// fuses into one [`Token::Op`] (longest-match; anything else in the operator
@@ -1229,23 +1307,18 @@ mod tests {
             ("import", Token::Import),
             ("in", Token::In),
             ("is", Token::Is),
-            ("jump", Token::Jump),
             ("let", Token::Let),
             ("macro", Token::Macro),
             ("match", Token::Match),
             ("mod", Token::Mod),
             ("mut", Token::Mut),
             ("null", Token::Null),
-            ("own", Token::Own),
-            ("borrows", Token::Borrows),
             ("ret", Token::Ret),
-            ("dyn", Token::Dyn),
             ("struct", Token::Struct),
             ("trait", Token::Trait),
             ("type", Token::Type),
             ("true", Token::Bool(true)),
             ("use", Token::Use),
-            ("with", Token::With),
         ];
         for (text, token) in keywords {
             assert_eq!(lex(text), vec![token], "keyword {text:?}");
@@ -1258,6 +1331,22 @@ mod tests {
         // B413: `resource` is no keyword — the kind is the `[resource]`
         // attribute, and the word is an ordinary name.
         assert_eq!(lex("resource"), vec![Token::Ident("resource")]);
+    }
+
+    /// B414: every contextual keyword lexes as an identifier — the parser reads
+    /// its keyword meaning by position — and no word is in both tables.
+    #[test]
+    fn contextual_keywords_lex_as_identifiers() {
+        for (word, _) in CONTEXTUAL_KEYWORDS {
+            assert_eq!(lex(word), vec![Token::Ident(word)], "contextual {word:?}");
+            assert!(
+                !KEYWORDS.iter().any(|(reserved, _)| reserved == word),
+                "`{word}` is both reserved and contextual"
+            );
+        }
+        for demoted in ["with", "borrows", "own", "dyn", "lazy", "jump"] {
+            assert!(is_contextual_keyword(demoted), "{demoted}");
+        }
     }
 
     // --- Numbers ------------------------------------------------------------

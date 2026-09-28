@@ -57,7 +57,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use vilan_core::lexing::{KEYWORDS, TWO_CHARACTER_OPERATORS, tokenize};
+use vilan_core::lexing::{CONTEXTUAL_KEYWORDS, KEYWORDS, TWO_CHARACTER_OPERATORS, tokenize};
 use vilan_core::parsing::KNOWN_ATTRIBUTE_MARKERS;
 use vilan_core::token::Token;
 use vilan_core::type_::{NUMERIC_SUFFIXES, SCALAR_PRIMITIVE_NAMES};
@@ -66,33 +66,26 @@ const TEXTMATE_GRAMMAR: &str = "editors/vscode/syntaxes/vilan.tmLanguage.json";
 const HIGHLIGHT_THEME: &str = "vilan/docs/theme/vilan.js";
 
 /// Words a grammar may colour as keywords although the lexer hands them back
-/// as identifiers. Each is CONTEXTUAL — a keyword in one position and a plain
-/// name anywhere else — and the grammars match it by position (the TextMate
-/// grammar and `vilan.js` both anchor `context` after what a clause follows —
-/// a closure type's `)`, a parameter list's `)`, or a declaration's RETURN type
-/// — and `sync` after the `(` that opens a closure type). Pinned to lex as
-/// `Token::Ident`: the day one is promoted to a real keyword (a `KEYWORDS`
-/// row), this list must shrink by it.
-const CONTEXTUAL_WORDS: &[(&str, &str)] = &[
-    (
-        "context",
-        "the clause on a closure type or a declaration: `(|| void) context owner`, `fun f(): i32 context settings`",
-    ),
-    (
-        "sync",
-        "the marker opening a closure type: `(sync || View)`",
-    ),
-    (
-        "as",
-        "the alias in an import path: `import a::b as c` (E142)",
-    ),
-    ("self", "the receiver parameter"),
-    ("Self", "the implementing type inside an `impl`"),
-    (
-        "void",
-        "the unit type — `Token::Ident(\"void\")` in type position",
-    ),
-];
+/// as identifiers: the compiler's own contextual-keyword table
+/// (`lexing::CONTEXTUAL_KEYWORDS`, B414 — no second copy here). Each is a
+/// keyword in one position and a plain name anywhere else, and the grammars
+/// match it by position (the TextMate grammar and `vilan.js` both anchor
+/// `context` after what a clause follows and `sync` after the `(` that opens a
+/// closure type; `with`/`borrows` after a type and before a name; `own`,
+/// `lazy`, `dyn`, `jump` before a name). Pinned to lex as `Token::Ident`: the
+/// day one is promoted to a real keyword (a `KEYWORDS` row), the table must
+/// shrink by it.
+const CONTEXTUAL_WORDS: &[(&str, &str)] = CONTEXTUAL_KEYWORDS;
+
+/// Contextual keywords NO grammar colours, with why. The allowance in
+/// [`every_grammar_keyword_is_a_lexer_keyword_or_contextual`] otherwise asks
+/// that each contextual word be coloured somewhere; a word here is exempt, and
+/// the exemption expires the day a grammar starts colouring it.
+const UNPAINTED_CONTEXTUAL_WORDS: &[(&str, &str)] = &[(
+    "only",
+    "the trailing import modifier sits after a path and before `;` — the one shape a \
+     line regex cannot tell from `ret only;`, a value named `only` being returned",
+)];
 
 /// Type names the TextMate grammar colours as primitives that are not
 /// scalar-view primitives: `bool` is the numeric enum `type_.rs` keeps BESIDE
@@ -295,7 +288,9 @@ fn highlight_grammar(probes: &[&str]) -> Grammar {
 
 /// The literal words a regex spells out: every maximal identifier-shaped run
 /// (`[A-Za-z_][A-Za-z0-9_]*`) that is neither an escape (`\b`, `\s`) nor inside
-/// a bracket class (`[A-Z]`). A regex written as a word list — `\b(if|else)\b`,
+/// a bracket class (`[A-Z]`) nor inside a NEGATIVE lookahead (`(?!…)` — the
+/// words a rule refuses to paint after its own, like B414's `(?!i[ns]\b|as\b)`,
+/// are not words it paints). A regex written as a word list — `\b(if|else)\b`,
 /// `(?:derive|service)\b`, `(?<=\))\s+(context)\b` — yields exactly its words;
 /// a shape rule — `\b[A-Z][A-Za-z0-9_]*\b` — yields none.
 fn literal_words(regex: &str) -> Vec<String> {
@@ -306,6 +301,25 @@ fn literal_words(regex: &str) -> Vec<String> {
         match bytes[index] {
             // An escape and the character it escapes.
             b'\\' => index += 2,
+            // A negative lookahead, to its balanced `)`.
+            b'(' if regex[index..].starts_with("(?!") => {
+                let mut depth = 0usize;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index += 1,
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
             // A bracket class, escapes inside it included.
             b'[' => {
                 index += 1;
@@ -430,9 +444,18 @@ fn every_grammar_keyword_is_a_lexer_keyword_or_contextual() {
             vec![&Token::Ident(word)],
             "`{word}` ({role}) is listed as contextual but the lexer now classifies it — move it to the keyword check"
         );
+        let painted = textmate.contains(*word) || highlight.contains(*word);
+        let exempt = UNPAINTED_CONTEXTUAL_WORDS
+            .iter()
+            .any(|(unpainted, _)| unpainted == word);
         assert!(
-            textmate.contains(*word) || highlight.contains(*word),
-            "`{word}` ({role}) is allowed as contextual but no grammar colours it any more — drop it from CONTEXTUAL_WORDS"
+            painted || exempt,
+            "`{word}` ({role}) is a contextual keyword no grammar colours — add a positional rule \
+             to both grammars, or record why not in UNPAINTED_CONTEXTUAL_WORDS"
+        );
+        assert!(
+            !(painted && exempt),
+            "`{word}` is coloured by a grammar now — drop it from UNPAINTED_CONTEXTUAL_WORDS"
         );
     }
 }
@@ -608,6 +631,105 @@ fn the_context_clause_is_coloured_by_position_in_both_grammars() {
             "{file}: {:?} colours `context` where it is an ordinary name ({NOT_CLAUSES:?})",
             rule.regex,
         );
+    }
+}
+
+/// B414 — the six demoted keywords colour as keywords in BOTH grammars exactly
+/// where the parser reads them as keywords, and stay names everywhere else
+/// (contextual-keywords.md §6's painting rule, run the way the editor and the
+/// book run it).
+#[test]
+fn b414_the_contextual_keywords_are_coloured_by_position_in_both_grammars() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "with",
+            &[
+                "impl Point with Show {",
+                "impl Option<type T> with Show + Debug {",
+                "trait Ordered with Equal {",
+                "impl type T: (2..) with Tuple {",
+            ],
+            &[
+                "let with = 1;",
+                "list.with(|xs| xs)",
+                "fun with(self): i32 {",
+                "for with in withs {",
+                "let x = with;",
+                "struct S { with: i32 }",
+            ],
+        ),
+        (
+            "borrows",
+            &[
+                "fun first(xs: &List<T>): &T borrows xs {",
+                "fun f(): (|| void) borrows x context c {",
+            ],
+            &["let borrows = 1;", "x.borrows()", "fun borrows(self) {"],
+        ),
+        (
+            "own",
+            &[
+                "fun take(own list: List<i32>)",
+                "|own item| item",
+                "own mut x: T",
+            ],
+            &[
+                "let own = 1;",
+                "fun f(own: Owner)",
+                "|own| own.dispose()",
+                "fun own(self)",
+                "for own in owners {",
+                "x.own",
+            ],
+        ),
+        (
+            "lazy",
+            &[
+                "lazy let config = load();",
+                "fun expect(self, lazy message: str)",
+            ],
+            &[
+                "let lazy = 1;",
+                "lazy.force()",
+                "lazy = 3;",
+                "if lazy is Some(x) {",
+            ],
+        ),
+        (
+            "dyn",
+            &["let s: dyn Show = x;", "List<dyn Source<i32>>"],
+            &[
+                "let dyn = 1;",
+                "dyn::Registry::new()",
+                "x.dyn()",
+                "fun dyn(self)",
+            ],
+        ),
+        (
+            "jump",
+            &["jump break;", "jump continue;"],
+            &["let jump = 1;", "jump.height", "fun jump(self)", "jump;"],
+        ),
+    ];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        for (word, keywords, names) in cases {
+            let rule = contextual_rule(&grammar, key, word);
+            assert_eq!(
+                regex_matches(&rule.regex, keywords),
+                vec![true; keywords.len()],
+                "{file}: {:?} misses `{word}` in a keyword position among {keywords:?}",
+                rule.regex,
+            );
+            assert_eq!(
+                regex_matches(&rule.regex, names),
+                vec![false; names.len()],
+                "{file}: {:?} colours `{word}` where it is an ordinary name ({names:?})",
+                rule.regex,
+            );
+        }
     }
 }
 
@@ -906,7 +1028,8 @@ enum KeywordRole {
     Declaration,
     /// `storage.modifier.vilan`; `keyword`.
     Modifier,
-    /// `with` and the `borrows` clause — `keyword.other.vilan`; `keyword`.
+    /// `css` — `keyword.other.vilan`; `keyword`. (The contextual `with`,
+    /// `borrows` and `dyn` take the same scope from their hand-written rules.)
     Other,
     /// `constant.language.vilan`; the highlight.js `literal` group.
     Literal,
@@ -925,7 +1048,6 @@ const KEYWORD_ROLES: &[(&str, KeywordRole)] = &[
     ("for", KeywordRole::Control),
     ("in", KeywordRole::Control),
     ("is", KeywordRole::Control),
-    ("jump", KeywordRole::Control),
     ("ret", KeywordRole::Control),
     ("await", KeywordRole::Control),
     ("import", KeywordRole::Import),
@@ -940,21 +1062,14 @@ const KEYWORD_ROLES: &[(&str, KeywordRole)] = &[
     ("macro", KeywordRole::Declaration),
     ("let", KeywordRole::Modifier),
     ("mut", KeywordRole::Modifier),
-    ("own", KeywordRole::Modifier),
     ("external", KeywordRole::Modifier),
     ("export", KeywordRole::Modifier),
     ("async", KeywordRole::Modifier),
     ("const", KeywordRole::Modifier),
-    // `lazy` modifies a parameter (`lazy message: str`) and a module binding
-    // (`lazy let database: …`) — a storage modifier beside `const`/`mut`, not a
-    // word that names a new item.
-    ("lazy", KeywordRole::Modifier),
-    // `dyn` modifies a TYPE (`dyn Source<i32>`) — it names no new item and
-    // heads no statement, so it sits with the other type-position words rather
-    // than in `storage.type`.
-    ("dyn", KeywordRole::Other),
-    ("with", KeywordRole::Other),
-    ("borrows", KeywordRole::Other),
+    // B414 demoted `with`, `borrows`, `own`, `dyn`, `lazy` and `jump` to
+    // contextual keywords; their positional rules are hand-written beside
+    // `context`/`sync`/`as` and pinned below
+    // (`b414_the_contextual_keywords_are_coloured_by_position_in_both_grammars`).
     // `css` heads an expression rather than declaring or modifying an item, so
     // it takes the general bucket beside `with`/`borrows` rather than
     // `storage.type` (which colours the word that names a new item).
@@ -2321,4 +2436,114 @@ fn e171_the_books_closing_tag_is_a_tag_after_an_identifier_character() {
             "{HIGHLIGHT_THEME}: {probe:?} is not markup: {tag}"
         );
     }
+}
+
+/// B414 at the SCOPE layer: one file holding each demoted keyword in its
+/// keyword position and as a name, tokenised by the engine VS Code runs.
+const B414_BOTH_READINGS: &str = concat!(
+    "struct Point { with: i32, own: i32 }\n",
+    "impl Point with Show {\n",
+    "\tfun show(self): str { \"p\" }\n",
+    "}\n",
+    "fun first(xs: &List<i32>): &i32 borrows xs { xs.get(0) }\n",
+    "fun take(own list: List<i32>, lazy fallback: i32, shape: dyn Show) {}\n",
+    "fun main() {\n",
+    "\tlet own = 1;\n",
+    "\tlet lazy = own;\n",
+    "\tlet dyn = lazy;\n",
+    "\tlet jump = dyn;\n",
+    "\tfor x in [ jump ] { jump break; }\n",
+    "}\n",
+);
+
+#[test]
+fn b414_each_demoted_keyword_is_a_keyword_in_its_position_and_a_name_elsewhere() {
+    let Some(painting) = painting(B414_BOTH_READINGS) else {
+        return;
+    };
+    for (needle, scope) in [
+        ("with Show", "keyword.other.vilan"),
+        ("borrows xs", "keyword.other.vilan"),
+        ("own list", "storage.modifier.vilan"),
+        ("lazy fallback", "storage.modifier.vilan"),
+        ("dyn Show", "keyword.other.vilan"),
+        ("jump break", "keyword.control.vilan"),
+    ] {
+        assert_eq!(painting.scope_at(needle), scope, "{needle:?}");
+    }
+    for needle in [
+        "with: i32",
+        "own: i32",
+        "own = 1",
+        "lazy = own",
+        "dyn = lazy",
+        "jump = dyn",
+        "jump ] {",
+    ] {
+        // The tokens over the WORD alone (the needle's first word): a plain
+        // name may share a token with the whitespace before it.
+        let (start, _, line) = painting.locate(needle);
+        let word_end = start + needle.find([':', ' ']).unwrap_or(needle.len());
+        for token in painting
+            .tokens
+            .iter()
+            .filter(|token| token.line == line && token.start < word_end && token.end > start)
+        {
+            let scope = token.innermost();
+            assert!(
+                !scope.starts_with("keyword") && !scope.starts_with("storage"),
+                "{needle:?} is a NAME and is painted {scope}"
+            );
+        }
+    }
+}
+
+/// B414 / E225: `vilan --print-keywords` is the keyword table every consumer
+/// outside the compiler reads, so it is held to the lexer's two tables here —
+/// parsed as JSON by node, the way a consumer would read it: `keywords` is
+/// every reserved word and every contextual keyword, `contextual` exactly the
+/// contextual ones, each sorted.
+#[test]
+fn the_printed_keyword_table_is_the_lexers() {
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("--print-keywords")
+        .output()
+        .expect("run vilan --print-keywords");
+    assert!(output.status.success(), "{output:?}");
+    let mut child = Command::new("node")
+        .args([
+            "-e",
+            r#"let text = "";
+               process.stdin.on("data", (chunk) => (text += chunk));
+               process.stdin.on("end", () => {
+                   const table = JSON.parse(text);
+                   console.log(table.keywords.join(" "));
+                   console.log(table.contextual.join(" "));
+               });"#,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run node");
+    child
+        .stdin
+        .take()
+        .expect("node's stdin")
+        .write_all(&output.stdout)
+        .expect("hand node the table");
+    let parsed = child.wait_with_output().expect("node finishes");
+    assert!(parsed.status.success(), "the printed table is not JSON");
+    let lines: Vec<String> = String::from_utf8_lossy(&parsed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut every: Vec<&str> = KEYWORDS
+        .iter()
+        .map(|(word, _)| *word)
+        .chain(CONTEXTUAL_KEYWORDS.iter().map(|(word, _)| *word))
+        .collect();
+    every.sort_unstable();
+    let mut contextual: Vec<&str> = CONTEXTUAL_KEYWORDS.iter().map(|(word, _)| *word).collect();
+    contextual.sort_unstable();
+    assert_eq!(lines, vec![every.join(" "), contextual.join(" ")]);
 }

@@ -60,16 +60,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use vilan_core::lexing::KEYWORDS;
+use vilan_core::lexing::{CONTEXTUAL_KEYWORDS, KEYWORDS};
 use vilan_core::parsing::KNOWN_ATTRIBUTE_MARKERS;
 
 const GRAMMAR: &str = "vilan/docs/spec/grammar.md";
 const PARSER: &str = "crates/vilan-core/src/parsing.rs";
 const LEXICAL: &str = "vilan/docs/spec/lexical.md";
 
-/// Identifier-shaped terminals the EBNF quotes that are not keywords, not
-/// attribute markers and not extern form words, with what each is. Every one
-/// is a CONTEXTUAL word or a fixed argument the parser matches by text.
+/// Identifier-shaped terminals the EBNF quotes that are not keywords (reserved
+/// or contextual — `lexing::CONTEXTUAL_KEYWORDS` is a compiler table, B414),
+/// not attribute markers and not extern form words, with what each is. Every
+/// one is a word or a fixed argument the parser matches by text.
 /// Attribute markers the parser RECOGNIZES but no longer ACCEPTS — a retired
 /// attribute whose name is still matched so the refusal can name what replaced
 /// it, rather than reporting "found `[` expected `fun`" at a form the book used
@@ -81,11 +82,6 @@ const REFUSED_ATTRIBUTE_MARKERS: &[(&str, &str)] = &[(
 )];
 
 const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
-    ("context", "the contextual clause on a closure type (§2.2)"),
-    (
-        "sync",
-        "the contextual marker opening a closure type (§7.4)",
-    ),
     ("on", "the element head's event form: `on:click(..)`"),
     (
         "keyed",
@@ -101,26 +97,7 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
          connectionless POST leg, so a handle- or `[expose]`-bearing member is refused at its \
          declaration (transport-rpc.md §9.7.5, A120 S5)",
     ),
-    (
-        "as",
-        "the contextual alias on an import/use path leaf (§3.2, E142)",
-    ),
-    (
-        "only",
-        "the contextual trailing modifier on an import statement (§3.2, B318)",
-    ),
     ("_", "the wildcard pattern"),
-    (
-        "self",
-        "the file's own module in `mod self;` (§3.1, B415) — an identifier the parser \
-         matches by text and reserves as a module name, never a keyword",
-    ),
-    (
-        "void",
-        "the unit VALUE, the sixth literal (§2.2 lists it contextual; N113 — \
-         the atom production read every `void` as the unit from the day it \
-         shipped, and §3's literal production did not say so)",
-    ),
 ];
 
 /// Nonterminals the document defines in PROSE rather than with a production,
@@ -389,6 +366,44 @@ fn every_keyword_is_spelled_in_the_normative_grammar() {
     );
 }
 
+/// Contextual keywords the EBNF does not quote, with why — the one exemption
+/// from [`every_contextual_keyword_is_spelled_in_the_normative_grammar`].
+const CONTEXTUAL_KEYWORDS_NOT_QUOTED: &[(&str, &str)] = &[(
+    "Self",
+    "a TYPE name inside an `impl`/`trait` — reached through `type-path`'s IDENT, \
+     with no production of its own",
+)];
+
+/// B414: a contextual keyword is a keyword by POSITION, and the position is a
+/// production's — so each is quoted where §3 puts it, exactly as a reserved
+/// keyword is. The six B414 demoted would otherwise be free to drop out of
+/// the grammar the moment they stopped being `KEYWORDS` rows.
+#[test]
+fn every_contextual_keyword_is_spelled_in_the_normative_grammar() {
+    let terminals = terminals(&ebnf());
+    let missing: Vec<&str> = CONTEXTUAL_KEYWORDS
+        .iter()
+        .map(|(word, _)| *word)
+        .filter(|word| {
+            !terminals.contains(*word)
+                && !CONTEXTUAL_KEYWORDS_NOT_QUOTED
+                    .iter()
+                    .any(|(exempt, _)| exempt == word)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the contextual keyword(s) {missing:?} are never quoted by spec §3's EBNF — \
+         quote each where its production reads it"
+    );
+    for (exempt, reason) in CONTEXTUAL_KEYWORDS_NOT_QUOTED {
+        assert!(
+            !terminals.contains(*exempt),
+            "`{exempt}` is quoted by the EBNF now — drop its exemption ({reason})"
+        );
+    }
+}
+
 #[test]
 fn every_word_the_grammar_quotes_is_one_the_compiler_knows() {
     let ebnf = ebnf();
@@ -396,6 +411,7 @@ fn every_word_the_grammar_quotes_is_one_the_compiler_knows() {
     let known: BTreeSet<&str> = KEYWORDS
         .iter()
         .map(|(word, _)| *word)
+        .chain(CONTEXTUAL_KEYWORDS.iter().map(|(word, _)| *word))
         .chain(KNOWN_ATTRIBUTE_MARKERS.iter().copied())
         .chain(form_words.iter().map(String::as_str))
         .chain(NON_KEYWORD_TERMINALS.iter().map(|(word, _)| *word))
@@ -651,7 +667,9 @@ fn every_recorded_non_keyword_terminal_still_needs_recording() {
     let quoted = terminals(&ebnf());
     let known: BTreeSet<String> = KEYWORDS
         .iter()
-        .map(|(word, _)| (*word).to_string())
+        .map(|(word, _)| *word)
+        .chain(CONTEXTUAL_KEYWORDS.iter().map(|(word, _)| *word))
+        .map(str::to_string)
         .chain(
             KNOWN_ATTRIBUTE_MARKERS
                 .iter()
