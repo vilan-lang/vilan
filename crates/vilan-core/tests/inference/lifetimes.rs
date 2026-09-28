@@ -1688,3 +1688,107 @@ fn disposing_a_reactive_client_twice_is_harmless() {
         "status = idle\n1\n0\nfalse\n0\nfalse\n",
     );
 }
+
+// --- A135 door (c): a handle-returning `[rpc]` whose tail is `.cell()` --------
+
+/// The `[service]` both A135 pins share: one handle method per shape, and the
+/// controls beside them. `{BODY}` is replaced per pin.
+const A135_SERVICE: &str = r#"
+    import std::reactive::{ Signal, SignalCell };
+    import std::map::Map;
+
+    [service(StoreClient)]
+    struct Store {
+        names: SignalCell<Map<i32, str>>,
+        kept: SignalCell<str>,
+    }
+
+    impl Store {
+        {BODY}
+    }
+
+    fun main() {}
+"#;
+
+/// The warnings a `Store` body raises that name A135's hazard, as
+/// `(method named, the text the warning spans)`.
+fn a135_warnings(body: &str) -> Vec<(String, String)> {
+    let source = A135_SERVICE.replace("{BODY}", body);
+    warning_diagnostics(&source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("returns a signal handle it builds with `.cell()`"))
+        .map(|(message, range)| {
+            let method = message.split('`').nth(1).unwrap_or_default().to_string();
+            (method, source[range].to_string())
+        })
+        .collect()
+}
+
+/// A135 (c), the warning's cases: the plain handle, a block-bodied one whose
+/// TAIL is the `.cell()`, and the `Option` form's `Some(…cell())`. Each is
+/// anchored at the `.cell` name of the call that mints per call, and names the
+/// method. (Kolt's `store.vl` wrote the first shape at three sites after the
+/// v0.41.0 flip.)
+#[test]
+fn a135_a_handle_method_whose_tail_is_cell_warns_with_the_memo_steer() {
+    let found = a135_warnings(
+        r#"
+        [rpc]
+        fun first_name(self): SignalCell<Option<str>> {
+            self.names.map(|names| names.get(1)).cell()
+        }
+
+        [rpc]
+        fun count(self): SignalCell<usize> {
+            let unused = 0;
+            self.names.map(|names| names.len()).cell()
+        }
+
+        [rpc]
+        fun maybe(self, id: i32): Option<SignalCell<str>> {
+            Some(self.names.map(|names| names.get(id).unwrap_or_default()).cell())
+        }
+        "#,
+    );
+    let mut methods: Vec<&str> = found.iter().map(|(method, _)| method.as_str()).collect();
+    methods.sort_unstable();
+    assert_eq!(methods, vec!["count", "first_name", "maybe"], "{found:#?}");
+    assert!(
+        found.iter().all(|(_, spanned)| spanned == "cell"),
+        "every warning spans the `.cell` name: {found:#?}"
+    );
+}
+
+/// A135 (c), the controls: a handle returning a cell that OUTLIVES the call (a
+/// field, which is what the dedup keys on), a `.cell_global()` (not this
+/// hazard's shape), an `Option` built from a field, a plain value method whose
+/// body merely USES a `.cell()`, and a free function that is no `[rpc]` at all.
+/// None warns.
+#[test]
+fn a135_a_handle_method_returning_what_outlives_the_call_does_not_warn() {
+    let found = a135_warnings(
+        r#"
+        [rpc]
+        fun kept(self): SignalCell<str> {
+            self.kept
+        }
+
+        [rpc]
+        fun global(self): SignalCell<usize> {
+            self.names.map(|names| names.len()).cell_global()
+        }
+
+        [rpc]
+        fun kept_if(self, present: bool): Option<SignalCell<str>> {
+            if present { Some(self.kept) } else { None }
+        }
+
+        [rpc]
+        fun size(self): usize {
+            let derived = self.names.map(|names| names.len()).cell();
+            derived.get()
+        }
+        "#,
+    );
+    assert!(found.is_empty(), "{found:#?}");
+}

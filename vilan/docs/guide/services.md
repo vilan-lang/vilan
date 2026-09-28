@@ -539,6 +539,25 @@ method body does not run when you *call* the stub: nothing has been
 asked yet. If you need a server-side effect, that is a plain `[rpc]`
 method, not a handle.)
 
+**Return a cell that outlives the call.** The server dedups a reply by
+the *cell* it carries, so a getter that answers a cell the service keeps
+— a field, a row's cell — is one channel however often it is asked. A
+body that ends in `.map(..).cell()` mints a fresh cell per call instead:
+the dedup never hits (one capability and one forward per call), and the
+compiler warns at that `.cell()`. Every handler runs under its
+**connection's owner**, so such a cell's subscription is released when
+the connection closes rather than kept for the life of the process —
+but the fix is to keep the derived cell, keyed by the arguments, in a
+[`Memo`](../std/collections.md#memokv) on the service whose maker writes
+`.cell_global()`:
+
+```vilan,fragment
+[rpc]
+fun get_channel_ids(self): SignalCell<List<i32>> {
+	self.derived.get_or_insert("ids", || self.channels.map(|all| all.keys()).cell_global())
+}
+```
+
 **When the server frees it.** Demand decides. A mirror's last lease
 going away sends `Unsubscribe`, and for a channel a reply minted that
 withdraws the capability whole: the forward stops, the starter is

@@ -549,6 +549,28 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// return its stdout (the same bound, and the same reason for it, as
 /// `service_layer.rs`).
 fn run_program(tag: &str, source: &str) -> String {
+    let (stdout, stderr) = run_program_capturing(tag, source);
+    assert!(
+        stderr.trim().is_empty(),
+        "the program wrote to stderr:\n{stderr}\n--- stdout ---\n{stdout}"
+    );
+    stdout
+}
+
+/// [`run_program`] for a program that is EXPECTED to build with one warning:
+/// its stderr must carry `warning` and nothing that reads as an error. The
+/// A135 programs are the shape the warning exists for, so the build that runs
+/// them is also the pin that it is raised through the real pipeline.
+fn run_program_warning(tag: &str, source: &str, warning: &str) -> String {
+    let (stdout, stderr) = run_program_capturing(tag, source);
+    assert!(
+        stderr.contains(warning) && !stderr.contains("Error"),
+        "expected exactly the warning {warning:?} on stderr, got:\n{stderr}\n--- stdout ---\n{stdout}"
+    );
+    stdout
+}
+
+fn run_program_capturing(tag: &str, source: &str) -> (String, String) {
     let dir = temp_project(tag);
     write(
         &dir,
@@ -589,12 +611,8 @@ fn run_program(tag: &str, source: &str) -> String {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert!(
-        stderr.trim().is_empty(),
-        "the program wrote to stderr:\n{stderr}\n--- stdout ---\n{stdout}"
-    );
     let _ = std::fs::remove_dir_all(&dir);
-    stdout
+    (stdout, stderr)
 }
 
 /// One session and one client over an in-process duplex, driving a single
@@ -3384,5 +3402,212 @@ fn a137_a_joining_mirror_is_seeded_over_a_socket() {
         ],
         "over a socket, a mirror whose Subscribe joins a sibling's forward must \
          hold the channel's value; got:\n{stdout}"
+    );
+}
+
+// --- A135: a handler runs under its CONNECTION's owner ----------------------
+
+/// A135 IN PROCESS: kolt's shape — a handle method whose body is
+/// `self.channels.map(..).cell()` — called three times (three leases, each
+/// released for real, so three mints), then the connection's session dropped.
+/// The store cell's live registrations are counted directly.
+const A135_CONNECTION_OWNER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell, Source };
+import std::rpc::{ ReactiveClient, RemoteSource, drop_session, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	// The shape A135 found in kolt's store: a derived cell minted per CALL.
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels.map(|ids| ids).cell()
+	}
+}
+
+/// The registrations standing on a cell's subscriber list that are still live.
+fun live_on<T>(cell: SignalCell<T>): i32 {
+	mut live = 0;
+	for subscriber in cell.subscribers.read() {
+		if subscriber.live.read() {
+			live += 1;
+		}
+	}
+	live
+}
+
+fun main() {
+	let channels: SignalCell<List<i32>> = Signal::new([1, 2]);
+	let store = Store { channels, calls = Shared::new(0) };
+	// The app's own watcher: the one registration that must survive.
+	let _app = channels.sub(|ids| {});
+	print(i"baseline:{live_on(channels)}");
+	let (client_end, server_end) = duplex_pair();
+	register_session(9, server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()).for_connection(9));
+	let client = StoreClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	// Three leases, each released for real before the next: three mints, so
+	// three CALLS, each minting its own derived cell on the server.
+	mut round = 0;
+	for round < 3 {
+		let mirror: RemoteSource<List<i32>> = client.get_channels();
+		let lease = mirror.sub(|ids| {});
+		sleep_for(Duration::millis(0));
+		lease.dispose();
+		sleep_for(Duration::millis(0));
+		sleep_for(Duration::millis(0));
+		round += 1;
+	}
+	print(i"connected:calls={store.calls.read()} live={live_on(channels)}");
+	// The connection goes: its session, and with A135 its OWNER, are disposed.
+	drop_session(9);
+	print(i"disconnected:live={live_on(channels)}");
+}
+"#;
+
+/// A135 (door b): the dispatcher runs each handler under the connection's owner
+/// (`rpc::under_connection`, written into every generated route), and
+/// `ReactiveServer::dispose` — which `drop_session` runs — disposes it. A
+/// per-call `.cell()` used to keep its registration on the store's cell for
+/// the life of the PROCESS: `disconnected:live=4` before (the app's own watcher
+/// plus one per call), `1` after — ONE registration, the app's. While the
+/// connection lives the three stand (`connected:… live=4`): door (b) bounds the
+/// leak by the connection and does not restore the dedup, which is what the
+/// compiler's warning at that `.cell()` steers to (door c, pinned in
+/// `vilan-core`'s `inference::lifetimes`).
+#[test]
+fn a135_n_calls_of_a_per_call_cell_leave_one_registration_after_disconnect() {
+    let stdout = run_program_warning(
+        "a135_owner",
+        A135_CONNECTION_OWNER,
+        "`get_channels` returns a signal handle it builds with `.cell()`",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "baseline:1",
+            "connected:calls=3 live=4",
+            "disconnected:live=1",
+        ],
+        "a handler's per-call cell must be released with its connection; got:\n{stdout}"
+    );
+}
+
+/// A135 OVER A SOCKET: the same three calls over a real WebSocket, and the
+/// disconnect the real way — the client's socket closes, and the server's
+/// teardown drops the connection's session (and its owner).
+const A135_CONNECTION_OWNER_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Source };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels.map(|ids| ids).cell()
+	}
+}
+
+let channels: SignalCell<List<i32>> = Signal::new([1, 2]);
+let store: Store = Store { channels, calls = Shared::new(0) };
+
+fun live_on<T>(cell: SignalCell<T>): i32 {
+	mut live = 0;
+	for subscriber in cell.subscribers.read() {
+		if subscriber.live.read() {
+			live += 1;
+		}
+	}
+	live
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+/// Poll until `ready` holds — the harness's own sequencing, never a bare sleep.
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 1000 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+async fun run(port: i32) {
+	let _app = channels.sub(|ids| {});
+	print(i"baseline:{live_on(channels)}");
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			mut round = 0;
+			for round < 3 {
+				let mirror: RemoteSource<List<i32>> = client.get_channels();
+				let lease = mirror.sub(|ids| {});
+				until(|| mirror.get().is_some());
+				lease.dispose();
+				// The close is real once the settle and the hop have passed and
+				// the server has revoked the channel.
+				until(|| !mirror.minted() || mirror.released.read());
+				round += 1;
+			}
+			until(|| store.calls.read() == 3);
+			print(i"connected:calls={store.calls.read()} live={live_on(channels)}");
+			// The client goes away for good: the server's teardown drops the
+			// connection's session, and with A135 its owner.
+			client.transport.duplex.socket.read().close();
+			until(|| live_on(channels) == 1);
+			print(i"disconnected:live={live_on(channels)}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a135_a_closed_socket_releases_its_handlers_per_call_cells() {
+    let stdout = run_program_warning(
+        "a135_owner_socket",
+        A135_CONNECTION_OWNER_SOCKET,
+        "`get_channels` returns a signal handle it builds with `.cell()`",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "baseline:1",
+            "connected:calls=3 live=4",
+            "disconnected:live=1",
+        ],
+        "over a socket, a handler's per-call cell must be released when the \
+         connection closes; got:\n{stdout}"
     );
 }

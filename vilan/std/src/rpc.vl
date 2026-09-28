@@ -40,6 +40,7 @@ import pkg::reactive::{
 	Disposable,
 	FlushPolicy,
 	Map as MapNode,
+	Owner,
 	SeqOp,
 	SignalCell,
 	Source,
@@ -52,6 +53,7 @@ import pkg::reactive::{
 	defer_to_owner,
 	fresh_id,
 	get_owner,
+	owner_scope,
 	queue_microtask,
 	register_with_owner,
 	turn,
@@ -2036,6 +2038,37 @@ export fun session_of(connection: i32): Option<ReactiveServer> {
 	None
 }
 
+/// Run `body` — one `[rpc]` route's handler — under the owner of the CONNECTION the
+/// request arrived on (tracker A135, door b). What the generated dispatcher wraps
+/// every route in.
+///
+/// A handler that builds something owner-tied — a `.cell()` over the store's cell,
+/// an `effect` — used to run under NO owner: the route closure is built once, where
+/// no scope is ambient, and a closure captures its context at creation. A
+/// `.cell()` made per call then kept its registration on the store's cell for the
+/// life of the PROCESS, one more per call, re-lease and reconnect. Under the
+/// connection's owner it is released with the connection (`ReactiveServer::
+/// dispose`, which `drop_session` runs) — bounded by the connection, where a
+/// cell that must outlive the CALL is still the author's to keep (a `Memo` on the
+/// service whose maker writes `.cell_global()`; the compiler warns at a
+/// handle-returning method whose tail is `.cell()`).
+///
+/// A request on NO session — the connectionless `{mount}rpc` leg, a
+/// `local_rpc` transport nothing stamped, a client-side handler — runs under a
+/// fresh owner nothing ever disposes, which is exactly the ownerless behaviour it
+/// had: nothing is released early, and nothing new is kept.
+///
+/// `body` is an INJECTED closure (`context owner_scope`, spec §8.5): the literal
+/// the route writes here takes the owner at each call, where a stored closure would
+/// have taken whatever was ambient when the dispatcher was built.
+export fun under_connection<T>(request: RpcRequest, body: (|| T) context owner_scope): T {
+	let owner = match session_of(request.connection) {
+		Some(let session) => session.owner,
+		None => Owner::new(),
+	};
+	owner_scope.run(owner, body)
+}
+
 // --- Server side: the reverse lane (§9.3) -----------------------------------
 
 /// One connection's reverse channel: how a server-side proxy puts a frame on the
@@ -2230,6 +2263,12 @@ export struct ReactiveServer {
 	// retained — until a client asks.
 	sources: Shared<List<(i32, Capability)>>,
 	live: Shared<List<LiveForward>>,
+	// The CONNECTION's owner (A135): every `[rpc]` handler this connection's
+	// requests reach runs under it (`under_connection`), so what a handler builds
+	// that ties itself to an owner — a `.cell()`'s registration on the store's
+	// cell, an `effect` — is released with the connection, when `dispose` runs,
+	// rather than kept for the life of the process.
+	owner: Owner,
 }
 
 export impl ReactiveServer {
@@ -2239,6 +2278,7 @@ export impl ReactiveServer {
 			codec,
 			sources = Shared::new([]),
 			live = Shared::new([]),
+			owner = Owner::new(),
 		};
 		(server.transport).on_frame(|frame| {
 			// every inbound frame is handled in a turn
@@ -3061,8 +3101,9 @@ export impl ReactiveServer with Disposable {
 	/// reachable from its transport forever. After this, changes no longer reach
 	/// this wire and the wire no longer reaches this session.
 	///
-	/// `drop_session` is covered by the same line: it disposes the session it
-	/// drops.
+	/// `drop_session` is covered by the same line: it disposes the session it drops
+	/// — and with it the connection's OWNER (A135), which releases what the
+	/// connection's handlers built.
 	fun dispose(self) {
 		for forward in self.live.read() {
 			forward.subscription.dispose();
@@ -3070,6 +3111,10 @@ export impl ReactiveServer with Disposable {
 		self.live.write() = [];
 		self.sources.write() = [];
 		(self.transport).clear_on_frame();
+		// And what this connection's handlers built under its owner (A135): a
+		// per-call `.cell()`'s registration on the store's cell goes here, with the
+		// connection, instead of staying for the process.
+		self.owner.dispose();
 	}
 }
 
@@ -5555,13 +5600,20 @@ export macro fun route_block(name: str, statements: List<str>): str {
 	// happens at INVOCATION, and its literal contains the DIRECT call into the
 	// user's handler method — so the turn threads compile-time into real handler
 	// code, and one request's signal writes settle as one wave.
+	//
+	// And the turn runs under the CONNECTION's owner (A135): `under_connection`
+	// establishes it per call, so a handler's `.cell()` or `effect` is released
+	// with the connection rather than kept for the process — the route closure
+	// itself is built once, where no owner is ambient.
 	let label = quote(name);
 	mut closure = i".on({label}, |__request| \{\n";
-	closure = closure + indent("reactive::turn(FlushPolicy::AtEnd, || {", 1) + "\n";
+	closure = closure
+		+ indent("rpc::under_connection(__request, || reactive::turn(FlushPolicy::AtEnd, || {", 1)
+		+ "\n";
 	for statement in statements {
 		closure = closure + indent(statement, 2) + "\n";
 	}
-	closure = closure + indent("})", 1) + "\n";
+	closure = closure + indent("}))", 1) + "\n";
 	closure + "})"
 }
 
