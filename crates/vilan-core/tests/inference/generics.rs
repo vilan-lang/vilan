@@ -9002,3 +9002,73 @@ fn b427_a_destructured_closure_parameter_types_the_closure_tail() {
         "3\n12\n",
     );
 }
+
+// --- B424: an unconstrained generic at a call (RULED R-h, 2026-09-28) --------
+
+/// Door (b): a combinator's own generic that only re-types one of the
+/// receiver's parameters takes the receiver's when nothing binds it —
+/// `or_else`'s `F` is the input's `E` when the closure builds only `Ok`, and a
+/// `_` parameter carries no obligation.
+#[test]
+fn b424_or_else_with_an_ok_only_closure_keeps_the_input_error_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet err: Result<i32, str> = Err(\"bad\");\n",
+            "\tlet fixed = err.or_else(|e| Ok(7));\n",
+            "\tlet same: Result<i32, str> = fixed;\n",
+            "\tprint(same.unwrap_or(0));\n",
+            "\tlet ignored: Result<i32, str> = err.or_else(|_| Ok(8));\n",
+            "\tprint(ignored.unwrap_or(0));\n",
+            "\tlet changed: Result<i32, i32> = err.or_else(|_| Err(3));\n",
+            "\tprint(changed.unwrap_or(0));\n",
+            "}\n",
+        ),
+        "7\n8\n0\n",
+    );
+}
+
+/// Door (a): anywhere else a generic nothing binds, and that the result is
+/// typed by, is refused with the steer; written on the binding or as the
+/// type argument, it compiles.
+#[test]
+fn b424_an_unbound_generic_typing_a_calls_result_is_refused() {
+    assert_fails_once_with(
+        concat!(
+            "fun nothing<U>(): Option<U> { None }\n",
+            "fun main() {\n",
+            "\tlet x = nothing();\n",
+            "}\n",
+        ),
+        "cannot infer 'U' for this call: nothing it is passed binds it, and its result is typed by it",
+    );
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun nothing<U>(): Option<U> { None }\n",
+            "fun main() {\n",
+            "\tlet y: Option<i32> = nothing();\n",
+            "\tlet z = nothing<str>();\n",
+            "\tprint(i\"{y.is_none()} {z.is_none()}\");\n",
+            "}\n",
+        ),
+        "true true\n",
+    );
+}
+
+/// A `_` closure parameter is never what a refusal asks to annotate.
+#[test]
+fn b424_an_underscore_closure_parameter_carries_no_annotation_obligation() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun apply<T, U>(value: T, transform: |T| U): U { transform(value) }\n",
+            "fun main() {\n",
+            "\tprint(apply(3, |_| \"x\"));\n",
+            "\tlet ignore = |_| {};\n",
+            "}\n",
+        ),
+        "x\n",
+    );
+}

@@ -7196,6 +7196,42 @@ impl<'src> Analyzer<'src> {
                     .filter(|generic| !in_return.contains(generic))
                     .collect();
             }
+            // B424, door (a) (the owner's ruling, 2026-09-28): an UNBOUNDED
+            // own generic the call left free is refused too when the call's
+            // RESULT is typed by it — the value's type names a parameter
+            // nothing decided, JS ran it as `any` and the native build had no
+            // type to emit. The steer names that generic and the two places a
+            // type can be written. One whose only role is a parameter the
+            // result does not carry decides nothing the program can observe,
+            // and stays free.
+            let return_generics = self.member_return_generics(member_id);
+            let parameter_generics = self.member_parameter_generics(member_id);
+            for constraint_id in own_generics.iter().copied() {
+                if !self.generic_bound_traits(constraint_id).is_empty()
+                    || !return_generics.contains(&constraint_id)
+                    || parameter_generics.contains(&constraint_id)
+                    || self
+                        .method_call_substitution
+                        .get(&call_id)
+                        .is_some_and(|substitution| substitution.contains_key(&constraint_id))
+                {
+                    continue;
+                }
+                let generic_label =
+                    self.pretty_print_type(&Type::Generic(constraint_id), &HashMap::default());
+                let member = self.callable_name(member_id).unwrap_or("this function");
+                errors.push((
+                    call_id,
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    format!(
+                        "cannot infer '{generic_label}' for this call: nothing it is passed binds \
+                         it, and its result is typed by it. Write the type — on the binding the \
+                         result lands in (`let value: … = …`), or as the call's type argument \
+                         (`{member}<…>(…)`)"
+                    ),
+                    constraint_id,
+                ));
+            }
             for constraint_id in own_generics.into_iter().chain(unbindable) {
                 let bound_traits = self.generic_bound_traits(constraint_id);
                 if bound_traits.is_empty() {
@@ -42842,6 +42878,14 @@ impl<'src> Analyzer<'src> {
                         argument_ids,
                         arguments_span,
                     );
+                    // B424 (door (b), ruled 2026-09-28): an own generic the
+                    // call left unbound that only RE-TYPES one of the
+                    // receiver's own parameters takes the receiver's.
+                    self.default_own_generics_from_receiver(
+                        target_id,
+                        argument_ids,
+                        &mut substitution_context,
+                    );
                     // Keep the callee's own-generic bindings as ordered values
                     // too — a bound static (`T::rebuild(source)`) re-targets a
                     // concrete impl's method at emission, whose generic IDS
@@ -43802,6 +43846,8 @@ impl<'src> Analyzer<'src> {
                 {
                     return Resolution::Deferred;
                 }
+                // B424, door (b): see `default_own_generics_from_receiver`.
+                self.default_own_generics_from_receiver(member_id, argument_ids, &mut substitution);
                 // Keep the own-generic bindings as ordered values too — the
                 // OnConstraint emission re-targets a concrete impl's method,
                 // whose own-generic IDS differ from this (possibly trait)
@@ -47505,6 +47551,273 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+    }
+
+    /// B424, door (b) (the owner's ruling, 2026-09-28): a combinator's own
+    /// generic that NOTHING at the call bound, and whose one role in the
+    /// return is to re-type one of the receiver's own parameters, defaults to
+    /// that parameter when the closure it is written in never produces a
+    /// value AT that position. `Result::or_else<F>(self, fn: |E| Result<T,
+    /// F>): Result<T, F>` with `|e| Ok(7)` leaves `F` free — the error type of
+    /// a closure that produces no error is the input's (`E`).
+    ///
+    /// Read off the declarations, not keyed on a name: the return is the
+    /// receiver's own nominal type with the free generic where the impl's
+    /// subject has a parameter the receiver bound, and every argument whose
+    /// declared type mentions the generic is a closure whose declared return
+    /// is that nominal with the generic at the SAME position — and whose every
+    /// returned value (tail and `ret`s) is a variant constructor whose payload
+    /// never carries that position (`Ok(..)` carries `T`, never `E`). A
+    /// returned value the reading cannot see through — a call, a binding —
+    /// decides nothing here, and the generic is left for the ordinary
+    /// channels (F38 closes `and_then`'s `U` from its closure natively).
+    fn default_own_generics_from_receiver(
+        &mut self,
+        target_id: Id,
+        argument_ids: &[Id],
+        substitution: &mut SubstitutionContext,
+    ) {
+        let Some((parameter_ids, own_generics)) = self.method_signature(target_id) else {
+            return;
+        };
+        // Unbound, bound to a hole, or bound to ITSELF: an argument that says
+        // nothing about the position (`Ok(3)`'s error type) reconciles `F`
+        // against its own unknown, or against the declared `F` it was typed
+        // at — no binding at all.
+        let unbound: Vec<TypeId> = own_generics
+            .iter()
+            .copied()
+            .filter(|generic| {
+                substitution.get(generic).is_none_or(|bound| {
+                    matches!(bound.borrow_type(self), Type::Unknown)
+                        || matches!(bound.borrow_type(self), Type::Generic(itself) if itself == generic)
+                })
+            })
+            .collect();
+        if unbound.is_empty() {
+            return;
+        }
+        let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&target_id) else {
+            return;
+        };
+        let Some(return_type_id) = self
+            .functions
+            .get(function_id)
+            .and_then(|function| function.return_type_id)
+        else {
+            return;
+        };
+        let Some(subject_id) = self
+            .implementations
+            .iter()
+            .find(|implementation| {
+                implementation
+                    .declarations
+                    .values()
+                    .any(|member| *member == target_id)
+            })
+            .map(|implementation| implementation.subject)
+        else {
+            return;
+        };
+        let (nominal, return_arguments, subject_arguments) =
+            match (return_type_id.get_type(self), subject_id.get_type(self)) {
+                (Type::Enum(returned, returns), Type::Enum(subject, subjects))
+                    if returned == subject && returns.len() == subjects.len() =>
+                {
+                    (returned, returns, subjects)
+                }
+                _ => return,
+            };
+        // The explicit parameters, aligned with the arguments (a method's
+        // `self` is parameter 0 and is not among `argument_ids`).
+        let explicit: Vec<Id> = match parameter_ids.len() == argument_ids.len() + 1 {
+            true => parameter_ids[1..].to_vec(),
+            false => parameter_ids.clone(),
+        };
+        for (position, (returned, declared)) in return_arguments
+            .iter()
+            .zip(subject_arguments.iter())
+            .enumerate()
+        {
+            let (Type::Generic(free), Type::Generic(receiver_parameter)) =
+                (returned.get_type(self), declared.get_type(self))
+            else {
+                continue;
+            };
+            if !unbound.contains(&free) {
+                continue;
+            }
+            let Some(bound) = substitution.get(&receiver_parameter).copied() else {
+                continue;
+            };
+            let unproduced =
+                explicit
+                    .iter()
+                    .zip(argument_ids.iter())
+                    .all(|(parameter_id, argument_id)| {
+                        self.argument_never_produces_at(
+                            *parameter_id,
+                            *argument_id,
+                            free,
+                            nominal,
+                            position,
+                        )
+                    });
+            if unproduced {
+                substitution.insert(free, bound);
+            }
+        }
+    }
+
+    /// B424 door (b)'s test for one argument: whether it cannot bind `free`.
+    /// A parameter whose type does not mention `free` binds nothing; one that
+    /// does must be a closure type returning `nominal` with `free` exactly at
+    /// `position`, fed a closure literal every returned value of which is a
+    /// constructor of `nominal` whose payload does not carry `position`.
+    fn argument_never_produces_at(
+        &self,
+        parameter_id: Id,
+        argument_id: Id,
+        free: TypeId,
+        nominal: Id,
+        position: usize,
+    ) -> bool {
+        let Some(parameter_type) = self
+            .parameters
+            .get(&parameter_id)
+            .map(|parameter| parameter.type_id.get_type(self))
+        else {
+            return false;
+        };
+        let mut mentioned = Vec::new();
+        self.collect_generics(&parameter_type, 0, &mut mentioned);
+        if !mentioned.contains(&free) {
+            return true;
+        }
+        // A VALUE of the nominal itself (`Result::or(self, b: Result<T, F>)`
+        // fed `Ok(3)`): the same reading, over the one value.
+        if let Type::Enum(declared, arguments) = &parameter_type {
+            return *declared == nominal
+                && matches!(arguments.get(position).map(|argument| argument.get_type(self)),
+                    Some(Type::Generic(at)) if at == free)
+                && self.values_never_carry_position(&[argument_id], nominal, position);
+        }
+        let Type::Closure(closure_parameters, closure_return, _) = &parameter_type else {
+            return false;
+        };
+        for closure_parameter in closure_parameters {
+            let mut in_parameter = Vec::new();
+            self.collect_generics(&closure_parameter.get_type(self), 0, &mut in_parameter);
+            if in_parameter.contains(&free) {
+                return false;
+            }
+        }
+        let Type::Enum(returned, arguments) = closure_return.get_type(self) else {
+            return false;
+        };
+        if returned != nominal
+            || !matches!(arguments.get(position).map(|argument| argument.get_type(self)),
+                Some(Type::Generic(at)) if at == free)
+        {
+            return false;
+        }
+        let Some(Expr::Closure(closure_id)) = self.expr_id_to_expr_map.get(&argument_id) else {
+            return false;
+        };
+        let Some(closure) = self.closures.get(closure_id) else {
+            return false;
+        };
+        let mut returned_values = vec![closure.return_];
+        for (_, value) in &closure.rets {
+            match value {
+                Some(value) => returned_values.push(*value),
+                None => return false,
+            }
+        }
+        self.values_never_carry_position(&returned_values, nominal, position)
+    }
+
+    /// B424 door (b): whether every one of `values` (through the tails of a
+    /// choosing value) is a constructor of `nominal` whose payload does not
+    /// carry its parameter at `position` — `Ok(..)` never carries `E`.
+    fn values_never_carry_position(&self, values: &[Id], nominal: Id, position: usize) -> bool {
+        let Some(enum_) = self.enums.get(&nominal) else {
+            return false;
+        };
+        let Some(parameter_at) = enum_
+            .generic_parameter_constraint_ids
+            .get(position)
+            .copied()
+        else {
+            return false;
+        };
+        let mut returned_values = Vec::new();
+        for value in values {
+            self.value_tails(*value, &mut returned_values);
+        }
+        returned_values.into_iter().all(|value_id| {
+            let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&value_id) else {
+                return false;
+            };
+            let Some(function_call) = self.function_calls.get(call_id) else {
+                return false;
+            };
+            let mut subject = function_call.subject_id;
+            if let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&subject) {
+                subject = *target;
+            }
+            let Some(Expr::EnumVariant(enum_id, variant_index)) =
+                self.expr_id_to_expr_map.get(&subject)
+            else {
+                return false;
+            };
+            if *enum_id != nominal {
+                return false;
+            }
+            let Some(variant) = enum_.variants.get(*variant_index) else {
+                return false;
+            };
+            variant.data_type_ids.iter().all(|payload| {
+                let mut in_payload = Vec::new();
+                self.collect_generics(&payload.get_type(self), 0, &mut in_payload);
+                !in_payload.contains(&parameter_at)
+            })
+        })
+    }
+
+    /// B424: the generic parameters `member_id`'s declared PARAMETER types
+    /// mention — the ones an argument can bind. Door (a) refuses only a
+    /// generic outside this set: one a parameter mentions may be bound by a
+    /// channel the analyzer's own record does not keep (a closure's tail read
+    /// at emission, F38), and "nothing it is passed binds it" must be true.
+    fn member_parameter_generics(&self, member_id: Id) -> Vec<TypeId> {
+        let mut generics = Vec::new();
+        if let Some((parameter_ids, _)) = self.method_signature_ref(member_id) {
+            for parameter_id in parameter_ids {
+                if let Some(parameter) = self.parameters.get(parameter_id) {
+                    let parameter_type = parameter.type_id.get_type(self);
+                    self.collect_generics(&parameter_type, 0, &mut generics);
+                }
+            }
+        }
+        generics
+    }
+
+    /// B424: the generic parameters `member_id`'s declared return type
+    /// mentions (empty for a member with no written return).
+    fn member_return_generics(&self, member_id: Id) -> Vec<TypeId> {
+        let mut generics = Vec::new();
+        if let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&member_id)
+            && let Some(return_type_id) = self
+                .functions
+                .get(function_id)
+                .and_then(|function| function.return_type_id)
+        {
+            let return_type = return_type_id.get_type(self);
+            self.collect_generics(&return_type, 0, &mut generics);
+        }
+        generics
     }
 
     /// B426: see the call site in `finalize_build`.

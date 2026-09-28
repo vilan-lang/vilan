@@ -1186,6 +1186,32 @@ const B430_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B424 door (b): `or_else`'s free `F` takes the input's error type, so the
+/// native build has a type to emit — it refused by name before ("a value of
+/// an unbound generic type parameter (parameter 1 of `or_else`)").
+#[test]
+fn or_else_with_an_ok_only_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b424.vl"), B424_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b424.vl"),
+        Verdict::Identical,
+        "`or_else` with an Ok-only closure must mean the same thing on both backends"
+    );
+}
+
+const B424_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "fun main() {\n",
+    "\tlet err: Result<i32, str> = Err(\"bad\");\n",
+    "\tlet fixed = err.or_else(|e| Ok(7));\n",
+    "\tprint(fixed.unwrap_or(0));\n",
+    "\tlet fixed2 = err.or_else(|_| Ok(8));\n",
+    "\tprint(fixed2.unwrap_or(0));\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
@@ -3528,17 +3554,20 @@ const AND_THEN_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F38's boundary: `result-combinators.vl` now stops at `or_else<F>` over an
-/// `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose `F` NOTHING in the
-/// program constrains — the analyzer records `any` and JavaScript never needs
-/// a type. Natively a type has to be chosen, which is a ruling, not a
-/// lowering, so it stays refused by name at the new wall.
+/// F38's boundary, moved by B424: `result-combinators.vl` stopped at
+/// `or_else<F>` over an `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose
+/// `F` nothing in the program constrained. The ruling (R-h, door (b)) gives
+/// that `F` the input's error type, and `err.or(Ok(3))`'s likewise, so both
+/// emit now. The program stops one wall further on: `ok.and(Ok(5))`'s
+/// ARGUMENT, a constructor whose own error parameter the analyzer leaves
+/// open although its landing position (`Result<U, E>` at the receiver's
+/// `E`) fixes it — refused by name, not broken.
 #[test]
 fn an_unconstrained_generic_parameter_is_refused_by_name() {
     let staged = stage();
     match compare(&staged, "result-combinators.vl") {
         Verdict::Refused(reason) => {
-            assert!(reason.contains("parameter 1 of `or_else`"), "{reason}")
+            assert!(reason.contains("parameter 2 of enum `Result`"), "{reason}")
         }
         other => panic!("expected a refusal by name, got {other:?}"),
     }

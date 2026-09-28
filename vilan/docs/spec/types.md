@@ -710,7 +710,18 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
 4. After binding, every bound's satisfaction is checked; an unsatisfied
    bound is an error naming the parameter and bound.
 5. A call whose generics cannot all be grounded (no argument or
-   expectation determines them) is an error at the call.
+   expectation determines them) is an error at the call, naming the
+   generic its result is typed by and the two places a type can be
+   written: the binding the result lands in (`let v: Option<i32> =
+   nothing();`) or the call's type argument (`nothing<i32>()`). One
+   exception grounds itself: a method's own generic whose only role in
+   the result is to RE-TYPE one of the receiver's own parameters — the
+   result is the receiver's type with the generic where the receiver has
+   a parameter — takes the receiver's argument when nothing else binds
+   it. `err.or_else(|e| Ok(7))` on a `Result<i32, str>` is a `Result<i32,
+   str>`: the error type of a closure that produces no error is the
+   input's. A closure parameter written `_` is never what a call waits
+   on, and never the thing a refusal asks to annotate.
 
 A generic parameter is **rigid inside its own body**. The caller chose it,
 once, for this instantiation; nothing in the body may choose again. So a
