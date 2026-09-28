@@ -9685,21 +9685,51 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{rendered} }}"));
         }
+        // F42: the expectation in force here is the one for the intrinsic's
+        // RESULT, and an argument is not its result. Rendered under it, the
+        // argument of `Shared::new(Map::new())` in a field typed
+        // `Shared<Map<Hash, usize>>` matched `Map<K, V>` against the `Shared`,
+        // closed nothing, and `KeyedCell::new` was refused for `Map`'s unbound
+        // `V`. Each argument takes the expectation its intrinsic gives it.
         let mut arguments = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
+            let expecting = self.intrinsic_argument_expectation(intrinsic, index);
             arguments.push(if index == 0 {
                 if mutating {
                     self.mutable_receiver(*argument, depth)?
                 } else {
-                    self.expression(*argument, depth)?
+                    let saved = std::mem::replace(&mut self.expected_type, expecting);
+                    let rendered = self.expression(*argument, depth);
+                    self.expected_type = saved;
+                    rendered?
                 }
             } else if mutating {
                 self.consumed_value_of_expecting(*argument, None, depth)?
             } else {
-                self.value_of(*argument, depth)?
+                self.value_of_expecting(*argument, expecting, depth)?
             });
         }
         self.intrinsic(intrinsic, arguments, span)
+    }
+
+    /// The type an intrinsic's argument at `index` is expected to have, read
+    /// off the expectation for the intrinsic's result (F42).
+    ///
+    /// Only a constructor relates the two: `Shared::new(value)` answers a
+    /// `Shared<T>`, so its value is expected at the `T` of the `Shared` the
+    /// position wants — which is the position a generic call inside it (a
+    /// `Map::new()`, a `SignalCell::new([])`) closes its open bindings from.
+    /// Every other intrinsic's argument is a receiver or an operand whose type
+    /// the result says nothing about, so it is rendered expecting nothing, as a
+    /// call's written arguments are.
+    fn intrinsic_argument_expectation(&self, intrinsic: Intrinsic, index: usize) -> Option<TypeId> {
+        match (intrinsic, index) {
+            (Intrinsic::SharedNew, 0) => match self.resolve(self.expected_type?)? {
+                Type::Struct(_, arguments) => arguments.first().copied(),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Whether a place's ROOT is a binding that lives in a cell — a boxed

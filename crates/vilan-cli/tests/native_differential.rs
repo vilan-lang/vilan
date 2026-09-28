@@ -967,6 +967,91 @@ const PATH_KEYWORD_FIELD_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F42: `KeyedCell` builds natively — every writer, the op log read back as
+/// the wire's `Delta`s, the `Source` view, the keyed lookup and the wholesale
+/// `set`.
+///
+/// It was refused whole, for `Map`'s unbound `V`, at `KeyedCell::new`'s
+/// `positions = Shared::new(Map::new())`. The field's type names both of
+/// `Map`'s arguments, and a generic call closes its open bindings from the
+/// position it fills — but `Shared::new` is an INTRINSIC, and its argument
+/// was rendered under the expectation for the intrinsic's RESULT: `Map<K, V>`
+/// matched against `Shared<Map<Hash, usize>>` closed nothing. Each argument
+/// of an intrinsic now takes the expectation its intrinsic gives it — the
+/// `Shared`'s element for `Shared::new`'s value, nothing for a receiver or
+/// an operand, which the result says nothing about.
+#[test]
+fn a_keyed_cell_builds_and_journals_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_keyed_cell.vl"), KEYED_CELL_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_keyed_cell.vl"),
+        Verdict::Identical,
+        "`KeyedCell` must build natively and journal the same deltas as node"
+    );
+}
+
+const KEYED_CELL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::Source;\n",
+    "import std::rpc::KeyedCell;\n",
+    "import std::wire::{ Delta, Keyed };\n",
+    "\n",
+    "struct Row {\n",
+    "\tid: i32,\n",
+    "\tlabel: str,\n",
+    "}\n",
+    "\n",
+    "impl Row with Keyed<i32> {\n",
+    "\tfun key(self): i32 {\n",
+    "\t\tself.id\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun describe(delta: Delta<i32, Row>): str {\n",
+    "\tmatch delta {\n",
+    "\t\tDelta::Reset(let rows) => i\"reset {rows.len()}\",\n",
+    "\t\tDelta::Insert(let key, let row, let at) => i\"insert {key} {row.label} at {at}\",\n",
+    "\t\tDelta::Update(let key, let row) => i\"update {key} {row.label}\",\n",
+    "\t\tDelta::Remove(let key) => i\"remove {key}\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun labels(rows: List<Row>): str {\n",
+    "\tmut joined = \"\";\n",
+    "\tfor row in rows {\n",
+    "\t\tjoined = joined + row.label + \";\";\n",
+    "\t}\n",
+    "\tjoined\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet cell: KeyedCell<i32, Row> = KeyedCell<i32, Row>::new([Row { id = 1, label = \"one\" }]);\n",
+    "\tlet cursor = cell.cursor();\n",
+    "\tcell.insert(Row { id = 2, label = \"two\" });\n",
+    "\tcell.insert(Row { id = 3, label = \"three\" });\n",
+    "\tcell.update(2, |&mut row| {\n",
+    "\t\trow.label = \"TWO\";\n",
+    "\t});\n",
+    "\tcell.remove(1);\n",
+    "\tcell.insert(Row { id = 3, label = \"THREE\" });\n",
+    "\tfor delta in cell.since(cursor) {\n",
+    "\t\tprint(describe(delta));\n",
+    "\t}\n",
+    "\tprint(labels(cell.get()));\n",
+    "\tmatch cell.locate(3) {\n",
+    "\t\tSome(let found) => print(i\"3 at {found.0}: {found.1.label}\"),\n",
+    "\t\tNone => print(\"3 missing\"),\n",
+    "\t}\n",
+    "\tcell.set([Row { id = 9, label = \"nine\" }]);\n",
+    "\tprint(labels(cell.get()));\n",
+    "\tfor delta in cell.since(cursor) {\n",
+    "\t\tprint(describe(delta));\n",
+    "\t}\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
