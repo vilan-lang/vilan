@@ -8893,3 +8893,87 @@ fn b392_the_annotated_parameter_control() {
         "5\n",
     );
 }
+
+// --- B403: a static call on a bounded impl generic nothing binds -------------
+//
+// The owner's ruling (2026-09-26): a BARE `Type::f()` inside `Type`'s own impl
+// MEANS `Self::f()` (std's JSON statics are the exhibit), and outside every
+// impl of `Type` a bounded impl parameter that neither the arguments nor the
+// return can bind is refused. Unbound, JS stopped with an internal error and
+// the native build emitted ONE instance for every `Holder<X>` (`A A`).
+
+const B403_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "trait Label { fun label(): str; }\n",
+    "struct A {}\n",
+    "impl A with Label { fun label(): str { \"A\" } }\n",
+    "struct B {}\n",
+    "impl B with Label { fun label(): str { \"B\" } }\n",
+    "struct Holder<T> { v: T }\n",
+);
+
+#[test]
+fn b403_a_bare_static_inside_its_own_impl_means_self() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun tag(): str { T::label() }\n",
+                "\tfun show(self): str { Holder::tag() }\n",
+                "\tfun show_self(self): str { Self::tag() }\n",
+                "\tfun show_named(self): str { Holder<T>::tag() }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder { v = A {} }.show());\n",
+                "\tprint(Holder { v = B {} }.show());\n",
+                "\tprint(Holder { v = A {} }.show_self());\n",
+                "\tprint(Holder { v = B {} }.show_named());\n",
+                "}\n",
+            )
+        ),
+        "A\nB\nA\nB\n",
+    );
+}
+
+#[test]
+fn b403_a_bare_static_outside_the_impl_that_nothing_binds_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun tag(): str { T::label() }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder<A>::tag());\n",
+                "\tprint(Holder::tag());\n",
+                "}\n",
+            )
+        ),
+        "cannot infer 'T' for this call; its bound ': Label' cannot be checked",
+    );
+}
+
+#[test]
+fn b403_a_bare_static_bound_by_its_arguments_or_its_return_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun make(v: T): Holder<T> { Holder { v } }\n",
+                "\tfun name(self): str { T::label() }\n",
+                "\tfun parse(text: str): Option<Holder<T>> { None }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder::make(A {}).name());\n",
+                "\tprint(Holder::make(B {}).name());\n",
+                "\tlet parsed: Option<Holder<B>> = Holder::parse(\"x\");\n",
+                "\tprint(parsed.is_none());\n",
+                "}\n",
+            )
+        ),
+        "A\nB\ntrue\n",
+    );
+}

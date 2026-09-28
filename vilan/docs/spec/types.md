@@ -644,6 +644,15 @@ declaration or nothing, and the refusal names the trait's spelling.
 The trait's own generic parameters bind from the call, like any generic
 function's: `Signal::new(7)` binds `T = i32`.
 
+An impl's parameters bind at a `Type::func(..)` path the same way — from
+the type arguments written on the path (`Holder<A>::tag()`), from the
+arguments, or from where the result lands. A path written with the BARE
+type name inside one of that type's own impls means `Self::func(..)`: the
+enclosing instance's arguments (`Holder::tag()` inside `impl Holder<type T:
+Label>` is `Holder<T>::tag()`). Outside every impl of the type, a bounded
+parameter that none of those binds is refused (`cannot infer 'T' for this
+call`) — there is no instance to dispatch its bound through.
+
 A trait parameter's bound is in scope inside the trait's own default
 bodies, exactly as a function's or impl's is inside theirs (§5.6): a
 default may call the bound trait's members on a value of that parameter's

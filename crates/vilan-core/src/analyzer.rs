@@ -4229,6 +4229,11 @@ pub struct Analyzer<'src> {
     // — without it they were silently discarded (the empty-inner-function /
     // cross-call-collision class).
     static_subject_bindings: HashMap<Id, SubstitutionContext>,
+    /// B403: the subjects of `Type::f(..)` paths written with a BARE nominal
+    /// (no type arguments) that resolved to an impl member — the calls whose
+    /// impl parameters only the arguments or the return can bind, which the
+    /// never-silent invariant asks about.
+    bare_static_path_subjects: HashSet<Id>,
     /// The type ids an `impl` HEAD walked — its subject and its `with` clause
     /// (B299). A name that fails to resolve THERE is a name in the head, not a
     /// body reaching for the implicit binder, so the head's steer would be
@@ -6138,6 +6143,7 @@ impl<'src> Analyzer<'src> {
             dyn_refusals_reported: HashSet::default(),
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::default(),
+            bare_static_path_subjects: HashSet::default(),
             impl_body_subjects: HashMap::default(),
             impl_head_type_ids: HashSet::default(),
             trait_qualified_calls: HashMap::default(),
@@ -7140,7 +7146,36 @@ impl<'src> Analyzer<'src> {
             if self.call_stands_down_on_refused_annotation(call_id) {
                 continue;
             }
-            for constraint_id in own_generics {
+            // B403: a bare `Type::f()` OUTSIDE `Type`'s impls binds the impl's
+            // parameters from nothing the path wrote. The arguments bind the
+            // ones they mention (recorded); one the RETURN mentions is bound
+            // where the result lands (`Map::new()`'s `K`, from its first
+            // insert). A BOUNDED one that neither reaches names nothing, and
+            // the native build emitted one instance for every instantiation
+            // (`A A` for a `Holder<B>`) — so it is this invariant's case.
+            let mut unbindable = Vec::new();
+            if self
+                .function_calls
+                .get(&call_id)
+                .is_some_and(|call| self.bare_static_path_subjects.contains(&call.subject_id))
+            {
+                let mut in_return = Vec::new();
+                if let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&member_id)
+                    && let Some(return_type_id) = self
+                        .functions
+                        .get(function_id)
+                        .and_then(|function| function.return_type_id)
+                {
+                    let return_type = return_type_id.get_type(self);
+                    self.collect_generics(&return_type, 0, &mut in_return);
+                }
+                unbindable = self
+                    .impl_binder_generics(member_id)
+                    .into_iter()
+                    .filter(|generic| !in_return.contains(generic))
+                    .collect();
+            }
+            for constraint_id in own_generics.into_iter().chain(unbindable) {
                 let bound_traits = self.generic_bound_traits(constraint_id);
                 if bound_traits.is_empty() {
                     continue;
@@ -30161,6 +30196,28 @@ impl<'src> Analyzer<'src> {
             .collect()
     }
 
+    /// B403: the enclosing impl's `Self` when it is an application of the
+    /// same nominal as `bare` (a struct or enum written with no arguments) —
+    /// what a bare `Type::f()` inside `Type`'s own impl means. `None` outside
+    /// every impl of that nominal, and for a non-generic one (nothing to
+    /// bind).
+    fn enclosing_self_of_same_nominal(&self, expr_id: Id, bare: &Type) -> Option<Type> {
+        let scope_id = *self.expr_id_to_scope_id_map.get(&expr_id)?;
+        let self_id = self.try_get_type_id_by_name("Self", scope_id)?;
+        let self_type = self
+            .type_id_to_type_map
+            .get(self.expr_id_to_type_id_map.get(&self_id)?)?;
+        match (bare, self_type) {
+            (Type::Struct(bare_id, _), Type::Struct(self_nominal, arguments))
+            | (Type::Enum(bare_id, _), Type::Enum(self_nominal, arguments))
+                if bare_id == self_nominal && !arguments.is_empty() =>
+            {
+                Some(self_type.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Registers the `Self` type within a trait/impl body scope. `self_type_id`
     /// is the concrete subject type for an `impl`, or an abstract placeholder
     /// (e.g. `any`) for a `trait`.
@@ -50033,6 +50090,28 @@ impl<'src> Analyzer<'src> {
                             if variant_id == Some(member_id) {
                                 self.seed_variant_subject_bindings(id, &subject_type);
                             }
+                            // B403 (the owner's ruling, 2026-09-26): a BARE
+                            // `Type::f()` inside `Type`'s own impl MEANS
+                            // `Self::f()` — the enclosing instance's arguments,
+                            // exactly as std's JSON statics
+                            // (`Option::from_json_value(value)` in `impl
+                            // Option<type T>`) have always read it. Unbound, the
+                            // call's impl parameters named nothing and the native
+                            // build emitted ONE instance for every `Holder<X>`.
+                            let subject_type = match &subject_type {
+                                Type::Struct(_, args) | Type::Enum(_, args) if args.is_empty() => {
+                                    match self.enclosing_self_of_same_nominal(id, &subject_type) {
+                                        Some(self_type) => self_type,
+                                        None => {
+                                            if impl_subject.is_some() {
+                                                self.bare_static_path_subjects.insert(id);
+                                            }
+                                            subject_type
+                                        }
+                                    }
+                                }
+                                _ => subject_type,
+                            };
                             let has_concrete_args = matches!(
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()

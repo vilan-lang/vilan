@@ -1025,6 +1025,43 @@ const B418_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B403: a bare `Holder::tag()` inside `impl Holder<type T: Label>` means
+/// `Self::tag()`, so each `Holder<X>` reaches its own `X::label()`. The
+/// native build emitted ONE instance for the unbound call and printed `A A`
+/// for a `Holder<B>`; JS stopped with an internal error.
+#[test]
+fn a_bare_static_inside_its_own_impl_dispatches_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b403.vl"), B403_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b403.vl"),
+        Verdict::Identical,
+        "a bare static inside its own impl must dispatch per instance on both backends"
+    );
+}
+
+const B403_PROBE: &str = concat!(
+    "trait Label { fun label(): str; }\n",
+    "struct A {}\n",
+    "impl A with Label { fun label(): str { \"A\" } }\n",
+    "struct B {}\n",
+    "impl B with Label { fun label(): str { \"B\" } }\n",
+    "struct Holder<T> { v: T }\n",
+    "impl Holder<type T: Label> {\n",
+    "\tfun tag(): str { T::label() }\n",
+    "\tfun show(self): str { Holder::tag() }\n",
+    "\tfun show_self(self): str { Self::tag() }\n",
+    "\tfun show_named(self): str { Holder<T>::tag() }\n",
+    "}\n",
+    "fun main() {\n",
+    "\tprint(Holder { v = A {} }.show_self());\n",
+    "\tprint(Holder { v = B {} }.show_named());\n",
+    "\tprint(Holder { v = A {} }.show());\n",
+    "\tprint(Holder { v = B {} }.show());\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
