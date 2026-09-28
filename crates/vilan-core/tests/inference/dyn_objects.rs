@@ -1290,3 +1290,65 @@ fn b430_a_tuple_value_erases_elementwise_at_a_mapped_position() {
         "1 b\n1 b\n",
     );
 }
+
+// --- B431: Q5 at every instantiation of an erased parameter ------------------
+//
+// B412 erases the enclosing declaration's own parameter `S` into a `dyn` when
+// its bounds provide the trait; the coercion's resource check could only ask
+// about `S`, so a `[resource]` instantiation compiled and the object dropped
+// the resource's teardown. Refused at the call that binds it, directly or
+// through a caller forwarding its own parameter.
+
+const B431_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src { fun get(self): i32; }\n",
+    "[resource] struct Handle { n: i32 }\n",
+    "impl Handle with Src { fun get(self): i32 { self.n } }\n",
+    "struct Plain { n: i32 }\n",
+    "impl Plain with Src { fun get(self): i32 { self.n } }\n",
+    "fun erase<S: Src>(own source: S): dyn Src { source }\n",
+);
+
+#[test]
+fn b431_an_erased_parameter_instantiated_at_a_resource_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B431_HEAD}{}",
+            "fun main() {\n\tprint(erase(Plain { n = 1 }).get());\n\tprint(erase(Handle { n = 2 }).get());\n}\n"
+        ),
+        "`Handle` is a resource, so it cannot become a `dyn Src`",
+    );
+}
+
+#[test]
+fn b431_a_forwarded_parameter_reaching_a_resource_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B431_HEAD}{}",
+            concat!(
+                "fun outer<T: Src>(own value: T): dyn Src { erase(value) }\n",
+                "fun main() {\n",
+                "\tprint(outer(Handle { n = 2 }).get());\n",
+                "}\n",
+            )
+        ),
+        "`Handle` is a resource, so it cannot become a `dyn Src`",
+    );
+}
+
+#[test]
+fn b431_an_erased_parameter_at_plain_values_still_runs() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B431_HEAD}{}",
+            concat!(
+                "fun outer<T: Src>(own value: T): dyn Src { erase(value) }\n",
+                "fun main() {\n",
+                "\tprint(erase(Plain { n = 1 }).get());\n",
+                "\tprint(outer(Plain { n = 2 }).get());\n",
+                "}\n",
+            )
+        ),
+        "1\n2\n",
+    );
+}

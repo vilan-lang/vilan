@@ -1388,7 +1388,11 @@ down as at the top.
 **Resources.** A `resource` value may not be coerced into a trait object.
 Teardown through a table would make the destructor dynamic where the rest
 of the language keeps it static (memory.md R7/R10), so the coercion is
-refused and the resource is held in a struct field of its own.
+refused and the resource is held in a struct field of its own. The rule
+holds at every instantiation: a generic parameter erased into an object
+(`fun erase<S: Src>(own source: S): dyn Src { source }`) is refused at
+the call that binds it to a resource, directly or through a caller that
+forwards its own parameter.
 
 **What reaches an object.** The members its trait and that trait's
 supertraits declare, through the table. Beyond those, only what is written

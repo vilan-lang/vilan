@@ -58,6 +58,9 @@ written down.
 <!-- family: miscompile -->
 **A built tuple erases element-wise at a tuple-of-objects position: `pair(t)` with `t: (Root, Root)` at `p: (dyn Src, dyn Src)` — and at a mapped `(U in T: dyn Source<U>)` — runs, where JS stopped with `p[0][1].get is not a function`.** B398 erased the elements of a tuple LITERAL at such a position; a tuple held in a binding or returned by a call reached the function bare. It is re-built by projection now, each object element paired with its table (`((t) => [[t[0], table], t[1]])(value)` — the value evaluated once, where it was written), which is what `(t.0, t.1)` spelled by hand does. The native build refuses the shape by name ("a tuple value erased element-wise") until it re-builds it too; before, rustc refused it. Tracker B430.
 
+<!-- family: miscompile -->
+**A generic parameter erased into a trait object cannot be instantiated at a resource: `erase(Handle { .. })` for `fun erase<S: Src>(own source: S): dyn Src { source }` is refused at the call ("`Handle` is a resource, so it cannot become a `dyn Src` …", noting where `S` is erased), where it compiled and the object dropped the resource's teardown.** A resource may never become an object (trait-objects.md's Q5); the check ran at the coercion, which for an erased PARAMETER sees only the parameter. It now runs over every instantiation, following a caller that forwards its own parameter (`fun outer<T: Src>(own value: T): dyn Src { erase(value) }`) to the concrete type at the outermost call. Tracker B431.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

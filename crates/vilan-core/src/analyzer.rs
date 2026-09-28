@@ -4237,6 +4237,9 @@ pub struct Analyzer<'src> {
     /// value landing there alone, or `None` for an element that passes as it
     /// is.
     dyn_tuple_coercions: HashMap<Id, Vec<Option<(TypeId, Id, Vec<TypeId>)>>>,
+    /// B431: every site at which a generic PARAMETER is erased into a `dyn`
+    /// (B412) — the site, the parameter, and the object type.
+    parameter_erasures: Vec<(Id, TypeId, TypeId)>,
     prepped_static_accessors: Vec<(Id, TypeId, &'src str)>,
     // A qualified-generic static subject's impl-binder bindings
     // (`Boxy<i32>::make` -> {impl's T -> i32}), keyed by the accessor expr id.
@@ -6154,6 +6157,7 @@ impl<'src> Analyzer<'src> {
             callable_coercions: HashMap::default(),
             dyn_coercions: HashMap::default(),
             dyn_tuple_coercions: HashMap::default(),
+            parameter_erasures: Vec::new(),
             dyn_method_calls: HashMap::default(),
             dyn_dispatched_members: HashSet::default(),
             dyn_object_traits: HashSet::default(),
@@ -35945,6 +35949,16 @@ impl<'src> Analyzer<'src> {
             }
             return;
         }
+        // B431: a PARAMETER erased here is bound per instance, and Q5 above
+        // sees only the parameter. The instantiations are asked after the
+        // build (`refuse_resource_parameter_erasures`).
+        if let Type::Generic(constraint_id) = inferred
+            && erasable_parameter
+        {
+            let object_type_id = constraint.clone().get_type_id(self);
+            self.parameter_erasures
+                .push((expr_id, *constraint_id, object_type_id));
+        }
         // The OBJECT's own trait and arguments ride with the site: an
         // `Expr::Local` reference stores no type on its own id (it reads
         // through the declaration it names), and the emitter needs both halves
@@ -47415,6 +47429,84 @@ impl<'src> Analyzer<'src> {
         Some(unified.unwrap_or(Type::Void))
     }
 
+    /// B431 — trait-objects.md §8.3's Q5 at monomorphisation. B412 erases the
+    /// enclosing declaration's own parameter `S` into a `dyn Trait` when its
+    /// bounds provide the trait, and the coercion's resource check could only
+    /// ask about `S`: `fun erase<S: Src>(own source: S): dyn Src { source }`
+    /// called with a `[resource]` value compiled, and the object dropped the
+    /// resource's teardown on the floor. Here every call's recorded binding
+    /// of the parameter is followed — through the generic bindings of callers
+    /// that forward their own parameter — to the concrete types it is
+    /// instantiated at, and a resource among them is refused at the call that
+    /// binds it, with the erasure noted. The walk is bounded (a forwarding
+    /// chain deeper than the cap is not followed further: NO is its answer).
+    fn refuse_resource_parameter_erasures(&mut self) {
+        if self.parameter_erasures.is_empty() {
+            return;
+        }
+        // generic → [(call, bound)], over every call's recorded bindings.
+        let mut edges: HashMap<TypeId, Vec<(Id, TypeId)>> = HashMap::default();
+        let mut calls: Vec<(&Id, &SubstitutionContext)> =
+            self.method_call_substitution.iter().collect();
+        calls.sort_unstable_by_key(|(call_id, _)| call_id.0);
+        for (call_id, substitution) in calls {
+            let mut bindings: Vec<(&TypeId, &TypeId)> = substitution.iter().collect();
+            bindings.sort_unstable_by_key(|(generic, _)| generic.0);
+            for (generic, bound) in bindings {
+                edges.entry(*generic).or_default().push((*call_id, *bound));
+            }
+        }
+        let erasures = std::mem::take(&mut self.parameter_erasures);
+        let mut reported: HashSet<(Id, Id)> = HashSet::default();
+        for (site, parameter, object) in erasures {
+            let mut frontier: Vec<(TypeId, usize)> = vec![(parameter, 0)];
+            let mut seen: HashSet<TypeId> = HashSet::default();
+            while let Some((generic, depth)) = frontier.pop() {
+                if depth > 32 || !seen.insert(generic) {
+                    continue;
+                }
+                let Some(bindings) = edges.get(&generic).cloned() else {
+                    continue;
+                };
+                for (call_id, bound) in bindings {
+                    let bound_type = bound.get_type(self);
+                    if let Type::Generic(next) = bound_type {
+                        frontier.push((next, depth + 1));
+                        continue;
+                    }
+                    if !self.type_is_resource(bound) || !reported.insert((call_id, site)) {
+                        continue;
+                    }
+                    let rendered = self.pretty_print_type(&bound_type, &HashMap::default());
+                    let object =
+                        self.pretty_print_type(&object.get_type(self), &HashMap::default());
+                    let generic_name =
+                        self.pretty_print_type(&Type::Generic(parameter), &HashMap::default());
+                    let note = self.span_map.get(&site).map(|span| Note {
+                        span: **span,
+                        msg: format!("`{generic_name}` becomes a `{object}` here"),
+                        source: self.source_of_id(site),
+                    });
+                    let span = **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN);
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note,
+                            span,
+                            msg: format!(
+                                "`{rendered}` is a resource, so it cannot become a `{object}`: a trait \
+                                 object's teardown would have to be dispatched through its table, and \
+                                 vilan keeps teardown static (memory.md R7/R10). Holding the resource in \
+                                 a struct field of your own is the sanctioned alternative"
+                            ),
+                        },
+                        call_id,
+                    );
+                }
+            }
+        }
+    }
+
     /// B426: see the call site in `finalize_build`.
     fn refuse_negative_unsigned_constants(&mut self) {
         let mut roots: Vec<Id> = Vec::new();
@@ -53537,6 +53629,9 @@ impl<'src> Analyzer<'src> {
         // non-literal operand (`z - 1` over `z: usize`) is not a constant and
         // is left to the runtime bounds rule (I5 ruling 2).
         self.refuse_negative_unsigned_constants();
+        // B431: Q5 (a `dyn` holds no resource) at every INSTANTIATION of an
+        // erased parameter, which the coercion site cannot see.
+        self.refuse_resource_parameter_erasures();
 
         // --- The starved-closure-parameter refusal (B131) --- a closure that
         // is never called leaves an unannotated parameter `Unknown` for good:
