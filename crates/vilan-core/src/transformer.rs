@@ -6431,6 +6431,9 @@ impl<'src> Transformer<'src> {
                 let t_iterable = self
                     .walk_entity(*iterable_id, block)
                     .unwrap_or(js::Node::Void);
+                // B400: a `Shared::read()` iterable whose loop can write the
+                // cell iterates a copy (the analyzer's decision).
+                let t_iterable = self.maybe_clone(*iterable_id, t_iterable);
                 // `Set` is a vilan struct over a `NativeMap`; iterate the backing
                 // map's stored originals (`set[0].values()`), in insertion order.
                 //

@@ -26709,6 +26709,41 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let argument_ids = function_call.argument_ids.clone();
+            // B400: a CLOSURE-typed callee holds its parameters' conventions in
+            // its type (`read: |&List<T>| U`), and a `&` there is the same
+            // promise a `fun`'s `&` parameter makes — a view, never a value.
+            // Unchecked, `read(self.items.read())` handed the closure the
+            // cell's live list where a `fun`'s `&` parameter refused the same
+            // argument, and a write to the cell inside showed through it (JS
+            // `seen=3`, native `seen=2`).
+            //
+            // SCOPED to that hazard (the owner's ruling, 2026-09-26): a CALL's
+            // result — a temporary, which for `Shared::read()` is the cell's
+            // own storage, uncopied — at a closure's view parameter. A PLACE
+            // (`mutate(list[at])` at a `|&mut T|`, std's `KeyedCell::update`)
+            // names storage the caller holds, and is not refused here, where a
+            // `fun`'s parameter still asks for the `&`-spelling below.
+            if let Some(views) = self.closure_callee_views(function_call.subject_id) {
+                for (view, argument_id) in views.iter().zip(argument_ids.iter()) {
+                    let Some(mutable) = view else {
+                        continue;
+                    };
+                    let kind = if *mutable { "&mut" } else { "&" };
+                    let temporary = matches!(
+                        self.expr_id_to_expr_map.get(argument_id),
+                        Some(Expr::Call(_))
+                    );
+                    if temporary && !self.assignment_target_is_view(*argument_id) {
+                        self.push_anchored(Error { trace: Vec::new(), note: None,
+                            span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
+                            ),
+                        }, *argument_id);
+                    }
+                }
+                continue;
+            }
             let callee_id = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
                 Some(Expr::Local(callee_id)) => *callee_id,
                 _ => continue,
@@ -26748,6 +26783,28 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+    }
+
+    /// B400: the per-parameter view conventions of a call whose callee is a
+    /// CLOSURE-typed value — a parameter, a local, or a field holding one —
+    /// read off the closure type as written (`|&List<T>| U`). `None` for a
+    /// named function (its parameters carry their conventions) and for a
+    /// closure type with no view parameter.
+    fn closure_callee_views(&self, subject_id: Id) -> Option<Vec<Option<bool>>> {
+        let type_id = match self.expr_id_to_expr_map.get(&subject_id)? {
+            Expr::Local(binding_id) | Expr::Parameter(binding_id) => self
+                .parameters
+                .get(binding_id)
+                .map(|parameter| parameter.type_id)
+                .or_else(|| {
+                    self.variables
+                        .get(binding_id)
+                        .map(|variable| variable.type_id)
+                })?,
+            Expr::Field(..) => self.expr_id_to_type_id_map.get(&subject_id).copied()?,
+            _ => return None,
+        };
+        self.closure_type_parameter_views.get(&type_id).cloned()
     }
 
     /// The text of the file `source` points at, when this analysis registered
@@ -27225,6 +27282,23 @@ impl<'src> Analyzer<'src> {
                 Expr::StructInitializer(_struct_id, assignments) => {
                     for value_id in assignments.values() {
                         consider(self, *value_id, None);
+                    }
+                }
+                // B400: a `for` over a `Shared::read()` TEMPORARY iterates the
+                // cell's own storage on JS (the read copies nothing, §6.1's "a
+                // temporary that only reads"). It is only a read while nothing
+                // writes the cell during the loop: a body that writes the cell
+                // IN PLACE (`cell.write().push(x)`) grew the array under the
+                // iteration (JS `b=4`, native — which iterates a copy — `b=3`),
+                // so that loop iterates a copy. A write reached only through a
+                // CALL in the body is not seen here — B267's call-conservative
+                // reading would copy std's every notify loop (a subscriber is a
+                // call); that is the copy-policy question, left to its ruling.
+                Expr::ForEach(iterable_id, _, _) => {
+                    if let Some(cell) = self.shared_cells.reads.get(iterable_id).copied()
+                        && self.spans_an_in_place_write(*expr_id, cell)
+                    {
+                        consider(self, *iterable_id, None);
                     }
                 }
                 Expr::Call(call_id) => {
@@ -28227,6 +28301,30 @@ impl<'src> Analyzer<'src> {
                 None => !self.shared_cells.reads.contains_key(other_id),
             }
         })
+    }
+
+    /// Whether a write that mutates `cell` IN PLACE (`cell.write().push(..)`,
+    /// not a rebind) lies inside `expr_id`'s source span — B400's loop test,
+    /// the narrow half of [`Self::spans_a_cell_hazard`] (which also counts
+    /// every call). Spans, for that function's reason: containment is a
+    /// superset of the subtree.
+    fn spans_an_in_place_write(&self, expr_id: Id, cell: CellSlot) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        let (start, end) = (span.start, span.end);
+        self.shared_cells
+            .writes
+            .iter()
+            .any(|(write_id, (written, rebinds))| {
+                *written == cell
+                    && !rebinds
+                    && self.source_of_id(*write_id) == Some(source)
+                    && self.span_map.get(write_id).is_some_and(|write_span| {
+                        write_span.start >= start && write_span.end <= end
+                    })
+            })
     }
 
     /// Every straight-line STATEMENT SEQUENCE in the program — the intervals

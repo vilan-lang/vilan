@@ -10351,3 +10351,161 @@ fn b433_well_typed_writes_at_every_place_compile_and_run() {
         "true true true 3 5\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B400 — a CLOSURE's `&` parameter takes a view, as a `fun`'s does
+// ---------------------------------------------------------------------------
+//
+// A closure-typed value whose parameter is `&List<T>` accepted
+// `self.items.read()` — a VALUE — where a `fun`'s `&` parameter refuses the
+// same argument ("a `&` parameter takes a view; pass `& <place>`"). JS then
+// passed the cell's live list uncopied, so a write to the cell inside the
+// closure showed through the parameter (`seen=3`; natively `seen=2`). The
+// closure type carries its parameters' conventions, and the view-argument
+// check now reads them. `std::delta`'s `ListCell::peek` was written this way
+// and re-spells through `Weak::get` (collections-42's patch, in this change).
+
+const B400_HOLDER: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "struct Holder { items: Shared<List<i32>> }\n",
+);
+
+/// collections-41's repro: a closure PARAMETER.
+#[test]
+fn b400_a_closure_parameters_view_refuses_a_shared_read() {
+    assert_fails_with(
+        &format!(
+            "{B400_HOLDER}{}",
+            concat!(
+                "impl Holder {\n",
+                "\tfun peek(self, read: sync |&List<i32>| usize): usize { read(self.items.read()) }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tlet holder = Holder { items = Shared::new([1, 2]) };\n",
+                "\tprint(holder.peek(|list| list.len()));\n",
+                "}\n",
+            )
+        ),
+        "a `&` parameter takes a view; pass `& <place>` (there is no implicit borrow).",
+    );
+}
+
+/// A closure held in a LOCAL, and one held in a struct FIELD, refuse alike; a
+/// `&mut` one names its own spelling.
+#[test]
+fn b400_a_local_and_a_field_closure_refuse_a_value_at_a_view_parameter() {
+    assert_fails_with(
+        &format!(
+            "{B400_HOLDER}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet holder = Holder { items = Shared::new([1, 2]) };\n",
+                "\tlet count: |&List<i32>| usize = |list| list.len();\n",
+                "\tprint(count(holder.items.read()));\n",
+                "}\n",
+            )
+        ),
+        "a `&` parameter takes a view",
+    );
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "struct Reader { read: |&mut List<i32>| usize }\n",
+            "fun make(): List<i32> { [1, 2] }\n",
+            "fun main() {\n",
+            "\tlet reader = Reader { read = |list| list.len() };\n",
+            "\tprint((reader.read)(make()));\n",
+            "}\n",
+        ),
+        "a `&mut` parameter takes a view; pass `&mut <place>`",
+    );
+}
+
+/// The spellings that ARE views still pass: `&place`, and a view binding
+/// forwarded (the `Weak::get` lend `peek` re-spells through).
+#[test]
+fn b400_a_view_argument_to_a_closure_view_parameter_still_runs() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun lend(cell: Shared<List<i32>>, read: sync |&List<i32>| usize): usize {\n",
+            "\tlet weak = cell.downgrade();\n",
+            "\tmatch weak.get() {\n",
+            "\t\tSome(let list) => read(list),\n",
+            "\t\tNone => 0,\n",
+            "\t}\n",
+            "}\n",
+            "fun apply(items: List<i32>, read: sync |&List<i32>| usize): usize { read(&items) }\n",
+            "fun main() {\n",
+            "\tprint(apply([1, 2, 3], |list| list.len()));\n",
+            "\tprint(lend(Shared::new([4, 5]), |list| list.len()));\n",
+            "}\n",
+        ),
+        "3\n2\n",
+    );
+}
+
+/// The owner's scoping (2026-09-26): a PLACE fed to a closure's `&mut`
+/// parameter is not the temporary-read hazard — std's `KeyedCell::update`
+/// passes `mutate(list[at])` — and is not refused.
+#[test]
+fn b400_a_place_at_a_closure_view_parameter_is_not_refused() {
+    assert_compiles(concat!(
+        "fun update(items: List<i32>, at: usize, mutate: |&mut i32| void) {\n",
+        "\tmut list = items;\n",
+        "\tmutate(list[at]);\n",
+        "}\n",
+        "fun main() {\n",
+        "\tupdate([1, 2], 0, |&mut value| { value += 1; });\n",
+        "}\n",
+    ));
+}
+
+/// The `for` half: a loop over a `Shared::read()` temporary whose body writes
+/// the cell IN PLACE iterates a copy, as the native backend always did (JS
+/// iterated the growing array: `b=4`).
+#[test]
+fn b400_a_for_over_a_read_whose_body_writes_the_cell_iterates_a_copy() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun main() {\n",
+            "\tlet cell: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+            "\tmut seen = 0;\n",
+            "\tfor x in cell.read() {\n",
+            "\t\tif seen < 1 { cell.write().push(x); }\n",
+            "\t\tseen += 1;\n",
+            "\t}\n",
+            "\tprint(i\"b={seen} len={cell.read().len()}\");\n",
+            "}\n",
+        ),
+        "b=3 len=4\n",
+    );
+}
+
+/// ...and a loop that only reads, or only REBINDS the cell, still copies
+/// nothing — the promise shared.vl makes for a temporary that only reads.
+#[test]
+fn b400_a_for_over_a_read_that_does_not_write_in_place_copies_nothing() {
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "import std::shared::Shared;\n",
+        "fun main() {\n",
+        "\tlet cell: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+        "\tmut kept: List<i32> = [];\n",
+        "\tfor x in cell.read() {\n",
+        "\t\tif x > 1 { kept.push(x); }\n",
+        "\t}\n",
+        "\tcell.write() = kept;\n",
+        "\tprint(cell.read().len());\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a read-only loop over a read must not copy:\n{emitted}"
+    );
+}
