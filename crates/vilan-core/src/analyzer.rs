@@ -44574,17 +44574,37 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 None => {
-                    let msg = self.type_mismatch_message(
+                    // E226: a `void` the annotation did not want, reaching the
+                    // binding through a method chain (`count.map(|n| { n * 2;
+                    // }).cell()`), is the regime-3 `;` in a closure the chain
+                    // was handed — the expectation stops at the receiver, so
+                    // the closure's own check never saw a target. Said at the
+                    // closure's brace, as the direct binding says it.
+                    if let Some((span, msg)) = self.void_closure_steer(
+                        first_value_id,
                         &variable_type,
                         &value_type,
                         &substitution_context,
-                    );
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: **self.span_map.get(&first_value_id).unwrap(),
-                        msg,
-                    });
+                    ) {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg,
+                        });
+                    } else {
+                        let msg = self.type_mismatch_message(
+                            &variable_type,
+                            &value_type,
+                            &substitution_context,
+                        );
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&first_value_id).unwrap(),
+                            msg,
+                        });
+                    }
                 }
             }
         }
@@ -45232,6 +45252,74 @@ impl<'src> Analyzer<'src> {
             format!(
                 "Expected {return_type_rendered}, but got void instead: this body ends without producing a value."
             )
+        }
+    }
+
+    /// E226: the regime-3 steer for a mismatch whose `void` came out of a
+    /// closure somewhere down the value's call chain. `expected` and `got`
+    /// are walked together to the first position where `got` is `void` and
+    /// `expected` is a real type; the value's calls are searched (receiver
+    /// first, then arguments, depth-capped — past the cap the answer is NO)
+    /// for a closure whose braced body ends without a value; the steer is the
+    /// one a closure checked against that type directly gets, at its brace.
+    /// `None` leaves the plain mismatch standing.
+    fn void_closure_steer(
+        &mut self,
+        value_id: Id,
+        expected: &Type,
+        got: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> Option<(Span, String)> {
+        let wanted = self.expected_at_void(expected, got, 0)?;
+        let (brace, last_statement) = self.void_closure_in_chain(value_id, 0)?;
+        let msg = self.missing_return_value_message(last_statement, &wanted, substitution_context);
+        Some((brace, msg))
+    }
+
+    /// E226: the first position where `got` holds `void` and `expected` a
+    /// real type, walking the two in step.
+    fn expected_at_void(&self, expected: &Type, got: &Type, depth: usize) -> Option<Type> {
+        if depth > 16 {
+            return None;
+        }
+        match (expected, got) {
+            (_, Type::Void) if !matches!(expected, Type::Void | Type::Unknown | Type::Any) => {
+                Some(expected.clone())
+            }
+            (Type::Struct(left, lefts), Type::Struct(right, rights))
+            | (Type::Enum(left, lefts), Type::Enum(right, rights))
+                if left == right && lefts.len() == rights.len() =>
+            {
+                lefts.iter().zip(rights.iter()).find_map(|(left, right)| {
+                    self.expected_at_void(&left.get_type(self), &right.get_type(self), depth + 1)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// E226: a closure literal reachable through `value_id`'s calls (a call's
+    /// arguments, the receiver being argument 0 of a method call) whose
+    /// braced body ends in the parser's synthesized `void` — its brace and
+    /// its last statement.
+    fn void_closure_in_chain(&self, value_id: Id, depth: usize) -> Option<(Span, Option<Id>)> {
+        if depth > 16 {
+            return None;
+        }
+        match self.expr_id_to_expr_map.get(&value_id)? {
+            Expr::Closure(closure_id) => {
+                let closure = self.closures.get(closure_id)?;
+                let (brace, tail, statements) = self.closure_block_tail(closure.return_)?;
+                matches!(self.expr_id_to_expr_map.get(&tail), Some(Expr::Void))
+                    .then(|| (brace, statements.last().copied()))
+            }
+            Expr::Call(call_id) => {
+                let call = self.function_calls.get(call_id)?;
+                call.argument_ids
+                    .iter()
+                    .find_map(|argument| self.void_closure_in_chain(*argument, depth + 1))
+            }
+            _ => None,
         }
     }
 

@@ -70,6 +70,9 @@ written down.
 <!-- family: diagnostics -->
 **A method named `Self` is refused where it is declared ("a function cannot be named `Self`: `Self` names the type an `impl` or `trait` is about, so `value.Self()` reads as that type and never reaches this member"), where it was accepted and then unreachable — and its declaration shadowed the impl's own `Self`, so the body's `self.x` failed with a confusing "cannot access field 'x' on type unknown".** Tracker B417.
 
+<!-- family: diagnostics -->
+**The regime-3 `;` steer reaches a closure down a method chain: `let doubled: SignalCell<i32> = count.map(|n| { n * 2; }).cell();` says "Expected i32, but got void instead: the `;` discards this body's last value." at the closure's `}`, where it said "Expected SignalCell<i32>, but got SignalCell<void>" over the whole chain.** The expectation stops at `.cell()`'s receiver, so the closure's own check never had a target; the binding's mismatch now walks the two types to the position where the value is `void` and finds the `;`-ended closure among the chain's calls. Tracker E226.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->
