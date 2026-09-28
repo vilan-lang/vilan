@@ -51815,6 +51815,31 @@ impl<'src> Analyzer<'src> {
             // `Enum`s that never reach `is_native_operator_primitive` at all.
             let numeric = self.is_native_operator_primitive(&operand_type)
                 && !self.is_str_type(&operand_type);
+            // B429: an UNSIGNED value has no negative to be negated into.
+            // B407 refuses a negative LITERAL at an unsigned type (the literal
+            // check, which reads the literal under the minus); a negated VALUE
+            // went through here as "numeric", computed a negative `usize` on
+            // JS and was refused by rustc natively.
+            if numeric
+                && !self.negated_number_literals.contains_key(&operand_id)
+                && let Some(name @ ("u8" | "u16" | "u32" | "u53" | "usize")) =
+                    self.numeric_primitive_name(&operand_type)
+            {
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&unary_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "`-` on an unsigned value: `{name}` has no negative values, so its \
+                             negation is out of range on every backend. Convert it to a signed \
+                             type first (`.as_i53()`) and negate that"
+                        ),
+                    },
+                    unary_id,
+                );
+                continue;
+            }
             if numeric {
                 continue;
             }

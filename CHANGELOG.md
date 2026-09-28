@@ -46,6 +46,9 @@ written down.
 <!-- family: fix -->
 **A literal `if` arm or `match` leg takes its sibling's numeric type: `let m = if n > 2 { n } else { 0 };` with `n: u53` types the `0` as `u53`, in either order and for a `match` leg alike, where it was "`if` arms have mismatched types: expected u53, but got i32".** With a declared type around it the arms were already typed from it; with none, the literal fell to its own default. It now takes the first typed arm's type when that is numeric — the peer step a literal binding already takes — and is held to that type's range (`300` beside a `u8` arm is out of range). Two literal arms keep the default. Tracker B423.
 
+<!-- family: fix -->
+**`-u` on an unsigned value is refused: `let n = -u;` with `u: usize` is "`-` on an unsigned value: `usize` has no negative values …", where JS computed a negative `usize` and the native build failed in rustc.** A negative LITERAL at an unsigned type was already refused (B407); a negated VALUE went through as ordinary arithmetic. Convert first: `-u.as_i53()`. Tracker B429.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

@@ -923,3 +923,31 @@ fn b423_two_literal_arms_keep_the_default() {
         "}\n",
     ));
 }
+
+// --- B429: `-` on an unsigned VALUE ------------------------------------------
+
+#[test]
+fn b429_negating_an_unsigned_value_is_refused() {
+    for width in ["u8", "u16", "u32", "u53", "usize"] {
+        assert_fails_once_with(
+            &format!("fun main() {{\n\tlet u: {width} = 3;\n\tlet n = -u;\n}}\n"),
+            &format!("`-` on an unsigned value: `{width}` has no negative values"),
+        );
+    }
+}
+
+#[test]
+fn b429_negating_a_converted_or_signed_value_compiles() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet u: usize = 3;\n",
+            "\tlet n = -u.as_i53();\n",
+            "\tlet s: i32 = 4;\n",
+            "\tprint(i\"{n} {-s}\");\n",
+            "}\n",
+        ),
+        "-3 -4\n",
+    );
+}
