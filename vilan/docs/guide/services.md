@@ -473,25 +473,35 @@ whatever it last held, and the **next** 0→1 lease asks again. So a row
 that re-renders after a failure retries by itself, and a view that shows
 a spinner or a retry button reads `status()` to decide which.
 
-**One handle per id.** Two views calling `get_message(id)` get two
-mirrors, two calls and two leases of one row. The server collapses the
-*channel* — a reply carrying a source it has already exported answers
-the channel it already minted, and withdraws it only when the last
-mirror lets go — but the client-side fix is yours and it is one line: a
-[`Memo`](../std/collections.md#memokv) keyed by the id, whose maker is
-the call.
+**One handle per origin.** A stub call is keyed by its *origin* — the
+method and its arguments, as the wire would carry them — and the
+client hands back the mirror it already minted for that origin: two
+views calling `get_message(id)` share one mirror, one call and one
+`Subscribe`. The entry lasts as long as something watches the mirror;
+once its last lease closes, the next call mints afresh (and a mirror
+you kept a handle to still works — its next lease re-issues its call).
+The server collapses the *channel* the same way underneath: a reply
+carrying a source it has already exported answers the channel it
+already minted, and withdraws it only when the last mirror lets go.
+
+That is what makes a stub safe inside a **cold select**. A node like
+`and_then` runs its select on every *read*, so a select that called a
+stub used to mint a fresh mirror per read — the `.cell()` below leased
+one mirror and refreshed from another, and read `[]` forever:
 
 ```vilan,fragment
-let bodies: Memo<str, RemoteSource<MessageBody>> = Memo::new();
-
-fun body_of(id: str): RemoteSource<MessageBody> {
-	bodies.get_or(id, || client().get_message(id))
-}
+// The select runs on every pull; with the per-origin table every pull
+// answers the SAME mirror, so the cell reads what its lease is fed.
+let channels: SignalCell<List<i32>> = client_cell
+	.and_then(|client| client.get_channels())
+	.map(|ids| ids.unwrap_or_default())
+	.cell();
 ```
 
-The stub does not memoize for you, deliberately: memoizing a handle is a
-decision about *identity* — which asks are the same ask — and generated
-code has no business making it.
+A [`Memo`](../std/collections.md#memokv) is no longer needed to get one
+handle per id; reach for one when you want to keep something *built
+over* the handle — and then what the maker builds outlives the caller,
+so a derivation in a maker is `.cell_global()`, never `.cell()`.
 
 **The element must be Wire, not the source.** The `SignalCell` never
 crosses; its values do, one `Update` frame at a time. So the Wire rule
@@ -529,6 +539,25 @@ method body does not run when you *call* the stub: nothing has been
 asked yet. If you need a server-side effect, that is a plain `[rpc]`
 method, not a handle.)
 
+**Return a cell that outlives the call.** The server dedups a reply by
+the *cell* it carries, so a getter that answers a cell the service keeps
+— a field, a row's cell — is one channel however often it is asked. A
+body that ends in `.map(..).cell()` mints a fresh cell per call instead:
+the dedup never hits (one capability and one forward per call), and the
+compiler warns at that `.cell()`. Every handler runs under its
+**connection's owner**, so such a cell's subscription is released when
+the connection closes rather than kept for the life of the process —
+but the fix is to keep the derived cell, keyed by the arguments, in a
+[`Memo`](../std/collections.md#memokv) on the service whose maker writes
+`.cell_global()`:
+
+```vilan,fragment
+[rpc]
+fun get_channel_ids(self): SignalCell<List<i32>> {
+	self.derived.get_or_insert("ids", || self.channels.map(|all| all.keys()).cell_global())
+}
+```
+
 **When the server frees it.** Demand decides. A mirror's last lease
 going away sends `Unsubscribe`, and for a channel a reply minted that
 withdraws the capability whole: the forward stops, the starter is
@@ -542,7 +571,10 @@ remount must find it on the same id.)
 
 "Last lease" means the last one on the **channel**, not on your mirror:
 where two mirrors ended up sharing a channel because they named the same
-source, the first to let go withdraws nothing.
+source — two methods answering one cell, say — the first to let go
+withdraws nothing. The second one's `Subscribe` joins the forward the
+first already holds, so the server sends it no seed; the client seeds it
+from its sibling instead, and it reads the channel's value at once.
 
 Two consequences worth having in mind. A dispose and a remount anywhere
 inside one macrotask — two event handlers, a route change, an `each`

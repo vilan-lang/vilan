@@ -834,8 +834,7 @@ function $aQ(self, subscriber) {
 	return $aR(self[0], subscriber);
 }
 function $aM(source, observer) {
-	const subscriber = $aN(source, observer);
-	return $aQ(source, subscriber);
+	return $aQ(source, $aN(source, observer));
 }
 function $aL(self, observer) {
 	return $aM(self, observer);
@@ -864,8 +863,7 @@ function $bf(self, subscriber) {
 	return $aR(self[0], subscriber);
 }
 function $bb(source, observer) {
-	const subscriber = $bc(source, observer);
-	return $bf(source, subscriber);
+	return $bf(source, $bc(source, observer));
 }
 function $ba(self, observer) {
 	return $bb(self, observer);

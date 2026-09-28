@@ -549,6 +549,28 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// return its stdout (the same bound, and the same reason for it, as
 /// `service_layer.rs`).
 fn run_program(tag: &str, source: &str) -> String {
+    let (stdout, stderr) = run_program_capturing(tag, source);
+    assert!(
+        stderr.trim().is_empty(),
+        "the program wrote to stderr:\n{stderr}\n--- stdout ---\n{stdout}"
+    );
+    stdout
+}
+
+/// [`run_program`] for a program that is EXPECTED to build with one warning:
+/// its stderr must carry `warning` and nothing that reads as an error. The
+/// A135 programs are the shape the warning exists for, so the build that runs
+/// them is also the pin that it is raised through the real pipeline.
+fn run_program_warning(tag: &str, source: &str, warning: &str) -> String {
+    let (stdout, stderr) = run_program_capturing(tag, source);
+    assert!(
+        stderr.contains(warning) && !stderr.contains("Error"),
+        "expected exactly the warning {warning:?} on stderr, got:\n{stderr}\n--- stdout ---\n{stdout}"
+    );
+    stdout
+}
+
+fn run_program_capturing(tag: &str, source: &str) -> (String, String) {
     let dir = temp_project(tag);
     write(
         &dir,
@@ -589,12 +611,8 @@ fn run_program(tag: &str, source: &str) -> String {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert!(
-        stderr.trim().is_empty(),
-        "the program wrote to stderr:\n{stderr}\n--- stdout ---\n{stdout}"
-    );
     let _ = std::fs::remove_dir_all(&dir);
-    stdout
+    (stdout, stderr)
 }
 
 /// One session and one client over an in-process duplex, driving a single
@@ -2819,5 +2837,918 @@ fn a114_a_mirror_lease_taken_in_a_scoped_effect_is_released_at_the_runs_end() {
         ],
         "a mirror lease taken inside a scoped effect must be released when that \
          run ends, and the last one by the boundary; got:\n{stdout}"
+    );
+}
+
+// --- A134: a handle stub is idempotent per ORIGIN ---------------------------
+
+/// A134, IN PROCESS (a `duplex_pair` link and a `local_rpc` transport stamped
+/// for the session — the generated client, reached as a hand-wired in-process
+/// client reaches it). Three claims, each its own block: one origin is one
+/// mirror; a stub inside a COLD select reads the mirror its lease keeps live;
+/// the entry goes with the mirror's last lease.
+const A134_ORIGIN_DEDUP: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::map::Map;
+import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
+import std::rpc::{ DuplexEnd, LocalTransport, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::Frame;
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	names: Shared<Map<i32, SignalCell<str>>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	[rpc]
+	fun create_channel(self, id: i32, name: str): i32 {
+		self.channels.update(|&mut ids| {
+			ids.push(id);
+		});
+		let cell: SignalCell<str> = Signal::new(name);
+		self.names.write().insert(id, cell);
+		id
+	}
+
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels
+	}
+
+	[rpc]
+	fun get_name(self, id: i32): Option<SignalCell<str>> {
+		self.calls.write() += 1;
+		self.names.read().get(id)
+	}
+}
+
+fun text_of(frame: Frame): str {
+	match frame {
+		Frame::Text(let text) => text,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+/// The link counts `Subscribe` frames going up — "one mirror" is a claim about
+/// the wire, not only about an object.
+fun counted_pair(subscribes: Shared<i32>): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		let text = text_of(frame);
+		if text.contains("Subscribe") && !text.contains("Unsubscribe") {
+			subscribes.write() += 1;
+		}
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| client_relay.send(frame));
+	(client_end, server_end)
+}
+
+fun same<T>(left: RemoteSource<T>, right: RemoteSource<T>): bool {
+	left.count.identity() == right.count.identity()
+}
+
+fun main() {
+	let store = Store { channels = Signal::new([]), names = Shared::new(Map::new()), calls = Shared::new(0) };
+	let subscribes: Shared<i32> = Shared::new(0);
+	let (client_end, server_end) = counted_pair(subscribes);
+	register_session(7, server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()).for_connection(7));
+	let reactive = ReactiveClient::new(client_end, json_codec());
+	let client = StoreClient { transport, codec = json_codec(), reactive };
+
+	// (1) Identity: one origin is one mirror; another argument is another origin.
+	print(i"same-origin:{same(client.get_channels(), client.get_channels())}");
+	print(i"same-args:{same(client.get_name(1), client.get_name(1))}");
+	print(i"other-args:{same(client.get_name(1), client.get_name(2))}");
+	print(i"unleased:calls={store.calls.read()} subscribes={subscribes.read()}");
+
+	// (2) The kolt shape: a stub inside a COLD select, pulled on every read.
+	let client_cell: SignalCell<Option<StoreClient<LocalTransport>>> = Signal::new(Some(client));
+	let page = Owner::new();
+	owner_scope.run(page, || {
+		let ids: SignalCell<List<i32>> = client_cell
+			.and_then(|held| held.get_channels())
+			.map(|value| value.unwrap_or_default())
+			.cell();
+		ids.effect(|value| print(i"cold-select sees {value.len()}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"create:{client.create_channel(1, "general").unwrap_or(0)}");
+	print(i"create:{client.create_channel(2, "random").unwrap_or(0)}");
+	print(i"leased:calls={store.calls.read()} subscribes={subscribes.read()}");
+
+	// (3) The entry goes with the mirror's last lease: after the page is gone
+	// and the close has flushed, the next stub call mints afresh.
+	let before = client.get_channels();
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print(i"released:fresh={!same(before, client.get_channels())}");
+	print("done");
+}
+"#;
+
+/// A134 (door a): the generated client dedups the mirrors it mints per ORIGIN —
+/// the method and its described arguments — so a stub call is idempotent.
+///
+/// - **One origin, one mirror.** Two `get_channels()` calls are one object (the
+///   count cell's identity), two `get_name(1)`s are one, and `get_name(1)` /
+///   `get_name(2)` are two: the arguments are part of the origin. Unleased,
+///   nothing was asked (`calls=0`) — dedup does not make a stub eager.
+/// - **The cold select.** `and_then` runs its select on every PULL, so before
+///   the table every pull minted a fresh mirror: `.cell()` read one, its
+///   `on_settle` leased a second, and each refresh read a third, so the cell
+///   read `0` forever while the leased mirror went unread (the red read
+///   `cold-select sees 0` after both creates). With the table every pull
+///   answers the one mirror its lease keeps live — `0`, `1`, `2` — on ONE
+///   call and ONE `Subscribe`.
+/// - **Released with the last lease.** After the page owner is disposed and
+///   the close has flushed (the settle, then the microtask hop), the next stub
+///   call mints a fresh mirror: the table holds what the app watches, not
+///   everything it ever watched.
+///
+/// The socket twin is the next test.
+#[test]
+fn a134_two_stub_calls_for_one_origin_are_one_mirror_and_one_subscribe() {
+    let stdout = run_program("a134_origin", A134_ORIGIN_DEDUP);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "same-origin:true",
+            "same-args:true",
+            "other-args:false",
+            "unleased:calls=0 subscribes=0",
+            // The effect's immediate call (nothing has arrived, so the
+            // default), then the seed.
+            "cold-select sees 0",
+            "cold-select sees 0",
+            "cold-select sees 1",
+            "create:1",
+            "cold-select sees 2",
+            "create:2",
+            "leased:calls=1 subscribes=1",
+            "released:fresh=true",
+            "done",
+        ],
+        "a stub call must be idempotent per origin; got:\n{stdout}"
+    );
+}
+
+/// A134 OVER A SOCKET: the same cold-select shape, server and client in one
+/// process joined by a real WebSocket (`Server` on port 0, the generated
+/// `connect`). The in-process pin above is not evidence for this one (the
+/// order's rule: an in-process probe is not a socket probe), and this is the
+/// transport kolt runs on.
+const A134_ORIGIN_DEDUP_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ RemoteSource, SocketTransport };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	[rpc]
+	fun create_channel(self, id: i32): i32 {
+		self.channels.update(|&mut ids| {
+			ids.push(id);
+		});
+		id
+	}
+
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels
+	}
+
+	[rpc]
+	fun calls(self): i32 {
+		self.calls.read()
+	}
+}
+
+let store: Store = Store { channels = Signal::new([]), calls = Shared::new(0) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun same<T>(left: RemoteSource<T>, right: RemoteSource<T>): bool {
+	left.count.identity() == right.count.identity()
+}
+
+async fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			print(i"same-origin:{same(client.get_channels(), client.get_channels())}");
+			let client_cell: SignalCell<Option<StoreClient<SocketTransport>>> = Signal::new(Some(client));
+			let page = Owner::new();
+			let seen: Shared<i32> = Shared::new(0);
+			owner_scope.run(page, || {
+				let ids: SignalCell<List<i32>> = client_cell
+					.and_then(|held| held.get_channels())
+					.map(|value| value.unwrap_or_default())
+					.cell();
+				ids.effect(|value| {
+					seen.write() += 1;
+					print(i"cold-select sees {value.len()}");
+				});
+			});
+			// The seed is the mint's round trip plus the `Subscribe`'s; wait
+			// for it by what it does, never by a duration. After it, each
+			// create's `Update` precedes its reply on the one socket.
+			mut tries = 0;
+			for seen.read() < 2 && tries < 1000 {
+				sleep(10);
+				tries += 1;
+			}
+			print(i"create:{client.create_channel(1).unwrap_or(0)}");
+			print(i"create:{client.create_channel(2).unwrap_or(0)}");
+			print(i"calls:{client.calls().unwrap_or(0 - 1)}");
+			page.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a134_a_stub_in_a_cold_select_reads_its_leased_mirror_over_a_socket() {
+    let stdout = run_program("a134_socket", A134_ORIGIN_DEDUP_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "same-origin:true",
+            "cold-select sees 0",
+            "cold-select sees 0",
+            "cold-select sees 1",
+            "create:1",
+            "cold-select sees 2",
+            "create:2",
+            "calls:1",
+        ],
+        "over a socket, a stub inside a cold select must read the mirror its \
+         lease keeps live, on one call; got:\n{stdout}"
+    );
+}
+
+// --- A137: a mirror that JOINS a held forward is seeded ---------------------
+
+/// A137 IN PROCESS: two ORIGINS (`notes` / `notes_again`, `rows` /
+/// `rows_again`) answering ONE cell, so `expose_dynamic` puts both mirrors on
+/// one channel while the client (A134) keeps two. The socket twin is next.
+const A137_JOIN_SEED: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// Two methods answering ONE cell: `expose_dynamic` dedups them onto one
+// channel, and they are two ORIGINS, so the client keeps two mirrors.
+[service(BoardClient)]
+struct Board {
+	notes: SignalCell<List<str>>,
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun add(self, text: str): i32 {
+		self.notes.update(|&mut list| {
+			list.push(text);
+		});
+		self.rows.insert(Row { id = text, text });
+		0
+	}
+
+	[rpc]
+	fun notes(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun notes_again(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+fun size(list: Option<List<str>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+fun rows_size(list: Option<List<Row>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+fun main() {
+	let board = Board { notes = Signal::new(["seed"]), rows = KeyedCell::new([Row { id = "seed", text = "seed" }]) };
+	let (client_end, server_end) = duplex_pair();
+	register_session(3, server_end, json_codec());
+	let transport = local_rpc(board.dispatcher().into_protocol(json_codec()).for_connection(3));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+
+	let first: RemoteSource<List<str>> = client.notes();
+	let second: RemoteSource<List<str>> = client.notes_again();
+	let _first = first.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	let _second = second.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	print(i"plain: same-channel={first.channel.read() == second.channel.read()} first={size(first.get())} second={size(second.get())}");
+	let rows: KeyedSource<str, Row> = client.rows();
+	let rows_again: KeyedSource<str, Row> = client.rows_again();
+	let _rows = rows.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	let _rows_again = rows_again.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	print(i"keyed: same-channel={rows.channel.read() == rows_again.channel.read()} first={rows_size(rows.get())} second={rows_size(rows_again.get())}");
+	print(i"add:{client.add("x").unwrap_or(0 - 1)}");
+	print(i"after: plain={size(first.get())}/{size(second.get())} keyed={rows_size(rows.get())}/{rows_size(rows_again.get())}");
+}
+"#;
+
+/// A137, settled: the second mirror's `Subscribe` JOINS the forward the first
+/// holds (`LiveForward.holds`) and the server sends it no seed — a frame names
+/// a channel, not a mirror, so a re-seed would reach the sibling too. The
+/// joiner therefore held nothing until the channel's next change
+/// (`second=-1`), and a KEYED joiner was worse than silent: the next patch
+/// landed on an empty mirror and left it DESYNCED for good (`keyed=2/1` after
+/// the add — the seed row never arrives). Both reproduce over a socket (the
+/// next test), so this is the mechanism and not A133's in-process caveat. The
+/// fix is the client's, where the joiner can be seeded ALONE: the sibling's
+/// route re-encodes what it holds (an `Update`, or a `Patch` of one `Reset`)
+/// and the joiner's own deliverer lands it (`seed_from_sibling`). Red before on
+/// the four `second=`/`keyed=` values.
+#[test]
+fn a137_a_mirror_joining_a_held_forward_is_seeded_from_its_sibling() {
+    let stdout = run_program("a137_join", A137_JOIN_SEED);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "plain: same-channel=true first=1 second=1",
+            "keyed: same-channel=true first=1 second=1",
+            "add:0",
+            "after: plain=2/2 keyed=2/2",
+        ],
+        "a mirror whose Subscribe joins a sibling's forward must hold the \
+         channel's value; got:\n{stdout}"
+    );
+}
+
+/// A137 OVER A SOCKET — the run the order asked for before anything was built:
+/// server and client in one process over a real WebSocket, the same two
+/// origins per cell. Readiness is polled (a mirror's channel is bound the
+/// moment its rebind has run, and the join seed is synchronous inside it).
+const A137_JOIN_SEED_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource, RemoteSource };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// Two methods answering ONE cell: `expose_dynamic` dedups them onto one
+// channel, and they are two ORIGINS, so the client keeps two mirrors.
+[service(BoardClient)]
+struct Board {
+	notes: SignalCell<List<str>>,
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun add(self, text: str): i32 {
+		self.notes.update(|&mut list| {
+			list.push(text);
+		});
+		self.rows.insert(Row { id = text, text });
+		0
+	}
+
+	[rpc]
+	fun notes(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun notes_again(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+let board: Board = Board { notes = Signal::new(["seed"]), rows = KeyedCell::new([Row { id = "seed", text = "seed" }]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+/// Wait until `ready` holds, by polling — never by a duration alone.
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 1000 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+fun size(list: Option<List<str>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+fun rows_size(list: Option<List<Row>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+async fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			// PLAIN. The first mirror leases and is seeded by the server.
+			let first: RemoteSource<List<str>> = client.notes();
+			let second: RemoteSource<List<str>> = client.notes_again();
+			let _first = first.sub(|list| {});
+			until(|| first.get().is_some());
+			// The JOIN: the second mirror's mint lands on the SAME channel and
+			// its `Subscribe` joins the forward the first holds — the server
+			// sends no seed for it. `rebind` runs the join synchronously, so the
+			// moment the channel is bound is the moment to read.
+			let _second = second.sub(|list| {});
+			until(|| second.channel.read() >= 0);
+			print(i"plain: same-channel={first.channel.read() == second.channel.read()} first={size(first.get())} second={size(second.get())}");
+			// KEYED, the same shape through a whole-collection lease.
+			let rows: KeyedSource<str, Row> = client.rows();
+			let rows_again: KeyedSource<str, Row> = client.rows_again();
+			let _rows = rows.sub(|list| {});
+			until(|| rows.get().is_some());
+			let _rows_again = rows_again.sub(|list| {});
+			until(|| rows_again.channel.read() >= 0);
+			print(i"keyed: same-channel={rows.channel.read() == rows_again.channel.read()} first={rows_size(rows.get())} second={rows_size(rows_again.get())}");
+			// And after a change both carry it, as they did before.
+			print(i"add:{client.add("x").unwrap_or(0 - 1)}");
+			until(|| size(second.get()) == 2 && rows_size(rows_again.get()) == 2);
+			print(i"after: plain={size(first.get())}/{size(second.get())} keyed={rows_size(rows.get())}/{rows_size(rows_again.get())}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a137_a_joining_mirror_is_seeded_over_a_socket() {
+    let stdout = run_program("a137_join_socket", A137_JOIN_SEED_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "plain: same-channel=true first=1 second=1",
+            "keyed: same-channel=true first=1 second=1",
+            "add:0",
+            "after: plain=2/2 keyed=2/2",
+        ],
+        "over a socket, a mirror whose Subscribe joins a sibling's forward must \
+         hold the channel's value; got:\n{stdout}"
+    );
+}
+
+// --- A135: a handler runs under its CONNECTION's owner ----------------------
+
+/// A135 IN PROCESS: kolt's shape — a handle method whose body is
+/// `self.channels.map(..).cell()` — called three times (three leases, each
+/// released for real, so three mints), then the connection's session dropped.
+/// The store cell's live registrations are counted directly.
+const A135_CONNECTION_OWNER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell, Source };
+import std::rpc::{ ReactiveClient, RemoteSource, drop_session, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	// The shape A135 found in kolt's store: a derived cell minted per CALL.
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels.map(|ids| ids).cell()
+	}
+}
+
+/// The registrations standing on a cell's subscriber list that are still live.
+fun live_on<T>(cell: SignalCell<T>): i32 {
+	mut live = 0;
+	for subscriber in cell.subscribers.read() {
+		if subscriber.live.read() {
+			live += 1;
+		}
+	}
+	live
+}
+
+fun main() {
+	let channels: SignalCell<List<i32>> = Signal::new([1, 2]);
+	let store = Store { channels, calls = Shared::new(0) };
+	// The app's own watcher: the one registration that must survive.
+	let _app = channels.sub(|ids| {});
+	print(i"baseline:{live_on(channels)}");
+	let (client_end, server_end) = duplex_pair();
+	register_session(9, server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()).for_connection(9));
+	let client = StoreClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	// Three leases, each released for real before the next: three mints, so
+	// three CALLS, each minting its own derived cell on the server.
+	mut round = 0;
+	for round < 3 {
+		let mirror: RemoteSource<List<i32>> = client.get_channels();
+		let lease = mirror.sub(|ids| {});
+		sleep_for(Duration::millis(0));
+		lease.dispose();
+		sleep_for(Duration::millis(0));
+		sleep_for(Duration::millis(0));
+		round += 1;
+	}
+	print(i"connected:calls={store.calls.read()} live={live_on(channels)}");
+	// The connection goes: its session, and with A135 its OWNER, are disposed.
+	drop_session(9);
+	print(i"disconnected:live={live_on(channels)}");
+}
+"#;
+
+/// A135 (door b): the dispatcher runs each handler under the connection's owner
+/// (`rpc::under_connection`, written into every generated route), and
+/// `ReactiveServer::dispose` — which `drop_session` runs — disposes it. A
+/// per-call `.cell()` used to keep its registration on the store's cell for
+/// the life of the PROCESS: `disconnected:live=4` before (the app's own watcher
+/// plus one per call), `1` after — ONE registration, the app's. While the
+/// connection lives the three stand (`connected:… live=4`): door (b) bounds the
+/// leak by the connection and does not restore the dedup, which is what the
+/// compiler's warning at that `.cell()` steers to (door c, pinned in
+/// `vilan-core`'s `inference::lifetimes`).
+#[test]
+fn a135_n_calls_of_a_per_call_cell_leave_one_registration_after_disconnect() {
+    let stdout = run_program_warning(
+        "a135_owner",
+        A135_CONNECTION_OWNER,
+        "`get_channels` returns a signal handle it builds with `.cell()`",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "baseline:1",
+            "connected:calls=3 live=4",
+            "disconnected:live=1",
+        ],
+        "a handler's per-call cell must be released with its connection; got:\n{stdout}"
+    );
+}
+
+/// A135 OVER A SOCKET: the same three calls over a real WebSocket, and the
+/// disconnect the real way — the client's socket closes, and the server's
+/// teardown drops the connection's session (and its owner).
+const A135_CONNECTION_OWNER_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Source };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels.map(|ids| ids).cell()
+	}
+}
+
+let channels: SignalCell<List<i32>> = Signal::new([1, 2]);
+let store: Store = Store { channels, calls = Shared::new(0) };
+
+fun live_on<T>(cell: SignalCell<T>): i32 {
+	mut live = 0;
+	for subscriber in cell.subscribers.read() {
+		if subscriber.live.read() {
+			live += 1;
+		}
+	}
+	live
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+/// Poll until `ready` holds — the harness's own sequencing, never a bare sleep.
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 1000 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+async fun run(port: i32) {
+	let _app = channels.sub(|ids| {});
+	print(i"baseline:{live_on(channels)}");
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			mut round = 0;
+			for round < 3 {
+				let mirror: RemoteSource<List<i32>> = client.get_channels();
+				let lease = mirror.sub(|ids| {});
+				until(|| mirror.get().is_some());
+				lease.dispose();
+				// The close is real once the settle and the hop have passed and
+				// the server has revoked the channel.
+				until(|| !mirror.minted() || mirror.released.read());
+				round += 1;
+			}
+			until(|| store.calls.read() == 3);
+			print(i"connected:calls={store.calls.read()} live={live_on(channels)}");
+			// The client goes away for good: the server's teardown drops the
+			// connection's session, and with A135 its owner.
+			client.transport.duplex.socket.read().close();
+			until(|| live_on(channels) == 1);
+			print(i"disconnected:live={live_on(channels)}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a135_a_closed_socket_releases_its_handlers_per_call_cells() {
+    let stdout = run_program_warning(
+        "a135_owner_socket",
+        A135_CONNECTION_OWNER_SOCKET,
+        "`get_channels` returns a signal handle it builds with `.cell()`",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "baseline:1",
+            "connected:calls=3 live=4",
+            "disconnected:live=1",
+        ],
+        "over a socket, a handler's per-call cell must be released when the \
+         connection closes; got:\n{stdout}"
+    );
+}
+
+// --- A136: what a Memo maker builds outlives the caller ---------------------
+
+/// A136 IN PROCESS: the order's kolt-mirrors probe, sections F and G, on
+/// `get_or_insert` (I7). F memoizes an owner-tied `.cell()`; G memoizes the
+/// program-lifetime cell of the unleased mirror and leases at the call site.
+const A136_MEMO_MAKER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::map::Map;
+import std::memo::Memo;
+import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
+import std::rpc::{ LocalTransport, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+
+[service(Client)]
+struct Store {
+	messages: Shared<Map<i32, SignalCell<List<str>>>>,
+}
+
+impl Store {
+	[rpc]
+	fun add_message(self, id: i32, text: str): bool {
+		match self.messages.read().get(id) {
+			Some(let list) => {
+				list.update(|&mut items| {
+					items.push(text);
+				});
+				true
+			},
+			None => false,
+		}
+	}
+
+	[rpc]
+	fun get_messages(self, id: i32): Option<SignalCell<List<str>>> {
+		self.messages.read().get(id)
+	}
+}
+
+// F — the trap: the maker builds an owner-tied `.cell()` under the FIRST
+// caller's owner, and the memo keeps it after that owner is gone.
+let handles_f: Memo<i32, SignalCell<Option<List<str>>>> = Memo::new();
+
+fun messages_f(client_cell: SignalCell<Option<Client<LocalTransport>>>, id: i32): SignalCell<List<str>> {
+	handles_f
+		.get_or_insert(id, || client_cell
+			.map(|client| client.map(|client| client.get_messages(id)))
+			.cell()
+			.and_then(|mirror| mirror)
+			.cell())
+		.map(|x| x.unwrap_or_default())
+		.cell()
+}
+
+// G — the rule: the memo keeps a program-lifetime cell of the (unleased)
+// mirror, and the lease is the caller's.
+let handles_g: Memo<i32, SignalCell<Option<RemoteSource<List<str>>>>> = Memo::new();
+
+fun messages_g(client_cell: SignalCell<Option<Client<LocalTransport>>>, id: i32): SignalCell<List<str>> {
+	handles_g
+		.get_or_insert(id, || client_cell
+			.map(|client| client.map(|client| client.get_messages(id)))
+			.cell_global())
+		.and_then(|mirror| mirror)
+		.map(|x| x.unwrap_or_default())
+		.cell()
+}
+
+fun main() {
+	let first: SignalCell<List<str>> = Signal::new(["a"]);
+	let messages: Map<i32, SignalCell<List<str>>> = Map::new();
+	let store = Store { messages = Shared::new(messages) };
+	store.messages.write().insert(0, first);
+	let (client_end, server_end) = duplex_pair();
+	register_session(4, server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()).for_connection(4));
+	let client = Client { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	let client_cell: SignalCell<Option<Client<LocalTransport>>> = Signal::new(Some(client));
+
+	let visit1 = Owner::new();
+	owner_scope.run(visit1, || {
+		messages_g(client_cell, 0).effect(|x| print(i"G visit 1 sees {x.len()}"));
+		messages_f(client_cell, 0).effect(|x| print(i"F visit 1 sees {x.len()}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"add -> {client.add_message(0, "b").unwrap_or(false)}");
+	print("(leave)");
+	visit1.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	let visit2 = Owner::new();
+	owner_scope.run(visit2, || {
+		messages_f(client_cell, 0).effect(|x| print(i"F visit 2 sees {x.len()}"));
+		messages_g(client_cell, 0).effect(|x| print(i"G visit 2 sees {x.len()}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"add -> {client.add_message(0, "c").unwrap_or(false)}");
+	visit2.dispose();
+	print("done");
+}
+"#;
+
+/// A136: F's maker builds a `.cell()` under the FIRST visit's owner and the
+/// memo keeps it past that owner — visit 2 is handed the dead cell and reads
+/// `2` forever (`c` never arrives). G's maker builds `.cell_global()` and the
+/// lease is the caller's: visit 2 paints the cached `2`, re-mints, and follows
+/// the add to `3`. F's two `.cell()`s are also what the compiler now warns at
+/// (door b), which this build pins through the real pipeline.
+#[test]
+fn a136_a_memo_maker_that_builds_cell_global_survives_its_first_caller() {
+    let stdout = run_program_warning(
+        "a136_memo",
+        A136_MEMO_MAKER,
+        "`.cell()` inside a `Memo` maker ties what it builds to the FIRST caller's owner",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "G visit 1 sees 0",
+            "F visit 1 sees 0",
+            "G visit 1 sees 1",
+            "F visit 1 sees 1",
+            "G visit 1 sees 2",
+            "F visit 1 sees 2",
+            "add -> true",
+            "(leave)",
+            // F: the dead cell, never updated again.
+            "F visit 2 sees 2",
+            // G: the cached value, the re-mint's seed, then the add.
+            "G visit 2 sees 2",
+            "G visit 2 sees 2",
+            "G visit 2 sees 3",
+            "add -> true",
+            "done",
+        ],
+        "a memo maker's cell must outlive its first caller only when it is \
+         `.cell_global()`; got:\n{stdout}"
     );
 }

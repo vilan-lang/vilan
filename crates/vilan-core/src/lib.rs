@@ -30,6 +30,7 @@ pub mod keyword_table;
 pub mod labels;
 pub mod leak_tally;
 pub mod lexing;
+pub mod lifetime_steers;
 pub mod lift;
 pub(crate) mod macros;
 pub mod manifest;
@@ -1138,6 +1139,10 @@ pub fn post_analysis_passes(
     // cycle check below — it does not need a clean program to be meaningful: a
     // resolved call to std's `.cell()` is a fact whatever else failed.
     init_order::check_module_level_cells(program);
+    // A135/A136: a derivation built where it outlives its owner — a
+    // handle-returning `[rpc]` method whose tail is `.cell()`, a `.cell()` or an
+    // `effect` inside a `Memo` maker. Warnings, over the same installed graph.
+    lifetime_steers::check_lifetime_steers(program);
     let phase_init_start = PhaseClock::now();
     init_order::check_cycles(program);
     let phase_init = phase_init_start.elapsed();

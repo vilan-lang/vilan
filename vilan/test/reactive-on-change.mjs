@@ -415,8 +415,7 @@ function $ae(self, subscriber) {
 	return $af(self[0], subscriber);
 }
 function $ac(source, observer) {
-	const subscriber = $ad(source, observer);
-	return $ae(source, subscriber);
+	return $ae(source, $ad(source, observer));
 }
 function $ab(self, observer) {
 	return $ac(self, observer);

@@ -113,10 +113,17 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc.vl",
-        47,
+        52,
         "R + O + E: sessions, wiring, the mirrors' leases. FIVE fewer since \
          A112 S1: `KeyedCell`'s own log, version, base and cursors, and its \
-         cursor's sequence, are `DeltaLog`'s now (see `delta.vl`).",
+         cursor's sequence, are `DeltaLog`'s now (see `delta.vl`). +4 at A134 \
+         (Order 43): a `ReactiveClient`'s origin-table enrolment list (E: \
+         minted by the client, run by its `dispose`), each mirror's retire \
+         hooks, plain and keyed (E: filled by the table that handed the \
+         mirror out, run by the mirror's last release), and a `MirrorTable`'s \
+         entries (R: a module binding the `[service]` expansion declares). +1 \
+         at A137: a keyed mirror's join hook (E: filled once its deliverer \
+         exists, run by its own `acquire`/`rebind`).",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     ("ws.vl", 4, "O: the frame decoder's state"),
@@ -232,7 +239,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 141,
+        total, 146,
         "the total number of `Shared` construction sites in std changed"
     );
 

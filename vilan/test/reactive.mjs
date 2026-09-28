@@ -226,8 +226,7 @@ function $j(self, subscriber) {
 	return $k(self[0], subscriber);
 }
 function $f(source, observer) {
-	const subscriber = $g(source, observer);
-	return $j(source, subscriber);
+	return $j(source, $g(source, observer));
 }
 function $e(self, observer) {
 	return $f(self, observer);

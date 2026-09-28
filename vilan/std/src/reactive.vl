@@ -1799,11 +1799,7 @@ export impl type S: Source<Option<type T>> {
 /// `on_settle` on `self`, because through a bound a `Combine`'s call landed on the
 /// payload bridge, which calls back into `on_change`, and the two recursed).
 fun subscribe_pulling<T, S: Source<T>>(source: S, observer: |T| void): Subscription {
-	// Two statements, not `source.on_settle(pulling(source, observer))`: natively
-	// the receiver is borrowed while the argument moves the same parameter, which
-	// rustc refuses (E0505; filed from A124 S2c).
-	let subscriber = pulling(source, observer);
-	source.on_settle(subscriber)
+	source.on_settle(pulling(source, observer))
 }
 
 /// The pulling observer — what a node's `on_change` hands its own `on_settle`:
@@ -2002,6 +1998,14 @@ export impl FlattenOption<type S: Source<Option<I>>, type I: Source<U>, type U> 
 /// `and_then` as a NODE (A123's Kleisli composition, cold): `None` on the outer is
 /// `None`; `Some(value)` reads the `Source<Option<U>>` that `select` answers for
 /// it. The rolling registration is `FlattenOption`'s.
+///
+/// **`select` runs on every PULL** — each `get`, and each re-follow — so it must be
+/// PURE: the same outer value must answer the same source. A select that MINTS a
+/// fresh source per call reads one object and subscribes another (A134: `.cell()`
+/// read a mirror nothing leased while the leased one went unread). A generated rpc
+/// handle stub is safe here — it answers one mirror per origin — and so is a field
+/// or a memoized value; a constructor (`Signal::new`, a `.cell()`) is not, and
+/// belongs under a `.cell()` of its own above the `and_then`.
 export struct AndThen<S, T, I, U> {
 	up: S,
 	select: |T| I,

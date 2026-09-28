@@ -25,6 +25,13 @@ foo.dispatcher(): Dispatcher                    // the method table
 dispatcher.into_protocol(codec: Codec): RpcProtocol   // what Service::new takes
 ```
 
+A handle stub is **idempotent per origin**: a second call with the same
+arguments on the same client answers the mirror the first one minted (one
+call, one `Subscribe`), until that mirror's last lease closes. The table
+behind it is generated beside the client — one `MirrorTable` per handle
+method — so a stub is safe inside a cold select (`and_then`, `switch`)
+that runs on every read.
+
 `connect` accepts a relative url (`"/"`) in the browser; it dials the same
 host over WebSocket, waits for the server's announcement, and verifies the
 **contract hash**: a drifted server fails the connect with

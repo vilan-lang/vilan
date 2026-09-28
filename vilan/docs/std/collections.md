@@ -297,7 +297,7 @@ fun main() {
 ```vilan,fragment
 impl Memo<type K: Hashable, type V> {
 	fun new(): Memo<K, V>
-	fun get_or(self, key: K, make: || V): V
+	fun get_or_insert(self, key: K, make: || V): V
 	fun get(self, key: K): Option<V>
 	fun forget(self, key: K)
 	fun clear(self)
@@ -305,42 +305,58 @@ impl Memo<type K: Hashable, type V> {
 }
 ```
 
-A per-key cache of values **made on first ask**. `get_or` answers what is held
-for `key`, or runs `make`, keeps the result and answers that. `get` is the
-passive read — it makes nothing.
+A per-key cache of values **made on first ask**. `get_or_insert` answers what
+is held for `key`, or runs `make`, inserts the result and answers that. `get`
+is the passive read — it makes nothing. (`get_or` is the old name, kept one
+release as a deprecated alias.)
 
 ```vilan
 import std::memo::Memo;
 
 fun main() {
 	let squares: Memo<i32, i32> = Memo::new();
-	print(squares.get_or(7, || 7 * 7));   // 49 -- made
-	print(squares.get_or(7, || 0));       // 49 -- held; the maker did not run
+	print(squares.get_or_insert(7, || 7 * 7));   // 49 -- made
+	print(squares.get_or_insert(7, || 0));       // 49 -- held; the maker did not run
 	squares.forget(7);
-	print(squares.len());                 // 0
+	print(squares.len());                        // 0
 }
 ```
 
-`make` runs **at the call site**, which is what makes a memo usable for values
-that read an ambient context — the one this exists for is a remote handle:
+`make` runs **at the call site**, so a maker that reads an ambient context —
+the rpc client, a theme — reads the caller's. Its *lifetime* is not the
+caller's, though: **what the maker builds outlives the caller.** The memo keeps
+it for the life of the program, past every owner the first call ran under, so a
+derivation built in a maker is `.cell_global()`, and a lease (`.cell()`,
+`effect`) belongs at the call site, on what the memo answers:
 
 ```vilan,fragment
-// One handle per id, shared by every call site (`guide/services.md`).
-let bodies: Memo<str, RemoteSource<MessageBody>> = Memo::new();
+// The memo holds the program-lifetime cell of the handle; the view that asks
+// takes its own lease, released with the view.
+let bodies: Memo<str, SignalCell<Option<RemoteSource<MessageBody>>>> = Memo::new();
 
-fun body_of(id: str): RemoteSource<MessageBody> {
-	bodies.get_or(id, || client().get_message(id))
+fun body_of(id: str): SignalCell<Option<MessageBody>> {
+	bodies
+		.get_or_insert(id, || client_cell().map(|client| client.map(|c| c.get_message(id))).cell_global())
+		.and_then(|mirror| mirror)
+		.cell()
 }
 ```
 
-Two views asking for the same row then lease the *same* mirror instead of
-minting a second one, so a row that re-renders finds the handle it had.
-Nothing is evicted by itself, and a remote handle needs no eviction to stay
-correct — demand decides its channel's life, and a released mirror re-mints on
-the next lease. `forget` is yours, for a value that turned out wrong.
+A `.cell()` inside the maker would be tied to the FIRST caller's owner: it dies
+with that view, and every later ask is answered with the dead cell — stale, and
+never updating again. The compiler warns at a `.cell()` or an `effect` written
+directly in a maker.
+
+You do not need a memo to get one remote handle per id: a generated handle
+stub already answers the same mirror for the same method and arguments (see the
+[services guide](../guide/services.md)). Nothing is evicted by itself; `forget`
+is yours, for a value that turned out wrong.
 
 It holds a `Shared` table inside, so a `Memo` bound with `let` at module level
 is written by every call site that reads it; no `mut` is needed.
+
+The one-slot twin is `Shared<Option<T>>::get_or_insert(make)`: the held value,
+or `make()` stored and answered — the same rule about what `make` builds.
 
 ## `Hashable`
 

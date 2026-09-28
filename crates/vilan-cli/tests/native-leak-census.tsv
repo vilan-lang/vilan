@@ -28,10 +28,10 @@ usize	0	0
 usize-literals	0	0
 unsigned-saturate	0	0
 bytes-aliasing	0	0
-delta-law	2842	14
+delta-law	2842	0
 reactive-on-change	27	0
 reactive-flatten	8	0
-list-cell	2231	92
+list-cell	2231	0
 reactive-selector	32	0
 f64-print-boundary	0	0
 non-bmp-string-length	0	0
