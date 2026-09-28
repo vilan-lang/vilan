@@ -1799,11 +1799,7 @@ export impl type S: Source<Option<type T>> {
 /// `on_settle` on `self`, because through a bound a `Combine`'s call landed on the
 /// payload bridge, which calls back into `on_change`, and the two recursed).
 fun subscribe_pulling<T, S: Source<T>>(source: S, observer: |T| void): Subscription {
-	// Two statements, not `source.on_settle(pulling(source, observer))`: natively
-	// the receiver is borrowed while the argument moves the same parameter, which
-	// rustc refuses (E0505; filed from A124 S2c).
-	let subscriber = pulling(source, observer);
-	source.on_settle(subscriber)
+	source.on_settle(pulling(source, observer))
 }
 
 /// The pulling observer — what a node's `on_change` hands its own `on_settle`:
