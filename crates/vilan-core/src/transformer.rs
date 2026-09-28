@@ -4189,8 +4189,11 @@ impl<'src> Transformer<'src> {
             // A comprehension runs its body per element (`combine` subscribes each
             // source this way), so it inherits the body's side effects — and its
             // SOURCE is evaluated once whatever the body does.
-            Expr::TupleComprehension(_, source_id, body_id) => {
-                self.expr_has_side_effects(*source_id) || self.expr_has_side_effects(*body_id)
+            Expr::TupleComprehension(bindings, body_id) => {
+                bindings
+                    .iter()
+                    .any(|(_, source_id)| self.expr_has_side_effects(*source_id))
+                    || self.expr_has_side_effects(*body_id)
             }
             // The compound shapes B377 was: a block runs its statements, an
             // `if`/`match` runs the subject plus whichever continuation fires.
@@ -4805,7 +4808,7 @@ impl<'src> Transformer<'src> {
             // A macro-name marker: never a value (the analyzer rejects value
             // uses); reached only as an inert statement — emit nothing.
             Expr::Macro => js::Node::Void,
-            Expr::TupleComprehension(binder_id, source_id, body_id) => {
+            Expr::TupleComprehension(bindings, body_id) => {
                 // A flat tuple is a JS array, so the comprehension lowers to a
                 // runtime `source.map((x) => body)` — arity-independent, no
                 // monomorphization needed. The binder is the closure parameter.
@@ -4816,7 +4819,11 @@ impl<'src> Transformer<'src> {
                 // tuple-valued body result must SPLICE into the result rather
                 // than nest in it. That instance is emitted unrolled — see
                 // `unrolled_comprehension`.
-                let (binder_id, source_id, body_id) = (*binder_id, *source_id, *body_id);
+                if bindings.len() > 1 {
+                    let (bindings, body_id) = (bindings.clone(), *body_id);
+                    return Some(self.zipped_comprehension(id, &bindings, body_id, block));
+                }
+                let ((binder_id, source_id), body_id) = (bindings[0], *body_id);
                 if let Some(unrolled) =
                     self.unrolled_comprehension(id, binder_id, source_id, body_id, block)
                 {
@@ -8154,6 +8161,154 @@ impl<'src> Transformer<'src> {
             )),
             loop_body,
         ));
+    }
+
+    /// B183 — a ZIPPED comprehension `(a in aa, b in bb => body)`, whose sources
+    /// are one family (the analyzer checked it), emitted UNROLLED: each source
+    /// evaluated once, and per position the body run as `((a, b) =>
+    /// body)(aa_i, bb_i)` with the walk's `U` bound to that position's element,
+    /// each source's element read at ITS OWN flat offset (the sources are
+    /// different mappings of one family, so their layouts differ), and a
+    /// tuple-valued result spliced. A family still abstract here (no instance
+    /// binds it) walks the first source's array by index, reading the others at
+    /// the same index — exact when every element is one slot.
+    fn zipped_comprehension(
+        &mut self,
+        comprehension_id: Id,
+        bindings: &[(Id, Id)],
+        body_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let mut sources = Vec::with_capacity(bindings.len());
+        for (_, source_id) in bindings {
+            let source = self
+                .walk_entity(*source_id, block)
+                .unwrap_or(js::Node::Void);
+            let source = match source {
+                js::Node::Local(name) => js::Node::Local(name),
+                other => {
+                    let name = self.ng.next_name();
+                    block.push(js::Node::ConstVariable(js::Variable {
+                        name: name.clone(),
+                        value: Box::new(other),
+                    }));
+                    js::Node::Local(name)
+                }
+            };
+            sources.push(source);
+        }
+        let parameters: Vec<js::Parameter> = bindings
+            .iter()
+            .map(|(binder_id, _)| js::Parameter {
+                name: self.ng.name_for(*binder_id),
+            })
+            .collect();
+        let views = self
+            .program
+            .tuple_zip_views
+            .get(&comprehension_id)
+            .cloned()
+            .unwrap_or_default();
+        let result_template = self.expr_type_id(comprehension_id).and_then(|type_id| {
+            match self.program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Mapped(_, _, template)) => Some(*template),
+                _ => None,
+            }
+        });
+        let layouts: Option<Vec<(Vec<(usize, usize, bool)>, Vec<Vec<(TypeId, TypeId)>>)>> = views
+            .iter()
+            .map(|view| {
+                let positions = self.tuple_positions(*view)?;
+                let elements = self.tuple_family_elements(*view)?;
+                Some((
+                    positions,
+                    elements.into_iter().map(|(_, bindings)| bindings).collect(),
+                ))
+            })
+            .collect();
+        let Some(layouts) = layouts.filter(|layouts| layouts.len() == bindings.len()) else {
+            // The abstract fallback: index the other sources in step.
+            let index_name = "$zip".to_string();
+            let mut body = Vec::new();
+            for (parameter, source) in parameters.iter().zip(&sources).skip(1) {
+                body.push(js::Node::ConstVariable(js::Variable {
+                    name: parameter.name.clone(),
+                    value: Box::new(js::Node::PropertyIndex(
+                        Box::new(source.clone()),
+                        Box::new(js::Node::Local(index_name.clone())),
+                    )),
+                }));
+            }
+            if let Some(value) = self.walk_entity(body_id, &mut body) {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+            return js::Node::Call(
+                Box::new(js::Node::Property(
+                    Box::new(sources[0].clone()),
+                    "map".to_string(),
+                )),
+                vec![js::Node::Closure(js::Closure {
+                    parameters: vec![parameters[0].clone(), js::Parameter { name: index_name }],
+                    body,
+                    is_async: false,
+                    origin: None,
+                })],
+            );
+        };
+        let count = layouts[0].0.len();
+        let mut items = Vec::with_capacity(count);
+        for at in 0..count {
+            let mut arguments = Vec::with_capacity(sources.len());
+            let mut inner = self.current_substitution.clone();
+            for ((positions, bindings), source) in layouts.iter().zip(&sources) {
+                let (offset, width, is_tuple) = positions[at];
+                arguments.push(match is_tuple {
+                    false => js::Node::PropertyIndex(
+                        Box::new(source.clone()),
+                        Box::new(js::Node::Number(offset.to_string(), None)),
+                    ),
+                    true => js::Node::Call(
+                        Box::new(js::Node::Property(
+                            Box::new(source.clone()),
+                            "slice".to_string(),
+                        )),
+                        vec![
+                            js::Node::Number(offset.to_string(), None),
+                            js::Node::Number((offset + width).to_string(), None),
+                        ],
+                    ),
+                });
+                inner.extend(bindings[at].iter().copied());
+            }
+            let outer = std::mem::replace(&mut self.current_substitution, inner);
+            let result_is_tuple = result_template.is_some_and(|template| {
+                matches!(
+                    self.program
+                        .type_id_to_type_map
+                        .get(&self.resolve_type_id(template)),
+                    Some(Type::Tuple(_))
+                )
+            });
+            let mut body = Vec::new();
+            if let Some(value) = self.walk_entity(body_id, &mut body) {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+            self.current_substitution = outer;
+            let call = js::Node::Call(
+                Box::new(js::Node::Closure(js::Closure {
+                    parameters: parameters.clone(),
+                    body,
+                    is_async: false,
+                    origin: None,
+                })),
+                arguments,
+            );
+            items.push(match result_is_tuple {
+                true => js::Node::Spread(Box::new(call)),
+                false => call,
+            });
+        }
+        js::Node::Array(items)
     }
 
     /// Binds a comprehension's element binder to one element's type on top of

@@ -7286,9 +7286,13 @@ fn a122_a_tuple_bounded_blanket_does_not_reach_outside_its_family() {
         "}\n",
         "\n",
     );
+    // A non-tuple is no CANDIDATE for a blanket over tuples (B183's lane,
+    // `tuple_blanket_excludes`): left in, the blanket shadowed the
+    // inherited-default tier (`list.iter().map(..)` found `Tuple::map`), so
+    // an `i32` receiver now meets the plain missing-method refusal.
     assert_fails_with(
         &format!("{blanket}fun main() {{\n\tlet _ = 5.arity();\n}}\n"),
-        "'i32' is not a tuple",
+        "i32 has no method 'arity'",
     );
     assert_fails_with(
         &format!("{blanket}fun main() {{\n\tlet _ = (1, 2).arity();\n}}\n"),
@@ -7903,5 +7907,149 @@ fn a122_divorce_of_combine_round_trips() {
             "}\n",
         ),
         "5 x 9 10\n",
+    );
+}
+
+// --- B183: the tuple comprehension's ZIP form, `(a in aa, b in bb => e)` —
+// --- several sources walked in step. The sources must be ONE tuple family
+// --- (each a mapped tuple over the same `T`, or a value of it), which is what
+// --- makes their arities equal by construction; each binder takes its own
+// --- source's element at the walk's one `U`.
+
+/// Two mappings of one family zipped, over a two-slot element: each source is
+/// read at ITS OWN flat offsets (a value of `T` spreads `(0, 0)` over two
+/// slots, the cells hold one each), and a pair result splices. Red before: the
+/// form did not parse (`found ',' expected '=>'`).
+#[test]
+fn b183_zip_walks_two_mappings_of_one_family_in_step() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun pair_up<T: (2..)>(fallbacks: T, cells: (U in T: SignalCell<U>)): (U in T: (U, U)) {\n",
+            "\t(fallback in fallbacks, cell in cells => (fallback, cell.get()))\n",
+            "}\n",
+            "\n",
+            "fun writes<T: (2..)>(targets: (U in T: SignalCell<U>), values: T) {\n",
+            "\tlet _done = (target in targets, value in values => target.set(value));\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet cells = (SignalCell::new((1, 2)), SignalCell::new(\"b\"));\n",
+            "\tlet (((f0, f1), (x, y)), (g, b)) = pair_up(((0, 0), \"z\"), cells);\n",
+            "\tprint(i\"{f0} {f1} {x} {y} {g} {b}\");\n",
+            "\twrites(cells, ((3, 4), \"c\"));\n",
+            "\tlet (p, q) = cells;\n",
+            "\tprint(i\"{p.get().0} {p.get().1} {q.get()}\");\n",
+            "}\n",
+        ),
+        "0 0 1 2 z b\n3 4 c\n",
+    );
+}
+
+/// A key walk zipped with the tuple it indexes — `keys()` is a mapping of
+/// `T` too, so the two sources are one family.
+#[test]
+fn b183_zip_pairs_keys_with_values() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun agree<T: (2..)>(whole: T): T {\n",
+            "\t(key in whole.keys(), value in whole => whole.get(key))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet ((m, n), o) = agree(((5, 6), \"o\"));\n",
+            "\tprint(i\"{m} {n} {o}\");\n",
+            "}\n",
+        ),
+        "5 6 o\n",
+    );
+}
+
+/// Zipped elements compare through the pack's element bound (B399), each
+/// position through its own `eq`.
+#[test]
+fn b183_zip_dispatches_through_the_element_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::compare::PartialEq;\n",
+            "\n",
+            "fun same<T: (2..: PartialEq)>(before: T, after: T): (U in T: bool) {\n",
+            "\t(a in before, b in after => a == b)\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (x, y, z) = same((1, \"a\", true), (1, \"b\", true));\n",
+            "\tprint(i\"{x} {y} {z}\");\n",
+            "}\n",
+        ),
+        "true false true\n",
+    );
+}
+
+/// Two UNRELATED families are refused: `T` and `S` are both `(2..)`, but their
+/// arities are independent, so their positions cannot be paired.
+#[test]
+fn b183_zip_refuses_two_families() {
+    assert_fails_with(
+        concat!(
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun cross<T: (2..), S: (2..)>(a: (U in T: SignalCell<U>), b: (U in S: SignalCell<U>)): i32 {\n",
+            "\tlet _x = (x in a, y in b => 0);\n",
+            "\t0\n",
+            "}\n",
+            "\n",
+            "fun main() {}\n",
+        ),
+        "a zipped comprehension walks ONE tuple family, and this source `(U in S: \
+         SignalCell<U>)` is not of the family `T` the first one walks",
+    );
+}
+
+/// A concrete tuple is no source in a zip either (B183's concrete arm is
+/// unbuilt), and the refusal points at the source that is not a family.
+#[test]
+fn b183_zip_refuses_a_concrete_source() {
+    assert_fails_spanning(
+        concat!(
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun mixed<T: (2..)>(a: (U in T: SignalCell<U>)): i32 {\n",
+            "\tlet _x = (x in a, y in (1, 2) => 0);\n",
+            "\t0\n",
+            "}\n",
+            "\n",
+            "fun main() {}\n",
+        ),
+        "(1, 2)",
+        "a tuple comprehension's source must be a mapped tuple, got (i32, i32)",
+    );
+}
+
+/// With `std::tuple` in the program, a struct's `map` reached through an
+/// INHERITED trait default still resolves: the blanket over tuples is no
+/// candidate for a non-tuple receiver, so it cannot shadow the default tier
+/// (found checking kolt's `list.iter().map(..).enumerate()`, which refused
+/// "'ListIterator<T>' is not a tuple").
+#[test]
+fn b183_a_tuple_blanket_does_not_shadow_an_iterator_default() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet words = [\"a\", \"bb\"];\n",
+            "\tlet lengths = words.iter().map(|word| word.len()).to_list();\n",
+            "\tprint(lengths[1]);\n",
+            "}\n",
+        ),
+        "2\n",
     );
 }

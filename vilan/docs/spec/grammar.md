@@ -519,7 +519,9 @@ tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
 entry   = spread | expression ;
 spread  = ".." expression ;
 list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
-tuple-comprehension = "(" IDENT "in" secondary-expr "=>" expression ")" ;
+tuple-comprehension = "(" comprehension-binding { "," comprehension-binding }
+                      "=>" expression ")" ;
+comprehension-binding = IDENT "in" secondary-expr ;
 
 element      = "<" element-name { head-item }
                ( "/>" | ">" { child } "</" element-name ">" )

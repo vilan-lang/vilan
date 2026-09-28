@@ -816,10 +816,12 @@ impl Liveness<'_, '_> {
             }
             // A tuple comprehension UNROLLS: one body per element, all from the
             // same expression ids, so a read there repeats like a loop's.
-            Expr::TupleComprehension(binder_id, source_id, body_id) => {
+            Expr::TupleComprehension(bindings, body_id) => {
                 self.walk_repeat(None, &[], body_id);
-                self.record_declaration(binder_id);
-                self.walk(source_id);
+                for (binder_id, source_id) in bindings.iter().rev() {
+                    self.record_declaration(*binder_id);
+                    self.walk(*source_id);
+                }
             }
             Expr::FunctionReturn(Some(value_id)) => {
                 self.walk(value_id);

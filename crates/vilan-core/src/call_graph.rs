@@ -821,10 +821,12 @@ impl<'a, 'src> Collector<'a, 'src> {
                 self.walk(*subject_id);
                 self.walk(*index_id);
             }
-            Expr::TupleComprehension(first, second, third) => {
-                self.walk(*first);
-                self.walk(*second);
-                self.walk(*third);
+            Expr::TupleComprehension(bindings, body) => {
+                for (binder, source) in bindings {
+                    self.walk(*binder);
+                    self.walk(*source);
+                }
+                self.walk(*body);
             }
             Expr::Destructure(subject_id, pattern) => {
                 self.walk(*subject_id);

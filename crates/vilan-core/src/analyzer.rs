@@ -238,6 +238,15 @@ impl TupleBoundRequirement {
     }
 }
 
+/// Why a comprehension's sources do not make one walk (B183).
+#[derive(Clone, Copy, Debug)]
+enum ZipRefusal {
+    /// Source `index` is not a tuple family (a concrete tuple, a non-tuple).
+    NotAFamily(usize),
+    /// Source `index` is a family, but not the first source's (its family id).
+    TwoFamilies(TypeId, usize),
+}
+
 /// `U` -> `U'` -> `U''`: the name a nested tuple walk's binder prints as when
 /// an enclosing walk already holds the plain one (A122). Interned, so a name
 /// leaks once per distinct spelling for the life of the process rather than
@@ -276,7 +285,7 @@ pub enum Expr<'src> {
     Closure(Id),
     // A tuple comprehension `(x in xs = e)`: the element binder, the source tuple
     // expr, and the body expr. Types as a mapped tuple and unrolls per element.
-    TupleComprehension(Id, Id, Id),
+    TupleComprehension(Vec<(Id, Id)>, Id),
     // An enum declaration.
     Enum(Id),
     // A reference to one variant of an enum: the enum and the variant index.
@@ -2562,10 +2571,10 @@ enum Constraint<'src> {
     /// `(x in xs => e)` — once the source `xs` resolves to a mapped tuple, type the
     /// binder `x` as its element so the body `e` checks; the expression is itself a
     /// mapped tuple. Resolved before method calls so a method on `x` sees its type.
+    /// Two or more bindings ZIP (B183): each `(binder, source)` in order.
     Comprehension {
         id: Id,
-        binder_id: Id,
-        source_id: Id,
+        bindings: Vec<(Id, Id)>,
         body_id: Id,
     },
     /// `subject.field` — resolves to the named field's type once the subject
@@ -3784,6 +3793,9 @@ pub struct Analyzer<'src> {
     // The view each walk resolved to — `(U in T: F<U>)` over its fresh `U` —
     // for the emitters, which bind `U` per element to unroll a body.
     tuple_walk_views: HashMap<Id, TypeId>,
+    // B183: a ZIPPED comprehension's views, one per source, in order (the
+    // first is also its `tuple_walk_views` entry).
+    tuple_zip_views: HashMap<Id, Vec<TypeId>>,
     // Each walk binder's name as its source wrote it, before
     // `name_nested_walk_binders` primes the nested ones.
     tuple_walk_names: HashMap<TypeId, (&'src str, Option<Id>)>,
@@ -6124,6 +6136,7 @@ impl<'src> Analyzer<'src> {
             tuple_walk_binders: HashMap::default(),
             tuple_walk_views: HashMap::default(),
             tuple_walk_names: HashMap::default(),
+            tuple_zip_views: HashMap::default(),
             tuple_map_results: HashMap::default(),
             tuple_call_receivers: HashMap::default(),
             impl_subject_args: HashMap::default(),
@@ -12804,7 +12817,10 @@ impl<'src> Analyzer<'src> {
                     out.extend(function_call.argument_ids.iter().copied());
                 }
             }
-            Expr::TupleComprehension(_, source_id, body_id) => out.extend([*source_id, *body_id]),
+            Expr::TupleComprehension(bindings, body_id) => {
+                out.extend(bindings.iter().map(|(_, source_id)| *source_id));
+                out.push(*body_id);
+            }
             Expr::For(condition, (statements, tail)) => {
                 out.extend(condition.iter().copied());
                 out.extend(statements.iter().copied());
@@ -13640,8 +13656,10 @@ impl<'src> Analyzer<'src> {
                 }
                 self.plan_expr(body, consuming, resources, owned, plan);
             }
-            Expr::TupleComprehension(_binder, source, body) => {
-                self.plan_expr(source, false, resources, owned, plan);
+            Expr::TupleComprehension(bindings, body) => {
+                for (_, source) in bindings {
+                    self.plan_expr(source, false, resources, owned, plan);
+                }
                 self.plan_expr(body, false, resources, owned, plan);
             }
             // Closures / spawns are their own scan roots (walked from
@@ -14678,8 +14696,10 @@ impl<'src> Analyzer<'src> {
                     body, consuming, terminal, scan, flow, loop_depth, violations,
                 );
             }
-            Expr::TupleComprehension(_binder, source, body) => {
-                self.scan_move(source, false, false, scan, flow, loop_depth, violations);
+            Expr::TupleComprehension(bindings, body) => {
+                for (_, source) in bindings {
+                    self.scan_move(source, false, false, scan, flow, loop_depth, violations);
+                }
                 self.scan_move(body, false, false, scan, flow, loop_depth, violations);
             }
 
@@ -15749,8 +15769,10 @@ impl<'src> Analyzer<'src> {
                 }
                 recurse!(body);
             }
-            Expr::TupleComprehension(_binder, source, body) => {
-                recurse!(source);
+            Expr::TupleComprehension(bindings, body) => {
+                for (_, source) in bindings {
+                    recurse!(source);
+                }
                 recurse!(body);
             }
             Expr::If(branch) => self.scan_capture_if(
@@ -17211,8 +17233,10 @@ impl<'src> Analyzer<'src> {
                 }
                 recurse!(body);
             }
-            Expr::TupleComprehension(_binder, source, body) => {
-                recurse!(source);
+            Expr::TupleComprehension(bindings, body) => {
+                for (_, source) in bindings {
+                    recurse!(source);
+                }
                 recurse!(body);
             }
             // Leaves and declarations hold no nested call or closure.
@@ -18362,7 +18386,7 @@ impl<'src> Analyzer<'src> {
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
-                )
+                ) && !self.tuple_blanket_excludes(implementation.subject, subject_type)
             })
             .filter_map(|implementation| {
                 if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
@@ -18415,6 +18439,26 @@ impl<'src> Analyzer<'src> {
             )
             .collect();
         self.applicable_candidates(subject_type, candidates)
+    }
+
+    /// A122: a blanket over TUPLES (`impl type T: (2..)`) is no candidate at all
+    /// for a receiver that is not a tuple — a struct, an enum, an array, a
+    /// closure, an object. Left in the candidate set, it shadowed the tier
+    /// below it: `list.iter().map(..)` found `Tuple::map` DECLARED and never
+    /// reached `Iterator::map`'s inherited default.
+    fn tuple_blanket_excludes(&self, impl_subject: TypeId, subject_type: &Type) -> bool {
+        let Type::Generic(binder_id) = impl_subject.get_type(self) else {
+            return false;
+        };
+        self.tuple_bounds.contains_key(&binder_id)
+            && matches!(
+                subject_type,
+                Type::Struct(..)
+                    | Type::Enum(..)
+                    | Type::Array(..)
+                    | Type::Closure(..)
+                    | Type::Dyn(..)
+            )
     }
 
     /// Whether the impl with this subject DECLARES `member_id` itself, as
@@ -23613,8 +23657,10 @@ impl<'src> Analyzer<'src> {
             // (Review finding: this arm was MISSED on the first pass — the
             // parity sweep's line window cut off one arm short of scan_move's
             // list, and the omission read as content-stable, an unsafe default.)
-            Expr::TupleComprehension(_, source, body) => {
-                self.scan_bumps(source, function_id, positions, visited);
+            Expr::TupleComprehension(bindings, body) => {
+                for (_, source) in bindings {
+                    self.scan_bumps(source, function_id, positions, visited);
+                }
                 self.scan_bumps(body, function_id, positions, visited);
             }
             _ => {}
@@ -30561,6 +30607,76 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// A comprehension's walk over each of its sources (B183): the first
+    /// source's view mints the walk's `U` ([`Self::tuple_family_view`]); every
+    /// further, ZIPPED source is re-bound at the same `U`, and must be of the
+    /// same FAMILY — two families' arities are independent (`T: (2..)` and `S:
+    /// (2..)` are two ranges), so only one family's positions can be walked in
+    /// step, and for it the pairing is exact by construction.
+    fn tuple_walk_views_of(
+        &mut self,
+        walk_id: Id,
+        body_scope_id: Option<Id>,
+        source_types: &[Type],
+    ) -> Result<Vec<Type>, ZipRefusal> {
+        let Some((first, rest)) = source_types.split_first() else {
+            return Err(ZipRefusal::NotAFamily(0));
+        };
+        let view = self
+            .tuple_family_view(walk_id, body_scope_id, first.clone())
+            .ok_or(ZipRefusal::NotAFamily(0))?;
+        let Type::Mapped(binder_id, family_id, _) = view else {
+            unreachable!("a tuple family's view is a mapped type");
+        };
+        let mut views = vec![view];
+        for (offset, source_type) in rest.iter().enumerate() {
+            let index = offset + 1;
+            let (other_family_id, template_id) = self
+                .tuple_family_at(binder_id, source_type.clone())
+                .ok_or(ZipRefusal::NotAFamily(index))?;
+            if !self.same_tuple_family(family_id, other_family_id) {
+                return Err(ZipRefusal::TwoFamilies(family_id, index));
+            }
+            views.push(Type::Mapped(binder_id, family_id, template_id));
+        }
+        Ok(views)
+    }
+
+    /// `source_type`'s family and its element template re-bound at `binder_id`
+    /// (a walk's `U` minted already), or `None` when it is not a family.
+    fn tuple_family_at(
+        &mut self,
+        binder_id: TypeId,
+        source_type: Type,
+    ) -> Option<(TypeId, TypeId)> {
+        let element_id = Type::Generic(binder_id).get_type_id(self);
+        match self.expand_mapped(source_type) {
+            Type::Mapped(written_binder, family_id, template_id) => {
+                let template = template_id.get_type(self);
+                let rebind: SubstitutionContext =
+                    [(written_binder, element_id)].into_iter().collect();
+                Some((
+                    family_id,
+                    self.substitute_type(&template, &rebind).get_type_id(self),
+                ))
+            }
+            Type::Generic(constraint_id) if self.tuple_bounds.contains_key(&constraint_id) => {
+                Some((Type::Generic(constraint_id).get_type_id(self), element_id))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether two family type ids name ONE tuple family: the same
+    /// tuple-bounded parameter. (A mapped family's own mapping is not compared
+    /// — zip tuples mapped from one parameter.)
+    fn same_tuple_family(&self, left: TypeId, right: TypeId) -> bool {
+        match (left.get_type(self), right.get_type(self)) {
+            (Type::Generic(left), Type::Generic(right)) => left == right,
+            _ => false,
+        }
+    }
+
     /// A122 §4.2/§4.4 — what a comprehension or a `for` over `source_type`
     /// walks: the tuple FAMILY it belongs to, as a mapped type `(U in T: F<U>)`
     /// over a binder FRESH to this walk (`walk_id`), or `None` when the source
@@ -33275,51 +33391,57 @@ impl<'src> Analyzer<'src> {
                 );
                 Some(Expr::Trait(id))
             }
-            Node::TupleComprehension {
-                binder,
-                binder_span,
-                source,
-                body,
-            } => {
-                let source_id = self.walk_expr_node(source, scope_id);
-                // The element binder scopes to the body. Its type (the source's
-                // element type) is set when the comprehension resolves.
+            Node::TupleComprehension { bindings, body } => {
+                // Every source walks in the ENCLOSING scope — a zipped source
+                // cannot see an earlier binding, which names an element only
+                // inside the body.
+                let source_ids: Vec<Id> = bindings
+                    .iter()
+                    .map(|binding| self.walk_expr_node(&binding.source, scope_id))
+                    .collect();
+                // The element binders scope to the body. Their types (each
+                // source's element type) are set when the comprehension
+                // resolves.
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
-                let binder_id = self.new_entity_id();
-                let unknown_type_id = Type::Unknown.get_type_id(self);
-                self.variables.insert(
-                    binder_id,
-                    Variable {
-                        id: binder_id,
-                        name: binder,
-                        name_span: *binder_span,
-                        initial: None,
-                        type_id: unknown_type_id,
-                        mutable: false,
-                        annotated: false,
-                    },
-                );
-                self.expr_id_to_expr_map
-                    .insert(binder_id, Expr::Variable(binder_id));
-                self.expr_id_to_scope_id_map
-                    .insert(binder_id, body_scope_id);
-                self.span_map.insert(binder_id, binder_span);
-                self.reference_count.entry(binder_id).or_insert(0);
-                if *binder != "_" {
-                    self.mut_scope_for_scope_id(body_scope_id)
-                        .name_to_id_map
-                        .insert(binder, binder_id);
+                let mut walked = Vec::with_capacity(bindings.len());
+                for (binding, source_id) in bindings.iter().zip(source_ids) {
+                    let binder_id = self.new_entity_id();
+                    let unknown_type_id = Type::Unknown.get_type_id(self);
+                    self.variables.insert(
+                        binder_id,
+                        Variable {
+                            id: binder_id,
+                            name: binding.binder,
+                            name_span: binding.binder_span,
+                            initial: None,
+                            type_id: unknown_type_id,
+                            mutable: false,
+                            annotated: false,
+                        },
+                    );
+                    self.expr_id_to_expr_map
+                        .insert(binder_id, Expr::Variable(binder_id));
+                    self.expr_id_to_scope_id_map
+                        .insert(binder_id, body_scope_id);
+                    self.span_map.insert(binder_id, &binding.binder_span);
+                    self.reference_count.entry(binder_id).or_insert(0);
+                    if binding.binder != "_" {
+                        self.mut_scope_for_scope_id(body_scope_id)
+                            .name_to_id_map
+                            .insert(binding.binder, binder_id);
+                    }
+                    // A method on the binder defers until its type is set (below).
+                    self.untyped_comprehension_binders.insert(binder_id);
+                    walked.push((binder_id, source_id));
                 }
-                // A method on the binder defers until its type is set (below).
-                self.untyped_comprehension_binders.insert(binder_id);
                 let body_id = self.walk_expr_node(body, body_scope_id);
-                // The binder's type is set when the source resolves (before method
-                // calls); the constraint records the `Expr::TupleComprehension`.
+                // The binders' types are set when the sources resolve (before
+                // method calls); the constraint records the
+                // `Expr::TupleComprehension`.
                 self.constraints.push(Constraint::Comprehension {
                     id,
-                    binder_id,
-                    source_id,
+                    bindings: walked,
                     body_id,
                 });
                 None
@@ -38179,46 +38301,55 @@ impl<'src> Analyzer<'src> {
                     Type::Void
                 }
             }
-            Expr::TupleComprehension(binder_id, source_id, body_id) => {
-                let (binder_id, source_id, body_id) = (*binder_id, *source_id, *body_id);
-                // The source must be a mapped tuple `(U in T: F<U>)` (its element
-                // type is the template `F<U>`); type the binder as that element,
-                // then the result is `(U in T: <body type>)`.
-                let source_type = self.infer_type_inner(
-                    source_id,
+            Expr::TupleComprehension(bindings, body_id) => {
+                let (bindings, body_id) = (bindings.clone(), *body_id);
+                // Each source must be a tuple FAMILY — a mapped tuple `(U in T:
+                // F<U>)` or a value of a tuple-bounded `T` — and a zip's sources
+                // one family; each binder takes its source's element template at
+                // the walk's one `U`, and the result is `(U in T: <body type>)`.
+                let mut source_types = Vec::with_capacity(bindings.len());
+                for (_, source_id) in &bindings {
+                    let source_type = self.infer_type_inner(
+                        *source_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    );
+                    if matches!(source_type, Type::Unresolved) {
+                        return Type::Unresolved;
+                    }
+                    source_types.push(source_type);
+                }
+                let body_scope_id = bindings.first().and_then(|(binder_id, _)| {
+                    self.expr_id_to_scope_id_map.get(binder_id).copied()
+                });
+                let Ok(views) = self.tuple_walk_views_of(expr_id, body_scope_id, &source_types)
+                else {
+                    return Type::Unknown;
+                };
+                for ((binder_id, _), view) in bindings.iter().zip(&views) {
+                    if let (Type::Mapped(_, _, element_template), Some(variable)) =
+                        (view, self.variables.get_mut(binder_id))
+                    {
+                        variable.type_id = *element_template;
+                    }
+                }
+                let Some(Type::Mapped(element_binder, element_source, _)) = views.first().cloned()
+                else {
+                    return Type::Unknown;
+                };
+                let body_type = self.infer_type_inner(
+                    body_id,
                     &Type::Unknown,
                     substitution_context,
                     exprs_seen,
                 );
-                let view = match source_type {
+                match body_type {
                     Type::Unresolved => Type::Unresolved,
-                    source_type => {
-                        let body_scope_id = self.expr_id_to_scope_id_map.get(&binder_id).copied();
-                        self.tuple_family_view(expr_id, body_scope_id, source_type)
-                            .unwrap_or(Type::Unknown)
+                    body_type => {
+                        let body_type_id = body_type.get_type_id(self);
+                        Type::Mapped(element_binder, element_source, body_type_id)
                     }
-                };
-                match view {
-                    Type::Unresolved => Type::Unresolved,
-                    Type::Mapped(element_binder, element_source, element_template) => {
-                        if let Some(variable) = self.variables.get_mut(&binder_id) {
-                            variable.type_id = element_template;
-                        }
-                        let body_type = self.infer_type_inner(
-                            body_id,
-                            &Type::Unknown,
-                            substitution_context,
-                            exprs_seen,
-                        );
-                        match body_type {
-                            Type::Unresolved => Type::Unresolved,
-                            body_type => {
-                                let body_type_id = body_type.get_type_id(self);
-                                Type::Mapped(element_binder, element_source, body_type_id)
-                            }
-                        }
-                    }
-                    _ => Type::Unknown,
                 }
             }
             Expr::Closure(closure_id) => {
@@ -42063,10 +42194,12 @@ impl<'src> Analyzer<'src> {
             Constraint::Destructure(constraint) => self.resolve_destructure(constraint),
             Constraint::Comprehension {
                 id,
-                binder_id,
-                source_id,
+                bindings,
                 body_id,
-            } => self.resolve_comprehension(*id, *binder_id, *source_id, *body_id),
+            } => {
+                let bindings = bindings.clone();
+                self.resolve_comprehension(*id, &bindings, *body_id)
+            }
             Constraint::MethodCall {
                 id,
                 subject_id,
@@ -45112,46 +45245,80 @@ impl<'src> Analyzer<'src> {
     /// `(x in xs => e)`: once the source resolves to a mapped tuple, type the
     /// binder as its element template so the body checks, and record the
     /// comprehension expression (it itself types as a mapped tuple via `infer_type`).
-    fn resolve_comprehension(
-        &mut self,
-        id: Id,
-        binder_id: Id,
-        source_id: Id,
-        body_id: Id,
-    ) -> Resolution {
-        let source_type = self.infer_type(source_id, &Type::Unknown, &HashMap::default());
-        if matches!(source_type, Type::Unresolved | Type::Unknown) {
-            return Resolution::Deferred;
+    fn resolve_comprehension(&mut self, id: Id, bindings: &[(Id, Id)], body_id: Id) -> Resolution {
+        let mut source_types = Vec::with_capacity(bindings.len());
+        for (_, source_id) in bindings {
+            let source_type = self.infer_type(*source_id, &Type::Unknown, &HashMap::default());
+            if matches!(source_type, Type::Unresolved | Type::Unknown) {
+                return Resolution::Deferred;
+            }
+            source_types.push(source_type);
         }
-        let body_scope_id = self.expr_id_to_scope_id_map.get(&binder_id).copied();
-        match self.tuple_family_view(id, body_scope_id, source_type.clone()) {
-            Some(view) => {
-                let Type::Mapped(_, _, element_template) = view else {
-                    unreachable!("a tuple family's view is a mapped type");
-                };
-                if let Some(variable) = self.variables.get_mut(&binder_id) {
-                    variable.type_id = element_template;
+        let body_scope_id = bindings
+            .first()
+            .and_then(|(binder_id, _)| self.expr_id_to_scope_id_map.get(binder_id).copied());
+        match self.tuple_walk_views_of(id, body_scope_id, &source_types) {
+            Ok(views) => {
+                for ((binder_id, _), view) in bindings.iter().zip(&views) {
+                    let Type::Mapped(_, _, element_template) = view else {
+                        unreachable!("a tuple family's view is a mapped type");
+                    };
+                    if let Some(variable) = self.variables.get_mut(binder_id) {
+                        variable.type_id = *element_template;
+                    }
+                    self.untyped_comprehension_binders.remove(binder_id);
                 }
-                self.untyped_comprehension_binders.remove(&binder_id);
-                let view_id = view.get_type_id(self);
-                self.tuple_walk_views.insert(id, view_id);
+                let view_ids: Vec<TypeId> = views
+                    .into_iter()
+                    .map(|view| view.get_type_id(self))
+                    .collect();
+                self.tuple_walk_views.insert(id, view_ids[0]);
+                if view_ids.len() > 1 {
+                    self.tuple_zip_views.insert(id, view_ids);
+                }
                 self.expr_id_to_expr_map
-                    .insert(id, Expr::TupleComprehension(binder_id, source_id, body_id));
+                    .insert(id, Expr::TupleComprehension(bindings.to_vec(), body_id));
                 Resolution::Resolved
             }
-            // A concrete tuple source isn't supported yet (heterogeneous elements
-            // have no single binder type — B183's concrete arm); only a tuple
-            // FAMILY is walked.
-            None => {
-                let other = self.expand_mapped(source_type);
-                let got = self.pretty_print_type(&other, &HashMap::default());
+            Err(refusal) => {
+                let span = match refusal {
+                    // A concrete tuple source isn't supported yet (heterogeneous
+                    // elements have no single binder type — B183's concrete
+                    // arm); only a tuple FAMILY is walked.
+                    ZipRefusal::NotAFamily(index) if bindings.len() > 1 => **self
+                        .span_map
+                        .get(&bindings[index].1)
+                        .unwrap_or(&&EMPTY_SPAN),
+                    ZipRefusal::TwoFamilies(_, index) => **self
+                        .span_map
+                        .get(&bindings[index].1)
+                        .unwrap_or(&&EMPTY_SPAN),
+                    ZipRefusal::NotAFamily(_) => **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                };
+                let msg = match refusal {
+                    ZipRefusal::NotAFamily(index) => {
+                        let other = self.expand_mapped(source_types[index].clone());
+                        let got = self.pretty_print_type(&other, &HashMap::default());
+                        format!("a tuple comprehension's source must be a mapped tuple, got {got}")
+                    }
+                    ZipRefusal::TwoFamilies(first, index) => {
+                        let first =
+                            self.pretty_print_type(&first.get_type(self), &HashMap::default());
+                        let other = self.expand_mapped(source_types[index].clone());
+                        let got = self.pretty_print_type(&other, &HashMap::default());
+                        format!(
+                            "a zipped comprehension walks ONE tuple family, and this source \
+                             `{got}` is not of the family `{first}` the first one walks: two \
+                             families' arities are independent, so their positions cannot be \
+                             paired. Zip tuples mapped from the same `{first}`"
+                        )
+                    }
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
-                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "a tuple comprehension's source must be a mapped tuple, got {got}"
-                    ),
+                    span,
+                    msg,
                 });
                 Resolution::Failed
             }
@@ -54862,7 +55029,9 @@ impl<'src> Analyzer<'src> {
                         consulted.extend(constraint.argument_ids.iter().copied());
                     }
                     Constraint::ForEachItem { iterable_id, .. } => consulted.push(*iterable_id),
-                    Constraint::Comprehension { source_id, .. } => consulted.push(*source_id),
+                    Constraint::Comprehension { bindings, .. } => {
+                        consulted.extend(bindings.iter().map(|(_, source_id)| *source_id));
+                    }
                     Constraint::Match(prepped) => consulted.push(prepped.subject_id),
                     // A binding grounding on the parameter (`mut next =
                     // values`) defers on the same condition (B185), so its
@@ -56586,6 +56755,8 @@ pub struct Program<'src> {
     pub tuple_walk_views: HashMap<Id, TypeId>,
     /// A122 §3: each tuple `map` call's answer, `(U in T: F<U>)`, by call id.
     pub tuple_map_results: HashMap<Id, TypeId>,
+    /// B183: each zipped comprehension's per-source views, in order.
+    pub tuple_zip_views: HashMap<Id, Vec<TypeId>>,
     /// A122: each `std::tuple` member call's receiver type as the analyzer
     /// resolved it — the emitters read the receiver's layout through it (a
     /// receiver that is itself a call records no type of its own).
@@ -66391,6 +66562,7 @@ fn analyze_over_world<'src>(
         generic_bounds: analyzer.generic_bounds,
         tuple_walk_views: analyzer.tuple_walk_views,
         tuple_map_results: analyzer.tuple_map_results,
+        tuple_zip_views: analyzer.tuple_zip_views,
         tuple_call_receivers: analyzer.tuple_call_receivers,
         tuple_bound_arities: analyzer
             .tuple_bounds

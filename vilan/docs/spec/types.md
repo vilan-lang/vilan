@@ -1170,6 +1170,20 @@ types (`U` and `U'`), and nothing outside a walk may bind its `U`. The
 answer is `(U in T: <body type>)`. A concrete tuple is not a source (its
 elements have types of their own and no template).
 
+Two or more bindings **zip**: `(a in aa, b in bb => e)` walks its sources'
+positions in step, each binder at its own source's element, one `U` for the
+walk. The sources must be ONE family — each a mapping of the same `T`, or a
+value of it — which is what makes their arities equal by construction; two
+families (`T` and `S`, both `(2..)`) are refused, because their arities are
+independent. `(key in whole.keys(), value in whole => …)` pairs each key
+with its element.
+
+```vilan,fragment
+fun writes<T: (2..)>(targets: (U in T: SignalCell<U>), values: T) {
+	let _done = (target in targets, value in values => target.set(value));
+}
+```
+
 A mapped type's binder carries its pack's **element bound**: over `T:
 (2..: PartialEq)`, the `U` of `(U in T: F<U>)` is `PartialEq`, because it
 ranges over exactly the elements the bound constrains — so a
