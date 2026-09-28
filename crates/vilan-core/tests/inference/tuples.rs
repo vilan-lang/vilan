@@ -2840,38 +2840,41 @@ fn positional_access_on_an_abstract_pack_is_refused_as_it_is_on_a_tuple() {
     );
 }
 
-/// The second PRE-EXISTING limit, likewise pinned beside its tuple-form twin: a
-/// comprehension's source must be a MAPPED tuple, so a bare element-bounded
-/// pack has no way to iterate its elements and the element bound has no
-/// consumer of its own. Unchanged by the spread — the mapped form (`gather`
-/// above) is what a comprehension reaches.
+/// The second limit this section once pinned — "a comprehension's source must
+/// be a MAPPED tuple", so a bare element-bounded pack could not be walked —
+/// is LIFTED by A122 §4.2: a value of a tuple-bounded parameter IS the
+/// identity mapping `(U in T: U)`, and B399 gives its `U` the element bound, so
+/// the pack walks and each element renders through its own `to_string`. The
+/// spread form and the tuple form still agree, now on the pass.
 #[test]
-fn a_comprehension_over_a_bare_pack_still_needs_a_mapped_source() {
-    assert_fails_with(
+fn a_comprehension_walks_a_bare_pack_by_its_element_bound() {
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         import std::display::Display;
-        fun render<T: (..: Display)>(...items: T): i32 {
-            let rendered = (item in items => item.to_string());
-            1
+        fun render<T: (..: Display)>(...items: T): (U in T: str) {
+            (item in items => item.to_string())
         }
         fun main() {
-            render(1, 2);
+            let (a, b) = render(1, 2);
+            print(a + b);
         }
         "#,
-        "a tuple comprehension's source must be a mapped tuple",
+        "12\n",
     );
-    assert_fails_with(
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         import std::display::Display;
-        fun render<T: (..: Display)>(items: T): i32 {
-            let rendered = (item in items => item.to_string());
-            1
+        fun render<T: (..: Display)>(items: T): (U in T: str) {
+            (item in items => item.to_string())
         }
         fun main() {
-            render((1, 2));
+            let (a, b, c) = render((1, "two", true));
+            print(a + b + c);
         }
         "#,
-        "a tuple comprehension's source must be a mapped tuple",
+        "1twotrue\n",
     );
 }
 
@@ -5904,44 +5907,49 @@ fn b209_a_nested_tuple_loop_is_refused_exactly_once() {
 }
 
 #[test]
-fn b209_a_mapped_tuple_loop_is_refused_and_steered_to_the_comprehension() {
-    // The same defect one type-shape over, and the half a LIBRARY writes: a
-    // mapped tuple `(U in T: F<U>)` is a tuple whose elements are still
-    // symbolic, so it fell through the same wildcard and the loop printed each
-    // element's raw runtime shape (`[ 0, 1 ]`, then `[ 0, 'two' ]`, over a
-    // pack of `Option`s).
-    //
-    // Its STEER is the concrete one's inverted, which is why the two are not
-    // one sentence: a mapped tuple has no positions to read (`items.0` is
-    // refused, "cannot access field '0' on type `(U in T: Option<U>)`") and
-    // the comprehension is the shipped form for exactly this source, where
-    // over a concrete tuple it is the other way round.
-    assert_fails_with(
+fn b209_a_mapped_tuple_loop_types_its_binder_since_a122() {
+    // B209 refused this loop because its binder took `any` and the body
+    // printed each element's raw runtime shape. A122 §4.4 (Q2, ruled
+    // 2026-09-25) gives the binder a TYPE instead — the element template
+    // `Option<U>` at a `U` fresh to the loop — and checks the body once, as a
+    // comprehension's is: `match` on the `Option` compiles and runs per
+    // element, and nothing about `U` beyond the template is promised.
+    assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::option::{ Option, Some };
+        import std::option::{ Option, Some, None };
 
-        fun walk<T: (2..)>(items: (U in T: Option<U>)) {
+        fun present<T: (2..)>(items: (U in T: Option<U>)): i32 {
+            mut count = 0;
             for item in items {
-                print(item);
+                match item {
+                    Some(_) => count += 1,
+                    None => {},
+                }
             }
+            count
         }
 
         fun main() {
-            walk((Some(1), Some("two")));
+            let absent: Option<bool> = None;
+            print(present((Some(1), absent, Some("two"))));
         }
         "#,
-        "cannot iterate `(U in T: Option<U>)`: a tuple is a fixed sequence of \
-         independently typed elements",
+        "2\n",
     );
+}
+
+/// A `&mut` walk over a mapped tuple keeps B209's refusal: a tuple family has
+/// no element VIEWS to hand out, only elements.
+#[test]
+fn b209_a_mutable_walk_over_a_mapped_tuple_is_still_refused() {
     assert_fails_with(
         r#"
-        import std::io::print;
         import std::option::{ Option, Some };
 
-        fun walk<T: (2..)>(items: (U in T: Option<U>)) {
-            for item in items {
-                print(item);
+        fun walk<T: (2..)>(mut items: (U in T: Option<U>)) {
+            for item in &mut items {
+                item = None;
             }
         }
 
@@ -5949,8 +5957,7 @@ fn b209_a_mapped_tuple_loop_is_refused_and_steered_to_the_comprehension() {
             walk((Some(1), Some("two")));
         }
         "#,
-        "A mapped tuple's elements have no positions to read yet, so the element-wise \
-         form here is the comprehension `(x in t => e)`",
+        "cannot iterate `(U in T: Option<U>)`",
     );
 }
 
@@ -7298,22 +7305,25 @@ fn a122_a_tuple_bounded_blanket_does_not_reach_outside_its_family() {
 // `T` were unbounded or not a tuple at all. It names the bound now and says
 // what the refusal is about (papers-41's probe `a122_02`).
 
+/// E223's refusal is gone with its premise (A122 §4.2): the item's own
+/// program — `divorce` over a VALUE of `T: (2..)` — is a comprehension source
+/// now, read as `(U in T: U)`, and it builds one cell per position.
 #[test]
-fn e223_a_tuple_bounded_parameter_source_names_its_bound() {
-    assert_fails_with(
+fn a122_a_tuple_bounded_value_is_a_comprehension_source() {
+    assert_compiles_and_runs(
         concat!(
+            "import std::io::print;\n",
             "import std::reactive::SignalCell;\n",
             "fun divorce<T: (2..)>(source: SignalCell<T>): (U in T: SignalCell<U>) {\n",
             "\t(x in source.get() => SignalCell::new(x))\n",
             "}\n",
             "fun main() {\n",
             "\tlet s = SignalCell::new((1, \"one\"));\n",
-            "\tlet _parts = divorce(s);\n",
+            "\tlet (n, word) = divorce(s);\n",
+            "\tprint(i\"{n.get()} {word.get()}\");\n",
             "}\n",
         ),
-        "a tuple comprehension's source must be a mapped tuple, got T, a type parameter \
-         bounded `(2..)`: the bound makes it a tuple, but a VALUE of a bounded tuple \
-         parameter is not a comprehension source today",
+        "1 one\n",
     );
 }
 
@@ -7476,5 +7486,422 @@ fn b399_an_element_bound_does_not_reach_another_packs_binder() {
             "}\n",
         ),
         "`U` is unbounded",
+    );
+}
+
+// --- A122: `std::tuple` — the `Tuple` trait over every tuple family, keyed by
+// --- position (`TupleKey<T, U>`), the key's family rule, a `for` over a
+// --- family, `map` as the comprehension's spelling, and `divorce` beside
+// --- `combine` (tuple-module.md, Q1–Q7 ruled 2026-09-25).
+
+/// On a CONCRETE tuple, including an element that is itself a tuple (flat
+/// storage: `(2, 3)` occupies two slots, so its key reads a `.slice`).
+#[test]
+fn a122_the_tuple_trait_walks_a_concrete_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet t = (1, \"a\", (2, 3), true);\n",
+            "\tprint(t.len());\n",
+            "\tlet (k0, k1, k2, k3) = t.keys();\n",
+            "\tlet (x, y) = t.get(k2);\n",
+            "\tprint(i\"{t.get(k0)} {t.get(k1)} {x} {y} {t.get(k3)}\");\n",
+            "\tlet (_, (k, v), (pair_key, (p, q)), _) = t.entries();\n",
+            "\tprint(i\"{v} {t.get(k)} {p} {q} {t.get(pair_key).1}\");\n",
+            "}\n",
+        ),
+        "4\n1 a 2 3 true\na a 2 3 3\n",
+    );
+}
+
+/// On a VALUE of a tuple-bounded parameter (§4.2): `len`, and `keys()` read
+/// back through `get` — the identity walk answers the tuple itself.
+#[test]
+fn a122_the_tuple_trait_walks_a_bounded_parameter() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun arity<T: (2..)>(whole: T): usize {\n",
+            "\twhole.len()\n",
+            "}\n",
+            "\n",
+            "fun rebuilt<T: (2..)>(whole: T): T {\n",
+            "\t(key in whole.keys() => whole.get(key))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(arity((1, \"a\", true)));\n",
+            "\tlet ((a, b), c) = rebuilt(((1, 2), \"c\"));\n",
+            "\tprint(i\"{a} {b} {c}\");\n",
+            "}\n",
+        ),
+        "3\n1 2 c\n",
+    );
+}
+
+/// THE FAMILY RULE (§4.3): a key minted by `whole.keys()` — a `TupleKey<T, U>` —
+/// reads a tuple MAPPED from `T` at the mapped element: `cells.get(key)` is a
+/// `SignalCell<U>`, so `.get()` on it types as `U`. Over a two-slot element, so
+/// the mapped family's layout (one slot per cell) and the root's (three slots)
+/// differ and each `get` reads its own.
+#[test]
+fn a122_a_key_for_a_family_reads_every_tuple_mapped_from_it() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun cells<T: (2..)>(whole: T): (U in T: SignalCell<U>) {\n",
+            "\t(key in whole.keys() => SignalCell::new(whole.get(key)))\n",
+            "}\n",
+            "\n",
+            "fun reads<T: (2..)>(whole: T, cells: (U in T: SignalCell<U>)): T {\n",
+            "\t(key in whole.keys() => cells.get(key).get())\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet t = ((1, 2), \"z\");\n",
+            "\tlet held = cells(t);\n",
+            "\tlet ((x, y), z) = reads(t, held);\n",
+            "\tprint(i\"{x} {y} {z}\");\n",
+            "}\n",
+        ),
+        "1 2 z\n",
+    );
+}
+
+/// Two UNRELATED families never share keys: `T` and `S` are both `(2..)` but
+/// their arities are independent, so a key of `T` does not read an `S`.
+#[test]
+fn a122_a_key_is_refused_across_families() {
+    assert_fails_with(
+        concat!(
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun cross<T: (2..), S: (2..)>(t: T, s: S): i32 {\n",
+            "\tlet _walk = (key in t.keys() => s.get(key));\n",
+            "\t0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet _ = cross((1, 2), (\"a\", \"b\"));\n",
+            "}\n",
+        ),
+        "Expected TupleKey<S, U>, but got TupleKey<T, U> instead.",
+    );
+}
+
+/// A walk's element type is RIGID and belongs to the walk: a value typed at it
+/// cannot escape into an outer binding — here a literal `mut` that would
+/// otherwise take its type from its first use (B389).
+#[test]
+fn a122_an_element_cannot_escape_its_walk() {
+    assert_fails_with(
+        concat!(
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun last<T: (2..)>(t: T): i32 {\n",
+            "\tmut out = 0;\n",
+            "\tlet _walk = (key in t.keys() => {\n",
+            "\t\tout = t.get(key);\n",
+            "\t\t0\n",
+            "\t});\n",
+            "\tout\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet _ = last((1, 2));\n",
+            "}\n",
+        ),
+        "Expected i32, but got U instead.",
+    );
+}
+
+/// Two walks over one family range over DIFFERENT positions at once, so their
+/// elements are different types. Before A122 both comprehensions typed their
+/// binder with the source's own `U`, so this compiled and wrote the `str` at
+/// position 1 into the `i32` cell at position 0. The inner binder prints
+/// primed.
+#[test]
+fn a122_two_walks_over_one_family_do_not_share_an_element_type() {
+    assert_fails_with(
+        concat!(
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun cross<T: (2..)>(cells: (U in T: SignalCell<U>)): (U in T: i32) {\n",
+            "\t(a in cells => {\n",
+            "\t\tlet _inner = (b in cells => {\n",
+            "\t\t\ta.set(b.get());\n",
+            "\t\t\t0\n",
+            "\t\t});\n",
+            "\t\t0\n",
+            "\t})\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet _ = cross((SignalCell::new(1), SignalCell::new(\"s\")));\n",
+            "}\n",
+        ),
+        "Expected U, but got U' instead.",
+    );
+}
+
+/// A numbered read on an abstract family stays refused (its arity is not
+/// known while the body is checked), and the refusal names the key.
+#[test]
+fn a122_a_numbered_read_on_a_family_steers_to_a_key() {
+    assert_fails_with(
+        concat!(
+            "fun first<T: (2..)>(t: T): i32 {\n",
+            "\tlet _x = t.0;\n",
+            "\t0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet _ = first((1, 2));\n",
+            "}\n",
+        ),
+        "cannot access field '0' on type T: a tuple of an abstract family has no numbered \
+         positions",
+    );
+}
+
+/// Q3 (ruled): no public constructor — a key that could be written by hand
+/// could name a position its family does not have, at a type it does not have.
+#[test]
+fn a122_a_key_has_no_constructor() {
+    assert_fails_with(
+        concat!(
+            "import std::tuple::{ Tuple, TupleKey };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet t = (1, \"a\");\n",
+            "\tlet key: TupleKey<(i32, str), str> = TupleKey { at = 0 };\n",
+            "\tlet _ = t.get(key);\n",
+            "}\n",
+        ),
+        "`TupleKey` expects 0 fields",
+    );
+}
+
+/// The blanket over tuples is a blanket over TUPLES: with `std::tuple`
+/// imported, a cell's `get` is still `Source::get`, not ambiguous with
+/// `Tuple::get` (the blanket's binder bound is `(2..)`, which a struct never
+/// meets).
+#[test]
+fn a122_the_tuple_blanket_does_not_reach_a_non_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet cell = SignalCell::new(3);\n",
+            "\tprint(cell.get());\n",
+            "}\n",
+        ),
+        "3\n",
+    );
+}
+
+/// §4.4 (Q2 ruled): the owner's sketch — a `for` over `entries()` binding
+/// `(key, value)`, body checked once, writing each position's cell through the
+/// family rule. Over a two-slot element, so the per-position emission is
+/// exercised.
+#[test]
+fn a122_the_owners_sketch_runs() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun mirror<T: (2..)>(source: SignalCell<T>): (U in T: SignalCell<U>) {\n",
+            "\tlet signals: (U in T: SignalCell<U>) = source.get().map(|initial| SignalCell::new(initial));\n",
+            "\tlet _subscription = source.sub(|fresh| {\n",
+            "\t\tfor (key, value) in fresh.entries() {\n",
+            "\t\t\tsignals.get(key).set(value);\n",
+            "\t\t}\n",
+            "\t});\n",
+            "\tsignals\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet source = SignalCell::new(((1, 2), \"a\"));\n",
+            "\tlet (pair, word) = mirror(source);\n",
+            "\tsource.set(((3, 4), \"b\"));\n",
+            "\tprint(i\"{pair.get().0} {pair.get().1} {word.get()}\");\n",
+            "}\n",
+        ),
+        "3 4 b\n",
+    );
+}
+
+/// A `for` over a family whose element bound the body dispatches through
+/// (B399 in a loop): each position compares through its own `==`, and
+/// `break`/`continue` keep their meaning across the per-position branches.
+#[test]
+fn a122_a_for_over_a_bounded_family_dispatches_per_element() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "import std::compare::PartialEq;\n",
+            "\n",
+            "fun changed<T: (2..: PartialEq)>(before: T, after: T): i32 {\n",
+            "\tmut count = 0;\n",
+            "\tfor (key, value) in after.entries() {\n",
+            "\t\tif value == before.get(key) {\n",
+            "\t\t\tjump continue;\n",
+            "\t\t}\n",
+            "\t\tcount += 1;\n",
+            "\t}\n",
+            "\tcount\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(changed((1, \"a\", true), (1, \"b\", false)));\n",
+            "}\n",
+        ),
+        "2\n",
+    );
+}
+
+/// §3 (Q1 ruled): `t.map(|x| e)` IS `(x in t => e)` — typed by the
+/// comprehension's rule, over a family.
+#[test]
+fn a122_map_is_the_comprehension_spelled_as_a_call() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::tuple::Tuple;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun cells<T: (2..)>(whole: T): (U in T: SignalCell<U>) {\n",
+            "\twhole.map(|x| SignalCell::new(x))\n",
+            "}\n",
+            "\n",
+            "fun pairs<T: (2..)>(whole: T): (U in T: (i32, U)) {\n",
+            "\twhole.map(|x| (7, x))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (a, b) = cells((1, \"b\"));\n",
+            "\tprint(i\"{a.get()} {b.get()}\");\n",
+            "\tlet ((s, x), (t, y)) = pairs((1, \"b\"));\n",
+            "\tprint(i\"{s} {x} {t} {y}\");\n",
+            "}\n",
+        ),
+        "1 b\n7 1 7 b\n",
+    );
+}
+
+/// Q1: a closure VALUE is refused — one closure has one type, and a tuple
+/// needs a function per position — with the steer to the literal.
+#[test]
+fn a122_map_refuses_a_closure_value() {
+    assert_fails_with(
+        concat!(
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun twice(x: i32): i32 {\n",
+            "\tx * 2\n",
+            "}\n",
+            "\n",
+            "fun doubled<T: (2..)>(t: T): i32 {\n",
+            "\tlet _m = t.map(twice);\n",
+            "\t0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet _ = doubled((1, 2));\n",
+            "}\n",
+        ),
+        "`map` over a tuple takes one closure LITERAL with one parameter",
+    );
+}
+
+/// An annotated `map` parameter can only restate the element: `U` is rigid.
+#[test]
+fn a122_map_refuses_a_parameter_annotated_off_the_element() {
+    assert_fails_with(
+        concat!(
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun ints<T: (2..)>(t: T): i32 {\n",
+            "\tlet _m = t.map(|x: i32| x);\n",
+            "\t0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet _ = ints((1, 2));\n",
+            "}\n",
+        ),
+        "Expected U, but got i32 instead.",
+    );
+}
+
+/// `divorce` at arity 2 and 3, and what its outputs FIRE on, stated: every
+/// output subscribes to the whole source, so each fires on every change of it
+/// — a change to the other position and a `set` that changes nothing included
+/// (Q4 ruled: no `PartialEq` gate; `.distinct()` at the consumer is the gate).
+/// `sub` also calls once on subscribing, hence 1 + 3.
+#[test]
+fn a122_divorce_splits_a_pair_and_every_output_fires_on_every_change() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, divorce };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet source = SignalCell::new((1, \"a\"));\n",
+            "\tlet (left, right) = divorce(source);\n",
+            "\tmut left_fired = 0;\n",
+            "\tmut right_fired = 0;\n",
+            "\tlet _l = left.sub(|_| {\n",
+            "\t\tleft_fired += 1;\n",
+            "\t});\n",
+            "\tlet _r = right.sub(|_| {\n",
+            "\t\tright_fired += 1;\n",
+            "\t});\n",
+            "\tsource.set((2, \"a\"));\n",
+            "\tsource.set((2, \"b\"));\n",
+            "\tsource.set((2, \"b\"));\n",
+            "\tprint(i\"{left.get()} {right.get()} {left_fired} {right_fired}\");\n",
+            "\tlet (a, b, c) = divorce(SignalCell::new((1, (2, 3), \"c\")));\n",
+            "\tprint(i\"{a.get()} {b.get().1} {c.get()}\");\n",
+            "}\n",
+        ),
+        "2 b 4 4\n1 3 c\n",
+    );
+}
+
+/// The round trip the item names: `divorce(combine((a, b, c)))` re-derives
+/// each input's value, a two-slot one included, after writes to two of them.
+#[test]
+fn a122_divorce_of_combine_round_trips() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, combine, divorce };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet a = SignalCell::new(1);\n",
+            "\tlet b = SignalCell::new(\"x\");\n",
+            "\tlet c = SignalCell::new((7, 8));\n",
+            "\tlet (a2, b2, c2) = divorce(combine((a, b, c)));\n",
+            "\ta.set(5);\n",
+            "\tc.set((9, 10));\n",
+            "\tprint(i\"{a2.get()} {b2.get()} {c2.get().0} {c2.get().1}\");\n",
+            "}\n",
+        ),
+        "5 x 9 10\n",
     );
 }

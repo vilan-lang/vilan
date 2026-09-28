@@ -259,10 +259,30 @@ pub fn subject_applies(program: &Program, subject: TypeId, target: TypeId) -> bo
     let mut bindings = HashMap::default();
     bind_subject(program, subject, target, &mut bindings);
     bindings.iter().all(|(constraint_id, bound_type)| {
-        bound_trait_ids(program, *constraint_id)
-            .iter()
-            .all(|trait_id| provides_trait(program, *bound_type, *trait_id))
+        tuple_bound_holds(program, *constraint_id, *bound_type)
+            && bound_trait_ids(program, *constraint_id)
+                .iter()
+                .all(|trait_id| provides_trait(program, *bound_type, *trait_id))
     })
+}
+
+/// A122: a binder's TUPLE bound (`impl type T: (2..)`) holds for a concrete
+/// tuple whose arity it admits, and for nothing else concrete — the blanket
+/// over tuples is not a blanket over every type.
+fn tuple_bound_holds(program: &Program, constraint_id: TypeId, bound_type: TypeId) -> bool {
+    let Some((lo, hi)) = program.tuple_bound_arities.get(&constraint_id) else {
+        return true;
+    };
+    match program.type_id_to_type_map.get(&bound_type) {
+        Some(Type::Tuple(elements)) => {
+            lo.is_none_or(|lo| elements.len() >= lo as usize)
+                && hi.is_none_or(|hi| elements.len() <= hi as usize)
+        }
+        Some(
+            Type::Struct(..) | Type::Enum(..) | Type::Array(..) | Type::Closure(..) | Type::Dyn(..),
+        ) => false,
+        _ => true,
+    }
 }
 
 /// [`subject_applies`], with each binder's PARAMETERIZED bounds read at their

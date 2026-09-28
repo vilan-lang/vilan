@@ -8,7 +8,7 @@ Import what you use:
 ```vilan,fragment
 import std::reactive::{
 	Signal, SignalCell, Source, MaybeSignal, Subscription, Disposable, combine,
-	selector, Selector,
+	divorce, selector, Selector,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -31,6 +31,7 @@ import std::reactive::{
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
 | `Subscription` | struct | an explicit subscription; `Disposable` |
 | `combine` | fn | tuple-signal over 2+ signals |
+| `divorce` | fn | the reverse: one derived source per position of a tuple-valued source |
 | `selector`, `Selector<T>` | fn/struct | per-key selection: one subscription, two writes per change |
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `on_cleanup` | fn | run a cleanup when the ambient owner is released |
@@ -758,6 +759,34 @@ fun main() {
 (Destructuring names the parts, which reads better than positions;
 `both.get().1` also works.) Like `map`, it is a cold node: `.cell()` it where
 the tuple is shared or read hot.
+
+## divorce
+
+```vilan,fragment
+fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Map<S, T, U>)
+```
+
+The reverse of `combine`: one derived source per position of a tuple-valued
+source. Each output is a cold `map` node reading its own position through a
+`std::tuple` key, so `divorce(combine((a, b)))` re-derives `a`'s and `b`'s
+values:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source, divorce };
+
+fun main() {
+	let pair = Signal::new((1, "one"));
+	let (number, word) = divorce(pair);
+	pair.set((2, "two"));
+	print(i"{number.get()} {word.get()}");
+}
+```
+
+Every output subscribes to the WHOLE source, so each one fires on every change
+of it — a change to another position, and a `set` that changes nothing,
+included. A consumer that wants its output to fire only when that position
+moved gates it: `divorce(pair).0.distinct()`, which asks `PartialEq` of that
+one element. `.cell()` an output where it is shared or read hot.
 
 ## Subscription, Disposable
 

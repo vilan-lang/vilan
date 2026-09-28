@@ -238,6 +238,26 @@ impl TupleBoundRequirement {
     }
 }
 
+/// `U` -> `U'` -> `U''`: the name a nested tuple walk's binder prints as when
+/// an enclosing walk already holds the plain one (A122). Interned, so a name
+/// leaks once per distinct spelling for the life of the process rather than
+/// once per analysis.
+fn primed_binder_name(name: &str) -> &'static str {
+    static PRIMED: std::sync::OnceLock<std::sync::Mutex<HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let primed = format!("{name}'");
+    let mut interned = PRIMED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = interned.get(primed.as_str()) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(primed.into_boxed_str());
+    interned.insert(leaked);
+    leaked
+}
+
 #[derive(Clone, Debug)]
 pub enum Expr<'src> {
     // An assignment to a local: target accessor and the (possibly desugared,
@@ -3753,6 +3773,26 @@ pub struct Analyzer<'src> {
     // it. Read at USE time by [`Self::generic_bound_traits`], like
     // `generic_bounds`' entries, because the source resolves in `build()`.
     mapped_binder_sources: HashMap<TypeId, TypeId>,
+    // A122 §4.2/§4.4: the element binder a comprehension or a `for` over a
+    // tuple FAMILY walks with, keyed by the comprehension / loop entity: a
+    // FRESH binder per walk and the family's type id. Fresh because two walks
+    // over one family range over DIFFERENT positions at once — `(a in cells =>
+    // (b in cells => ..))` — and sharing the source's own binder typed `a` and
+    // `b` alike, so `a.set(b.get())` checked and wrote a `str` into an `i32`
+    // cell. Memoized so a deferred resolution retries with the same binder.
+    tuple_walk_binders: HashMap<Id, (TypeId, TypeId)>,
+    // The view each walk resolved to — `(U in T: F<U>)` over its fresh `U` —
+    // for the emitters, which bind `U` per element to unroll a body.
+    tuple_walk_views: HashMap<Id, TypeId>,
+    // Each walk binder's name as its source wrote it, before
+    // `name_nested_walk_binders` primes the nested ones.
+    tuple_walk_names: HashMap<TypeId, (&'src str, Option<Id>)>,
+    // A122 §3: each `t.map(|x| e)` over a tuple family, by call id -> its
+    // answer `(U in T: <e's type>)`. `map` is the comprehension's spelling,
+    // typed by the comprehension's rule rather than by its signature.
+    tuple_map_results: HashMap<Id, TypeId>,
+    // A122: each `Tuple` member call's receiver type, as resolved.
+    tuple_call_receivers: HashMap<Id, TypeId>,
     // For an impl whose subject is a generic application (`impl Option<(type T,
     // type U)>`), the impl body scope -> the subject's type id. Lets `self`'s
     // variant patterns substitute the subject enum's declared parameters for the
@@ -4799,6 +4839,10 @@ pub struct Analyzer<'src> {
     result_enum_id: Option<Id>,
     try_trait_id: Option<Id>,
     lift_trait_id: Option<Id>,
+    // A122: `std::tuple`'s `Tuple` trait and `TupleKey` struct, by identity —
+    // `map`'s desugar keys on the trait, the key's family rule on the struct.
+    tuple_trait_id: Option<Id>,
+    tuple_key_struct_id: Option<Id>,
     /// The std `Callable` marker (B340), resolved by identity from
     /// `std::operators` after loading. `x(args)` on a receiver whose type
     /// implements it resolves as the method `call`; keyed on the real std
@@ -6077,6 +6121,11 @@ impl<'src> Analyzer<'src> {
             defaulted_parameter_mentions: HashMap::default(),
             tuple_bounds: HashMap::default(),
             mapped_binder_sources: HashMap::default(),
+            tuple_walk_binders: HashMap::default(),
+            tuple_walk_views: HashMap::default(),
+            tuple_walk_names: HashMap::default(),
+            tuple_map_results: HashMap::default(),
+            tuple_call_receivers: HashMap::default(),
             impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
             implementations_by_member: HashMap::default(),
@@ -6266,6 +6315,8 @@ impl<'src> Analyzer<'src> {
             option_enum_id: None,
             result_enum_id: None,
             try_trait_id: None,
+            tuple_trait_id: None,
+            tuple_key_struct_id: None,
             lift_trait_id: None,
             callable_trait_id: None,
             hmr_stash_fn_id: None,
@@ -7928,6 +7979,18 @@ impl<'src> Analyzer<'src> {
             )];
         }
 
+        // A122: a MAPPED tuple over a tuple-bounded family is a tuple of the
+        // family's arity — `cells.len()` on `(U in T: SignalCell<U>)` reaches
+        // the `(2..)` blanket through `T`'s own bound.
+        if let Type::Mapped(..) = value_type {
+            if self.tuple_family_entails(value_type, requirement) {
+                return Vec::new();
+            }
+            return vec![format!(
+                "'{value_label}' is a mapped tuple whose family is not bound to guarantee \
+                 '{bound_label}', which this argument's parameter requires"
+            )];
+        }
         let Type::Tuple(elements) = value_type else {
             return vec![format!(
                 "'{value_label}' is not a tuple: this argument's parameter is bound \
@@ -18481,6 +18544,35 @@ impl<'src> Analyzer<'src> {
         let context: SubstitutionContext = bindings.iter().copied().collect();
         for (constraint_id, bound_id) in bindings {
             let bound = bound_id.get_type(self);
+            // A122: a binder's TUPLE bound holds for a tuple of an admitted
+            // arity and for a family that entails it — never for a nominal
+            // type. Without this, `impl type T: (2..) with Tuple` applied to
+            // every receiver, and `std::tuple` imported anywhere made
+            // `SignalCell::get` ambiguous with `Tuple::get`.
+            if let Some(requirement) = self.tuple_bounds.get(&constraint_id).cloned() {
+                let holds = match &bound {
+                    Type::Tuple(elements) => {
+                        requirement
+                            .lo
+                            .is_none_or(|lo| elements.len() >= lo as usize)
+                            && requirement
+                                .hi
+                                .is_none_or(|hi| elements.len() <= hi as usize)
+                    }
+                    Type::Generic(_) | Type::Mapped(..) => {
+                        self.tuple_family_entails(&bound, &requirement)
+                    }
+                    Type::Struct(..)
+                    | Type::Enum(..)
+                    | Type::Array(..)
+                    | Type::Closure(..)
+                    | Type::Dyn(..) => false,
+                    _ => true,
+                };
+                if !holds {
+                    return false;
+                }
+            }
             if !matches!(bound, Type::Struct(..) | Type::Enum(..)) {
                 continue;
             }
@@ -19355,6 +19447,13 @@ impl<'src> Analyzer<'src> {
         let pairs: Vec<(TypeId, TypeId)> = bindings.iter().map(|(k, v)| (*k, *v)).collect();
         for (binder, value_id) in pairs {
             let value = value_id.get_type(self);
+            // A122: a binder's TUPLE bound (`impl type T: (2..)`) holds for an
+            // abstract family only when the family's own bound entails it.
+            if let Some(requirement) = self.tuple_bounds.get(&binder).cloned()
+                && !self.tuple_family_entails(&value, &requirement)
+            {
+                return false;
+            }
             for (trait_id, arguments) in self.generic_bound_traits(binder) {
                 let required: Vec<TypeId> = arguments
                     .iter()
@@ -19378,6 +19477,58 @@ impl<'src> Analyzer<'src> {
             }
         }
         true
+    }
+
+    /// A122: whether an ABSTRACT tuple family provably meets a tuple bound —
+    /// the receiver side of B408's entailment, for a blanket over `impl type
+    /// T: (lo..hi: E)`. A tuple-bounded parameter meets it when its own arity
+    /// range sits inside the bound's and its own element bound provides `E`
+    /// (directly or through a supertrait); a mapped tuple `(U in T: F<U>)` has
+    /// `T`'s arity, but its elements are `F<U>`, about which an element bound on
+    /// `T` says nothing — so it meets an arity-only bound and no other. A
+    /// concrete tuple is `impl_subject_admits`' business and is not asked here.
+    fn tuple_family_entails(&self, family: &Type, requirement: &TupleBoundRequirement) -> bool {
+        let (declared, element_bound_reaches) = match family {
+            Type::Generic(constraint_id) => match self.tuple_bounds.get(constraint_id) {
+                Some(declared) => (declared.clone(), true),
+                None => return false,
+            },
+            Type::Mapped(_, source_id, _) => {
+                let source = source_id.get_type(self);
+                let Type::Generic(constraint_id) = source else {
+                    return false;
+                };
+                match self.tuple_bounds.get(&constraint_id) {
+                    Some(declared) => (declared.clone(), false),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        let lo_holds = requirement.lo.unwrap_or(0) <= declared.lo.unwrap_or(0);
+        let hi_holds = match (requirement.hi, declared.hi) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(required), Some(declared)) => declared <= required,
+        };
+        let element_holds = match requirement.element_bound {
+            None => true,
+            Some(required) => {
+                let Type::Trait(required_trait_id, _) = required.get_type(self) else {
+                    return false;
+                };
+                element_bound_reaches
+                    && declared
+                        .element_bound
+                        .is_some_and(|declared_element| match declared_element.get_type(self) {
+                            Type::Trait(declared_trait_id, _) => self
+                                .trait_with_supertraits(declared_trait_id)
+                                .contains(&required_trait_id),
+                            _ => false,
+                        })
+            }
+        };
+        lo_holds && hi_holds && element_holds
     }
 
     /// The arguments a caller's own parameter provides `trait_id` at, read off
@@ -30216,6 +30367,285 @@ impl<'src> Analyzer<'src> {
         self.tuple_bounds.get(&source_constraint_id)?.element_bound
     }
 
+    /// Whether `member_id` is `std::tuple`'s `map` — the `Tuple` trait's own
+    /// requirement or the blanket's intrinsic that provides it.
+    fn is_tuple_map_member(&self, member_id: Id) -> bool {
+        self.tuple_member_name(member_id) == Some("map")
+    }
+
+    /// The name of `member_id` when it is one of `std::tuple`'s `Tuple`
+    /// members — the trait's requirement or the blanket's intrinsic.
+    fn tuple_member_name(&self, member_id: Id) -> Option<&'src str> {
+        let tuple_trait_id = self.tuple_trait_id?;
+        let declared_in = |declarations: &IndexMap<&'src str, Id>| {
+            declarations
+                .iter()
+                .find(|(_, declared)| **declared == member_id)
+                .map(|(name, _)| *name)
+        };
+        if let Some(name) = self
+            .traits
+            .get(&tuple_trait_id)
+            .and_then(|trait_| declared_in(&trait_.declarations))
+        {
+            return Some(name);
+        }
+        self.implementations
+            .iter()
+            .filter(|implementation| implementation.trait_ids.contains(&tuple_trait_id))
+            .find_map(|implementation| declared_in(&implementation.declarations))
+    }
+
+    /// A122 §3 — `t.map(|x| e)` over a tuple family IS the comprehension `(x in
+    /// t => e)`: the closure literal's parameter is the binder, typed at the
+    /// element template of a view fresh to this call, its body is checked ONCE,
+    /// and the answer is `(U in T: <body type>)`. One closure has one type and
+    /// a tuple needs a function per position, so only a LITERAL is admitted — a
+    /// closure VALUE has no body to check per position.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "resolve_method_call's own arguments, forwarded"
+    )]
+    fn resolve_tuple_map(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        member_id: Id,
+        subject_type: &Type,
+        generic_argument_ids: &[TypeId],
+        argument_ids: &[Id],
+        arguments_span: Span,
+    ) -> Resolution {
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let literal = match argument_ids {
+            [argument_id] => match self.expr_id_to_expr_map.get(argument_id) {
+                Some(Expr::Closure(closure_id)) => self
+                    .closures
+                    .get(closure_id)
+                    .filter(|closure| closure.parameters.len() == 1)
+                    .map(|closure| (*argument_id, closure.parameters[0])),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((argument_id, parameter_id)) = literal else {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: match argument_ids.first() {
+                    Some(argument_id) => **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
+                    None => arguments_span,
+                },
+                msg: "`map` over a tuple takes one closure LITERAL with one parameter: its \
+                      body is checked once per position, at that position's element, and a \
+                      closure value has one type. Write `t.map(|x| f(x))`"
+                    .to_string(),
+            });
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        };
+        let body_scope_id = self.expr_id_to_scope_id_map.get(&parameter_id).copied();
+        let Some(view) = self.tuple_family_view(id, body_scope_id, subject_type.clone()) else {
+            let got = self.pretty_print_type(subject_type, &HashMap::default());
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!("a tuple comprehension's source must be a mapped tuple, got {got}"),
+            });
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        };
+        let Type::Mapped(binder_id, family_id, element_template) = view else {
+            unreachable!("a tuple family's view is a mapped type");
+        };
+        let annotated = self
+            .parameters
+            .get(&parameter_id)
+            .map(|parameter| parameter.type_id)
+            .filter(|type_id| !matches!(type_id.get_type(self), Type::Unknown));
+        match annotated {
+            // An annotation must BE the element: the template is what the body
+            // is checked at, so an annotation can only restate it.
+            Some(annotation) => {
+                let written = annotation.get_type(self);
+                let template = element_template.get_type(self);
+                if !self.compare_type_rigid(&written, &template, &HashMap::default(), &[binder_id])
+                {
+                    let msg = self.type_mismatch_message(&template, &written, &HashMap::default());
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
+                        msg,
+                    });
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
+            }
+            None => {
+                if let Some(parameter) = self.parameters.get_mut(&parameter_id) {
+                    parameter.type_id = element_template;
+                }
+            }
+        }
+        let unknown = Type::Unknown.get_type_id(self);
+        let expected = Type::Closure(vec![element_template], unknown, Vec::new());
+        let closure_type = self.infer_type(argument_id, &expected, &HashMap::default());
+        let Type::Closure(_, return_type_id, _) = closure_type else {
+            return Resolution::Deferred;
+        };
+        if matches!(
+            return_type_id.get_type(self),
+            Type::Unresolved | Type::Unknown
+        ) {
+            return Resolution::Deferred;
+        }
+        let view_id = view.get_type_id(self);
+        self.tuple_walk_views.insert(id, view_id);
+        let result = Type::Mapped(binder_id, family_id, return_type_id).get_type_id(self);
+        self.tuple_map_results.insert(id, result);
+        // `map<F>`'s placeholder generic is the closure's own type — grounded,
+        // so nothing downstream reads an unbound parameter at this call.
+        if let Some((_, own_generics)) = self.method_signature(member_id)
+            && let [own_generic] = own_generics.as_slice()
+        {
+            let closure_type_id = closure_type.get_type_id(self);
+            self.method_call_substitution
+                .entry(id)
+                .or_default()
+                .insert(*own_generic, closure_type_id);
+            self.own_generic_call_bindings
+                .insert(id, vec![closure_type_id]);
+        }
+        self.wire_method_call(
+            id,
+            subject_id,
+            member_id,
+            generic_argument_ids.to_vec(),
+            argument_ids.to_vec(),
+            arguments_span,
+        );
+        Resolution::Resolved
+    }
+
+    /// A walk nested in another would print both binders by one name —
+    /// "Expected U, but got U" — so each is primed once per ENCLOSING walk that
+    /// wrote the same name (`U`, `U'`, `U''`). Re-run at every mint, because the
+    /// fixpoint may type an inner walk before the outer one exists.
+    fn name_nested_walk_binders(&mut self) {
+        let walks: Vec<(TypeId, &'src str, Option<Id>)> = self
+            .tuple_walk_names
+            .iter()
+            .map(|(binder_id, (name, body_scope_id))| (*binder_id, *name, *body_scope_id))
+            .collect();
+        for (binder_id, name, scope_id) in &walks {
+            let Some(scope_id) = scope_id else {
+                continue;
+            };
+            let enclosing = walks
+                .iter()
+                .filter(|(other_id, other_name, other_scope)| {
+                    other_id != binder_id
+                        && other_name == name
+                        && other_scope.is_some_and(|other_scope| {
+                            other_scope != *scope_id && self.scope_encloses(other_scope, *scope_id)
+                        })
+                })
+                .count();
+            let mut printed: &'src str = name;
+            for _ in 0..enclosing {
+                printed = primed_binder_name(printed);
+            }
+            self.generic_constraint_names.insert(*binder_id, printed);
+        }
+    }
+
+    /// A122 §4.2/§4.4 — what a comprehension or a `for` over `source_type`
+    /// walks: the tuple FAMILY it belongs to, as a mapped type `(U in T: F<U>)`
+    /// over a binder FRESH to this walk (`walk_id`), or `None` when the source
+    /// is not a family.
+    ///
+    /// Two sources are families: a mapped type `(V in T: F<V>)` — whose element
+    /// is `F` re-bound at the fresh `U` — and a VALUE of a tuple-bounded
+    /// parameter `T: (2..)`, which is the identity mapping `(U in T: U)` (the
+    /// converse of `reduce_identity_mapped`). A concrete tuple is not: its
+    /// elements have types of their own and no template (B183's open arm).
+    ///
+    /// The fresh binder ranges over the family `T`, so it inherits `T`'s element
+    /// bound (B399) exactly as a written mapped type's binder does. And it is
+    /// RIGID inside `body_scope_id`, the walk's body: one position, fixed and
+    /// unknown, so a value typed at it meets only its own kind — a second walk's
+    /// element, a caller's `i32`, an outer binding's type are all refused by
+    /// the ordinary rigid-generic mismatch (`Expected U, but got U`), which is
+    /// also what keeps a key or an element from escaping its walk.
+    fn tuple_family_view(
+        &mut self,
+        walk_id: Id,
+        body_scope_id: Option<Id>,
+        source_type: Type,
+    ) -> Option<Type> {
+        let (written_binder, family_id, template_id) = match self.expand_mapped(source_type) {
+            Type::Mapped(binder_id, family_id, template_id) => {
+                (Some(binder_id), family_id, Some(template_id))
+            }
+            Type::Generic(constraint_id) if self.tuple_bounds.contains_key(&constraint_id) => {
+                let family_id = match self.tuple_walk_binders.get(&walk_id) {
+                    Some((_, family_id)) => *family_id,
+                    None => Type::Generic(constraint_id).get_type_id(self),
+                };
+                (None, family_id, None)
+            }
+            _ => return None,
+        };
+        let binder_id = match self.tuple_walk_binders.get(&walk_id) {
+            Some((binder_id, _)) => *binder_id,
+            None => {
+                let binder_id = Type::Any.get_type_id(self);
+                let name = written_binder
+                    .and_then(|binder| self.generic_constraint_names.get(&binder).copied())
+                    .unwrap_or("U");
+                self.generic_constraint_names.insert(binder_id, name);
+                // RIGID in the whole file the walk is written in, not only in
+                // its body: nothing outside the walk may bind it either — a
+                // literal `let` that took its type from a use inside (B389), a
+                // parameter annotation the call site checks, a value carried
+                // out — so every meeting with another type is the ordinary
+                // rigid mismatch.
+                if let Some(body_scope_id) = body_scope_id {
+                    let mut root_scope_id = body_scope_id;
+                    while let Some(parent_id) = self
+                        .scopes
+                        .get(&root_scope_id)
+                        .and_then(|scope| scope.parent_id)
+                    {
+                        root_scope_id = parent_id;
+                    }
+                    self.anonymous_binder_scopes
+                        .insert(binder_id, root_scope_id);
+                }
+                self.tuple_walk_names
+                    .insert(binder_id, (name, body_scope_id));
+                self.name_nested_walk_binders();
+                binder_id
+            }
+        };
+        self.tuple_walk_binders
+            .insert(walk_id, (binder_id, family_id));
+        self.mapped_binder_sources.insert(binder_id, family_id);
+        let element_id = Type::Generic(binder_id).get_type_id(self);
+        let template_id = match (written_binder, template_id) {
+            (Some(written_binder), Some(template_id)) => {
+                let template = template_id.get_type(self);
+                let rebind: SubstitutionContext =
+                    [(written_binder, element_id)].into_iter().collect();
+                self.substitute_type(&template, &rebind).get_type_id(self)
+            }
+            _ => element_id,
+        };
+        Some(Type::Mapped(binder_id, family_id, template_id))
+    }
+
     /// Registers a single generic parameter named `name` (bound by the
     /// constraint type) into `scope_id`.
     fn register_generic_parameter(
@@ -37088,6 +37518,11 @@ impl<'src> Analyzer<'src> {
             Expr::Module(module_id) => Type::Module(*module_id),
             Expr::Call(id) => {
                 let id = *id;
+                // A122 §3: a tuple family's `map` answers by the comprehension
+                // rule, never by its placeholder signature.
+                if let Some(result) = self.tuple_map_results.get(&id).copied() {
+                    return result.get_type(self);
+                }
                 // The call may not have been wired up yet (its `FunctionCall`
                 // is recorded once the subject resolves). Defer until it is.
                 let (subject_id, generic_argument_ids, argument_ids) =
@@ -37755,7 +38190,15 @@ impl<'src> Analyzer<'src> {
                     substitution_context,
                     exprs_seen,
                 );
-                match source_type {
+                let view = match source_type {
+                    Type::Unresolved => Type::Unresolved,
+                    source_type => {
+                        let body_scope_id = self.expr_id_to_scope_id_map.get(&binder_id).copied();
+                        self.tuple_family_view(expr_id, body_scope_id, source_type)
+                            .unwrap_or(Type::Unknown)
+                    }
+                };
+                match view {
                     Type::Unresolved => Type::Unresolved,
                     Type::Mapped(element_binder, element_source, element_template) => {
                         if let Some(variable) = self.variables.get_mut(&binder_id) {
@@ -38949,6 +39392,121 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// A122 §4.3, THE FAMILY RULE: **a `TupleKey<T, U>` is a
+    /// `TupleKey<(V in T: F<V>), F[V := U]>`** — a key for `T` is a key for
+    /// every tuple mapped from `T`, at the mapped element type, and through
+    /// any number of mappings. So `cells.get(key)`, with `cells: (V in T:
+    /// SignalCell<V>)` and `key: TupleKey<T, U>` from `whole.keys()`, answers
+    /// `SignalCell<U>` with no special case in `get`.
+    ///
+    /// `Some(answer)` when one side's family is the other's mapped (the rule
+    /// decides, and may refuse); `None` when neither is, and the key's
+    /// arguments reconcile as any struct's do — which is also what keeps two
+    /// UNRELATED families apart: `T` and `S` are two rigid parameters, and no
+    /// arm reconciles them.
+    #[allow(
+        clippy::type_complexity,
+        reason = "reconcile_type's own answer, wrapped"
+    )]
+    fn reconcile_tuple_keys(
+        &mut self,
+        key_id: Id,
+        l_arguments: &[TypeId],
+        r_arguments: &[TypeId],
+        substitution_context: &SubstitutionContext,
+    ) -> Option<Option<(Type, Vec<(TypeId, TypeId)>)>> {
+        let ([l_family, l_element], [r_family, r_element]) = (l_arguments, r_arguments) else {
+            return None;
+        };
+        // A family written as a declaration's own binder (`get`'s `Self`, the
+        // blanket's `T`) is read through the call's substitution: it is the
+        // receiver's family there.
+        let l_family_type = l_family.get_type(self);
+        let l_family_type = self.substitute_type(&l_family_type, substitution_context);
+        let r_family_type = r_family.get_type(self);
+        let r_family_type = self.substitute_type(&r_family_type, substitution_context);
+        // Left is the MAPPED family, right the root it maps from — or the other
+        // way round. Either way the root side's element is carried through the
+        // mapping and meets the mapped side's element.
+        for (mapped_type, mapped_element, root_family, root_element) in [
+            (&l_family_type, *l_element, &r_family_type, *r_element),
+            (&r_family_type, *r_element, &l_family_type, *l_element),
+        ] {
+            let mapped_family = mapped_type.clone().get_type_id(self);
+            let mapped_type = mapped_type.clone();
+            let Some((carried, mut bindings)) = self.tuple_key_element_through(
+                &mapped_type,
+                root_family,
+                root_element,
+                substitution_context,
+            ) else {
+                continue;
+            };
+            let expected = mapped_element.get_type(self);
+            let carried = carried.get_type(self);
+            let Some((element, element_bindings)) =
+                self.reconcile_type(&expected, &carried, substitution_context)
+            else {
+                return Some(None);
+            };
+            bindings.extend(element_bindings);
+            return Some(Some((
+                Type::Struct(key_id, vec![mapped_family, element.get_type_id(self)]),
+                bindings,
+            )));
+        }
+        None
+    }
+
+    /// The element a key minted for the family `root` at `element` names in
+    /// `family`, when `family` is `root` mapped once or more: `(V in root:
+    /// F<V>)` names `F[V := element]`, and a mapping of that mapping carries
+    /// it on. `None` when `family` is not mapped from `root`.
+    fn tuple_key_element_through(
+        &mut self,
+        family: &Type,
+        root: &Type,
+        element: TypeId,
+        substitution_context: &SubstitutionContext,
+    ) -> Option<(TypeId, Vec<(TypeId, TypeId)>)> {
+        let _guard = crate::util::RecursionGuard::enter()?;
+        let Type::Mapped(binder_id, source_id, template_id) = family else {
+            return None;
+        };
+        let (binder_id, template_id) = (*binder_id, *template_id);
+        let source = source_id.get_type(self);
+        let (inner, bindings) = match self.reconcile_type(&source, root, substitution_context) {
+            Some((_, bindings)) if !matches!(source, Type::Mapped(..)) => (element, bindings),
+            _ => self.tuple_key_element_through(&source, root, element, substitution_context)?,
+        };
+        let template = template_id.get_type(self);
+        let rebind: SubstitutionContext = [(binder_id, inner)].into_iter().collect();
+        Some((
+            self.substitute_type(&template, &rebind).get_type_id(self),
+            bindings,
+        ))
+    }
+
+    /// The read-only half of [`Self::tuple_key_element_through`]'s question:
+    /// is `family` the tuple family `root`, mapped once or more?
+    fn tuple_family_maps_from(
+        &self,
+        family: &Type,
+        root: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        let Type::Mapped(_, source_id, _) = family else {
+            return false;
+        };
+        let source = source_id.get_type(self);
+        (!matches!(source, Type::Mapped(..))
+            && self.compare_type(&source, root, substitution_context))
+            || self.tuple_family_maps_from(&source, root, substitution_context)
+    }
+
     /// `(U in T: U)` — a mapped type whose template IS its own binder — sends
     /// every element of its source to itself, so it IS the source. Reducing it
     /// is what lets `combine`'s `(source in sources => source.get())` meet the
@@ -39304,6 +39862,16 @@ impl<'src> Analyzer<'src> {
                 (Type::Enum(*l_id, arguments), bindings)
             }
             (Type::Struct(l_id, l_arguments), Type::Struct(r_id, r_arguments)) if l_id == r_id => {
+                if Some(*l_id) == self.tuple_key_struct_id
+                    && let Some(reconciled) = self.reconcile_tuple_keys(
+                        *l_id,
+                        l_arguments,
+                        r_arguments,
+                        substitution_context,
+                    )
+                {
+                    return reconciled;
+                }
                 let (arguments, bindings) =
                     self.reconcile_argument_types(l_arguments, r_arguments, substitution_context)?;
                 (Type::Struct(*l_id, arguments), bindings)
@@ -39674,6 +40242,26 @@ impl<'src> Analyzer<'src> {
             (Type::Enum(l_id, l_arguments), Type::Enum(r_id, r_arguments)) if l_id == r_id => {
                 self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
             }
+            // A122's family rule, read-only: a key for `T` fits a key position
+            // of any family mapped from `T` (the element is `reconcile_type`'s
+            // to check — the substitution it needs is not a read).
+            (Type::Struct(l_id, l_arguments), Type::Struct(r_id, r_arguments))
+                if l_id == r_id
+                    && Some(*l_id) == self.tuple_key_struct_id
+                    && l_arguments.len() == 2
+                    && r_arguments.len() == 2
+                    && (self.tuple_family_maps_from(
+                        &l_arguments[0].get_type(self),
+                        &r_arguments[0].get_type(self),
+                        substitution_context,
+                    ) || self.tuple_family_maps_from(
+                        &r_arguments[0].get_type(self),
+                        &l_arguments[0].get_type(self),
+                        substitution_context,
+                    )) =>
+            {
+                true
+            }
             (Type::Struct(l_id, l_arguments), Type::Struct(r_id, r_arguments)) if l_id == r_id => {
                 self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
             }
@@ -39902,6 +40490,17 @@ impl<'src> Analyzer<'src> {
                     self.substitute_argument_types(&arguments, substitution_context),
                 )
             }
+            // A trait OBJECT carries exactly the arguments `Trait` carries, and
+            // substitutes them the same way: `dyn Source<U>` under `U = A` is
+            // `dyn Source<A>` (A122 — a comprehension over `combine`'s
+            // `(U in T: dyn Source<U>)` re-binds `U` to its own walk's binder).
+            Type::Dyn(id, arguments) => {
+                let arguments = arguments.clone();
+                Type::Dyn(
+                    *id,
+                    self.substitute_argument_types(&arguments, substitution_context),
+                )
+            }
             // A closure type substitutes its parameter and return types, so a
             // generic method parameter `|T| U` becomes `|i32| U` under `T = i32` —
             // without this an unannotated closure argument's parameter stays the
@@ -39950,7 +40549,21 @@ impl<'src> Analyzer<'src> {
                             .collect();
                         Type::Tuple(slots)
                     }
-                    other => Type::Mapped(binder_id, other.get_type_id(self), template_id),
+                    // Still abstract: the TEMPLATE substitutes too, around its
+                    // own binder — `(U in T: TupleKey<T, U>)` under `T := S` is
+                    // `(U in S: TupleKey<S, U>)`, not a template still naming
+                    // the declaration's `T` (A122: a blanket's `keys()` read
+                    // through a caller's own `S`).
+                    other => {
+                        let template = template_id.get_type(self);
+                        let mut context = substitution_context.clone();
+                        context.remove(&binder_id);
+                        let template_id = match context.is_empty() {
+                            true => template_id,
+                            false => self.substitute_type(&template, &context).get_type_id(self),
+                        };
+                        Type::Mapped(binder_id, other.get_type_id(self), template_id)
+                    }
                 }
             }
             _ => type_.clone(),
@@ -43048,6 +43661,30 @@ impl<'src> Analyzer<'src> {
             return Resolution::Deferred;
         }
         let next_method = self.for_each_next_method(Some(item_id));
+        // A122 §4.4: a plain `for` over a tuple FAMILY — a mapped tuple, or a
+        // value of a tuple-bounded parameter — binds the element template at a
+        // binder fresh to this loop and rigid in its body, and the body is
+        // checked ONCE, as a comprehension's is. B209's refusal was about a
+        // binder with no type (`any`); this one has one, and the body may use
+        // only what it promises. A CONCRETE tuple is untouched (B183's open
+        // Q2), and so is a `&mut` walk: a tuple family has no element views.
+        if next_method == "next" && !matches!(iterable_type, Type::Unresolved | Type::Unknown) {
+            let body_scope_id = self.expr_id_to_scope_id_map.get(&item_id).copied();
+            if let Some(view) =
+                self.tuple_family_view(iterable_id, body_scope_id, iterable_type.clone())
+            {
+                let Type::Mapped(_, _, element_template) = view else {
+                    unreachable!("a tuple family's view is a mapped type");
+                };
+                let view_id = view.get_type_id(self);
+                self.tuple_walk_views.insert(iterable_id, view_id);
+                if let Some(variable) = self.variables.get_mut(&item_id) {
+                    variable.type_id = element_template;
+                }
+                self.resolved_types.insert(item_id, element_template);
+                return Resolution::Resolved;
+            }
+        }
         let element_type = self.iterable_element_type(&iterable_type, next_method);
         if matches!(iterable_type, Type::Unresolved)
             || matches!(element_type, Some(Type::Unknown | Type::Unresolved))
@@ -43685,6 +44322,65 @@ impl<'src> Analyzer<'src> {
                     }
                 }
             }
+            // A122: a value of a tuple FAMILY with no trait bound — a
+            // `T: (2..)`, or a mapped tuple `(U in T: F<U>)` over one — reaches
+            // exactly the blankets written over tuple bounds its own bound
+            // entails (`impl type T: (2..) with Tuple`), by B408's route: the
+            // receiver is abstract, so its declared bound is the only evidence.
+            Type::Generic(constraint_id)
+                if self.generic_bound_traits(*constraint_id).is_empty()
+                    && self.tuple_bounds.contains_key(constraint_id) =>
+            {
+                match self.resolve_blanket_through_bounds(id, &subject_type, member_name) {
+                    Some(ImplMemberResolution::Found(member_id, _)) => {
+                        // `std::tuple`'s members are intrinsics over the
+                        // receiver's layout, provided by ONE blanket: the call
+                        // is wired to it directly rather than re-dispatched by
+                        // name at each instance, where a by-name `get` would
+                        // look like any other `get` — an async one among them.
+                        if self.tuple_member_name(member_id).is_some() {
+                            self.generic_dispatch.remove(&id);
+                            self.bound_dispatch_traits.remove(&id);
+                        }
+                        MethodLookup::Found(member_id)
+                    }
+                    Some(ImplMemberResolution::AmbiguousTraits(trait_ids)) => {
+                        MethodLookup::AmbiguousTraits(trait_ids)
+                    }
+                    Some(ImplMemberResolution::AmbiguousTraitArguments(homes)) => {
+                        MethodLookup::AmbiguousTraitArguments(homes)
+                    }
+                    Some(ImplMemberResolution::AmbiguousImpls(unranked)) => {
+                        MethodLookup::AmbiguousImpls(unranked)
+                    }
+                    Some(
+                        ImplMemberResolution::FoundInheritedDefault(..)
+                        | ImplMemberResolution::Missing,
+                    )
+                    | None => MethodLookup::NotCallable,
+                }
+            }
+            Type::Mapped(..) => {
+                match self.resolve_blanket_through_bounds(id, &subject_type, member_name) {
+                    Some(ImplMemberResolution::Found(member_id, _)) => {
+                        MethodLookup::Found(member_id)
+                    }
+                    Some(ImplMemberResolution::AmbiguousTraits(trait_ids)) => {
+                        MethodLookup::AmbiguousTraits(trait_ids)
+                    }
+                    Some(ImplMemberResolution::AmbiguousTraitArguments(homes)) => {
+                        MethodLookup::AmbiguousTraitArguments(homes)
+                    }
+                    Some(ImplMemberResolution::AmbiguousImpls(unranked)) => {
+                        MethodLookup::AmbiguousImpls(unranked)
+                    }
+                    Some(
+                        ImplMemberResolution::FoundInheritedDefault(..)
+                        | ImplMemberResolution::Missing,
+                    )
+                    | None => MethodLookup::NotCallable,
+                }
+            }
             Type::Generic(constraint_id) => {
                 let bound_traits = self.generic_bound_traits(*constraint_id);
                 if bound_traits.is_empty() {
@@ -43813,7 +44509,27 @@ impl<'src> Analyzer<'src> {
             Some(trait_ids) => MethodLookup::AmbiguousTraits(trait_ids),
             None => lookup,
         };
+        // A122: a `Tuple` member reads its receiver's LAYOUT at emission, and a
+        // receiver that is itself a call records no type of its own — so the
+        // type it was resolved at is kept, for the emitter to read through its
+        // instance's substitution.
+        if let MethodLookup::Found(member_id) = &lookup
+            && self.tuple_member_name(*member_id).is_some()
+        {
+            let receiver_type_id = subject_type.clone().get_type_id(self);
+            self.tuple_call_receivers.insert(id, receiver_type_id);
+        }
         match lookup {
+            MethodLookup::Found(member_id) if self.is_tuple_map_member(member_id) => self
+                .resolve_tuple_map(
+                    id,
+                    subject_id,
+                    member_id,
+                    &subject_type,
+                    generic_argument_ids,
+                    argument_ids,
+                    arguments_span,
+                ),
             MethodLookup::Found(member_id) => {
                 // Drive bidirectional inference of any closure arguments against the
                 // method's parameter types, and defer a full argument type-check.
@@ -44404,58 +45120,38 @@ impl<'src> Analyzer<'src> {
         body_id: Id,
     ) -> Resolution {
         let source_type = self.infer_type(source_id, &Type::Unknown, &HashMap::default());
-        match self.expand_mapped(source_type) {
-            Type::Unresolved | Type::Unknown => Resolution::Deferred,
-            Type::Mapped(_, _, element_template) => {
+        if matches!(source_type, Type::Unresolved | Type::Unknown) {
+            return Resolution::Deferred;
+        }
+        let body_scope_id = self.expr_id_to_scope_id_map.get(&binder_id).copied();
+        match self.tuple_family_view(id, body_scope_id, source_type.clone()) {
+            Some(view) => {
+                let Type::Mapped(_, _, element_template) = view else {
+                    unreachable!("a tuple family's view is a mapped type");
+                };
                 if let Some(variable) = self.variables.get_mut(&binder_id) {
                     variable.type_id = element_template;
                 }
                 self.untyped_comprehension_binders.remove(&binder_id);
+                let view_id = view.get_type_id(self);
+                self.tuple_walk_views.insert(id, view_id);
                 self.expr_id_to_expr_map
                     .insert(id, Expr::TupleComprehension(binder_id, source_id, body_id));
                 Resolution::Resolved
             }
             // A concrete tuple source isn't supported yet (heterogeneous elements
-            // have no single binder type); only mapped sources, which combine uses.
-            other => {
+            // have no single binder type — B183's concrete arm); only a tuple
+            // FAMILY is walked.
+            None => {
+                let other = self.expand_mapped(source_type);
                 let got = self.pretty_print_type(&other, &HashMap::default());
-                // E223: a type parameter carrying a TUPLE bound (`T: (2..)`) is
-                // not "unbounded" and not a stray non-tuple — the bound says it
-                // is a tuple, and the refusal is about what a comprehension
-                // walks: a mapped tuple's elements each have a template the
-                // body is checked against once, and a bounded parameter's have
-                // none yet (A122's ask).
-                let bounded_tuple = match &other {
-                    Type::Generic(constraint_id) => self
-                        .tuple_bounds
-                        .get(constraint_id)
-                        .cloned()
-                        .map(|requirement| {
-                            let element = requirement.element_bound.map(|element| {
-                                let element = element.get_type(self);
-                                self.pretty_print_type(&element, &HashMap::default())
-                            });
-                            requirement.label(element.as_deref())
-                        }),
-                    _ => None,
-                };
-                let msg = match bounded_tuple {
-                    Some(bound) => format!(
-                        "a tuple comprehension's source must be a mapped tuple, got {got}, a type \
-                         parameter bounded `{bound}`: the bound makes it a tuple, but a VALUE of \
-                         a bounded tuple parameter is not a comprehension source today — its \
-                         elements have no template the body can be checked against once. Walk \
-                         a mapped tuple `(U in {got}: F<U>)` instead"
-                    ),
-                    None => {
-                        format!("a tuple comprehension's source must be a mapped tuple, got {got}")
-                    }
-                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                    msg,
+                    msg: format!(
+                        "a tuple comprehension's source must be a mapped tuple, got {got}"
+                    ),
                 });
                 Resolution::Failed
             }
@@ -49187,14 +49883,31 @@ impl<'src> Analyzer<'src> {
                     return Resolution::Failed;
                 }
                 let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                // A122 §4.3: a POSITION read on a tuple family whose arity is
+                // still abstract names the typed read that exists — a key.
+                let is_tuple_family = match &subject_type {
+                    Type::Generic(constraint_id) => self.tuple_bounds.contains_key(constraint_id),
+                    Type::Mapped(..) => true,
+                    _ => false,
+                };
+                let msg = match is_tuple_family && member_name.parse::<usize>().is_ok() {
+                    true => format!(
+                        "cannot access field '{member_name}' on type {subject_str}: a tuple of an \
+                         abstract family has no numbered positions — its arity is not known \
+                         while the body is checked. Read it at a key: `keys()` and `entries()` \
+                         (`import std::tuple::Tuple;`) mint one `TupleKey` per position, and \
+                         `get(key)` answers the element at that position's own type"
+                    ),
+                    false => format!(
+                        "cannot access field '{}' on type {}",
+                        member_name, subject_str
+                    ),
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "cannot access field '{}' on type {}",
-                        member_name, subject_str
-                    ),
+                    msg,
                 });
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
                 Resolution::Failed
@@ -52129,6 +52842,11 @@ impl<'src> Analyzer<'src> {
         // iterator) iterates by calling `next()` until `None`; anything else
         // (e.g. a `List`) stays a native `for...of`.
         for (for_each_id, iterable_id) in std::mem::take(&mut self.prepped_for_each) {
+            // A122 §4.4: a walk over a tuple family is typed by its view and
+            // emitted element-wise; there is no protocol member to find.
+            if self.tuple_walk_views.contains_key(&iterable_id) {
+                continue;
+            }
             let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
             // Keep it: emission picks its native lowering by this same type, and
             // it is the only place the type is known. A `for x in <expr>` whose
@@ -55188,6 +55906,23 @@ pub enum Intrinsic {
     // array, `Array.from(document.querySelectorAll(selector))` (querySelectorAll
     // yields a NodeList, which a `List` would otherwise mishandle).
     QuerySelectorAll,
+    // A122 — `std::tuple`'s four members over every tuple of a family. Each is
+    // lowered against the CONCRETE layout of the receiver in the instance it is
+    // emitted in: tuples store flat, so a position's slot offset and width are
+    // properties of the whole tuple type, known only once `T` is.
+    //
+    // `Tuple.len(): usize` -> the arity, a constant per instance.
+    TupleLen,
+    // `Tuple.keys()` -> one `TupleKey` (`[at]`) per position.
+    TupleKeys,
+    // `Tuple.entries()` -> `(key, value)` per position, spliced flat.
+    TupleEntries,
+    // `Tuple.get(key)` -> the element at `key.at`, read at the receiver's own
+    // offset for that position (a slot, or a `.slice` for a multi-slot one).
+    TupleGet,
+    // `Tuple.map(|x| e)` -> the comprehension `(x in t => e)`: the receiver's
+    // `.map` where every element and every result is one slot, else unrolled.
+    TupleMap,
 }
 
 /// Identifies a source file within a compiled `Program` — an index into
@@ -55845,6 +56580,20 @@ pub struct Program<'src> {
     /// binders' bounds, and the emission side has to reach the same verdict
     /// the analyzer did or a call through a bound lands in the wrong body.
     pub generic_bounds: HashMap<TypeId, Vec<TypeId>>,
+    /// A122: each comprehension's and each tuple `for`'s walk — the mapped
+    /// view `(U in T: F<U>)` over the binder fresh to that walk. The emitters
+    /// bind `U` per element when they unroll the body.
+    pub tuple_walk_views: HashMap<Id, TypeId>,
+    /// A122 §3: each tuple `map` call's answer, `(U in T: F<U>)`, by call id.
+    pub tuple_map_results: HashMap<Id, TypeId>,
+    /// A122: each `std::tuple` member call's receiver type as the analyzer
+    /// resolved it — the emitters read the receiver's layout through it (a
+    /// receiver that is itself a call records no type of its own).
+    pub tuple_call_receivers: HashMap<Id, TypeId>,
+    /// A122: each tuple-bounded parameter's or binder's arity range (`T:
+    /// (2..)` -> `(Some(2), None)`), by constraint id — so emission-side impl
+    /// selection applies a blanket over tuples to tuples alone.
+    pub tuple_bound_arities: HashMap<TypeId, (Option<u32>, Option<u32>)>,
     /// The `value()` members synthesized on backed enums (backed-enums.md
     /// §3.8), by member id. `x.value()` lowers to `x` — the receiver already IS
     /// the backing value at runtime — so the transformer folds the call away
@@ -63688,6 +64437,18 @@ fn analyze_inner<'src>(
             .get(scope_id)
             .and_then(|scope| scope.name_to_id_map.get("Result").copied())
     });
+    analyzer.tuple_trait_id = module_scopes.get("tuple").and_then(|scope_id| {
+        analyzer
+            .scopes
+            .get(scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("Tuple").copied())
+    });
+    analyzer.tuple_key_struct_id = module_scopes.get("tuple").and_then(|scope_id| {
+        analyzer
+            .scopes
+            .get(scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("TupleKey").copied())
+    });
     analyzer.try_trait_id = module_scopes.get("operators").and_then(|scope_id| {
         analyzer
             .scopes
@@ -64817,6 +65578,26 @@ fn analyze_over_world<'src>(
             }
         }
     }
+    // A122: `std::tuple`'s blanket over every `T: (2..)` — the impl that
+    // implements the `Tuple` trait — carries the four tuple intrinsics.
+    if let Some(tuple_trait_id) = analyzer.tuple_trait_id {
+        for implementation in &analyzer.implementations {
+            if !implementation.trait_ids.contains(&tuple_trait_id) {
+                continue;
+            }
+            for (name, intrinsic) in [
+                ("len", Intrinsic::TupleLen),
+                ("keys", Intrinsic::TupleKeys),
+                ("entries", Intrinsic::TupleEntries),
+                ("get", Intrinsic::TupleGet),
+                ("map", Intrinsic::TupleMap),
+            ] {
+                if let Some(id) = external_intrinsic_declaration(&analyzer, implementation, name) {
+                    intrinsics.insert(id, intrinsic);
+                }
+            }
+        }
+    }
     if let Some(json_value_struct_id) = analyzer.primitive_struct_ids.get("JsonValue").copied() {
         for implementation in &analyzer.implementations {
             let subject_is_json_value = matches!(
@@ -65608,6 +66389,14 @@ fn analyze_over_world<'src>(
         impl_selector_members: HashMap::default(),
         impl_admission: ImplAdmission::default(),
         generic_bounds: analyzer.generic_bounds,
+        tuple_walk_views: analyzer.tuple_walk_views,
+        tuple_map_results: analyzer.tuple_map_results,
+        tuple_call_receivers: analyzer.tuple_call_receivers,
+        tuple_bound_arities: analyzer
+            .tuple_bounds
+            .iter()
+            .map(|(constraint_id, requirement)| (*constraint_id, (requirement.lo, requirement.hi)))
+            .collect(),
         backed_value_members,
         list_new_fn_id,
         list_push_fn_id,
