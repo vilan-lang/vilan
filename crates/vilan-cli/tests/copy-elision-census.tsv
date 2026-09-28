@@ -40,6 +40,8 @@ enum-discriminant	0
 equality	0
 estate	0
 expression-lift	3
+f64-print-boundary	0
+f64-print-negative-zero	0
 field-assignment	0
 file	0
 fixed-arrays	8
@@ -82,6 +84,7 @@ math	4
 module-dirs	0
 multiline-string	0
 mut-parameters	3
+non-bmp-string-length	0
 number-math	0
 numeric-types	0
 nursery	0
