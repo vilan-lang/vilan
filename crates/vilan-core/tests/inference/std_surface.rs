@@ -6871,3 +6871,36 @@ fn a126_u53_displays_through_a_bound() {
 fn a126_f32_displays_through_a_bound() {
     assert_displays_through_a_bound("f32", "1.5f32", "1.5");
 }
+
+// --- B416: `[derive(Wire)]`'s locals are hygienic ------------------------------
+//
+// The rebuild bound each field to a local spelled like the FIELD, so a field
+// named `deserializer` (or any name the expansion itself uses) shadowed the
+// parameter every later read went through: five errors inside code the author
+// never wrote. The locals take the `__` prefix the expansions reserve.
+
+#[test]
+fn b416_a_field_named_like_the_expansions_own_bindings_round_trips() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::wire::Wire;\n",
+            "import std::binary::{ encode_binary, decode_binary };\n",
+            "[derive(Wire)]\n",
+            "struct Tricky {\n",
+            "\tdeserializer: i32,\n",
+            "\tserializer: str,\n",
+            "\trebuilt: i32,\n",
+            "\tvalue: List<i32>,\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet t = Tricky { deserializer = 1, serializer = \"s\", rebuilt = 2, value = [3, 4] };\n",
+            "\tmatch decode_binary<Tricky>(encode_binary(t)) {\n",
+            "\t\tOk(let back) => print(i\"{back.deserializer} {back.serializer} {back.rebuilt} {back.value.len()}\"),\n",
+            "\t\tErr(let error) => print(error),\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "1 s 2 2\n",
+    );
+}
