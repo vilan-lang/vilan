@@ -2508,6 +2508,11 @@ export impl ReactiveServer {
 	/// forward, however many times a client asks), and since A92 the join
 	/// also COUNTS: a deduped channel serves two mirrors, and the hold is what
 	/// says how many of them one forward is for.
+	///
+	/// A join sends NOTHING, deliberately: a frame names a channel, not a mirror,
+	/// so a re-seed here would reach the sibling that already holds the value as a
+	/// second notification of it. The joining mirror is seeded on the client, from
+	/// that sibling (`seed_from_sibling`, A137).
 	fun open_forward(self, channel: i32, key: Option<Hash>, start: || Subscription) {
 		match self.forward_for(channel, key) {
 			Some(let held) => held.holds.write() = held.holds.read() + 1,
@@ -3070,6 +3075,59 @@ export impl ReactiveServer with Disposable {
 
 // --- Client side: the remote handle -----------------------------------------
 
+/// One inbound route of a `ReactiveClient`: the channel a mirror is bound to (the
+/// id cell it shares with the mirror, so a rebind moves both in one write), the
+/// deliverer that lands a routed frame in it at the mirror's own type, and what a
+/// sibling joining the same channel is seeded from (A137).
+struct MirrorRoute {
+	channel: Shared<i32>,
+	deliver: |Frame| void,
+	/// This mirror's value as the frame that would carry it, while this mirror
+	/// holds the server's forward on its channel and has a value; `None`
+	/// otherwise.
+	snapshot: || Option<Frame>,
+}
+
+/// Seed a mirror whose `Subscribe` has just gone out on a channel a SIBLING on this
+/// client already holds (A137).
+///
+/// Two mirrors on one client can share a server channel: two methods — or one
+/// method's mirror kept past its table entry and a fresh one minted since (A134) —
+/// answering the same cell are deduped onto one channel by `expose_dynamic` (A92).
+/// The server counts the second `Subscribe` into the forward it already runs
+/// (`LiveForward.holds`) and sends nothing, because on the wire a frame names a
+/// CHANNEL and not a mirror: a re-seed would reach the sibling too, as a second
+/// notification of a value it already holds. So the joiner was silent until the
+/// channel's next change — over a socket as well as in process, which is what
+/// settled A137. The client is the one place that can seed exactly the joiner: the
+/// sibling's route re-encodes what it holds, and the joiner's own deliverer lands
+/// it.
+///
+/// A sibling that holds the forward but has no value yet has its seed in flight,
+/// and that frame reaches every route on the channel, the joiner's included — so
+/// "nothing to offer" needs no second path.
+fun seed_from_sibling(
+	routes: Shared<List<MirrorRoute>>,
+	joiner: Shared<i32>,
+	deliver: |Frame| void,
+) {
+	let channel = joiner.read();
+	if channel < 0 {
+		ret;
+	}
+	for route in routes.read() {
+		if route.channel.read() == channel && route.channel.identity() != joiner.identity() {
+			match (route.snapshot)() {
+				Some(let frame) => {
+					deliver(frame);
+					ret;
+				},
+				None => {},
+			}
+		}
+	}
+}
+
 /// The reactive protocol's client half: routes each inbound `Update` frame to the
 /// typed mirror of its subscribed channel. `source<T>` hands out a
 /// `RemoteSource<T>` — the type binds at the call site (an annotated `let`, or the
@@ -3081,7 +3139,7 @@ export struct ReactiveClient {
 	// the channel's type (fixed by `source<T>`) and lands it in the mirror. The id
 	// is a CELL shared with the channel's `RemoteSource` — a reconnect rebind moves
 	// both in one write (proposal/transport-robustness.md §2.5).
-	routes: Shared<List<(Shared<i32>, |Frame| void)>>,
+	routes: Shared<List<MirrorRoute>>,
 	// The mirrors minted from a RUNTIME channel id (`source`), each paired with the
 	// action that points it at nothing. A reconnect mints a fresh server session,
 	// and these are exactly the mirrors no `__attach` reply can rebind — see
@@ -3249,12 +3307,31 @@ export impl ReactiveClient {
 			}
 		};
 		let channel_cell = Shared::new(channel);
-		self.routes.write().push((channel_cell, deliver));
+		let count: Shared<usize> = Shared::new(0usize);
+		let closing = Shared::new(false);
+		// What a SIBLING joining this channel is seeded from (A137): the value this
+		// mirror holds, as the `Update` that would carry it — offered only while
+		// this mirror holds the server's forward (a lease, or a close not yet
+		// flushed), because only then does a sibling's `Subscribe` JOIN it.
+		let snapshot = || {
+			if count.read() == 0 && !closing.read() {
+				ret None;
+			}
+			match cache.get() {
+				Some(let value) => Some(encode_update(codec, channel_cell.read(), |mut serializer: Serializer| {
+					value.describe(&mut serializer);
+				})),
+				None => None,
+			}
+		};
+		self.routes.write().push(MirrorRoute { channel = channel_cell, deliver, snapshot });
+		let routes = self.routes;
 		RemoteSource {
 			channel = channel_cell,
 			subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)),
-			count = Shared::new(0usize),
-			closing = Shared::new(false),
+			count,
+			closing,
+			join = || seed_from_sibling(routes, channel_cell, deliver),
 			settle_id = fresh_id(),
 			codec = self.codec,
 			transport = self.transport,
@@ -3290,14 +3367,37 @@ export impl ReactiveClient {
 		let channel_cell = Shared::new(channel);
 		let cache: SignalCell<Option<List<T>>> = SignalCell::new(None);
 		let fault: SignalCell<Option<str>> = SignalCell::new(None);
+		let count: Shared<usize> = Shared::new(0usize);
+		let closing = Shared::new(false);
+		let codec = self.codec;
+		// `mirror_of`'s snapshot at the keyed type (A137): a WHOLE-collection
+		// holder offers what it holds as the `Reset` a fresh forward would seed
+		// with. A per-key holder offers nothing — a joining per-key lease is not
+		// seeded by this path (the report's find).
+		let snapshot = || {
+			if count.read() == 0 && !closing.read() {
+				ret None;
+			}
+			match cache.get() {
+				Some(let list) => Some(encode_patch(codec, channel_cell.read(), |mut serializer: Serializer| {
+					let ops: List<Delta<K, T>> = [Delta::Reset(list)];
+					ops.describe(&mut serializer);
+				})),
+				None => None,
+			}
+		};
+		let routes = self.routes;
+		// Filled in below, once `deliver` exists: the join seeds through it.
+		let join_hook: Shared<|| void> = Shared::new(|| {});
 		let mirror: KeyedSource<K, T> = KeyedSource {
 			channel = channel_cell,
 			codec = self.codec,
 			transport = self.transport,
 			cache,
 			fault,
-			count = Shared::new(0usize),
-			closing = Shared::new(false),
+			count,
+			closing,
+			join = join_hook,
 			settle_id = fresh_id(),
 			leases = Shared::new([]),
 			positions = Shared::new(Map::new()),
@@ -3307,7 +3407,6 @@ export impl ReactiveClient {
 			mint = SignalCell::new(None),
 			retire = Shared::new([]),
 		};
-		let codec = self.codec;
 		// Deliver one routed `Patch`: re-open the frame (the envelope was only
 		// routed, not consumed) and rebuild the ops at this channel's key and
 		// element types. A malformed patch is dropped whole — a half-applied one
@@ -3330,7 +3429,8 @@ export impl ReactiveClient {
 				None => mirror.apply(ops),
 			}
 		};
-		self.routes.write().push((channel_cell, deliver));
+		self.routes.write().push(MirrorRoute { channel = channel_cell, deliver, snapshot });
+		join_hook.write() = || seed_from_sibling(routes, channel_cell, deliver);
 		mirror
 	}
 
@@ -3512,9 +3612,8 @@ export impl ReactiveClient {
 				Some(let _reason) => {},
 				None => {
 					for route in self.routes.read() {
-						let (id, deliver) = route;
-						if id.read() == channel {
-							deliver(frame);
+						if route.channel.read() == channel {
+							(route.deliver)(frame);
 						}
 					}
 				},
@@ -3757,6 +3856,11 @@ export struct RemoteSource<T> {
 	// the same origin mints afresh instead of handing out a mirror whose demand is
 	// gone. Run once and cleared (`retired`).
 	retire: Shared<List<|| void>>,
+	// Seed this mirror from a SIBLING on the same client that already holds the
+	// server's forward on its channel (A137) — run right after a `Subscribe` goes
+	// out, because a `Subscribe` that joins a held forward is answered with no
+	// seed. See `seed_from_sibling`.
+	join: || void,
 }
 
 /// A mirror IS a `Source` (tracker A52) — at `Option<T>`, which is what it
@@ -3956,6 +4060,7 @@ export impl RemoteSource<type T> {
 				self.remint();
 			} else {
 				(self.transport).send(self.subscribe.read());
+				(self.join)();
 			}
 		}
 	}
@@ -4146,6 +4251,7 @@ export impl RemoteSource<type T> {
 		self.mint.set(None);
 		if self.count.read() > 0 {
 			(self.transport).send(subscribe);
+			(self.join)();
 		}
 	}
 }
@@ -4606,6 +4712,10 @@ export struct KeyedSource<K, T> {
 	/// `RemoteSource.retire`, at the keyed type: run when the mirror's last demand
 	/// is surrendered, or its owner goes with none ever taken (A134).
 	retire: Shared<List<|| void>>,
+	/// `RemoteSource.join`, at the keyed type (A137): the whole-collection
+	/// `Subscribe`'s seed when it joined a sibling's forward. A cell, because the
+	/// hook closes over the mirror's own deliverer, which is built after it.
+	join: Shared<|| void>,
 }
 
 /// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
@@ -4895,6 +5005,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				self.remint();
 			} else {
 				(self.transport).send(encode_control(self.codec, "Subscribe", self.channel.read()));
+				(self.join.read())();
 			}
 			for lease in self.leases.read() {
 				if lease.on_wire.read() {
@@ -5139,6 +5250,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		self.mint.set(None);
 		if self.count.read() > 0 {
 			(self.transport).send(encode_control(self.codec, "Subscribe", channel));
+			(self.join.read())();
 		}
 		for lease in self.leases.read() {
 			lease.closing.write() = false;

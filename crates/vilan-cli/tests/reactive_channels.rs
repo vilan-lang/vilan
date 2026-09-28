@@ -3099,3 +3099,290 @@ fn a134_a_stub_in_a_cold_select_reads_its_leased_mirror_over_a_socket() {
          lease keeps live, on one call; got:\n{stdout}"
     );
 }
+
+// --- A137: a mirror that JOINS a held forward is seeded ---------------------
+
+/// A137 IN PROCESS: two ORIGINS (`notes` / `notes_again`, `rows` /
+/// `rows_again`) answering ONE cell, so `expose_dynamic` puts both mirrors on
+/// one channel while the client (A134) keeps two. The socket twin is next.
+const A137_JOIN_SEED: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// Two methods answering ONE cell: `expose_dynamic` dedups them onto one
+// channel, and they are two ORIGINS, so the client keeps two mirrors.
+[service(BoardClient)]
+struct Board {
+	notes: SignalCell<List<str>>,
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun add(self, text: str): i32 {
+		self.notes.update(|&mut list| {
+			list.push(text);
+		});
+		self.rows.insert(Row { id = text, text });
+		0
+	}
+
+	[rpc]
+	fun notes(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun notes_again(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+fun size(list: Option<List<str>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+fun rows_size(list: Option<List<Row>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+fun main() {
+	let board = Board { notes = Signal::new(["seed"]), rows = KeyedCell::new([Row { id = "seed", text = "seed" }]) };
+	let (client_end, server_end) = duplex_pair();
+	register_session(3, server_end, json_codec());
+	let transport = local_rpc(board.dispatcher().into_protocol(json_codec()).for_connection(3));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+
+	let first: RemoteSource<List<str>> = client.notes();
+	let second: RemoteSource<List<str>> = client.notes_again();
+	let _first = first.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	let _second = second.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	print(i"plain: same-channel={first.channel.read() == second.channel.read()} first={size(first.get())} second={size(second.get())}");
+	let rows: KeyedSource<str, Row> = client.rows();
+	let rows_again: KeyedSource<str, Row> = client.rows_again();
+	let _rows = rows.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	let _rows_again = rows_again.sub(|list| {});
+	sleep_for(Duration::millis(0));
+	print(i"keyed: same-channel={rows.channel.read() == rows_again.channel.read()} first={rows_size(rows.get())} second={rows_size(rows_again.get())}");
+	print(i"add:{client.add("x").unwrap_or(0 - 1)}");
+	print(i"after: plain={size(first.get())}/{size(second.get())} keyed={rows_size(rows.get())}/{rows_size(rows_again.get())}");
+}
+"#;
+
+/// A137, settled: the second mirror's `Subscribe` JOINS the forward the first
+/// holds (`LiveForward.holds`) and the server sends it no seed — a frame names
+/// a channel, not a mirror, so a re-seed would reach the sibling too. The
+/// joiner therefore held nothing until the channel's next change
+/// (`second=-1`), and a KEYED joiner was worse than silent: the next patch
+/// landed on an empty mirror and left it DESYNCED for good (`keyed=2/1` after
+/// the add — the seed row never arrives). Both reproduce over a socket (the
+/// next test), so this is the mechanism and not A133's in-process caveat. The
+/// fix is the client's, where the joiner can be seeded ALONE: the sibling's
+/// route re-encodes what it holds (an `Update`, or a `Patch` of one `Reset`)
+/// and the joiner's own deliverer lands it (`seed_from_sibling`). Red before on
+/// the four `second=`/`keyed=` values.
+#[test]
+fn a137_a_mirror_joining_a_held_forward_is_seeded_from_its_sibling() {
+    let stdout = run_program("a137_join", A137_JOIN_SEED);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "plain: same-channel=true first=1 second=1",
+            "keyed: same-channel=true first=1 second=1",
+            "add:0",
+            "after: plain=2/2 keyed=2/2",
+        ],
+        "a mirror whose Subscribe joins a sibling's forward must hold the \
+         channel's value; got:\n{stdout}"
+    );
+}
+
+/// A137 OVER A SOCKET — the run the order asked for before anything was built:
+/// server and client in one process over a real WebSocket, the same two
+/// origins per cell. Readiness is polled (a mirror's channel is bound the
+/// moment its rebind has run, and the join seed is synchronous inside it).
+const A137_JOIN_SEED_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource, RemoteSource };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// Two methods answering ONE cell: `expose_dynamic` dedups them onto one
+// channel, and they are two ORIGINS, so the client keeps two mirrors.
+[service(BoardClient)]
+struct Board {
+	notes: SignalCell<List<str>>,
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun add(self, text: str): i32 {
+		self.notes.update(|&mut list| {
+			list.push(text);
+		});
+		self.rows.insert(Row { id = text, text });
+		0
+	}
+
+	[rpc]
+	fun notes(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun notes_again(self): SignalCell<List<str>> {
+		self.notes
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+let board: Board = Board { notes = Signal::new(["seed"]), rows = KeyedCell::new([Row { id = "seed", text = "seed" }]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+/// Wait until `ready` holds, by polling — never by a duration alone.
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 1000 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+fun size(list: Option<List<str>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+fun rows_size(list: Option<List<Row>>): i32 {
+	match list {
+		Some(let held) => held.len().as_i32(),
+		None => 0 - 1,
+	}
+}
+
+async fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			// PLAIN. The first mirror leases and is seeded by the server.
+			let first: RemoteSource<List<str>> = client.notes();
+			let second: RemoteSource<List<str>> = client.notes_again();
+			let _first = first.sub(|list| {});
+			until(|| first.get().is_some());
+			// The JOIN: the second mirror's mint lands on the SAME channel and
+			// its `Subscribe` joins the forward the first holds — the server
+			// sends no seed for it. `rebind` runs the join synchronously, so the
+			// moment the channel is bound is the moment to read.
+			let _second = second.sub(|list| {});
+			until(|| second.channel.read() >= 0);
+			print(i"plain: same-channel={first.channel.read() == second.channel.read()} first={size(first.get())} second={size(second.get())}");
+			// KEYED, the same shape through a whole-collection lease.
+			let rows: KeyedSource<str, Row> = client.rows();
+			let rows_again: KeyedSource<str, Row> = client.rows_again();
+			let _rows = rows.sub(|list| {});
+			until(|| rows.get().is_some());
+			let _rows_again = rows_again.sub(|list| {});
+			until(|| rows_again.channel.read() >= 0);
+			print(i"keyed: same-channel={rows.channel.read() == rows_again.channel.read()} first={rows_size(rows.get())} second={rows_size(rows_again.get())}");
+			// And after a change both carry it, as they did before.
+			print(i"add:{client.add("x").unwrap_or(0 - 1)}");
+			until(|| size(second.get()) == 2 && rows_size(rows_again.get()) == 2);
+			print(i"after: plain={size(first.get())}/{size(second.get())} keyed={rows_size(rows.get())}/{rows_size(rows_again.get())}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a137_a_joining_mirror_is_seeded_over_a_socket() {
+    let stdout = run_program("a137_join_socket", A137_JOIN_SEED_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "plain: same-channel=true first=1 second=1",
+            "keyed: same-channel=true first=1 second=1",
+            "add:0",
+            "after: plain=2/2 keyed=2/2",
+        ],
+        "over a socket, a mirror whose Subscribe joins a sibling's forward must \
+         hold the channel's value; got:\n{stdout}"
+    );
+}

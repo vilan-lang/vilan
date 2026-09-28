@@ -552,7 +552,10 @@ remount must find it on the same id.)
 
 "Last lease" means the last one on the **channel**, not on your mirror:
 where two mirrors ended up sharing a channel because they named the same
-source, the first to let go withdraws nothing.
+source — two methods answering one cell, say — the first to let go
+withdraws nothing. The second one's `Subscribe` joins the forward the
+first already holds, so the server sends it no seed; the client seeds it
+from its sibling instead, and it reads the channel's value at once.
 
 Two consequences worth having in mind. A dispose and a remount anywhere
 inside one macrotask — two event handlers, a route change, an `each`
