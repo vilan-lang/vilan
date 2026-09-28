@@ -40,7 +40,9 @@ use crate::span::Span;
 pub fn check_lifetime_steers(program: &mut Program) {
     let found = {
         let targets = call_targets(program);
-        handle_tail_warnings(program, &targets)
+        let mut found = memo_maker_warnings(program, &targets);
+        found.extend(handle_tail_warnings(program, &targets));
+        found
     };
     let mut seen: HashSet<(u32, usize, usize)> = HashSet::default();
     for (warning, source) in found {
@@ -88,6 +90,26 @@ fn std_functions(program: &Program, file: &str, names: &[&str]) -> HashSet<Id> {
         .collect()
 }
 
+/// The owner-taking calls a maker must not make: std's `.cell()` and every std
+/// `effect` spelling (the trait's and the mirrors' overrides alike).
+fn owner_taking_functions(program: &Program) -> HashSet<Id> {
+    let mut owner_taking = std_functions(program, "reactive.vl", &["cell"]);
+    for function in program.functions.values() {
+        if !matches!(
+            function.name,
+            "effect" | "effect_on_change" | "scoped_effect"
+        ) {
+            continue;
+        }
+        if let Some(source) = program.source_of(function.id)
+            && program.std_sources.contains(&source)
+        {
+            owner_taking.insert(function.id);
+        }
+    }
+    owner_taking
+}
+
 /// Whether `id` sits in user code (not in the standard library).
 fn in_user_code(program: &Program, id: Id) -> bool {
     program
@@ -104,6 +126,75 @@ fn call_span(program: &Program, call_id: Id) -> Span {
         .copied()
         .or_else(|| program.span_map.get(&call_id).map(|span| **span))
         .unwrap_or(Span { start: 0, end: 0 })
+}
+
+/// The name a warning quotes for an owner-taking callee.
+fn callee_label(program: &Program, callee: Id) -> String {
+    match program.functions.get(&callee) {
+        Some(function) if function.name == "cell" => "`.cell()`".to_string(),
+        Some(function) => format!("`{}`", function.name),
+        None => "this call".to_string(),
+    }
+}
+
+/// A136 door (b): an owner-taking call syntactically inside a `Memo` maker.
+fn memo_maker_warnings(
+    program: &Program,
+    targets: &HashMap<Id, CallTarget>,
+) -> Vec<(Error, SourceId)> {
+    let makers = std_functions(program, "memo.vl", &["get_or", "get_or_insert"]);
+    if makers.is_empty() {
+        return Vec::new();
+    }
+    let owner_taking = owner_taking_functions(program);
+    let graph = program.call_graph();
+    let mut found = Vec::new();
+    for (call_id, target) in targets {
+        let CallTarget::Function(callee) = target else {
+            continue;
+        };
+        if !makers.contains(callee) || !in_user_code(program, *call_id) {
+            continue;
+        }
+        let Some(maker) = program
+            .function_calls
+            .get(call_id)
+            .and_then(|call| call.argument_ids.last())
+            .and_then(|argument| closure_of(program, *argument))
+        else {
+            continue;
+        };
+        for inner in graph.calls_of(maker) {
+            // The NAMED member, whatever the dispatch: `source.effect(..)` on a
+            // concrete cell is a trait default the transformer re-dispatches per
+            // type (an indirect target in the graph), and it is the same
+            // owner-taking call.
+            let Some(inner_callee) = named_callee(program, inner.call_id) else {
+                continue;
+            };
+            if !owner_taking.contains(&inner_callee) {
+                continue;
+            }
+            let label = callee_label(program, inner_callee);
+            found.push(program.anchored(
+                Error {
+                    trace: Vec::new(),
+                    span: call_span(program, inner.call_id),
+                    msg: format!(
+                        "{label} inside a `Memo` maker ties what it builds to the FIRST \
+                         caller's owner, and the memo keeps it after that owner is gone: \
+                         every later ask is answered with a dead one. What a maker builds \
+                         outlives the caller — a derivation in a maker is `.cell_global()`, \
+                         and a lease (`.cell()`, `effect`) belongs at the call site, on what \
+                         the memo answers"
+                    ),
+                    note: None,
+                },
+                inner.call_id,
+            ));
+        }
+    }
+    found
 }
 
 /// A135 door (c): a handle-returning `[rpc]` method whose tail is `.cell()`.
@@ -175,6 +266,24 @@ fn handle_tail_warnings(
     found
 }
 
+/// The function a call NAMES — the declaration its subject resolved to — before
+/// any per-type re-dispatch. `None` for a call through a value.
+fn named_callee(program: &Program, call_id: Id) -> Option<Id> {
+    let subject = program.function_calls.get(&call_id)?.subject_id;
+    match program.entity_map.get(&subject)? {
+        Expr::Local(target) if program.functions.contains_key(target) => Some(*target),
+        _ => None,
+    }
+}
+
+/// The closure an expression IS (a literal written in place), if any.
+fn closure_of(program: &Program, expression: Id) -> Option<Id> {
+    match program.entity_map.get(&expression)? {
+        Expr::Closure(closure) => Some(*closure),
+        _ => None,
+    }
+}
+
 /// The function a call expression resolves to, if it is a direct call.
 fn called_function(
     program: &Program,
@@ -201,12 +310,15 @@ fn tail_derivation(
     match program.entity_map.get(&expression)? {
         Expr::Block((_statements, tail)) => tail_derivation(program, targets, derivations, *tail),
         Expr::Call(call_id) => match targets.get(call_id)? {
-            CallTarget::Function(callee) if derivations.contains(callee) => Some(*call_id),
             CallTarget::Variant(_) => {
                 let payload = program.function_calls.get(call_id)?.argument_ids.first()?;
                 tail_derivation(program, targets, derivations, *payload)
             }
-            _ => None,
+            // The named member, as the maker check reads it: a per-type
+            // re-dispatch is still a call to `.cell()`.
+            _ => named_callee(program, *call_id)
+                .filter(|callee| derivations.contains(callee))
+                .map(|_| *call_id),
         },
         _ => None,
     }

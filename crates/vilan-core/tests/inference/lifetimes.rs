@@ -1792,3 +1792,79 @@ fn a135_a_handle_method_returning_what_outlives_the_call_does_not_warn() {
     );
     assert!(found.is_empty(), "{found:#?}");
 }
+
+// --- A136 door (b): an owner-taking call inside a `Memo` maker ---------------
+
+/// The warnings a program raises that name A136's hazard, as the text each
+/// spans.
+fn a136_warnings(source: &str) -> Vec<String> {
+    warning_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("inside a `Memo` maker ties what it builds"))
+        .map(|(_, range)| source[range].to_string())
+        .collect()
+}
+
+/// A136 (b), the warning's cases: a `.cell()` and an `effect` written directly
+/// in a maker — through `get_or_insert` and through the deprecated `get_or`
+/// alias alike (I7). Kolt's `model.vl` wrote the first at four sites: the
+/// memo is program-lifetime, the `.cell()` dies with the FIRST caller's owner,
+/// and every later ask got the dead cell.
+#[test]
+fn a136_a_cell_or_an_effect_inside_a_memo_maker_warns() {
+    let found = a136_warnings(
+        r#"
+        import std::memo::Memo;
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        let source: SignalCell<i32> = Signal::new(1);
+        let doubled: Memo<i32, SignalCell<i32>> = Memo::new();
+        let watched: Memo<i32, bool> = Memo::new();
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let a = doubled.get_or_insert(1, || source.map(|n| n * 2).cell());
+                let b = doubled.get_or(2, || source.map(|n| n * 3).cell());
+                let c = watched.get_or_insert(1, || {
+                    source.effect(|n| {});
+                    true
+                });
+            });
+        }
+        "#,
+    );
+    assert_eq!(found, vec!["cell", "cell", "effect"], "{found:#?}");
+}
+
+/// A136 (b), the controls: the maker that builds `.cell_global()` (the rule's
+/// own spelling), the lease taken at the CALL SITE on what the memo answers
+/// (the fixed shape), a `.cell()` inside a closure the maker merely CREATES
+/// (inert until something runs it — the ruling's static line), and a
+/// `.cell()` in an ordinary closure argument that is no memo's. None warns.
+#[test]
+fn a136_a_maker_that_builds_what_outlives_the_caller_does_not_warn() {
+    let found = a136_warnings(
+        r#"
+        import std::memo::Memo;
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        let source: SignalCell<i32> = Signal::new(1);
+        let global: Memo<i32, SignalCell<i32>> = Memo::new();
+        let later: Memo<i32, || SignalCell<i32>> = Memo::new();
+
+        fun apply(make: || SignalCell<i32>): SignalCell<i32> {
+            make()
+        }
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let kept = global.get_or_insert(1, || source.map(|n| n * 2).cell_global());
+                let leased = global.get_or_insert(2, || source.map(|n| n + 1).cell_global()).map(|n| n).cell();
+                let deferred = later.get_or_insert(1, || || source.map(|n| n).cell());
+                let plain = apply(|| source.map(|n| n).cell());
+            });
+        }
+        "#,
+    );
+    assert!(found.is_empty(), "{found:#?}");
+}

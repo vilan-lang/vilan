@@ -5842,14 +5842,14 @@ fn a_memo_makes_a_value_once_per_key_and_forgets_one_on_request() {
         }
 
         fun main() {
-            print(i"first:{widths.get_or("alpha", || width_of("alpha"))}");
-            print(i"again:{widths.get_or("alpha", || width_of("alpha"))}");
-            print(i"other:{widths.get_or("be", || width_of("be"))}");
+            print(i"first:{widths.get_or_insert("alpha", || width_of("alpha"))}");
+            print(i"again:{widths.get_or_insert("alpha", || width_of("alpha"))}");
+            print(i"other:{widths.get_or_insert("be", || width_of("be"))}");
             print(i"makes:{makes.read()} len:{widths.len()}");
             print(i"held:{widths.get("alpha").is_some()}");
             widths.forget("alpha");
             print(i"held_after_forget:{widths.get("alpha").is_some()} len:{widths.len()}");
-            print(i"remade:{widths.get_or("alpha", || width_of("alpha"))} makes:{makes.read()}");
+            print(i"remade:{widths.get_or_insert("alpha", || width_of("alpha"))} makes:{makes.read()}");
             widths.clear();
             print(i"cleared:{widths.len()}");
         }
@@ -6870,4 +6870,55 @@ fn a126_u53_displays_through_a_bound() {
 #[test]
 fn a126_f32_displays_through_a_bound() {
     assert_displays_through_a_bound("f32", "1.5f32", "1.5");
+}
+
+/// I7: `Memo::get_or` is `get_or_insert` now, and the old name stays one
+/// release as a `[deprecated]` alias (E224's rule for functions) — it still
+/// answers, and it warns at the name with the steer.
+#[test]
+fn i7_memo_get_or_is_a_deprecated_alias_of_get_or_insert() {
+    assert_warns_spanning(
+        r#"
+        import std::memo::Memo;
+
+        let widths: Memo<str, usize> = Memo::new();
+
+        fun main() {
+            let held = widths.get_or("alpha", || 5usize);
+        }
+        "#,
+        "get_or",
+        "`get_or` is deprecated; use get_or_insert(key, make)",
+    );
+}
+
+/// I8: `Shared<Option<T>>::get_or_insert(make)` — a miss makes once and
+/// stores, a hit makes nothing, and what the cell holds afterwards is what was
+/// answered.
+#[test]
+fn i8_an_optional_cell_is_filled_once_by_get_or_insert() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let makes: Shared<i32> = Shared::new(0);
+        let slot: Shared<Option<str>> = Shared::new(None);
+
+        fun make(): str {
+            makes.write() += 1;
+            i"made-{makes.read()}"
+        }
+
+        fun main() {
+            print(i"miss:{slot.get_or_insert(|| make())}");
+            print(i"hit:{slot.get_or_insert(|| make())}");
+            print(i"held:{slot.read().unwrap_or("-")} makes:{makes.read()}");
+            slot.write() = Some("preset");
+            print(i"preset:{slot.get_or_insert(|| make())} makes:{makes.read()}");
+        }
+        main();
+        "#,
+        "miss:made-1\nhit:made-1\nheld:made-1 makes:1\npreset:preset makes:1\n",
+    );
 }

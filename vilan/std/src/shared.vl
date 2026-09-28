@@ -100,6 +100,31 @@ impl Shared<type T> {
 	external fun downgrade(&self): Weak<T>;
 }
 
+/// The optional cell, filled on first ask (tracker I8) — `Memo::get_or_insert`'s
+/// one-slot twin, for the value an app keeps in a `Shared<Option<T>>` and builds
+/// once: a module-level handle, a lazily opened connection.
+impl Shared<Option<type T>> {
+	/// The `T` this cell holds — or, while it holds `None`, the one `make` builds,
+	/// STORED and then answered. `make` runs at the call site and only on a miss,
+	/// so a maker that reads a context reads the caller's; what it builds is kept
+	/// in the cell past the caller, which is `Memo::get_or_insert`'s rule and its
+	/// warning's reason (a derivation built here is `.cell_global()`).
+	///
+	/// The by-hand form this replaces is a `match` over `read()` with a
+	/// `write() = Some(made)` arm — the exact place B433's unchecked assignment
+	/// through `write()` made a cache that never cached.
+	fun get_or_insert(self, make: || T): T {
+		match self.read() {
+			Some(let held) => held,
+			None => {
+				let made = make();
+				self.write() = Some(made);
+				made
+			},
+		}
+	}
+}
+
 /// A weak handle to a `Shared<T>` cell: it names the cell, and it does not keep it
 /// alive. `Shared::downgrade` is where one comes from; `upgrade` and `get` are the
 /// two ways back, and they differ in what they promise about the cell's lifetime

@@ -3611,3 +3611,144 @@ fn a135_a_closed_socket_releases_its_handlers_per_call_cells() {
          connection closes; got:\n{stdout}"
     );
 }
+
+// --- A136: what a Memo maker builds outlives the caller ---------------------
+
+/// A136 IN PROCESS: the order's kolt-mirrors probe, sections F and G, on
+/// `get_or_insert` (I7). F memoizes an owner-tied `.cell()`; G memoizes the
+/// program-lifetime cell of the unleased mirror and leases at the call site.
+const A136_MEMO_MAKER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::map::Map;
+import std::memo::Memo;
+import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
+import std::rpc::{ LocalTransport, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+
+[service(Client)]
+struct Store {
+	messages: Shared<Map<i32, SignalCell<List<str>>>>,
+}
+
+impl Store {
+	[rpc]
+	fun add_message(self, id: i32, text: str): bool {
+		match self.messages.read().get(id) {
+			Some(let list) => {
+				list.update(|&mut items| {
+					items.push(text);
+				});
+				true
+			},
+			None => false,
+		}
+	}
+
+	[rpc]
+	fun get_messages(self, id: i32): Option<SignalCell<List<str>>> {
+		self.messages.read().get(id)
+	}
+}
+
+// F — the trap: the maker builds an owner-tied `.cell()` under the FIRST
+// caller's owner, and the memo keeps it after that owner is gone.
+let handles_f: Memo<i32, SignalCell<Option<List<str>>>> = Memo::new();
+
+fun messages_f(client_cell: SignalCell<Option<Client<LocalTransport>>>, id: i32): SignalCell<List<str>> {
+	handles_f
+		.get_or_insert(id, || client_cell
+			.map(|client| client.map(|client| client.get_messages(id)))
+			.cell()
+			.and_then(|mirror| mirror)
+			.cell())
+		.map(|x| x.unwrap_or_default())
+		.cell()
+}
+
+// G — the rule: the memo keeps a program-lifetime cell of the (unleased)
+// mirror, and the lease is the caller's.
+let handles_g: Memo<i32, SignalCell<Option<RemoteSource<List<str>>>>> = Memo::new();
+
+fun messages_g(client_cell: SignalCell<Option<Client<LocalTransport>>>, id: i32): SignalCell<List<str>> {
+	handles_g
+		.get_or_insert(id, || client_cell
+			.map(|client| client.map(|client| client.get_messages(id)))
+			.cell_global())
+		.and_then(|mirror| mirror)
+		.map(|x| x.unwrap_or_default())
+		.cell()
+}
+
+fun main() {
+	let first: SignalCell<List<str>> = Signal::new(["a"]);
+	let messages: Map<i32, SignalCell<List<str>>> = Map::new();
+	let store = Store { messages = Shared::new(messages) };
+	store.messages.write().insert(0, first);
+	let (client_end, server_end) = duplex_pair();
+	register_session(4, server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()).for_connection(4));
+	let client = Client { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	let client_cell: SignalCell<Option<Client<LocalTransport>>> = Signal::new(Some(client));
+
+	let visit1 = Owner::new();
+	owner_scope.run(visit1, || {
+		messages_g(client_cell, 0).effect(|x| print(i"G visit 1 sees {x.len()}"));
+		messages_f(client_cell, 0).effect(|x| print(i"F visit 1 sees {x.len()}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"add -> {client.add_message(0, "b").unwrap_or(false)}");
+	print("(leave)");
+	visit1.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	let visit2 = Owner::new();
+	owner_scope.run(visit2, || {
+		messages_f(client_cell, 0).effect(|x| print(i"F visit 2 sees {x.len()}"));
+		messages_g(client_cell, 0).effect(|x| print(i"G visit 2 sees {x.len()}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"add -> {client.add_message(0, "c").unwrap_or(false)}");
+	visit2.dispose();
+	print("done");
+}
+"#;
+
+/// A136: F's maker builds a `.cell()` under the FIRST visit's owner and the
+/// memo keeps it past that owner — visit 2 is handed the dead cell and reads
+/// `2` forever (`c` never arrives). G's maker builds `.cell_global()` and the
+/// lease is the caller's: visit 2 paints the cached `2`, re-mints, and follows
+/// the add to `3`. F's two `.cell()`s are also what the compiler now warns at
+/// (door b), which this build pins through the real pipeline.
+#[test]
+fn a136_a_memo_maker_that_builds_cell_global_survives_its_first_caller() {
+    let stdout = run_program_warning(
+        "a136_memo",
+        A136_MEMO_MAKER,
+        "`.cell()` inside a `Memo` maker ties what it builds to the FIRST caller's owner",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "G visit 1 sees 0",
+            "F visit 1 sees 0",
+            "G visit 1 sees 1",
+            "F visit 1 sees 1",
+            "G visit 1 sees 2",
+            "F visit 1 sees 2",
+            "add -> true",
+            "(leave)",
+            // F: the dead cell, never updated again.
+            "F visit 2 sees 2",
+            // G: the cached value, the re-mint's seed, then the add.
+            "G visit 2 sees 2",
+            "G visit 2 sees 2",
+            "G visit 2 sees 3",
+            "add -> true",
+            "done",
+        ],
+        "a memo maker's cell must outlive its first caller only when it is \
+         `.cell_global()`; got:\n{stdout}"
+    );
+}
