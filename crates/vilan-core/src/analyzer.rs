@@ -47300,6 +47300,140 @@ impl<'src> Analyzer<'src> {
         Some(unified.unwrap_or(Type::Void))
     }
 
+    /// B426: see the call site in `finalize_build`.
+    fn refuse_negative_unsigned_constants(&mut self) {
+        let mut roots: Vec<Id> = Vec::new();
+        let mut operands: HashSet<Id> = HashSet::default();
+        let mut negated: HashSet<Id> = HashSet::default();
+        for (id, expr) in &self.expr_id_to_expr_map {
+            match expr {
+                Expr::Binary(BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul, left, right) => {
+                    operands.insert(*left);
+                    operands.insert(*right);
+                    roots.push(*id);
+                }
+                Expr::Unary('-', operand) => {
+                    operands.insert(*operand);
+                    negated.insert(*id);
+                }
+                _ => {}
+            }
+        }
+        // A tree holding a NEGATED literal is B407's to report, at the literal.
+        roots.retain(|id| {
+            !operands.contains(id)
+                && !self.reusable_entity(*id)
+                && !self.subtree_contains(*id, &negated, 0)
+        });
+        roots.sort_unstable_by_key(|id| id.0);
+        for root in roots {
+            let mut literal = None;
+            let Some(value) = self.fold_literal_constant(root, &mut literal, 0) else {
+                continue;
+            };
+            if value >= 0 {
+                continue;
+            }
+            let Some(literal_id) = literal else {
+                continue;
+            };
+            let Some(type_id) = self
+                .expected_types
+                .get(&root)
+                .or_else(|| self.expected_types.get(&literal_id))
+                .or_else(|| self.expr_id_to_type_id_map.get(&literal_id))
+                .or_else(|| self.literal_types.get(&literal_id))
+                .copied()
+            else {
+                continue;
+            };
+            let settled = type_id.get_type(self);
+            let Some(name @ ("u8" | "u16" | "u32" | "u53" | "usize")) =
+                self.numeric_primitive_name(&settled)
+            else {
+                continue;
+            };
+            let range = match name {
+                "u53" | "usize" => "0 ..= 2^53 on the JS backend".to_string(),
+                "u8" => "0 ..= 255".to_string(),
+                "u16" => "0 ..= 65535".to_string(),
+                _ => "0 ..= 4294967295".to_string(),
+            };
+            let span = **self.span_map.get(&root).unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{name}` is unsigned ({range}), and this constant folds to `{value}`: a \
+                         value of `{name}` cannot be below zero, and a sentinel for 'nothing \
+                         here' is `None` in an `Option<{name}>`"
+                    ),
+                },
+                root,
+            );
+        }
+    }
+
+    /// Whether a `+`/`-`/`*` tree rooted at `id` contains one of `targets`,
+    /// within `fold_literal_constant`'s depth cap (past it the answer is NO,
+    /// and the fold gives up at the same depth, so nothing is reported).
+    fn subtree_contains(&self, id: Id, targets: &HashSet<Id>, depth: usize) -> bool {
+        if targets.contains(&id) {
+            return true;
+        }
+        if depth > 64 {
+            return false;
+        }
+        match self.expr_id_to_expr_map.get(&id) {
+            Some(Expr::Binary(BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul, left, right)) => {
+                self.subtree_contains(*left, targets, depth + 1)
+                    || self.subtree_contains(*right, targets, depth + 1)
+            }
+            _ => false,
+        }
+    }
+
+    /// B426: the exact value of a literal-only integer tree — unsuffixed
+    /// integer literals under `+`, `-`, `*` and unary `-` — and one of its
+    /// literals (whose recorded type is the tree's). `None` for anything else,
+    /// a fractional or suffixed literal, an overflow of `i128`, or a tree
+    /// deeper than the cap (the cap answers "not a constant", so nothing is
+    /// refused on a guess).
+    fn fold_literal_constant(
+        &self,
+        id: Id,
+        literal: &mut Option<Id>,
+        depth: usize,
+    ) -> Option<i128> {
+        if depth > 64 {
+            return None;
+        }
+        match self.expr_id_to_expr_map.get(&id)? {
+            Expr::Number(whole, None, None) => {
+                literal.get_or_insert(id);
+                match whole.strip_prefix("0x") {
+                    Some(hex) => i128::from_str_radix(hex, 16).ok(),
+                    None => whole.parse::<i128>().ok(),
+                }
+            }
+            Expr::Unary('-', operand) => self
+                .fold_literal_constant(*operand, literal, depth + 1)?
+                .checked_neg(),
+            Expr::Binary(op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul), left, right) => {
+                let left = self.fold_literal_constant(*left, literal, depth + 1)?;
+                let right = self.fold_literal_constant(*right, literal, depth + 1)?;
+                match op {
+                    BinaryOp::Add => left.checked_add(right),
+                    BinaryOp::Sub => left.checked_sub(right),
+                    _ => left.checked_mul(right),
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// B423 — the numeric type a LITERAL arm takes from its sibling when the
     /// construct has no expectation: `if n > 2 { n } else { 0 }` with `n: u53`
     /// types the `0` as `u53`, in either order and for a `match` leg alike,
@@ -53277,6 +53411,17 @@ impl<'src> Analyzer<'src> {
                 );
             }
         }
+
+        // --- B426: a CONSTANT that folds negative at an unsigned type ---
+        // B407 refuses a negative LITERAL (`-1`); a literal-only expression
+        // that FOLDS negative (`let end: usize = 0 - 1;`, the spelling
+        // `std::ui`'s focus wrap used) passed and printed `-1` on JS. The
+        // maximal literal-only `+`/`-`/`*` trees are folded exactly (i128), at
+        // the type their literals settled at, and a negative result at an
+        // unsigned type is refused where it is written. A tree with any
+        // non-literal operand (`z - 1` over `z: usize`) is not a constant and
+        // is left to the runtime bounds rule (I5 ruling 2).
+        self.refuse_negative_unsigned_constants();
 
         // --- The starved-closure-parameter refusal (B131) --- a closure that
         // is never called leaves an unannotated parameter `Unknown` for good:

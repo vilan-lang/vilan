@@ -600,3 +600,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 575	-	`.cell()` in the initializer of the module binding `{name}` ties the cell to an owner, and a module binding has none: its subscription would stay on the upstream for the life of the program. Build it under the owner that reads it (inside the view, or an `owner_scope.run`), or write `.cell_global()`, which says that lifetime
 576	-	a `{got}` does not become a `{expected}` as a whole: an object is built where ONE value lands, and each `{concrete}` inside this one was built already; {steer}
 577	-	`-` on an unsigned value: `{name}` has no negative values, so its negation is out of range on every backend. Convert it to a signed type first (`.as_i53()`) and negate that
+578	-	`{name}` is unsigned ({range}), and this constant folds to `{value}`: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`

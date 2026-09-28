@@ -951,3 +951,29 @@ fn b429_negating_a_converted_or_signed_value_compiles() {
         "-3 -4\n",
     );
 }
+
+// --- B426: a literal-only constant that folds negative at an unsigned type --
+
+#[test]
+fn b426_a_constant_folding_negative_at_an_unsigned_type_is_refused() {
+    assert_fails_once_with(
+        "fun main() {\n\tlet end: usize = 0 - 1;\n}\n",
+        "`usize` is unsigned (0 ..= 2^53 on the JS backend), and this constant folds to `-1`",
+    );
+    assert_fails_once_with(
+        "fun main() {\n\tlet small: u8 = 2 * 3 - 10;\n}\n",
+        "`u8` is unsigned (0 ..= 255), and this constant folds to `-4`",
+    );
+}
+
+#[test]
+fn b426_a_non_negative_constant_and_a_runtime_difference_compile() {
+    assert_compiles(concat!(
+        "fun main() {\n",
+        "\tlet a: usize = 5 - 3;\n",
+        "\tlet signed: i32 = 0 - 1;\n",
+        "\tlet z: usize = 0;\n",
+        "\tlet later = z + 2 - 1;\n",
+        "}\n",
+    ));
+}

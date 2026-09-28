@@ -3844,7 +3844,7 @@ fn lift_maps_flattens_and_short_circuits() {
         	let flat_none: Option<str> = user("miss")?.nickname();
         	print(flat_none.unwrap_or("?"));
         	// multi-link with args, escaped by parens.
-        	print(format((user("hit")?.nickname()?.len()).unwrap_or(0 - 1)));
+        	print(format((user("hit")?.nickname()?.len()).unwrap_or(0)));
         }
         "#,
         "computed\nada\n?\nthe countess\n?\n12\n",

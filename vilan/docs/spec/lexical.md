@@ -96,8 +96,12 @@ where the same expression with no annotation truncates to `3`. A
 FRACTIONAL literal never takes an integer type from its context: to the
 right of an integer operand (`y / 2.0` with `y: i32`) it is a compile error
 whose fix is the other operand's conversion (`y.as_f64() / 2.0`). Every
-integer literal is **range-checked** against its type at compile time, and
-a negative one at an unsigned type (`let n: usize = -1`) is out of range.
+integer literal is **range-checked** against its type at compile time,
+and a negative one at an unsigned type (`let n: usize = -1`) is out of
+range — as is a literal-only expression that folds
+negative there (`let end: usize = 0 - 1;`). Negating an unsigned VALUE
+(`-u` for `u: usize`) is refused too: convert it to a signed type first
+(`-u.as_i53()`).
 
 `i53` spans the symmetric range ±2^53 and `u53` spans [0, 2^53]: the
 window in which every integer is exactly representable in an IEEE-754

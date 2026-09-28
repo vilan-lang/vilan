@@ -49,6 +49,9 @@ written down.
 <!-- family: fix -->
 **`-u` on an unsigned value is refused: `let n = -u;` with `u: usize` is "`-` on an unsigned value: `usize` has no negative values …", where JS computed a negative `usize` and the native build failed in rustc.** A negative LITERAL at an unsigned type was already refused (B407); a negated VALUE went through as ordinary arithmetic. Convert first: `-u.as_i53()`. Tracker B429.
 
+<!-- family: fix -->
+**A literal-only constant that folds negative at an unsigned type is refused: `let end: usize = 0 - 1;` is "`usize` is unsigned (…), and this constant folds to `-1`", where it compiled and printed `-1` on JS.** B407 refused a negative LITERAL, not an expression of literals whose value is negative — the spelling `std::ui`'s focus wrap once used. The maximal literal-only `+`/`-`/`*` trees are folded exactly at the type their literals settled at; anything with a runtime operand (`z - 1` over `z: usize`) is not a constant and keeps I5's runtime rule. Tracker B426.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->
