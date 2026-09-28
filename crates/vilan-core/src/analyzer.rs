@@ -43792,6 +43792,19 @@ impl<'src> Analyzer<'src> {
                     .get(&id)
                     .cloned()
                     .unwrap_or_default();
+                // B435: WRITTEN type arguments (`rs.map<dyn Src>(..)`) fix the
+                // method's own generics before anything is inferred — the free
+                // path's rule (`resolve_call_subject` seeds them first). The
+                // method path took them only when it wired the call, after the
+                // closure had typed and bound `U` from its body, so the call
+                // answered a `List<dyn Src>` holding bare `Root`s.
+                if !generic_argument_ids.is_empty()
+                    && let Some((_, own_generics)) = self.method_signature(member_id)
+                {
+                    for (generic, argument) in own_generics.iter().zip(generic_argument_ids) {
+                        substitution.insert(*generic, *argument);
+                    }
+                }
                 // B389: a generic only a literal argument fixes takes the call's
                 // numeric expectation first.
                 self.bind_literal_generics_from_expectation(

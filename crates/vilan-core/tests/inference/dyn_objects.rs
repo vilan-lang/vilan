@@ -1352,3 +1352,27 @@ fn b431_an_erased_parameter_at_plain_values_still_runs() {
         "1\n2\n",
     );
 }
+
+/// B435's family: a WRITTEN type argument on a method call fixes the method's
+/// own generic before its closure is typed — `rs.map<dyn Src>(|element|
+/// element)` erases each element where it lands. The method path took the
+/// argument only when it wired the call, after the closure had bound `U` to
+/// `Root` from its body, and JS read `.get` off a bare struct.
+#[test]
+fn b435_a_written_type_argument_on_a_method_erases_the_closures_result() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet built: List<Root> = [Root { n = 1 }, Root { n = 2 }];\n",
+                "\tlet objects = built.map<dyn Src>(|element| element);\n",
+                "\tprint(total(objects));\n",
+                "\tlet wide = built.map<i53>(|element| element.n.as_i53());\n",
+                "\tprint(wide[1]);\n",
+                "}\n",
+            )
+        ),
+        "3\n2\n",
+    );
+}

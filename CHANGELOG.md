@@ -76,6 +76,9 @@ written down.
 <!-- family: fix -->
 **A generic function calling through its own trait bound no longer takes hidden context parameters from an unrelated trait's same-named member: `badge<V: MaybeSignal<str>>(label: V) { label.bind(..) }` over a program's OWN `MaybeSignal` threads no ambient owner, where it declared one because std's `MaybeSignal::bind` (whose reactive impl registers an effect) shares the name — and a top-level call supplied nothing for it (JS passed `undefined`; the native build refused the arity).** The context pass read a call through a bounded parameter as reaching every member of that NAME in the program; it now reads the members of the bound's traits (and their supertraits), the same narrowing a known receiver already got. `blanket-impl.vl` builds natively and prints what JS prints; its golden loses the two unused parameters and renames minified locals, runtime-identical. Tracker B425.
 
+<!-- family: miscompile -->
+**A written type argument on a method call fixes the method's own generic before its closure is typed: `built.map<dyn Src>(|element| element)` erases each element into the object, where the list held bare `Root`s behind a `List<dyn Src>` type and JS stopped with `x.get is not a function`.** The free-function path always seeded written type arguments first; the method path took them only when it wired the call, after the closure had typed and bound the generic from its own body. Found beside B435; the native build still refuses a closure body erased to `dyn` at rustc (reported). Tracker B435 (family).
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->
