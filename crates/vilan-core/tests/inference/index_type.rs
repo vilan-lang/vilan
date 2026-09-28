@@ -860,3 +860,120 @@ fn a_non_index_numeric_argument_keeps_the_plain_steer_and_no_note() {
         "an index",
     );
 }
+
+// --- B423: a literal arm takes its sibling's numeric type ------------------
+
+#[test]
+fn b423_a_literal_if_arm_takes_its_sibling_type_in_either_order() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun want(value: u53): u53 { value }\n",
+            "fun main() {\n",
+            "\tlet n: u53 = 5;\n",
+            "\tlet m = if n > 2 { n } else { 0 };\n",
+            "\tlet k = if n > 2 { 0 } else { n };\n",
+            "\tprint(i\"{want(m)} {want(k)}\");\n",
+            "}\n",
+        ),
+        "5 0\n",
+    );
+}
+
+#[test]
+fn b423_a_literal_match_leg_takes_its_sibling_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun want(value: usize): usize { value }\n",
+            "fun main() {\n",
+            "\tlet at: usize = 4;\n",
+            "\tlet chosen = match at > 2 {\n",
+            "\t\ttrue => 1,\n",
+            "\t\tfalse => at,\n",
+            "\t};\n",
+            "\tprint(want(chosen));\n",
+            "}\n",
+        ),
+        "1\n",
+    );
+}
+
+#[test]
+fn b423_the_sibling_type_holds_the_literal_to_its_range() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet small: u8 = 5;\n",
+            "\tlet m = if small > 2 { small } else { 300 };\n",
+            "}\n",
+        ),
+        "the literal `300` is out of range for `u8`",
+    );
+}
+
+#[test]
+fn b423_two_literal_arms_keep_the_default() {
+    assert_compiles(concat!(
+        "fun want(value: i32): i32 { value }\n",
+        "fun main() {\n",
+        "\tlet flag = true;\n",
+        "\tlet two = if flag { 1 } else { 2 };\n",
+        "\twant(two);\n",
+        "}\n",
+    ));
+}
+
+// --- B429: `-` on an unsigned VALUE ------------------------------------------
+
+#[test]
+fn b429_negating_an_unsigned_value_is_refused() {
+    for width in ["u8", "u16", "u32", "u53", "usize"] {
+        assert_fails_once_with(
+            &format!("fun main() {{\n\tlet u: {width} = 3;\n\tlet n = -u;\n}}\n"),
+            &format!("`-` on an unsigned value: `{width}` has no negative values"),
+        );
+    }
+}
+
+#[test]
+fn b429_negating_a_converted_or_signed_value_compiles() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet u: usize = 3;\n",
+            "\tlet n = -u.as_i53();\n",
+            "\tlet s: i32 = 4;\n",
+            "\tprint(i\"{n} {-s}\");\n",
+            "}\n",
+        ),
+        "-3 -4\n",
+    );
+}
+
+// --- B426: a literal-only constant that folds negative at an unsigned type --
+
+#[test]
+fn b426_a_constant_folding_negative_at_an_unsigned_type_is_refused() {
+    assert_fails_once_with(
+        "fun main() {\n\tlet end: usize = 0 - 1;\n}\n",
+        "`usize` is unsigned (0 ..= 2^53 on the JS backend), and this constant folds to `-1`",
+    );
+    assert_fails_once_with(
+        "fun main() {\n\tlet small: u8 = 2 * 3 - 10;\n}\n",
+        "`u8` is unsigned (0 ..= 255), and this constant folds to `-4`",
+    );
+}
+
+#[test]
+fn b426_a_non_negative_constant_and_a_runtime_difference_compile() {
+    assert_compiles(concat!(
+        "fun main() {\n",
+        "\tlet a: usize = 5 - 3;\n",
+        "\tlet signed: i32 = 0 - 1;\n",
+        "\tlet z: usize = 0;\n",
+        "\tlet later = z + 2 - 1;\n",
+        "}\n",
+    ));
+}

@@ -88,101 +88,101 @@ function $s(self, fn) {
 	}
 	return $u;
 }
-function $y(self, fn) {
+function $v(self, fn) {
+	const $w = self;
+	let $x = null;
+	if ($w[0] === 0) {
+		const x = __clone($w[1]);
+		$x = x;
+	} else {
+		const e = $w[1];
+		$x = fn(e);
+	}
+	return $x;
+}
+function $y(self) {
 	const $z = self;
 	let $A = null;
 	if ($z[0] === 0) {
-		const x = __clone($z[1]);
-		$A = x;
+		const x = $z[1];
+		$A = [ 0, __clone(x) ];
 	} else {
-		const e = $z[1];
-		$A = fn(e);
+		$A = [ 1 ];
 	}
 	return $A;
 }
 function $B(self) {
 	const $C = self;
-	let $D = null;
-	if ($C[0] === 0) {
-		const x = $C[1];
-		$D = [ 0, __clone(x) ];
+	return $C[0] === 0;
+}
+function $D(self) {
+	const $E = self;
+	let $F = null;
+	if ($E[0] === 1) {
+		const e = $E[1];
+		$F = [ 0, __clone(e) ];
 	} else {
-		$D = [ 1 ];
+		$F = [ 1 ];
 	}
-	return $D;
+	return $F;
 }
-function $E(self) {
-	const $F = self;
-	return $F[0] === 0;
-}
-function $G(self) {
+function $G(self, fallback) {
 	const $H = self;
 	let $I = null;
-	if ($H[0] === 1) {
-		const e = $H[1];
-		$I = [ 0, __clone(e) ];
+	if ($H[0] === 0) {
+		const x = __clone($H[1]);
+		$I = x;
 	} else {
-		$I = [ 1 ];
+		$I = __clone(fallback);
 	}
 	return $I;
 }
-function $J(self, fallback) {
+function $J(self) {
 	const $K = self;
 	let $L = null;
 	if ($K[0] === 0) {
 		const x = __clone($K[1]);
 		$L = x;
 	} else {
-		$L = __clone(fallback);
+		$L = default2();
 	}
 	return $L;
 }
-function $M(self) {
+function $M(self, b) {
 	const $N = self;
 	let $O = null;
 	if ($N[0] === 0) {
-		const x = __clone($N[1]);
-		$O = x;
+		$O = b;
 	} else {
-		$O = default2();
+		const e = $N[1];
+		$O = [ 1, __clone(e) ];
 	}
 	return $O;
 }
-function $P(self, b) {
-	const $Q = self;
-	let $R = null;
-	if ($Q[0] === 0) {
-		$R = b;
+function $S(self, b) {
+	const $T = self;
+	let $U = null;
+	if ($T[0] === 0) {
+		const x = $T[1];
+		$U = [ 0, __clone(x) ];
 	} else {
-		const e = $Q[1];
-		$R = [ 1, __clone(e) ];
+		$U = b;
 	}
-	return $R;
+	return $U;
 }
-function $V(self, b) {
+function $V(self) {
 	const $W = self;
 	let $X = null;
-	if ($W[0] === 0) {
-		const x = $W[1];
-		$X = [ 0, __clone(x) ];
+	if ($W[0] === 0 && $W[1][0] === 0) {
+		const x = $W[1][1];
+		$X = [ 0, [ 0, __clone(x) ] ];
+	} else if ($W[0] === 0 && $W[1][0] === 1) {
+		$X = [ 1 ];
 	} else {
-		$X = b;
+		const e = $W[1];
+		$X = [ 0, [ 1, __clone(e) ] ];
 	}
 	return $X;
-}
-function $ab(self) {
-	const $ac = self;
-	let $ad = null;
-	if ($ac[0] === 0 && $ac[1][0] === 0) {
-		const x = $ac[1][1];
-		$ad = [ 0, [ 0, __clone(x) ] ];
-	} else if ($ac[0] === 0 && $ac[1][0] === 1) {
-		$ad = [ 1 ];
-	} else {
-		const e = $ac[1];
-		$ad = [ 0, [ 1, __clone(e) ] ];
-	}
-	return $ad;
 }
 const ok = [ 0, 10 ];
 const err = [ 1, "boom" ];
@@ -204,13 +204,13 @@ console.log($d($p(ok, (n) => {
 console.log($d($s(err, (e) => {
 	return [ 0, 7 ];
 }), 0));
-console.log($y(err, (e) => {
+console.log($v(err, (e) => {
 	return 99;
 }));
-console.log($E($B(ok)));
-console.log($J($G(err), "none"));
-console.log($M(err));
-console.log($d($P(ok, [ 0, 5 ]), 0));
-console.log($d($V(err, [ 0, 3 ]), 0));
+console.log($B($y(ok)));
+console.log($G($D(err), "none"));
+console.log($J(err));
+console.log($d($M(ok, [ 0, 5 ]), 0));
+console.log($d($S(err, [ 0, 3 ]), 0));
 const ro = [ 0, [ 0, 42 ] ];
-console.log($E($ab(ro)));
+console.log($B($V(ro)));

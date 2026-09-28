@@ -1621,9 +1621,8 @@ fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
 // Re-derived at A124 S2c: `map` answers a `Map<S, T, U>` node now, so the
 // expectation that binds `U` is the node's annotation (the pre-flip pin wrote
 // `SignalCell<i32>`, which a node is not). Written `count.map(..).cell()` under
-// a `SignalCell<i32>` annotation, the expectation stops at `.cell()`'s receiver
-// and the diagnostic is the plainer "Expected SignalCell<i32>, but got
-// SignalCell<void>" over the chain — no steer (reported with Order 42's finds).
+// a `SignalCell<i32>` annotation, the expectation stops at `.cell()`'s receiver;
+// E226 finds the closure down the chain (the next pin).
 #[test]
 fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
     assert_fails_spanning_nth(
@@ -1643,6 +1642,33 @@ fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
         1,
         "Expected i32, but got void instead: the `;` discards this body's last value.",
     );
+}
+
+/// E226: through `.map(..).cell()`, where the expectation stops at `.cell()`'s
+/// receiver — the binding's mismatch (`SignalCell<i32>` against
+/// `SignalCell<void>`) finds the `;`-ended closure down the chain and says the
+/// regime-3 steer at its brace, as the direct binding does.
+#[test]
+fn missing_return_value_regime_3_through_a_map_then_cell_chain() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun main() {
+        	let count: SignalCell<i32> = Signal::new(1);
+        	let doubled: SignalCell<i32> = count.map(|n| {
+        		n * 2;
+        	}).cell();
+        	print(doubled.get());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "SignalCell<void>");
 }
 
 // The nested shapes: the expectation reaches a call standing in a block
@@ -3844,7 +3870,7 @@ fn lift_maps_flattens_and_short_circuits() {
         	let flat_none: Option<str> = user("miss")?.nickname();
         	print(flat_none.unwrap_or("?"));
         	// multi-link with args, escaped by parens.
-        	print(format((user("hit")?.nickname()?.len()).unwrap_or(0 - 1)));
+        	print(format((user("hit")?.nickname()?.len()).unwrap_or(0)));
         }
         "#,
         "computed\nada\n?\nthe countess\n?\n12\n",

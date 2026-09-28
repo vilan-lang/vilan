@@ -1381,6 +1381,315 @@ const MUT_PARAMETER_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B435: a value erased where it lands in a `dyn` position that a generic
+/// parameter or a literal hands it — `push` on a `List<dyn Src>` (the list's
+/// own and a field's), an index assignment, `Some(value)` at an
+/// `Option<dyn Src>`, and a generic struct literal under a `Boxed<dyn Src>`
+/// annotation. Each printed a `TypeError` on JS before (the bare value
+/// reached code reading a `(value, table)` pair) and was refused by rustc;
+/// the two backends agree now.
+#[test]
+fn a_value_erased_at_a_bound_or_literal_dyn_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b435.vl"), B435_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b435.vl"),
+        Verdict::Identical,
+        "a value erased at a bound or literal `dyn` position must mean the same thing on both backends"
+    );
+}
+
+const B435_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Boxed<T> {\n",
+    "\tvalue: T,\n",
+    "}\n",
+    "\n",
+    "struct Bag {\n",
+    "\titems: List<dyn Src>,\n",
+    "}\n",
+    "\n",
+    "fun total(objects: List<dyn Src>): i32 {\n",
+    "\tmut sum = 0;\n",
+    "\tfor object in objects {\n",
+    "\t\tsum = sum + object.get();\n",
+    "\t}\n",
+    "\tsum\n",
+    "}\n",
+    "\n",
+    "fun read(object: Option<dyn Src>): i32 {\n",
+    "\tmatch object {\n",
+    "\t\tSome(let found) => found.get(),\n",
+    "\t\tNone => 0,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet root = Root { n = 4 };\n",
+    "\tprint(read(Some(root)));\n",
+    "\tprint(read(Some(Root { n = 5 })));\n",
+    "\tlet boxed: Boxed<dyn Src> = Boxed { value = Root { n = 7 } };\n",
+    "\tprint(boxed.value.get());\n",
+    "\tmut pushed: List<dyn Src> = [];\n",
+    "\tpushed.push(Root { n = 8 });\n",
+    "\tpushed.push(root);\n",
+    "\tprint(total(pushed));\n",
+    "\tmut bag = Bag { items = [] };\n",
+    "\tbag.items.push(Root { n = 9 });\n",
+    "\tprint(bag.items[0].get());\n",
+    "\tmut slots: List<dyn Src> = [Root { n = 0 }];\n",
+    "\tslots[0] = Root { n = 11 };\n",
+    "\tprint(slots[0].get());\n",
+    "}\n",
+);
+
+/// B418: a place or a `Shared` read reaching a binding through an `if` or
+/// `match` arm is a copy on both backends. JS aliased it (the cell's later
+/// write showed through the binding, and a `push` on the binding grew the
+/// source) where the native build copied.
+#[test]
+fn a_place_chosen_by_a_branch_is_copied_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b418.vl"), B418_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b418.vl"),
+        Verdict::Identical,
+        "a place chosen by a branch must be copied the same way on both backends"
+    );
+}
+
+const B418_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet s: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+    "\tlet flag = true;\n",
+    "\tlet b = if flag { s.read() } else { [] };\n",
+    "\ts.write().push(4);\n",
+    "\tprint(b.len());\n",
+    "\tlet c = match flag {\n",
+    "\t\ttrue => s.read(),\n",
+    "\t\tfalse => [],\n",
+    "\t};\n",
+    "\ts.write().push(5);\n",
+    "\tprint(c.len());\n",
+    "\tlet a: List<i32> = [1, 2];\n",
+    "\tmut d = if flag { a } else { [] };\n",
+    "\td.push(3);\n",
+    "\tprint(a.len());\n",
+    "\tprint(d.len());\n",
+    "\tmut e: List<i32> = [];\n",
+    "\te = if flag { a } else { [] };\n",
+    "\te.push(9);\n",
+    "\tprint(a.len());\n",
+    "}\n",
+);
+
+/// B403: a bare `Holder::tag()` inside `impl Holder<type T: Label>` means
+/// `Self::tag()`, so each `Holder<X>` reaches its own `X::label()`. The
+/// native build emitted ONE instance for the unbound call and printed `A A`
+/// for a `Holder<B>`; JS stopped with an internal error.
+#[test]
+fn a_bare_static_inside_its_own_impl_dispatches_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b403.vl"), B403_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b403.vl"),
+        Verdict::Identical,
+        "a bare static inside its own impl must dispatch per instance on both backends"
+    );
+}
+
+const B403_PROBE: &str = concat!(
+    "trait Label { fun label(): str; }\n",
+    "struct A {}\n",
+    "impl A with Label { fun label(): str { \"A\" } }\n",
+    "struct B {}\n",
+    "impl B with Label { fun label(): str { \"B\" } }\n",
+    "struct Holder<T> { v: T }\n",
+    "impl Holder<type T: Label> {\n",
+    "\tfun tag(): str { T::label() }\n",
+    "\tfun show(self): str { Holder::tag() }\n",
+    "\tfun show_self(self): str { Self::tag() }\n",
+    "\tfun show_named(self): str { Holder<T>::tag() }\n",
+    "}\n",
+    "fun main() {\n",
+    "\tprint(Holder { v = A {} }.show_self());\n",
+    "\tprint(Holder { v = B {} }.show_named());\n",
+    "\tprint(Holder { v = A {} }.show());\n",
+    "\tprint(Holder { v = B {} }.show());\n",
+    "}\n",
+);
+
+/// B419: a blanket over a SUPERTRAIT applies to a type whose one impl block
+/// names the subtrait (B243's one-block form) — both backends find `pair`.
+#[test]
+fn a_blanket_over_a_supertrait_reaches_a_one_block_subtrait_impl_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b419.vl"), B419_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b419.vl"),
+        Verdict::Identical,
+        "a blanket over a supertrait must reach a one-block subtrait impl on both backends"
+    );
+}
+
+const B419_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Src<T> {\n",
+    "\tfun get(self): T;\n",
+    "}\n",
+    "\n",
+    "trait Sig<T> with Src<T> {\n",
+    "\tfun label(self): str;\n",
+    "}\n",
+    "\n",
+    "struct Cell<T> {\n",
+    "\tv: T,\n",
+    "}\n",
+    "\n",
+    "impl Cell<type T> with Sig<T> {\n",
+    "\tfun get(self): T {\n",
+    "\t\tself.v\n",
+    "\t}\n",
+    "\tfun label(self): str {\n",
+    "\t\t\"cell\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl type S: Src<type T> {\n",
+    "\tfun pair(self): (T, T) {\n",
+    "\t\t(self.get(), self.get())\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet c = Cell { v = 3 };\n",
+    "\tlet (a, b) = c.pair();\n",
+    "\tprint(a + b);\n",
+    "}\n",
+);
+
+/// B423: a literal `if` arm or `match` leg takes its sibling's numeric type
+/// (`u53` here) on both backends — the analyzer refused it before, and the
+/// native build needs the literal typed to emit `0u64`.
+#[test]
+fn a_literal_arm_typed_by_its_sibling_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b423.vl"), B423_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b423.vl"),
+        Verdict::Identical,
+        "a literal arm typed by its sibling must mean the same thing on both backends"
+    );
+}
+
+const B423_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun want(value: u53): u53 {\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n: u53 = 5;\n",
+    "\tlet m = if n > 2 { n } else { 0 };\n",
+    "\tlet k = if n > 2 { 0 } else { n };\n",
+    "\tlet j = match n > 2 {\n",
+    "\t\ttrue => n,\n",
+    "\t\tfalse => 0,\n",
+    "\t};\n",
+    "\tprint(i\"{want(m)} {want(k)} {want(j)}\");\n",
+    "}\n",
+);
+
+/// B430: the native build does not yet re-build a tuple erased element-wise
+/// (the JS emitter does, by projection) — it REFUSES by name rather than
+/// handing rustc a bare struct where a `Dyn` is wanted.
+#[test]
+fn a_tuple_erased_elementwise_is_refused_by_name_natively() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b430.vl"), B430_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_b430.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a tuple value erased element-wise"),
+            "refused for another reason: {reason}"
+        ),
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
+const B430_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "fun pair(p: (dyn Src, dyn Src)): i32 {\n",
+    "\tp.0.get() + p.1.get()\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet t = (Root { n = 1 }, Root { n = 2 });\n",
+    "\tprint(pair(t));\n",
+    "}\n",
+);
+
+/// B424 door (b): `or_else`'s free `F` takes the input's error type, so the
+/// native build has a type to emit — it refused by name before ("a value of
+/// an unbound generic type parameter (parameter 1 of `or_else`)").
+#[test]
+fn or_else_with_an_ok_only_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b424.vl"), B424_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b424.vl"),
+        Verdict::Identical,
+        "`or_else` with an Ok-only closure must mean the same thing on both backends"
+    );
+}
+
+const B424_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "fun main() {\n",
+    "\tlet err: Result<i32, str> = Err(\"bad\");\n",
+    "\tlet fixed = err.or_else(|e| Ok(7));\n",
+    "\tprint(fixed.unwrap_or(0));\n",
+    "\tlet fixed2 = err.or_else(|_| Ok(8));\n",
+    "\tprint(fixed2.unwrap_or(0));\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
@@ -3916,24 +4225,25 @@ const ENCODE_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F36's boundary, named: `blanket-impl.vl` got past the interpolation and met
-/// a call that threads FEWER context arguments than its callee's instance
-/// declares (`badge("static")` from `main`, whose instance takes the ambient
-/// `Owner` because one impl of the trait member it dispatches through reaches
-/// it; JavaScript passes `undefined`). rustc refused that as E0061 — a BROKEN
-/// verdict — so it is refused by name instead, which is what the whole-set
-/// sweep's zero-broken gate needs. The context pass is the analyzer's, and the
-/// fix that makes the call emittable is there.
+/// F36's boundary, CLOSED by B425: `blanket-impl.vl` met a call that threaded
+/// FEWER context arguments than its callee's instance declared
+/// (`badge("static")` from `main`). The instance declared the ambient `Owner`
+/// because the context pass read `label.bind(..)` — a dispatch through `V:
+/// MaybeSignal<str>`, the program's OWN trait — as reaching every member
+/// NAMED `bind`, std's `MaybeSignal::bind` (whose reactive impl registers an
+/// effect) among them, while coverage, which narrows, found no need. A
+/// generic-member site's candidates are now the bound's traits' members only,
+/// so nothing is declared that no caller supplies: the program is identical
+/// on both backends (it was refused by name here, and before that rustc's
+/// E0061).
 #[test]
 fn a_call_missing_a_context_argument_is_refused_by_name() {
     let staged = stage();
-    match compare(&staged, "blanket-impl.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("a call to `badge` that threads fewer context arguments"),
-            "{reason}"
-        ),
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "blanket-impl.vl"),
+        Verdict::Identical,
+        "`blanket-impl.vl` must mean the same thing on both backends"
+    );
 }
 
 /// **F38**: `and_then<U>`'s `U` — a callee's OWN generic parameter that no
@@ -3991,17 +4301,20 @@ const AND_THEN_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F38's boundary: `result-combinators.vl` now stops at `or_else<F>` over an
-/// `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose `F` NOTHING in the
-/// program constrains — the analyzer records `any` and JavaScript never needs
-/// a type. Natively a type has to be chosen, which is a ruling, not a
-/// lowering, so it stays refused by name at the new wall.
+/// F38's boundary, moved by B424: `result-combinators.vl` stopped at
+/// `or_else<F>` over an `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose
+/// `F` nothing in the program constrained. The ruling (R-h, door (b)) gives
+/// that `F` the input's error type, and `err.or(Ok(3))`'s likewise, so both
+/// emit now. The program stops one wall further on: `ok.and(Ok(5))`'s
+/// ARGUMENT, a constructor whose own error parameter the analyzer leaves
+/// open although its landing position (`Result<U, E>` at the receiver's
+/// `E`) fixes it — refused by name, not broken.
 #[test]
 fn an_unconstrained_generic_parameter_is_refused_by_name() {
     let staged = stage();
     match compare(&staged, "result-combinators.vl") {
         Verdict::Refused(reason) => {
-            assert!(reason.contains("parameter 1 of `or_else`"), "{reason}")
+            assert!(reason.contains("parameter 2 of enum `Result`"), "{reason}")
         }
         other => panic!("expected a refusal by name, got {other:?}"),
     }

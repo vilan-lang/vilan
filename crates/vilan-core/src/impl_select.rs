@@ -725,8 +725,10 @@ fn provided_trait_arguments(
     trait_id: Id,
 ) -> Option<Vec<TypeId>> {
     for implementation in &program.implementations {
+        // B419: through the supertrait chain — a one-block subtrait impl
+        // provides the supertrait too.
         let Some((_, written)) = implementation
-            .trait_args
+            .provided_trait_args
             .iter()
             .find(|(provided, _)| *provided == trait_id)
         else {

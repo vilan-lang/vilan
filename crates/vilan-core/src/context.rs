@@ -1019,8 +1019,18 @@ fn analyze(
             let Some(name) = dispatch_member_name(call.call_id) else {
                 continue;
             };
+            // B425: a GENERIC-MEMBER site (`label.bind(..)` through `V:
+            // MaybeSignal<str>`) reaches only the traits its parameter is
+            // bounded by — a same-NAMED member of an unrelated trait (std's own
+            // `MaybeSignal::bind`, whose reactive impl needs the ambient owner)
+            // is no candidate of it. Name-keyed, that impl made the caller
+            // DECLARE the strict owner parameter while coverage, which narrows,
+            // found no need — so a top-level call threaded nothing into it
+            // (`blanket-impl.vl`'s `badge("static")`: JS passed `undefined`,
+            // rustc refused the arity).
             let candidates =
                 crate::dispatch_refine::known_receiver_candidates(program, call.call_id)
+                    .or_else(|| crate::dispatch_refine::bound_candidates(program, call.call_id))
                     .unwrap_or_else(|| dispatch_candidates(call.call_id, name));
             for &candidate in &candidates {
                 dispatch_callers

@@ -1139,11 +1139,11 @@ function $af(deserializer) {
 function $ad(deserializer) {
 	begin_struct6(deserializer);
 	field6(deserializer, "at");
-	const at = $ae(deserializer);
+	const __at = $ae(deserializer);
 	field6(deserializer, "label");
-	const label = $af(deserializer);
+	const __label = $af(deserializer);
 	end_struct6(deserializer);
-	return [ at, label ];
+	return [ __at, __label ];
 }
 function $ac(codec, frame) {
 	let deserializer = codec[1](frame);
@@ -1175,9 +1175,9 @@ function $au(codec, value2) {
 function $ay(deserializer) {
 	begin_struct6(deserializer);
 	field6(deserializer, "millis");
-	const millis2 = $ae(deserializer);
+	const __millis = $ae(deserializer);
 	end_struct6(deserializer);
-	return [ millis2 ];
+	return [ __millis ];
 }
 function $ax(codec, frame) {
 	let deserializer = codec[1](frame);

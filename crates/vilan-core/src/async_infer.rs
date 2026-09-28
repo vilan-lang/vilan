@@ -544,11 +544,26 @@ fn object_asyncness_refusals(
     async_set: &HashSet<Id>,
 ) -> Vec<(crate::error::Error, SourceId)> {
     let mut refusals = Vec::new();
-    if program.dyn_coercions.is_empty() {
+    if program.dyn_coercions.is_empty() && program.dyn_tuple_coercions.is_empty() {
         return refusals;
     }
-    let mut coercions: Vec<(&Id, &(TypeId, Id, Vec<TypeId>))> =
-        program.dyn_coercions.iter().collect();
+    // B430: an element-wise tuple erasure is one coercion per erased element,
+    // each anchored at the tuple value.
+    let mut coercions: Vec<(&Id, &(TypeId, Id, Vec<TypeId>))> = program
+        .dyn_coercions
+        .iter()
+        .chain(
+            program
+                .dyn_tuple_coercions
+                .iter()
+                .flat_map(|(expr_id, elements)| {
+                    elements
+                        .iter()
+                        .flatten()
+                        .map(move |element| (expr_id, element))
+                }),
+        )
+        .collect();
     coercions.sort_by_key(|(expr_id, _)| expr_id.0);
     for (expr_id, (subject_type_id, trait_id, trait_arguments)) in coercions {
         let mut members: Vec<&str> = program

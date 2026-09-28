@@ -644,6 +644,15 @@ declaration or nothing, and the refusal names the trait's spelling.
 The trait's own generic parameters bind from the call, like any generic
 function's: `Signal::new(7)` binds `T = i32`.
 
+An impl's parameters bind at a `Type::func(..)` path the same way — from
+the type arguments written on the path (`Holder<A>::tag()`), from the
+arguments, or from where the result lands. A path written with the BARE
+type name inside one of that type's own impls means `Self::func(..)`: the
+enclosing instance's arguments (`Holder::tag()` inside `impl Holder<type T:
+Label>` is `Holder<T>::tag()`). Outside every impl of the type, a bounded
+parameter that none of those binds is refused (`cannot infer 'T' for this
+call`) — there is no instance to dispatch its bound through.
+
 A trait parameter's bound is in scope inside the trait's own default
 bodies, exactly as a function's or impl's is inside theirs (§5.6): a
 default may call the bound trait's members on a value of that parameter's
@@ -701,7 +710,18 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
 4. After binding, every bound's satisfaction is checked; an unsatisfied
    bound is an error naming the parameter and bound.
 5. A call whose generics cannot all be grounded (no argument or
-   expectation determines them) is an error at the call.
+   expectation determines them) is an error at the call, naming the
+   generic its result is typed by and the two places a type can be
+   written: the binding the result lands in (`let v: Option<i32> =
+   nothing();`) or the call's type argument (`nothing<i32>()`). One
+   exception grounds itself: a method's own generic whose only role in
+   the result is to RE-TYPE one of the receiver's own parameters — the
+   result is the receiver's type with the generic where the receiver has
+   a parameter — takes the receiver's argument when nothing else binds
+   it. `err.or_else(|e| Ok(7))` on a `Result<i32, str>` is a `Result<i32,
+   str>`: the error type of a closure that produces no error is the
+   input's. A closure parameter written `_` is never what a call waits
+   on, and never the thing a refusal asks to annotate.
 
 A generic parameter is **rigid inside its own body**. The caller chose it,
 once, for this instantiation; nothing in the body may choose again. So a
@@ -1298,6 +1318,15 @@ Normative rejection cases (each is a compile error):
   `list[i].f = v`) is the same door. A compound `s.field op= v` is
   checked on what lands — the result of `op` (§5.7) — not on `v`. The
   error is reported at the value.
+- A value assigned to ANY place it does not match. Every place takes the
+  plain `mut` local's rule, checked against what the place holds: a
+  subscript (`list[i] = v`), a tuple position (`pair.0 = v`), a
+  `&mut`/`own` parameter or a `&mut` view binding, and a call answering
+  `&mut T` (`cell.write() = v` against `Shared<T>`'s `T`). References are
+  transparent, so the place's type is `T`, never `&mut T`: a bare `5`
+  written through a `Shared<Option<i32>>` is refused with `Expected
+  Option<i32>, but got i32` exactly as `mut x: Option<i32>; x = 5` is —
+  write `Some(5)`.
 
 *Implementation note (tracked gaps): a closure bound to a local and
 called directly does not infer its parameter types from the call, and
@@ -1348,10 +1377,33 @@ a field, an element of a list whose element type is a `dyn`. There is no
 implicit coercion between two concrete types, and no coercion out of an
 object: a `dyn Trait` never narrows back to the type it erased.
 
+The coercion is per VALUE, at the position where the value lands. A
+literal hands each of its elements the position — `[Root { .. }]` at a
+`List<dyn Src>`, `Some(root)` at an `Option<dyn Src>`, `|| Root { .. }` at
+a `|| dyn Src`, `Boxed { value = root }` under a `Boxed<dyn Src>`
+annotation — and a generic position bound to an object is one (`push` on
+a `List<dyn Src>`). A value already BUILT with concrete elements inside
+does not become an object container as a whole: a `List<Root>` binding
+or call result passed as `List<dyn Src>` is refused, and so is a built
+`Option<Root>`, a `Boxed<Root>`, and a `|| Root` closure held in a
+binding. Rebuild it element by element under the object type (`let
+objects: List<dyn Src> = built.map(|element| element);`), or wrap a
+closure in a literal (`|| make()`). A TUPLE is the exception, because
+its elements are a fixed set: a built `(Root, Root)` landing at a
+`(dyn Src, dyn Src)` position (or at a mapped `(U in T: dyn Source<U>)`)
+is re-built by projection, each element becoming its object where it
+lands, exactly as `(t.0, t.1)` would. The reverse, nested (`List<dyn
+Src>` where `List<Root>` is wanted), is the narrowing, refused one level
+down as at the top.
+
 **Resources.** A `resource` value may not be coerced into a trait object.
 Teardown through a table would make the destructor dynamic where the rest
 of the language keeps it static (memory.md R7/R10), so the coercion is
-refused and the resource is held in a struct field of its own.
+refused and the resource is held in a struct field of its own. The rule
+holds at every instantiation: a generic parameter erased into an object
+(`fun erase<S: Src>(own source: S): dyn Src { source }`) is refused at
+the call that binds it to a resource, directly or through a caller that
+forwards its own parameter.
 
 **What reaches an object.** The members its trait and that trait's
 supertraits declare, through the table. Beyond those, only what is written

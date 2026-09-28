@@ -8893,3 +8893,182 @@ fn b392_the_annotated_parameter_control() {
         "5\n",
     );
 }
+
+// --- B403: a static call on a bounded impl generic nothing binds -------------
+//
+// The owner's ruling (2026-09-26): a BARE `Type::f()` inside `Type`'s own impl
+// MEANS `Self::f()` (std's JSON statics are the exhibit), and outside every
+// impl of `Type` a bounded impl parameter that neither the arguments nor the
+// return can bind is refused. Unbound, JS stopped with an internal error and
+// the native build emitted ONE instance for every `Holder<X>` (`A A`).
+
+const B403_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "trait Label { fun label(): str; }\n",
+    "struct A {}\n",
+    "impl A with Label { fun label(): str { \"A\" } }\n",
+    "struct B {}\n",
+    "impl B with Label { fun label(): str { \"B\" } }\n",
+    "struct Holder<T> { v: T }\n",
+);
+
+#[test]
+fn b403_a_bare_static_inside_its_own_impl_means_self() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun tag(): str { T::label() }\n",
+                "\tfun show(self): str { Holder::tag() }\n",
+                "\tfun show_self(self): str { Self::tag() }\n",
+                "\tfun show_named(self): str { Holder<T>::tag() }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder { v = A {} }.show());\n",
+                "\tprint(Holder { v = B {} }.show());\n",
+                "\tprint(Holder { v = A {} }.show_self());\n",
+                "\tprint(Holder { v = B {} }.show_named());\n",
+                "}\n",
+            )
+        ),
+        "A\nB\nA\nB\n",
+    );
+}
+
+#[test]
+fn b403_a_bare_static_outside_the_impl_that_nothing_binds_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun tag(): str { T::label() }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder<A>::tag());\n",
+                "\tprint(Holder::tag());\n",
+                "}\n",
+            )
+        ),
+        "cannot infer 'T' for this call; its bound ': Label' cannot be checked",
+    );
+}
+
+#[test]
+fn b403_a_bare_static_bound_by_its_arguments_or_its_return_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun make(v: T): Holder<T> { Holder { v } }\n",
+                "\tfun name(self): str { T::label() }\n",
+                "\tfun parse(text: str): Option<Holder<T>> { None }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder::make(A {}).name());\n",
+                "\tprint(Holder::make(B {}).name());\n",
+                "\tlet parsed: Option<Holder<B>> = Holder::parse(\"x\");\n",
+                "\tprint(parsed.is_none());\n",
+                "}\n",
+            )
+        ),
+        "A\nB\ntrue\n",
+    );
+}
+
+// --- B427: a destructuring `let` of an unfilled closure parameter ------------
+
+/// `let (x, y) = pair` inside `|pair| ..` waits for the call to fill `pair`
+/// (B185's rule, at a destructure) — typed as it stood, both names bound
+/// `Unknown` and the blanket `map`'s `U` stayed open.
+#[test]
+fn b427_a_destructured_closure_parameter_types_the_closure_tail() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, combine };\n",
+            "fun main() {\n",
+            "\tlet a = Signal::new(1);\n",
+            "\tlet b = Signal::new(2);\n",
+            "\tlet sum = combine((a, b)).map(|pair| { let (x, y) = pair; x + y });\n",
+            "\tprint(sum.get());\n",
+            "\tlet p = Signal::new((3, 4));\n",
+            "\tlet q = p.map(|pair| { let (x, y) = pair; x * y });\n",
+            "\tprint(q.get());\n",
+            "}\n",
+        ),
+        "3\n12\n",
+    );
+}
+
+// --- B424: an unconstrained generic at a call (RULED R-h, 2026-09-28) --------
+
+/// Door (b): a combinator's own generic that only re-types one of the
+/// receiver's parameters takes the receiver's when nothing binds it —
+/// `or_else`'s `F` is the input's `E` when the closure builds only `Ok`, and a
+/// `_` parameter carries no obligation.
+#[test]
+fn b424_or_else_with_an_ok_only_closure_keeps_the_input_error_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet err: Result<i32, str> = Err(\"bad\");\n",
+            "\tlet fixed = err.or_else(|e| Ok(7));\n",
+            "\tlet same: Result<i32, str> = fixed;\n",
+            "\tprint(same.unwrap_or(0));\n",
+            "\tlet ignored: Result<i32, str> = err.or_else(|_| Ok(8));\n",
+            "\tprint(ignored.unwrap_or(0));\n",
+            "\tlet changed: Result<i32, i32> = err.or_else(|_| Err(3));\n",
+            "\tprint(changed.unwrap_or(0));\n",
+            "}\n",
+        ),
+        "7\n8\n0\n",
+    );
+}
+
+/// Door (a): anywhere else a generic nothing binds, and that the result is
+/// typed by, is refused with the steer; written on the binding or as the
+/// type argument, it compiles.
+#[test]
+fn b424_an_unbound_generic_typing_a_calls_result_is_refused() {
+    assert_fails_once_with(
+        concat!(
+            "fun nothing<U>(): Option<U> { None }\n",
+            "fun main() {\n",
+            "\tlet x = nothing();\n",
+            "}\n",
+        ),
+        "cannot infer 'U' for this call: nothing it is passed binds it, and its result is typed by it",
+    );
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun nothing<U>(): Option<U> { None }\n",
+            "fun main() {\n",
+            "\tlet y: Option<i32> = nothing();\n",
+            "\tlet z = nothing<str>();\n",
+            "\tprint(i\"{y.is_none()} {z.is_none()}\");\n",
+            "}\n",
+        ),
+        "true true\n",
+    );
+}
+
+/// A `_` closure parameter is never what a refusal asks to annotate.
+#[test]
+fn b424_an_underscore_closure_parameter_carries_no_annotation_obligation() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun apply<T, U>(value: T, transform: |T| U): U { transform(value) }\n",
+            "fun main() {\n",
+            "\tprint(apply(3, |_| \"x\"));\n",
+            "\tlet ignore = |_| {};\n",
+            "}\n",
+        ),
+        "x\n",
+    );
+}

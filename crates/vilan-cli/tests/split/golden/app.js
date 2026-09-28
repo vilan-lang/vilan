@@ -530,7 +530,7 @@ function close(self) {
 		} else {
 			$ct = self[0];
 		}
-		const end = $ct;
+		const end = __clone($ct);
 		cut_row(self, row, end);
 		drop_row(self, row);
 		at = at + 1;

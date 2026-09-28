@@ -41,7 +41,9 @@
 // a value, so storing one copies (spec §6.1), and so does a temporary standing
 // at a `&mut self` receiver (`cell.read().push(x)` mutates the copy and is
 // lost) — a temporary that only reads the slot, `for x in cell.read()` or
-// `cell.read().len()`, copies nothing; `write(self): &mut T
+// `cell.read().len()`, copies nothing, and a `for` whose body writes the same
+// cell in place (`cell.write().push(x)`) iterates a copy, since it no longer
+// only reads (B400); `write(self): &mut T
 // borrows self` hands back a view, and a write through it is visible through
 // every other handle to the same cell.
 

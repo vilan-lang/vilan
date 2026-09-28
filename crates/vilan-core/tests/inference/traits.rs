@@ -2486,12 +2486,12 @@ fn b243_a_one_block_signal_impl_reaches_source_sub_and_effect_on_change() {
 }
 
 /// The half of the pre-flip b243 pin the flip moved out of reach: `map` is a
-/// blanket over `S: Source<T>` since A124 S2c, and a blanket is not found on a
-/// type that implements `Source` only through a one-block `impl .. with
-/// Signal<T>` — "Cell<i32> has no method 'map'". Kept as the program the pin
-/// used to be, so the fix turns it green as written.
+/// blanket over `S: Source<T>` since A124 S2c, and a blanket was not found on
+/// a type that implements `Source` only through a one-block `impl .. with
+/// Signal<T>` — "Cell<i32> has no method 'map'" (B419). Kept as the program
+/// the pin used to be; an impl's PROVIDED set now closes over the supertrait
+/// chain.
 #[test]
-#[ignore = "B419: a blanket over a supertrait is not found through a one-block sub-trait impl"]
 fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
     assert_compiles_and_runs(
         r#"
@@ -2520,6 +2520,61 @@ fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
         main();
         "#,
         "2\n10\n",
+    );
+}
+
+/// B419's std-free shape (reactive-42's find S1): a blanket over the
+/// SUPERTRAIT, reached on a type whose one impl block names the subtrait.
+#[test]
+fn b419_a_blanket_over_a_supertrait_reaches_a_one_block_subtrait_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Src<T> { fun get(self): T; }
+        trait Sig<T> with Src<T> { fun label(self): str; }
+        struct Cell<T> { v: T }
+        impl Cell<type T> with Sig<T> {
+            fun get(self): T { self.v }
+            fun label(self): str { "cell" }
+        }
+        impl type S: Src<type T> {
+            fun pair(self): (T, T) { (self.get(), self.get()) }
+        }
+        fun main() {
+            let c = Cell { v = 3 };
+            let (a, b) = c.pair();
+            print(a + b);
+            print(c.label());
+        }
+        "#,
+        "6\ncell\n",
+    );
+}
+
+/// ...and at the supertrait's ARGUMENTS: a blanket written at `Src<i32>`
+/// applies to a `Cell<i32>` and not to a `Cell<str>`, through the subtrait's
+/// clause.
+#[test]
+fn b419_the_supertrait_is_provided_at_the_arguments_the_clause_reaches_it_through() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Src<T> { fun get(self): T; }
+        trait Sig<T> with Src<T> { fun label(self): str; }
+        struct Cell<T> { v: T }
+        impl Cell<type T> with Sig<T> {
+            fun get(self): T { self.v }
+            fun label(self): str { "cell" }
+        }
+        impl type S: Src<i32> {
+            fun twice(self): i32 { self.get() * 2 }
+        }
+        fun main() {
+            print(Cell { v = 4 }.twice());
+            print(Cell { v = "x" }.twice());
+        }
+        "#,
+        "'Cell<str>' does not implement trait 'Src<i32>'",
     );
 }
 
@@ -7638,5 +7693,33 @@ fn b411_a_switch_shaped_node_reads_its_value_type_from_the_selected_source() {
             "}\n",
         ),
         "w2!\nw2?\n",
+    );
+}
+
+// --- B417: a member named `Self` is refused at its declaration ---------------
+
+#[test]
+fn b417_a_method_named_self_is_refused_where_it_is_declared() {
+    assert_fails_once_with(
+        r#"
+        struct Point { x: i32 }
+        impl Point {
+            fun Self(self): i32 { self.x }
+        }
+        fun main() {}
+        "#,
+        "a function cannot be named `Self`",
+    );
+    // The refusal is the one report: the body still reads the real `Self`, so
+    // `self.x` is not a second, confusing error.
+    assert_fails_without(
+        r#"
+        struct Point { x: i32 }
+        impl Point {
+            fun Self(self): i32 { self.x }
+        }
+        fun main() {}
+        "#,
+        "cannot access field",
     );
 }

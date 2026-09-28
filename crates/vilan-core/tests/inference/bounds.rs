@@ -2944,7 +2944,8 @@ fn a_negative_index_panics() {
         fun main() {
             mut xs: List<i32> = List::new();
             xs.push(10);
-            let i = 0 - 1;
+            let zero: usize = 0;
+            let i = zero - 1;
             print(xs[i]);
         }
         main();
@@ -3039,7 +3040,8 @@ fn a_negative_list_remove_panics_rather_than_counting_from_the_end() {
             xs.push(10);
             xs.push(20);
             xs.push(30);
-            let i = 0 - 1;
+            let zero: usize = 0;
+            let i = zero - 1;
             print(xs.remove(i));
         }
         main();
@@ -3074,7 +3076,8 @@ fn a_negative_list_insert_panics_rather_than_counting_from_the_end() {
         fun main() {
             mut xs: List<i32> = List::new();
             xs.push(10);
-            let i = 0 - 1;
+            let zero: usize = 0;
+            let i = zero - 1;
             xs.insert(i, 40);
         }
         main();
