@@ -282,7 +282,36 @@ pub fn platform_free_programs() -> Vec<String> {
 /// still leads the name, so two concurrent runs of this binary cannot meet
 /// either. The shared cargo target directory stays shared on purpose; cargo
 /// locks it itself.
-fn stage() -> PathBuf {
+///
+/// Nothing removed the directory at the test's end, so a run that started
+/// clean left every staged corpus copy behind: 2,788 of them after one day of
+/// Order 42's runs, and CI's `vilan-fmt` leg — walking `./target` locally —
+/// tripped on 5,556 stale `resource struct` copies from before B413 (N133).
+/// `StagedDir` removes its directory on drop, at the end of the test function
+/// that called `stage()`, whether the test passed, failed, or panicked.
+struct StagedDir(PathBuf);
+
+impl std::ops::Deref for StagedDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for StagedDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn stage() -> StagedDir {
     static STAGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let call = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staged = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -291,7 +320,7 @@ fn stage() -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&staged);
     copy_tree(&corpus_dir(), &staged);
-    staged
+    StagedDir(staged)
 }
 
 /// Copies the corpus tree, DIRECTORIES INCLUDED.

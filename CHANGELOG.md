@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: tooling -->
+**`native_differential`'s staged copies of the corpus are removed when the test that made them ends, and its formatter gate no longer walks into a cargo build directory.** Nothing removed the per-test staging directory (`target/tmp/native-differential-src-<pid>-<counter>`) at the end of its test, so a day of Order 42's runs left 2,788 stale copies of the corpus behind, and the `vilan-fmt` CI leg, walking `.` from the repository root, reached `target/tmp`'s stale copies and declined 5,556 of them as `resource struct` — a construct retired before B413, so the printer had no rule left for them. `StagedDir` now removes its directory on drop, whether the test passed, failed, or panicked; and `vilan fmt`'s (and the watcher's) tree walk skips any directory tagged `CACHEDIR.TAG` per the Cache Directory Tagging Specification — a name-independent check, since `native_differential`'s own shared `CARGO_TARGET_DIR` is not spelled `target`. Tracker N133.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

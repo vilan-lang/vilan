@@ -2553,6 +2553,29 @@ struct TreeWalk {
     outside: Vec<PathBuf>,
 }
 
+/// Whether `directory` is a build/cache directory per the Cache Directory
+/// Tagging Specification (<https://bford.info/cachedir/>) — the
+/// `CACHEDIR.TAG` file cargo (among other tools) writes at a target
+/// directory's root the first time it builds into it. The walk never
+/// descends into one, by name-independent means: `CARGO_TARGET_DIR` need not
+/// be spelled `target` (`native_differential`'s shared target directory is
+/// `native-differential`, under `target/tmp/`), so a check keyed on the
+/// literal name `target` would have missed it.
+///
+/// N133: the `vilan-fmt` leg, walking `.` from the repository root, reached
+/// `target/tmp/native-differential-src-*`'s staged corpus copies and
+/// DECLINED 5,556 of their stale `resource struct` files — a construct
+/// retired before B413, so the printer had no rule left for them. The
+/// staging directories are also now removed at their test's end
+/// ([`StagedDir`] in `native_differential.rs`), but a tag-respecting walk is
+/// the general fix: any future build product left under a tagged directory
+/// stops being a formatter or watcher concern the same way.
+fn is_build_cache_dir(directory: &Path) -> bool {
+    const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    fs::read(directory.join("CACHEDIR.TAG"))
+        .is_ok_and(|contents| contents.starts_with(CACHEDIR_TAG_SIGNATURE))
+}
+
 impl TreeWalk {
     fn rooted_at(root: &Path) -> TreeWalk {
         TreeWalk {
@@ -2652,6 +2675,9 @@ impl TreeWalk {
             return;
         };
         if !self.visited.insert(identity) {
+            return;
+        }
+        if is_build_cache_dir(path) {
             return;
         }
         let Ok(entries) = fs::read_dir(path) else {
