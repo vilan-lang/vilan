@@ -645,13 +645,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// BINDING, not the value, so a `mut` local a closure reads is a place two
     /// frames share. JavaScript boxes every place for free; natively the box is
     /// the emitter's to write.
+    ///
+    /// A `mut` PARAMETER is a binding too (F47, UNSOUND until it joined): `fun
+    /// late(mut n: i32): i32 { let show = || n; n = 5; show() }` printed `5` on
+    /// JS and `0` natively, because the closure captured a COPY of `n`, and a
+    /// closure that wrote one (`|| { n = n + 1; }`) was refused by rustc as
+    /// `FnMut` where `Fn` was wanted. A boxed parameter is received as the plain
+    /// value its signature says and re-bound into its cell on entry — see
+    /// [`Emitter::boxed_parameter_prologue`].
     fn compute_boxed_bindings(&mut self) {
         let closures: Vec<Id> = self.program.closures.keys().copied().collect();
         for closure_id in closures {
             let Some(closure) = self.program.closures.get(&closure_id) else {
                 continue;
             };
-            let mut declared_inside = HashSet::new();
+            // The closure's OWN parameters are declared inside it: `|mut v|
+            // { v = v - 1; v }` writes its parameter and captures nothing, and
+            // since parameters joined the analysis (F47) an unseeded walk read
+            // `v` as a capture of itself and boxed it.
+            let mut declared_inside = self.closure_parameter_bindings(closure);
             let mut referenced = HashSet::new();
             let mut visited = HashSet::new();
             self.scan_closure(
@@ -664,12 +676,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if declared_inside.contains(&binding) {
                     continue;
                 }
-                if self
+                let mutable_local = self
                     .program
                     .variables
                     .get(&binding)
-                    .is_some_and(|variable| variable.mutable)
-                {
+                    .is_some_and(|variable| variable.mutable);
+                let mutable_parameter =
+                    self.program
+                        .parameters
+                        .get(&binding)
+                        .is_some_and(|parameter| {
+                            parameter.mutable
+                                && !parameter.lazy
+                                && self.receiving_form(parameter) == Receiving::ByValue
+                        });
+                if mutable_local || mutable_parameter {
                     self.boxed.insert(binding);
                 }
             }
@@ -808,16 +829,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// body referred to bindings nothing declared; `destructuring.vl` was
     /// refused for the `let` form before this slice and became a rustc refusal
     /// the moment that form was admitted, which is how it was found.
+    /// The `let`s that re-bind a function's or a closure's BOXED parameters
+    /// into their cells on entry (F47): the signature receives the plain value
+    /// its type says, and every read and write in the body goes through the
+    /// cell a closure shares, exactly as a boxed `let` does.
+    fn boxed_parameter_prologue(&mut self, parameters: &[Id]) -> String {
+        let mut prologue = String::new();
+        for parameter in parameters {
+            if self.boxed.contains(parameter) {
+                self.boxed_emitted.insert(*parameter);
+                let name = self.binding_name(*parameter);
+                let _ = write!(prologue, "let {name} = vilan_rt::Captured::new({name}); ");
+            }
+        }
+        prologue
+    }
+
     fn closure_body(
         &mut self,
         closure: &vilan_core::analyzer::Closure,
         depth: usize,
     ) -> Result<String, Error> {
+        let boxed = self.boxed_parameter_prologue(&closure.parameters);
         let body = self.expression(closure.return_, depth)?;
         if closure.parameter_destructures.is_empty() {
-            return Ok(body);
+            if boxed.is_empty() {
+                return Ok(body);
+            }
+            return Ok(format!("{{ {boxed}{body} }}"));
         }
-        let mut prefix = String::new();
+        let mut prefix = boxed;
         for destructure in &closure.parameter_destructures {
             let rendered = self.expression(*destructure, depth)?;
             let _ = write!(prefix, "{rendered}; ");
@@ -3233,6 +3274,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .map(|type_id| self.concrete(type_id));
         let saved_return_type = std::mem::replace(&mut self.current_return_type, declared_return);
         let saved_origin = self.current_origin.replace(function.name);
+        let boxed = self.boxed_parameter_prologue(&function.parameters);
+        if !boxed.is_empty() {
+            let _ = writeln!(body, "    {}", boxed.trim_end());
+        }
         let walked = self.emit_block(&function.body.0, function.body.1, &mut body, 1);
         self.current_origin = saved_origin;
         self.current_return_type = saved_return_type;

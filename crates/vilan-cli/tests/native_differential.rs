@@ -1205,6 +1205,87 @@ const LOANED_RECEIVER_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F47 (UNSOUND until now): a `mut` PARAMETER a closure captures is one
+/// binding the two frames share, and natively it was a COPY — `late(0)`
+/// printed `0` where node prints `5`, and a closure that WROTE one was
+/// refused by rustc as `FnMut`. A captured `mut` parameter is boxed like a
+/// captured `mut` let and re-bound into its cell on entry. The shapes: a
+/// read after the write, a closure writing it, a `List` pushed through a
+/// capture, `mut self` written through a capture, and a closure's own `mut`
+/// parameter captured by a closure inside it.
+#[test]
+fn a_captured_mut_parameter_is_shared_with_its_closure_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_mut_parameter.vl"),
+        MUT_PARAMETER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_mut_parameter.vl"),
+        Verdict::Identical,
+        "a closure's capture of a `mut` parameter must be the parameter itself on both backends"
+    );
+}
+
+const MUT_PARAMETER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "// A `mut` parameter a closure captures is one binding two frames share.\n",
+    "fun late(mut n: i32): i32 {\n",
+    "\tlet show = || n;\n",
+    "\tn = 5;\n",
+    "\tshow()\n",
+    "}\n",
+    "\n",
+    "fun bump(mut n: i32): i32 {\n",
+    "\tlet inc = || {\n",
+    "\t\tn = n + 1;\n",
+    "\t};\n",
+    "\tinc();\n",
+    "\tinc();\n",
+    "\tn\n",
+    "}\n",
+    "\n",
+    "fun collect(mut seen: List<i32>): usize {\n",
+    "\tlet add = |value: i32| seen.push(value);\n",
+    "\tadd(1);\n",
+    "\tadd(2);\n",
+    "\tseen.len()\n",
+    "}\n",
+    "\n",
+    "struct Tally {\n",
+    "\tcount: i32,\n",
+    "}\n",
+    "\n",
+    "impl Tally {\n",
+    "\tfun spend(mut self): i32 {\n",
+    "\t\tlet take = || {\n",
+    "\t\t\tself.count = self.count - 1;\n",
+    "\t\t};\n",
+    "\t\ttake();\n",
+    "\t\tself.count\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(late(0));\n",
+    "\tprint(bump(0));\n",
+    "\tprint(collect([9]));\n",
+    "\tprint(Tally { count = 3 }.spend());\n",
+    "\t// A closure's own `mut` parameter, captured by a closure inside it.\n",
+    "\tlet outer = |mut total: i32| {\n",
+    "\t\tlet add = |amount: i32| {\n",
+    "\t\t\ttotal = total + amount;\n",
+    "\t\t};\n",
+    "\t\tadd(10);\n",
+    "\t\tadd(20);\n",
+    "\t\ttotal\n",
+    "\t};\n",
+    "\tprint(outer(1));\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
