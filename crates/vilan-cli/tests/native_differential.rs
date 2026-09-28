@@ -903,6 +903,70 @@ const DESTRUCTURE_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F41: a field named `self`, `super` or `crate` builds natively.
+///
+/// Vilan's `self` and `super` are contextual, so they are legal field names
+/// and the JS backend always ran them; the emitter spelled them `r#self` /
+/// `r#super`, and rustc refuses a PATH keyword raw. They are mangled instead
+/// (`self` → `self_`), and a field ALREADY spelled `self_` sits beside
+/// them in the probe so the mangling is shown injective: one more `_` for
+/// every name in the family, never a collision. Every site the name reaches is
+/// here — the declaration, a literal, a read, a write, a compound write, a
+/// method body through `self.self`, the derived `PartialEq` and `Json`, the
+/// printed struct, and a closure-holding struct's hand-written `PartialEq`.
+#[test]
+fn a_field_named_by_a_path_keyword_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_path_keywords.vl"),
+        PATH_KEYWORD_FIELD_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_path_keywords.vl"),
+        Verdict::Identical,
+        "a field named `self`/`super`/`crate` must build and print identically on both backends"
+    );
+}
+
+const PATH_KEYWORD_FIELD_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "[derive(Json, PartialEq)]\n",
+    "struct Node {\n",
+    "\tself: i32,\n",
+    "\tsuper: str,\n",
+    "\tself_: i32,\n",
+    "\tcrate: bool,\n",
+    "}\n",
+    "\n",
+    "struct Hook {\n",
+    "\tself: || i32,\n",
+    "\tsuper: i32,\n",
+    "}\n",
+    "\n",
+    "impl Node {\n",
+    "\tfun total(self): i32 {\n",
+    "\t\tself.self + self.self_\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut node = Node { self = 1, super = \"up\", self_ = 10, crate = true };\n",
+    "\tnode.self = node.self + 1;\n",
+    "\tnode.self_ += node.self;\n",
+    "\tprint(i\"{node.self} {node.super} {node.self_} {node.crate} {node.total()}\");\n",
+    "\tprint(node);\n",
+    "\tprint(node.to_json());\n",
+    "\tlet hook = Hook { self = || 7, super = 8 };\n",
+    "\tlet call = hook.self;\n",
+    "\tprint(call() + hook.super);\n",
+    "\tlet copy = Node { self = 5, super = \"s\", self_ = 6, crate = false };\n",
+    "\tprint(copy == node);\n",
+    "\tprint(copy.self == 5 && copy.super == \"s\");\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's

@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**Native builds accept a field named `self`, `super` or `crate`: `struct S { self: i32, super: i32 }` — legal vilan, since both words are contextual, and always run by the JS backend — was emitted as `r#self`/`r#super`, which rustc refuses ("`self` cannot be a raw identifier").** Rust has two kinds of keyword and the emitter treated them as one: most are spelled raw (`r#type`), but the four PATH keywords — `self`, `Self`, `super`, `crate` — cannot be. They are now mangled with a trailing `_`, and so is every name that is a path keyword followed only by underscores (`self_` → `self__`), which keeps the map injective: a struct holding both `self` and `self_` gets two distinct Rust fields rather than a collision. Every site a field name reaches — the declaration, a literal, a read, a write, a compound write, `self.self` in a method, the derived `PartialEq` and `Json`, a closure-holding struct's hand-written `PartialEq` — emits it through the one function, so the write and the read-back agree without a table, and no output moves: a struct prints and serializes as its flat field array, so no field name is ever rendered. Pin: `a_field_named_by_a_path_keyword_builds_the_same_on_both_backends` (identical with node; red with the mangling planted out). Tracker F41.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

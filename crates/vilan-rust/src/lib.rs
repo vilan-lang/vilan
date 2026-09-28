@@ -10167,14 +10167,38 @@ fn is_integer_type(rendered: &str) -> bool {
 /// A vilan identifier as a Rust one. Vilan's identifier grammar is a subset of
 /// Rust's already, so this only has to keep a vilan name that happens to be a
 /// Rust keyword from becoming one.
+///
+/// **Two ways, because rustc has two kinds of keyword** (F41). Most keywords
+/// are spelled as a raw identifier (`r#type`, `r#match`), which names the same
+/// field on every read and write and needs no bookkeeping. Four cannot be:
+/// `self`, `Self`, `super` and `crate` are PATH keywords, and rustc refuses
+/// them raw ("`self` cannot be a raw identifier"). Vilan's `self` and `super`
+/// are contextual, so `struct S { self: i32, super: i32 }` is a program the JS
+/// backend runs — and every field access, struct literal, and rendering site
+/// emits its name through THIS function, so the mangling below is what makes
+/// the write and the read-back agree without a table.
+///
+/// A path keyword takes a trailing `_`, and so does every name that is a path
+/// keyword followed by underscores only: `self` → `self_`, `self_` → `self__`,
+/// `self__` → `self___`. Appending one `_` across that whole family keeps the
+/// map injective — a struct holding both `self` and `self_` gets two distinct
+/// Rust fields — where mangling `self` alone would collide with a vilan field
+/// already spelled `self_`. The mangling never reaches a program's output: a
+/// struct prints and serializes as its flat field array on both backends, so
+/// no field NAME is ever rendered.
 fn sanitize(name: &str) -> String {
     const RUST_KEYWORDS: &[&str] = &[
-        "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
-        "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-        "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-        "unsafe", "use", "where", "while", "async", "await", "box", "final", "macro", "override",
-        "priv", "try", "typeof", "unsized", "virtual", "yield", "abstract", "become", "do",
+        "as", "break", "const", "continue", "dyn", "else", "enum", "extern", "false", "fn", "for",
+        "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+        "static", "struct", "trait", "true", "type", "unsafe", "use", "where", "while", "async",
+        "await", "box", "final", "macro", "override", "priv", "try", "typeof", "unsized",
+        "virtual", "yield", "abstract", "become", "do",
     ];
+    /// The keywords rustc refuses to spell raw.
+    const PATH_KEYWORDS: &[&str] = &["self", "Self", "super", "crate"];
+    if PATH_KEYWORDS.contains(&name.trim_end_matches('_')) {
+        return format!("{name}_");
+    }
     if RUST_KEYWORDS.contains(&name) {
         return format!("r#{name}");
     }
