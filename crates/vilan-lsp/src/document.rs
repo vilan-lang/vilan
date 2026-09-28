@@ -8753,12 +8753,15 @@ pub(crate) mod tests {
     /// `crates/vilan-lsp/../..`), the server pins resolve std through
     /// `discover_std_dir`, which for a document under the temp directory is the
     /// MATERIALIZED embedded std (`~/.vilan/std-cache/<hash>`). The two are
-    /// byte-identical, and the base-cache key carries no std root, so both
-    /// analyses file under one key; a checks record written from one root's
+    /// byte-identical, and the base-cache key carried no std root, so both
+    /// analyses filed under one key; a checks record written from one root's
     /// world was read on a hit of the other's. Measured, not inferred: the
     /// panic's two fingerprints are exactly those of `sources[1..]` for
     /// `import std::io::print` under the tree std (5909227631414359650) and
-    /// under the materialized std (3214450399013780599).
+    /// under the materialized std (3214450399013780599). B422 put the std
+    /// roots in the key (`BaseCacheKey::std_roots`), so the two roots are two
+    /// worlds and two records;
+    /// `b422_two_byte_identical_std_roots_are_two_base_worlds` pins it.
     pub(crate) static BASE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Takes [`BASE_CACHE_LOCK`], recovering from a poisoned one: a pin that
@@ -8902,6 +8905,78 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&entry).unwrap();
         let document = Document::analyze(&text, &std_root(), &entry);
         (dir, document)
+    }
+
+    /// Copies the directory tree `from` into `to` (created), files only.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the copy's directory");
+        for entry in std::fs::read_dir(from).expect("read a std directory") {
+            let entry = entry.expect("a directory entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("a file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy a std file");
+            }
+        }
+    }
+
+    /// B422: two BYTE-IDENTICAL std roots are two base worlds. The base-cache
+    /// key carried no std root, so the tree's std (`std_root()`, what an open
+    /// file inside a checkout analyzes against) and a second copy of the same
+    /// bytes (the materialized `~/.vilan/std-cache/<hash>` std, what a file
+    /// OUTSIDE a checkout gets) filed under one key: the second analysis was
+    /// served the first root's world — its std modules at the first root's
+    /// paths — and M19's replay record, written from one root's `sources`,
+    /// was read on a hit of the other's, which is the hard assertion N131
+    /// measured firing in-suite ("the world's `sources` vector moved"). One
+    /// LSP session with documents inside and outside a checkout is exactly
+    /// this shape.
+    #[test]
+    fn b422_two_byte_identical_std_roots_are_two_base_worlds() {
+        let _guard = base_cache_guard();
+        let scratch = std::env::temp_dir().join(format!("vilan_lsp_b422_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let copy = scratch.join("std");
+        copy_tree(&std_root(), &copy);
+        let copy_canonical = vilan_core::util::canonical_path(&copy);
+        let text = "import std::io::print;\nfun main() { print(1); }\n";
+        let (tree_sources, copy_sources) = on_big_stack({
+            let copy = copy.clone();
+            move || {
+                let std_sources = |document: &Document| -> Vec<PathBuf> {
+                    let program = document.program.as_ref().expect("an analyzed program");
+                    program.sources[1..]
+                        .iter()
+                        .map(vilan_core::util::canonical_path)
+                        .collect()
+                };
+                // The tree's root first, then the copy — twice each, so the
+                // second pass of each is a hit on its OWN world.
+                let tree = Document::analyze(text, &std_root(), Path::new("b422.vl"));
+                let copied = Document::analyze(text, &copy, Path::new("b422.vl"));
+                let _ = Document::analyze(text, &std_root(), Path::new("b422.vl"));
+                let copied_again = Document::analyze(text, &copy, Path::new("b422.vl"));
+                assert_eq!(std_sources(&copied), std_sources(&copied_again));
+                (std_sources(&tree), std_sources(&copied))
+            }
+        });
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(!copy_sources.is_empty(), "the program loads std modules");
+        for source in &copy_sources {
+            assert!(
+                source.starts_with(&copy_canonical),
+                "an analysis against the copy must read the copy's std, not the tree's: {}",
+                source.display()
+            );
+        }
+        for source in &tree_sources {
+            assert!(
+                !source.starts_with(&copy_canonical),
+                "and the tree's analysis reads the tree's: {}",
+                source.display()
+            );
+        }
     }
 
     /// M27's `source_lookup` is a BINARY SEARCH standing in for
@@ -16964,6 +17039,105 @@ pub(crate) mod tests {
         let labels = call_receiver_completions("\tlet _q = echo(make().|);\n");
         assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
         assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+    }
+
+    // --- E228: a `Shared<T>` handle's `read()` / `write()` as a receiver -----
+    //
+    // The owner's report (kolt model.vl): `channel_list_handle.read().|` on a
+    // module-level `let cell: Shared<Option<..>>` offered nothing. The
+    // receiver is a call to an `external` generic method whose result is the
+    // substituted `T` (`read`) or `&mut T` (`write`). Three pins over one
+    // cell, the plain `Option` local as the control, and the `let`-first
+    // variant that separates "the call receiver" from "the type".
+
+    const SHARED_CELL_PRELUDE: &str = "import std::shared::Shared;\n\
+         let cell: Shared<Option<i32>> = Shared::new(None);\n";
+
+    fn shared_cell_completions(body: &str) -> Vec<String> {
+        completions_at_cursor(&format!("{SHARED_CELL_PRELUDE}fun main() {{\n{body}}}\n"))
+    }
+
+    fn assert_offers_option_members(labels: &[String], shape: &str) {
+        for member in ["is_some", "map", "unwrap_or"] {
+            assert!(
+                labels.iter().any(|label| label == member),
+                "{shape}: `{member}` must be offered: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e228_member_completion_on_a_shared_read_receiver() {
+        let labels = shared_cell_completions("\tcell.read().|\n");
+        assert_offers_option_members(&labels, "cell.read().");
+    }
+
+    #[test]
+    fn e228_member_completion_on_a_shared_write_receiver() {
+        let labels = shared_cell_completions("\tcell.write().|\n");
+        assert_offers_option_members(&labels, "cell.write().");
+    }
+
+    #[test]
+    fn e228_member_completion_on_a_plain_option_local() {
+        let labels = shared_cell_completions("\tlet x: Option<i32> = None;\n\tx.|\n");
+        assert_offers_option_members(&labels, "x.");
+    }
+
+    #[test]
+    fn e228_member_completion_on_a_shared_read_bound_first() {
+        let labels = shared_cell_completions("\tlet v = cell.read();\n\tv.|\n");
+        assert_offers_option_members(&labels, "let v = cell.read(); v.");
+    }
+
+    /// E228's keystroke half: the `.` (and the call before it) typed SINCE the
+    /// last analysis landed — the request inside the debounce, answered from
+    /// the landed program with the live buffer ahead of it. The receiver's
+    /// line is inside the edit window by construction, so the analyzed arm is
+    /// gated off (E131) and the answer is the live token walk's alone.
+    fn shared_cell_stale_completions(base_body: &str, live_body: &str) -> Vec<String> {
+        let base = format!("{SHARED_CELL_PRELUDE}fun main() {{\n{base_body}}}\n");
+        let live = format!("{SHARED_CELL_PRELUDE}fun main() {{\n{live_body}}}\n");
+        let offset = live.find('|').expect("the live body needs a `|` cursor");
+        let mut document = Document::analyze(&base, &std_root(), Path::new("test.vl"));
+        document.set_text(&live.replace('|', ""));
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
+    #[test]
+    fn e228_member_completion_on_a_shared_read_typed_since_the_landing() {
+        let labels = shared_cell_stale_completions("\tlet _n = 1;\n", "\tcell.read().|\n");
+        assert_offers_option_members(&labels, "cell.read(). (stale)");
+    }
+
+    #[test]
+    fn e228_member_completion_on_a_shared_write_typed_since_the_landing() {
+        let labels = shared_cell_stale_completions("\tlet _n = 1;\n", "\tcell.write().|\n");
+        assert_offers_option_members(&labels, "cell.write(). (stale)");
+    }
+
+    /// The same grounding reaches E130's own shape when it is typed since the
+    /// landing: a `SignalCell<List<str>>`'s `get()` answers `List`'s members.
+    #[test]
+    fn e228_a_signal_cells_get_typed_since_the_landing_offers_the_held_types_members() {
+        let base = "import std::reactive::SignalCell;\nfun main() {\n\tlet c: SignalCell<List<str>> = SignalCell::new(List::new());\n\tlet _n = 1;\n}\n";
+        let live = base.replace("\tlet _n = 1;\n", "\tc.get().|\n");
+        let offset = live.find('|').expect("a cursor");
+        let mut document = Document::analyze(base, &std_root(), Path::new("test.vl"));
+        document.set_text(&live.replace('|', ""));
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "len") && labels.iter().any(|label| label == "push"),
+            "a stale `c.get().` answers List's members: {labels:?}"
+        );
     }
 
     // E66: a `?.`-lifted call offers the ELEMENT's members, exactly as the

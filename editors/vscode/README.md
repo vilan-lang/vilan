@@ -55,15 +55,19 @@ irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | i
 That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` (on Windows,
 `%USERPROFILE%\.vilan\bin`). The unix script prints the `PATH` line to add; the
 PowerShell one adds the directory to your user `PATH` itself, so open a new
-terminal afterwards. `vilan upgrade` updates both later, and
-[every release](https://github.com/vilan-lang/vilan/releases) also carries
-plain archives if you would rather unpack one yourself.
+terminal afterwards. When `code` is on your `PATH`, either script also installs
+this extension at the toolchain's version (opt out with `VILAN_NO_VSCODE=1`, or
+`sh -s -- --no-vscode` on the unix pipe). `vilan upgrade` updates the toolchain
+later, and [every release](https://github.com/vilan-lang/vilan/releases) also
+carries plain archives if you would rather unpack one yourself.
 
 **2. Open a `.vl` file.** The extension starts the server on first open.
 
 Keep the two in step: the extension and the toolchain ship from one repo at
 one version, and a server older than the extension will not know about newer
-language features.
+language features. The extension checks: when the server it starts reports a
+different version, it says so once, with the command that brings the stale half
+up to date.
 
 ### Finding the server
 

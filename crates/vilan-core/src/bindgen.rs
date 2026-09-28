@@ -233,18 +233,28 @@ pub fn generate(source: &str, options: &Options) -> Generated {
 
 // --- Names -------------------------------------------------------------------
 
-/// Vilan's reserved words plus the built-in type names a generated binding must
-/// not shadow. A TS member landing on one of these is suffixed with `_`.
-const RESERVED: &[&str] = &[
-    "any", "async", "await", "bool", "borrows", "const", "else", "enum", "export", "external",
-    "f32", "f64", "false", "for", "fun", "i16", "i32", "i53", "i8", "if", "impl", "import", "in",
-    "is", "jump", "let", "macro", "match", "mod", "mut", "null", "own", "resource", "ret", "self",
-    "str", "struct", "trait", "true", "type", "u16", "u32", "u53", "u8", "use", "usize", "void",
-    "with", "BigInt", "List", "Map", "Option", "Set",
+/// The names a generated binding must not take that are NOT keywords: `self`
+/// (an identifier the grammar gives one meaning) and the built-in type names a
+/// binding must not shadow. The keywords themselves are the lexer's table,
+/// read through [`crate::keyword_table::is_keyword`] — this list used to copy
+/// them, and the copy drifted (E225: no `css`, `dyn` or `lazy`, a stale
+/// `resource`), so a TS member named `lazy` generated a binding that did not
+/// parse. `bindgen_reserves_no_keyword_by_hand` holds that no keyword creeps
+/// back in here.
+const RESERVED_NAMES: &[&str] = &[
+    "self", "any", "bool", "f32", "f64", "i8", "i16", "i32", "i53", "str", "u8", "u16", "u32",
+    "u53", "usize", "void", "BigInt", "List", "Map", "Option", "Set",
 ];
 
+/// Whether a generated name must be escaped: a keyword, or a name
+/// [`RESERVED_NAMES`] keeps for the language.
+fn is_reserved(name: &str) -> bool {
+    crate::keyword_table::is_keyword(name) || RESERVED_NAMES.contains(&name)
+}
+
+/// A TS name landing on a reserved one, suffixed with `_`.
 fn escape_reserved(name: &str) -> String {
-    if RESERVED.contains(&name) {
+    if is_reserved(name) {
         return format!("{name}_");
     }
     name.to_string()
@@ -1305,9 +1315,11 @@ impl<'options> Emitter<'options> {
             .map(|parameter| parameter.name.clone())
             .collect();
         let binding = format!("[extern(\"{}\")]", signature.name);
+        // Escaped like every other generated name (E225): a free function
+        // named `lazy` or `match` was emitted verbatim and did not parse.
         let text = self.emit_function(
             "",
-            &to_snake_case(&signature.name),
+            &escape_reserved(&to_snake_case(&signature.name)),
             signature,
             &binding,
             None,
@@ -2795,5 +2807,41 @@ fn substitute_member(member: &Member, substitution: &HashMap<String, TsType>) ->
             construct,
             raw: raw.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod reserved_tests {
+    use super::*;
+
+    /// E225: every keyword is escaped — derived, so a keyword added to the
+    /// lexer is escaped with no second edit — and the words the old copy
+    /// missed are named.
+    #[test]
+    fn every_keyword_is_escaped() {
+        for word in crate::keyword_table::keywords() {
+            assert_eq!(escape_reserved(word), format!("{word}_"), "{word}");
+        }
+        for word in ["css", "dyn", "lazy"] {
+            assert_eq!(escape_reserved(word), format!("{word}_"));
+        }
+        // B413 made `resource` an attribute: an ordinary name again.
+        assert_eq!(escape_reserved("resource"), "resource");
+        // And the non-keyword reservations still hold.
+        for name in RESERVED_NAMES {
+            assert_eq!(escape_reserved(name), format!("{name}_"));
+        }
+    }
+
+    /// The hand list is only what the lexer cannot say: no keyword is copied
+    /// into it, so there is nothing in it to drift.
+    #[test]
+    fn bindgen_reserves_no_keyword_by_hand() {
+        for name in RESERVED_NAMES {
+            assert!(
+                !crate::keyword_table::is_keyword(name),
+                "`{name}` is a keyword — the lexer's table already reserves it"
+            );
+        }
     }
 }

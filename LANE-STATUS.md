@@ -102,3 +102,21 @@ Worktree: `vilan/.claude/worktrees/hygiene-43`, branch `hygiene-43` off `origin/
   `cargo clippy --workspace --all-targets -- -D warnings` (the whole workspace, not just
   `vilan-cli`): both clean. `target/tmp` has zero stale `native-differential-src-*`
   directories after every run in this lane.
+
+
+# LANE-STATUS — editor-43 (worktree off origin/next @762c6aa5)
+
+- 2026-09-28 13:25 started. Queue: E229 (first) -> E214 pins -> E228 -> E225+K24 -> B422 -> E224 -> E182/E199 if time.
+- Observed at start: ~/.vscode-server/extensions now holds vilan-lang.vilan-0.41.1 (installed from a vsix 2026-09-28 13:03, registered in extensions.json) beside 0.40.0 — the owner has applied R-a's one-liner.
+- E229 LANDED 57296047 (doors a, b, d; door c: release.yml ALREADY has publish-marketplace/publish-openvsx jobs, gated on AZURE_CLIENT_ID/AZURE_TENANT_ID secrets — the L-item is configuring them, not writing the job).
+- FIND (E229 premise): the extension IS on the marketplace — release run 36353347340's publish-marketplace logged 'Published vilan-lang.vilan v0.41.1'; the gallery lists 0.41.1/0.41.0/0.40.0 (Open VSX published too). Door (c) is DONE. The owner's installs are from vsix, which VS Code PINS (extensions.json: "pinned": true, "source": "vsix") — a pinned extension never auto-updates. So the notice's command is now `code --install-extension vilan-lang.vilan@<version> --force`. OWNER Q (not blocking): should the installers install by gallery id (auto-updating, unpinned) instead of the verified vsix (pinned, exactly the toolchain's version)? Built as the item says (vsix).
+- E214 pins LANDED e82ae72a (closes at the owner's word).
+- E228 LANDED 164f2733 (two causes: external returns unsubstituted; the live walk declined a bare T — now grounded from the receiver).
+- E225+K24 LANDED 502e12fe (keyword_table + bindgen + vilan --print-keywords; also fixed: free functions were never escaped). Site diff (owner's): scratchpad/editor-43/k24-site.diff. Seam for syntax-43: consumers read vilan_core::keyword_table (reads lexing::KEYWORDS).
+- B422 LANDED f25fce11 (key carries canonical std roots; plain cargo test -p vilan-lsp: no references:: panics, the 2 known N131 load pins still red under cargo test only). NOTE: touches analyzer.rs (BaseCacheKey only) — solver-43's file.
+- E224 STOPPED (OWNER Q unanswered since Order 42's std-42 stop): deprecation.md line 356 ('An import line alone does not warn … the behavior we want') and the shipped pin generics::a_std_marked_item_warns_at_its_use contradict the brief's direction (function import leaves warn); the paper itself also says at line 87 'the failing segment at an import' is an anchor. Needs the owner: (a) function import leaves warn (reverse line 356 + the pin), or (b) type import leaves stop warning (reverse E221/B382's leaf warnings). std-42's held patch (a) is at its scratchpad; not rebuilt here.
+- E182 NOT BUILT: premise still latent — std/vilan.toml has two layers (process, browser); no third `std::ui` twin exists until F1 S2's native layer, which the item says to sequence with.
+- E199 STOPPED: no repro. The message's type (`StorageSignalCell`) no longer exists in std; eight probe shapes over `swap(SignalCell<bool>, …)` (bodies of the wrong type, parameters annotated `str`) all name the SOURCE's `T` correctly (`Swap<bool, SignalCell<bool>, i32>`). FIND: an annotated parameter that contradicts the source (`swap(flag, |on: str| 42)`) reports the real mismatch AND a spurious first error, "cannot infer 'C' for this call; its bound ': Slot' cannot be checked".
+- Seam with syntax-43 read from their LANE-STATUS: they adopt keyword_table/--print-keywords at rebase, add "contextual", and make is_keyword RESERVED-only — so tests/bindgen.rs e225 + keyword_table's css/dyn/lazy asserts + reserved_tests need their update for dyn/lazy (contextual after B414), and `Self` breaks every_spelling_is_a_plain_identifier (uppercase).
+- 2026-09-28 all items done or stopped; writing REPORT-editor-43.md.
+- REPORT committed 6a572a6b.

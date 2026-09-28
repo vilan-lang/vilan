@@ -1708,3 +1708,34 @@ fn option_cannot_cross_a_host_boundary_in_either_direction() {
         "`None` should reach the host as the raw tagged array, got:\n{javascript}"
     );
 }
+
+/// E225: a TypeScript member named a keyword the old hand list missed (`css`,
+/// `dyn`, `lazy`) binds to an escaped name, and the bindings COMPILE — before,
+/// they emitted `fun lazy(self)` and did not parse; a free function named one
+/// was never escaped at all. `resource` (an attribute
+/// since B413) is an ordinary name again and binds as written.
+#[test]
+fn e225_members_named_css_dyn_or_lazy_bind_to_escaped_names_that_compile() {
+    let source = bind(
+        "export interface Sheet {\n  css: string;\n  dyn(): void;\n  lazy: number;\n  resource: string;\n}\n\
+         export declare function lazy(): void;\n",
+    );
+    for escaped in ["css_", "dyn_", "lazy_"] {
+        assert!(
+            source.contains(escaped),
+            "`{escaped}` is emitted:\n{source}"
+        );
+    }
+    // A FREE function named a keyword too — the top-level path escaped
+    // nothing at all.
+    assert!(source.contains("external fun lazy_(): void;"), "{source}");
+    assert!(
+        source.contains("fun resource("),
+        "`resource` binds as written:\n{source}"
+    );
+    let errors = compile(&format!("{source}\nfun main() {{}}\n"));
+    assert!(
+        errors.is_empty(),
+        "the bindings compile: {errors:?}\n{source}"
+    );
+}

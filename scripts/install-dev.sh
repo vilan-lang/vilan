@@ -9,8 +9,15 @@
 # variable install.sh uses, so a dev build and a release install overwrite
 # each other rather than shadowing), refreshes any older pair already sitting
 # in ~/.cargo/bin (override with $VILAN_MIRROR_DIR, set it to $VILAN_INSTALL_DIR
-# to skip), and packages the VS Code extension into a `.vsix` beside its
-# sources. Idempotent: re-running it updates in place.
+# to skip), packages the VS Code extension into a `.vsix` beside its sources,
+# and installs that into VS Code (E229 door d) — a VS Code Server's own CLI
+# (~/.vscode-server: WSL, Remote-SSH, Tunnels) and/or `code` on PATH — so the
+# editor never runs an extension older than the server this just installed.
+# Opt out of the editor step with VILAN_NO_VSCODE=1. Idempotent: re-running it
+# updates in place.
+#
+# This is the integrator's toolchain refresh at every seal: run it from the
+# sealed worktree and both `vilan` locations AND the editor move to the tip.
 set -eu
 
 BIN_DIR="${VILAN_INSTALL_DIR:-$HOME/.vilan/bin}"
@@ -25,6 +32,23 @@ command -v npm > /dev/null 2>&1 || fail "npm is required (for the VS Code extens
 
 say "building vilan and vilan-lsp (release) ..."
 cargo build --release -p vilan-cli -p vilan-lsp
+
+# `vilan --version` carries the commit it was built from, stamped by
+# crates/vilan-cli/build.rs — which re-runs only when the `.git/HEAD` it
+# resolved changes. In a linked worktree `.git` is a FILE, so a new commit there
+# never re-runs it and the stamp stays at an older commit. Refuse to install a
+# binary that names the wrong commit: re-stamp and build once more.
+head="$(git rev-parse --short=9 HEAD 2> /dev/null || true)"
+if [ -n "$head" ]; then
+    case "$(target/release/vilan --version)" in
+        *"($head)"* | *"($head-dirty)"*) ;;
+        *)
+            say "the version stamp is stale (not $head) — re-stamping ..."
+            touch crates/vilan-cli/build.rs
+            cargo build --release -p vilan-cli
+            ;;
+    esac
+fi
 
 mkdir -p "$BIN_DIR"
 # Remove first so replacing a currently-running vilan can't fail on
@@ -63,14 +87,63 @@ say "packaging the VS Code extension ..."
         npm ci
     fi
     # vsce's prepublish hook runs the esbuild bundle; the .vsix lands beside
-    # the sources as vilan-<version>.vsix, as a release build's would.
-    npx --yes @vscode/vsce package
+    # the sources as vilan-<version>.vsix, as a release build's would. Named
+    # explicitly, so an older one left beside it is never the one installed.
+    npx --yes @vscode/vsce package --out "vilan-$(node -p "require('./package.json').version").vsix"
 )
 
-vsix="$(ls editors/vscode/vilan-*.vsix | tail -n 1)"
+vsix="$PWD/editors/vscode/vilan-$(node -p "require('./editors/vscode/package.json').version").vsix"
 say ""
 say "packaged $vsix"
-say "install it with: code --install-extension $vsix"
+
+# The newest VS Code Server's CLI on this machine, or nothing. Every server
+# build under ~/.vscode-server shares one extensions directory, so one install
+# reaches whichever the editor runs.
+vscode_server_cli() {
+    newest=""
+    for candidate in "$HOME"/.vscode-server/bin/*/bin/code-server \
+        "$HOME"/.vscode-server/cli/servers/*/server/bin/code-server; do
+        [ -x "$candidate" ] || continue
+        if [ -z "$newest" ] || [ "$candidate" -nt "$newest" ]; then
+            newest="$candidate"
+        fi
+    done
+    [ -n "$newest" ] && echo "$newest"
+    return 0
+}
+
+if [ -n "${VILAN_NO_VSCODE:-}" ]; then
+    say "not installing it into VS Code (VILAN_NO_VSCODE is set) — by hand:"
+    say "    code --install-extension $vsix --force"
+else
+    installed=""
+    server="$(vscode_server_cli)"
+    if [ -n "$server" ]; then
+        if "$server" --install-extension "$vsix" --force > /dev/null; then
+            say "installed it into the VS Code server ($HOME/.vscode-server)"
+            installed=1
+        else
+            say "the VS Code server's CLI refused it ($server)"
+        fi
+    fi
+    # Inside WSL, `code` is the Windows launcher, which forwards to the very
+    # server just installed into — asking it again would only be slower.
+    if command -v code > /dev/null 2>&1 &&
+        { [ -z "$installed" ] || [ -z "${WSL_DISTRO_NAME:-}" ]; }; then
+        if code --install-extension "$vsix" --force > /dev/null; then
+            say "installed it into VS Code (\`code\` on PATH)"
+            installed=1
+        else
+            say "\`code --install-extension\` refused it"
+        fi
+    fi
+    if [ -n "$installed" ]; then
+        say "reload the VS Code window (Developer: Reload Window) to run it"
+    else
+        say "no VS Code found to install it into — by hand:"
+        say "    code --install-extension $vsix --force"
+    fi
+fi
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

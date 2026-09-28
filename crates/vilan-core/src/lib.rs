@@ -26,6 +26,7 @@ pub mod id;
 pub mod impl_select;
 pub mod init_order;
 pub mod interpreter;
+pub mod keyword_table;
 pub mod labels;
 pub mod leak_tally;
 pub mod lexing;
