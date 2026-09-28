@@ -4232,6 +4232,11 @@ pub struct Analyzer<'src> {
     /// [`Analyzer::note_dyn_coercion`]; the `dyn` type itself is the slot's, so
     /// only the erased side needs keeping.
     dyn_coercions: HashMap<Id, (TypeId, Id, Vec<TypeId>)>,
+    /// B430: a built tuple erased ELEMENT-WISE at a tuple-of-objects
+    /// position — per element, the erasure `dyn_coercions` would record for a
+    /// value landing there alone, or `None` for an element that passes as it
+    /// is.
+    dyn_tuple_coercions: HashMap<Id, Vec<Option<(TypeId, Id, Vec<TypeId>)>>>,
     prepped_static_accessors: Vec<(Id, TypeId, &'src str)>,
     // A qualified-generic static subject's impl-binder bindings
     // (`Boxy<i32>::make` -> {impl's T -> i32}), keyed by the accessor expr id.
@@ -6148,6 +6153,7 @@ impl<'src> Analyzer<'src> {
             expected_types: HashMap::default(),
             callable_coercions: HashMap::default(),
             dyn_coercions: HashMap::default(),
+            dyn_tuple_coercions: HashMap::default(),
             dyn_method_calls: HashMap::default(),
             dyn_dispatched_members: HashSet::default(),
             dyn_object_traits: HashSet::default(),
@@ -35976,28 +35982,42 @@ impl<'src> Analyzer<'src> {
         inferred: &Type,
         substitution_context: &SubstitutionContext,
     ) {
-        if self.dyn_object_traits.is_empty()
-            || !matches!(
-                constraint,
-                Type::Struct(..)
-                    | Type::Enum(..)
-                    | Type::Tuple(..)
-                    | Type::Array(..)
-                    | Type::Closure(..)
+        if self.dyn_object_traits.is_empty() {
+            return;
+        }
+        // B430: a MAPPED position (`(U in T: dyn Source<U>)`) is a tuple of
+        // objects once its source is concrete under this inference — B398's
+        // expansion, which the literal arm already takes.
+        let expanded;
+        let constraint = match constraint {
+            Type::Mapped(..) => match self.substitute_type(constraint, substitution_context) {
+                tuple @ Type::Tuple(_) => {
+                    expanded = tuple;
+                    &expanded
+                }
+                _ => return,
+            },
+            _ => constraint,
+        };
+        if !matches!(
+            constraint,
+            Type::Struct(..)
+                | Type::Enum(..)
+                | Type::Tuple(..)
+                | Type::Array(..)
+                | Type::Closure(..)
+        ) || !matches!(
+            self.expr_id_to_expr_map.get(&expr_id),
+            Some(
+                Expr::Local(_)
+                    | Expr::Field(..)
+                    | Expr::Index(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Call(_)
+                    | Expr::StructInitializer(..)
+                    | Expr::Dereference(_)
             )
-            || !matches!(
-                self.expr_id_to_expr_map.get(&expr_id),
-                Some(
-                    Expr::Local(_)
-                        | Expr::Field(..)
-                        | Expr::Index(..)
-                        | Expr::TupleIndex(..)
-                        | Expr::Call(_)
-                        | Expr::StructInitializer(..)
-                        | Expr::Dereference(_)
-                )
-            )
-        {
+        ) {
             return;
         }
         // A variant constructor is a LITERAL for this purpose: `Some(Root {
@@ -36009,6 +36029,9 @@ impl<'src> Analyzer<'src> {
         if let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&expr_id)
             && self.call_is_variant_constructor(*call_id)
         {
+            return;
+        }
+        if self.erase_tuple_elementwise(expr_id, constraint, inferred, substitution_context) {
             return;
         }
         let (object, concrete) =
@@ -36066,6 +36089,89 @@ impl<'src> Analyzer<'src> {
                  {steer}"
             ),
         });
+    }
+
+    /// B430: a built TUPLE landing at a tuple position whose elements are
+    /// objects — `pair(t)` with `t: (Root, Root)` at `p: (dyn A, dyn B)`, or
+    /// at B398's mapped `(U in T: dyn Source<U>)` — is erased ELEMENT-WISE:
+    /// the tuple is re-built by projection with each object element paired
+    /// with its table (`dyn_tuple_coercions`), which is exactly what the
+    /// literal spelling `(t.0, t.1)` does one element at a time. Unlike a
+    /// `List`'s elements, a tuple's are a fixed, known set, so the re-wrap is
+    /// finite and needs no loop. Answers `true` when it recorded the
+    /// coercion (the caller then refuses nothing); `false` when this is not
+    /// that shape — an element nested deeper than one level, an element that
+    /// cannot erase, or no object element at all — and B435's rule applies.
+    fn erase_tuple_elementwise(
+        &mut self,
+        expr_id: Id,
+        constraint: &Type,
+        inferred: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> bool {
+        let (Type::Tuple(positions), Type::Tuple(values)) = (constraint, inferred) else {
+            return false;
+        };
+        if positions.len() != values.len() {
+            return false;
+        }
+        let pairs: Vec<(Type, Type)> = positions
+            .iter()
+            .zip(values.iter())
+            .map(|(position, value)| {
+                let position = match position.get_type(self) {
+                    Type::Generic(constraint_id) => {
+                        match substitution_context.get(&constraint_id) {
+                            Some(bound) => bound.get_type(self),
+                            None => Type::Generic(constraint_id),
+                        }
+                    }
+                    other => other,
+                };
+                (position, value.get_type(self))
+            })
+            .collect();
+        let mut elements: Vec<Option<(TypeId, Id, Vec<TypeId>)>> = Vec::new();
+        let mut erases_any = false;
+        for (position, value) in pairs {
+            match (&position, &value) {
+                (Type::Dyn(trait_id, trait_arguments), _) if !matches!(value, Type::Dyn(..)) => {
+                    let erases = matches!(
+                        value,
+                        Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+                    ) && self.type_implements_trait(&value, *trait_id)
+                        && self.type_implements_trait_at(&value, *trait_id, trait_arguments);
+                    if !erases {
+                        return false;
+                    }
+                    let subject_type_id = value.clone().get_type_id(self);
+                    // Q5, as at the top-level coercion: a resource is never
+                    // erased. Left to B435's refusal path would name the
+                    // container; the element is the one to name, so say no
+                    // here and let the element-wise literal spelling reach
+                    // the top-level refusal instead.
+                    if self.type_is_resource(subject_type_id) {
+                        return false;
+                    }
+                    elements.push(Some((subject_type_id, *trait_id, trait_arguments.clone())));
+                    erases_any = true;
+                }
+                _ => {
+                    if self
+                        .nested_dyn_landing(&position, &value, substitution_context, 1)
+                        .is_some()
+                    {
+                        return false;
+                    }
+                    elements.push(None);
+                }
+            }
+        }
+        if !erases_any {
+            return false;
+        }
+        self.dyn_tuple_coercions.insert(expr_id, elements);
+        true
     }
 
     /// B435's walk: the first position NESTED inside `position` (depth ≥ 1)
@@ -55626,6 +55732,8 @@ pub struct Program<'src> {
     /// A124 R3: the recorded `dyn` coercion sites — expression id to the type
     /// being erased. The emitter builds one `(value, vtable)` pair per entry.
     pub dyn_coercions: HashMap<Id, (TypeId, Id, Vec<TypeId>)>,
+    /// B430: see the analyzer's field of the same name.
+    pub dyn_tuple_coercions: HashMap<Id, Vec<Option<(TypeId, Id, Vec<TypeId>)>>>,
     // The next unused entity id. Post-analysis passes (the context threading
     // pass) mint fresh entities — synthetic parameters and references — from
     // here without colliding with analyzed ones.
@@ -64995,6 +65103,7 @@ fn analyze_over_world<'src>(
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
         dyn_coercions: std::mem::take(&mut analyzer.dyn_coercions),
+        dyn_tuple_coercions: std::mem::take(&mut analyzer.dyn_tuple_coercions),
         dyn_method_calls: std::mem::take(&mut analyzer.dyn_method_calls),
         dyn_dispatched_members: std::mem::take(&mut analyzer.dyn_dispatched_members),
         next_entity_id: analyzer.entity_id,

@@ -1147,6 +1147,45 @@ const B423_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B430: the native build does not yet re-build a tuple erased element-wise
+/// (the JS emitter does, by projection) — it REFUSES by name rather than
+/// handing rustc a bare struct where a `Dyn` is wanted.
+#[test]
+fn a_tuple_erased_elementwise_is_refused_by_name_natively() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b430.vl"), B430_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_b430.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a tuple value erased element-wise"),
+            "refused for another reason: {reason}"
+        ),
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
+const B430_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "fun pair(p: (dyn Src, dyn Src)): i32 {\n",
+    "\tp.0.get() + p.1.get()\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet t = (Root { n = 1 }, Root { n = 2 });\n",
+    "\tprint(pair(t));\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's

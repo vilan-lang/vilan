@@ -55,6 +55,9 @@ written down.
 <!-- family: fix -->
 **A destructuring `let` of a closure's parameter types the closure: `combine((a, b)).map(|pair| { let (x, y) = pair; x + y })` compiles, where `map`'s result "is never fully determined" unless `pair` was annotated.** The destructure resolved before the call filled `pair`, bound `x` and `y` at `Unknown` for good, and the tail `x + y` told the call nothing. An unfilled closure parameter is now a not-yet at a destructure, as it already was at a plain binding; the names bind from the tuple once the call fills it. Tracker B427.
 
+<!-- family: miscompile -->
+**A built tuple erases element-wise at a tuple-of-objects position: `pair(t)` with `t: (Root, Root)` at `p: (dyn Src, dyn Src)` — and at a mapped `(U in T: dyn Source<U>)` — runs, where JS stopped with `p[0][1].get is not a function`.** B398 erased the elements of a tuple LITERAL at such a position; a tuple held in a binding or returned by a call reached the function bare. It is re-built by projection now, each object element paired with its table (`((t) => [[t[0], table], t[1]])(value)` — the value evaluated once, where it was written), which is what `(t.0, t.1)` spelled by hand does. The native build refuses the shape by name ("a tuple value erased element-wise") until it re-builds it too; before, rustc refused it. Tracker B430.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

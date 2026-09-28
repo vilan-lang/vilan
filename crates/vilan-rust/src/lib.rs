@@ -3850,6 +3850,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// reason). The `Rc<Concrete>` coerces to `Rc<dyn ObjectX>` at
     /// `Dyn::new`'s argument, which is the whole erasure.
     fn erase_into_object(&mut self, id: Id, text: String) -> Result<String, Error> {
+        // B430: the JS emitter re-builds a tuple erased element-wise by
+        // projection; this backend refuses it by name until it does too.
+        if self.program.dyn_tuple_coercions.contains_key(&id) {
+            return Err(unsupported(
+                "a tuple value erased element-wise into a tuple of trait objects",
+                self.span_of(id),
+            ));
+        }
         let Some((subject, trait_id, arguments)) = self.program.dyn_coercions.get(&id).cloned()
         else {
             return Ok(text);

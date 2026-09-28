@@ -4653,6 +4653,48 @@ impl<'src> Transformer<'src> {
             let vtable = self.emit_vtable(subject_type_id, trait_id, &trait_arguments);
             return Some(js::Node::Array(vec![node, js::Node::Local(vtable)]));
         }
+        // B430: a built tuple at a tuple-of-objects position is re-built by
+        // projection, each object element paired with its table —
+        // `((t) => [[t[0], vtable], t[1]])(value)`. An arrow applied in place
+        // rather than a hoisted `const`, so the value is evaluated exactly once
+        // and exactly where it was written, among its sibling arguments.
+        if let Some(elements) = self.program.dyn_tuple_coercions.get(&id).cloned() {
+            let tuple = self.ng.next_name();
+            let projected: Vec<js::Node<'src>> = elements
+                .iter()
+                .enumerate()
+                .map(|(index, element)| {
+                    let read = js::Node::PropertyIndex(
+                        Box::new(js::Node::Local(tuple.clone())),
+                        Box::new(js::Node::Number(index.to_string(), None)),
+                    );
+                    match element {
+                        Some((subject_type_id, trait_id, trait_arguments))
+                            if !matches!(
+                                self.program
+                                    .type_id_to_type_map
+                                    .get(&self.resolve_type_id(*subject_type_id)),
+                                Some(Type::Dyn(..))
+                            ) =>
+                        {
+                            let vtable =
+                                self.emit_vtable(*subject_type_id, *trait_id, trait_arguments);
+                            js::Node::Array(vec![read, js::Node::Local(vtable)])
+                        }
+                        _ => read,
+                    }
+                })
+                .collect();
+            return Some(js::Node::Call(
+                Box::new(js::Node::Closure(js::Closure {
+                    parameters: vec![js::Parameter { name: tuple }],
+                    body: vec![js::Node::Return(Box::new(js::Node::Array(projected)))],
+                    is_async: false,
+                    origin: None,
+                })),
+                vec![node],
+            ));
+        }
         Some(node)
     }
 

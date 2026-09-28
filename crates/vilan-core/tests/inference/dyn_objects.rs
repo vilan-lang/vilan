@@ -1231,3 +1231,62 @@ fn b435_a_generic_struct_literal_under_an_object_annotation_erases_its_field() {
         "8\n9\n3\n",
     );
 }
+
+// --- B430: a built tuple at a tuple-of-objects position ----------------------
+//
+// B398 erased the elements of a tuple LITERAL at such a position; a tuple
+// VALUE (a binding, a call result) escaped, and JS read `p[0][1].get` off a
+// bare struct. It is re-built by projection now, each object element paired
+// with its table — at a written `(dyn A, dyn B)` and at B398's mapped
+// `(U in T: dyn Source<U>)` alike.
+
+#[test]
+fn b430_a_tuple_value_erases_elementwise_at_a_tuple_of_objects() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "trait Named { fun name(self): str; }\n",
+                "impl Root with Named { fun name(self): str { \"root\" } }\n",
+                "fun pair(p: (dyn Src, dyn Src)): i32 { p.0.get() + p.1.get() }\n",
+                "fun mixed(p: (dyn Named, i32)): str { i\"{p.0.name()} {p.1}\" }\n",
+                "fun make(): (Root, Root) { (Root { n = 5 }, Root { n = 6 }) }\n",
+                "fun main() {\n",
+                "\tlet t = (Root { n = 1 }, Root { n = 2 });\n",
+                "\tprint(pair(t));\n",
+                "\tprint(pair(make()));\n",
+                "\tlet m = (Root { n = 0 }, 7);\n",
+                "\tprint(mixed(m));\n",
+                "\tlet held: (dyn Src, dyn Src) = t;\n",
+                "\tprint(held.0.get() + held.1.get());\n",
+                "}\n",
+            )
+        ),
+        "3\n11\nroot 7\n3\n",
+    );
+}
+
+#[test]
+fn b430_a_tuple_value_erases_elementwise_at_a_mapped_position() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, Source };\n",
+            "fun pair(p: (dyn Source<i32>, dyn Source<str>)): str {\n",
+            "\ti\"{p.0.get()} {p.1.get()}\"\n",
+            "}\n",
+            "fun reads<T: (2..)>(sources: (U in T: dyn Source<U>)): T {\n",
+            "\t(s in sources => s.get())\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet a = SignalCell::new(1);\n",
+            "\tlet b = SignalCell::new(\"b\");\n",
+            "\tlet t = (a, b);\n",
+            "\tprint(pair(t));\n",
+            "\tlet (x, y) = reads(t);\n",
+            "\tprint(i\"{x} {y}\");\n",
+            "}\n",
+        ),
+        "1 b\n1 b\n",
+    );
+}

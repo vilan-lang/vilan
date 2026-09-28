@@ -1377,9 +1377,13 @@ or call result passed as `List<dyn Src>` is refused, and so is a built
 `Option<Root>`, a `Boxed<Root>`, and a `|| Root` closure held in a
 binding. Rebuild it element by element under the object type (`let
 objects: List<dyn Src> = built.map(|element| element);`), or wrap a
-closure in a literal (`|| make()`). The reverse, nested (`List<dyn Src>`
-where `List<Root>` is wanted), is the narrowing, refused one level down
-as at the top.
+closure in a literal (`|| make()`). A TUPLE is the exception, because
+its elements are a fixed set: a built `(Root, Root)` landing at a
+`(dyn Src, dyn Src)` position (or at a mapped `(U in T: dyn Source<U>)`)
+is re-built by projection, each element becoming its object where it
+lands, exactly as `(t.0, t.1)` would. The reverse, nested (`List<dyn
+Src>` where `List<Root>` is wanted), is the narrowing, refused one level
+down as at the top.
 
 **Resources.** A `resource` value may not be coerced into a trait object.
 Teardown through a table would make the destructor dynamic where the rest
