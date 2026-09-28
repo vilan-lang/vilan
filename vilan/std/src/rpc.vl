@@ -3242,7 +3242,7 @@ export impl ReactiveClient {
 		RemoteSource {
 			channel = channel_cell,
 			subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)),
-			count = Shared::new(0usize),
+			count = Shared::new(0),
 			closing = Shared::new(false),
 			settle_id = fresh_id(),
 			codec = self.codec,
@@ -3284,7 +3284,7 @@ export impl ReactiveClient {
 			transport = self.transport,
 			cache,
 			fault,
-			count = Shared::new(0usize),
+			count = Shared::new(0),
 			closing = Shared::new(false),
 			settle_id = fresh_id(),
 			leases = Shared::new([]),
