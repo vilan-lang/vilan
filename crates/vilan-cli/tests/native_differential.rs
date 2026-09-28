@@ -1062,6 +1062,57 @@ const B403_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B419: a blanket over a SUPERTRAIT applies to a type whose one impl block
+/// names the subtrait (B243's one-block form) — both backends find `pair`.
+#[test]
+fn a_blanket_over_a_supertrait_reaches_a_one_block_subtrait_impl_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b419.vl"), B419_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b419.vl"),
+        Verdict::Identical,
+        "a blanket over a supertrait must reach a one-block subtrait impl on both backends"
+    );
+}
+
+const B419_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Src<T> {\n",
+    "\tfun get(self): T;\n",
+    "}\n",
+    "\n",
+    "trait Sig<T> with Src<T> {\n",
+    "\tfun label(self): str;\n",
+    "}\n",
+    "\n",
+    "struct Cell<T> {\n",
+    "\tv: T,\n",
+    "}\n",
+    "\n",
+    "impl Cell<type T> with Sig<T> {\n",
+    "\tfun get(self): T {\n",
+    "\t\tself.v\n",
+    "\t}\n",
+    "\tfun label(self): str {\n",
+    "\t\t\"cell\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl type S: Src<type T> {\n",
+    "\tfun pair(self): (T, T) {\n",
+    "\t\t(self.get(), self.get())\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet c = Cell { v = 3 };\n",
+    "\tlet (a, b) = c.pair();\n",
+    "\tprint(a + b);\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's

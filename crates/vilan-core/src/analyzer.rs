@@ -1973,6 +1973,17 @@ pub struct Implementation<'src> {
     /// (`impl SignalCell<type T> with Readable<T>` -> `[(readable_id, [T])]`). Used to
     /// recover a parameterized trait's arguments for a concrete subject.
     pub trait_args: Vec<(Id, Vec<TypeId>)>,
+    /// B419: `trait_args` CLOSED over the supertrait chain, each supertrait at
+    /// the arguments the `with` clause reaches it through — what the block
+    /// PROVIDES, as against what it names. `impl Cell<type T> with Sig<T>`
+    /// (B243's one-block form, `trait Sig<T> with Src<T>`) provides `Src<T>`
+    /// too, so a blanket over `S: Src<T>` applies to a `Cell` exactly as it
+    /// would to one written in two blocks. Filled after the `with` clauses
+    /// resolve; the questions "does this type implement X" and "at which
+    /// arguments" read it, while the ones about the clause as WRITTEN
+    /// (coherence, conformance, the inherited-default walk, which already
+    /// climbs the chain) keep `trait_args`.
+    pub provided_trait_args: Vec<(Id, Vec<TypeId>)>,
 }
 
 /// B317: one `impl` block as an IMPORT PATH sees it — the members it declares,
@@ -7965,7 +7976,10 @@ impl<'src> Analyzer<'src> {
             return true;
         }
         self.implementations.iter().any(|implementation| {
-            implementation.trait_ids.contains(&trait_id)
+            implementation
+                .provided_trait_args
+                .iter()
+                .any(|(provided, _)| *provided == trait_id)
                 && self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
@@ -18450,25 +18464,22 @@ impl<'src> Analyzer<'src> {
         if required.is_empty() {
             return self.type_implements_trait(subject_type, trait_id);
         }
+        // B419: the PROVIDED set — a one-block subtrait impl provides the
+        // supertrait at the arguments its clause reaches it through.
         let providers: Vec<(TypeId, Vec<TypeId>)> = self
             .implementations
             .iter()
-            .filter(|implementation| implementation.trait_ids.contains(&trait_id))
-            .filter(|implementation| {
+            .filter_map(|implementation| {
+                let (_, provided) = implementation
+                    .provided_trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)?;
                 self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
                 )
-            })
-            .map(|implementation| {
-                let written = implementation
-                    .trait_args
-                    .iter()
-                    .find(|(id, _)| *id == trait_id)
-                    .map(|(_, arguments)| arguments.clone())
-                    .unwrap_or_default();
-                (implementation.subject, written)
+                .then(|| (implementation.subject, provided.clone()))
             })
             .collect();
         if providers.is_empty() {
@@ -32669,6 +32680,7 @@ impl<'src> Analyzer<'src> {
                     declared_members,
                     trait_ids: Vec::new(),
                     trait_args: Vec::new(),
+                    provided_trait_args: Vec::new(),
                 });
 
                 Some(Expr::Impl(id))
@@ -37941,7 +37953,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             .filter_map(|implementation| {
                 implementation
-                    .trait_args
+                    .provided_trait_args
                     .iter()
                     .find(|(provided, _)| *provided == trait_id)
                     .map(|(_, arguments)| (implementation.subject, arguments.clone()))
@@ -49953,6 +49965,35 @@ impl<'src> Analyzer<'src> {
             let trait_type_id = Type::Trait(trait_id, Vec::new()).get_type_id(self);
             self.type_references
                 .push((source_id, span, Some(trait_id), trait_type_id));
+        }
+        // B419: each block's provided set, closed over the supertrait chain.
+        //
+        // A BLANKET keeps its clause as written. Its subject's bound is what a
+        // supertrait of the clause would otherwise be proved by — `impl type S:
+        // Source<T> with Derived<T>` REQUIRES `Source`, it does not supply it —
+        // and closing over the chain there made "does X implement Source" ask
+        // the blanket, whose bound asks "does X implement Source" (a stack
+        // overflow on std's reactive traits).
+        for index in 0..self.implementations.len() {
+            let written = self.implementations[index].trait_args.clone();
+            if matches!(
+                self.implementations[index].subject.borrow_type(self),
+                Type::Generic(_)
+            ) {
+                self.implementations[index].provided_trait_args = written;
+                continue;
+            }
+            let mut provided: Vec<(Id, Vec<TypeId>)> = Vec::new();
+            for (trait_id, arguments) in written {
+                for (reached_id, reached_arguments) in
+                    self.trait_with_supertraits_at(trait_id, &arguments)
+                {
+                    if !provided.iter().any(|(seen, _)| *seen == reached_id) {
+                        provided.push((reached_id, reached_arguments));
+                    }
+                }
+            }
+            self.implementations[index].provided_trait_args = provided;
         }
 
         for (id, subject_type_id, member_name) in std::mem::take(&mut self.prepped_static_accessors)
