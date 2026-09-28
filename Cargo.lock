@@ -1225,6 +1225,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vilan-rt-signal"
+version = "0.41.1"
+dependencies = [
+ "ctrlc",
+ "vilan-rt",
+]
+
+[[package]]
 name = "vilan-rt-sqlite"
 version = "0.41.1"
 dependencies = [

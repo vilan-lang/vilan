@@ -63,6 +63,16 @@ server answers `Connection: close` on every response and sends no `Date`; node
 keeps connections alive and dates every answer. Everything a program sets — the
 status, its headers, its body — is the same on both.
 
+**A native server stops gracefully on SIGTERM.** `Server::stop()` works as it
+does on node. Beyond it, a program that starts a server answers SIGTERM, SIGINT
+and SIGHUP (Ctrl-C, and the console's close on Windows) by stopping its
+servers: it stops accepting, closes the connections that are only waiting and
+the upgraded sockets, lets a request already being answered finish — and then
+`main` returns, where node would have died of the signal. A second signal ends
+the process at once, for a server whose open response never ends. The handler
+lives in a third runtime crate, linked only by a program that serves, so a
+native server build fetches the `ctrlc` crate the first time.
+
 ## Debug by default
 
 `vilan run --backend rust` builds in **debug**, and so does `vilan build

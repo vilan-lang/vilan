@@ -82,7 +82,7 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
         .map(|(key, contents)| (staging.join(key), *contents))
         .collect();
     written.push((staging.join("vilan-rt").join("Cargo.toml"), RT_MANIFEST));
-    // F18 slice 2 and F40: the optional crates materialize beside the runtime,
+    // F18 slice 2, F40 and F45: the optional crates materialize beside the runtime,
     // under the same hash, because the generated cargo manifest reaches each as
     // a sibling of the runtime path.
     written.push((
@@ -92,6 +92,10 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
     written.push((
         staging.join("vilan-rt-crypto").join("Cargo.toml"),
         RT_CRYPTO_MANIFEST,
+    ));
+    written.push((
+        staging.join("vilan-rt-signal").join("Cargo.toml"),
+        RT_SIGNAL_MANIFEST,
     ));
     for (path, contents) in written {
         let parent = path.parent().expect("every embedded file has a parent");

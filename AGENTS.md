@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, ten crates, plus the language's own tree:
+Rust workspace, eleven crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -69,6 +69,11 @@ Rust workspace, ten crates, plus the language's own tree:
   `vilan-rt` could reach only through a crate or `unsafe`; the digests are hand-written, the
   crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
   when the program reaches one of its bindings (optimized even in the dev profile).
+- `crates/vilan-rt-signal` — a native server's graceful stop on SIGTERM/SIGINT/SIGHUP (F45;
+  Order 43's R-i): installing a signal handler is FFI or a crate, so `ctrlc` (already the
+  CLI's) lives here and routes the signals to `vilan_rt::http::request_termination`; the
+  crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
+  when the program starts an HTTP server.
 
 ## Definition of done (the gates)
 

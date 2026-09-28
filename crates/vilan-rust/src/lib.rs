@@ -95,8 +95,8 @@ pub struct Emitted {
     pub host_gaps: Vec<String>,
     /// The OPTIONAL runtime crates the program reached, so the cargo project
     /// written for it depends on exactly those (F18 slice 2's
-    /// `vilan-rt-sqlite`, F40's `vilan-rt-crypto`). A program that reaches
-    /// neither names neither and never builds them.
+    /// `vilan-rt-sqlite`, F40's `vilan-rt-crypto`, F45's `vilan-rt-signal`). A
+    /// program that reaches none names none and never builds them.
     pub optional_crates: OptionalCrates,
     /// R3's measurement: how many bindings this program had to box into
     /// `vilan_rt::Captured<_>` (an `Rc<RefCell<_>>`) because a closure captures
@@ -129,6 +129,9 @@ pub struct OptionalCrates {
     /// OS randomness, SHA-384/512, HMAC and PBKDF2 — `vilan-rt-crypto`
     /// (`getrandom`; F40, RULED (a)).
     pub crypto: bool,
+    /// A server's graceful stop on a termination signal — `vilan-rt-signal`
+    /// (`ctrlc`; F45, Order 43's R-i). Reached by starting an HTTP server.
+    pub signal: bool,
 }
 
 impl OptionalCrates {
@@ -140,6 +143,9 @@ impl OptionalCrates {
         }
         if self.crypto {
             names.push("vilan-rt-crypto");
+        }
+        if self.signal {
+            names.push("vilan-rt-signal");
         }
         names
     }
@@ -351,6 +357,11 @@ struct Emitter<'a, 'src> {
     /// [`Emitter::crypto_host_binding`] and by rendering a node `Buffer`'s type
     /// — the two places a program's text can name that crate.
     reaches_crypto: bool,
+    /// Whether this program starts an HTTP server, and so links
+    /// `vilan-rt-signal` (F45): the emitted `main` installs the termination
+    /// handler that stops its servers gracefully. Set where `createServer` is
+    /// lowered, the one door every server passes through.
+    reaches_signal: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -540,6 +551,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_return_type: None,
             reaches_sqlite: false,
             reaches_crypto: false,
+            reaches_signal: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -581,10 +593,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.compute_boxed_bindings();
 
         let main = self.ensure_function(main_id, &HashMap::default())?;
-        let main_body = self
+        let mut main_body = self
             .functions
             .remove(&main.slot)
             .expect("main was just emitted");
+        // F45: a program that starts an HTTP server routes the termination
+        // signals to the runtime's graceful stop before its body runs. Known
+        // only now — `main` has been walked, and everything it reaches.
+        if self.reaches_signal {
+            main_body = main_body.replacen(
+                "fn main() {\n",
+                "fn main() {\n    vilan_rt_signal::install();\n",
+                1,
+            );
+        }
 
         let mut source = String::from(PRELUDE);
         for declaration in self.types.values() {
@@ -607,6 +629,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             optional_crates: OptionalCrates {
                 sqlite: self.reaches_sqlite,
                 crypto: self.reaches_crypto,
+                signal: self.reaches_signal,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -6664,6 +6687,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.expects_async_value = true;
                 let handler = self.value_argument(argument_ids, 0, depth);
                 self.expects_async_value = false;
+                // F45: a program that serves stops gracefully on a termination
+                // signal, which is `vilan-rt-signal`'s wire to the runtime.
+                self.reaches_signal = true;
                 return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
             }
             // The two body reads CONSUME the request handle, and the callback

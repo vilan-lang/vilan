@@ -2858,6 +2858,274 @@ impl Drop for ServerUnderTest {
     }
 }
 
+/// F45: `Server::stop()` ends a native server program as it ends a node one —
+/// the listener closes, `on_stop` fires, the loop runs out of work, and the
+/// process exits 0 — and `on_start` runs AFTER the turn that called
+/// `start()`, as node's `'listening'` does (it ran inside `start()`
+/// natively, so `print("main returned")` came second; found building this).
+#[test]
+fn a_stopped_server_ends_the_program_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_stop.vl"), STOP_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_stop.vl"),
+        Verdict::Identical,
+        "a server that stops itself must end the program, printing the same lines in the same \
+         order on both backends"
+    );
+}
+
+const STOP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder().body(\"hello\\n\").build(),\n",
+    "\t\ton_start = |started| {\n",
+    "\t\t\tprint(\"started\");\n",
+    "\t\t\tstarted.stop();\n",
+    "\t\t},\n",
+    "\t\ton_stop = |stopped| print(\"stopped\"),\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "\tprint(\"main returned\");\n",
+    "}\n",
+);
+
+/// A native server built from `program` and spawned with `environment`: the
+/// child and the port it announced.
+#[cfg(unix)]
+struct SignalledServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+#[cfg(unix)]
+impl SignalledServer {
+    fn spawn(staged: &Path, program: &str, environment: &[(&str, &str)]) -> SignalledServer {
+        let built = vilan(staged)
+            .args(["build", "--backend", "rust", program])
+            .output()
+            .expect("build the server natively");
+        assert!(
+            built.status.success(),
+            "the native leg did not build:\n{}{}",
+            String::from_utf8_lossy(&built.stdout),
+            String::from_utf8_lossy(&built.stderr)
+        );
+        // The graceful stop is linked only by a program that serves.
+        let manifest = std::fs::read_to_string(
+            staged
+                .join("dist")
+                .join("native")
+                .join(program.trim_end_matches(".vl"))
+                .join("Cargo.toml"),
+        )
+        .expect("read the generated manifest");
+        assert!(
+            manifest.contains("vilan-rt-signal"),
+            "a program that starts a server links the signal crate:\n{manifest}"
+        );
+        let binary = String::from_utf8_lossy(&built.stdout)
+            .lines()
+            .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+            .expect("`vilan build` says where the binary is");
+        let mut command = Command::new(staged.join(&binary));
+        command
+            .current_dir(staged)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("spawn the server");
+        let stdout = child.stdout.take().expect("the server's stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let port = loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .expect("read the server's stdout");
+            assert!(
+                read > 0,
+                "the server's stdout ended before it announced a port"
+            );
+            if let Some(number) = line.trim().strip_prefix("vilan-test-port=") {
+                break number.parse().expect("the announced port is a number");
+            }
+        };
+        SignalledServer { child, port }
+    }
+
+    fn signal(&self, name: &str) {
+        let sent = Command::new("kill")
+            .args([name, &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "kill {name} must succeed");
+    }
+
+    /// Waits for the process to end — a LIVENESS bound, not a claim about how
+    /// fast it stops — and answers its exit status and its stderr.
+    fn finish(mut self) -> (std::process::ExitStatus, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll the server") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server did not end after the signal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        (status, stderr)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalledServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// F45 (Order 43's R-i, RULED: build): a native server STOPS on SIGTERM and
+/// reaches its process end, so the leak census reads a server's cells at exit.
+///
+/// The kolt shape answers a login, takes a SIGTERM, and exits 0 — where node,
+/// with no handler, dies of the signal — printing the census line the runtime
+/// prints only after the program's thread has ended. A `#[cfg(unix)]` pin: the
+/// signal is sent with `kill`, and Windows has no console equivalent a test
+/// could send.
+#[cfg(unix)]
+#[test]
+fn a_native_server_stops_on_sigterm_and_reaches_its_process_end() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_kolt_exit.vl"), KOLT_SHAPE_PROBE)
+        .expect("write the probe program");
+    let server = SignalledServer::spawn(
+        &staged,
+        "native_probe_kolt_exit.vl",
+        &[("VILAN_NATIVE_LEAK_CENSUS", "1")],
+    );
+    let login =
+        ServedRequest::exchange(server.port, "POST", "/api/login", "[\"ada\",\"lovelace1\"]");
+    assert_eq!(login.body, "{\"ok\":true,\"message\":\"welcome ada\"}");
+    server.signal("-TERM");
+    let (status, stderr) = server.finish();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a SIGTERM'd native server drains and exits 0 (stderr: {stderr})"
+    );
+    let census = stderr
+        .lines()
+        .find(|line| line.starts_with("vilan-native: cells minted="))
+        .unwrap_or_else(|| panic!("the program reached no process end:\n{stderr}"));
+    assert_eq!(
+        census, KOLT_SHAPE_EXIT_CENSUS,
+        "the kolt shape's exit census moved; a live cell is a cycle — read it before moving \
+         this line"
+    );
+}
+
+/// What the kolt shape's counted cells are at process end after one login and
+/// a SIGTERM — F45's exit row, C14's gate reading a server for the first time.
+#[cfg(unix)]
+const KOLT_SHAPE_EXIT_CENSUS: &str = "vilan-native: cells minted=1 live=0";
+
+/// F45: the SECOND termination signal ends the process at once — the answer
+/// for a server whose open response never ends. The first stops the listener
+/// (a new connection is refused, which is how the harness knows it landed —
+/// no sleep stands in for it) while the open stream keeps the program alive;
+/// the second exits 1 with the runtime's sentence.
+#[cfg(unix)]
+#[test]
+fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_open_stream.vl"),
+        OPEN_STREAM_PROBE,
+    )
+    .expect("write the probe program");
+    let mut server = SignalledServer::spawn(&staged, "native_probe_open_stream.vl", &[]);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port))
+        .expect("connect to the announced port");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .expect("send the request");
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone the stream"));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).expect("read the stream") > 0,
+            "the stream ended before its first chunk"
+        );
+        if line.contains("first") {
+            break;
+        }
+    }
+    server.signal("-TERM");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::net::TcpStream::connect(("127.0.0.1", server.port)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first SIGTERM never closed the listener"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        server.child.try_wait().expect("poll the server").is_none(),
+        "the open stream keeps the program alive after the first signal"
+    );
+    server.signal("-TERM");
+    let (status, stderr) = server.finish();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the second signal exits 1 (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("stopped by a second termination request"),
+        "the runtime says why it stopped: {stderr}"
+    );
+    drop(stream);
+}
+
+const OPEN_STREAM_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder()\n",
+    "\t\t\t.streaming(|stream| stream.send(\"first\\n\"))\n",
+    "\t\t\t.build(),\n",
+    "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
+    "\t\ton_stop = |stopped| {},\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "}\n",
+);
+
 /// F25: a program that FAILS answers the same exit code on both backends, and
 /// the native binary does not print Rust's panic banner.
 ///
@@ -3832,9 +4100,11 @@ fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
 /// not a number to regenerate past. Regenerate with
 /// `VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1` only after reading the difference.
 ///
-/// The F18/F40 exit — kolt's server and its shape — is NOT a row: a server is
-/// stopped by a signal, and `vilan_rt::http` has no graceful stop to reach
-/// process end through (recorded in the lane's report).
+/// The F18/F40 exit — kolt's server and its shape — is not a row of THIS
+/// table, whose rows run to their own end: a server runs until it is told to
+/// stop. Since F45 it can be told — SIGTERM stops it gracefully and the
+/// census reads it at process end — and the kolt shape's exit line is held by
+/// [`a_native_server_stops_on_sigterm_and_reaches_its_process_end`].
 #[test]
 fn the_native_leak_census_matches_its_table() {
     let staged = stage();

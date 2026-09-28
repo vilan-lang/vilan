@@ -24,6 +24,11 @@ members = [
     # HMAC and PBKDF2 beside it, is a second optional crate, linked only by a
     # program that reaches one of them.
     "crates/vilan-rt-crypto",
+    # F45 (Order 43's R-i, RULED: build): a server's graceful stop on SIGTERM
+    # needs a signal handler, which is FFI or a crate — `ctrlc`, already the
+    # CLI's — so it is a third optional crate, linked only by a program that
+    # starts an HTTP server.
+    "crates/vilan-rt-signal",
 ]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace
