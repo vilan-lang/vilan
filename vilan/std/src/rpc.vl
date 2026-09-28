@@ -4636,47 +4636,66 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with DeltaSource<List<
 	}
 
 	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
-		match self.log.since(cursor) {
-			// A cursor that lost history is told the collection — the cell knows
-			// what a `Reset` is for its shape and the log does not.
-			None => {
-				mut lost: List<SeqOp<T>> = [];
-				lost.push(SeqOp::Reset(self.elements.get()));
-				lost
-			},
-			Some(let recorded) => {
-				mut ops: List<SeqOp<T>> = [];
-				for op in recorded {
-					match op {
-						SeqOp::Splice(let at, let removed, let inserted) => {
-							mut left: List<T> = [];
-							for element in removed {
-								left.push(element.value);
-							}
-							mut arrived: List<T> = [];
-							for element in inserted {
-								arrived.push(element.value);
-							}
-							ops.push(SeqOp::Splice(at, left, arrived));
-						},
-						SeqOp::SetAt(let at, let previous, let element) => {
-							ops.push(SeqOp::SetAt(at, previous.value, element.value));
-						},
-						SeqOp::Reset(let items) => {
-							mut collection: List<T> = [];
-							for element in items {
-								collection.push(element.value);
-							}
-							ops.push(SeqOp::Reset(collection));
-						},
-						SeqOp::Move(let from, let count, let to) => {
-							ops.push(SeqOp::Move(from, count, to));
-						},
-					}
+		keyed_cell_since(self.log, self.elements.value, cursor)
+	}
+
+	/// The log and the elements' VALUE cell — not the `SignalCell`, whose
+	/// subscriber list a delta consumer's handler is registered on (A132).
+	fun reader(self): |DeltaCursor| List<SeqOp<T>> {
+		let log = self.log;
+		let elements = self.elements.value;
+		|cursor| keyed_cell_since(log, elements, cursor)
+	}
+}
+
+/// `KeyedCell`'s positional `since` over the two parts it reads, so the cell and
+/// its `reader` answer from one place: the log's keyed ops with the keys stripped
+/// off.
+fun keyed_cell_since<K, T>(
+	log: DeltaLog<SeqOp<KeyedElement<K, T>>>,
+	elements: Shared<List<T>>,
+	cursor: DeltaCursor,
+): List<SeqOp<T>> {
+	match log.since(cursor) {
+		// A cursor that lost history is told the collection — the cell knows what a
+		// `Reset` is for its shape and the log does not.
+		None => {
+			mut lost: List<SeqOp<T>> = [];
+			lost.push(SeqOp::Reset(elements.read()));
+			lost
+		},
+		Some(let recorded) => {
+			mut ops: List<SeqOp<T>> = [];
+			for op in recorded {
+				match op {
+					SeqOp::Splice(let at, let removed, let inserted) => {
+						mut left: List<T> = [];
+						for element in removed {
+							left.push(element.value);
+						}
+						mut arrived: List<T> = [];
+						for element in inserted {
+							arrived.push(element.value);
+						}
+						ops.push(SeqOp::Splice(at, left, arrived));
+					},
+					SeqOp::SetAt(let at, let previous, let element) => {
+						ops.push(SeqOp::SetAt(at, previous.value, element.value));
+					},
+					SeqOp::Reset(let items) => {
+						mut collection: List<T> = [];
+						for element in items {
+							collection.push(element.value);
+						}
+						ops.push(SeqOp::Reset(collection));
+					},
+					SeqOp::Move(let from, let count, let to) => {
+						ops.push(SeqOp::Move(from, count, to));
+					},
 				}
-				ops
-			},
-		}
+			}
+			ops
+		},
 	}
 }
 

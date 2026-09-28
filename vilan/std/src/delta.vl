@@ -328,6 +328,25 @@ export trait DeltaSource<C, O> with Source<C> {
 	/// fails: a cursor that lost history is answered with the shape's `Reset`,
 	/// carrying the collection.
 	fun since(self, cursor: DeltaCursor): List<O>;
+
+	/// `since`, as a closure that holds only what READING the ops needs — the log,
+	/// and the collection a lost cursor's `Reset` carries — and not the
+	/// notification a consumer subscribes to (tracker A132).
+	///
+	/// A delta consumer drains ops from inside its own change handler, and a
+	/// handler that captured the SOURCE to call `since` closed a loop: the source's
+	/// subscriber list holds the handler, the handler holds the source. On the JS
+	/// backend the collector reclaims it once nothing else reaches it; under
+	/// counting it never goes (C14's leak gate read 14 cells live in `delta-law`
+	/// and 92 in `list-cell`, all `map_each`'s). A consumer captures this reader
+	/// instead.
+	///
+	/// The default is the loop-closing form — `self` captured whole — because a
+	/// generic impl cannot name its own parts; std's cells override it with the two
+	/// handles `since` actually reads, and an app's cell should too.
+	fun reader(self): |DeltaCursor| List<O> {
+		|cursor| self.since(cursor)
+	}
 }
 
 /// What a CONSUMER asks a source for when it can use ops but does not require
@@ -906,9 +925,15 @@ export impl ListCell<type T> with Source<List<T>> {
 
 	/// The observer is handed the list as it stands when the notification is
 	/// delivered, which is what a `SignalCell`'s observer is handed too.
+	///
+	/// The notification captures the ITEMS cell and not the cell handle (A132): the
+	/// handle carries `published`, whose subscriber list is where this very closure
+	/// is registered, so capturing it closed a loop under counting for every
+	/// observer a `ListCell` ever had.
 	[must_use]
 	fun on_change(self, observer: |List<T>| void): Subscription {
-		self.published.on_change(|_sequence| observer(self.items.read()))
+		let items = self.items;
+		self.published.on_change(|_sequence| observer(items.read()))
 	}
 }
 
@@ -963,16 +988,33 @@ export impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
 	}
 
 	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
-		match self.log.since(cursor) {
-			// A cursor that lost history is told the collection: the cell knows
-			// what a `Reset` is for its shape and the log does not.
-			None => {
-				mut lost: List<SeqOp<T>> = [];
-				lost.push(SeqOp::Reset(self.items.read()));
-				lost
-			},
-			Some(let recorded) => recorded,
-		}
+		list_cell_since(self.log, self.items, cursor)
+	}
+
+	/// The log and the items, and not `published` (A132).
+	fun reader(self): |DeltaCursor| List<SeqOp<T>> {
+		let log = self.log;
+		let items = self.items;
+		|cursor| list_cell_since(log, items, cursor)
+	}
+}
+
+/// `ListCell::since`'s body over the two parts it reads, so the cell and its
+/// `reader` answer from one place.
+fun list_cell_since<T>(
+	log: DeltaLog<SeqOp<T>>,
+	items: Shared<List<T>>,
+	cursor: DeltaCursor,
+): List<SeqOp<T>> {
+	match log.since(cursor) {
+		// A cursor that lost history is told the collection: the cell knows what a
+		// `Reset` is for its shape and the log does not.
+		None => {
+			mut lost: List<SeqOp<T>> = [];
+			lost.push(SeqOp::Reset(items.read()));
+			lost
+		},
+		Some(let recorded) => recorded,
 	}
 }
 
@@ -1008,8 +1050,12 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	let cursor = source.cursor();
 	let out: ListCell<U> = ListCell<U>::of(source.get().map(g));
 	as_derivation();
+	// The READER, not the source (A132): the handler is registered on the source's
+	// notification, so a handler holding the source was a loop no count could
+	// collect.
+	let read = source.reader();
 	let _owned = register_with_owner(source.on_change(|_published| {
-		for op in source.since(cursor) {
+		for op in read(cursor) {
 			match op {
 				// The derivative of `map g`: what arrived, mapped. Nothing else is
 				// read, and `g` runs exactly `inserted.len()` times.
