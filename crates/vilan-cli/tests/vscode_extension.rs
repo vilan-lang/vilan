@@ -603,3 +603,111 @@ fn f27_the_status_line_names_the_platform_and_the_kind_of_fact() {
     );
     assert!(source.contains("schedulePlatformRefresh();"));
 }
+
+// --- The extension's own tests (`npm test`) ----------------------------------
+//
+// The parts of the extension that DECIDE something live in files with no
+// `vscode` import (`src/versions.ts`, E229), and `src/test/*.test.ts` runs
+// them under plain node. They run here too, so the suite gates them: bundled
+// by the extension's own esbuild into this binary's scratch directory (never
+// the source tree's `out/`), then `node --test`. Like `grammar_sync`'s scope
+// pins, they need `npm ci --prefix editors/vscode`; on a working copy without
+// it the pin says so and passes, and under `CI` — where ci.yml runs that step —
+// a missing install is a failure.
+
+#[test]
+fn the_extensions_own_tests_pass() {
+    let modules = extension_dir().join("node_modules");
+    if !modules.join("esbuild/package.json").is_file() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must run `npm ci --prefix editors/vscode` before the suite"
+        );
+        eprintln!("skipped: run `npm ci --prefix editors/vscode` to run the extension's tests");
+        return;
+    }
+    let tests: Vec<PathBuf> = std::fs::read_dir(extension_dir().join("src/test"))
+        .expect("editors/vscode/src/test")
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.to_string_lossy().ends_with(".test.ts"))
+        .collect();
+    assert!(!tests.is_empty(), "the extension has tests to run");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("vscode-extension-tests");
+    let _ = std::fs::remove_dir_all(&out);
+    // esbuild's JS API rather than its `bin/`, which the install replaces with
+    // a native executable on some platforms. Paths travel as JSON, so a
+    // Windows path's backslashes arrive intact.
+    let entry_points = tests
+        .iter()
+        .map(|test| json_string(&test.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "require({}).buildSync({{ entryPoints: [{entry_points}], bundle: true, format: 'cjs', \
+         platform: 'node', outdir: {} }})",
+        json_string(&modules.join("esbuild").to_string_lossy()),
+        json_string(&out.to_string_lossy()),
+    );
+    let bundled = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("run esbuild");
+    assert!(
+        bundled.status.success(),
+        "bundling the extension's tests: {}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let bundles: Vec<PathBuf> = std::fs::read_dir(&out)
+        .expect("the bundles")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    assert_eq!(bundles.len(), tests.len(), "one bundle per test file");
+    let run = Command::new("node")
+        .arg("--test")
+        .args(&bundles)
+        .output()
+        .expect("run node --test");
+    assert!(
+        run.status.success(),
+        "the extension's tests failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// `text` as a JSON (and so JavaScript) string literal.
+fn json_string(text: &str) -> String {
+    let mut literal = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            _ => literal.push(character),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+// --- E229: the version check -------------------------------------------------
+
+/// At every start the extension reads the server's `serverInfo.version` and
+/// hands it with its own to `versionGap` (whose decision `npm test` pins), and
+/// a gap is shown ONCE per window — a restart starts the same server.
+#[test]
+fn e229_the_extension_compares_its_version_with_the_servers_once() {
+    let source = extension_source();
+    assert!(
+        source.contains("await client.start();\n        checkServerVersion(context);"),
+        "the check runs right after every successful start"
+    );
+    assert!(source.contains("client.initializeResult?.serverInfo?.version"));
+    assert!(source.contains("context.extension.packageJSON.version"));
+    assert!(source.contains("versionGap(extensionVersion, serverVersion)"));
+    assert!(
+        source.contains("if (gap === undefined || versionNoticeShown) {")
+            && source.contains("versionNoticeShown = true;"),
+        "one notification per window, not one per restart"
+    );
+    assert!(source.contains(".showWarningMessage(gap.message, 'Copy Command', 'Open Release')"));
+}

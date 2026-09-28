@@ -9,6 +9,7 @@ import {
     CodeAction,
     CodeActionKind,
     Disposable,
+    env as vscodeEnvironment,
     FileSystemWatcher,
     LogOutputChannel,
     ExtensionContext,
@@ -20,7 +21,9 @@ import {
     TextDocumentChangeEvent,
     TextEdit,
     TextEditor,
+    Uri,
 } from 'vscode';
+import { versionGap } from './versions';
 import {
     DidChangeConfigurationNotification,
     ExecuteCommandRequest,
@@ -518,6 +521,43 @@ function forgetDistantClosers(editor: TextEditor): void {
     }
 }
 
+// --- E229: one version on both halves ---------------------------------------
+//
+// The decision is `versions.ts`'s (no `vscode` import; `npm test` runs it);
+// this is the wiring: read the started server's `serverInfo.version`, compare
+// it with this extension's own, and on a gap show ONE notification per window
+// with the command that closes it — never again on a restart, which starts
+// the same server. Every start logs both versions to the output channel.
+
+/// Whether this window has already named a version gap.
+let versionNoticeShown = false;
+
+function checkServerVersion(context: ExtensionContext): void {
+    if (!client) {
+        return;
+    }
+    const extensionVersion: string = context.extension.packageJSON.version;
+    const serverVersion = client.initializeResult?.serverInfo?.version;
+    outputChannel?.info(
+        `language server version ${serverVersion ?? '(none reported)'}, extension ${extensionVersion}`,
+    );
+    const gap = versionGap(extensionVersion, serverVersion);
+    if (gap === undefined || versionNoticeShown) {
+        return;
+    }
+    versionNoticeShown = true;
+    outputChannel?.warn(`${gap.message}\n  ${gap.command}`);
+    void window
+        .showWarningMessage(gap.message, 'Copy Command', 'Open Release')
+        .then(async (choice) => {
+            if (choice === 'Copy Command') {
+                await vscodeEnvironment.clipboard.writeText(gap.command);
+            } else if (choice === 'Open Release') {
+                await vscodeEnvironment.openExternal(Uri.parse(gap.releaseUrl));
+            }
+        });
+}
+
 /// Resolve the language-server binary. An explicit `vilan.server.path` setting
 /// wins; otherwise look for a binary built in-repo (the extension lives at
 /// `<repo>/editors/vscode`, so the cargo target dir is two levels up), one
@@ -670,6 +710,7 @@ async function startClient(context: ExtensionContext): Promise<void> {
     client = new LanguageClient('vilan', 'Vilan Language Server', serverOptions, clientOptions);
     try {
         await client.start();
+        checkServerVersion(context);
     } catch (error) {
         client = undefined;
         reportMissingServer(command);

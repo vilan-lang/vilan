@@ -2853,6 +2853,21 @@ pub const OPENS_A_GENERIC_LIST: &str = "vilan/opensAGenericList";
 /// two spellings are gated against each other in `book_sync`.
 pub const ANALYSIS_PLATFORM: &str = "vilan/analysisPlatform";
 
+/// E229: the toolchain version this server was built at — the one version the
+/// CLI, the server, the embedded std and the VS Code extension share
+/// (releases.md §4, `scripts/bump-version.sh`). The server says it twice: in
+/// the `initialize` result's `serverInfo.version`, which the extension compares
+/// with its own at start and names the gap when they differ (an extension a
+/// release behind its server lacks what the server's notes promise, silently —
+/// the owner ran 0.40.0 against 0.41.1), and as `vilan-lsp --version`, for a
+/// human or a script asking the binary directly.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `vilan-lsp --version`'s line: `vilan-lsp <version>`.
+fn version_line() -> String {
+    format!("vilan-lsp {SERVER_VERSION}")
+}
+
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -3219,7 +3234,7 @@ impl LanguageServer for Backend {
                 capabilities: server_capabilities(),
                 server_info: Some(ServerInfo {
                     name: "vilan-lsp".to_string(),
-                    version: None,
+                    version: Some(SERVER_VERSION.to_string()),
                 }),
             })
         })
@@ -6326,6 +6341,16 @@ mod base_cache_budget_knob {
 
 #[tokio::main]
 async fn main() {
+    // E229: the one flag. Anything else on the command line is left to the
+    // client that spawned the server (VS Code passes `--stdio` to some
+    // servers; this one reads stdio regardless).
+    if std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--version")
+    {
+        println!("{}", version_line());
+        return;
+    }
     apply_base_cache_budget_from_env();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -9807,5 +9832,41 @@ fun main() {}
             edits[0].new_text
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// E229: the server names its version, so the extension can name a gap
+/// between the two — the ONE notification an extension a release behind its
+/// server shows (`editors/vscode/src/extension.ts`, `checkServerVersion`).
+#[cfg(test)]
+mod server_version_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// `initialize` answers `serverInfo.version` = the crate version, which
+    /// `bump-version.sh` keeps equal to the extension's (the
+    /// `vscode_extension` pin `the_extension_version_is_the_toolchain_version`
+    /// holds that half). Before E229 the field was `None`, so a client had
+    /// nothing to compare with.
+    #[tokio::test]
+    async fn initialize_reports_the_toolchain_version() {
+        let (service, _socket) = backend();
+        let result = service
+            .inner()
+            .initialize(InitializeParams::default())
+            .await
+            .expect("initialize answers");
+        let info = result.server_info.expect("serverInfo is present");
+        assert_eq!(info.name, "vilan-lsp");
+        assert_eq!(info.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// `vilan-lsp --version` prints one line, `vilan-lsp <version>`.
+    #[test]
+    fn the_version_line_names_the_binary_and_the_version() {
+        assert_eq!(
+            version_line(),
+            format!("vilan-lsp {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

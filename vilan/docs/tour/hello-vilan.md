@@ -23,7 +23,10 @@ Either way `vilan` (and `vilan-lsp`, the language server) lands in
 `~/.vilan/bin` (`%USERPROFILE%\.vilan\bin` on Windows). The unix script
 prints the PATH line to add; the PowerShell one edits your user PATH
 itself, so open a new terminal afterwards. `vilan --version` confirms it
-worked, and `vilan upgrade` updates it later.
+worked, and `vilan upgrade` updates it later. When VS Code's `code` command
+is on your PATH, the installer also installs the matching VS Code extension
+(opt out with `VILAN_NO_VSCODE=1`, or `sh -s -- --no-vscode` on the unix
+pipe); its last lines say which it did.
 
 Homebrew (`brew install vilan-lang/vilan/vilan`) and building from source
 are the other two routes; the
