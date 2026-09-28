@@ -1113,6 +1113,40 @@ const B419_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B423: a literal `if` arm or `match` leg takes its sibling's numeric type
+/// (`u53` here) on both backends — the analyzer refused it before, and the
+/// native build needs the literal typed to emit `0u64`.
+#[test]
+fn a_literal_arm_typed_by_its_sibling_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b423.vl"), B423_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b423.vl"),
+        Verdict::Identical,
+        "a literal arm typed by its sibling must mean the same thing on both backends"
+    );
+}
+
+const B423_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun want(value: u53): u53 {\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n: u53 = 5;\n",
+    "\tlet m = if n > 2 { n } else { 0 };\n",
+    "\tlet k = if n > 2 { 0 } else { n };\n",
+    "\tlet j = match n > 2 {\n",
+    "\t\ttrue => n,\n",
+    "\t\tfalse => 0,\n",
+    "\t};\n",
+    "\tprint(i\"{want(m)} {want(k)} {want(j)}\");\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's

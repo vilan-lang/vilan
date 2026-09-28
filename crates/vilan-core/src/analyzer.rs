@@ -37469,6 +37469,16 @@ impl<'src> Analyzer<'src> {
                 if if_branch_has_final_else(branch) {
                     let mut bodies = Vec::new();
                     if_branch_bodies(branch, &mut bodies);
+                    // B423: no expectation — a literal arm takes its sibling's
+                    // numeric type (`unify_arm_bodies` states the rule).
+                    let constraint = match constraint.as_ref() {
+                        Type::Unknown => match self.literal_arm_peer_type(&bodies) {
+                            Err(()) => return Type::Unresolved,
+                            Ok(Some(peer)) => std::borrow::Cow::Owned(peer),
+                            Ok(None) => constraint,
+                        },
+                        _ => constraint,
+                    };
                     // The `if`'s type is the unification of its branches; infer
                     // each against the constraint so each branch's tail directs
                     // its own inference (the branches must agree, checked
@@ -47235,10 +47245,20 @@ impl<'src> Analyzer<'src> {
         construct: &str,
     ) -> Option<Type> {
         let expected = self.expected_types.get(&expression_id).copied();
+        // B423: with no expectation of its own, a literal arm takes its
+        // SIBLING's numeric type — the peer step B389 gives a stalled binding.
+        let peer = match expected {
+            Some(_) => None,
+            None => match self.literal_arm_peer_type(bodies) {
+                Err(()) => return None,
+                Ok(peer) => peer,
+            },
+        };
         let mut unified: Option<Type> = None;
         for (statements, body_id) in bodies {
             let arm_constraint = expected
                 .map(|type_id| type_id.get_type(self))
+                .or_else(|| peer.clone())
                 .unwrap_or(Type::Unknown);
             let body_type = if self.block_diverges(statements, *body_id) {
                 Type::Never
@@ -47278,6 +47298,46 @@ impl<'src> Analyzer<'src> {
         }
         // No arms at all is `void`, the same value an armless construct has.
         Some(unified.unwrap_or(Type::Void))
+    }
+
+    /// B423 — the numeric type a LITERAL arm takes from its sibling when the
+    /// construct has no expectation: `if n > 2 { n } else { 0 }` with `n: u53`
+    /// types the `0` as `u53`, in either order and for a `match` leg alike,
+    /// where the literal's own default (`i32`) was refused against the typed
+    /// arm. The peer step B389 gives a stalled binding (`let m = 0; m = n`),
+    /// at the arms.
+    ///
+    /// `Ok(None)` when no arm is literal-shaped, none is typed, or the typed
+    /// arms are not numeric (the arms' own rule reports whatever follows —
+    /// two literal arms keep their default); `Err` while a typed arm is still
+    /// unresolved, which the caller defers on. The FIRST typed arm answers:
+    /// two typed arms that disagree are the arms' mismatch to report, not
+    /// this step's to choose between.
+    fn literal_arm_peer_type(&mut self, bodies: &[(Vec<Id>, Id)]) -> Result<Option<Type>, ()> {
+        let mut literal_arms = false;
+        let mut typed_arms = Vec::new();
+        for (statements, body_id) in bodies {
+            if self.block_diverges(statements, *body_id) {
+                continue;
+            }
+            match self.is_unsuffixed_numeric(*body_id) {
+                true => literal_arms = true,
+                false => typed_arms.push(*body_id),
+            }
+        }
+        if !literal_arms || typed_arms.is_empty() {
+            return Ok(None);
+        }
+        for body_id in typed_arms {
+            let arm_type = self.infer_type(body_id, &Type::Unknown, &HashMap::default());
+            if matches!(arm_type, Type::Unresolved) {
+                return Err(());
+            }
+            if self.numeric_primitive_name(&arm_type).is_some() {
+                return Ok(Some(arm_type));
+            }
+        }
+        Ok(None)
     }
 
     /// `if c { .. } else { .. }`: unify the arm bodies, by the rule `match`

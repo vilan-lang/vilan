@@ -860,3 +860,66 @@ fn a_non_index_numeric_argument_keeps_the_plain_steer_and_no_note() {
         "an index",
     );
 }
+
+// --- B423: a literal arm takes its sibling's numeric type ------------------
+
+#[test]
+fn b423_a_literal_if_arm_takes_its_sibling_type_in_either_order() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun want(value: u53): u53 { value }\n",
+            "fun main() {\n",
+            "\tlet n: u53 = 5;\n",
+            "\tlet m = if n > 2 { n } else { 0 };\n",
+            "\tlet k = if n > 2 { 0 } else { n };\n",
+            "\tprint(i\"{want(m)} {want(k)}\");\n",
+            "}\n",
+        ),
+        "5 0\n",
+    );
+}
+
+#[test]
+fn b423_a_literal_match_leg_takes_its_sibling_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun want(value: usize): usize { value }\n",
+            "fun main() {\n",
+            "\tlet at: usize = 4;\n",
+            "\tlet chosen = match at > 2 {\n",
+            "\t\ttrue => 1,\n",
+            "\t\tfalse => at,\n",
+            "\t};\n",
+            "\tprint(want(chosen));\n",
+            "}\n",
+        ),
+        "1\n",
+    );
+}
+
+#[test]
+fn b423_the_sibling_type_holds_the_literal_to_its_range() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet small: u8 = 5;\n",
+            "\tlet m = if small > 2 { small } else { 300 };\n",
+            "}\n",
+        ),
+        "the literal `300` is out of range for `u8`",
+    );
+}
+
+#[test]
+fn b423_two_literal_arms_keep_the_default() {
+    assert_compiles(concat!(
+        "fun want(value: i32): i32 { value }\n",
+        "fun main() {\n",
+        "\tlet flag = true;\n",
+        "\tlet two = if flag { 1 } else { 2 };\n",
+        "\twant(two);\n",
+        "}\n",
+    ));
+}

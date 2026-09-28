@@ -43,6 +43,9 @@ written down.
 <!-- family: fix -->
 **A blanket over a supertrait applies to a type that implements the supertrait through a one-block subtrait impl: `impl Cell<type T> with Signal<T> { .. }` reaches `map`, `.cell()` and every other blanket over `S: Source<T>`, where it was "Cell<i32> has no method 'map'".** B243 made that one-block form reach the supertrait's DEFAULTS; since A124's flip `map` is a blanket, and a blanket asks whether the type implements `Source` — which read only the traits a `with` clause NAMES. Each impl block's provided set is now its clause closed over the supertrait chain, at the arguments the clause reaches each supertrait through (so a blanket at `Src<i32>` still refuses a `Cell<str>`, naming the trait). A blanket's own clause is left as written: its bound is what requires the supertrait, not what provides it. What to change: a type that carried its OWN inherent `map` (or any member a std blanket over `Source` declares) as the workaround for this — kolt's `StorageSignalCell` — now meets A86's rule, that a blanket and a concrete subject declaring one inherent name collide; drop the inherent member and use the blanket's (`.map(..)` answers a `Map` node, so write `.map(..).cell()` where a `SignalCell` is wanted). Tracker B419.
 
+<!-- family: fix -->
+**A literal `if` arm or `match` leg takes its sibling's numeric type: `let m = if n > 2 { n } else { 0 };` with `n: u53` types the `0` as `u53`, in either order and for a `match` leg alike, where it was "`if` arms have mismatched types: expected u53, but got i32".** With a declared type around it the arms were already typed from it; with none, the literal fell to its own default. It now takes the first typed arm's type when that is numeric — the peer step a literal binding already takes — and is held to that type's range (`300` beside a `u8` arm is out of range). Two literal arms keep the default. Tracker B423.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->
