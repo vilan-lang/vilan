@@ -15,6 +15,14 @@ For the guided on-ramp, see [Hello Vilan](../tour/hello-vilan.md); for
 `--watch`, HMR, and the manifest keys that shape the dev loop, see
 [the dev loop](../guide/dev-loop.md).
 
+One flag stands outside the commands: `vilan --print-keywords` prints the
+language's keyword table (every word the lexer reads as a keyword rather
+than a name) as JSON, `{"keywords": ["async", "await", …]}`, and exits.
+It is the list for a tool that highlights or escapes Vilan outside this
+toolchain to read instead of keeping its own copy, which drifts: the
+playground's editor on this site reads it, and `vilan bindgen` escapes
+exactly these words (a TypeScript member named `lazy` binds as `lazy_`).
+
 ## `vilan init [name]`
 
 Scaffolds a ready-to-run project: a manifest, sources that compile, and

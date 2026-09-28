@@ -31,11 +31,18 @@ use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 #[command(
     name = "vilan",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VILAN_BUILD_SHA"), ")"),
-    about
+    about,
+    arg_required_else_help = true,
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    /// Print the language's keyword table as JSON (`{"keywords": [...]}`) and
+    /// exit — the one list an editor or a highlighter outside this toolchain
+    /// reads instead of keeping its own copy (the website's playground does).
+    #[arg(long, exclusive = true)]
+    print_keywords: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -330,7 +337,20 @@ fn main() -> ExitCode {
 }
 
 fn run_cli() -> ExitCode {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    if cli.print_keywords {
+        print!("{}", vilan_core::keyword_table::to_json());
+        return ExitCode::SUCCESS;
+    }
+    // `arg_required_else_help` answers a bare `vilan` with the help, as the
+    // required subcommand did before `--print-keywords` made it optional; a
+    // flag with no subcommand is the only other way here.
+    let Some(command) = cli.command else {
+        use clap::CommandFactory as _;
+        let _ = Cli::command().print_help();
+        return ExitCode::from(2);
+    };
+    match command {
         Command::Build {
             file,
             stdout,
@@ -7934,6 +7954,31 @@ mod tests {
             2,
             "a compiler thread spawned outside `spawn_compiler_thread` / \
              `spawn_scoped_compiler_thread` declares no stack to the probe"
+        );
+    }
+
+    // --- `vilan --print-keywords` (E225, K24) --------------------------------
+
+    /// The flag parses alone; with a subcommand it is refused rather than one
+    /// of the two silently ignored; a bare `vilan` still answers with help.
+    #[test]
+    fn print_keywords_is_a_top_level_flag_that_takes_no_subcommand() {
+        let cli = Cli::try_parse_from(["vilan", "--print-keywords"]).expect("parses");
+        assert!(cli.print_keywords);
+        assert!(cli.command.is_none());
+        let refused = Cli::try_parse_from(["vilan", "--print-keywords", "build"])
+            .err()
+            .expect("the flag and a subcommand conflict");
+        assert!(
+            refused.to_string().contains("cannot be used with"),
+            "{refused}"
+        );
+        let bare = Cli::try_parse_from(["vilan"])
+            .err()
+            .expect("a bare `vilan` is help");
+        assert_eq!(
+            bare.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
     }
 
