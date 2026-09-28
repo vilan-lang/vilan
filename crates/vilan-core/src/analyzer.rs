@@ -2748,6 +2748,17 @@ impl Constraint<'_> {
     }
 }
 
+/// What [`Analyzer::nested_dyn_landing`] found one level or more inside a
+/// landing (B435).
+enum NestedDyn {
+    /// A `dyn` position holding a concrete value that erases to it — the pair
+    /// named in the refusal.
+    Erasure { object: Type, concrete: Type },
+    /// A concrete position holding an object: the narrowing the top level
+    /// refuses, reached through a container.
+    Narrowing,
+}
+
 /// The outcome of resolving a [`Constraint`]. `Failed` has already recorded its
 /// diagnostic. `Resolved` and `Failed` are both progress — the task is done and
 /// dropped from the queue; `Deferred` re-queues it for a later pass.
@@ -35560,7 +35571,7 @@ impl<'src> Analyzer<'src> {
             waiting_on.push(expr_id);
         }
         self.note_callable_coercion(expr_id, constraint, &inferred);
-        self.note_dyn_coercion(expr_id, constraint, &inferred);
+        self.note_dyn_coercion(expr_id, constraint, &inferred, substitution_context);
         inferred
     }
 
@@ -35578,7 +35589,30 @@ impl<'src> Analyzer<'src> {
     ///
     /// The shape test comes first because this runs on every inference entry
     /// and a `dyn` expectation is a vanishing minority of them.
-    fn note_dyn_coercion(&mut self, expr_id: Id, constraint: &Type, inferred: &Type) {
+    fn note_dyn_coercion(
+        &mut self,
+        expr_id: Id,
+        constraint: &Type,
+        inferred: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        // B435: a position spelled by a generic parameter this inference has
+        // bound — `List<T>::push(value: T)` on a `List<dyn Src>` — IS the
+        // object position. Read through the binding, or `ys.push(Root { .. })`
+        // stored the bare value in a list of objects (JS `x.get is not a
+        // function`). Only the one lookup: the nested walk below reads each
+        // level's binding itself.
+        let bound_constraint;
+        let constraint = match constraint {
+            Type::Generic(constraint_id) => match substitution_context.get(constraint_id) {
+                Some(bound) => {
+                    bound_constraint = bound.get_type(self);
+                    &bound_constraint
+                }
+                None => constraint,
+            },
+            _ => constraint,
+        };
         // The rule's other half: an object never NARROWS. `dyn Trait` is where
         // the concrete type went, not a view of it, so a `dyn` landing in a
         // concrete position is refused — here, because this is the one seam
@@ -35593,6 +35627,7 @@ impl<'src> Analyzer<'src> {
             return;
         }
         let Type::Dyn(trait_id, trait_arguments) = constraint else {
+            self.refuse_nested_dyn_coercion(expr_id, constraint, inferred, substitution_context);
             return;
         };
         // An object flowing into a `dyn`-typed position is already one: no pair
@@ -35672,6 +35707,216 @@ impl<'src> Analyzer<'src> {
             expr_id,
             (subject_type_id, *trait_id, trait_arguments.clone()),
         );
+    }
+
+    /// B435: a value that is already BUILT reaching a position whose `dyn` is
+    /// NESTED — a `List<Root>` binding passed as `List<dyn Src>`, an
+    /// `Option<Root>` call result, a `Box<Root>` field, a `|| Root` closure
+    /// held in a local, a generic struct literal whose parameter bound to the
+    /// concrete type — is refused, with the element-wise spelling as the
+    /// steer.
+    ///
+    /// The erasure is a per-VALUE act (trait-objects.md §7.2): the pair is
+    /// built where one value lands in one `dyn` position. A literal carries
+    /// the expectation down to each element — `[Root { .. }]`, `Some(Root {
+    /// .. })`, `|| Root { .. }` all erase their element where it is written —
+    /// but a value that was built already has concrete elements inside it,
+    /// and nothing re-wraps them: `reconcile_type` accepted the pair of types
+    /// (it is a unifier, and its `Dyn` arms answer "the object"), the JS
+    /// build handed the raw values to code that reads each as a `(value,
+    /// table)` pair, and the native build refused at rustc. Refusing HERE
+    /// is the same seam and the same allow-list the top-level erasure uses:
+    /// only a form that holds a finished value (a binding, a field, an
+    /// element, a call result) can be one whose insides were built
+    /// elsewhere.
+    fn refuse_nested_dyn_coercion(
+        &mut self,
+        expr_id: Id,
+        constraint: &Type,
+        inferred: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        if self.dyn_object_traits.is_empty()
+            || !matches!(
+                constraint,
+                Type::Struct(..)
+                    | Type::Enum(..)
+                    | Type::Tuple(..)
+                    | Type::Array(..)
+                    | Type::Closure(..)
+            )
+            || !matches!(
+                self.expr_id_to_expr_map.get(&expr_id),
+                Some(
+                    Expr::Local(_)
+                        | Expr::Field(..)
+                        | Expr::Index(..)
+                        | Expr::TupleIndex(..)
+                        | Expr::Call(_)
+                        | Expr::StructInitializer(..)
+                        | Expr::Dereference(_)
+                )
+            )
+        {
+            return;
+        }
+        // A variant constructor is a LITERAL for this purpose: `Some(Root {
+        // .. })` hands the position's payload type to its argument, which
+        // erases where it lands (and a built payload is refused at its own
+        // landing, one level down). Its own type still reads the payload's
+        // concrete type, which is why the walk would otherwise see a
+        // `Option<Root>`.
+        if let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&expr_id)
+            && self.call_is_variant_constructor(*call_id)
+        {
+            return;
+        }
+        let (object, concrete) =
+            match self.nested_dyn_landing(constraint, inferred, substitution_context, 0) {
+                None => return,
+                Some(NestedDyn::Narrowing) => {
+                    let constraint = self.substitute_type(constraint, substitution_context);
+                    self.refuse_dyn_narrowing(expr_id, &constraint, inferred);
+                    return;
+                }
+                Some(NestedDyn::Erasure { object, concrete }) => (object, concrete),
+            };
+        if !self.dyn_refusals_reported.insert(expr_id) {
+            return;
+        }
+        let Some(span) = self.span_map.get(&expr_id).map(|span| **span) else {
+            return;
+        };
+        let got = self.pretty_print_type(inferred, &HashMap::default());
+        let expected = self.pretty_print_type(constraint, substitution_context);
+        let object = self.pretty_print_type(&object, substitution_context);
+        let concrete = self.pretty_print_type(&concrete, &HashMap::default());
+        let steer = match constraint {
+            Type::Closure(..) => format!(
+                "wrap it in a closure literal (`|..| f(..)`), whose body's value becomes the \
+                 `{object}` where it lands"
+            ),
+            Type::Struct(id, _) if self.primitive_struct_ids.get("List") == Some(id) => {
+                format!(
+                    "rebuild it element by element under the object type — `let objects: \
+                     {expected} = value.map(|element| element);` erases each element where it \
+                     lands"
+                )
+            }
+            Type::Enum(id, _)
+                if self.enums.get(id).map(|enumeration| enumeration.name) == Some("Option") =>
+            {
+                format!(
+                    "rebuild it under the object type — `let object: {expected} = \
+                     value.map(|element| element);` erases the payload where it lands"
+                )
+            }
+            _ => format!(
+                "write the object type where the value is made — `let value: {expected} = \
+                 ..;` — so each `{concrete}` erases where it lands"
+            ),
+        };
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "a `{got}` does not become a `{expected}` as a whole: an object is built where \
+                 ONE value lands, and each `{concrete}` inside this one was built already; \
+                 {steer}"
+            ),
+        });
+    }
+
+    /// B435's walk: the first position NESTED inside `position` (depth ≥ 1)
+    /// that is a `dyn` while `value` holds, at the same place, a concrete type
+    /// that erases to it (or a rigid parameter whose bounds provide it, B412's
+    /// door) — or the reverse, a concrete position holding an object
+    /// ([`NestedDyn::Narrowing`]). `None` when there is no
+    /// such place — including when the walk gives up at its depth cap, which
+    /// is an answer of NO (a type deeper than the cap is not refused on a
+    /// guess). Depth 0 is the top-level erasure's own case and never answers
+    /// here. `position`'s generic parameters are read through `context` at
+    /// each level, as the top-level lookup reads the outermost one.
+    fn nested_dyn_landing(
+        &mut self,
+        position: &Type,
+        value: &Type,
+        context: &SubstitutionContext,
+        depth: usize,
+    ) -> Option<NestedDyn> {
+        const NESTED_DYN_DEPTH_CAP: usize = 32;
+        if depth > NESTED_DYN_DEPTH_CAP {
+            return None;
+        }
+        let position = match position {
+            Type::Generic(constraint_id) => context.get(constraint_id)?.get_type(self),
+            other => other.clone(),
+        };
+        // The other direction, nested: an object where a concrete type is
+        // wanted (`List<dyn Src>` passed as `List<Root>`) — never admitted at
+        // the top level (`refuse_dyn_narrowing`), and one level down the same
+        // pairs reached code reading them as the concrete value.
+        if depth > 0
+            && matches!(
+                position,
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+            )
+            && matches!(value, Type::Dyn(..))
+        {
+            return Some(NestedDyn::Narrowing);
+        }
+        let pairs: Vec<(TypeId, TypeId)> = match (&position, value) {
+            (Type::Dyn(trait_id, trait_arguments), _) => {
+                if depth == 0 {
+                    return None;
+                }
+                let erases = match value {
+                    Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..) => {
+                        self.type_implements_trait(value, *trait_id)
+                            && self.type_implements_trait_at(value, *trait_id, trait_arguments)
+                    }
+                    Type::Generic(constraint_id) => {
+                        self.generic_is_rigid_here(*constraint_id)
+                            && self.caller_generic_provides(
+                                *constraint_id,
+                                *trait_id,
+                                trait_arguments,
+                            )
+                    }
+                    _ => false,
+                };
+                return erases.then(|| NestedDyn::Erasure {
+                    object: position.clone(),
+                    concrete: value.clone(),
+                });
+            }
+            (Type::Struct(left, lefts), Type::Struct(right, rights))
+            | (Type::Enum(left, lefts), Type::Enum(right, rights))
+                if left == right && lefts.len() == rights.len() =>
+            {
+                lefts.iter().copied().zip(rights.iter().copied()).collect()
+            }
+            (Type::Tuple(lefts), Type::Tuple(rights)) if lefts.len() == rights.len() => {
+                lefts.iter().copied().zip(rights.iter().copied()).collect()
+            }
+            (Type::Array(left, _), Type::Array(right, _)) => vec![(*left, *right)],
+            (
+                Type::Closure(left_parameters, left_return, _),
+                Type::Closure(right_parameters, right_return, _),
+            ) if left_parameters.len() == right_parameters.len() => left_parameters
+                .iter()
+                .copied()
+                .zip(right_parameters.iter().copied())
+                .chain(std::iter::once((*left_return, *right_return)))
+                .collect(),
+            _ => return None,
+        };
+        pairs.into_iter().find_map(|(position_id, value_id)| {
+            let position = position_id.get_type(self);
+            let value = value_id.get_type(self);
+            self.nested_dyn_landing(&position, &value, context, depth + 1)
+        })
     }
 
     /// B340 Q1: record an expression at which a `Callable` value coerces to a
@@ -47409,6 +47654,27 @@ impl<'src> Analyzer<'src> {
                 substitution_context.insert(*generic_constraint, *generic_argument_id);
             }
         }
+        // B435: an OBJECT argument of the literal's expectation binds the
+        // parameter before any field is checked. `let c: Box2<dyn Src> = Box2 {
+        // v = Root { .. } }` reconciled the field value-first and bound `T :=
+        // Root`, so the value was never erased and a `Box2<Root>` reached a
+        // `Box2<dyn Src>` binding (JS: `x.get is not a function`). Bound to the
+        // object, the field's position IS a `dyn` one and the value erases
+        // where it lands, as a `dyn Src` field's value always has. Only a `dyn`
+        // argument binds this way: every other argument keeps the value-first
+        // rule (B406 seeds its literals below), because a concrete expectation
+        // has nothing to decide that the value does not.
+        if let Some(expected_id) = self.expected_types.get(&initializer_id).copied()
+            && let Type::Struct(expected_struct_id, expected_arguments) = expected_id.get_type(self)
+            && expected_struct_id == struct_id
+            && expected_arguments.len() == literal_param_ids.len()
+        {
+            for (parameter, argument) in literal_param_ids.iter().zip(expected_arguments) {
+                if matches!(argument.borrow_type(self), Type::Dyn(..)) {
+                    substitution_context.entry(*parameter).or_insert(argument);
+                }
+            }
+        }
         // B406, every field at once: a value's expectation is seeded before
         // ANY field is checked. The per-field seed in `check_field_value` runs
         // only once the loop reaches that field, and the loop stops at the
@@ -47517,7 +47783,13 @@ impl<'src> Analyzer<'src> {
                     // field of the same literal is then checked under: the
                     // second `Bag::new([])` read the first's instantiation.
                     for (constraint_id, type_id) in bindings {
-                        if literal_param_ids.contains(&constraint_id) {
+                        // B435: a parameter the expectation bound to an
+                        // OBJECT stays the object — the value erased into it,
+                        // and its own concrete type is not the literal's.
+                        let bound_to_object = substitution_context
+                            .get(&constraint_id)
+                            .is_some_and(|bound| matches!(bound.borrow_type(self), Type::Dyn(..)));
+                        if literal_param_ids.contains(&constraint_id) && !bound_to_object {
                             substitution_context.insert(constraint_id, type_id);
                         }
                     }

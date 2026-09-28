@@ -903,6 +903,84 @@ const DESTRUCTURE_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B435: a value erased where it lands in a `dyn` position that a generic
+/// parameter or a literal hands it — `push` on a `List<dyn Src>` (the list's
+/// own and a field's), an index assignment, `Some(value)` at an
+/// `Option<dyn Src>`, and a generic struct literal under a `Boxed<dyn Src>`
+/// annotation. Each printed a `TypeError` on JS before (the bare value
+/// reached code reading a `(value, table)` pair) and was refused by rustc;
+/// the two backends agree now.
+#[test]
+fn a_value_erased_at_a_bound_or_literal_dyn_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b435.vl"), B435_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b435.vl"),
+        Verdict::Identical,
+        "a value erased at a bound or literal `dyn` position must mean the same thing on both backends"
+    );
+}
+
+const B435_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Boxed<T> {\n",
+    "\tvalue: T,\n",
+    "}\n",
+    "\n",
+    "struct Bag {\n",
+    "\titems: List<dyn Src>,\n",
+    "}\n",
+    "\n",
+    "fun total(objects: List<dyn Src>): i32 {\n",
+    "\tmut sum = 0;\n",
+    "\tfor object in objects {\n",
+    "\t\tsum = sum + object.get();\n",
+    "\t}\n",
+    "\tsum\n",
+    "}\n",
+    "\n",
+    "fun read(object: Option<dyn Src>): i32 {\n",
+    "\tmatch object {\n",
+    "\t\tSome(let found) => found.get(),\n",
+    "\t\tNone => 0,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet root = Root { n = 4 };\n",
+    "\tprint(read(Some(root)));\n",
+    "\tprint(read(Some(Root { n = 5 })));\n",
+    "\tlet boxed: Boxed<dyn Src> = Boxed { value = Root { n = 7 } };\n",
+    "\tprint(boxed.value.get());\n",
+    "\tmut pushed: List<dyn Src> = [];\n",
+    "\tpushed.push(Root { n = 8 });\n",
+    "\tpushed.push(root);\n",
+    "\tprint(total(pushed));\n",
+    "\tmut bag = Bag { items = [] };\n",
+    "\tbag.items.push(Root { n = 9 });\n",
+    "\tprint(bag.items[0].get());\n",
+    "\tmut slots: List<dyn Src> = [Root { n = 0 }];\n",
+    "\tslots[0] = Root { n = 11 };\n",
+    "\tprint(slots[0].get());\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's

@@ -1357,6 +1357,21 @@ a field, an element of a list whose element type is a `dyn`. There is no
 implicit coercion between two concrete types, and no coercion out of an
 object: a `dyn Trait` never narrows back to the type it erased.
 
+The coercion is per VALUE, at the position where the value lands. A
+literal hands each of its elements the position — `[Root { .. }]` at a
+`List<dyn Src>`, `Some(root)` at an `Option<dyn Src>`, `|| Root { .. }` at
+a `|| dyn Src`, `Boxed { value = root }` under a `Boxed<dyn Src>`
+annotation — and a generic position bound to an object is one (`push` on
+a `List<dyn Src>`). A value already BUILT with concrete elements inside
+does not become an object container as a whole: a `List<Root>` binding
+or call result passed as `List<dyn Src>` is refused, and so is a built
+`Option<Root>`, a `Boxed<Root>`, and a `|| Root` closure held in a
+binding. Rebuild it element by element under the object type (`let
+objects: List<dyn Src> = built.map(|element| element);`), or wrap a
+closure in a literal (`|| make()`). The reverse, nested (`List<dyn Src>`
+where `List<Root>` is wanted), is the narrowing, refused one level down
+as at the top.
+
 **Resources.** A `resource` value may not be coerced into a trait object.
 Teardown through a table would make the destructor dynamic where the rest
 of the language keeps it static (memory.md R7/R10), so the coercion is

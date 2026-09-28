@@ -1019,3 +1019,215 @@ fn b421_a_node_at_the_objects_arguments_still_erases() {
         "9\n",
     );
 }
+
+// --- B435: a `dyn` NESTED inside a landing -----------------------------------
+//
+// The erasure is per VALUE: a literal hands each element its `dyn` position,
+// a value already BUILT has concrete elements inside and nothing re-wraps
+// them. Such a landing type-checked (the unifier's `Dyn` arms answer "the
+// object") and crashed on JS (`x.get is not a function`); natively rustc
+// refused it. Refused now with the element-wise steer; a generic position
+// bound to an object (`push` on a `List<dyn Src>`) and a generic literal
+// under an object annotation erase instead.
+
+const B435_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src { fun get(self): i32; }\n",
+    "struct Root { n: i32 }\n",
+    "impl Root with Src { fun get(self): i32 { self.n } }\n",
+    "struct Boxed<T> { value: T }\n",
+    "fun total(objects: List<dyn Src>): i32 {\n",
+    "\tmut sum = 0;\n",
+    "\tfor object in objects { sum = sum + object.get(); }\n",
+    "\tsum\n",
+    "}\n",
+    "fun read(object: Option<dyn Src>): i32 {\n",
+    "\tmatch object { Some(let found) => found.get(), None => 0 }\n",
+    "}\n",
+    "fun run(make: || dyn Src): i32 { make().get() }\n",
+    "fun roots(): List<Root> { [Root { n = 10 }] }\n",
+);
+
+const B435_REFUSAL: &str = "does not become a";
+
+#[test]
+fn b435_a_built_list_binding_at_a_list_of_objects_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet built: List<Root> = [Root { n = 1 }];\n",
+                "\tprint(total(built));\n",
+                "}\n",
+            )
+        ),
+        "a `List<Root>` does not become a `List<dyn Src>` as a whole",
+    );
+}
+
+#[test]
+fn b435_a_call_result_at_a_list_of_objects_is_refused_with_the_map_steer() {
+    assert_fails_once_with(
+        &format!(
+            "{B435_HEAD}{}",
+            "fun main() {\n\tlet objects: List<dyn Src> = roots();\n\tprint(total(objects));\n}\n"
+        ),
+        "`let objects: List<dyn Src> = value.map(|element| element);`",
+    );
+}
+
+#[test]
+fn b435_a_built_option_at_an_option_of_an_object_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet maybe: Option<Root> = Some(Root { n = 3 });\n",
+                "\tprint(read(maybe));\n",
+                "}\n",
+            )
+        ),
+        "a `Option<Root>` does not become a `Option<dyn Src>` as a whole",
+    );
+}
+
+#[test]
+fn b435_a_closure_binding_at_an_object_returning_closure_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B435_HEAD}{}",
+            "fun main() {\n\tlet make = || Root { n = 7 };\n\tprint(run(make));\n}\n"
+        ),
+        "wrap it in a closure literal",
+    );
+}
+
+#[test]
+fn b435_a_built_generic_struct_at_an_object_argument_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet built: Boxed<Root> = Boxed { value = Root { n = 1 } };\n",
+                "\tlet erased: Boxed<dyn Src> = built;\n",
+                "\tprint(erased.value.get());\n",
+                "}\n",
+            )
+        ),
+        "a `Boxed<Root>` does not become a `Boxed<dyn Src>` as a whole",
+    );
+}
+
+#[test]
+fn b435_a_built_tuple_is_refused_at_a_tuple_of_objects_inside_a_list() {
+    // A tuple nested one level further down than B430's element-wise door.
+    assert_fails_with(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun pairs(items: List<(dyn Src, i32)>): i32 { items.len().as_i32() }\n",
+                "fun main() {\n",
+                "\tlet built: List<(Root, i32)> = [(Root { n = 1 }, 2)];\n",
+                "\tprint(pairs(built));\n",
+                "}\n",
+            )
+        ),
+        B435_REFUSAL,
+    );
+}
+
+#[test]
+fn b435_a_list_of_objects_at_a_list_of_the_concrete_type_is_refused() {
+    // The narrowing, one level down: an object does not narrow back.
+    assert_fails_once_with(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun sum(items: List<Root>): i32 { mut s = 0; for item in items { s = s + item.n; } s }\n",
+                "fun main() {\n",
+                "\tlet objects: List<dyn Src> = [Root { n = 1 }];\n",
+                "\tprint(sum(objects));\n",
+                "}\n",
+            )
+        ),
+        "Expected List<Root>, but got List<dyn Src> instead: an object does not narrow back",
+    );
+}
+
+#[test]
+fn b435_the_literal_and_element_wise_spellings_erase_and_run() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet built: List<Root> = [Root { n = 1 }, Root { n = 2 }];\n",
+                "\tlet objects: List<dyn Src> = built.map(|element| element);\n",
+                "\tprint(total(objects));\n",
+                "\tlet maybe: Option<Root> = Some(Root { n = 3 });\n",
+                "\tlet object: Option<dyn Src> = maybe.map(|element| element);\n",
+                "\tprint(read(object));\n",
+                "\tlet root = Root { n = 4 };\n",
+                "\tprint(read(Some(root)));\n",
+                "\tprint(read(Some(Root { n = 5 })));\n",
+                "\tlet make = || Root { n = 6 };\n",
+                "\tprint(run(|| make()));\n",
+                "\tprint(total([Root { n = 7 }, root]));\n",
+                "}\n",
+            )
+        ),
+        "3\n3\n4\n5\n6\n11\n",
+    );
+}
+
+#[test]
+fn b435_a_push_into_a_list_of_objects_erases_the_value() {
+    // `List<T>::push(value: T)`: `T` is bound to the object at this call, so
+    // the value's position IS a `dyn` one.
+    assert_compiles_and_runs(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "struct Bag { items: List<dyn Src> }\n",
+                "fun main() {\n",
+                "\tmut pushed: List<dyn Src> = [];\n",
+                "\tpushed.push(Root { n = 1 });\n",
+                "\tlet root = Root { n = 2 };\n",
+                "\tpushed.push(root);\n",
+                "\tprint(total(pushed));\n",
+                "\tmut bag = Bag { items = [] };\n",
+                "\tbag.items.push(Root { n = 4 });\n",
+                "\tprint(bag.items[0].get());\n",
+                "\tmut slots: List<dyn Src> = [Root { n = 0 }];\n",
+                "\tslots[0] = Root { n = 5 };\n",
+                "\tprint(slots[0].get());\n",
+                "}\n",
+            )
+        ),
+        "3\n4\n5\n",
+    );
+}
+
+#[test]
+fn b435_a_generic_struct_literal_under_an_object_annotation_erases_its_field() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B435_HEAD}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet boxed: Boxed<dyn Src> = Boxed { value = Root { n = 8 } };\n",
+                "\tprint(boxed.value.get());\n",
+                "\tlet root = Root { n = 9 };\n",
+                "\tlet held: Boxed<dyn Src> = Boxed { value = root };\n",
+                "\tprint(held.value.get());\n",
+                "\tlet plain: Boxed<i32> = Boxed { value = 3 };\n",
+                "\tprint(plain.value);\n",
+                "}\n",
+            )
+        ),
+        "8\n9\n3\n",
+    );
+}
