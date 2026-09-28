@@ -582,6 +582,15 @@ const A_PATH_CANNOT_START_AT_A_BLOCK: &str = "`::` reaches into a NAMESPACE — 
 /// the pair is a Rust spelling with no reading here — and the failure it
 /// produces ("found 'let' expected a statement") names the one token that was
 /// right (E101).
+const OWN_IS_A_PARAMETER_CONVENTION: &str = "`own` is a PARAMETER convention — `fun take(own list: List<T>)` — and has no \
+     reading here: a `let` already owns its value, and a type is written without it";
+
+const DYN_IS_A_TYPE_MARKER: &str = "`dyn` marks a trait object in TYPE position — `let shape: dyn Shape = circle;` — and \
+     has no reading in an expression: a value becomes a trait object where it meets that type";
+
+const LAZY_IS_WRITTEN_AT_THE_DECLARATION: &str = "`lazy` is written where the deferral is DECLARED — `lazy let name: T = …;` at \
+     module level, or `lazy name: T` on a parameter — and a call passes the argument plainly";
+
 const LET_MUT_IS_ONE_WORD: &str = "a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, \
      not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and \
      writing both is neither";
@@ -708,21 +717,57 @@ fn starts_item(token: &Token<'_>) -> bool {
 /// expression statement, but they also appear all through a broken one, so
 /// stopping at them would resume mid-garbage and report again (the cascade
 /// `editing-dx.md` §9 records vilan as not having).
-fn starts_statement_or_item(token: &Token<'_>) -> bool {
+fn starts_statement_or_item(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    let Some((token, _)) = tokens.get(index) else {
+        return false;
+    };
     starts_item(token)
+        || starts_contextual_statement(tokens, index)
         || matches!(
             token,
             Token::Let
-                | Token::Lazy
                 | Token::Mut
                 | Token::Ret
-                | Token::Jump
                 | Token::If
                 | Token::For
                 | Token::Match
                 | Token::Const
                 | Token::Async
         )
+}
+
+/// Whether the CONTEXTUAL keyword at `index` begins a statement — the LL(2)
+/// test of `proposal/contextual-keywords.md` §2 at a statement head (B414):
+/// `jump` followed by its target (a name) is the jump; `lazy` followed by
+/// `let`/`mut` is the lazy binding, and followed by a name it is the
+/// missing-binder-word recovery `parse_let` reports (two juxtaposed names are
+/// never an expression, so nothing else could read it). Anything else after
+/// either word — `jump.height`, `lazy = 3;`, `lazy.force()` — is an expression
+/// over a NAME. One predicate for the dispatch in
+/// [`Parser::parse_secondary_inner`] and the recovery sync points, so the two
+/// can never disagree about what a statement head is.
+fn starts_contextual_statement(tokens: &[Spanned<Token<'_>>], index: usize) -> bool {
+    let next = tokens.get(index + 1).map(|(token, _)| token);
+    match tokens.get(index).map(|(token, _)| token) {
+        Some(Token::Ident("jump")) => matches!(next, Some(Token::Ident(_))),
+        Some(Token::Ident("lazy")) => {
+            matches!(next, Some(Token::Let | Token::Mut | Token::Ident(_)))
+        }
+        _ => false,
+    }
+}
+
+/// The placement rule for a contextual keyword written, before a name, where
+/// its keyword reading is not admitted (B414) — or `None` for a word that has
+/// no such misreading (`with`/`borrows` are positional: the typo cases read the
+/// same before and after the demotion).
+fn misplaced_contextual_keyword(word: &str) -> Option<ParseErrorReason> {
+    match word {
+        "own" => Some(ParseErrorReason::Rule(OWN_IS_A_PARAMETER_CONVENTION)),
+        "dyn" => Some(ParseErrorReason::Rule(DYN_IS_A_TYPE_MARKER)),
+        "lazy" => Some(ParseErrorReason::Rule(LAZY_IS_WRITTEN_AT_THE_DECLARATION)),
+        _ => None,
+    }
 }
 
 /// The closing bracket that matches an opening one — for the `Unbalanced` message.
@@ -890,6 +935,27 @@ fn parse_with(
     (Some(root), errors)
 }
 
+/// The spans of `source`'s CONTEXTUAL keywords (B414) where the parser read
+/// them AS keywords — `with` in `impl A with B`, and not the method
+/// `list.with(..)`; `own` in `fun f(own x: T)`, and not the parameter
+/// `own: Owner`. The editor's raw-parse read (contextual-keywords.md §6, Q5):
+/// the lexer cannot answer, because it hands every contextual word back as an
+/// identifier, and the analyzed program cannot either, because a keyword
+/// binds no entity. Sorted, without duplicates; a recovered parse answers for
+/// what it recovered.
+pub fn contextual_keyword_readings(source: &str) -> Vec<Span> {
+    let (tokens, _) = lexing::tokenize(source);
+    let mut parser = Parser::new(&tokens, source, false);
+    parser.parse_program();
+    let mut indices = std::mem::take(&mut parser.contextual_readings);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+        .into_iter()
+        .filter_map(|index| tokens.get(index).map(|(_, span)| *span))
+        .collect()
+}
+
 struct Parser<'a, 'src> {
     tokens: &'a [Spanned<Token<'src>>],
     position: usize,
@@ -997,6 +1063,14 @@ struct Parser<'a, 'src> {
     /// Cleared at the head of every `import`/`use`, so one statement's record
     /// can never be read by the next.
     import_path_failure: Option<usize>,
+    /// The token indices at which a CONTEXTUAL keyword (B414) was read as its
+    /// keyword — pushed by [`Parser::eat_word`] and
+    /// [`Parser::eat_binder_prefix`], the two funnels every contextual reading
+    /// goes through, and popped past the rewind point when an
+    /// [`Parser::attempt`] declines. Read only by
+    /// [`contextual_keyword_readings`], the editor's raw-parse question "is
+    /// this `with` the keyword or a name?" (hover, contextual-keywords.md Q5).
+    contextual_readings: Vec<usize>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1226,6 +1300,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             nesting_depth: 0,
             nesting_refusal: None,
             import_path_failure: None,
+            contextual_readings: Vec::new(),
         }
     }
 
@@ -1377,6 +1452,48 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
+    // --- Contextual keywords (B414, proposal/contextual-keywords.md) --------
+
+    /// Whether the cursor is at the identifier `word` — how every contextual
+    /// keyword (lexing.rs `CONTEXTUAL_KEYWORDS`) is recognized: the lexer hands
+    /// it back as a name, and the parser reads its keyword meaning by position.
+    fn peek_is_word(&self, word: &str) -> bool {
+        matches!(self.peek(), Some(Token::Ident(found)) if *found == word)
+    }
+
+    /// Consumes the contextual keyword `word` at a POSITIONAL decision point —
+    /// one where no name can stand, so the word there is always the keyword:
+    /// `with` after an `impl` subject or a `trait` head, `borrows` after a
+    /// declaration's return type.
+    fn eat_word(&mut self, word: &str) -> bool {
+        if self.peek_is_word(word) {
+            self.contextual_readings.push(self.position);
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The LL(2) decision (contextual-keywords.md §2) for a contextual keyword
+    /// whose reading is a PREFIX of a binder — `own` and `lazy` at a parameter
+    /// head: the word at the cursor is the keyword when what follows it can
+    /// begin a binder (a name, `mut`, a destructure's `(`/`[`, a spread's
+    /// `...`), and a NAME otherwise (`own: Owner`, `|lazy| lazy.force()`).
+    /// Sound because vilan never puts two names side by side.
+    fn eat_binder_prefix(&mut self, word: &str) -> bool {
+        let prefixes_a_binder = self.peek_is_word(word)
+            && matches!(
+                self.peek_at(1),
+                Some(Token::Ident(_) | Token::Mut | Token::Ctrl('(' | '[' | '.'))
+            );
+        if prefixes_a_binder {
+            self.contextual_readings.push(self.position);
+            self.bump();
+        }
+        prefixes_a_binder
+    }
+
     // --- Span assembly -------------------------------------------------------
 
     /// The span of a parse that began at token index `start` and ends at the
@@ -1426,6 +1543,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         if result.is_none() {
             self.position = start;
             self.errors.truncate(error_count);
+            while self
+                .contextual_readings
+                .last()
+                .is_some_and(|index| *index >= start)
+            {
+                self.contextual_readings.pop();
+            }
             // `nesting_refusal` is deliberately NOT restored: like
             // `farthest_failure`, it records how deep the input went, which no
             // backtrack un-does. See the field.
@@ -1687,6 +1811,25 @@ impl<'a, 'src> Parser<'a, 'src> {
             });
             return;
         }
+        // B414: a contextual keyword followed by a name, where its keyword
+        // reading is not admitted — `let own x = 1;`, `let s = dyn Shape;` —
+        // reads the word as a NAME and stops at the name after it. The word is
+        // the whole mistake, so its placement rule replaces the message
+        // (contextual-keywords.md §8; `parse_misplaced_resource` is the
+        // precedent).
+        if let Some(previous) = position.checked_sub(1)
+            && matches!(self.tokens.get(position), Some((Token::Ident(_), _)))
+            && let Some((Token::Ident(word), _)) = self.tokens.get(previous)
+            && let Some(reason) = misplaced_contextual_keyword(word)
+        {
+            self.errors.push(ParseError {
+                span: self.token_span(previous),
+                reason,
+                context,
+                hint: None,
+            });
+            return;
+        }
         // A missing statement terminator is not a "found X expected Y" — the token
         // at `position` is a perfectly good next statement, and the mistake is in
         // the whitespace before it (`editing-dx.md` §4.4). It reports at the gap,
@@ -1729,10 +1872,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             Some((Token::Ident("public"), _)) => "public",
             _ => return None,
         };
-        let starts_fresh = self
-            .tokens
-            .get(position)
-            .is_some_and(|(token, _)| starts_statement_or_item(token));
+        let starts_fresh = starts_statement_or_item(self.tokens, position);
         starts_fresh.then_some((previous, marker))
     }
 
@@ -1976,7 +2116,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 .or_else(|| parser.attempt(Self::parse_use))?;
             let at_a_fresh_statement = parser.at_end()
                 || parser.peek_is_ctrl('}')
-                || parser.peek().is_some_and(starts_statement_or_item);
+                || starts_statement_or_item(parser.tokens, parser.position);
             at_a_fresh_statement.then_some(body)
         }) else {
             return TerminatorRecovery::Declined;
@@ -2083,7 +2223,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             if index > start {
                 let inside_a_block = open.iter().any(|(_, closer)| *closer == '}');
                 let stops = if open.is_empty() {
-                    starts_statement_or_item(token)
+                    starts_statement_or_item(self.tokens, index)
                 } else {
                     !inside_a_block && starts_item(token)
                 };
@@ -2684,8 +2824,20 @@ impl<'a, 'src> Parser<'a, 'src> {
             // the tower, so a leading `||` is never a logical-or (which needs a left
             // operand). Nothing else in the grammar leads with `|`/`||` here.
             Some(Token::Op("|") | Token::Op("||")) => return self.parse_closure(),
-            Some(Token::Jump) => return self.parse_jump(),
-            Some(Token::Let | Token::Mut | Token::Lazy) => return self.parse_let(),
+            // B414: `jump` and `lazy` are contextual — the keyword only where
+            // the LL(2) test says so (`starts_contextual_statement`), a name
+            // (`jump.height`, `lazy = 3;`) everywhere else.
+            Some(Token::Ident("jump"))
+                if starts_contextual_statement(self.tokens, self.position) =>
+            {
+                return self.parse_jump();
+            }
+            Some(Token::Let | Token::Mut) => return self.parse_let(),
+            Some(Token::Ident("lazy"))
+                if starts_contextual_statement(self.tokens, self.position) =>
+            {
+                return self.parse_let();
+            }
             Some(Token::Ret) => return self.parse_return(),
             // The four block-bearing heads. They share one rule past their closing
             // brace — B248/B259's: the form is COMPLETE there, so an operator or a
@@ -4762,7 +4914,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `jump target` — a loop-control keyword.
     fn parse_jump(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        self.expect(&Token::Jump)?;
+        if !self.eat_word("jump") {
+            return None;
+        }
         let target = self.eat_ident()?;
         Some((Node::Jump(target), self.span_from(start)))
     }
@@ -4783,7 +4937,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // runs at the binding's first USE instead of at module load, then
         // memoizes. `lazy` is the outermost word, as it is on a parameter, and
         // for the same reason: it is about WHEN, before anything about what.
-        let lazy = self.eat(&Token::Lazy);
+        let lazy = self.eat_word("lazy");
         let mutable = if self.eat(&Token::Let) {
             false
         } else if self.eat(&Token::Mut) {
@@ -5277,7 +5431,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is(&Token::Type) || self.peek_is(&Token::Ident(ANONYMOUS_TYPE_BINDER)) {
             return self.parse_type_binder();
         }
-        if self.peek_is(&Token::Dyn) {
+        // B414: `dyn` is contextual — the trait-object marker at a type head,
+        // except `dyn::`, which is a path into a module named `dyn`.
+        if self.peek_is_word("dyn") && !self.peek_at_is_op(1, "::") {
             return self.parse_dyn_type();
         }
         if let Some(closure) = self.parse_closure_type() {
@@ -5311,7 +5467,9 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// stands wherever a type stands.
     fn parse_dyn_type(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        self.expect(&Token::Dyn)?;
+        if !self.eat_word("dyn") {
+            return None;
+        }
         let Some(inner) = self.parse_path_type() else {
             self.note_expected("a trait name after `dyn`");
             return None;
@@ -5898,7 +6056,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
         }
         // `borrows <param>` — the returned view is a projection of that parameter.
-        let borrows = if self.eat(&Token::Borrows) {
+        // Contextual (B414): positional, after the return type, where no name
+        // can stand.
+        let borrows = if self.eat_word("borrows") {
             Some(self.eat_ident()?)
         } else {
             None
@@ -6019,9 +6179,12 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// question (the three rules below).
     fn parse_function_parameter(&mut self) -> Option<Parameter<'src>> {
         let start = self.position;
-        let lazy = self.eat(&Token::Lazy);
+        // B414: `lazy` and `own` are contextual — each is the prefix only
+        // when a binder follows it (`eat_binder_prefix`), so a parameter may
+        // be NAMED either (`own: Owner`, `|lazy| …`).
+        let lazy = self.eat_binder_prefix("lazy");
         let mutable = self.eat(&Token::Mut);
-        let prefix = if self.eat(&Token::Own) {
+        let prefix = if self.eat_binder_prefix("own") {
             Some(Convention::Own)
         } else if self.eat_op("&") {
             Some(if self.eat(&Token::Mut) {
@@ -6041,7 +6204,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // composition rules below names the real problem, instead of the
         // backtrack throwing "expected an expression" at the next declaration
         // (diagnostics-standard B5).
-        let lazy = lazy | self.eat(&Token::Lazy);
+        let lazy = lazy | self.eat_binder_prefix("lazy");
         let spread = self.eat_spread();
         let (pattern, pattern_span) = self.parse_binder()?;
         let parameter_type = if self.eat_op(":") {
@@ -6471,7 +6634,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         let labels = self.parse_item_labels();
         self.expect(&Token::Impl)?;
         let subject = self.parse_type()?;
-        let traits = if self.eat(&Token::With) {
+        // B414: `with` is contextual, and positional — after the subject no
+        // name can stand (a type path never consumes a following identifier).
+        let traits = if self.eat_word("with") {
             self.parse_type_bounds()?
         } else {
             Vec::new()
@@ -6504,7 +6669,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let name = self.eat_ident()?;
         let name = (name, self.span_from(name_start));
         let generic_parameters = self.parse_generic_parameters();
-        let supertraits = if self.eat(&Token::With) {
+        let supertraits = if self.eat_word("with") {
             self.parse_type_bounds()?
         } else {
             Vec::new()
@@ -10168,5 +10333,90 @@ mod tests {
         assert_eq!(statements.len(), 1, "the complete `fun ok` survives");
         assert!(matches!(statements[0].0, Node::Func(_)));
         assert!(!errors.is_empty(), "the broken tail is still reported");
+    }
+
+    // --- B414: contextual keywords --------------------------------------------
+
+    /// The words the parser READ as keywords in `source`, in order.
+    fn readings(source: &str) -> Vec<&str> {
+        contextual_keyword_readings(source)
+            .into_iter()
+            .map(|span| &source[span.into_range()])
+            .collect()
+    }
+
+    #[test]
+    fn b414_each_contextual_keyword_is_read_as_the_keyword_only_at_its_decision_point() {
+        let source = concat!(
+            "impl Point with Show { fun with(self, with: i32): i32 { with } }\n",
+            "trait Ordered with Equal {}\n",
+            "fun first(xs: &List<T>): &T borrows xs { xs.borrows }\n",
+            "fun take(own list: T, own: T, lazy fallback: T, lazy: T, shape: dyn Show) {}\n",
+            "lazy let config = 1;\n",
+            "fun main() {\n",
+            "\tlet own = 1; let dyn = own; let jump = dyn; let lazy = jump;\n",
+            "\tlet close = |own| own.dispose();\n",
+            "\tlet path: dyn::Registry = dyn::Registry::new();\n",
+            "\tfor x in xs { jump break; }\n",
+            "\tlazy = 3; jump.height; with.len();\n",
+            "}\n",
+        );
+        let (_, errors) = parse(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            readings(source),
+            vec![
+                "with", "with", "borrows", "own", "lazy", "dyn", "lazy", "jump"
+            ],
+        );
+    }
+
+    #[test]
+    fn b414_a_declined_attempt_takes_its_readings_back() {
+        // `dyn` read inside a speculative type attempt that backtracks must not
+        // survive as a reading: `a < dyn` is a comparison over a name.
+        let source = "fun main() { let b = a < dyn; }\n";
+        let (_, errors) = parse(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(readings(source).is_empty(), "{:?}", readings(source));
+    }
+
+    #[test]
+    fn b414_jump_and_lazy_are_statement_heads_only_before_a_name() {
+        let tokens = |source: &'static str| lexing::tokenize(source).0;
+        for (source, heads) in [
+            ("jump break", true),
+            ("jump;", false),
+            ("jump.height", false),
+            ("lazy let x = 1", true),
+            ("lazy mut x = 1", true),
+            ("lazy x = 1", true),
+            ("lazy = 3", false),
+            ("lazy.force()", false),
+            ("lazy is Some(x)", false),
+        ] {
+            assert_eq!(
+                starts_contextual_statement(&tokens(source), 0),
+                heads,
+                "{source:?}"
+            );
+            assert_eq!(
+                starts_statement_or_item(&tokens(source), 0),
+                heads,
+                "{source:?} as a recovery sync point"
+            );
+        }
+    }
+
+    #[test]
+    fn b414_a_misplaced_prefix_word_names_its_placement() {
+        assert_eq!(
+            rendered_errors("fun main() {\n\tlet own x = 1;\n}\n"),
+            vec![OWN_IS_A_PARAMETER_CONVENTION.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("fun main() {\n\tlet s = dyn Shape;\n}\n"),
+            vec![DYN_IS_A_TYPE_MARKER.to_string()]
+        );
     }
 }

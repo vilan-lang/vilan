@@ -53,7 +53,7 @@
 //!    [`every_curated_rule_statement_still_opens_as_recorded`]). A
 //!    `ParseErrorReason::Rule` stated through a NAMED constant is a message the
 //!    index cannot key on — row 229 is keyless for exactly this reason, and its
-//!    count notices a site added, never a message reworded. The eighteen are
+//!    count notices a site added, never a message reworded. They are
 //!    named with their heads in [`CURATED_RULE_STATEMENTS`], held to the tree in
 //!    both directions.
 //! 7. **The exemptions expire** (N42/N50, and N27's rule for `#[ignore]`
@@ -397,7 +397,7 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// `&'static str` rather than a literal (the lexer's rule constants come through
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
-const RULE_STATEMENT_SITES: usize = 52;
+const RULE_STATEMENT_SITES: usize = 55;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what
@@ -517,6 +517,21 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
         "crates/vilan-core/src/parsing.rs",
         "LET_MUT_IS_ONE_WORD",
         "a mutable binding is spelled `mut x = …`:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "OWN_IS_A_PARAMETER_CONVENTION",
+        "`own` is a PARAMETER convention — `fun take(own list: List<T>)` —",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "DYN_IS_A_TYPE_MARKER",
+        "`dyn` marks a trait object in TYPE position —",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "LAZY_IS_WRITTEN_AT_THE_DECLARATION",
+        "`lazy` is written where the deferral is DECLARED —",
     ),
     (
         "crates/vilan-core/src/parsing.rs",

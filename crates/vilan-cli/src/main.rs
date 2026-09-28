@@ -3724,11 +3724,12 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
         // platform the editor analyzes it under, and the terminal must not
         // answer differently. Otherwise the CLI's `node` default answers, and
         // there is nothing about the file's own situation to explain.
-        let declared = vilan_core::util::read_source(&entry)
-            .ok()
-            .and_then(|text| vilan_core::platform_color::declared_platform(&text));
+        let text = vilan_core::util::read_source(&entry).ok();
+        let declared = text
+            .as_deref()
+            .and_then(vilan_core::platform_color::declared_platform);
         let platform = declared.as_ref().map(|declared| declared.hosts[0]);
-        let platform_reasons = declared
+        let mut platform_reasons = declared
             .map(|declared| {
                 vec![(
                     declared.hosts[0],
@@ -3736,6 +3737,21 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
                 )]
             })
             .unwrap_or_default();
+        // F27 R3 (§8.4 item 1): a platform-fenced twin the primary platform
+        // excludes is checked under its own platform too — a further leg.
+        let primary = platform.unwrap_or_default();
+        let twin_legs = text
+            .as_deref()
+            .map(|text| vilan_core::platform_color::twin_legs(text, &[primary]))
+            .unwrap_or_default();
+        let shared_platforms: Vec<Platform> =
+            twin_legs.iter().map(|(platform, _)| *platform).collect();
+        platform_reasons.extend(twin_legs.into_iter().map(|(platform, fence)| {
+            (
+                platform,
+                vilan_core::platform_color::PlatformReason::Twin(fence).clause(),
+            )
+        }));
         Project::Single {
             unit: Unit {
                 name: String::new(),
@@ -3752,7 +3768,7 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
                 },
             },
             platform,
-            shared_platforms: Vec::new(),
+            shared_platforms,
             hooks: BuildHooks::default(),
         }
     };

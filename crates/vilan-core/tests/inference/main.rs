@@ -22,6 +22,7 @@ mod borrows;
 mod bounds;
 mod callable;
 mod const_eval;
+mod contextual_keywords;
 mod dyn_objects;
 mod generics;
 mod hmr;

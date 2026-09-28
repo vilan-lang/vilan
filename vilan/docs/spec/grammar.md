@@ -4,6 +4,19 @@ The full syntactic grammar, in the notation of §1.3. Token classes
 (`IDENT`, `NUMBER`, `STRING`, …) are defined in §2. The start symbol is
 `module`.
 
+A quoted terminal that is a **contextual keyword** (§2.2 — `with`,
+`borrows`, `own`, `lazy`, `dyn`, `jump`, `as`, `only`, `context`, `sync`,
+`self`) matches an `IDENT` of that spelling, and only at the position its
+production puts it; everywhere else the same word is an ordinary `IDENT`
+(B414). Each is decided without backtracking. `with` (after an `impl`
+subject or a `trait` head) and `borrows` (after a return type) sit where no
+name can, so the position alone decides. `own` and `lazy` at a parameter's
+head, `lazy` before `let`/`mut`, `jump` before its target and `dyn` at a
+type's head are PREFIXES of a name, and the grammar never puts two names side
+by side, so the word is the keyword when a name follows it (for `dyn`, when
+anything but `::` follows it) and a name otherwise: `fun f(own: Owner)`,
+`|lazy| lazy.force()`, `jump.height`, `dyn::Registry`.
+
 ## 3.1 Modules and statements
 
 ```text
@@ -136,7 +149,7 @@ function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ ":" type ] [ "borrows" IDENT ] [ context-clause ]
            ( block | ";" ) ;
 
-parameter  = [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
+parameter  = [ "lazy" ] [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
 binder     = IDENT
            | "(" binder "," binder { "," binder } [ "," ] ")"

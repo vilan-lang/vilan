@@ -16,12 +16,15 @@ For the guided on-ramp, see [Hello Vilan](../tour/hello-vilan.md); for
 [the dev loop](../guide/dev-loop.md).
 
 One flag stands outside the commands: `vilan --print-keywords` prints the
-language's keyword table (every word the lexer reads as a keyword rather
-than a name) as JSON, `{"keywords": ["async", "await", …]}`, and exits.
-It is the list for a tool that highlights or escapes Vilan outside this
-toolchain to read instead of keeping its own copy, which drifts: the
-playground's editor on this site reads it, and `vilan bindgen` escapes
-exactly these words (a TypeScript member named `lazy` binds as `lazy_`).
+language's keyword table as JSON, `{"keywords": ["Self", "as", "async", …],
+"contextual": ["Self", "as", …]}`, and exits. `keywords` is every word with
+a keyword reading; `contextual` is the subset that is a keyword only in one
+position and an ordinary name everywhere else (`with`, `own`, `lazy`, `as`,
+…); the rest are reserved. It is the list for a tool that highlights or
+escapes Vilan outside this toolchain to read instead of keeping its own
+copy, which drifts: the playground's editor on this site reads it, and
+`vilan bindgen` escapes exactly the reserved words (a TypeScript member
+named `css` binds as `css_`, one named `lazy` as `lazy`).
 
 ## `vilan init [name]`
 

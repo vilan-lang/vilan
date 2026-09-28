@@ -267,10 +267,10 @@ fn canonicalize_declaration_clauses(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     while index < tokens.len() {
         if tokens[index] == Token::Ident("context")
             && let Some(after_clause) = context_clause_end(&tokens, index)
-            && tokens.get(after_clause) == Some(&Token::Borrows)
+            && tokens.get(after_clause) == Some(&Token::Ident("borrows"))
             && matches!(tokens.get(after_clause + 1), Some(Token::Ident(_)))
         {
-            result.push(Token::Borrows);
+            result.push(Token::Ident("borrows"));
             result.push(tokens[after_clause + 1].clone());
             result.extend(tokens[index..after_clause].iter().cloned());
             index = after_clause + 2;
@@ -8227,6 +8227,28 @@ mod reformats {
         assert_eq!(format(source), expected);
         // The output must be a fixed point — formatting it again is a no-op.
         assert_eq!(format(expected), expected, "output is not idempotent");
+    }
+
+    // B414: the six demoted keywords reprint as NAMES where they are names and
+    // as keywords where they are keywords — one file, both readings, and the
+    // declaration clause canonicalization (`borrows` before `context`) still
+    // reads a `borrows` that is an identifier token now.
+    #[test]
+    fn b414_contextual_keywords_reprint_in_both_readings() {
+        let source = concat!(
+            "struct Point {\n\twith: i32,\n\town: i32,\n}\n\n",
+            "impl Point with Show {\n\tfun with(self, own: i32): i32 {\n\t\tself.with + own\n\t}\n}\n\n",
+            "fun first(xs: &List<i32>): &i32 borrows xs context settings {\n\t&xs[0]\n}\n\n",
+            "fun take(own list: List<i32>, lazy fallback: i32, shape: dyn Show): i32 {\n\tfallback\n}\n\n",
+            "lazy let config: i32 = 1;\n\n",
+            "fun main() {\n\tlet lazy = 1;\n\tlet jump = lazy;\n\tlet dyn = |own: i32| own;\n",
+            "\tfor x in xs {\n\t\tjump break;\n\t}\n}\n",
+        );
+        assert_formats(source, source);
+        assert_formats(
+            "fun own(with: i32): i32 context lazy borrows with {\n\twith\n}\n",
+            "fun own(with: i32): i32 borrows with context lazy {\n\twith\n}\n",
+        );
     }
 
     // B242: a DECLARED `context` clause CLOSES the signature — it is the last

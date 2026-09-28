@@ -34,26 +34,41 @@ Identifiers are ASCII. The following words are **reserved**; they lex as
 keyword tokens and are never `IDENT`:
 
 ```text
-async     await     borrows  const   css    dyn     else  enum
-export    external  for      fun     if     impl    import in
-is        jump      lazy     let     macro  match   mod   mut
-null      own       ret      struct  trait  type    use   with
-true      false
+async     await     const    css     else    enum    export
+external  for       fun      if      impl    import  in
+is        let       macro    match   mod     mut     null
+ret       struct    trait    type    use     true    false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
 
-**Contextual keywords** lex as `IDENT` and take meaning only by position:
-`context` (the clause after a closure type, §3.9), `sync` (the marker
-opening a closure type, §3.9), `void` (the unit value/type), `self` and
-`Self` (receiver and receiver type; `self` is also the file's own module
-in `mod self;`, §3.1), `as` (the alias on an import path leaf, §3.2),
-`only` (the trailing modifier on an import, §3.2), `derive`, `service`,
-`extern`, `must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated`, `internal`, `resource` (attribute names in `[...]`
-position — `resource` was a keyword until B413 made it the `[resource]`
-attribute), and jump targets (`break`, `continue`) after `jump`. All remain usable as ordinary
-identifiers elsewhere, with one exception: `void` may not be a
+The following words are **contextual keywords**: they lex as `IDENT` and
+take meaning only by position, and are ordinary identifiers everywhere
+else (`vilan --print-keywords` prints both lists, each word flagged):
+
+```text
+as        borrows   context   dyn       jump      lazy      only
+own       self      Self      sync      void      with
+```
+
+`with` is the trait list of an `impl` or `trait` head (§3.3); `borrows`
+the return clause after a declaration's return type (§3.3); `own` and
+`lazy` a parameter's prefix when a binder follows (§3.3), and `lazy` also
+opens a `lazy let` (§3.4); `dyn` the trait-object marker at a type's head
+(§3.9 — `dyn::` is a path instead); `jump` loop control when its target
+follows (§3.4); `context` the clause after a closure type or a return type
+(§3.9); `sync` the marker opening a closure type (§3.9); `void` the unit
+value and type; `self` and `Self` the receiver and its type (`self` is
+also the file's own module in `mod self;`, §3.1); `as` the alias on an
+import path leaf and `only` the trailing modifier on an import (§3.2).
+Beside them, two families of words are matched by text in one position
+and are ordinary identifiers everywhere else: the ATTRIBUTE names in
+`[...]` position (`derive`, `service`, `client_service`, `extern`,
+`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
+`deprecated`, `internal`, `resource` — `resource` was a keyword until B413
+made it the `[resource]` attribute), and the jump TARGETS `break` and
+`continue` after `jump`. All remain usable as ordinary identifiers
+elsewhere, with one exception: `void` may not be a
 BINDER's name (a `let`, a `for` binder, a function parameter, a match
 capture). An expression `void` is always the unit, so a binding by
 that name could never be read back, and it is refused where it is

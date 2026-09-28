@@ -2814,16 +2814,19 @@ fn substitute_member(member: &Member, substitution: &HashMap<String, TsType>) ->
 mod reserved_tests {
     use super::*;
 
-    /// E225: every keyword is escaped — derived, so a keyword added to the
-    /// lexer is escaped with no second edit — and the words the old copy
-    /// missed are named.
+    /// E225: every RESERVED keyword is escaped — derived, so a keyword added
+    /// to the lexer is escaped with no second edit — and the word the old copy
+    /// missed is named. B414: a CONTEXTUAL keyword is a legal name, so it
+    /// binds as itself (`dyn` and `lazy`, which the old copy also missed,
+    /// became contextual in the same order).
     #[test]
     fn every_keyword_is_escaped() {
-        for word in crate::keyword_table::keywords() {
+        for word in crate::keyword_table::reserved() {
             assert_eq!(escape_reserved(word), format!("{word}_"), "{word}");
         }
-        for word in ["css", "dyn", "lazy"] {
-            assert_eq!(escape_reserved(word), format!("{word}_"));
+        assert_eq!(escape_reserved("css"), "css_");
+        for word in ["dyn", "lazy", "with", "own", "borrows", "jump"] {
+            assert_eq!(escape_reserved(word), word, "{word} is a legal name (B414)");
         }
         // B413 made `resource` an attribute: an ordinary name again.
         assert_eq!(escape_reserved("resource"), "resource");

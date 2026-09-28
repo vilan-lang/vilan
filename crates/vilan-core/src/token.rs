@@ -29,13 +29,6 @@ pub enum Token<'src> {
     Import,
     In,
     Is,
-    Jump,
-    // `lazy` — defer to first demand (proposal/lazy.md). A HARD keyword in two
-    // positions: the parameter modifier `fun expect(self, lazy message: str)`
-    // (§1) and the module binding `lazy let database: Database = …;` (§2). One
-    // semantic in both — evaluate at first demand, at most once, memoize — and
-    // one lowering (the memo cell + `__force`, §5).
-    Lazy,
     Let,
     Macro,
     Match,
@@ -48,8 +41,6 @@ pub enum Token<'src> {
     Op(&'src str),
     // `const expr` — compile-time evaluation (proposal/const-eval.md).
     Const,
-    Own,
-    Borrows,
     Ret,
     String(&'src str),
     // A triple-quoted string's raw inner text (between the `\"\"\"` delimiters),
@@ -59,12 +50,6 @@ pub enum Token<'src> {
     Trait,
     Type,
     Use,
-    With,
-    // `dyn Trait` — the TRAIT OBJECT marker in type position (A124 R3,
-    // trait-objects.md §7.2's explicit spelling). A keyword rather than a
-    // contextual marker because the explicitness is the point: `dyn` must be
-    // impossible to write by accident and impossible to miss when reading.
-    Dyn,
 }
 
 impl std::fmt::Display for Token<'_> {
@@ -88,8 +73,6 @@ impl std::fmt::Display for Token<'_> {
             Token::Import => write!(f, "import"),
             Token::In => write!(f, "in"),
             Token::Is => write!(f, "is"),
-            Token::Jump => write!(f, "jump"),
-            Token::Lazy => write!(f, "lazy"),
             Token::Let => write!(f, "let"),
             Token::Macro => write!(f, "macro"),
             Token::Match => write!(f, "match"),
@@ -107,8 +90,6 @@ impl std::fmt::Display for Token<'_> {
             ),
             Token::Op(s) => write!(f, "{s}"),
             Token::Const => write!(f, "const"),
-            Token::Own => write!(f, "own"),
-            Token::Borrows => write!(f, "borrows"),
             Token::Ret => write!(f, "ret"),
             Token::String(s) => write!(f, "{s}"),
             Token::MultilineString(s) => write!(f, "\"\"\"{s}\"\"\""),
@@ -116,8 +97,6 @@ impl std::fmt::Display for Token<'_> {
             Token::Trait => write!(f, "trait"),
             Token::Type => write!(f, "type"),
             Token::Use => write!(f, "use"),
-            Token::With => write!(f, "with"),
-            Token::Dyn => write!(f, "dyn"),
         }
     }
 }
