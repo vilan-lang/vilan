@@ -8977,3 +8977,28 @@ fn b403_a_bare_static_bound_by_its_arguments_or_its_return_compiles() {
         "A\nB\ntrue\n",
     );
 }
+
+// --- B427: a destructuring `let` of an unfilled closure parameter ------------
+
+/// `let (x, y) = pair` inside `|pair| ..` waits for the call to fill `pair`
+/// (B185's rule, at a destructure) — typed as it stood, both names bound
+/// `Unknown` and the blanket `map`'s `U` stayed open.
+#[test]
+fn b427_a_destructured_closure_parameter_types_the_closure_tail() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, combine };\n",
+            "fun main() {\n",
+            "\tlet a = Signal::new(1);\n",
+            "\tlet b = Signal::new(2);\n",
+            "\tlet sum = combine((a, b)).map(|pair| { let (x, y) = pair; x + y });\n",
+            "\tprint(sum.get());\n",
+            "\tlet p = Signal::new((3, 4));\n",
+            "\tlet q = p.map(|pair| { let (x, y) = pair; x * y });\n",
+            "\tprint(q.get());\n",
+            "}\n",
+        ),
+        "3\n12\n",
+    );
+}

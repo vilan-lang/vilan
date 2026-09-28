@@ -44237,8 +44237,17 @@ impl<'src> Analyzer<'src> {
 
     fn resolve_destructure(&mut self, constraint: &DestructureConstraint<'src>) -> Resolution {
         let value_type = self.infer_type(constraint.value_id, &Type::Unknown, &HashMap::default());
+        // B427: a `let (x, y) = pair` whose value is an UNFILLED closure
+        // parameter is a not-yet, not an answer — B185's rule for a binding,
+        // at a destructure. Typed as it stood, both names bound `Unknown` for
+        // good, the closure's tail `x + y` typed `Unknown`, and the call the
+        // closure was handed to (`combine((a, b)).map(|pair| ..)`) left its
+        // `U` open. Deferred, the names bind from the tuple once the call
+        // fills the parameter; one that is never filled is B131's to report.
         let not_ready = matches!(value_type, Type::Unresolved)
-            || (constraint.defer_until_known && matches!(value_type, Type::Unknown));
+            || (matches!(value_type, Type::Unknown)
+                && (constraint.defer_until_known
+                    || self.value_awaits_a_closure_parameter(constraint.value_id)));
         if not_ready {
             return Resolution::Deferred;
         }

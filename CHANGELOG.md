@@ -52,6 +52,9 @@ written down.
 <!-- family: fix -->
 **A literal-only constant that folds negative at an unsigned type is refused: `let end: usize = 0 - 1;` is "`usize` is unsigned (…), and this constant folds to `-1`", where it compiled and printed `-1` on JS.** B407 refused a negative LITERAL, not an expression of literals whose value is negative — the spelling `std::ui`'s focus wrap once used. The maximal literal-only `+`/`-`/`*` trees are folded exactly at the type their literals settled at; anything with a runtime operand (`z - 1` over `z: usize`) is not a constant and keeps I5's runtime rule. Tracker B426.
 
+<!-- family: fix -->
+**A destructuring `let` of a closure's parameter types the closure: `combine((a, b)).map(|pair| { let (x, y) = pair; x + y })` compiles, where `map`'s result "is never fully determined" unless `pair` was annotated.** The destructure resolved before the call filled `pair`, bound `x` and `y` at `Unknown` for good, and the tail `x + y` told the call nothing. An unfilled closure parameter is now a not-yet at a destructure, as it already was at a plain binding; the names bind from the tuple once the call fills it. Tracker B427.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->
