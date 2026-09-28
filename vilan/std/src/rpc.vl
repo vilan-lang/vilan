@@ -3094,6 +3094,12 @@ export struct ReactiveClient {
 	// channel. Erased to closures because the list is heterogeneous — one entry per
 	// element type the service hands out.
 	replays: Shared<List<|| void>>,
+	// The ORIGIN tables this client has minted into (A134), one entry per table,
+	// keyed by the table's identity: the action that drops every entry this client
+	// put there. `dispose` runs them, so a client that is gone leaves nothing in a
+	// generated stub's table — which is program-lifetime, because the stub's
+	// element type is known only where it is generated (`MirrorTable`).
+	tables: Shared<List<(i32, || void)>>,
 }
 
 export impl ReactiveClient {
@@ -3104,6 +3110,7 @@ export impl ReactiveClient {
 			routes = Shared::new([]),
 			dynamic = Shared::new([]),
 			replays = Shared::new([]),
+			tables = Shared::new([]),
 		};
 		(client.transport).on_frame(|frame| {
 			// every inbound frame is handled in a turn
@@ -3177,6 +3184,10 @@ export impl ReactiveClient {
 	/// The channel id is `0 - 1`, which `fresh_channel` (counting from 0) never
 	/// hands out, so the inbound route this registers matches nothing until the
 	/// mint lands and `rebind` moves the shared id cell.
+	///
+	/// A generated stub does not call this directly: it calls `origin_source`,
+	/// which mints through here on an origin's FIRST call and hands the same
+	/// mirror back on every later one (A134).
 	fun unleased_source<T: Wire>(self, origin: Origin): RemoteSource<T> {
 		let mirror: RemoteSource<T> = self.mirror_of(0 - 1, Some(origin));
 		mirror.released.write() = true;
@@ -3252,6 +3263,7 @@ export impl ReactiveClient {
 			released = Shared::new(false),
 			leased = Shared::new(false),
 			mint = SignalCell::new(None),
+			retire = Shared::new([]),
 		}
 	}
 
@@ -3293,6 +3305,7 @@ export impl ReactiveClient {
 			released = Shared::new(false),
 			leased = Shared::new(false),
 			mint = SignalCell::new(None),
+			retire = Shared::new([]),
 		};
 		let codec = self.codec;
 		// Deliver one routed `Patch`: re-open the frame (the envelope was only
@@ -3341,6 +3354,108 @@ export impl ReactiveClient {
 		});
 		defer_to_owner(|| mirror.release_unleased());
 		mirror
+	}
+
+	/// A handle stub's mirror, DEDUPED PER ORIGIN (A134) — what every generated
+	/// handle stub calls. The first call for an origin (the method and its
+	/// described arguments) mints exactly what `unleased_source` mints and files it
+	/// in `table`; every later call for the SAME origin on the SAME client hands
+	/// back that mirror, until the mirror's last lease closes (or its owner goes
+	/// with no lease ever taken, or this client is disposed) and the entry is
+	/// dropped.
+	///
+	/// **Why a stub has to be idempotent.** A92 made the stub sync and made its
+	/// mirror the CALL: minting one is free, and the first lease issues it. That
+	/// left every stub call a fresh object, and a cold node calls its select on
+	/// every PULL — `client.and_then(|c| c.get_channels()).map(..).cell()` read one
+	/// mirror, leased a second and refreshed from a third, so the cell read `None`
+	/// forever while the mirror its lease kept live went unread. With the table, a
+	/// stub inside a cold select answers the same mirror on every pull, and the
+	/// select is pure again as far as anything downstream can tell. It is the
+	/// client twin of `expose_dynamic`'s identity dedup (A92): one origin, one
+	/// mirror, one `Subscribe` — however many times, and from however many places,
+	/// the stub is called.
+	///
+	/// **Why the table is an argument.** The mirror is typed at the stub's element,
+	/// and this client is not generic: a table here would have to hold mirrors of
+	/// every element type the service hands out, which nothing in the language can
+	/// read back at its type. The `[service]` expansion knows the element and
+	/// declares one `MirrorTable` per handle method beside the stub; the key carries
+	/// this client's identity, so two connections never share an entry.
+	fun origin_source<T: Wire>(
+		self,
+		table: MirrorTable<RemoteSource<T>>,
+		origin: Origin,
+	): RemoteSource<T> {
+		let key = self.origin_key(origin);
+		match table.entries.read().get(key) {
+			Some(let held) => {
+				let (_stamp, mirror) = held;
+				mirror
+			},
+			None => {
+				let mirror: RemoteSource<T> = self.unleased_source(origin);
+				let stamp = mirror.count.identity();
+				table.entries.write().insert(key, (stamp, mirror));
+				mirror.retire.write().push(|| table.forget(key, stamp));
+				self.enrol(table.entries.identity(), || table.forget_prefix(self.origin_prefix()));
+				mirror
+			},
+		}
+	}
+
+	/// `origin_source` at the keyed type (A79's `unleased_keyed_source`, deduped
+	/// per origin by the same table and the same rule).
+	fun origin_keyed_source<K: Wire + Hashable, T: Wire + Keyed<K>>(
+		self,
+		table: MirrorTable<KeyedSource<K, T>>,
+		origin: Origin,
+	): KeyedSource<K, T> {
+		let key = self.origin_key(origin);
+		match table.entries.read().get(key) {
+			Some(let held) => {
+				let (_stamp, mirror) = held;
+				mirror
+			},
+			None => {
+				let mirror: KeyedSource<K, T> = self.unleased_keyed_source(origin);
+				let stamp = mirror.count.identity();
+				table.entries.write().insert(key, (stamp, mirror));
+				mirror.retire.write().push(|| table.forget(key, stamp));
+				self.enrol(table.entries.identity(), || table.forget_prefix(self.origin_prefix()));
+				mirror
+			},
+		}
+	}
+
+	/// This client's prefix on every origin key: two connections calling the same
+	/// method with the same arguments are two origins, because a channel id belongs
+	/// to one connection.
+	fun origin_prefix(self): str {
+		i"{self.routes.identity()}:"
+	}
+
+	/// An origin's key: this client, then the request envelope `call` would send
+	/// for it — the method and every argument, described exactly as the wire sees
+	/// them, so two calls are one origin precisely when they would ask the server
+	/// the same question.
+	fun origin_key(self, origin: Origin): str {
+		let body = match encode_request(self.codec, origin.method, origin.describers) {
+			Frame::Text(let text) => text,
+			Frame::Binary(let bytes) => bytes.to_hex(),
+		};
+		self.origin_prefix() + body
+	}
+
+	/// Remember, once per table, how to drop this client's entries from it.
+	fun enrol(self, table: i32, forget: || void) {
+		for entry in self.tables.read() {
+			let (known, _forget) = entry;
+			if known == table {
+				ret;
+			}
+		}
+		self.tables.write().push((table, forget));
 	}
 
 	/// `attached_keyed_source` for a channel id the APP learned at runtime —
@@ -3425,11 +3540,20 @@ export impl ReactiveClient with Disposable {
 	/// long as the tab, which is why A29 measured the SERVER half (one session per
 	/// connection, churned per disconnect) as the leak that costs.
 	///
-	/// IDEMPOTENT: both lines assign an empty, so disposing an already-disposed
+	/// It also drops every entry this client filed in a generated stub's origin
+	/// table (A134): the tables are program-lifetime, and an entry naming a
+	/// disposed client's mirror is one nothing could ever lease usefully again.
+	///
+	/// IDEMPOTENT: every line empties something, so disposing an already-disposed
 	/// client — an app that tore its own down before the socket closed for good —
 	/// is a no-op rather than a fault.
 	fun dispose(self) {
 		(self.transport).clear_on_frame();
+		for entry in self.tables.read() {
+			let (_table, forget) = entry;
+			forget();
+		}
+		self.tables.write() = [];
 		self.routes.write() = [];
 		self.dynamic.write() = [];
 	}
@@ -3521,6 +3645,62 @@ export struct Origin {
 	reissue: async |str, List<|Serializer| void>| Result<Option<i32>, RpcError>,
 }
 
+/// One generated handle stub's ORIGIN table (A134): the mirror each origin — a
+/// client, the method, its described arguments — was handed, so a second stub
+/// call for the same origin answers the same mirror (`ReactiveClient::
+/// origin_source`). Generic over the MIRROR type, so one type serves the plain
+/// and the keyed handle.
+///
+/// The `[service]` expansion declares one per handle method, at module level,
+/// because that is the only place the element type and the table can meet: the
+/// client is not generic, so it cannot hold mirrors of every element type a
+/// service hands out and read them back at theirs. An entry lives from the first
+/// stub call for its origin until the mirror's last lease closes (or its owner
+/// goes with none ever taken, or its client is disposed), so a table holds what
+/// the app is watching and nothing it stopped watching.
+///
+/// Each entry carries the mirror's STAMP (its count cell's identity), so a retiring
+/// mirror drops its own entry and never a successor's.
+export struct MirrorTable<M> {
+	entries: Shared<Map<str, (i32, M)>>,
+}
+
+export impl MirrorTable<type M> {
+	/// An empty table.
+	fun new(): MirrorTable<M> {
+		let entries: Map<str, (i32, M)> = Map::new();
+		MirrorTable { entries = Shared::new(entries) }
+	}
+
+	/// Drop `key`'s entry if it is still the mirror stamped `stamp`.
+	fun forget(self, key: str, stamp: i32) {
+		match self.entries.read().get(key) {
+			Some(let held) => {
+				let (held_stamp, _mirror) = held;
+				if held_stamp == stamp {
+					self.entries.write().remove(key);
+				}
+			},
+			None => {},
+		}
+	}
+
+	/// Drop every entry whose key starts with `prefix` — one client's, at its
+	/// disposal.
+	fun forget_prefix(self, prefix: str) {
+		for key in self.entries.read().keys() {
+			if key.starts_with(prefix) {
+				self.entries.write().remove(key);
+			}
+		}
+	}
+
+	/// How many origins this table holds a mirror for.
+	fun len(self): usize {
+		self.entries.read().len()
+	}
+}
+
 export struct RemoteSource<T> {
 	// Cells, not plain fields: a reconnect rebind points the mirror at the fresh
 	// connection's channel (the id cell is SHARED with the `ReactiveClient` route,
@@ -3571,6 +3751,12 @@ export struct RemoteSource<T> {
 	// by `rebind`, which is the one event that retires whatever the last attempt
 	// said.
 	mint: SignalCell<Option<Status>>,
+	// What to run when this mirror stops being anyone's (A134): its last lease
+	// closed for real, or its owner went with no lease ever taken. The origin table
+	// a generated stub filed it in drops its entry here, so the next stub call for
+	// the same origin mints afresh instead of handing out a mirror whose demand is
+	// gone. Run once and cleared (`retired`).
+	retire: Shared<List<|| void>>,
 }
 
 /// A mirror IS a `Source` (tracker A52) — at `Option<T>`, which is what it
@@ -3834,9 +4020,24 @@ export impl RemoteSource<type T> {
 	/// demand is gone — a `[expose]`-less mirror handed out by
 	/// `ReactiveClient::source`, and any mirror a rebind left unwatched.
 	fun release_unleased(self) {
-		if !self.leased.read() && !self.released.read() && self.minted() {
-			self.released.write() = true;
-			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+		if !self.leased.read() {
+			if !self.released.read() && self.minted() {
+				self.released.write() = true;
+				(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+			}
+			self.retired();
+		}
+	}
+
+	/// Run and clear the retire hooks (A134): this mirror is nobody's any more, so
+	/// the origin table that handed it out forgets it. A holder that kept the
+	/// handle can still lease it — it re-mints, as a released mirror always does —
+	/// but the next STUB call mints a fresh one.
+	fun retired(self) {
+		let hooks = self.retire.read();
+		self.retire.write() = [];
+		for hook in hooks {
+			hook();
 		}
 	}
 
@@ -3919,6 +4120,7 @@ export impl RemoteSource<type T> {
 			match self.origin {
 				Some(let _minting) => {
 					self.released.write() = true;
+					self.retired();
 				},
 				None => {},
 			}
@@ -4401,6 +4603,9 @@ export struct KeyedSource<K, T> {
 	/// What the last MINT said, when it said something other than "here is your
 	/// channel" — `RemoteSource.mint`, at the keyed type.
 	mint: SignalCell<Option<Status>>,
+	/// `RemoteSource.retire`, at the keyed type: run when the mirror's last demand
+	/// is surrendered, or its owner goes with none ever taken (A134).
+	retire: Shared<List<|| void>>,
 }
 
 /// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
@@ -4552,9 +4757,21 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// when its owner is disposed. A mirror that never reached a lease is
 	/// `released` from birth (A79) and has nothing to say.
 	fun release_unleased(self) {
-		if !self.leased.read() && !self.released.read() && self.minted() {
-			self.released.write() = true;
-			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+		if !self.leased.read() {
+			if !self.released.read() && self.minted() {
+				self.released.write() = true;
+				(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+			}
+			self.retired();
+		}
+	}
+
+	/// `RemoteSource::retired`, at the keyed type (A134).
+	fun retired(self) {
+		let hooks = self.retire.read();
+		self.retire.write() = [];
+		for hook in hooks {
+			hook();
 		}
 	}
 
@@ -4567,6 +4784,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 			Some(let _minting) => {
 				if self.demand() == 0 {
 					self.released.write() = true;
+					self.retired();
 				}
 			},
 		}
@@ -5826,6 +6044,10 @@ export macro fun service(item: Item): Source {
 		mirror_index = mirror_index + 1;
 	}
 	mut client_impl = impl_of(target.client_name).generics("<type T>");
+	// One ORIGIN table per handle method (A134), declared beside the client at
+	// module level: the stub's element type is known here and nowhere the client's
+	// runtime can reach, so this is where a table typed at it can live.
+	mut origin_tables: List<str> = [];
 	mut stub_index = 0;
 	for method in target.methods {
 		mut stub = fun_of(method.name).parameter("self");
@@ -5932,13 +6154,25 @@ export macro fun service(item: Item): Source {
 				+ "\n"
 				+ indent("},", 1)
 				+ "\n}";
-			// The annotated `let` rather than a tail expression: the mirror's
+			//
+			// And the mint is DEDUPED PER ORIGIN (A134): the stub files its mirror
+			// in this method's table and a second call with the same arguments
+			// hands back the same mirror, so a stub inside a cold select — which
+			// runs on every pull — is idempotent rather than a fresh mirror per
+			// read. The annotated `let` rather than a tail expression: the mirror's
 			// parameters are solved from the call's TYPES, and a binding is where
 			// this file already says so every other time it mints one.
-			let minting = if kind == "keyed" {
-				i"let handle_mirror: KeyedSource<{key}, {element}> = self.reactive.unleased_keyed_source({origin});"
+			let table_name = i"__mirrors_{target.client_name}_{method.name}";
+			let mirror_type = if kind == "keyed" {
+				i"KeyedSource<{key}, {element}>"
 			} else {
-				i"let handle_mirror: RemoteSource<{element}> = self.reactive.unleased_source({origin});"
+				i"RemoteSource<{element}>"
+			};
+			origin_tables.push(i"let {table_name}: MirrorTable<{mirror_type}> = MirrorTable::new();");
+			let minting = if kind == "keyed" {
+				i"let handle_mirror: {mirror_type} = self.reactive.origin_keyed_source({table_name}, {origin});"
+			} else {
+				i"let handle_mirror: {mirror_type} = self.reactive.origin_source({table_name}, {origin});"
 			};
 			stub = stub.returns(mapped).line(minting).expr("handle_mirror");
 		}
@@ -6173,7 +6407,11 @@ export macro fun service(item: Item): Source {
 	// server half above described one nobody asked for; it is built either way (the
 	// builders are strings) and emitted only here.
 	let client_source = if target.client_name != "" {
-		client_struct.render() + client_impl.render() + connect_impl + over_http_impl
+		mut tables = "";
+		for table in origin_tables {
+			tables = tables + table + "\n";
+		}
+		tables + client_struct.render() + client_impl.render() + connect_impl + over_http_impl
 	} else {
 		""
 	};
@@ -6191,7 +6429,7 @@ export macro fun service(item: Item): Source {
 	// so the service's vocabulary is the author's again.
 	let imports = "import std::rpc;\n"
 		+ "import std::reactive;\n"
-		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, HttpTransport, HeaderedHttpTransport, ReactiveClient };\n"
+		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, HttpTransport, HeaderedHttpTransport, ReactiveClient, MirrorTable };\n"
 		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"

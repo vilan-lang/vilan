@@ -2821,3 +2821,281 @@ fn a114_a_mirror_lease_taken_in_a_scoped_effect_is_released_at_the_runs_end() {
          run ends, and the last one by the boundary; got:\n{stdout}"
     );
 }
+
+// --- A134: a handle stub is idempotent per ORIGIN ---------------------------
+
+/// A134, IN PROCESS (a `duplex_pair` link and a `local_rpc` transport stamped
+/// for the session — the generated client, reached as a hand-wired in-process
+/// client reaches it). Three claims, each its own block: one origin is one
+/// mirror; a stub inside a COLD select reads the mirror its lease keeps live;
+/// the entry goes with the mirror's last lease.
+const A134_ORIGIN_DEDUP: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::map::Map;
+import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
+import std::rpc::{ DuplexEnd, LocalTransport, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::Frame;
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	names: Shared<Map<i32, SignalCell<str>>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	[rpc]
+	fun create_channel(self, id: i32, name: str): i32 {
+		self.channels.update(|&mut ids| {
+			ids.push(id);
+		});
+		let cell: SignalCell<str> = Signal::new(name);
+		self.names.write().insert(id, cell);
+		id
+	}
+
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels
+	}
+
+	[rpc]
+	fun get_name(self, id: i32): Option<SignalCell<str>> {
+		self.calls.write() += 1;
+		self.names.read().get(id)
+	}
+}
+
+fun text_of(frame: Frame): str {
+	match frame {
+		Frame::Text(let text) => text,
+		Frame::Binary(let _bytes) => "<binary>",
+	}
+}
+
+/// The link counts `Subscribe` frames going up — "one mirror" is a claim about
+/// the wire, not only about an object.
+fun counted_pair(subscribes: Shared<i32>): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		let text = text_of(frame);
+		if text.contains("Subscribe") && !text.contains("Unsubscribe") {
+			subscribes.write() += 1;
+		}
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| client_relay.send(frame));
+	(client_end, server_end)
+}
+
+fun same<T>(left: RemoteSource<T>, right: RemoteSource<T>): bool {
+	left.count.identity() == right.count.identity()
+}
+
+fun main() {
+	let store = Store { channels = Signal::new([]), names = Shared::new(Map::new()), calls = Shared::new(0) };
+	let subscribes: Shared<i32> = Shared::new(0);
+	let (client_end, server_end) = counted_pair(subscribes);
+	register_session(7, server_end, json_codec());
+	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()).for_connection(7));
+	let reactive = ReactiveClient::new(client_end, json_codec());
+	let client = StoreClient { transport, codec = json_codec(), reactive };
+
+	// (1) Identity: one origin is one mirror; another argument is another origin.
+	print(i"same-origin:{same(client.get_channels(), client.get_channels())}");
+	print(i"same-args:{same(client.get_name(1), client.get_name(1))}");
+	print(i"other-args:{same(client.get_name(1), client.get_name(2))}");
+	print(i"unleased:calls={store.calls.read()} subscribes={subscribes.read()}");
+
+	// (2) The kolt shape: a stub inside a COLD select, pulled on every read.
+	let client_cell: SignalCell<Option<StoreClient<LocalTransport>>> = Signal::new(Some(client));
+	let page = Owner::new();
+	owner_scope.run(page, || {
+		let ids: SignalCell<List<i32>> = client_cell
+			.and_then(|held| held.get_channels())
+			.map(|value| value.unwrap_or_default())
+			.cell();
+		ids.effect(|value| print(i"cold-select sees {value.len()}"));
+	});
+	sleep_for(Duration::millis(0));
+	print(i"create:{client.create_channel(1, "general").unwrap_or(0)}");
+	print(i"create:{client.create_channel(2, "random").unwrap_or(0)}");
+	print(i"leased:calls={store.calls.read()} subscribes={subscribes.read()}");
+
+	// (3) The entry goes with the mirror's last lease: after the page is gone
+	// and the close has flushed, the next stub call mints afresh.
+	let before = client.get_channels();
+	page.dispose();
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	print(i"released:fresh={!same(before, client.get_channels())}");
+	print("done");
+}
+"#;
+
+/// A134 (door a): the generated client dedups the mirrors it mints per ORIGIN —
+/// the method and its described arguments — so a stub call is idempotent.
+///
+/// - **One origin, one mirror.** Two `get_channels()` calls are one object (the
+///   count cell's identity), two `get_name(1)`s are one, and `get_name(1)` /
+///   `get_name(2)` are two: the arguments are part of the origin. Unleased,
+///   nothing was asked (`calls=0`) — dedup does not make a stub eager.
+/// - **The cold select.** `and_then` runs its select on every PULL, so before
+///   the table every pull minted a fresh mirror: `.cell()` read one, its
+///   `on_settle` leased a second, and each refresh read a third, so the cell
+///   read `0` forever while the leased mirror went unread (the red read
+///   `cold-select sees 0` after both creates). With the table every pull
+///   answers the one mirror its lease keeps live — `0`, `1`, `2` — on ONE
+///   call and ONE `Subscribe`.
+/// - **Released with the last lease.** After the page owner is disposed and
+///   the close has flushed (the settle, then the microtask hop), the next stub
+///   call mints a fresh mirror: the table holds what the app watches, not
+///   everything it ever watched.
+///
+/// The socket twin is the next test.
+#[test]
+fn a134_two_stub_calls_for_one_origin_are_one_mirror_and_one_subscribe() {
+    let stdout = run_program("a134_origin", A134_ORIGIN_DEDUP);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "same-origin:true",
+            "same-args:true",
+            "other-args:false",
+            "unleased:calls=0 subscribes=0",
+            // The effect's immediate call (nothing has arrived, so the
+            // default), then the seed.
+            "cold-select sees 0",
+            "cold-select sees 0",
+            "cold-select sees 1",
+            "create:1",
+            "cold-select sees 2",
+            "create:2",
+            "leased:calls=1 subscribes=1",
+            "released:fresh=true",
+            "done",
+        ],
+        "a stub call must be idempotent per origin; got:\n{stdout}"
+    );
+}
+
+/// A134 OVER A SOCKET: the same cold-select shape, server and client in one
+/// process joined by a real WebSocket (`Server` on port 0, the generated
+/// `connect`). The in-process pin above is not evidence for this one (the
+/// order's rule: an in-process probe is not a socket probe), and this is the
+/// transport kolt runs on.
+const A134_ORIGIN_DEDUP_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ RemoteSource, SocketTransport };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(StoreClient)]
+struct Store {
+	channels: SignalCell<List<i32>>,
+	calls: Shared<i32>,
+}
+
+impl Store {
+	[rpc]
+	fun create_channel(self, id: i32): i32 {
+		self.channels.update(|&mut ids| {
+			ids.push(id);
+		});
+		id
+	}
+
+	[rpc]
+	fun get_channels(self): SignalCell<List<i32>> {
+		self.calls.write() += 1;
+		self.channels
+	}
+
+	[rpc]
+	fun calls(self): i32 {
+		self.calls.read()
+	}
+}
+
+let store: Store = Store { channels = Signal::new([]), calls = Shared::new(0) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun same<T>(left: RemoteSource<T>, right: RemoteSource<T>): bool {
+	left.count.identity() == right.count.identity()
+}
+
+async fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			print(i"same-origin:{same(client.get_channels(), client.get_channels())}");
+			let client_cell: SignalCell<Option<StoreClient<SocketTransport>>> = Signal::new(Some(client));
+			let page = Owner::new();
+			let seen: Shared<i32> = Shared::new(0);
+			owner_scope.run(page, || {
+				let ids: SignalCell<List<i32>> = client_cell
+					.and_then(|held| held.get_channels())
+					.map(|value| value.unwrap_or_default())
+					.cell();
+				ids.effect(|value| {
+					seen.write() += 1;
+					print(i"cold-select sees {value.len()}");
+				});
+			});
+			// The seed is the mint's round trip plus the `Subscribe`'s; wait
+			// for it by what it does, never by a duration. After it, each
+			// create's `Update` precedes its reply on the one socket.
+			mut tries = 0;
+			for seen.read() < 2 && tries < 1000 {
+				sleep(10);
+				tries += 1;
+			}
+			print(i"create:{client.create_channel(1).unwrap_or(0)}");
+			print(i"create:{client.create_channel(2).unwrap_or(0)}");
+			print(i"calls:{client.calls().unwrap_or(0 - 1)}");
+			page.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a134_a_stub_in_a_cold_select_reads_its_leased_mirror_over_a_socket() {
+    let stdout = run_program("a134_socket", A134_ORIGIN_DEDUP_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "same-origin:true",
+            "cold-select sees 0",
+            "cold-select sees 0",
+            "cold-select sees 1",
+            "create:1",
+            "cold-select sees 2",
+            "create:2",
+            "calls:1",
+        ],
+        "over a socket, a stub inside a cold select must read the mirror its \
+         lease keeps live, on one call; got:\n{stdout}"
+    );
+}

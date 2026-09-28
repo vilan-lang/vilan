@@ -473,25 +473,35 @@ whatever it last held, and the **next** 0→1 lease asks again. So a row
 that re-renders after a failure retries by itself, and a view that shows
 a spinner or a retry button reads `status()` to decide which.
 
-**One handle per id.** Two views calling `get_message(id)` get two
-mirrors, two calls and two leases of one row. The server collapses the
-*channel* — a reply carrying a source it has already exported answers
-the channel it already minted, and withdraws it only when the last
-mirror lets go — but the client-side fix is yours and it is one line: a
-[`Memo`](../std/collections.md#memokv) keyed by the id, whose maker is
-the call.
+**One handle per origin.** A stub call is keyed by its *origin* — the
+method and its arguments, as the wire would carry them — and the
+client hands back the mirror it already minted for that origin: two
+views calling `get_message(id)` share one mirror, one call and one
+`Subscribe`. The entry lasts as long as something watches the mirror;
+once its last lease closes, the next call mints afresh (and a mirror
+you kept a handle to still works — its next lease re-issues its call).
+The server collapses the *channel* the same way underneath: a reply
+carrying a source it has already exported answers the channel it
+already minted, and withdraws it only when the last mirror lets go.
+
+That is what makes a stub safe inside a **cold select**. A node like
+`and_then` runs its select on every *read*, so a select that called a
+stub used to mint a fresh mirror per read — the `.cell()` below leased
+one mirror and refreshed from another, and read `[]` forever:
 
 ```vilan,fragment
-let bodies: Memo<str, RemoteSource<MessageBody>> = Memo::new();
-
-fun body_of(id: str): RemoteSource<MessageBody> {
-	bodies.get_or(id, || client().get_message(id))
-}
+// The select runs on every pull; with the per-origin table every pull
+// answers the SAME mirror, so the cell reads what its lease is fed.
+let channels: SignalCell<List<i32>> = client_cell
+	.and_then(|client| client.get_channels())
+	.map(|ids| ids.unwrap_or_default())
+	.cell();
 ```
 
-The stub does not memoize for you, deliberately: memoizing a handle is a
-decision about *identity* — which asks are the same ask — and generated
-code has no business making it.
+A [`Memo`](../std/collections.md#memokv) is no longer needed to get one
+handle per id; reach for one when you want to keep something *built
+over* the handle — and then what the maker builds outlives the caller,
+so a derivation in a maker is `.cell_global()`, never `.cell()`.
 
 **The element must be Wire, not the source.** The `SignalCell` never
 crosses; its values do, one `Update` frame at a time. So the Wire rule
