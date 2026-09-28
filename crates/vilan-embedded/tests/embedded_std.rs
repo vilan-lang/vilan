@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use vilan_embedded::{
     CONTENT_HASH, FILES, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES, RT_MANIFEST,
-    RT_SQLITE_MANIFEST, materialize_into,
+    RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, materialize_into,
 };
 
 mod scratch;
@@ -163,11 +163,11 @@ fn the_runtime_materializes_completely_and_idempotently() {
     let _ = fs::remove_dir_all(&cache_root);
 }
 
-/// F18 slice 2 and F40: the two OPTIONAL runtime crates ride the runtime's
+/// F18 slice 2, F40 and F45: the three OPTIONAL runtime crates ride the runtime's
 /// table and its cache — every source of each is embedded (a collector gap
 /// would materialize a crate that does not build), each materialized manifest
 /// KEEPS its crates.io dependency (the reason it is a crate apart) and drops
-/// the workspace-only lints, and both land BESIDE `vilan-rt` under the one
+/// the workspace-only lints, and all land BESIDE `vilan-rt` under the one
 /// hash, which is where the generated cargo manifest looks for them.
 #[test]
 fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
@@ -176,6 +176,7 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
     let optional = [
         ("vilan-rt-sqlite", RT_SQLITE_MANIFEST, "rusqlite"),
         ("vilan-rt-crypto", RT_CRYPTO_MANIFEST, "getrandom"),
+        ("vilan-rt-signal", RT_SIGNAL_MANIFEST, "ctrlc"),
     ];
     for (directory, manifest, dependency) in optional {
         let mut on_disk = Vec::new();

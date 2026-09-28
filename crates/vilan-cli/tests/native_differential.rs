@@ -998,6 +998,389 @@ const DESTRUCTURE_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F41: a field named `self`, `super` or `crate` builds natively.
+///
+/// Vilan's `self` and `super` are contextual, so they are legal field names
+/// and the JS backend always ran them; the emitter spelled them `r#self` /
+/// `r#super`, and rustc refuses a PATH keyword raw. They are mangled instead
+/// (`self` → `self_`), and a field ALREADY spelled `self_` sits beside
+/// them in the probe so the mangling is shown injective: one more `_` for
+/// every name in the family, never a collision. Every site the name reaches is
+/// here — the declaration, a literal, a read, a write, a compound write, a
+/// method body through `self.self`, the derived `PartialEq` and `Json`, the
+/// printed struct, and a closure-holding struct's hand-written `PartialEq`.
+#[test]
+fn a_field_named_by_a_path_keyword_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_path_keywords.vl"),
+        PATH_KEYWORD_FIELD_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_path_keywords.vl"),
+        Verdict::Identical,
+        "a field named `self`/`super`/`crate` must build and print identically on both backends"
+    );
+}
+
+const PATH_KEYWORD_FIELD_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "[derive(Json, PartialEq)]\n",
+    "struct Node {\n",
+    "\tself: i32,\n",
+    "\tsuper: str,\n",
+    "\tself_: i32,\n",
+    "\tcrate: bool,\n",
+    "}\n",
+    "\n",
+    "struct Hook {\n",
+    "\tself: || i32,\n",
+    "\tsuper: i32,\n",
+    "}\n",
+    "\n",
+    "impl Node {\n",
+    "\tfun total(self): i32 {\n",
+    "\t\tself.self + self.self_\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut node = Node { self = 1, super = \"up\", self_ = 10, crate = true };\n",
+    "\tnode.self = node.self + 1;\n",
+    "\tnode.self_ += node.self;\n",
+    "\tprint(i\"{node.self} {node.super} {node.self_} {node.crate} {node.total()}\");\n",
+    "\tprint(node);\n",
+    "\tprint(node.to_json());\n",
+    "\tlet hook = Hook { self = || 7, super = 8 };\n",
+    "\tlet call = hook.self;\n",
+    "\tprint(call() + hook.super);\n",
+    "\tlet copy = Node { self = 5, super = \"s\", self_ = 6, crate = false };\n",
+    "\tprint(copy == node);\n",
+    "\tprint(copy.self == 5 && copy.super == \"s\");\n",
+    "}\n",
+);
+
+/// F42: `KeyedCell` builds natively — every writer, the op log read back as
+/// the wire's `Delta`s, the `Source` view, the keyed lookup and the wholesale
+/// `set`.
+///
+/// It was refused whole, for `Map`'s unbound `V`, at `KeyedCell::new`'s
+/// `positions = Shared::new(Map::new())`. The field's type names both of
+/// `Map`'s arguments, and a generic call closes its open bindings from the
+/// position it fills — but `Shared::new` is an INTRINSIC, and its argument
+/// was rendered under the expectation for the intrinsic's RESULT: `Map<K, V>`
+/// matched against `Shared<Map<Hash, usize>>` closed nothing. Each argument
+/// of an intrinsic now takes the expectation its intrinsic gives it — the
+/// `Shared`'s element for `Shared::new`'s value, nothing for a receiver or
+/// an operand, which the result says nothing about.
+#[test]
+fn a_keyed_cell_builds_and_journals_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_keyed_cell.vl"), KEYED_CELL_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_keyed_cell.vl"),
+        Verdict::Identical,
+        "`KeyedCell` must build natively and journal the same deltas as node"
+    );
+}
+
+const KEYED_CELL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::Source;\n",
+    "import std::rpc::KeyedCell;\n",
+    "import std::wire::{ Delta, Keyed };\n",
+    "\n",
+    "struct Row {\n",
+    "\tid: i32,\n",
+    "\tlabel: str,\n",
+    "}\n",
+    "\n",
+    "impl Row with Keyed<i32> {\n",
+    "\tfun key(self): i32 {\n",
+    "\t\tself.id\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun describe(delta: Delta<i32, Row>): str {\n",
+    "\tmatch delta {\n",
+    "\t\tDelta::Reset(let rows) => i\"reset {rows.len()}\",\n",
+    "\t\tDelta::Insert(let key, let row, let at) => i\"insert {key} {row.label} at {at}\",\n",
+    "\t\tDelta::Update(let key, let row) => i\"update {key} {row.label}\",\n",
+    "\t\tDelta::Remove(let key) => i\"remove {key}\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun labels(rows: List<Row>): str {\n",
+    "\tmut joined = \"\";\n",
+    "\tfor row in rows {\n",
+    "\t\tjoined = joined + row.label + \";\";\n",
+    "\t}\n",
+    "\tjoined\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet cell: KeyedCell<i32, Row> = KeyedCell<i32, Row>::new([Row { id = 1, label = \"one\" }]);\n",
+    "\tlet cursor = cell.cursor();\n",
+    "\tcell.insert(Row { id = 2, label = \"two\" });\n",
+    "\tcell.insert(Row { id = 3, label = \"three\" });\n",
+    "\tcell.update(2, |&mut row| {\n",
+    "\t\trow.label = \"TWO\";\n",
+    "\t});\n",
+    "\tcell.remove(1);\n",
+    "\tcell.insert(Row { id = 3, label = \"THREE\" });\n",
+    "\tfor delta in cell.since(cursor) {\n",
+    "\t\tprint(describe(delta));\n",
+    "\t}\n",
+    "\tprint(labels(cell.get()));\n",
+    "\tmatch cell.locate(3) {\n",
+    "\t\tSome(let found) => print(i\"3 at {found.0}: {found.1.label}\"),\n",
+    "\t\tNone => print(\"3 missing\"),\n",
+    "\t}\n",
+    "\tcell.set([Row { id = 9, label = \"nine\" }]);\n",
+    "\tprint(labels(cell.get()));\n",
+    "\tfor delta in cell.since(cursor) {\n",
+    "\t\tprint(describe(delta));\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// F44: a closure stored where nothing names its type is the counted
+/// `dyn Fn` its vilan type renders as — including one pushed into the list it
+/// READS.
+///
+/// `Shared::new([])` gives Rust's inference nothing, so the first closure
+/// pushed decided the element type: its own anonymous one. A second closure
+/// was then "a different closure", and a closure that reads the list it is
+/// pushed into was "a cyclic type of infinite size" — the closure's type held
+/// the list that held the closure. Every closure literal is now built AS
+/// `Rc<dyn Fn(..) -> _>`, so the element type is the one the vilan type
+/// names. The three shapes: a self-reading closure beside a second one in a
+/// `Shared<List<..>>`, two closures grown into an empty `List`, and an
+/// `Option` holding a closure that reads the cell holding the option.
+#[test]
+fn a_closure_stored_in_what_it_reads_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_stored_closure.vl"),
+        STORED_CLOSURE_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_stored_closure.vl"),
+        Verdict::Identical,
+        "a closure stored in a collection it reads must build and answer the same on both backends"
+    );
+}
+
+const STORED_CLOSURE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun main() {\n",
+    "\t// A closure pushed into the very list it reads, then a second closure.\n",
+    "\tlet cell: Shared<List<|| usize>> = Shared::new([]);\n",
+    "\tlet same = cell;\n",
+    "\tcell.write().push(|| same.read().len());\n",
+    "\tcell.write().push(|| 40);\n",
+    "\tmut total: usize = 0;\n",
+    "\tfor call in cell.read() {\n",
+    "\t\ttotal += call();\n",
+    "\t}\n",
+    "\tprint(total);\n",
+    "\n",
+    "\t// A plain list of two different closures, built empty and grown.\n",
+    "\tmut steps: List<|i32| i32> = [];\n",
+    "\tsteps.push(|n| n + 1);\n",
+    "\tsteps.push(|n| n * 10);\n",
+    "\tmut value = 1;\n",
+    "\tfor step in steps {\n",
+    "\t\tvalue = step(value);\n",
+    "\t}\n",
+    "\tprint(value);\n",
+    "\n",
+    "\t// An `Option` holding a closure that reads the cell holding the option.\n",
+    "\tlet hook: Shared<Option<|| str>> = Shared::new(None);\n",
+    "\tlet seen = hook;\n",
+    "\thook.write() = Some(|| if seen.read().is_some() { \"set\" } else { \"unset\" });\n",
+    "\tmatch hook.read() {\n",
+    "\t\tSome(let call) => print(call()),\n",
+    "\t\tNone => print(\"none\"),\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// F46: an argument that hands the RECEIVER's binding on by value copies it,
+/// because the receiver's loan outlives every argument.
+///
+/// `source.on_settle(pulling(source, observer))` — `std::reactive`'s
+/// `subscribe_pulling`, which reactive-42 wrote as two statements to dodge
+/// this. The last-use pass walked the receiver first, so the argument's read
+/// was the binding's last use and MOVED it while `&source` was live (rustc
+/// E0505; E0382 behind F35's hoist for a `&mut` receiver). A loaned bare
+/// place is now walked after the call's other arguments, so the argument
+/// copies. Four shapes, each the binding's last use: a `&self` method, a
+/// `&mut self` method (F35's hoist), a trait default, and the std shape
+/// through a generic bound.
+#[test]
+fn an_argument_handing_on_the_borrowed_receiver_copies_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_loaned_receiver.vl"),
+        LOANED_RECEIVER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_loaned_receiver.vl"),
+        Verdict::Identical,
+        "an argument moving the borrowed receiver must build and print identically"
+    );
+}
+
+const LOANED_RECEIVER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Counter {\n",
+    "\thits: List<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Counter {\n",
+    "\tfun absorb(self, other: Counter): i32 {\n",
+    "\t\tself.hits.len().as_i32() + other.hits.len().as_i32()\n",
+    "\t}\n",
+    "\n",
+    "\tfun grow(&mut self, other: Counter): i32 {\n",
+    "\t\tself.hits.push(other.hits.len().as_i32());\n",
+    "\t\tself.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun twice(counter: Counter): Counter {\n",
+    "\tmut hits = counter.hits;\n",
+    "\thits.push(0);\n",
+    "\tCounter { hits }\n",
+    "}\n",
+    "\n",
+    "trait Source {\n",
+    "\tfun size(self): i32;\n",
+    "\tfun settle(self, witness: Counter): i32 {\n",
+    "\t\tself.size() * 100 + witness.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Counter with Source {\n",
+    "\tfun size(self): i32 {\n",
+    "\t\tself.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun witness<S: Source>(source: S): Counter {\n",
+    "\tCounter { hits = [source.size(), source.size()] }\n",
+    "}\n",
+    "\n",
+    "// `std::reactive`'s `subscribe_pulling` shape: through a BOUND, the receiver\n",
+    "// is borrowed while the argument hands the same parameter on by value.\n",
+    "fun generic<S: Source>(source: S): i32 {\n",
+    "\tsource.settle(witness(source))\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet counter = Counter { hits = [1, 2] };\n",
+    "\t// The argument MOVES the receiver's binding at its last use, while the\n",
+    "\t// receiver is borrowed for the call.\n",
+    "\tprint(counter.absorb(twice(counter)));\n",
+    "\tmut growing = Counter { hits = [3] };\n",
+    "\tprint(growing.grow(twice(growing)));\n",
+    "\tlet source = Counter { hits = [4, 5, 6] };\n",
+    "\tprint(source.settle(twice(source)));\n",
+    "\tlet again = Counter { hits = [7] };\n",
+    "\tprint(generic(again));\n",
+    "}\n",
+);
+
+/// F47 (UNSOUND until now): a `mut` PARAMETER a closure captures is one
+/// binding the two frames share, and natively it was a COPY — `late(0)`
+/// printed `0` where node prints `5`, and a closure that WROTE one was
+/// refused by rustc as `FnMut`. A captured `mut` parameter is boxed like a
+/// captured `mut` let and re-bound into its cell on entry. The shapes: a
+/// read after the write, a closure writing it, a `List` pushed through a
+/// capture, `mut self` written through a capture, and a closure's own `mut`
+/// parameter captured by a closure inside it.
+#[test]
+fn a_captured_mut_parameter_is_shared_with_its_closure_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_mut_parameter.vl"),
+        MUT_PARAMETER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_mut_parameter.vl"),
+        Verdict::Identical,
+        "a closure's capture of a `mut` parameter must be the parameter itself on both backends"
+    );
+}
+
+const MUT_PARAMETER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "// A `mut` parameter a closure captures is one binding two frames share.\n",
+    "fun late(mut n: i32): i32 {\n",
+    "\tlet show = || n;\n",
+    "\tn = 5;\n",
+    "\tshow()\n",
+    "}\n",
+    "\n",
+    "fun bump(mut n: i32): i32 {\n",
+    "\tlet inc = || {\n",
+    "\t\tn = n + 1;\n",
+    "\t};\n",
+    "\tinc();\n",
+    "\tinc();\n",
+    "\tn\n",
+    "}\n",
+    "\n",
+    "fun collect(mut seen: List<i32>): usize {\n",
+    "\tlet add = |value: i32| seen.push(value);\n",
+    "\tadd(1);\n",
+    "\tadd(2);\n",
+    "\tseen.len()\n",
+    "}\n",
+    "\n",
+    "struct Tally {\n",
+    "\tcount: i32,\n",
+    "}\n",
+    "\n",
+    "impl Tally {\n",
+    "\tfun spend(mut self): i32 {\n",
+    "\t\tlet take = || {\n",
+    "\t\t\tself.count = self.count - 1;\n",
+    "\t\t};\n",
+    "\t\ttake();\n",
+    "\t\tself.count\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(late(0));\n",
+    "\tprint(bump(0));\n",
+    "\tprint(collect([9]));\n",
+    "\tprint(Tally { count = 3 }.spend());\n",
+    "\t// A closure's own `mut` parameter, captured by a closure inside it.\n",
+    "\tlet outer = |mut total: i32| {\n",
+    "\t\tlet add = |amount: i32| {\n",
+    "\t\t\ttotal = total + amount;\n",
+    "\t\t};\n",
+    "\t\tadd(10);\n",
+    "\t\tadd(20);\n",
+    "\t\ttotal\n",
+    "\t};\n",
+    "\tprint(outer(1));\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
@@ -2651,6 +3034,274 @@ impl Drop for ServerUnderTest {
     }
 }
 
+/// F45: `Server::stop()` ends a native server program as it ends a node one —
+/// the listener closes, `on_stop` fires, the loop runs out of work, and the
+/// process exits 0 — and `on_start` runs AFTER the turn that called
+/// `start()`, as node's `'listening'` does (it ran inside `start()`
+/// natively, so `print("main returned")` came second; found building this).
+#[test]
+fn a_stopped_server_ends_the_program_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_stop.vl"), STOP_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_stop.vl"),
+        Verdict::Identical,
+        "a server that stops itself must end the program, printing the same lines in the same \
+         order on both backends"
+    );
+}
+
+const STOP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder().body(\"hello\\n\").build(),\n",
+    "\t\ton_start = |started| {\n",
+    "\t\t\tprint(\"started\");\n",
+    "\t\t\tstarted.stop();\n",
+    "\t\t},\n",
+    "\t\ton_stop = |stopped| print(\"stopped\"),\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "\tprint(\"main returned\");\n",
+    "}\n",
+);
+
+/// A native server built from `program` and spawned with `environment`: the
+/// child and the port it announced.
+#[cfg(unix)]
+struct SignalledServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+#[cfg(unix)]
+impl SignalledServer {
+    fn spawn(staged: &Path, program: &str, environment: &[(&str, &str)]) -> SignalledServer {
+        let built = vilan(staged)
+            .args(["build", "--backend", "rust", program])
+            .output()
+            .expect("build the server natively");
+        assert!(
+            built.status.success(),
+            "the native leg did not build:\n{}{}",
+            String::from_utf8_lossy(&built.stdout),
+            String::from_utf8_lossy(&built.stderr)
+        );
+        // The graceful stop is linked only by a program that serves.
+        let manifest = std::fs::read_to_string(
+            staged
+                .join("dist")
+                .join("native")
+                .join(program.trim_end_matches(".vl"))
+                .join("Cargo.toml"),
+        )
+        .expect("read the generated manifest");
+        assert!(
+            manifest.contains("vilan-rt-signal"),
+            "a program that starts a server links the signal crate:\n{manifest}"
+        );
+        let binary = String::from_utf8_lossy(&built.stdout)
+            .lines()
+            .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+            .expect("`vilan build` says where the binary is");
+        let mut command = Command::new(staged.join(&binary));
+        command
+            .current_dir(staged)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("spawn the server");
+        let stdout = child.stdout.take().expect("the server's stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let port = loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .expect("read the server's stdout");
+            assert!(
+                read > 0,
+                "the server's stdout ended before it announced a port"
+            );
+            if let Some(number) = line.trim().strip_prefix("vilan-test-port=") {
+                break number.parse().expect("the announced port is a number");
+            }
+        };
+        SignalledServer { child, port }
+    }
+
+    fn signal(&self, name: &str) {
+        let sent = Command::new("kill")
+            .args([name, &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "kill {name} must succeed");
+    }
+
+    /// Waits for the process to end — a LIVENESS bound, not a claim about how
+    /// fast it stops — and answers its exit status and its stderr.
+    fn finish(mut self) -> (std::process::ExitStatus, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll the server") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server did not end after the signal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        (status, stderr)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalledServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// F45 (Order 43's R-i, RULED: build): a native server STOPS on SIGTERM and
+/// reaches its process end, so the leak census reads a server's cells at exit.
+///
+/// The kolt shape answers a login, takes a SIGTERM, and exits 0 — where node,
+/// with no handler, dies of the signal — printing the census line the runtime
+/// prints only after the program's thread has ended. A `#[cfg(unix)]` pin: the
+/// signal is sent with `kill`, and Windows has no console equivalent a test
+/// could send.
+#[cfg(unix)]
+#[test]
+fn a_native_server_stops_on_sigterm_and_reaches_its_process_end() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_kolt_exit.vl"), KOLT_SHAPE_PROBE)
+        .expect("write the probe program");
+    let server = SignalledServer::spawn(
+        &staged,
+        "native_probe_kolt_exit.vl",
+        &[("VILAN_NATIVE_LEAK_CENSUS", "1")],
+    );
+    let login =
+        ServedRequest::exchange(server.port, "POST", "/api/login", "[\"ada\",\"lovelace1\"]");
+    assert_eq!(login.body, "{\"ok\":true,\"message\":\"welcome ada\"}");
+    server.signal("-TERM");
+    let (status, stderr) = server.finish();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a SIGTERM'd native server drains and exits 0 (stderr: {stderr})"
+    );
+    let census = stderr
+        .lines()
+        .find(|line| line.starts_with("vilan-native: cells minted="))
+        .unwrap_or_else(|| panic!("the program reached no process end:\n{stderr}"));
+    assert_eq!(
+        census, KOLT_SHAPE_EXIT_CENSUS,
+        "the kolt shape's exit census moved; a live cell is a cycle — read it before moving \
+         this line"
+    );
+}
+
+/// What the kolt shape's counted cells are at process end after one login and
+/// a SIGTERM — F45's exit row, C14's gate reading a server for the first time.
+#[cfg(unix)]
+const KOLT_SHAPE_EXIT_CENSUS: &str = "vilan-native: cells minted=1 live=0";
+
+/// F45: the SECOND termination signal ends the process at once — the answer
+/// for a server whose open response never ends. The first stops the listener
+/// (a new connection is refused, which is how the harness knows it landed —
+/// no sleep stands in for it) while the open stream keeps the program alive;
+/// the second exits 1 with the runtime's sentence.
+#[cfg(unix)]
+#[test]
+fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_open_stream.vl"),
+        OPEN_STREAM_PROBE,
+    )
+    .expect("write the probe program");
+    let mut server = SignalledServer::spawn(&staged, "native_probe_open_stream.vl", &[]);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port))
+        .expect("connect to the announced port");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .expect("send the request");
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone the stream"));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).expect("read the stream") > 0,
+            "the stream ended before its first chunk"
+        );
+        if line.contains("first") {
+            break;
+        }
+    }
+    server.signal("-TERM");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::net::TcpStream::connect(("127.0.0.1", server.port)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first SIGTERM never closed the listener"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        server.child.try_wait().expect("poll the server").is_none(),
+        "the open stream keeps the program alive after the first signal"
+    );
+    server.signal("-TERM");
+    let (status, stderr) = server.finish();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the second signal exits 1 (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("stopped by a second termination request"),
+        "the runtime says why it stopped: {stderr}"
+    );
+    drop(stream);
+}
+
+const OPEN_STREAM_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder()\n",
+    "\t\t\t.streaming(|stream| stream.send(\"first\\n\"))\n",
+    "\t\t\t.build(),\n",
+    "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
+    "\t\ton_stop = |stopped| {},\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "}\n",
+);
+
 /// F25: a program that FAILS answers the same exit code on both backends, and
 /// the native binary does not print Rust's panic banner.
 ///
@@ -3625,9 +4276,11 @@ fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
 /// not a number to regenerate past. Regenerate with
 /// `VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1` only after reading the difference.
 ///
-/// The F18/F40 exit — kolt's server and its shape — is NOT a row: a server is
-/// stopped by a signal, and `vilan_rt::http` has no graceful stop to reach
-/// process end through (recorded in the lane's report).
+/// The F18/F40 exit — kolt's server and its shape — is not a row of THIS
+/// table, whose rows run to their own end: a server runs until it is told to
+/// stop. Since F45 it can be told — SIGTERM stops it gracefully and the
+/// census reads it at process end — and the kolt shape's exit line is held by
+/// [`a_native_server_stops_on_sigterm_and_reaches_its_process_end`].
 #[test]
 fn the_native_leak_census_matches_its_table() {
     let staged = stage();

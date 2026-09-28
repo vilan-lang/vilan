@@ -95,8 +95,8 @@ pub struct Emitted {
     pub host_gaps: Vec<String>,
     /// The OPTIONAL runtime crates the program reached, so the cargo project
     /// written for it depends on exactly those (F18 slice 2's
-    /// `vilan-rt-sqlite`, F40's `vilan-rt-crypto`). A program that reaches
-    /// neither names neither and never builds them.
+    /// `vilan-rt-sqlite`, F40's `vilan-rt-crypto`, F45's `vilan-rt-signal`). A
+    /// program that reaches none names none and never builds them.
     pub optional_crates: OptionalCrates,
     /// R3's measurement: how many bindings this program had to box into
     /// `vilan_rt::Captured<_>` (an `Rc<RefCell<_>>`) because a closure captures
@@ -129,6 +129,9 @@ pub struct OptionalCrates {
     /// OS randomness, SHA-384/512, HMAC and PBKDF2 — `vilan-rt-crypto`
     /// (`getrandom`; F40, RULED (a)).
     pub crypto: bool,
+    /// A server's graceful stop on a termination signal — `vilan-rt-signal`
+    /// (`ctrlc`; F45, Order 43's R-i). Reached by starting an HTTP server.
+    pub signal: bool,
 }
 
 impl OptionalCrates {
@@ -140,6 +143,9 @@ impl OptionalCrates {
         }
         if self.crypto {
             names.push("vilan-rt-crypto");
+        }
+        if self.signal {
+            names.push("vilan-rt-signal");
         }
         names
     }
@@ -351,6 +357,11 @@ struct Emitter<'a, 'src> {
     /// [`Emitter::crypto_host_binding`] and by rendering a node `Buffer`'s type
     /// — the two places a program's text can name that crate.
     reaches_crypto: bool,
+    /// Whether this program starts an HTTP server, and so links
+    /// `vilan-rt-signal` (F45): the emitted `main` installs the termination
+    /// handler that stops its servers gracefully. Set where `createServer` is
+    /// lowered, the one door every server passes through.
+    reaches_signal: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -540,6 +551,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_return_type: None,
             reaches_sqlite: false,
             reaches_crypto: false,
+            reaches_signal: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -581,10 +593,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.compute_boxed_bindings();
 
         let main = self.ensure_function(main_id, &HashMap::default())?;
-        let main_body = self
+        let mut main_body = self
             .functions
             .remove(&main.slot)
             .expect("main was just emitted");
+        // F45: a program that starts an HTTP server routes the termination
+        // signals to the runtime's graceful stop before its body runs. Known
+        // only now — `main` has been walked, and everything it reaches.
+        if self.reaches_signal {
+            main_body = main_body.replacen(
+                "fn main() {\n",
+                "fn main() {\n    vilan_rt_signal::install();\n",
+                1,
+            );
+        }
 
         let mut source = String::from(PRELUDE);
         for declaration in self.types.values() {
@@ -607,6 +629,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             optional_crates: OptionalCrates {
                 sqlite: self.reaches_sqlite,
                 crypto: self.reaches_crypto,
+                signal: self.reaches_signal,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -622,13 +645,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// BINDING, not the value, so a `mut` local a closure reads is a place two
     /// frames share. JavaScript boxes every place for free; natively the box is
     /// the emitter's to write.
+    ///
+    /// A `mut` PARAMETER is a binding too (F47, UNSOUND until it joined): `fun
+    /// late(mut n: i32): i32 { let show = || n; n = 5; show() }` printed `5` on
+    /// JS and `0` natively, because the closure captured a COPY of `n`, and a
+    /// closure that wrote one (`|| { n = n + 1; }`) was refused by rustc as
+    /// `FnMut` where `Fn` was wanted. A boxed parameter is received as the plain
+    /// value its signature says and re-bound into its cell on entry — see
+    /// [`Emitter::boxed_parameter_prologue`].
     fn compute_boxed_bindings(&mut self) {
         let closures: Vec<Id> = self.program.closures.keys().copied().collect();
         for closure_id in closures {
             let Some(closure) = self.program.closures.get(&closure_id) else {
                 continue;
             };
-            let mut declared_inside = HashSet::new();
+            // The closure's OWN parameters are declared inside it: `|mut v|
+            // { v = v - 1; v }` writes its parameter and captures nothing, and
+            // since parameters joined the analysis (F47) an unseeded walk read
+            // `v` as a capture of itself and boxed it.
+            let mut declared_inside = self.closure_parameter_bindings(closure);
             let mut referenced = HashSet::new();
             let mut visited = HashSet::new();
             self.scan_closure(
@@ -641,12 +676,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if declared_inside.contains(&binding) {
                     continue;
                 }
-                if self
+                let mutable_local = self
                     .program
                     .variables
                     .get(&binding)
-                    .is_some_and(|variable| variable.mutable)
-                {
+                    .is_some_and(|variable| variable.mutable);
+                let mutable_parameter =
+                    self.program
+                        .parameters
+                        .get(&binding)
+                        .is_some_and(|parameter| {
+                            parameter.mutable
+                                && !parameter.lazy
+                                && self.receiving_form(parameter) == Receiving::ByValue
+                        });
+                if mutable_local || mutable_parameter {
                     self.boxed.insert(binding);
                 }
             }
@@ -785,16 +829,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// body referred to bindings nothing declared; `destructuring.vl` was
     /// refused for the `let` form before this slice and became a rustc refusal
     /// the moment that form was admitted, which is how it was found.
+    /// The `let`s that re-bind a function's or a closure's BOXED parameters
+    /// into their cells on entry (F47): the signature receives the plain value
+    /// its type says, and every read and write in the body goes through the
+    /// cell a closure shares, exactly as a boxed `let` does.
+    fn boxed_parameter_prologue(&mut self, parameters: &[Id]) -> String {
+        let mut prologue = String::new();
+        for parameter in parameters {
+            if self.boxed.contains(parameter) {
+                self.boxed_emitted.insert(*parameter);
+                let name = self.binding_name(*parameter);
+                let _ = write!(prologue, "let {name} = vilan_rt::Captured::new({name}); ");
+            }
+        }
+        prologue
+    }
+
     fn closure_body(
         &mut self,
         closure: &vilan_core::analyzer::Closure,
         depth: usize,
     ) -> Result<String, Error> {
+        let boxed = self.boxed_parameter_prologue(&closure.parameters);
         let body = self.expression(closure.return_, depth)?;
         if closure.parameter_destructures.is_empty() {
-            return Ok(body);
+            if boxed.is_empty() {
+                return Ok(body);
+            }
+            return Ok(format!("{{ {boxed}{body} }}"));
         }
-        let mut prefix = String::new();
+        let mut prefix = boxed;
         for destructure in &closure.parameter_destructures {
             let rendered = self.expression(*destructure, depth)?;
             let _ = write!(prefix, "{rendered}; ");
@@ -1045,6 +1109,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 });
             }
             Some(Expr::If(branch)) => self.walk_if_liveness(&branch, depth, state),
+            // F46: a LOANED place argument — a `&self` / `&mut self` receiver
+            // above all — is read for as long as the call runs, not at the
+            // moment it is evaluated: the borrow outlives every argument after
+            // it. So it is walked LAST, and a by-value argument that hands the
+            // same binding on (`source.on_settle(pulling(source, observer))`)
+            // is not its last use and copies, where it had moved the binding
+            // out from under the live borrow (rustc: E0505, or E0382 behind
+            // F35's hoist). Only a bare place is deferred: taking one has no
+            // effect of its own, so walking it late changes no evaluation
+            // order — a loaned argument that COMPUTES something keeps its
+            // place, because its reads really happen first.
+            Some(Expr::Call(call_id))
+                if let Some(deferred) = self.loaned_place_arguments(call_id)
+                    && !deferred.is_empty() =>
+            {
+                for child in self.children_of(expr_id) {
+                    if !deferred.contains(&child) {
+                        self.walk_liveness(child, depth, state);
+                    }
+                }
+                for argument in deferred {
+                    self.walk_liveness(argument, depth, state);
+                }
+            }
             Some(Expr::Match(subject, legs)) if legs.iter().all(|leg| leg.guard.is_none()) => {
                 self.walk_liveness(subject, depth, state);
                 let before = state.clone();
@@ -1115,6 +1203,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             None => {}
         }
+    }
+
+    /// The arguments of a call that the callee LOANS (`&`/`&mut`, a plain
+    /// `self` receiver among them) and that are bare places — a binding, a
+    /// field spine over one, or a written `&` of either. `None` when the call's
+    /// callee is not a declaration this emitter can read conventions off (a
+    /// closure value, a variant constructor). See [`Self::walk_liveness`]'s
+    /// call arm (F46).
+    fn loaned_place_arguments(&self, call_id: Id) -> Option<Vec<Id>> {
+        let function_call = self.program.function_calls.get(&call_id)?;
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let function = self.program.functions.get(target)?;
+        let is_a_place = |argument: Id| match self.program.entity_map.get(&argument) {
+            Some(Expr::Reference(inner, _)) => self.place_spine(*inner).is_some(),
+            _ => self.place_spine(argument).is_some(),
+        };
+        Some(
+            function
+                .parameters
+                .iter()
+                .zip(&function_call.argument_ids)
+                .filter(|(parameter_id, argument)| {
+                    self.program
+                        .parameters
+                        .get(*parameter_id)
+                        .is_some_and(|parameter| {
+                            self.receiving_form(parameter) != Receiving::ByValue
+                        })
+                        && is_a_place(**argument)
+                })
+                .map(|(_, argument)| *argument)
+                .collect(),
+        )
     }
 
     /// One `if` / `else if` chain, arm by arm (F37). The condition is read on
@@ -3150,6 +3274,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .map(|type_id| self.concrete(type_id));
         let saved_return_type = std::mem::replace(&mut self.current_return_type, declared_return);
         let saved_origin = self.current_origin.replace(function.name);
+        let boxed = self.boxed_parameter_prologue(&function.parameters);
+        if !boxed.is_empty() {
+            let _ = writeln!(body, "    {}", boxed.trim_end());
+        }
         let walked = self.emit_block(&function.body.0, function.body.1, &mut body, 1);
         self.current_origin = saved_origin;
         self.current_return_type = saved_return_type;
@@ -3295,8 +3423,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn parameter_declaration(&mut self, id: Id, span: Span) -> Result<String, Error> {
+        let (binder, rendered) = self.parameter_parts(id, span)?;
+        Ok(format!("{binder}: {rendered}"))
+    }
+
+    /// A parameter's declaration in its two halves: the BINDER (`mut name`)
+    /// and the Rust TYPE it is received at. The type alone is what a closure's
+    /// `dyn Fn(..)` signature is written from (F44), so it is rendered once, by
+    /// the same rules the declaration uses, and the two cannot disagree.
+    fn parameter_parts(&mut self, id: Id, span: Span) -> Result<(String, String), Error> {
         if self.program.context_hidden_parameters.contains_key(&id) {
-            return self.context_parameter_declaration(id, span);
+            return self.context_parameter_parts(id, span);
         }
         let parameter = self
             .program
@@ -3314,10 +3451,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // is an ordinary parameter here too.
         if parameter.lazy && !self.program.lazy_eager_parameters.contains(&id) {
             let rendered = self.rust_type(parameter.type_id, span)?;
-            return Ok(format!(
-                "{}: vilan_rt::Lazy<{rendered}>",
-                self.binding_name(id)
-            ));
+            return Ok((self.binding_name(id), format!("vilan_rt::Lazy<{rendered}>")));
         }
         // A parameter declared `async |T| U` (J2's `async_values`, which the
         // inference also fills for an unannotated binding that holds one) —
@@ -3347,10 +3481,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Receiving::ByValue => "mut ",
             _ => "",
         };
-        Ok(format!("{binder}{}: {declaration}", self.binding_name(id)))
+        Ok((format!("{binder}{}", self.binding_name(id)), declaration))
     }
 
-    /// A HIDDEN CONTEXT parameter's declaration (J6).
+    /// A HIDDEN CONTEXT parameter's declaration (J6), in
+    /// [`Self::parameter_parts`]' two halves.
     ///
     /// `context::thread_contexts` rewrites every ambient read into a parameter
     /// and every call into one that passes the value — so by the time a program
@@ -3366,9 +3501,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// [`Emitter::context_parameter_type`] decides. The binder is `mut` because
     /// nothing in the IR says whether the plumbing writes it, and an unused
     /// `mut` is in `PRELUDE`'s allow list.
-    fn context_parameter_declaration(&mut self, id: Id, span: Span) -> Result<String, Error> {
+    fn context_parameter_parts(&mut self, id: Id, span: Span) -> Result<(String, String), Error> {
         let rendered = self.context_parameter_type(id, span)?;
-        Ok(format!("mut {}: {rendered}", self.binding_name(id)))
+        Ok((format!("mut {}", self.binding_name(id)), rendered))
     }
 
     /// The native type a context-threaded hidden parameter carries — the
@@ -6144,9 +6279,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return rendered;
         }
         let mut parameters = Vec::new();
+        let mut signature = Vec::new();
         for parameter_id in &closure.parameters {
-            parameters.push(self.parameter_declaration(*parameter_id, span)?);
+            let (binder, rendered) = self.parameter_parts(*parameter_id, span)?;
+            parameters.push(format!("{binder}: {rendered}"));
+            signature.push(rendered);
         }
+        // F44: the literal IS the counted `dyn Fn` every closure type renders
+        // as (F16), from the moment it is built — not an `Rc` of its own
+        // anonymous closure type that coerces only where the position happens
+        // to name the target. Where nothing names it, Rust's inference takes
+        // the anonymous type: `Shared::new([])` pushed a closure became a
+        // `Vec<Rc<{closure}>>`, so a second closure was "a different closure"
+        // and one that READ the list it was pushed into was "a cyclic type of
+        // infinite size" (the closure's type contained the list that contained
+        // the closure). The parameter types are the literal's own, so a view
+        // parameter keeps its higher-ranked `&mut`; the return is left to
+        // inference, which the body answers.
+        let as_counted = format!(" as std::rc::Rc<dyn Fn({}) -> _>", signature.join(", "));
         // A `move` closure takes its captures by value, so a captured CELL has
         // to be a handle of its own — otherwise the binding outside is moved
         // into the closure and every later read of it is a use-after-move.
@@ -6249,7 +6399,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let inner =
                 self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
             return Ok(format!(
-                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}) }}",
+                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}){as_counted} }}",
                 parameters.join(", ")
             ));
         }
@@ -6262,7 +6412,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
             let origin = rust_string(self.current_origin.unwrap_or("a floating handler"));
             return Ok(format!(
-                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}) }}",
+                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}){as_counted} }}",
                 parameters.join(", ")
             ));
         }
@@ -6270,7 +6420,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // here whether the position it lands in stores it. `Rc::new` is the
         // shape the probe's R-1 finding forced.
         Ok(format!(
-            "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}) }}",
+            "{{ {prelude}std::rc::Rc::new(move |{}| {{ {body} }}){as_counted} }}",
             parameters.join(", ")
         ))
     }
@@ -6582,6 +6732,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.expects_async_value = true;
                 let handler = self.value_argument(argument_ids, 0, depth);
                 self.expects_async_value = false;
+                // F45: a program that serves stops gracefully on a termination
+                // signal, which is `vilan-rt-signal`'s wire to the runtime.
+                self.reaches_signal = true;
                 return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
             }
             // The two body reads CONSUME the request handle, and the callback
@@ -9685,21 +9838,51 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{rendered} }}"));
         }
+        // F42: the expectation in force here is the one for the intrinsic's
+        // RESULT, and an argument is not its result. Rendered under it, the
+        // argument of `Shared::new(Map::new())` in a field typed
+        // `Shared<Map<Hash, usize>>` matched `Map<K, V>` against the `Shared`,
+        // closed nothing, and `KeyedCell::new` was refused for `Map`'s unbound
+        // `V`. Each argument takes the expectation its intrinsic gives it.
         let mut arguments = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
+            let expecting = self.intrinsic_argument_expectation(intrinsic, index);
             arguments.push(if index == 0 {
                 if mutating {
                     self.mutable_receiver(*argument, depth)?
                 } else {
-                    self.expression(*argument, depth)?
+                    let saved = std::mem::replace(&mut self.expected_type, expecting);
+                    let rendered = self.expression(*argument, depth);
+                    self.expected_type = saved;
+                    rendered?
                 }
             } else if mutating {
                 self.consumed_value_of_expecting(*argument, None, depth)?
             } else {
-                self.value_of(*argument, depth)?
+                self.value_of_expecting(*argument, expecting, depth)?
             });
         }
         self.intrinsic(intrinsic, arguments, span)
+    }
+
+    /// The type an intrinsic's argument at `index` is expected to have, read
+    /// off the expectation for the intrinsic's result (F42).
+    ///
+    /// Only a constructor relates the two: `Shared::new(value)` answers a
+    /// `Shared<T>`, so its value is expected at the `T` of the `Shared` the
+    /// position wants — which is the position a generic call inside it (a
+    /// `Map::new()`, a `SignalCell::new([])`) closes its open bindings from.
+    /// Every other intrinsic's argument is a receiver or an operand whose type
+    /// the result says nothing about, so it is rendered expecting nothing, as a
+    /// call's written arguments are.
+    fn intrinsic_argument_expectation(&self, intrinsic: Intrinsic, index: usize) -> Option<TypeId> {
+        match (intrinsic, index) {
+            (Intrinsic::SharedNew, 0) => match self.resolve(self.expected_type?)? {
+                Type::Struct(_, arguments) => arguments.first().copied(),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Whether a place's ROOT is a binding that lives in a cell — a boxed
@@ -10167,14 +10350,38 @@ fn is_integer_type(rendered: &str) -> bool {
 /// A vilan identifier as a Rust one. Vilan's identifier grammar is a subset of
 /// Rust's already, so this only has to keep a vilan name that happens to be a
 /// Rust keyword from becoming one.
+///
+/// **Two ways, because rustc has two kinds of keyword** (F41). Most keywords
+/// are spelled as a raw identifier (`r#type`, `r#match`), which names the same
+/// field on every read and write and needs no bookkeeping. Four cannot be:
+/// `self`, `Self`, `super` and `crate` are PATH keywords, and rustc refuses
+/// them raw ("`self` cannot be a raw identifier"). Vilan's `self` and `super`
+/// are contextual, so `struct S { self: i32, super: i32 }` is a program the JS
+/// backend runs — and every field access, struct literal, and rendering site
+/// emits its name through THIS function, so the mangling below is what makes
+/// the write and the read-back agree without a table.
+///
+/// A path keyword takes a trailing `_`, and so does every name that is a path
+/// keyword followed by underscores only: `self` → `self_`, `self_` → `self__`,
+/// `self__` → `self___`. Appending one `_` across that whole family keeps the
+/// map injective — a struct holding both `self` and `self_` gets two distinct
+/// Rust fields — where mangling `self` alone would collide with a vilan field
+/// already spelled `self_`. The mangling never reaches a program's output: a
+/// struct prints and serializes as its flat field array on both backends, so
+/// no field NAME is ever rendered.
 fn sanitize(name: &str) -> String {
     const RUST_KEYWORDS: &[&str] = &[
-        "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
-        "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-        "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-        "unsafe", "use", "where", "while", "async", "await", "box", "final", "macro", "override",
-        "priv", "try", "typeof", "unsized", "virtual", "yield", "abstract", "become", "do",
+        "as", "break", "const", "continue", "dyn", "else", "enum", "extern", "false", "fn", "for",
+        "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+        "static", "struct", "trait", "true", "type", "unsafe", "use", "where", "while", "async",
+        "await", "box", "final", "macro", "override", "priv", "try", "typeof", "unsized",
+        "virtual", "yield", "abstract", "become", "do",
     ];
+    /// The keywords rustc refuses to spell raw.
+    const PATH_KEYWORDS: &[&str] = &["self", "Self", "super", "crate"];
+    if PATH_KEYWORDS.contains(&name.trim_end_matches('_')) {
+        return format!("{name}_");
+    }
     if RUST_KEYWORDS.contains(&name) {
         return format!("r#{name}");
     }
