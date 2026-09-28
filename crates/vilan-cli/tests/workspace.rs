@@ -2307,6 +2307,71 @@ fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── F27 R3: platform-fenced twins join the legs that check the file ───────
+//
+// §8.4 item 1: a twin is compiled only under a platform its fence admits, so
+// `vilan check` checks a file with twins under each twin's platform as well as
+// its colour — otherwise the browser twin of a module a server colours would
+// be checked by nothing.
+
+/// A module holding `Slot` twins, each reading only its own platform's `View`
+/// (std's own `ui.vl` twin pair, in userland). `{browser_value}` is what the
+/// browser twin writes, so a pin can break THAT twin alone.
+fn slot_twins_module(browser_value: &str) -> String {
+    format!(
+        "import std::ui;\nimport std::ui::{{ Slot, View }};\n\nexport struct Badge {{\n\tlabel: str,\n}}\n\n\
+         export [platform(\"browser\")]\nimpl Badge with Slot {{\n\tfun place(self, parent: View) {{\n\t\tparent.element.set_attribute(\"data-badge\", {browser_value});\n\t}}\n}}\n\n\
+         export [platform(\"@process\")]\nimpl Badge with Slot {{\n\tfun place(self, parent: View) {{\n\t\tui::set_attribute(parent.attributes, \"data-badge\", self.label);\n\t}}\n}}\n"
+    )
+}
+
+#[test]
+fn f27_r3_a_module_with_twins_is_checked_under_each_twins_platform() {
+    let dir = f27_package(
+        "f27_r3_twins_clean",
+        &slot_twins_module("self.label"),
+        PLAIN_SERVER,
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "each twin analyzed under the platform its fence admits:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // The server colours the module; only the browser leg the twin adds can
+    // see the browser twin's mistake.
+    let dir = f27_package(
+        "f27_r3_twins_broken",
+        &slot_twins_module("42"),
+        PLAIN_SERVER,
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("Expected str, but got i32"),
+        "the browser twin is checked by the leg it adds:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_r3_a_bare_files_twins_add_their_legs_on_the_terminal_too() {
+    let dir = temp_project("f27_r3_bare_twins");
+    write(
+        &dir,
+        "slot.vl",
+        &format!("{}\nfun main() {{}}\n", slot_twins_module("42")),
+    );
+    let output = vilan_plain(&["check", dir.join("slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("Expected str, but got i32"),
+        "the node default is the primary leg; the browser twin adds its own:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn f27_the_twin_note_names_the_attribute_that_moves_the_file() {
     let dir = f27_package("f27_note_attribute", REGION_FIELD_MODULE, PLAIN_SERVER);

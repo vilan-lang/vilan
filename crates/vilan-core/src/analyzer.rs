@@ -3451,6 +3451,14 @@ pub struct Analyzer<'src> {
     /// diagnostic sites can read both without threading either.
     platform: Platform,
     platform_reason: Option<String>,
+    /// F27 R3: the platform-fenced TWINS this leg does not collect — each
+    /// item's outermost span, keyed by its file — read at the one place the
+    /// walk could collect them ([`Self::walk_expr_node_inner`]'s head). Empty
+    /// for every analysis of a program that writes no twins.
+    fenced_out_items: HashSet<(SourceId, Span)>,
+    /// F27 R3.5: twin FUNCTIONS none of whose fences admits this leg, with
+    /// the fences their twins declare — the steer on the miss a reach makes.
+    fenced_out_names: HashMap<String, String>,
     // The file currently being walked, so type references (which aren't entities)
     // can be tagged with their source for the language server.
     current_source_id: SourceId,
@@ -6092,6 +6100,8 @@ impl<'src> Analyzer<'src> {
             std_layer_twin_files: HashMap::default(),
             platform: Platform::default(),
             platform_reason: None,
+            fenced_out_items: HashSet::default(),
+            fenced_out_names: HashMap::default(),
             lazy_argument_resource_refusals: HashSet::default(),
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
@@ -31026,6 +31036,19 @@ impl<'src> Analyzer<'src> {
     }
 
     fn walk_expr_node_inner(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        // F27 R3.2: a platform-fenced twin whose fence excludes this leg is
+        // not collected — no entity of its own, no scope entry, no impl
+        // registration, no emission. It walks as the module-level no-op a
+        // `mod self;` walks as.
+        if !self.fenced_out_items.is_empty()
+            && self
+                .fenced_out_items
+                .contains(&(self.current_source_id, node.1))
+        {
+            let id = self.new_entity_id();
+            self.expr_id_to_expr_map.insert(id, Expr::Void);
+            return id;
+        }
         // `const expr` marks and FORWARDS: the inner expression is the entity
         // (no wrapper), so every downstream pass sees a plain subtree; the
         // const pass (const_eval.rs) evaluates the marked ids after analysis.
@@ -41494,6 +41517,27 @@ impl<'src> Analyzer<'src> {
     /// Sets the file the analyzer is currently walking AND drops a diagnostic
     /// attribution mark: errors pushed from here on belong to `source` until
     /// the next mark (backlog E1).
+    /// F27 R3: reads the platform-fenced twins of the file about to be walked
+    /// (its top level and its inline `mod`s) against THIS leg's platform,
+    /// before anything in it is collected — `platform_color::select_twins`
+    /// decides, and this records what it decided: the twins the leg skips,
+    /// the twin functions with no twin for the leg, and R3.1/R3.4's refusals,
+    /// attributed to the file.
+    fn select_platform_twins(&mut self, items: &'src NodeList<'src>, text: &str) {
+        let selection = crate::platform_color::select_twins(items, text, self.platform);
+        let source = self.current_source_id;
+        for span in selection.fenced_out {
+            self.fenced_out_items.insert((source, span));
+        }
+        self.fenced_out_names.extend(selection.missing);
+        for mut diagnostic in selection.diagnostics {
+            if let Some(note) = diagnostic.note.as_mut() {
+                note.source = Some(source);
+            }
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
     fn set_current_source(&mut self, source: SourceId) {
         self.current_source_id = source;
         match self.diagnostic_source_marks.last() {
@@ -46642,6 +46686,15 @@ impl<'src> Analyzer<'src> {
                  `jump continue;`"
                     .to_string(),
             );
+        }
+        // F27 R3.5: a twin function none of whose twins this platform admits
+        // is an ordinary miss, and the miss says which twins there are.
+        if let Some(fences) = self.fenced_out_names.get(name) {
+            return Some(format!(
+                "; `{name}` is declared only as platform-fenced twins ({fences}), and none \
+                 admits `{}`, the platform this is analyzed under",
+                self.platform.runtime_name()
+            ));
         }
         if let Some(steer) = self.web_prelude_steer(name) {
             return Some(steer);
@@ -64499,9 +64552,13 @@ fn analyze_inner<'src>(
                 .push((*module_scope_id, path.to_string(), *source_id));
         }
     }
-    for (_name, ast, _text, module_scope_id, source_id, _origin) in &loaded {
+    for (_name, ast, text, module_scope_id, source_id, origin) in &loaded {
         analyzer.set_current_source(*source_id);
         analyzer.module_scope_ids.insert(*module_scope_id);
+        // F27 R3: twins are userland's (std's are layer twins, a file each).
+        if !matches!(origin, Origin::Std) {
+            analyzer.select_platform_twins(&ast.0, text);
+        }
         let start = analyzer.entity_id;
         analyzer.walk_expr_nodes(&ast.0, *module_scope_id);
         analyzer.source_ranges.push(SourceRange {
@@ -65146,6 +65203,14 @@ fn analyze_over_world<'src>(
             if !entry_is_open_module {
                 analyzer.seed_preludes();
             }
+        }
+        if let Some((_, entry_text)) = analyzer
+            .source_texts
+            .iter()
+            .find(|(source, _)| *source == SourceId(0))
+            .copied()
+        {
+            analyzer.select_platform_twins(&nodes.0, entry_text);
         }
         let entry_walk_start = analyzer.entity_id;
         analyzer.walk_expr_nodes(&nodes.0, global_scope_id);

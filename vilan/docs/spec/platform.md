@@ -73,6 +73,51 @@ members; on a struct, an enum or a trait it takes part in choosing the
 platform the file is analyzed under. A type has no platform of its own
 (§11.2's requirement is on code), so a label on one requires nothing.
 
+**Twins.** Two items of one identity — two module-level functions of one
+name, or two `impl`s of one trait for one subject — may stand in one file
+when both are fenced and their fences share no platform. They are
+**twins**, and each build compiles the one its platform admits:
+
+```vilan
+import std::io::print;
+
+[platform("browser")]
+fun where_am_i(): str {
+	"the browser"
+}
+
+[platform("@process")]
+fun where_am_i(): str {
+	"a server"
+}
+
+fun main() {
+	print(where_am_i());
+}
+```
+
+Each twin is analyzed only under a platform its fence admits, so a body
+reads its own platform's `std` twin (a browser twin's `View` has an
+`element`, a `@process` twin's has `attributes`), and a build collects
+only its own: the other twin is not type-checked, registered or emitted
+by it. Twins whose fences overlap are refused, naming a platform both
+admit; so is an unfenced item beside a fenced one — there is no default
+with a platform override, the default is the complement fence written
+out. Twin functions agree on their written signature (parameters, return
+type, generics). A platform no twin admits simply has none: reaching the
+name from it is a miss that names the twins there are. A file whose
+`mod self;` declares a platform holds its twins to it — a twin that
+admits none of the file's platforms is refused, since nothing could
+compile it. The twin trait impls and functions are the whole of it:
+nominals and inherent impls have no twins.
+
+This bends §11.2's "unreachable code is still type-checked" for twins
+alone, and the rule that replaces it is: every item is type-checked under
+at least one platform it admits, and `vilan check` checks a file under
+each platform its twins name as well as under its colour — so a
+single-platform `vilan build` checks its own twins and no others, and
+`vilan check` is the answer for all of them.
+
 ## 11.4 Manifests (`vilan.toml`)
 
 The manifest declares what a directory builds. Sections:
