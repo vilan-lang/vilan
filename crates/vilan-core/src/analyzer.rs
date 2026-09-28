@@ -27219,29 +27219,36 @@ impl<'src> Analyzer<'src> {
         // aliased its source, while `b = a[0]` (an `Index`, which does intern)
         // copied one line away.
         let mut consider = |analyzer: &Self, value_id: Id, declared_type: Option<TypeId>| {
-            // B256: a `Shared.read()` is admitted beside a place, because it IS
-            // one — the intrinsic hands back `self.v`. B267's cell-aware
-            // elision is what takes the reads back out again, and it is asked
-            // here rather than inside `is_elidable_copy` because its answer is
-            // about the BINDING this read initializes, not about a dying
-            // source.
-            if (analyzer.is_place_expr(value_id)
-                || (analyzer.is_shared_read(value_id)
-                    && !analyzer.elided_shared_reads.contains(&value_id)))
-                // Rule 3: a VIEW is an alias on purpose. A `&mut` parameter
-                // forwarded into a construction (`Some(p)`) must stay the same
-                // view, or the write through the capture lands on a detached
-                // copy. A projection THROUGH a view (`p.field`) is an ordinary
-                // place and does copy — the same line `assignment_target_is_view`
-                // draws.
-                && !analyzer.assignment_target_is_view(value_id)
-                && !analyzer.resource_value_places.contains(&value_id)
-                && !analyzer.is_elidable_copy(value_id, shared_captures)
-                && let Some(type_id) = declared_type
-                    .or_else(|| analyzer.shared_read_value_type_id(value_id))
-                    .or_else(|| analyzer.place_value_type_id(value_id))
+            if let Some(type_id) =
+                analyzer.copy_candidate_type(value_id, declared_type, shared_captures)
             {
                 candidates.push((value_id, type_id));
+                return;
+            }
+            // B418: a value that CHOOSES — an `if`, a `match`, a block — whose
+            // chosen tail is a place or a `Shared` read hands that storage on
+            // exactly as the tail would standing alone: `let b = if flag {
+            // s.read() } else { [] }` aliased the cell's live list on JS, and
+            // `mut b = if flag { a } else { [] }; b.push(3)` grew `a`. The
+            // copy is taken of the WHOLE value, at the one emission point the
+            // position already has — a fresh tail copied as well is the price
+            // of not threading an emission point into every arm of both
+            // backends, and `__clone` of a fresh value is a copy nothing
+            // observes.
+            if matches!(
+                analyzer.expr_id_to_expr_map.get(&value_id),
+                Some(Expr::If(_) | Expr::Match(..) | Expr::Block(_))
+            ) {
+                let mut tails = Vec::new();
+                analyzer.value_tails(value_id, &mut tails);
+                if let Some(type_id) = tails.iter().find_map(|tail_id| {
+                    analyzer.copy_candidate_type(*tail_id, declared_type, shared_captures)
+                }) {
+                    let type_id = declared_type
+                        .or_else(|| analyzer.type_id_of_expr(value_id))
+                        .unwrap_or(type_id);
+                    candidates.push((value_id, type_id));
+                }
             }
         };
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
@@ -27399,6 +27406,72 @@ impl<'src> Analyzer<'src> {
                 .map(|(id, decision)| (*id, decision.clone())),
         );
         sites
+    }
+
+    /// Rule 1's candidacy test for ONE value at a copying position: the type
+    /// the copy is taken at, when the value reads existing aggregate storage
+    /// that would otherwise alias — a place, or a `Shared` read B267 did not
+    /// elide — and no rule excuses it (a view, a resource place, a source that
+    /// dies here). `declared_type` is the position's own type when it has one.
+    fn copy_candidate_type(
+        &self,
+        value_id: Id,
+        declared_type: Option<TypeId>,
+        shared_captures: &HashSet<Id>,
+    ) -> Option<TypeId> {
+        // B256: a `Shared.read()` is admitted beside a place, because it IS
+        // one — the intrinsic hands back `self.v`. B267's cell-aware
+        // elision is what takes the reads back out again, and it is asked
+        // here rather than inside `is_elidable_copy` because its answer is
+        // about the BINDING this read initializes, not about a dying
+        // source.
+        if !(self.is_place_expr(value_id)
+            || (self.is_shared_read(value_id) && !self.elided_shared_reads.contains(&value_id)))
+        {
+            return None;
+        }
+        // Rule 3: a VIEW is an alias on purpose. A `&mut` parameter
+        // forwarded into a construction (`Some(p)`) must stay the same
+        // view, or the write through the capture lands on a detached
+        // copy. A projection THROUGH a view (`p.field`) is an ordinary
+        // place and does copy — the same line `assignment_target_is_view`
+        // draws.
+        if self.assignment_target_is_view(value_id)
+            || self.resource_value_places.contains(&value_id)
+            || self.is_elidable_copy(value_id, shared_captures)
+        {
+            return None;
+        }
+        declared_type
+            .or_else(|| self.shared_read_value_type_id(value_id))
+            .or_else(|| self.place_value_type_id(value_id))
+    }
+
+    /// B418: the expressions a CHOOSING value can hand back — the tail of a
+    /// block, of each arm of a value `if`, of each leg of a `match`,
+    /// recursively; any other expression is its own tail.
+    fn value_tails(&self, value_id: Id, tails: &mut Vec<Id>) {
+        fn branch_tails(analyzer: &Analyzer, branch: &ExprIfBranch, tails: &mut Vec<Id>) {
+            match branch {
+                ExprIfBranch::If(_, (_, tail), otherwise) => {
+                    analyzer.value_tails(*tail, tails);
+                    if let Some(otherwise) = otherwise {
+                        branch_tails(analyzer, otherwise, tails);
+                    }
+                }
+                ExprIfBranch::Else((_, tail)) => analyzer.value_tails(*tail, tails),
+            }
+        }
+        match self.expr_id_to_expr_map.get(&value_id) {
+            Some(Expr::Block((_, tail))) => self.value_tails(*tail, tails),
+            Some(Expr::If(branch)) => branch_tails(self, branch, tails),
+            Some(Expr::Match(_, legs)) => {
+                for leg in legs {
+                    self.value_tails(leg.body, tails);
+                }
+            }
+            _ => tails.push(value_id),
+        }
     }
 
     /// Rule 1's RETURN clause (`proposal/element-clones.md` §3): a place a body

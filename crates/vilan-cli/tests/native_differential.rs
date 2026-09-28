@@ -981,6 +981,50 @@ const B435_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B418: a place or a `Shared` read reaching a binding through an `if` or
+/// `match` arm is a copy on both backends. JS aliased it (the cell's later
+/// write showed through the binding, and a `push` on the binding grew the
+/// source) where the native build copied.
+#[test]
+fn a_place_chosen_by_a_branch_is_copied_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b418.vl"), B418_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b418.vl"),
+        Verdict::Identical,
+        "a place chosen by a branch must be copied the same way on both backends"
+    );
+}
+
+const B418_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet s: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+    "\tlet flag = true;\n",
+    "\tlet b = if flag { s.read() } else { [] };\n",
+    "\ts.write().push(4);\n",
+    "\tprint(b.len());\n",
+    "\tlet c = match flag {\n",
+    "\t\ttrue => s.read(),\n",
+    "\t\tfalse => [],\n",
+    "\t};\n",
+    "\ts.write().push(5);\n",
+    "\tprint(c.len());\n",
+    "\tlet a: List<i32> = [1, 2];\n",
+    "\tmut d = if flag { a } else { [] };\n",
+    "\td.push(3);\n",
+    "\tprint(a.len());\n",
+    "\tprint(d.len());\n",
+    "\tmut e: List<i32> = [];\n",
+    "\te = if flag { a } else { [] };\n",
+    "\te.push(9);\n",
+    "\tprint(a.len());\n",
+    "}\n",
+);
+
 /// F18 slice 1: the emitter reaches `vilan_rt::http`.
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's

@@ -10509,3 +10509,76 @@ fn b400_a_for_over_a_read_that_does_not_write_in_place_copies_nothing() {
         "a read-only loop over a read must not copy:\n{emitted}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// B418 — a place or a `Shared` read reaching a binding THROUGH a branch copies
+// ---------------------------------------------------------------------------
+//
+// Rule 1 copies a place (and an unelided `Shared` read) at a binding, an
+// assignment and a construction slot — but only when the value IS the place.
+// Through an `if`/`match`/block tail it aliased on JS: `let b = if flag {
+// s.read() } else { [] }` saw a later `s.write().push` (4, native 3), and
+// `mut b = if flag { a } else { [] }; b.push(3)` grew `a`. The whole choosing
+// value copies now, as the native backend always did.
+
+#[test]
+fn b418_a_read_through_an_if_or_a_match_arm_is_copied_at_the_binding() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun main() {\n",
+            "\tlet s: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+            "\tlet flag = true;\n",
+            "\tlet b = if flag { s.read() } else { [] };\n",
+            "\ts.write().push(4);\n",
+            "\tprint(b.len());\n",
+            "\tlet c = match flag {\n",
+            "\t\ttrue => s.read(),\n",
+            "\t\tfalse => [],\n",
+            "\t};\n",
+            "\ts.write().push(5);\n",
+            "\tprint(c.len());\n",
+            "}\n",
+        ),
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn b418_a_place_through_a_branch_is_copied_at_a_binding_and_an_assignment() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet flag = true;\n",
+            "\tlet a: List<i32> = [1, 2];\n",
+            "\tmut d = if flag { a } else { [] };\n",
+            "\td.push(3);\n",
+            "\tmut e: List<i32> = [];\n",
+            "\te = if flag { { a } } else { [] };\n",
+            "\te.push(9);\n",
+            "\tlet f = [if flag { a } else { [] }];\n",
+            "\tprint(i\"{a.len()} {d.len()} {e.len()} {f[0].len()}\");\n",
+            "}\n",
+        ),
+        "2 3 3 2\n",
+    );
+}
+
+#[test]
+fn b418_a_branch_of_fresh_values_copies_nothing() {
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "fun main() {\n",
+        "\tlet flag = true;\n",
+        "\tlet b = if flag { [1] } else { [] };\n",
+        "\tprint(b.len());\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a branch of fresh values must not copy:\n{emitted}"
+    );
+}
