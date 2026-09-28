@@ -10102,3 +10102,252 @@ fn a_view_inside_a_nested_call_subject_is_a_closure_capture() {
         "a closure cannot capture the view 'seen'",
     );
 }
+
+// --- B433: an assignment through a place that is not a plain `mut` local ----
+//
+// The value is checked against what the PLACE holds, by the plain place's rule
+// (`mut x: T; x = v`). Before B433 only a plain local and a struct field
+// (B166) were checked; a call answering `&mut T`, a subscript, a tuple
+// position, a `&mut`/`own` parameter and a view binding accepted any value,
+// and `Shared<Option<i32>>.write() = 5` stored a bare `i32` in an `Option`
+// slot that every later read misread (kolt's cache never cached).
+
+#[test]
+fn b433_a_bare_i32_through_write_into_an_option_cell_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let cell: Shared<Option<i32>> = Shared::new(None);
+            cell.write() = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_a_bare_struct_through_write_into_an_option_cell_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::shared::Shared;
+        struct Plain { n: i32 }
+        fun main() {
+            let cell: Shared<Option<Plain>> = Shared::new(None);
+            cell.write() = Plain { n = 1 };
+        }
+        "#,
+        "Expected Option<Plain>, but got Plain",
+    );
+}
+
+#[test]
+fn b433_a_bare_list_through_write_into_an_option_cell_is_refused() {
+    // Kolt's shape: a cache slot `Shared<Option<List<..>>>` written bare.
+    assert_fails_once_with(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let cache: Shared<Option<List<i32>>> = Shared::new(None);
+            let made: List<i32> = [1, 2];
+            cache.write() = made;
+        }
+        "#,
+        "Expected Option<List<i32>>, but got List<i32>",
+    );
+}
+
+#[test]
+fn b433_some_through_write_into_an_option_cell_compiles_and_reads_back() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Plain { n: i32 }
+        fun main() {
+            let cell: Shared<Option<i32>> = Shared::new(None);
+            cell.write() = Some(5);
+            print(i"{cell.read().is_some()}");
+            let record: Shared<Option<Plain>> = Shared::new(None);
+            record.write() = Some(Plain { n = 2 });
+            print(i"{record.read().is_some()}");
+            cell.write() = None;
+            print(i"{cell.read().is_some()}");
+        }
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b433_a_compound_assignment_through_write_at_a_u53_counter_compiles() {
+    // kolt store.vl:172's shape: the literal takes the place's type.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let next: Shared<u53> = Shared::new(0);
+            next.write() += 1;
+            next.write() += 1;
+            next.write() = 7;
+            print(i"{next.read()}");
+            let index: Shared<usize> = Shared::new(0);
+            index.write() += 2;
+            print(i"{index.read()}");
+        }
+        "#,
+        "7\n2\n",
+    );
+}
+
+#[test]
+fn b433_a_compound_assignment_of_the_wrong_type_through_write_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let count: Shared<i32> = Shared::new(0);
+            count.write() += "one";
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
+fn b433_a_user_method_answering_a_mut_view_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        struct Holder { v: Option<i32> }
+        impl Holder {
+            fun slot(mut self): &mut Option<i32> borrows self { self.v }
+        }
+        fun main() {
+            mut holder = Holder { v = None };
+            holder.slot() = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_a_subscript_place_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut items: List<Option<i32>> = [None];
+            items[0] = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut items: List<i32> = [1];
+            items[0] = "c";
+        }
+        "#,
+        "Expected i32, but got str",
+    );
+}
+
+#[test]
+fn b433_a_tuple_position_place_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut pair: (Option<i32>, i32) = (None, 1);
+            pair.0 = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_a_mut_parameter_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun set(slot: &mut Option<i32>) { slot = 5; }
+        fun main() {
+            mut x: Option<i32> = None;
+            set(&mut x);
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_an_own_parameter_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun take(own n: i32) { n = "b"; }
+        fun main() { take(3); }
+        "#,
+        "Expected i32, but got str",
+    );
+}
+
+#[test]
+fn b433_a_mut_view_binding_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut x = 1;
+            let view = &mut x;
+            view = "e";
+        }
+        "#,
+        "Expected i32, but got str",
+    );
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut items: List<i32> = [1, 2];
+            for item in &mut items { item = "f"; }
+        }
+        "#,
+        "Expected i32, but got str",
+    );
+}
+
+#[test]
+fn b433_a_readonly_parameter_target_reports_only_the_mutation() {
+    // A place that cannot be written is refused as a target; a second
+    // "expected" diagnostic on it would say nothing more.
+    assert_fails_without(
+        r#"
+        fun set(n: i32) { n = "a"; }
+        fun main() { set(1); }
+        "#,
+        "Expected i32",
+    );
+}
+
+#[test]
+fn b433_well_typed_writes_at_every_place_compile_and_run() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun set(slot: &mut Option<i32>) { slot = Some(4); }
+        fun bump(own n: i32): i32 { n = n + 1; n }
+        fun main() {
+            mut items: List<Option<i32>> = [None];
+            items[0] = Some(1);
+            mut pair: (Option<i32>, i32) = (None, 1);
+            pair.0 = Some(2);
+            mut x: Option<i32> = None;
+            set(&mut x);
+            mut y = 1;
+            let view = &mut y;
+            view = 3;
+            print(i"{items[0].is_some()} {pair.0.is_some()} {x.is_some()} {y} {bump(4)}");
+        }
+        "#,
+        "true true true 3 5\n",
+    );
+}

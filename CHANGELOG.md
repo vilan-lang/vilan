@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: miscompile -->
+**An assignment is checked against the place it writes, whatever the place is: `cell.write() = 5` on a `Shared<Option<i32>>` is refused with `Expected Option<i32>, but got i32`, exactly as `mut x: Option<i32> = None; x = 5` always was.** Only two places were ever checked — a plain `mut` local, and a struct field (B166). Every other place accepted ANY value, and the emitter stored it: a call answering `&mut T` (`Shared::write()`, or your own `fun slot(mut self): &mut T borrows self`), a subscript (`list[i] = v` — `"c"` into a `List<i32>` compiled and printed `c1` for `list[0] + 1`), a tuple position (`pair.0 = v`), a `&mut` or `own` parameter, and a `&mut` view binding (`let v = &mut x; v = ..`, `for e in &mut list { e = .. }`). The one that bit was the `Option` slot: `write() = value` into a `Shared<Option<T>>` stored a bare `T`, so `is_some()` read `false` and a `match` took `None` on every read — a cache that silently never cached. Every place now takes the plain local's rule against what it HOLDS (references are transparent, so `&mut T` checks as `T`), through the same check the struct-field door uses — a literal takes the place's type (`write() += 1` at a `u53` counter is fine), and the error is reported at the value. What to change: write `Some(value)` where a bare value was going into an `Option` place; any other refusal was a value of the wrong type being stored. std, the examples and kolt carry none (222 `write() =` sites in std and the examples, 12 in kolt, all clean). A place that cannot be written at all (a bare or `&` parameter) keeps its one "cannot mutate" diagnostic. Tracker B433.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

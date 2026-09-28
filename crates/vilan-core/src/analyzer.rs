@@ -2544,12 +2544,17 @@ enum Constraint<'src> {
     /// definition, infers its type arguments from the values, and records the
     /// initializer once every field value's type is known.
     StructInitializer(StructInitializerConstraint<'src>),
-    /// `place.field = value` — the ASSIGNMENT door into a struct field, which
-    /// checked nothing at all before B166. Once the target resolves, the stored
-    /// value is checked against the field's declared type by the SAME rule the
-    /// literal door uses (`check_field_value`). Vacuous for any target that is
-    /// not a field: those places are checked by the kind that owns them.
-    FieldAssignment {
+    /// `place = value` where the place is anything but a plain `mut` local —
+    /// a struct field (B166), a tuple position, a subscript, a call answering
+    /// `&mut T` (`cell.write() = v`), a `&mut`/`own` parameter or a view
+    /// binding (B433). Every one of those checked NOTHING before its door was
+    /// written: a field until B166, the rest until B433, so
+    /// `Shared<Option<i32>>.write() = 5` stored a bare `i32` in an `Option`
+    /// slot. Once the target resolves, the stored value is checked against
+    /// the place's type by the SAME rule the literal door uses
+    /// (`check_field_value`). A plain `mut` local is the `Variable`
+    /// constraint's, which folds the value into the binding's own type.
+    PlaceAssignment {
         target_id: Id,
         /// The value that LANDS in the field — for a compound `f += v` this is
         /// the synthesized `f + v`, which is what the field ends up holding.
@@ -2671,7 +2676,7 @@ impl Constraint<'_> {
             Constraint::Comprehension { id, .. } => *id,
             Constraint::FieldAccessor(constraint) => constraint.id,
             Constraint::StructInitializer(constraint) => constraint.initializer_id,
-            Constraint::FieldAssignment { target_id, .. } => *target_id,
+            Constraint::PlaceAssignment { target_id, .. } => *target_id,
             Constraint::Match(prepped) => prepped.id,
             Constraint::IfArms { id, .. } => *id,
             Constraint::Variable(constraint) => constraint.variable_id,
@@ -2738,7 +2743,7 @@ impl Constraint<'_> {
             // Last, for `IfArms`'s reason: a pure CHECK nothing downstream
             // consumes, so it reads a settled target and a settled value
             // instead of deferring on each of them in turn.
-            Constraint::FieldAssignment { .. } => 12,
+            Constraint::PlaceAssignment { .. } => 12,
         }
     }
 }
@@ -31944,7 +31949,7 @@ impl<'src> Analyzer<'src> {
                 // target resolves and is vacuous when the target turns out not
                 // to be a field. The value's own span anchors a mismatch (E7),
                 // which for a compound `f += v` is the written `v`.
-                self.constraints.push(Constraint::FieldAssignment {
+                self.constraints.push(Constraint::PlaceAssignment {
                     target_id,
                     value_id: stored_value_id,
                     value_span: value.1,
@@ -40735,11 +40740,11 @@ impl<'src> Analyzer<'src> {
             Constraint::StructInitializer(constraint) => {
                 self.resolve_struct_initializer(constraint)
             }
-            Constraint::FieldAssignment {
+            Constraint::PlaceAssignment {
                 target_id,
                 value_id,
                 value_span,
-            } => self.resolve_field_assignment(*target_id, *value_id, *value_span),
+            } => self.resolve_place_assignment(*target_id, *value_id, *value_span),
             Constraint::Match(prepped) => self.resolve_match(prepped),
             Constraint::IfArms { id, span } => self.resolve_if_arms(*id, *span),
             Constraint::Variable(constraint) => self.resolve_variable(constraint),
@@ -47177,42 +47182,73 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// `place.field = value` (and the compound `place.field += value`, whose
-    /// stored value is the synthesized `field + value`): the ASSIGNMENT door
-    /// into a struct field. Defers until the target has resolved, then — if it
-    /// resolved to a FIELD — checks the stored value through
-    /// [`Self::check_field_value`], the same rule the literal door uses.
+    /// `place = value` (and the compound `place += value`, whose stored value
+    /// is the synthesized `place + value`) at a place that is not a plain
+    /// `mut` local: the ASSIGNMENT door. Defers until the target has
+    /// resolved, then checks the stored value against the PLACE's type
+    /// through [`Self::check_field_value`], the same rule the literal door
+    /// uses.
     ///
-    /// A target that resolved to anything else (a local, a tuple position, a
-    /// subscript, a failed accessor already carrying its own diagnostic) is
-    /// vacuous here: the kind that owns that place checks it. The field's type
-    /// is read off the TARGET, which `resolve_field_accessor` already recorded
-    /// with the subject's type arguments substituted in — so a field reached
-    /// through `Wrap<Doubler>` is checked against `Doubler`, not the struct's
-    /// abstract parameter.
-    fn resolve_field_assignment(
+    /// The place's type is read off the TARGET. For a field,
+    /// `resolve_field_accessor` already recorded it with the subject's type
+    /// arguments substituted in — so a field reached through `Wrap<Doubler>`
+    /// is checked against `Doubler`, not the struct's abstract parameter —
+    /// and a subscript and a call record theirs the same way. References are
+    /// transparent (R1), so a call answering `&mut T` and a `&mut T`
+    /// parameter both type as `T`: the value is checked against what the
+    /// place HOLDS, exactly as `mut x: T` checks it (B433 — the plain place's
+    /// rule, no lenient door).
+    ///
+    /// Which targets are vacuous here, and why: a plain `mut` local is the
+    /// `Variable` constraint's (`wire_prepped_assignment` folds the value into
+    /// the binding's type — the value may still be deciding it); a bare or `&`
+    /// parameter, an immutable binding and a function name are refused as
+    /// targets by `check_readonly_mutation` / `wire_prepped_assignment`, and a
+    /// second "expected" diagnostic on a place that cannot be written says
+    /// nothing; an explicit `*x = v`, a lifted chain and an `Error` carry
+    /// their own diagnostic already.
+    fn resolve_place_assignment(
         &mut self,
         target_id: Id,
         value_id: Id,
         value_span: Span,
     ) -> Resolution {
         match self.expr_id_to_expr_map.get(&target_id) {
-            Some(Expr::Field(_, _, _)) => {}
+            Some(Expr::Field(..) | Expr::TupleIndex(..) | Expr::Index(..) | Expr::Call(_)) => {}
+            Some(Expr::Local(binding_id)) => {
+                if !self.local_place_is_checked_at_its_assignment(*binding_id) {
+                    return Resolution::Resolved;
+                }
+            }
             Some(_) => return Resolution::Resolved,
             None => return Resolution::Deferred,
         }
-        let Some(field_type_id) = self.expr_id_to_type_id_map.get(&target_id).copied() else {
-            return Resolution::Deferred;
+        let place_type = match self.expr_id_to_type_id_map.get(&target_id).copied() {
+            Some(type_id) => type_id.get_type(self),
+            None => self.infer_type(target_id, &Type::Unknown, &HashMap::default()),
         };
-        let field_type = field_type_id.get_type(self);
-        if let Type::Unresolved = field_type {
+        if let Type::Unresolved = place_type {
             return Resolution::Deferred;
         }
-        match self.check_field_value(value_id, &field_type, &HashMap::default(), value_span) {
+        match self.check_field_value(value_id, &place_type, &HashMap::default(), value_span) {
             FieldValueVerdict::Deferred => Resolution::Deferred,
             FieldValueVerdict::Accepted(_) => Resolution::Resolved,
             FieldValueVerdict::Refused => Resolution::Failed,
         }
+    }
+
+    /// Whether an assignment to this LOCAL is type-checked by
+    /// [`Self::resolve_place_assignment`] (B433): a `&mut`/`own` parameter and
+    /// a view binding — the locals `wire_prepped_assignment` hands off
+    /// because their type is fixed by their declaration or by the view, not
+    /// by later writes. A plain variable is the `Variable` constraint's; a
+    /// bare or `&` parameter and a read-only view are refused as targets by
+    /// `check_readonly_mutation`, which is the one diagnostic they need.
+    fn local_place_is_checked_at_its_assignment(&self, binding_id: Id) -> bool {
+        if let Some(parameter) = self.parameters.get(&binding_id) {
+            return matches!(parameter.convention, Convention::RefMut | Convention::Own);
+        }
+        self.view_binding_mutability(binding_id) == Some(true)
     }
 
     /// The declaration a struct literal's head names: a bare name resolved
@@ -47445,7 +47481,7 @@ impl<'src> Analyzer<'src> {
             let struct_field_type = struct_field.type_id.get_type(self);
             let struct_field_type = self.rename_into_literal(struct_field_type, &literal_rename);
             // THE field-value rule — shared with the assignment door
-            // (`resolve_field_assignment`), so `S { field = value }` and
+            // (`resolve_place_assignment`), so `S { field = value }` and
             // `s.field = value` cannot disagree about what fits (B166).
             // A LITERAL instantiates the struct's parameters, so they are open
             // here even inside an `impl Boxy<type T>` whose body holds the same

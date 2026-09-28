@@ -1298,6 +1298,15 @@ Normative rejection cases (each is a compile error):
   `list[i].f = v`) is the same door. A compound `s.field op= v` is
   checked on what lands — the result of `op` (§5.7) — not on `v`. The
   error is reported at the value.
+- A value assigned to ANY place it does not match. Every place takes the
+  plain `mut` local's rule, checked against what the place holds: a
+  subscript (`list[i] = v`), a tuple position (`pair.0 = v`), a
+  `&mut`/`own` parameter or a `&mut` view binding, and a call answering
+  `&mut T` (`cell.write() = v` against `Shared<T>`'s `T`). References are
+  transparent, so the place's type is `T`, never `&mut T`: a bare `5`
+  written through a `Shared<Option<i32>>` is refused with `Expected
+  Option<i32>, but got i32` exactly as `mut x: Option<i32>; x = 5` is —
+  write `Some(5)`.
 
 *Implementation note (tracked gaps): a closure bound to a local and
 called directly does not infer its parameter types from the call, and
