@@ -236,10 +236,13 @@ binding (leading its prefix, as on a function), and a **re-export**:
 pkg::inner::DeltaCursor as KeyedCursor;` deprecates the name `KeyedCursor`
 the re-export publishes, while the item stays exactly the item —
 `KeyedCursor` is still a `DeltaCursor`. A use of a deprecated type in
-another module — an import, an annotation, a literal's head — warns with
-the function's own warning; so does every other module's import that
-reaches a deprecated re-export, and importing the item from where it is
-declared does not. The declaring module's own uses are silent, as std's
+another module — an annotation, a literal's head — warns with the
+function's own warning. An `import` line alone does not warn, for a type
+exactly as for a function: the uses are the fix sites, and a dead import
+falls out with the last one. The one import that does warn is one that
+reaches a deprecated re-export — the renamed name is transparent at every
+other site, so the import is its only use — and importing the item from
+where it is declared does not. The declaring module's own uses are silent, as std's
 are. A `[deprecated]` import that is not exported publishes nothing and is
 refused, and so is a `[deprecated]` or `[internal]` on an `impl` block,
 which nobody names — label its members. The editor strikes a deprecated
@@ -276,8 +279,9 @@ The editor treats each exactly as it treats a function: hidden from
 completion below an exact three-character prefix, dimmed at the
 declaration and at every use (a type position included), and leading its
 hover. A package that also wants the terminal to say so opts in with
-`[lints] internal_use = "warn"` in its `vilan.toml`: every import and use
-of an internal item outside the module that declares it then warns
+`[lints] internal_use = "warn"` in its `vilan.toml`: every use of an
+internal item outside the module that declares it then warns (an
+`import` line alone is not a use)
 `` `{name}` is internal: {reason} ``; the declaring module's own uses,
 std's and a dependency's stay silent.
 

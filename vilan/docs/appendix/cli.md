@@ -248,8 +248,8 @@ for them, in its own `vilan.toml`:
 internal_use = "warn"
 ```
 
-`internal_use` warns at every import and use of an `[internal("reason")]`
-item outside the module that declares it — `` `anchor` is internal: place
+`internal_use` warns at every use of an `[internal("reason")]` item outside
+the module that declares it (an `import` line alone is not a use) — `` `anchor` is internal: place
 against it, never through it ``. The label on its own only changes what the
 editor shows (the name is hidden from completion, dimmed, and its hover leads
 with the reason); a package that wants the terminal to say so too sets the

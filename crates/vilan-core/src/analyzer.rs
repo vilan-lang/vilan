@@ -3995,6 +3995,10 @@ pub struct Analyzer<'src> {
     /// ANCESTOR files off them (`ancestor_module_sources`), as the post-build
     /// pass reads `Program::canonical_sources`.
     source_paths: Vec<PathBuf>,
+    /// E224 (R-j): every `import`/`use` STATEMENT's span, by file — what
+    /// `labels::check` reads to tell an import line's own name rows (which are
+    /// not uses) from the uses it warns at.
+    import_statement_spans: Vec<(SourceId, Span)>,
     /// B318 S4: the cross-module inherent collisions the declaration-site rule
     /// banks for the IMPORT pass ([`MemberCollision`]). Empty for every program
     /// in which no two files declare one inherent name for one subject — the
@@ -6375,6 +6379,7 @@ impl<'src> Analyzer<'src> {
             lookup_anchor: None,
             declined_default_calls: HashMap::default(),
             source_paths: Vec::new(),
+            import_statement_spans: Vec::new(),
             cross_module_collisions: Vec::new(),
             blanket_residues: Vec::new(),
             scoped_reach_checks: Vec::new(),
@@ -33004,6 +33009,8 @@ impl<'src> Analyzer<'src> {
             // `Expr::Void` keeps a statement-position import a well-formed
             // no-op through typing and emission.
             Node::Import(root_branch, modifier) => {
+                self.import_statement_spans
+                    .push((self.current_source_id, node.1));
                 self.record_reach_marks(root_branch);
                 let mut entries = Vec::new();
                 flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
@@ -33034,6 +33041,8 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Void)
             }
             Node::Use(root_branch) => {
+                self.import_statement_spans
+                    .push((self.current_source_id, node.1));
                 self.record_reach_marks(root_branch);
                 let mut entries = Vec::new();
                 flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
@@ -59132,6 +59141,10 @@ pub struct Program<'src> {
     /// read by [`check_call_site_admission`] — a default's block is not found
     /// by its declarations.
     pub declined_default_calls: HashMap<Id, (Id, usize, String)>,
+    /// E224 (R-j): every `import`/`use` statement's span, by file. An import
+    /// line names what it binds, and a name row inside one is not a USE: the
+    /// labels pass warns at uses only (`labels::check`).
+    pub import_statement_spans: Vec<(SourceId, Span)>,
     /// B318 S4: the cross-module inherent collisions, banked at the declaration
     /// and refused at the IMPORT of whichever file admits both
     /// ([`refuse_imported_member_collisions`]).
@@ -69042,6 +69055,7 @@ fn analyze_over_world<'src>(
         implementations: analyzer.implementations,
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
         declined_default_calls: std::mem::take(&mut analyzer.declined_default_calls),
+        import_statement_spans: std::mem::take(&mut analyzer.import_statement_spans),
         cross_module_collisions: std::mem::take(&mut analyzer.cross_module_collisions),
         blanket_residues: std::mem::take(&mut analyzer.blanket_residues),
         scoped_reach_checks: std::mem::take(&mut analyzer.scoped_reach_checks),
