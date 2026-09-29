@@ -1503,6 +1503,73 @@ const B418_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B452: a sibling that lowers to statements — a block, an `if` or `match`
+/// in value position — runs AFTER the siblings written before it, on JS as it
+/// always did natively: call arguments, list and tuple elements, struct
+/// fields in written order, binary operands, a method receiver, a `mut`
+/// binding read before a block that writes it.
+#[test]
+fn a_sibling_that_lowers_to_statements_keeps_its_order_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b452.vl"), B452_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b452.vl"),
+        Verdict::Identical,
+        "sibling evaluation order must agree on both backends"
+    );
+}
+
+const B452_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Pair {\n",
+    "\ta: i32,\n",
+    "\tb: i32,\n",
+    "}\n",
+    "\n",
+    "struct Acc {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Acc {\n",
+    "\tfun plus(self, k: i32): i32 {\n",
+    "\t\tself.n + k\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun say(label: str, value: i32): i32 {\n",
+    "\tprint(label);\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun add(a: i32, b: i32): i32 {\n",
+    "\ta + b\n",
+    "}\n",
+    "\n",
+    "fun make(label: str): Acc {\n",
+    "\tprint(label);\n",
+    "\tAcc { n = 100 }\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(add(say(\"a\", 1), { print(\"b-block\"); say(\"b\", 2) }));\n",
+    "\tlet list = [say(\"x\", 1), { print(\"y-block\"); say(\"y\", 2) }];\n",
+    "\tprint(list.len());\n",
+    "\tlet p = Pair { b = say(\"b\", 2), a = { print(\"a-block\"); say(\"a\", 1) } };\n",
+    "\tprint(p.a * 10 + p.b);\n",
+    "\tlet c = true;\n",
+    "\tprint(add(say(\"i\", 1), if c { print(\"j-if\"); say(\"j\", 2) } else { 0 }));\n",
+    "\tprint(add(say(\"m\", 1), match Some(2) { Some(let v) => { print(\"n-match\"); say(\"n\", v) }, None => 0 }));\n",
+    "\tmut x = 1;\n",
+    "\tprint(add(x, { x = 10; x }));\n",
+    "\tprint(say(\"l\", 1) + { print(\"r-block\"); say(\"r\", 2) });\n",
+    "\tlet t = (say(\"p\", 1), { print(\"q-block\"); say(\"q\", 2) });\n",
+    "\tprint(t.0 + t.1);\n",
+    "\tprint(make(\"recv\").plus({ print(\"arg-block\"); 1 }));\n",
+    "}\n",
+);
+
 /// B403: a bare `Holder::tag()` inside `impl Holder<type T: Label>` means
 /// `Self::tag()`, so each `Holder<X>` reaches its own `X::label()`. The
 /// native build emitted ONE instance for the unbound call and printed `A A`
