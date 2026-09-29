@@ -487,6 +487,90 @@ fn i9_the_old_names_are_the_same_types_as_the_new() {
     );
 }
 
+// --- I8's maps half: `HashMap::get_or_insert(key, make)` --------------------
+
+/// A miss makes once and stores; a hit makes nothing; the value read back is
+/// the one stored. The maker counts its runs through a `Shared`, so "made
+/// nothing" is observed rather than inferred from the answer.
+#[test]
+fn i8_hash_map_get_or_insert_makes_once_on_a_miss_and_never_on_a_hit() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::shared::Shared;
+
+        fun main() {
+            let runs = Shared::new(0);
+            mut widths: HashMap<str, i32> = HashMap::new();
+            print(widths.get_or_insert("a", || { runs.write() = runs.read() + 1; 5 }));
+            print(widths.get_or_insert("a", || { runs.write() = runs.read() + 1; 9 }));
+            print(widths.get("a").unwrap_or(0));
+            print(widths.get_or_insert("b", || { runs.write() = runs.read() + 1; 7 }));
+            print(widths.len());
+            print(runs.read());
+        }
+        "#,
+        "5\n5\n5\n7\n2\n2\n",
+    );
+}
+
+/// The key a miss stores is the caller's key, by value: a derived-`Hashable`
+/// struct key is found again by an EQUAL, distinct value, and `keys()` answers
+/// the stored key itself.
+#[test]
+fn i8_hash_map_get_or_insert_stores_the_key_it_was_given() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        [derive(Hashable, PartialEq)]
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            mut names: HashMap<Point, str> = HashMap::new();
+            print(names.get_or_insert(Point { x = 1, y = 2 }, || "first"));
+            print(names.get_or_insert(Point { x = 1, y = 2 }, || "second"));
+            for key in names.keys() {
+                print(key.x + key.y);
+            }
+        }
+        "#,
+        "first\nfirst\n3\n",
+    );
+}
+
+/// `Memo::get_or_insert` stays three steps (read, make, write) rather than a
+/// call to `HashMap::get_or_insert` through `write()`, because a maker may ask
+/// the same memo again: the memoized recursion. Pinned so a "thin wrapper"
+/// refactor that runs the maker under a live `write()` view has to answer it.
+#[test]
+fn i8_a_memo_maker_may_ask_the_same_memo_again() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::memo::Memo;
+
+        let fibs: Memo<i32, i32> = Memo::new();
+
+        fun fib(n: i32): i32 {
+            if n < 2 {
+                n
+            } else {
+                fibs.get_or_insert(n, || fib(n - 1) + fib(n - 2))
+            }
+        }
+
+        fun main() {
+            print(fib(30));
+            print(fibs.len());
+        }
+        "#,
+        "832040\n29\n",
+    );
+}
+
 // --- I4's open tail: Map/Set parity (proposal/std-surface.md §1.2/§3) --------
 //
 // The unranked "Map/Set parity" row v1 left unshipped: `entries`/

@@ -165,6 +165,7 @@ impl HashMap<type K: Hashable, type V> {
 	fun new(): HashMap<K, V>
 	fun insert(&mut self, key: K, value: V)
 	fun get(self, key: K): Option<V>
+	fun get_or_insert(&mut self, key: K, make: || V): V   // the held value, or make() stored and answered
 	fun contains_key(self, key: K): bool
 	fun remove(&mut self, key: K)
 	fun len(self): usize
@@ -255,6 +256,21 @@ fun main() {
 	print(total);                        // 3
 	print(scores.contains_value(2));     // true
 	print(scores.contains_value(9));     // false
+}
+```
+
+`get_or_insert` is the entry idiom: the value held for `key`, or — on a miss,
+and only there — the one `make` builds, inserted and then answered. The maker
+runs once per key, at the call site:
+
+```vilan
+import std::hash_map::HashMap;
+
+fun main() {
+	mut lengths: HashMap<str, usize> = HashMap::new();
+	print(lengths.get_or_insert("alpha", || "alpha".len()));  // 5 -- made and stored
+	print(lengths.get_or_insert("alpha", || 0));              // 5 -- held; the maker did not run
+	print(lengths.len());                                     // 1
 }
 ```
 
@@ -367,7 +383,8 @@ It holds a `Shared` table inside, so a `Memo` bound with `let` at module level
 is written by every call site that reads it; no `mut` is needed.
 
 The one-slot twin is `Shared<Option<T>>::get_or_insert(make)`: the held value,
-or `make()` stored and answered — the same rule about what `make` builds.
+or `make()` stored and answered — the same rule about what `make` builds. The
+unshared form is `HashMap::get_or_insert(key, make)` on a map you hold `mut`.
 
 ## `Hashable`
 

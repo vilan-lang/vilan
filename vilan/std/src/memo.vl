@@ -70,6 +70,14 @@ impl Memo<type K: Hashable, type V> {
 	/// handle mint, a parse) is paid for once. What it builds is kept for the life
 	/// of the memo, past the caller's owner: a derivation in a maker is
 	/// `.memo_global()`, and a lease belongs at the call site (the module's head).
+	///
+	/// This is `HashMap::get_or_insert` over the shared table, and deliberately
+	/// NOT a call to it: through `self.entries.write().get_or_insert(key, make)`
+	/// the maker would run while the table's `&mut` view is live, and a maker
+	/// that asks this same memo for another key — the memoized recursion,
+	/// `fibs.get_or_insert(n, || fib(n - 1) + fib(n - 2))` — would re-enter the
+	/// cell it is being written through. So the read, the make and the write are
+	/// three steps here, and the maker runs holding nothing.
 	fun get_or_insert(self, key: K, make: || V): V {
 		match self.entries.read().get(key) {
 			Some(let held) => held,

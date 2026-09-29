@@ -40,6 +40,26 @@ impl HashMap<type K: Hashable, type V> {
 		}
 	}
 
+	/// The value stored under `key` — or, when there is none, the one `make`
+	/// builds, INSERTED and then answered (tracker I8: the map's entry idiom, as
+	/// Rust's `entry(key).or_insert_with(make)`; the name says the write, as
+	/// `Shared<Option<T>>::get_or_insert` and `Memo::get_or_insert` do).
+	///
+	/// `make` runs only on a miss, and exactly once there, so a maker that costs
+	/// something is paid for once per key. It runs at the call site, so a maker
+	/// that reads a context reads the caller's. The key is hashed once.
+	fun get_or_insert(&mut self, key: K, make: || V): V {
+		let hash = key.hash();
+		match self.table.get(hash) {
+			Some(let entry) => entry.1,
+			None => {
+				let made = make();
+				self.table.insert(hash, (key, made));
+				made
+			},
+		}
+	}
+
 	fun contains_key(self, key: K): bool {
 		self.table.contains_key(key.hash())
 	}
