@@ -1144,9 +1144,9 @@ impl<T: std::hash::Hash + Eq + Clone> Clone for Set<T> {
 /// Entry-wise, in insertion order.
 ///
 /// **This is not reachable from a vilan program**, and it is here because the
-/// emitter derives `PartialEq` for every aggregate it writes: `std::map` gives
-/// `Map` no `impl PartialEq`, so `a == b` on two maps does not type-check, and
-/// `[derive(PartialEq)]` on a struct with a `Map` field is rejected by the
+/// emitter derives `PartialEq` for every aggregate it writes: `std::hash_map`
+/// gives `HashMap` no `impl PartialEq`, so `a == b` on two maps does not
+/// type-check, and `[derive(PartialEq)]` on a struct with a `HashMap` field is rejected by the
 /// analyzer's all-fields-comparable check. What the derive would mean on the JS
 /// backend is `===` — reference equality on two `Map` objects — and a value
 /// struct has no reference to compare, which is the other half of why this stays

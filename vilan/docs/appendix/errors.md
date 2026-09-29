@@ -747,7 +747,7 @@ instead.
 → [Resources](../tour/resources.md)
 
 **"`…` cannot hold the resource `…`…: … a native container's internals are host code …"**
-`List`, `Map`, `Set`, and the external generics (`Shared`, `Task`,
+`List`, `HashMap`, `HashSet`, and the external generics (`Shared`, `Task`,
 `Promise`, `Context`) can't hold a resource: the move checker
 can't see inside host storage. `Option` is the sanctioned resource
 container; or keep the resource in a struct field.
@@ -941,7 +941,7 @@ migration notes.
 **"field `…` of `[derive(Wire)]` type `…` is `…`, which is not Wire: …"**
 Something unserializable (a closure, a `Signal`) is inside a payload
 type. Wire types carry data only: scalars, `str`, `bool`,
-`List`/`Option`/`Result`/`Map` of Wire, other Wire types, and anything
+`List`/`Option`/`Result`/`HashMap` of Wire, other Wire types, and anything
 you write an `impl … with Wire` for.
 → [Services & RPC](../guide/services.md)
 

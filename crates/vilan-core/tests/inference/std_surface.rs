@@ -357,6 +357,136 @@ fn the_std_surface_batch_needs_no_import() {
     );
 }
 
+// --- I9: `HashMap`/`HashSet`, and the old names as deprecated aliases ---------
+//
+// The hash collections are `std::hash_map::HashMap` and `std::hash_set::HashSet`.
+// `std::map::Map` and `std::set::Set` stay one release as `[deprecated]`
+// re-exports of the SAME types: a program that still spells them compiles,
+// warns at the name with the steer, and its values pass for the new type's in
+// both directions (a second spelling of one item, not a second type).
+
+#[test]
+fn i9_std_map_map_is_a_deprecated_alias_that_warns_with_the_steer() {
+    assert_warns_spanning(
+        r#"
+        import std::map::Map;
+
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("a", 1);
+        }
+        "#,
+        "Map",
+        "`Map` is deprecated; use std::hash_map::HashMap",
+    );
+}
+
+#[test]
+fn i9_std_set_set_is_a_deprecated_alias_that_warns_with_the_steer() {
+    assert_warns_spanning(
+        r#"
+        import std::set::Set;
+
+        fun main() {
+            mut seen: Set<i32> = Set::new();
+            seen.insert(1);
+        }
+        "#,
+        "Set",
+        "`Set` is deprecated; use std::hash_set::HashSet",
+    );
+}
+
+#[test]
+fn i9_the_new_names_do_not_warn() {
+    let warnings = warnings(
+        r#"
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        fun main() {
+            mut scores: HashMap<str, i32> = HashMap::new();
+            scores.insert("a", 1);
+            mut seen: HashSet<i32> = HashSet::new();
+            seen.insert(1);
+        }
+        "#,
+    );
+    assert!(warnings.is_empty(), "{warnings:#?}");
+}
+
+/// The iteration contract the new names keep: INSERTION order (papers-44's
+/// probe found both backends agree on it). An overwrite keeps its key's place,
+/// a remove and re-insert goes to the end, and a set's duplicate insert keeps
+/// its value's place.
+#[test]
+fn i9_hash_map_and_hash_set_iterate_in_insertion_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        fun main() {
+            mut m: HashMap<str, i32> = HashMap::new();
+            m.insert("a", 1);
+            m.insert("b", 2);
+            m.insert("c", 3);
+            m.insert("a", 10);
+            m.remove("b");
+            m.insert("b", 20);
+            m.insert("d", 4);
+            print(m.keys());
+            print(m.values());
+            mut s: HashSet<i32> = HashSet::new();
+            s.insert(3);
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            s.remove(1);
+            s.insert(1);
+            print(s.values());
+        }
+        "#,
+        "[ 'a', 'c', 'b', 'd' ]\n[ 10, 3, 20, 4 ]\n[ 3, 2, 1 ]\n",
+    );
+}
+
+/// The alias IS the type: an old-spelled value goes where the new type is
+/// declared and back, the old import still reaches the `List` terminators
+/// (`to_map`/`to_set`, extension impls declared in the new modules), and a
+/// `for` over an old-spelled set still takes the set's native lowering (it is
+/// keyed on the declaring struct, which the alias shares).
+#[test]
+fn i9_the_old_names_are_the_same_types_as_the_new() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+        import std::map::Map;
+        import std::set::Set;
+
+        fun size_new(table: HashMap<str, i32>): usize { table.len() }
+        fun size_old(table: Map<str, i32>): usize { table.len() }
+        fun make_old(): Set<i32> { [3, 1, 3].to_set() }
+
+        fun main() {
+            let old: Map<str, i32> = [("a", 1), ("b", 2)].to_map();
+            let new: HashMap<str, i32> = old;
+            print(size_new(old));
+            print(size_old(new));
+            let seen: HashSet<i32> = make_old();
+            for value in make_old() {
+                print(value);
+            }
+            print(seen.contains(1));
+        }
+        "#,
+        "2\n2\n3\n1\ntrue\n",
+    );
+}
+
 // --- I4's open tail: Map/Set parity (proposal/std-surface.md §1.2/§3) --------
 //
 // The unranked "Map/Set parity" row v1 left unshipped: `entries`/
@@ -373,9 +503,9 @@ fn map_entries_pairs_keys_and_values_in_insertion_order() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("alice", 1);
             scores.insert("bob", 2);
             scores.insert("alice", 99);   // overwrite -- position does not move
@@ -399,9 +529,9 @@ fn map_entries_on_an_empty_map_is_empty() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut empty: Map<str, i32> = Map::new();
+            mut empty: HashMap<str, i32> = HashMap::new();
             print(empty.entries().len());   // 0
             print(empty.entries().is_empty()); // true
         }
@@ -415,9 +545,9 @@ fn map_contains_value_compares_by_value_not_by_key() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("x", 5);
             scores.insert("y", 5);   // a duplicate value under a different key
             print(scores.contains_value(5));    // true
@@ -434,9 +564,9 @@ fn map_contains_value_on_an_empty_map_is_false() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut empty: Map<str, i32> = Map::new();
+            mut empty: HashMap<str, i32> = HashMap::new();
             print(empty.contains_value(0));
         }
         "#,
@@ -449,13 +579,13 @@ fn set_union_combines_and_dedupes_the_overlap() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(2);
             b.insert(3);
             b.insert(4);
@@ -475,12 +605,12 @@ fn set_union_with_an_empty_set_is_identity_either_direction() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
-            mut empty: Set<i32> = Set::new();
+            mut empty: HashSet<i32> = HashSet::new();
             print(a.union(empty).len());       // 2
             print(empty.union(a).len());       // 2
             print(empty.union(empty).len());   // 0 -- both sides empty
@@ -495,13 +625,13 @@ fn set_intersection_keeps_only_the_shared_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(2);
             b.insert(3);
             b.insert(4);
@@ -510,7 +640,7 @@ fn set_intersection_keeps_only_the_shared_elements() {
             print(shared.contains(2));      // true
             print(shared.contains(1));      // false
 
-            mut disjoint: Set<i32> = Set::new();
+            mut disjoint: HashSet<i32> = HashSet::new();
             disjoint.insert(100);
             print(a.intersection(disjoint).len());   // 0 -- no overlap
         }
@@ -524,13 +654,13 @@ fn set_difference_keeps_elements_absent_from_the_other_side() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(2);
             b.insert(3);
             let remainder = a.difference(b);
@@ -539,7 +669,7 @@ fn set_difference_keeps_elements_absent_from_the_other_side() {
             print(remainder.contains(2));    // false
 
             print(a.difference(a).len());    // 0 -- a set minus itself is empty
-            mut empty: Set<i32> = Set::new();
+            mut empty: HashSet<i32> = HashSet::new();
             print(a.difference(empty).len()); // 3 -- nothing removed
         }
         "#,
@@ -556,10 +686,10 @@ fn the_map_set_parity_batch_needs_only_its_own_type_import() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("a", 1);
             mut total = 0;
             for entry in scores.entries() {
@@ -568,9 +698,9 @@ fn the_map_set_parity_batch_needs_only_its_own_type_import() {
             print(total);
             print(scores.contains_value(1));
 
-            mut xs: Set<i32> = Set::new();
+            mut xs: HashSet<i32> = HashSet::new();
             xs.insert(1);
-            mut ys: Set<i32> = Set::new();
+            mut ys: HashSet<i32> = HashSet::new();
             ys.insert(2);
             print(xs.union(ys).len());
             print(xs.intersection(ys).len());
@@ -601,9 +731,9 @@ fn a_set_loop_over_self_inside_its_own_generic_impl_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
+        impl HashSet<type T: Hashable> {
             fun probe(self): i32 {
                 mut n = 0;
                 for x in self {
@@ -613,7 +743,7 @@ fn a_set_loop_over_self_inside_its_own_generic_impl_walks_the_elements() {
             }
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -632,9 +762,9 @@ fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
+        impl HashSet<type T: Hashable> {
             fun total(self): i32 {
                 mut sum = 0;
                 for x in self {
@@ -643,7 +773,7 @@ fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
                 sum
             }
         }
-        impl Set<i32> {
+        impl HashSet<i32> {
             fun sum(self): i32 {
                 mut sum = 0;
                 for x in self {
@@ -653,7 +783,7 @@ fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
             }
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(10);
             s.insert(20);
             s.insert(30);
@@ -676,11 +806,11 @@ fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
-            fun merged(self, other: Set<T>): Set<T> {
-                mut result: Set<T> = Set::new();
+        impl HashSet<type T: Hashable> {
+            fun merged(self, other: HashSet<T>): HashSet<T> {
+                mut result: HashSet<T> = HashSet::new();
                 for value in self {
                     result.insert(value);
                 }
@@ -691,11 +821,11 @@ fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
             }
         }
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(3);
             b.insert(4);
             print(a.merged(b).len());   // 4, not 1
@@ -710,9 +840,9 @@ fn a_set_loop_over_a_mut_self_receiver_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
+        impl HashSet<type T: Hashable> {
             fun probe(&mut self): i32 {
                 mut n = 0;
                 for x in self {
@@ -722,7 +852,7 @@ fn a_set_loop_over_a_mut_self_receiver_walks_the_elements() {
             }
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             print(s.probe());
@@ -740,16 +870,16 @@ fn a_set_loop_over_a_plain_parameter_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        fun count_concrete(s: Set<i32>): i32 {
+        fun count_concrete(s: HashSet<i32>): i32 {
             mut n = 0;
             for x in s {
                 n = n + 1;
             }
             n
         }
-        fun count_generic<T: Hashable>(s: Set<T>): i32 {
+        fun count_generic<T: Hashable>(s: HashSet<T>): i32 {
             mut n = 0;
             for x in s {
                 n = n + 1;
@@ -757,7 +887,7 @@ fn a_set_loop_over_a_plain_parameter_walks_the_elements() {
             n
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -777,12 +907,12 @@ fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         struct Holder {
-            inner: Set<i32>,
+            inner: HashSet<i32>,
         }
-        fun make(): Set<i32> {
-            mut s: Set<i32> = Set::new();
+        fun make(): HashSet<i32> {
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -795,7 +925,7 @@ fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
             }
             n
         }
-        fun from_view(s: &Set<i32>): i32 {
+        fun from_view(s: &HashSet<i32>): i32 {
             mut n = 0;
             for x in *s {
                 n = n + 1;
@@ -830,9 +960,9 @@ fn a_set_loop_survives_nesting_and_a_closure_parameter() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
-        fun make(): Set<i32> {
-            mut s: Set<i32> = Set::new();
+        import std::hash_set::HashSet;
+        fun make(): HashSet<i32> {
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -845,8 +975,8 @@ fn a_set_loop_survives_nesting_and_a_closure_parameter() {
                     n = n + 1;
                 }
             }
-            print(n);   // 6 -- the loop binding is a `Set`, not an element
-            let count = |s: Set<i32>| {
+            print(n);   // 6 -- the loop binding is a `HashSet`, not an element
+            let count = |s: HashSet<i32>| {
                 mut c = 0;
                 for x in s {
                     c = c + 1;
@@ -916,9 +1046,9 @@ fn a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("a", 1);
             scores.insert("b", 2);
             mut n = 0;
@@ -6032,21 +6162,21 @@ fn i4_the_containers_have_a_default_and_it_is_the_empty_one() {
         r#"
         import std::io::print;
         import std::default::Default;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         fun make<T: Default>(): T {
             T::default()
         }
         fun main() {
             let list: List<i32> = make();
-            mut map: Map<str, i32> = make();
-            mut set: Set<i32> = make();
+            mut map: HashMap<str, i32> = make();
+            mut set: HashSet<i32> = make();
             print(i"{list.len()} {map.len()} {set.len()}");
             map.insert("a", 1);
             set.insert(3);
             print(i"{map.len()} {set.len()}");
-            let fresh_map: Map<str, i32> = make();
-            let fresh_set: Set<i32> = make();
+            let fresh_map: HashMap<str, i32> = make();
+            let fresh_set: HashSet<i32> = make();
             print(i"{fresh_map.len()} {fresh_set.len()}");
         }
         "#,
@@ -6087,13 +6217,13 @@ fn i4_a_derived_default_admits_a_struct_holding_containers() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         [derive(Default)]
         struct Prefs {
             names: List<str>,
-            seen: Set<i32>,
-            widths: Map<str, i32>,
+            seen: HashSet<i32>,
+            widths: HashMap<str, i32>,
             label: str,
             collapsed: bool,
             width: i32,
@@ -6118,13 +6248,13 @@ fn i4_the_container_defaults_do_not_widen_what_a_map_key_may_be() {
         r#"
         import std::io::print;
         import std::default::Default;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         struct Key { id: i32 }
         fun make<T: Default>(): T {
             T::default()
         }
         fun main() {
-            let map: Map<Key, i32> = make();
+            let map: HashMap<Key, i32> = make();
             print(map.len());
         }
         "#,

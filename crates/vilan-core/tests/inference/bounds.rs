@@ -3426,9 +3426,9 @@ fn const_eval_keeps_a_maps_insertion_order() {
         r#"
         import std::io::print;
         import std::display::Display;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun ordered(): str {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert("zeta", 1);
             table.insert("alpha", 2);
             table.insert("mu", 3);
@@ -4267,9 +4267,9 @@ fn a_generic_structs_method_checks_its_argument() {
 fn a_maps_insert_checks_its_value() {
     assert_fails_spanning(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut m: Map<str, i32> = Map::new();
+            mut m: HashMap<str, i32> = HashMap::new();
             m.insert("k", "not an int");
         }
         main();
@@ -9603,13 +9603,13 @@ fn b324_a_clause_inside_a_map_value_is_refused() {
         r#"
         import std::io::print;
         import std::context::Context;
-        import std::map::Map;
+        import std::hash_map::HashMap;
 
         let current: Context<i32> = Context::new();
 
         fun main() {
             current.run(1, || {
-                mut bodies: Map<str, (|| void) context current> = Map::new();
+                mut bodies: HashMap<str, (|| void) context current> = HashMap::new();
                 bodies.insert("a", || print(i"saw {current.get()}"));
             });
         }

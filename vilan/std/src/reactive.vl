@@ -2008,7 +2008,7 @@ export fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Derive<S, T, U>)
 /// method call threads the caller's ambient owner the ordinary way, which is what
 /// lets a row's entry die with the row.
 export struct Selector<T> {
-	// One cell per key, keyed by `key.hash()` (the canonical key `Map`/`Set` use).
+	// One cell per key, keyed by `key.hash()` (the canonical key `HashMap`/`HashSet` use).
 	// Every `of` for the same key hands back the same cell.
 	cells: Shared<NativeMap<SignalCell<bool>>>,
 	// The source's current value, mirrored here so `of` can seed a fresh cell and

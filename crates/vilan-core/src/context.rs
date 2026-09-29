@@ -575,7 +575,7 @@ fn struct_binds_parameter_to_a_field(program: &Program, struct_id: Id, position:
 }
 
 /// B324: the first `context` clause written INSIDE `type_id` at a position no
-/// landing rule reaches — `List<(|| i32) context c>`, `Map<str, (|| i32)
+/// landing rule reaches — `List<(|| i32) context c>`, `HashMap<str, (|| i32)
 /// context c>`, `Option<..>`, a tuple element, an array element.
 ///
 /// B309 gave the clause four WRITING positions (a parameter, a `let`
@@ -638,7 +638,7 @@ fn unfollowable_clause(
 /// cannot follow it (B324). One row.
 fn unfollowable_refusal(program: &Program, position: &str, clause: &[Id]) -> String {
     format!(
-        "a closure written at this {position} would be born under `{}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array",
+        "a closure written at this {position} would be born under `{}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `HashMap`, an `Option`, a tuple or an array",
         clause_spelling(program, clause),
     )
 }

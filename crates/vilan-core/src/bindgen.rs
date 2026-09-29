@@ -28,7 +28,7 @@
 //! - `enum` lowers to `[tag, …payload]`. A TS discriminated union is a tagged
 //!   *object* (`{kind: "circle", r: 2}`); matching one as an enum reads
 //!   `value[0]`, misses every arm, and crashes.
-//! - `std::map::Map<K, V>` is a plain struct wrapping a `NativeMap` keyed by
+//! - `std::hash_map::HashMap<K, V>` is a plain struct wrapping a `NativeMap` keyed by
 //!   `key.hash()` — nothing like a host `{a: 1}` object.
 //! - `List<T>` is a native JS *array*. An array-LIKE object (`{[index: number]:
 //!   T}` — NodeList-shaped: numeric keys and `length`, no `Symbol.iterator`)
@@ -243,7 +243,10 @@ pub fn generate(source: &str, options: &Options) -> Generated {
 /// back in here.
 const RESERVED_NAMES: &[&str] = &[
     "self", "any", "bool", "f32", "f64", "i8", "i16", "i32", "i53", "str", "u8", "u16", "u32",
-    "u53", "usize", "void", "BigInt", "List", "Map", "Option", "Set",
+    "u53", "usize", "void", "BigInt", "List", "HashMap", "HashSet", "Option",
+    // `Map`/`Set` are the hash collections' names before tracker I9, still
+    // published one release as `std::map`/`std::set`'s deprecated aliases.
+    "Map", "Set",
 ];
 
 /// Whether a generated name must be escaped: a keyword, or a name
@@ -1416,7 +1419,7 @@ impl<'options> Emitter<'options> {
                 // is a native JS array, and an array-LIKE object is not one.
                 // `for`-in over `{0: "a", length: 1}` throws `TypeError: … is
                 // not iterable`, and `map`/`filter`/`fold`/`reverse` all ride
-                // `for`-in. `Map<str, T>` is worse still: it is a plain vilan
+                // `for`-in. `HashMap<str, T>` is worse still: it is a plain vilan
                 // struct wrapping a `NativeMap` keyed by `key.hash()`, so a
                 // host `{a: 1}` read through it crashes on `.has`.
                 let (kind, note) = match index.key {
@@ -1429,7 +1432,7 @@ impl<'options> Emitter<'options> {
                     ),
                     IndexKey::String => (
                         "string index signature",
-                        "vilan has no open keyed-object type at a host boundary: `Map<str, T>` \
+                        "vilan has no open keyed-object type at a host boundary: `HashMap<str, T>` \
                          is a vilan struct over a `NativeMap` keyed by `key.hash()`, not a plain \
                          host object. Bind the keys you need as `[extern(get, \"key\")]` \
                          accessors",
@@ -1974,7 +1977,7 @@ impl<'options> Emitter<'options> {
                 self.coverage.note_todo("Record type");
                 return Mapped::todo(
                     "any",
-                    "`Record<K, V>` is an open keyed host object; vilan's `Map` is a struct over \
+                    "`Record<K, V>` is an open keyed host object; vilan's `HashMap` is a struct over \
                      a `NativeMap` keyed by `key.hash()`, not a host object. Bind the keys you \
                      need as `[extern(get, \"key\")]` accessors",
                 );

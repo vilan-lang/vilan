@@ -235,12 +235,12 @@ a spread, and vilan has no range operator for it to be confused with.
 
 ## Collections
 
-`List<T>` is built in and has literal syntax. `Map<K, V>` and `Set<T>`
+`List<T>` is built in and has literal syntax. `HashMap<K, V>` and `HashSet<T>`
 come from std:
 
 ```vilan
-import std::map::Map;
-import std::set::Set;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
 
 fun main() {
 	mut items: List<i32> = [1, 2, 3];
@@ -248,10 +248,10 @@ fun main() {
 	print(items.len());
 	print(items[0]);
 
-	mut scores: Map<str, i32> = Map::new();
+	mut scores: HashMap<str, i32> = HashMap::new();
 	scores.insert("ada", 100);
 
-	mut seen: Set<i32> = Set::new();
+	mut seen: HashSet<i32> = HashSet::new();
 	seen.insert(7);
 	print(seen.contains(7));
 }
@@ -296,7 +296,7 @@ length is known, `let [r, g, b] = rgb;` destructures one irrefutably,
 with the element count checked against the type (works in parameter
 position too).
 
-> **Going deeper.** `Map` and `Set` key **by value**. Scalar keys (`i32`,
+> **Going deeper.** `HashMap` and `HashSet` key **by value**. Scalar keys (`i32`,
 > `str`) and backed enums (`enum Align { Start = "flex-start" }` — the enum
 > *is* the string) work directly; a struct, an unbacked enum, or a `List`
 > key works once it derives `Hashable` (`[derive(Hashable)]`), so two equal

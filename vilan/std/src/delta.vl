@@ -32,8 +32,9 @@
 // the log is as long as one turn's writes.
 import pkg::compare::PartialEq;
 import pkg::hash::Hashable;
+import pkg::hash_map::HashMap;
+import pkg::hash_set::HashSet;
 import pkg::io::panic;
-import pkg::map::Map;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Signal,
@@ -46,7 +47,6 @@ import pkg::reactive::{
 	fresh_id,
 	register_with_owner,
 };
-import pkg::set::Set;
 import pkg::shared::Shared;
 
 /// How many ops a `DeltaLog` will hold for a consumer that has stopped
@@ -113,10 +113,10 @@ export enum SeqOp<T> {
 /// A map's change. `Put`'s `Option<V>` is the difference between an insert and an
 /// overwrite, which a group fold over the values needs.
 ///
-/// Recorded, not slated: nothing asks for a reactive `Map` cell yet. It is written
+/// Recorded, not slated: nothing asks for a reactive map cell yet. It is written
 /// here so the log's shape is chosen against more than one collection.
 ///
-/// `K: Hashable` is the `Reset` arm's bound, not the op's: `Map<K, V>` demands it,
+/// `K: Hashable` is the `Reset` arm's bound, not the op's: `HashMap<K, V>` demands it,
 /// and an op that carries the whole collection carries its bounds with it.
 export enum MapOp<K: Hashable, V> {
 	/// The key, what was there, and what is there now.
@@ -124,14 +124,14 @@ export enum MapOp<K: Hashable, V> {
 	/// The key and the value that left.
 	Delete(K, V),
 	/// The collection BECAME this map.
-	Reset(Map<K, V>),
+	Reset(HashMap<K, V>),
 }
 
 /// A set's change. Recorded, not slated — `MapOp`'s sentence applies.
 export enum SetOp<T: Hashable> {
 	Add(T),
 	Remove(T),
-	Reset(Set<T>),
+	Reset(HashSet<T>),
 }
 
 // === The log =================================================================

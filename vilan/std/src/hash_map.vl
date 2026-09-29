@@ -1,0 +1,131 @@
+// `std::hash_map` — `HashMap<K, V>`, the built-in hash map (tracker I9: the name
+// says how it keys — by `Hashable` value — and leaves room for a sorted map
+// beside it). It iterates in INSERTION order, on both backends: `keys()`,
+// `values()` and `entries()` walk the keys in the order they first arrived, an
+// overwrite keeps its key's place, and a key removed and inserted again goes to
+// the end. Keys are compared **by value** — a
+// scalar or a backed enum keys directly (the enum IS its backing value), and a
+// struct or unbacked/payload enum keys once it derives `Hashable` (I1). Each key
+// is turned into a canonical `Hash` via `key.hash()`, which keys the underlying
+// native map; the original key is stored alongside the value so `keys()`
+// returns real `K`s, and mutating the original afterward can't desync the map
+// (value semantics snapshot it on insert).
+import pkg::compare::PartialEq;
+import pkg::default::Default;
+import pkg::hash::{ Hash, Hashable };
+import pkg::native_map::NativeMap;
+import pkg::option::Option::{ self, None, Some };
+
+export *;
+
+struct HashMap<K: Hashable, V> {
+	table: NativeMap<(K, V)>,
+}
+
+impl HashMap<type K: Hashable, type V> {
+	fun new(): HashMap<K, V> {
+		let table: NativeMap<(K, V)> = NativeMap::new();
+		HashMap { table }
+	}
+
+	fun insert(&mut self, key: K, value: V) {
+		self.table.insert(key.hash(), (key, value));
+	}
+
+	/// A copy of the value stored under `key`, or `None` if absent.
+	fun get(self, key: K): Option<V> {
+		match self.table.get(key.hash()) {
+			Some(let entry) => Some(entry.1),
+			None => None,
+		}
+	}
+
+	fun contains_key(self, key: K): bool {
+		self.table.contains_key(key.hash())
+	}
+
+	fun remove(&mut self, key: K) {
+		self.table.remove(key.hash());
+	}
+
+	fun len(self): usize {
+		self.table.len()
+	}
+
+	fun is_empty(self): bool {
+		self.len() == 0
+	}
+
+	/// `List` snapshots of the keys / values, in insertion order — iterate with
+	/// `for key in map.keys()`.
+	fun keys(self): List<K> {
+		mut result: List<K> = [];
+		for entry in self.table.values() {
+			result.push(entry.0);
+		}
+		result
+	}
+
+	fun values(self): List<V> {
+		mut result: List<V> = [];
+		for entry in self.table.values() {
+			result.push(entry.1);
+		}
+		result
+	}
+
+	/// A `List` snapshot of `(key, value)` pairs, in insertion order — the paired
+	/// counterpart to `keys()`/`values()`, for walking both together without
+	/// zipping two separate snapshots by hand:
+	/// `for entry in map.entries() { entry.0; entry.1 }`.
+	fun entries(self): List<(K, V)> {
+		self.table.values()
+	}
+}
+
+/// Split into its own bound impl block for the reason `compare.vl`'s `List`
+/// methods are (std-surface.md §1.1): `contains_value` needs `V: PartialEq`,
+/// a bound the unbounded `HashMap<type K: Hashable, type V>` block above cannot
+/// carry.
+impl HashMap<type K: Hashable, type V: PartialEq> {
+	/// Whether any stored value equals `value`. For a KEY, use `contains_key`.
+	fun contains_value(self, value: V): bool {
+		for entry in self.table.values() {
+			if entry.1.eq(value) {
+				ret true;
+			}
+		}
+		false
+	}
+}
+
+/// The map half of the explicit termination family: a list of `(key, value)`
+/// pairs becomes a `HashMap`, so an iterator chain ends
+/// `xs.iter().map(|w| (w, w.len())).to_list().to_map()`. A repeated key keeps
+/// the LAST pair, matching `insert`.
+///
+/// The impl subject binds the element structurally — `List<(K, V)>` — which is how
+/// the two bounds a `HashMap` needs (`K: Hashable`, and the element being a pair at
+/// all) are stated. It lives here rather than on `Iterator` for the same reason
+/// `to_set` lives on `List`: a trait default may not require a bound its trait does
+/// not declare.
+impl List<(type K: Hashable, type V)> {
+	fun to_map(self): HashMap<K, V> {
+		mut result: HashMap<K, V> = HashMap::new();
+		for entry in self {
+			result.insert(entry.0, entry.1);
+		}
+		result
+	}
+}
+
+/// The empty map is a `HashMap`'s default (I4) — `Default`'s only implementors were the
+/// numeric family, so a `T: Default` bound could not be met by a container and kolt
+/// wrote this impl itself (`prefs.vl:100`, under a
+/// `// FIXME: Implement with std.`). The binder carries `Hashable` because the TYPE
+/// does: a `HashMap` whose key is not hashable does not exist to have a default.
+impl HashMap<type K: Hashable, type V> with Default {
+	fun default(): HashMap<K, V> {
+		HashMap::new()
+	}
+}

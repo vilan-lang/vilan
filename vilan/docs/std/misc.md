@@ -155,7 +155,7 @@ main();
 
 Do not reach for them for passwords — a raw digest is far too fast, and
 `pbkdf2_sha512` is the primitive for that. They are also not `std::hash`,
-which is the Map/Set canonical-key mechanism and promises no avalanche.
+which is the HashMap/HashSet canonical-key mechanism and promises no avalanche.
 
 The std surface is **async** because WebCrypto is. On a path that must
 stay sync — the walkthrough's rpc dispatch hashes passwords inside a

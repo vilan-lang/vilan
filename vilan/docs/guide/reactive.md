@@ -85,8 +85,8 @@ is exactly what makes the push land in the signal rather than in a copy.
 Subscribers are notified **once**, after the closure returns, whatever it
 did (a closure that writes nothing still notifies — `update` is a write,
 like `set`). Inside a `batch`, that notification defers and coalesces like
-any other write. `update` works for any `T` a closure can mutate: `Map`,
-`Set`, a struct's fields, a nested aggregate.
+any other write. `update` works for any `T` a closure can mutate: `HashMap`,
+`HashSet`, a struct's fields, a nested aggregate.
 
 `set_with` remains the read-**transform**-write form, and it still reads
 better when you're computing a new value rather than editing one:

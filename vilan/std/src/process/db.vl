@@ -8,9 +8,9 @@
 // typed column accessors. No ORM ambitions — grow from real call sites.
 
 import pkg::drop::Drop;
+import pkg::hash_set::HashSet;
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
-import pkg::set::Set;
 import pkg::time::now;
 
 /// An open database handle (`node:sqlite`'s DatabaseSync — synchronous, the right
@@ -222,8 +222,8 @@ export impl Database {
 	/// The set of step names `vilan_migrations` records. A SET, not a list: the
 	/// table stores WHICH steps ran, and every ordering question is answered
 	/// against the list the caller passed (`db-migrations.md` §4).
-	fun recorded_migrations(self): Set<str> {
-		mut recorded: Set<str> = Set::new();
+	fun recorded_migrations(self): HashSet<str> {
+		mut recorded: HashSet<str> = HashSet::new();
 		for row in self.prepare("SELECT name FROM vilan_migrations").all([]) {
 			recorded.insert(row.text("name"));
 		}
@@ -281,8 +281,8 @@ export impl Database {
 /// to. A name is a step's identity — an empty one names nothing, and two steps
 /// sharing one map to a single record, which would make "recorded if and only if
 /// applied" unstatable.
-fun migration_names(migrations: List<Migration>): Set<str> {
-	mut names: Set<str> = Set::new();
+fun migration_names(migrations: List<Migration>): HashSet<str> {
+	mut names: HashSet<str> = HashSet::new();
 	mut index = 0;
 	for index < migrations.len() {
 		let step = migrations[index];
@@ -304,7 +304,7 @@ fun migration_names(migrations: List<Migration>): Set<str> {
 /// predate a schema change the file already has. Also the "someone deleted a
 /// migration" case. Either way history disagrees, and the only safe move is to stop
 /// before touching anything.
-fun refuse_database_ahead(names: Set<str>, recorded: Set<str>, count: i32) {
+fun refuse_database_ahead(names: HashSet<str>, recorded: HashSet<str>, count: i32) {
 	for recorded_name in recorded.values() {
 		if !names.contains(recorded_name) {
 			panic(i"std::db migrate: the database has migration '{recorded_name}' applied, but it is not among the {count} migrations given — this database was migrated by a newer build");
@@ -322,7 +322,7 @@ fun refuse_database_ahead(names: Set<str>, recorded: Set<str>, count: i32) {
 /// This is also why the surface does NOT require ascending names: on a database
 /// with history this refusal catches every misordering such a rule would, and on a
 /// fresh database any list order is self-consistent — it IS the history.
-fun refuse_inserted_migration(migrations: List<Migration>, recorded: Set<str>) {
+fun refuse_inserted_migration(migrations: List<Migration>, recorded: HashSet<str>) {
 	// I5 S2: "nothing applied" is `None`, where it was the `-1` below every index.
 	// (After S2 the `-1` COMPILES as a `usize` — the binding takes its type from
 	// `last_applied = index` and a negative literal is not refused at an unsigned

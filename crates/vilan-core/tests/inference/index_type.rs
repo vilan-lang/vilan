@@ -442,14 +442,14 @@ fn usize_satisfies_each_family_bound() {
 fn a_usize_keys_a_map_and_a_set() {
     assert_compiles_and_runs(
         concat!(
-            "import std::{ map::Map, set::Set };\n",
+            "import std::{ hash_map::HashMap, hash_set::HashSet };\n",
             "\n",
             "fun main() {\n",
-            "\tmut rows: Map<usize, str> = Map::new();\n",
+            "\tmut rows: HashMap<usize, str> = HashMap::new();\n",
             "\trows.insert(2usize, \"two\");\n",
             "\trows.insert(5usize, \"five\");\n",
             "\tprint(rows.get(5usize).unwrap_or(\"none\"));\n",
-            "\tmut seen: Set<usize> = Set::new();\n",
+            "\tmut seen: HashSet<usize> = HashSet::new();\n",
             "\tseen.insert(3usize);\n",
             "\tseen.insert(3usize);\n",
             "\tprint(seen.len());\n",

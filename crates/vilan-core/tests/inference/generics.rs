@@ -2056,16 +2056,16 @@ fn update_generalizes_over_every_collection() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         import std::reactive::{ Signal, SignalCell };
         struct Counter { hits: i32 }
         fun main() {
-            let scores: SignalCell<Map<str, i32>> = Signal::new(Map::new());
+            let scores: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());
             scores.update(|&mut m| { m.insert("a", 1); m.insert("b", 2); });
             print(scores.get().len());
 
-            let tags: SignalCell<Set<i32>> = Signal::new(Set::new());
+            let tags: SignalCell<HashSet<i32>> = Signal::new(HashSet::new());
             tags.update(|&mut s| { s.insert(7); });
             print(tags.get().len());
 
@@ -5166,11 +5166,11 @@ fn b185_rebinding_a_map_parameter() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::Signal;
 
         fun main() {
-            mut seed: Map<str, i32> = Map::new();
+            mut seed: HashMap<str, i32> = HashMap::new();
             seed.insert("a", 1);
             let s = Signal::new(seed);
             s.set_with(|entries| {
@@ -7283,19 +7283,19 @@ fn b244_maps_conditional_wire_impl_takes_the_same_path() {
         import std::io::print;
         import std::wire::{ Wire, Serializer, Frame };
         import std::json::json_codec;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::Hashable;
 
-        fun narrate<K: Hashable + Wire, V: Wire>(rows: List<Map<K, V>>, mut serializer: Serializer) {
+        fun narrate<K: Hashable + Wire, V: Wire>(rows: List<HashMap<K, V>>, mut serializer: Serializer) {
             rows.describe(&mut serializer);
         }
 
         fun main() {
             let codec = json_codec();
             let (serializer, finish) = (codec.writer)();
-            mut row: Map<str, i32> = Map::new();
+            mut row: HashMap<str, i32> = HashMap::new();
             row.insert("a", 1);
-            let rows: List<Map<str, i32>> = [row];
+            let rows: List<HashMap<str, i32>> = [row];
             narrate(rows, serializer);
             match finish() {
                 Frame::Text(let text) => print(text),

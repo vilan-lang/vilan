@@ -24,8 +24,8 @@ async external fun pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: i32, 
 /// `Bytes::to_hex` for the hex form those are written as.
 ///
 /// NOT a password primitive (`pbkdf2_sha512` is — a raw digest is far too fast to
-/// hash a password with), and not `std::hash`, which is the Map/Set canonical-key
-/// mechanism and makes no avalanche promise at all.
+/// hash a password with), and not `std::hash`, which is the HashMap/HashSet
+/// canonical-key mechanism and makes no avalanche promise at all.
 [extern("__sha256")]
 async external fun sha256(data: Bytes): Bytes;
 

@@ -2410,11 +2410,11 @@ fn the_cold_std_analysis_is_the_per_process_floor_an_on_disk_world_would_remove(
         // `std` surface the program reaches. A corpus program reaches a good
         // deal of it.
         const WIDE_A: &str = "import std::io::print;\nimport std::list::List;\n\
-                              import std::map::Map;\nimport std::set::Set;\n\
+                              import std::hash_map::HashMap;\nimport std::hash_set::HashSet;\n\
                               import std::json;\nimport std::math::PI;\n\
                               fun main() { print(PI); }\n";
         const WIDE_B: &str = "import std::io::print;\nimport std::list::List;\n\
-                              import std::map::Map;\nimport std::set::Set;\n\
+                              import std::hash_map::HashMap;\nimport std::hash_set::HashSet;\n\
                               import std::json;\nimport std::math::PI;\n\
                               fun main() { print(PI + 1.0); }\n";
         vilan_core::analyzer::base_cache_clear();

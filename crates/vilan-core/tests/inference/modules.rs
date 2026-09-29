@@ -95,11 +95,11 @@ fn bumps_list_pop_bumps_the_receiver() {
 #[test]
 fn bumps_map_insert_and_remove_bump() {
     let source = r#"
-        import std::map::Map;
-        fun put(m: &mut Map<str, i32>) { m.insert("k", 1); }
-        fun evict(m: &mut Map<str, i32>) { m.remove("k"); }
+        import std::hash_map::HashMap;
+        fun put(m: &mut HashMap<str, i32>) { m.insert("k", 1); }
+        fun evict(m: &mut HashMap<str, i32>) { m.remove("k"); }
         fun main() {
-            mut m: Map<str, i32> = Map::new();
+            mut m: HashMap<str, i32> = HashMap::new();
             put(&mut m);
             evict(&mut m);
         }
@@ -111,11 +111,11 @@ fn bumps_map_insert_and_remove_bump() {
 #[test]
 fn bumps_set_insert_and_remove_bump() {
     let source = r#"
-        import std::set::Set;
-        fun add(s: &mut Set<i32>) { s.insert(1); }
-        fun take_out(s: &mut Set<i32>) { s.remove(1); }
+        import std::hash_set::HashSet;
+        fun add(s: &mut HashSet<i32>) { s.insert(1); }
+        fun take_out(s: &mut HashSet<i32>) { s.remove(1); }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             add(&mut s);
             take_out(&mut s);
         }
@@ -5723,10 +5723,10 @@ fn indexing_a_map_value_keeps_the_element_type() {
         r#"
         import std::io::print;
         import std::list::List;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::option::Option::{ self, Some, None };
         fun main() {
-            mut lists: Map<str, List<i32>> = Map::new();
+            mut lists: HashMap<str, List<i32>> = HashMap::new();
             mut values: List<i32> = List::new();
             values.push(5);
             lists.insert("k", values);

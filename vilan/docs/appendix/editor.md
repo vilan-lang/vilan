@@ -89,7 +89,7 @@ declared`, `analyzed as: node — default-entry` — with the whole reason in
 its tooltip. A file can say it itself: `[platform("browser")] mod self;` as
 its first line — and at the top of a file, completion offers that line.
 
-**A generic `<` closes itself.** `List<`, `Map<`, `fun pair<` and a
+**A generic `<` closes itself.** `List<`, `HashMap<`, `fun pair<` and a
 generic call's own argument list each get their `>` as you type the `<`.
 The editor's static bracket pairs cannot do this — `<` is also the
 comparison operator, and `a < b` must not grow a `>` — so the server

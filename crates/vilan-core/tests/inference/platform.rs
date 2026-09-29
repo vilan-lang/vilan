@@ -3912,10 +3912,10 @@ fn an_unknown_struct_steers_to_its_import() {
     assert_fails_with(
         r#"
         fun main() {
-            mut table = Map { };
+            mut table = HashMap { };
         }
         "#,
-        "unknown struct: Map; import it first (`import std::map::Map;`)",
+        "unknown struct: HashMap; import it first (`import std::hash_map::HashMap;`)",
     );
 }
 
@@ -4341,9 +4341,9 @@ fn consistent_later_calls_stay_clean() {
 fn an_unannotated_map_new_requires_an_annotation() {
     assert_fails_with(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table = Map::new();
+            mut table = HashMap::new();
             table.insert("k", 1);
         }
         "#,
@@ -4355,9 +4355,9 @@ fn an_unannotated_map_new_requires_an_annotation() {
 fn an_unannotated_set_new_requires_an_annotation() {
     assert_fails_with(
         r#"
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut seen = Set::new();
+            mut seen = HashSet::new();
             seen.insert(7);
         }
         "#,
@@ -4371,9 +4371,9 @@ fn an_annotated_map_checks_its_inserts() {
     // real error (the B16 substitution-applied argument check).
     assert_fails(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert(2, "v");
         }
         "#,
@@ -4381,9 +4381,9 @@ fn an_annotated_map_checks_its_inserts() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert("k", 1);
             print(table.get("k").unwrap_or(-1));
         }

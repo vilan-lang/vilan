@@ -345,9 +345,9 @@ fn r10_list_rejects_a_resource_argument() {
 fn r10_map_rejects_a_resource_argument() {
     assert_fails_with(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         [resource] struct Db { handle: i32 }
-        fun sink(table: Map<str, Db>) {}
+        fun sink(table: HashMap<str, Db>) {}
         fun main() {}
         "#,
         "resource",
@@ -358,9 +358,9 @@ fn r10_map_rejects_a_resource_argument() {
 fn r10_set_rejects_a_resource_argument() {
     assert_fails_with(
         r#"
-        import std::set::Set;
+        import std::hash_set::HashSet;
         [resource] struct Db { handle: i32 }
-        fun sink(items: Set<Db>) {}
+        fun sink(items: HashSet<Db>) {}
         fun main() {}
         "#,
         "resource",
@@ -4498,9 +4498,9 @@ fn native_map_insert_loans_its_hash_key() {
 fn r10_map_of_a_resource_reports_once() {
     assert_fails_once_with(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         [resource] struct Db { handle: i32 }
-        fun sink(table: Map<str, Db>) {}
+        fun sink(table: HashMap<str, Db>) {}
         fun main() {}
         "#,
         "cannot hold the resource",
@@ -4511,9 +4511,9 @@ fn r10_map_of_a_resource_reports_once() {
 fn r10_set_of_a_resource_reports_once() {
     assert_fails_once_with(
         r#"
-        import std::set::Set;
+        import std::hash_set::HashSet;
         [resource] struct Db { handle: i32 }
-        fun sink(items: Set<Db>) {}
+        fun sink(items: HashSet<Db>) {}
         fun main() {}
         "#,
         "cannot hold the resource",
@@ -4528,12 +4528,12 @@ fn r10_map_construction_never_reports_the_native_map_inside_it() {
     assert_fails_without(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::drop::Drop;
         [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
-            mut table: Map<str, Res> = Map::new();
+            mut table: HashMap<str, Res> = HashMap::new();
             print("built");
         }
         "#,
@@ -4546,12 +4546,12 @@ fn r10_set_construction_never_reports_the_native_map_inside_it() {
     assert_fails_without(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::drop::Drop;
         [resource] struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
-            mut items: Set<Res> = Set::new();
+            mut items: HashSet<Res> = HashSet::new();
             print("built");
         }
         "#,
@@ -4586,16 +4586,16 @@ fn r11_reports_an_independent_body_container_beside_a_refused_signature() {
     // holds, and is nobody's consequence — so it still reports. Both heads,
     // once each.
     let source = r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         [resource] struct Guard { handle: i32 }
         [resource] struct Other { handle: i32 }
-        fun two<type A, type B>(a: Map<str, A>, own b: B) { let items = [b]; }
-        fun caller(table: Map<str, Guard>) {
+        fun two<type A, type B>(a: HashMap<str, A>, own b: B) { let items = [b]; }
+        fun caller(table: HashMap<str, Guard>) {
             two(table, Other { handle = 2 });
         }
         fun main() {}
         "#;
-    assert_fails_once_with(source, "`Map` cannot hold the resource `Guard`");
+    assert_fails_once_with(source, "`HashMap` cannot hold the resource `Guard`");
     assert_fails_once_with(source, "`List` cannot hold the resource `Other`");
 }
 
@@ -4609,10 +4609,10 @@ fn r11_stands_down_on_a_body_container_built_from_the_refused_parameter() {
     // decision the caller made, one report.
     assert_fails_once_with(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         [resource] struct Guard { handle: i32 }
-        fun wrap<type A>(own a: A, table: Map<str, A>) { let items = [a]; }
-        fun caller(table: Map<str, Guard>) {
+        fun wrap<type A>(own a: A, table: HashMap<str, A>) { let items = [a]; }
+        fun caller(table: HashMap<str, Guard>) {
             wrap(Guard { handle = 1 }, table);
         }
         fun main() {}

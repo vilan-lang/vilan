@@ -2849,7 +2849,7 @@ fn a114_a_mirror_lease_taken_in_a_scoped_effect_is_released_at_the_runs_end() {
 /// the entry goes with the mirror's last lease.
 const A134_ORIGIN_DEDUP: &str = r#"import std::io::print;
 import std::json::json_codec;
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
 import std::rpc::{ DuplexEnd, LocalTransport, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
 import std::shared::Shared;
@@ -2859,7 +2859,7 @@ import std::wire::Frame;
 [service(StoreClient)]
 struct Store {
 	channels: SignalCell<List<i32>>,
-	names: Shared<Map<i32, SignalCell<str>>>,
+	names: Shared<HashMap<i32, SignalCell<str>>>,
 	calls: Shared<i32>,
 }
 
@@ -2915,7 +2915,7 @@ fun same<T>(left: RemoteSource<T>, right: RemoteSource<T>): bool {
 }
 
 fun main() {
-	let store = Store { channels = Signal::new([]), names = Shared::new(Map::new()), calls = Shared::new(0) };
+	let store = Store { channels = Signal::new([]), names = Shared::new(HashMap::new()), calls = Shared::new(0) };
 	let subscribes: Shared<i32> = Shared::new(0);
 	let (client_end, server_end) = counted_pair(subscribes);
 	register_session(7, server_end, json_codec());
@@ -5183,7 +5183,7 @@ fn a141_a_stamped_instance_owner_keeps_a_cached_cell_past_its_connection() {
 /// program-lifetime cell of the unleased mirror and leases at the call site.
 const A136_MEMO_MAKER: &str = r#"import std::io::print;
 import std::json::json_codec;
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::memo::Memo;
 import std::reactive::{ Owner, Signal, SignalCell, Source, owner_scope };
 import std::rpc::{ LocalTransport, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
@@ -5192,7 +5192,7 @@ import std::time::{ Duration, sleep_for };
 
 [service(Client)]
 struct Store {
-	messages: Shared<Map<i32, SignalCell<List<str>>>>,
+	messages: Shared<HashMap<i32, SignalCell<List<str>>>>,
 }
 
 impl Store {
@@ -5246,7 +5246,7 @@ fun messages_g(client_cell: SignalCell<Option<Client<LocalTransport>>>, id: i32)
 
 fun main() {
 	let first: SignalCell<List<str>> = Signal::new(["a"]);
-	let messages: Map<i32, SignalCell<List<str>>> = Map::new();
+	let messages: HashMap<i32, SignalCell<List<str>>> = HashMap::new();
 	let store = Store { messages = Shared::new(messages) };
 	store.messages.write().insert(0, first);
 	let (client_end, server_end) = duplex_pair();

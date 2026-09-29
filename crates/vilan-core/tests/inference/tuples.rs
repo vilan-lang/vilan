@@ -672,7 +672,7 @@ fn a_derived_struct_key_maps_by_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::Hashable;
         import std::option::Option::{ self, Some, None };
 
@@ -680,7 +680,7 @@ fn a_derived_struct_key_maps_by_value() {
         struct Point { x: i32, y: i32 }
 
         fun main() {
-            mut m: Map<Point, str> = Map::new();
+            mut m: HashMap<Point, str> = HashMap::new();
             m.insert(Point { x = 1, y = 2 }, "here");
             // A FRESH, distinct-but-equal Point hits.
             match m.get(Point { x = 1, y = 2 }) {
@@ -699,14 +699,14 @@ fn a_set_dedups_struct_elements_by_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
 
         [derive(Hashable)]
         struct Point { x: i32, y: i32 }
 
         fun main() {
-            mut s: Set<Point> = Set::new();
+            mut s: HashSet<Point> = HashSet::new();
             s.insert(Point { x = 1, y = 2 });
             s.insert(Point { x = 1, y = 2 });   // dup by value
             s.insert(Point { x = 3, y = 4 });
@@ -723,14 +723,14 @@ fn a_derived_enum_is_a_valid_key() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
 
         [derive(Hashable)]
         enum Shape { Circle(i32), Rect(i32, i32), Empty }
 
         fun main() {
-            mut s: Set<Shape> = Set::new();
+            mut s: HashSet<Shape> = HashSet::new();
             s.insert(Shape::Circle(5));
             s.insert(Shape::Circle(5));   // dup by value
             s.insert(Shape::Empty);
@@ -749,7 +749,7 @@ fn a_custom_hashable_impl_is_honored_by_map() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::{ Hashable, Hash };
 
         struct User { id: i32, name: str }
@@ -760,7 +760,7 @@ fn a_custom_hashable_impl_is_honored_by_map() {
         }
 
         fun main() {
-            mut m: Map<User, str> = Map::new();
+            mut m: HashMap<User, str> = HashMap::new();
             m.insert(User { id = 1, name = "Ada" }, "a");
             m.insert(User { id = 1, name = "Bob" }, "b");   // same id -> overwrites
             print(m.len());                                  // 1
@@ -775,12 +775,12 @@ fn a_list_is_a_valid_key() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::Hashable;
         import std::option::Option::{ self, Some, None };
 
         fun main() {
-            mut m: Map<List<i32>, str> = Map::new();
+            mut m: HashMap<List<i32>, str> = HashMap::new();
             m.insert([1, 2, 3], "here");
             match m.get([1, 2, 3]) {
                 Some(let v) => print(v),
@@ -797,18 +797,18 @@ fn map_keys_and_set_iteration_return_real_values() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
 
         [derive(Hashable, Debug)]
         struct Point { x: i32, y: i32 }
 
         fun main() {
-            mut m: Map<Point, i32> = Map::new();
+            mut m: HashMap<Point, i32> = HashMap::new();
             m.insert(Point { x = 1, y = 2 }, 10);
             for key in m.keys() { print(key.debug()); }   // Point { x = 1, y = 2 }
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(7);
             s.insert(8);
             for x in s { print(x); }                       // 7, 8
@@ -840,13 +840,13 @@ fn an_aggregate_key_is_snapshot_on_insert() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::Hashable;
         import std::option::Option::{ self, Some, None };
 
         fun main() {
             mut xs: List<i32> = [1, 2];
-            mut m: Map<List<i32>, str> = Map::new();
+            mut m: HashMap<List<i32>, str> = HashMap::new();
             m.insert(xs, "here");
             xs.push(3);                        // mutate the original AFTER insert
             print(m.contains_key([1, 2]));     // true  — snapshot held
@@ -864,17 +864,17 @@ fn hashable_builds_a_reusable_container() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::{ Hashable, Hash };
         import std::option::Option::{ self, Some, None };
 
         struct Counter<K: Hashable> {
-            counts: Map<Hash, i32>,
+            counts: HashMap<Hash, i32>,
         }
 
         impl Counter<type K: Hashable> {
             fun new(): Counter<K> {
-                let counts: Map<Hash, i32> = Map::new();
+                let counts: HashMap<Hash, i32> = HashMap::new();
                 Counter { counts = counts }
             }
             fun bump(&mut self, key: K) {
@@ -6636,10 +6636,10 @@ fn b310_a_map_of_tuple_values_round_trips_through_entries() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
 
         fun main() {
-            mut m: Map<str, (str, str)> = Map::new();
+            mut m: HashMap<str, (str, str)> = HashMap::new();
             m.insert("a", ("class", "decl"));
             for entry in m.entries() {
                 let (key, slot) = entry;
@@ -6664,11 +6664,11 @@ fn b310_the_other_map_readers_still_agree_with_entries() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::option::Option::{ Some, None };
 
         fun main() {
-            mut m: Map<str, (str, str)> = Map::new();
+            mut m: HashMap<str, (str, str)> = HashMap::new();
             m.insert("a", ("one", "two"));
             for key in m.keys() { print(key); }
             for value in m.values() { let (x, y) = value; print(x); print(y); }

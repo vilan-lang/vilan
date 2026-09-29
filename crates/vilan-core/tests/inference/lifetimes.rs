@@ -1864,11 +1864,11 @@ fn disposing_a_reactive_client_twice_is_harmless() {
 /// controls beside them. `{BODY}` is replaced per pin.
 const A135_SERVICE: &str = r#"
     import std::reactive::{ Signal, SignalCell };
-    import std::map::Map;
+    import std::hash_map::HashMap;
 
     [service(StoreClient)]
     struct Store {
-        names: SignalCell<Map<i32, str>>,
+        names: SignalCell<HashMap<i32, str>>,
         kept: SignalCell<str>,
     }
 

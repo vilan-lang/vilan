@@ -28,9 +28,9 @@ import pkg::fetch::{
 	post_bytes_with_headers,
 };
 import pkg::hash::{ Hash, Hashable };
+import pkg::hash_map::HashMap;
 import pkg::io::panic;
 import pkg::json::JsonValue;
-import pkg::map::Map;
 import pkg::option::Option::{ self, None, Some };
 import pkg::promise::Promise;
 import pkg::reactive::{
@@ -2516,15 +2516,15 @@ export impl ReactiveServer {
 		self.expose_keyed_with(source, |value: List<T>| value, key_of)
 	}
 
-	/// The `Map` form. The map's VALUES are the collection, and `key_of` is the
+	/// The `HashMap` form. The map's VALUES are the collection, and `key_of` is the
 	/// authority on each one's key because it is what a delta carries — a map whose
 	/// key disagrees with its value's own would patch under the value's.
-	fun expose_keyed_map<K: Wire + Hashable, V: Wire + PartialEq, S: Source<Map<K, V>>>(
+	fun expose_keyed_map<K: Wire + Hashable, V: Wire + PartialEq, S: Source<HashMap<K, V>>>(
 		self,
 		source: S,
 		key_of: sync |V| K,
 	): i32 {
-		self.expose_keyed_with(source, |value: Map<K, V>| value.values(), key_of)
+		self.expose_keyed_with(source, |value: HashMap<K, V>| value.values(), key_of)
 	}
 
 	/// The general keyed exposure both forms bottom out in: any `Source<C>` plus
@@ -3121,7 +3121,7 @@ fun keyed_diff<K: Wire + Hashable, T: Wire + PartialEq>(
 	current: List<T>,
 	key_of: sync |T| K,
 ): List<Delta<K, T>> {
-	mut previous_at: Map<Hash, i32> = Map::new();
+	mut previous_at: HashMap<Hash, i32> = HashMap::new();
 	mut index: usize = 0;
 	for element in previous {
 		let key = key_of(element).hash();
@@ -3130,7 +3130,7 @@ fun keyed_diff<K: Wire + Hashable, T: Wire + PartialEq>(
 		}
 		index += 1;
 	}
-	mut current_keys: Map<Hash, bool> = Map::new();
+	mut current_keys: HashMap<Hash, bool> = HashMap::new();
 	for element in current {
 		current_keys.insert(key_of(element).hash(), true);
 	}
@@ -4071,7 +4071,7 @@ export impl ReactiveClient {
 		let positions = mirror.positions;
 		self.dynamic.write().push(|| {
 			cell.write() = 0 - 1;
-			positions.write() = Map::new();
+			positions.write() = HashMap::new();
 			cache.set(None);
 		});
 		mirror
@@ -4273,13 +4273,13 @@ export struct Origin {
 /// Each entry carries the mirror's STAMP (its count cell's identity), so a retiring
 /// mirror drops its own entry and never a successor's.
 export struct MirrorTable<M> {
-	entries: Shared<Map<str, (i32, M)>>,
+	entries: Shared<HashMap<str, (i32, M)>>,
 }
 
 export impl MirrorTable<type M> {
 	/// An empty table.
 	fun new(): MirrorTable<M> {
-		let entries: Map<str, (i32, M)> = Map::new();
+		let entries: HashMap<str, (i32, M)> = HashMap::new();
 		MirrorTable { entries = Shared::new(entries) }
 	}
 
@@ -4913,7 +4913,7 @@ export struct KeyedCell<K, T> {
 	elements: SignalCell<List<T>>,
 	/// Where each held key sits in `elements`, by hash. What makes `update(key, …)`
 	/// and `remove(key)` a lookup instead of a scan.
-	positions: Shared<Map<Hash, usize>>,
+	positions: Shared<HashMap<Hash, usize>>,
 	/// The positional op log — `DeltaLog`'s cursors, trim and lag fallback (A112
 	/// S1), at `delta_log_limit`. `since` translates what it holds into the
 	/// `Delta<K, T>` a forward sends; the `DeltaSource` impl strips the keys back
@@ -4927,7 +4927,7 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	fun new(initial: List<T>): KeyedCell<K, T> {
 		let cell = KeyedCell {
 			elements = SignalCell::new(initial),
-			positions = Shared::new(Map::new()),
+			positions = Shared::new(HashMap::new()),
 			log = DeltaLog<SeqOp<KeyedElement<K, T>>>::new(),
 		};
 		cell.reindex(initial, 0);
@@ -5012,7 +5012,7 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	/// is not incremental. O(N), which is what replacing N elements costs;
 	/// every mirror is told `Reset`.
 	fun set(self, value: List<T>) {
-		self.positions.write() = Map::new();
+		self.positions.write() = HashMap::new();
 		// One pass, one projection per element — `reindex`'s cost, not a second
 		// one: the index and the op's keyed elements come off the same `key()`
 		// call.
@@ -5309,7 +5309,7 @@ export struct KeyedSource<K, T> {
 	/// whose whole point is that a change is O(change). The index is maintained by
 	/// `apply` alone (nothing else writes the cache's contents) and cleared
 	/// wherever the cache is.
-	positions: Shared<Map<Hash, usize>>,
+	positions: Shared<HashMap<Hash, usize>>,
 	/// The call that minted this mirror (A79), or `None` for the `[expose]`d field
 	/// twin — `RemoteSource.origin`'s field, at the keyed type, meaning exactly
 	/// what it means there: a mirror that can ask for a fresh channel whenever one
@@ -5875,7 +5875,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				match op {
 					Delta::Reset(let items) => {
 						list = items;
-						self.positions.write() = Map::new();
+						self.positions.write() = HashMap::new();
 						self.reindex(list, 0);
 					},
 					Delta::Insert(let key, let value, let index) => {
@@ -5943,7 +5943,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		// `RemoteSource::rebind`'s forget, for its reason (A143).
 		self.wire.forget(self.channel.identity());
 		self.channel.write() = channel;
-		self.positions.write() = Map::new();
+		self.positions.write() = HashMap::new();
 		self.cache.set(None);
 		self.closing.write() = false;
 		// The fresh channel is live, and whatever the last mint said about the old
@@ -6397,7 +6397,7 @@ export macro fun service(item: Item): Source {
 	// A KEYED field (`[expose(keyed)]`, A39) reads TWO types off the annotation
 	// rather than one — the mirror is a `KeyedSource<K, T>` — and vilan has no
 	// associated types, so `K` can only come from what the author wrote.
-	// `SignalCell<Map<K, V>>` names both in the collection itself; every other
+	// `SignalCell<HashMap<K, V>>` names both in the collection itself; every other
 	// keyed collection names only its element, and A51 gives it the attribute
 	// ARGUMENT to name the key with: `[expose(keyed = str)] SignalCell<List<T>>`.
 	// The refusal for anything else is the analyzer's, said in the vocabulary of
@@ -6408,8 +6408,8 @@ export macro fun service(item: Item): Source {
 	// The key type per exposed field, or `""` for the whole-value form — the
 	// discriminator every later loop reads.
 	mut exposed_keys: List<str> = [];
-	// Whether the keyed collection is a `Map` (the values are the elements) or a
-	// `List` (the collection IS the elements). Only the server-side exposure call
+	// Whether the keyed collection is a `HashMap` (the values are the elements) or
+	// a `List` (the collection IS the elements). Only the server-side exposure call
 	// differs; the wire, the mirror and the contract entry do not, which is why the
 	// two forms hash identically and patch identically.
 	mut exposed_maps: List<bool> = [];
@@ -6425,7 +6425,7 @@ export macro fun service(item: Item): Source {
 			// TYPE and needs nothing from the attribute — `[expose]` and
 			// `[expose(keyed)]` over one mean the same channel. A written
 			// `keyed = K` is redundant rather than authoritative here (where over a
-			// `Map<K, V>` it wins): the cell's own `K` is what its
+			// `HashMap<K, V>` it wins): the cell's own `K` is what its
 			// `expose_keyed_cell` and its mirror are typed at, so preferring a
 			// disagreeing written one could only generate code that does not
 			// compile.
@@ -6452,7 +6452,12 @@ export macro fun service(item: Item): Source {
 				match field.type_.arguments.get(0) {
 					Some(let element) => {
 						if field.keyed {
-							if element.name == "Map" && element.arguments.len() == 2 {
+							// `Map` is the hash map's spelling before tracker I9,
+							// kept one release as `std::map`'s deprecated alias of
+							// the same type — the annotation is read as WRITTEN, so
+							// both spellings are the map here until the alias goes
+							// (the analyzer's `is_hash_map_head` is the twin).
+							if (element.name == "HashMap" || element.name == "Map") && element.arguments.len() == 2 {
 								match element.arguments.get(0) {
 									Some(let key) => match element.arguments.get(1) {
 										Some(let value) => {
@@ -6465,7 +6470,7 @@ export macro fun service(item: Item): Source {
 											// in the field's vocabulary, before
 											// this ever runs (A56/R6,
 											// `check_expose_fields`). It used
-											// to silently win over a `Map` that
+											// to silently win over a `HashMap` that
 											// said otherwise, and the author
 											// read the disagreement as a
 											// `Keyed<K>` bound failure at the
@@ -6482,7 +6487,9 @@ export macro fun service(item: Item): Source {
 									},
 									None => {},
 								}
-							} else if field.key != "" && element.name == "List" && element.arguments.len() == 1 {
+							} else if field.key != ""
+								&& element.name == "List"
+								&& element.arguments.len() == 1 {
 								match element.arguments.get(0) {
 									Some(let value) => {
 										exposed_names.push(field.name);

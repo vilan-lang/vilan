@@ -34,12 +34,12 @@
 // **Nothing is evicted by itself.** `forget` is the caller's, for a value that
 // turned out wrong.
 //
-// Where it lives: its own module, like every other collection in std (`Map`,
+// Where it lives: its own module, like every other collection in std (`HashMap`,
 // `Set`, `Arena`, `NativeMap` — one type, one file named for it). std has no
 // `collections` module and inventing one for this would be a second organizing
 // principle for the same shelf.
 import pkg::hash::Hashable;
-import pkg::map::Map;
+import pkg::hash_map::HashMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::shared::Shared;
 
@@ -51,13 +51,13 @@ export *;
 /// every call site that reads it — a module-level `let`, a field on a store — and
 /// `get_or_insert` is a read from the caller's point of view even when it writes.
 struct Memo<K: Hashable, V> {
-	entries: Shared<Map<K, V>>,
+	entries: Shared<HashMap<K, V>>,
 }
 
 impl Memo<type K: Hashable, type V> {
 	/// An empty memo.
 	fun new(): Memo<K, V> {
-		let entries: Map<K, V> = Map::new();
+		let entries: HashMap<K, V> = HashMap::new();
 		Memo { entries = Shared::new(entries) }
 	}
 
@@ -102,7 +102,7 @@ impl Memo<type K: Hashable, type V> {
 
 	/// Drop everything.
 	fun clear(self) {
-		let entries: Map<K, V> = Map::new();
+		let entries: HashMap<K, V> = HashMap::new();
 		self.entries.write() = entries;
 	}
 

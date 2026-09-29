@@ -23,7 +23,7 @@
 
 import pkg::bytes::Bytes;
 import pkg::hash::Hashable;
-import pkg::map::Map;
+import pkg::hash_map::HashMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 
@@ -667,8 +667,8 @@ impl Delta<type K: Wire, type T: Wire> with Wire {
 //
 // Insertion order is what `entries()` reports and what rebuild replays, so a
 // round trip preserves it. A duplicate key on the wire keeps the LAST pair,
-// matching `Map::insert`.
-impl Map<type K: Hashable + Wire, type V: Wire> with Wire {
+// matching `HashMap::insert`.
+impl HashMap<type K: Hashable + Wire, type V: Wire> with Wire {
 	fun describe<S: Serialize>(self, serializer: &mut S) {
 		let entries = self.entries();
 		serializer.begin_list(entries.len().as_i32());
@@ -683,9 +683,9 @@ impl Map<type K: Hashable + Wire, type V: Wire> with Wire {
 		serializer.end_list();
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: &mut D): Map<K, V> {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): HashMap<K, V> {
 		let length = deserializer.begin_list();
-		mut result: Map<K, V> = Map::new();
+		mut result: HashMap<K, V> = HashMap::new();
 		mut index = 0;
 		for index < length {
 			deserializer.begin_struct();

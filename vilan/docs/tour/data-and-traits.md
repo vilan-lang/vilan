@@ -452,7 +452,7 @@ write the boilerplate:
 | `PartialEq` | structural `==` |
 | `Debug` | `.debug()`: a developer-facing rendering |
 | `Default` | `Default::default()` built from the fields' defaults |
-| `Hashable` | usability as a `Map` key or `Set` member (`std::hash`) — a backed enum already has it |
+| `Hashable` | usability as a `HashMap` key or `HashSet` member (`std::hash`) — a backed enum already has it |
 | `Json` | JSON encode/decode (`std::json`) |
 | `Wire` | serialization for rpc payloads (`std::wire`) |
 

@@ -651,7 +651,7 @@ defer every key's cleanup to whatever owner was ambient where `selector` was
 *called* — the component, never the row. A method call threads the caller's
 ambient owner the ordinary way.
 
-The key type is bounded on `Hashable` (the canonical key `Map` and `Set` use)
+The key type is bounded on `Hashable` (the canonical key `HashMap` and `HashSet` use)
 and on `PartialEq` (to seed a fresh cell against the current value). A key
 nobody has asked about has no cell and costs nothing: a change into it writes
 only the outgoing one.
@@ -1084,8 +1084,8 @@ enum SeqOp<T> {
 	Move(usize, usize, usize),        // from, count, to — the same elements, elsewhere
 }
 
-enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(Map<K, V>) }
-enum SetOp<T: Hashable> { Add(T), Remove(T), Reset(Set<T>) }
+enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(HashMap<K, V>) }
+enum SetOp<T: Hashable> { Add(T), Remove(T), Reset(HashSet<T>) }
 ```
 
 Every arm carries **what left** as well as what arrived. That is a requirement,
