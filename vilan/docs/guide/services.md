@@ -528,7 +528,12 @@ is *wired*, before the first call: register the session and stamp it
 `into_protocol(codec).for_connection(id)`) and handles work in process
 too, which is how `vilan/examples/rpc` is written. Everything a generated
 `Client::connect` builds rides the socket, so reaching this at all means
-having assembled the client by hand.
+having assembled the client by hand. In process, delivery is *inline*: a
+`duplex_pair` answers a mirror's `Subscribe` with its seed inside the send,
+where a socket answers on a later task. So a subscriber over a mirror can
+be told the seed twice in process and once over a socket: the same value,
+one more notification. That is the in-process transport's contract, and
+a count of notifications is measured over a socket.
 
 **A handle-returning method must be safe to re-run.** Its return type is
 the declaration that it is a *getter*: the runtime issues the call at

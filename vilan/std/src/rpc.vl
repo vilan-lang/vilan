@@ -298,6 +298,28 @@ export impl DuplexEnd {
 
 /// Create two connected duplex ends: whatever one sends arrives at the other's
 /// handler.
+///
+/// **Delivery is INLINE, and that is the contract (tracker A133, ruled door c).**
+/// A `send` runs the peer's handler before it returns, so a mirror's `Subscribe`
+/// is answered with the server's seeding `Update` INSIDE the call that sent it,
+/// under the subscribing turn. Over a socket the same seed arrives on a later
+/// task. Every observable difference follows from that one fact:
+///
+/// - A mirror attaches its observer before it takes its lease (`on_change`'s
+///   order), so the seed is a change on both transports, and a mirror read right
+///   after its first lease holds the value in process and `None` over a socket.
+/// - A node over a mirror (`mirror.map(f).sub(..)`) that pulls the mirror as it
+///   subscribes can see the seed TWICE in process: once through the pull, which
+///   already reads the value the inline seed wrote, and once as the seed's own
+///   notification. Over a socket it sees it once. The value is the same; only the
+///   count of notifications differs.
+///
+/// The in-process pair is the test and wiring transport, not the wire: a pin that
+/// counts notifications holds over a socket (the `reactive_channels` socket twins),
+/// and one written against a `duplex_pair` states that it measures the inline
+/// contract. Deferring delivery to the next task to match the socket was prototyped
+/// and rejected (A133 door a): it rewrites the documented synchronous-seed contract
+/// and the pin record built on it.
 export fun duplex_pair(): (DuplexEnd, DuplexEnd) {
 	let slot_a: Shared<Option<|Frame| void>> = Shared::new(None);
 	let slot_b: Shared<Option<|Frame| void>> = Shared::new(None);

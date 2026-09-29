@@ -3876,6 +3876,44 @@ fn a140_released_mirrors_leave_no_routes_over_a_socket() {
     );
 }
 
+// --- A133: the in-process seed is INLINE, by contract -----------------------
+
+/// A133 (ruled door c): a `duplex_pair` answers a mirror's `Subscribe` with its
+/// seed INSIDE the send, so a node over a mirror that pulls as it subscribes
+/// is told the seed twice in process: once through the pull, once as the
+/// seed's own notification. Over a socket it is told once. This pins the
+/// documented in-process contract (`duplex_pair`'s doc, the services guide),
+/// so a change to it is a decision rather than a drift.
+const A133_INLINE_SEED: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell, Source };
+import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+import std::time::{ Duration, sleep_for };
+
+fun main() {
+	let count: SignalCell<i32> = Signal::new(7);
+	let (client_end, server_end) = duplex_pair();
+	let server = ReactiveServer::new(server_end, json_codec());
+	let channel = server.expose(count);
+	let client = ReactiveClient::new(client_end, json_codec());
+	let mirror: RemoteSource<i32> = client.attached_source(channel);
+	let _watch = mirror.map(|value| value.unwrap_or(0)).sub(|value| print(i"sees {value}"));
+	sleep_for(Duration::millis(0));
+	print("done");
+}
+"#;
+
+#[test]
+fn a133_an_in_process_seed_is_inline_and_a_node_over_the_mirror_sees_it_twice() {
+    let stdout = run_program("a133_inline_seed", A133_INLINE_SEED);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec!["sees 7", "sees 7", "done"],
+        "the in-process seed is inline by contract (A133 door c); got:\n{stdout}"
+    );
+}
+
 // --- A135: a handler runs under its CONNECTION's owner ----------------------
 
 /// A135 IN PROCESS: kolt's shape — a handle method whose body is
