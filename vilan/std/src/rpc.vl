@@ -3298,8 +3298,10 @@ export struct ReactiveClient {
 	// The mirrors a REPLY minted (`minted_source`, §9.2), each paired with the
 	// action that re-issues its `origin` and rebinds it onto the fresh session's
 	// channel. Erased to closures because the list is heterogeneous — one entry per
-	// element type the service hands out.
-	replays: Shared<List<|| void>>,
+	// element type the service hands out — and keyed by the identity of the
+	// mirror's channel cell, the same identity that names its route, so a retired
+	// mirror's replay is pruned with its route (A140, `enlist`).
+	replays: Shared<List<(i32, || void)>>,
 	// The ORIGIN tables this client has minted into (A134), one entry per table,
 	// keyed by the table's identity: the action that drops every entry this client
 	// put there. `dispose` runs them, so a client that is gone leaves nothing in a
@@ -3406,12 +3408,81 @@ export impl ReactiveClient {
 	fun watch_minted<T: Wire>(self, mirror: RemoteSource<T>) {
 		// Only a WATCHED mirror is replayed: an unwatched one costs a call it does
 		// not need, and its next lease re-mints anyway (`acquire`).
-		self.replays.write().push(|| {
+		self.enlist(mirror.channel, || {
 			if mirror.count.read() > 0 {
 				mirror.remint();
 			}
-		});
+		}, mirror.retire, mirror.revive);
 		defer_to_owner(|| mirror.release_unleased());
+	}
+
+	/// Keep a minted mirror's ROUTE and reconnect REPLAY on this client for as long
+	/// as the mirror is someone's, and no longer (tracker A140).
+	///
+	/// Every mint pushed both, and nothing ever took them out: a released mirror's
+	/// route stayed in `routes` (matching a channel the server had withdrawn) and
+	/// its replay in `replays`, so a long session's scroll of handles kept every
+	/// one of them for the connection's life. A134's origin table already forgets a
+	/// mirror at the moment it stops being anyone's — its RETIRE hook, run by the
+	/// last real close or by its owner going with no lease ever taken — and this
+	/// prunes on the same event: the route by its channel cell's identity, the
+	/// replay by the same key.
+	///
+	/// A retired mirror is not dead. A holder that kept the handle can lease it
+	/// again, and it re-mints and REBINDS, as a released mirror always has. So the
+	/// prune arms `revive`, which `rebind` runs FIRST — before its `Subscribe` goes
+	/// out, because an in-process seed lands inside that send and must find the
+	/// route. It restores the route and the replay and re-arms the prune for the
+	/// next retire. On a mirror that is still enlisted it does nothing.
+	fun enlist(
+		self,
+		cell: Shared<i32>,
+		replay: || void,
+		retire: Shared<List<|| void>>,
+		revive: Shared<|| void>,
+	) {
+		let id = cell.identity();
+		mut found: Option<MirrorRoute> = None;
+		for route in self.routes.read() {
+			if route.channel.identity() == id {
+				found = Some(route);
+			}
+		}
+		self.replays.write().push((id, replay));
+		let routes = self.routes;
+		let replays = self.replays;
+		let prune = || {
+			mut kept_routes: List<MirrorRoute> = [];
+			for route in routes.read() {
+				if route.channel.identity() != id {
+					kept_routes.push(route);
+				}
+			}
+			routes.write() = kept_routes;
+			mut kept_replays: List<(i32, || void)> = [];
+			for entry in replays.read() {
+				let (owner, _action) = entry;
+				if owner != id {
+					kept_replays.push(entry);
+				}
+			}
+			replays.write() = kept_replays;
+		};
+		retire.write().push(prune);
+		revive.write() = || {
+			for entry in replays.read() {
+				let (owner, _action) = entry;
+				if owner == id {
+					ret;
+				}
+			}
+			match found {
+				Some(let route) => routes.write().push(route),
+				None => {},
+			}
+			replays.write().push((id, replay));
+			retire.write().push(prune);
+		};
 	}
 
 	/// Re-issue every WATCHED minted mirror's origin call and rebind it — the
@@ -3419,7 +3490,8 @@ export impl ReactiveClient {
 	/// re-verify and the positional `__attach` rebind, so the fresh session exists
 	/// before any of these calls reaches it.
 	fun replay_dynamic(self) {
-		for replay in self.replays.read() {
+		for entry in self.replays.read() {
+			let (_mirror, replay) = entry;
 			replay();
 		}
 	}
@@ -3487,6 +3559,7 @@ export impl ReactiveClient {
 			count,
 			closing,
 			join = || seed_from_sibling(routes, channel_cell, deliver),
+			revive = Shared::new(|| {}),
 			settle_id = fresh_id(),
 			codec = self.codec,
 			transport = self.transport,
@@ -3592,6 +3665,7 @@ export impl ReactiveClient {
 			closing,
 			join = join_hook,
 			join_key = join_key_hook,
+			revive = Shared::new(|| {}),
 			settle_id = fresh_id(),
 			leases,
 			positions,
@@ -3643,12 +3717,13 @@ export impl ReactiveClient {
 		mirror.released.write() = true;
 		// Only a WATCHED mirror is replayed, `minted_source`'s rule: demand here is
 		// whole-collection OR per-key, and either is a reason to ask again on a
-		// fresh session.
-		self.replays.write().push(|| {
+		// fresh session. Enlisted like a plain one, so a retired keyed mirror's
+		// route and replay are pruned too (A140).
+		self.enlist(mirror.channel, || {
 			if mirror.demand() > 0 {
 				mirror.remint();
 			}
-		});
+		}, mirror.retire, mirror.revive);
 		defer_to_owner(|| mirror.release_unleased());
 		mirror
 	}
@@ -3851,6 +3926,7 @@ export impl ReactiveClient with Disposable {
 		}
 		self.tables.write() = [];
 		self.routes.write() = [];
+		self.replays.write() = [];
 		self.dynamic.write() = [];
 	}
 }
@@ -4058,6 +4134,11 @@ export struct RemoteSource<T> {
 	// out, because a `Subscribe` that joins a held forward is answered with no
 	// seed. See `seed_from_sibling`.
 	join: || void,
+	// Put this mirror's route and replay back on its client after a retire pruned
+	// them (A140, `ReactiveClient::enlist`). Run first by `rebind`, the one way a
+	// retired mirror comes back to a channel; a no-op on a mirror that is still
+	// enlisted, and on one no client enlisted (an `[expose]` field mirror).
+	revive: Shared<|| void>,
 }
 
 /// A mirror IS a `Source` (tracker A52) — at `Option<T>`, which is what it
@@ -4435,6 +4516,9 @@ export impl RemoteSource<type T> {
 	/// rebind it would be a no-op on a closed socket at best, and at worst name an
 	/// id the fresh session has since minted for something else).
 	fun rebind(self, channel: i32, subscribe: Frame) {
+		// Back on the client's routes and replays first, if a retire pruned them
+		// (A140): the `Subscribe` below may be answered inside the send.
+		(self.revive.read())();
 		self.channel.write() = channel;
 		self.subscribe.write() = subscribe;
 		self.closing.write() = false;
@@ -4939,6 +5023,8 @@ export struct KeyedSource<K, T> {
 	/// sends, so a lease that JOINS a sibling's per-key forward is seeded from the
 	/// sibling (`seed_key_from_sibling`). A cell for `join`'s reason.
 	join_key: Shared<|Hash| void>,
+	/// `RemoteSource.revive`, at the keyed type (A140).
+	revive: Shared<|| void>,
 }
 
 /// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
@@ -5450,6 +5536,8 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// what it is asked for, so an element deleted while the connection was down
 	/// would otherwise survive as a ghost no later op would ever name.
 	fun rebind(self, channel: i32) {
+		// `RemoteSource::rebind`'s first line, for its reason (A140).
+		(self.revive.read())();
 		self.channel.write() = channel;
 		self.positions.write() = Map::new();
 		self.cache.set(None);

@@ -3635,6 +3635,247 @@ fn a139_a_per_key_joiner_is_seeded_over_a_socket() {
     );
 }
 
+// --- A140: a retired mirror's route and replay are pruned ------------------
+
+/// A140 IN PROCESS: five plain mints (five origins) and three keyed ones,
+/// each leased and released for real, then one OLD handle leased again. Every
+/// mint used to push a route and a replay onto the `ReactiveClient` that
+/// nothing took out (`released: routes=8 replays=8`, the same after the old
+/// handle's second release). Pruned on the mirror's retire hook (A134's
+/// table event), and restored by `rebind` when a kept handle comes back.
+const A140_PRUNE: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::map::Map;
+import std::reactive::{ Signal, SignalCell };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(BoardClient)]
+struct Board {
+	notes: Shared<Map<i32, SignalCell<str>>>,
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun write(self, id: i32, text: str): i32 {
+		match self.notes.read().get(id) {
+			Some(let cell) => cell.set(text),
+			None => {},
+		}
+		0
+	}
+
+	[rpc]
+	fun note(self, id: i32): Option<SignalCell<str>> {
+		self.notes.read().get(id)
+	}
+
+	[rpc]
+	fun rows(self, page: i32): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+fun settle() {
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+}
+
+fun main() {
+	let notes: Map<i32, SignalCell<str>> = Map::new();
+	let board = Board { notes = Shared::new(notes), rows = KeyedCell::new([Row { id = "a", text = "one" }]) };
+	mut id = 0;
+	for id < 5 {
+		board.notes.write().insert(id, Signal::new(i"n{id}"));
+		id += 1;
+	}
+	let (client_end, server_end) = duplex_pair();
+	register_session(3, server_end, json_codec());
+	let transport = local_rpc(board.dispatcher().into_protocol(json_codec()).for_connection(3));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	print(i"start: routes={client.reactive.routes.read().len()} replays={client.reactive.replays.read().len()}");
+	// N plain mints, each leased and released for real.
+	mut kept: List<RemoteSource<str>> = [];
+	mut round = 0;
+	for round < 5 {
+		let mirror: RemoteSource<str> = client.note(round);
+		let lease = mirror.sub(|text| {});
+		settle();
+		lease.dispose();
+		settle();
+		kept.push(mirror);
+		round += 1;
+	}
+	// N keyed mints (distinct origins), per-key leases released for real.
+	round = 0;
+	for round < 3 {
+		let keyed: KeyedSource<str, Row> = client.rows(round);
+		let lease = keyed.sub_key("a", |row| {});
+		settle();
+		lease.dispose();
+		settle();
+		round += 1;
+	}
+	print(i"released: routes={client.reactive.routes.read().len()} replays={client.reactive.replays.read().len()}");
+	// A holder that kept an old handle can still lease it: it re-mints and follows.
+	let old = kept.get(0).unwrap();
+	let seen: Shared<str> = Shared::new("?");
+	let again = old.sub(|text| seen.write() = text);
+	settle();
+	print(i"write:{client.write(0, "fresh").unwrap_or(0 - 1)}");
+	settle();
+	print(i"revived: seen={seen.read()} routes={client.reactive.routes.read().len()} replays={client.reactive.replays.read().len()}");
+	again.dispose();
+	settle();
+	print(i"final: routes={client.reactive.routes.read().len()} replays={client.reactive.replays.read().len()}");
+}
+"#;
+
+#[test]
+fn a140_n_mints_then_n_releases_leave_no_routes_and_no_replays() {
+    let stdout = run_program("a140_prune", A140_PRUNE);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start: routes=0 replays=0",
+            "released: routes=0 replays=0",
+            "write:0",
+            "revived: seen=fresh routes=1 replays=1",
+            "final: routes=0 replays=0",
+        ],
+        "a retired mirror's route and replay must be pruned, and a kept handle \
+         must come back on re-lease; got:\n{stdout}"
+    );
+}
+
+/// A140 OVER A SOCKET: five plain mints over a real WebSocket, released for
+/// real, then one old handle re-leased and released. Red before on `5`
+/// routes and `5` replays in every line.
+const A140_PRUNE_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(BoardClient)]
+struct Board {
+	notes: Shared<Map<i32, SignalCell<str>>>,
+}
+
+impl Board {
+	[rpc]
+	fun write(self, id: i32, text: str): i32 {
+		match self.notes.read().get(id) {
+			Some(let cell) => cell.set(text),
+			None => {},
+		}
+		0
+	}
+
+	[rpc]
+	fun note(self, id: i32): Option<SignalCell<str>> {
+		self.notes.read().get(id)
+	}
+}
+
+let board: Board = Board { notes = Shared::new(Map::new()) };
+
+fun main() {
+	mut id = 0;
+	for id < 5 {
+		board.notes.write().insert(id, Signal::new(i"n{id}"));
+		id += 1;
+	}
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+async fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let base = client.reactive.routes.read().len();
+			mut kept: List<RemoteSource<str>> = [];
+			mut round = 0;
+			for round < 5 {
+				let mirror: RemoteSource<str> = client.note(round);
+				let lease = mirror.sub(|text| {});
+				until(|| mirror.get().is_some());
+				lease.dispose();
+				until(|| mirror.released.read());
+				kept.push(mirror);
+				round += 1;
+			}
+			print(i"released: routes={client.reactive.routes.read().len() - base} replays={client.reactive.replays.read().len()}");
+			let old = kept.get(0).unwrap();
+			let seen: Shared<str> = Shared::new("?");
+			let again = old.sub(|text| seen.write() = text);
+			until(|| seen.read() == "n0");
+			print(i"write:{client.write(0, "fresh").unwrap_or(0 - 1)}");
+			until(|| seen.read() == "fresh");
+			print(i"revived: seen={seen.read()} routes={client.reactive.routes.read().len() - base} replays={client.reactive.replays.read().len()}");
+			again.dispose();
+			until(|| old.released.read());
+			print(i"final: routes={client.reactive.routes.read().len() - base} replays={client.reactive.replays.read().len()}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a140_released_mirrors_leave_no_routes_over_a_socket() {
+    let stdout = run_program("a140_prune_socket", A140_PRUNE_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "released: routes=0 replays=0",
+            "write:0",
+            "revived: seen=fresh routes=1 replays=1",
+            "final: routes=0 replays=0",
+        ],
+        "over a socket, a retired mirror's route and replay must be pruned; \
+         got:\n{stdout}"
+    );
+}
+
 // --- A135: a handler runs under its CONNECTION's owner ----------------------
 
 /// A135 IN PROCESS: kolt's shape — a handle method whose body is
