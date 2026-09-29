@@ -3298,6 +3298,182 @@ fun seed_key_from_sibling(
 	}
 }
 
+/// One demand a mirror registered with its client's wire (A143): the channel, the
+/// mirror (its channel cell's identity, the one that names its route), and the key
+/// — `None` for the whole collection — with the key's describer.
+export struct WireEntry {
+	channel: i32,
+	mirror: i32,
+	key: Option<Hash>,
+	describe: |Serializer| void,
+}
+
+/// One client's demand on the wire, per channel, at the UNION of its mirrors'
+/// demands (tracker A143, ruled door b).
+///
+/// Two mirrors on one client can share a channel (A92's dedup), and each used to
+/// send its own `Subscribe` for its own demand. On a keyed channel two DIFFERENT
+/// demands — one mirror holding the whole collection, a sibling holding one key —
+/// are two server forwards, and a frame names a channel, not a forward: every op on
+/// that key arrived twice, and the second `Remove` faulted on both mirrors. So the
+/// client keeps ONE forward per channel, and every `Subscribe`/`Unsubscribe` goes
+/// through here:
+///
+/// - the wire carries the WHOLE-collection demand when any mirror holds it, and
+///   then no per-key one (the whole forward carries every key);
+/// - otherwise it carries one per-key demand per key any mirror holds, once;
+/// - a change is sent SUBSCRIBES FIRST: the new demand is on the wire before the
+///   old one is withdrawn, because a dynamic channel is revoked by the
+///   `Unsubscribe` that leaves it carrying nothing.
+///
+/// A registration the wire already covers sends nothing, and the mirror is seeded
+/// from a sibling (`seed_from_sibling`, `seed_key_from_sibling`). What reaches a
+/// mirror is decided at the other end, by its own demand (`KeyedSource::accept`).
+/// No frame changed: the server sees one client asking once.
+export struct WireDemand {
+	transport: DuplexEnd,
+	codec: Codec,
+	entries: Shared<List<WireEntry>>,
+}
+
+export impl WireDemand {
+	fun new(transport: DuplexEnd, codec: Codec): WireDemand {
+		WireDemand { transport, codec, entries = Shared::new([]) }
+	}
+
+	/// Whether any mirror holds the whole collection on `channel`.
+	fun whole_on(self, channel: i32): bool {
+		for entry in self.entries.read() {
+			if entry.channel == channel && same_demand(entry.key, None) {
+				ret true;
+			}
+		}
+		false
+	}
+
+	/// Whether any mirror holds any demand on `channel`.
+	fun holds(self, channel: i32): bool {
+		for entry in self.entries.read() {
+			if entry.channel == channel {
+				ret true;
+			}
+		}
+		false
+	}
+
+	/// The per-key demands the wire carries for `channel`: one entry per key any
+	/// mirror holds, and none while the whole collection is held.
+	fun keys_on(self, channel: i32): List<WireEntry> {
+		mut keys: List<WireEntry> = [];
+		if self.whole_on(channel) {
+			ret keys;
+		}
+		for entry in self.entries.read() {
+			if entry.channel == channel {
+				match entry.key {
+					None => {},
+					Some(let _key) => {
+						if !carries(keys, entry.key) {
+							keys.push(entry);
+						}
+					},
+				}
+			}
+		}
+		keys
+	}
+
+	/// Register one mirror's demand, and put on the wire whatever it adds. A demand
+	/// already registered for this mirror is not registered twice.
+	fun open(self, channel: i32, mirror: i32, key: Option<Hash>, describe: |Serializer| void) {
+		for entry in self.entries.read() {
+			if entry.channel == channel && entry.mirror == mirror && same_demand(entry.key, key) {
+				ret;
+			}
+		}
+		let was_whole = self.whole_on(channel);
+		let was_keys = self.keys_on(channel);
+		self.entries.write().push(WireEntry { channel, mirror, key, describe });
+		self.settle(channel, was_whole, was_keys);
+	}
+
+	/// Withdraw one mirror's demand, and take off the wire whatever no mirror holds
+	/// any more. A demand never registered is nothing to withdraw.
+	fun close(self, channel: i32, mirror: i32, key: Option<Hash>) {
+		let was_whole = self.whole_on(channel);
+		let was_keys = self.keys_on(channel);
+		mut kept: List<WireEntry> = [];
+		mut removed = false;
+		for entry in self.entries.read() {
+			if !removed
+				&& entry.channel == channel
+				&& entry.mirror == mirror
+				&& same_demand(entry.key, key) {
+				removed = true;
+			} else {
+				kept.push(entry);
+			}
+		}
+		if !removed {
+			ret;
+		}
+		self.entries.write() = kept;
+		self.settle(channel, was_whole, was_keys);
+	}
+
+	/// Drop every demand `mirror` registered, sending nothing: what a REBIND owes
+	/// the channel it leaves, which is a withdrawn id or a dead session's.
+	fun forget(self, mirror: i32) {
+		mut kept: List<WireEntry> = [];
+		for entry in self.entries.read() {
+			if entry.mirror != mirror {
+				kept.push(entry);
+			}
+		}
+		self.entries.write() = kept;
+	}
+
+	/// Drop every demand, sending nothing: a reconnect's fresh session knows none
+	/// of them, and may mint the old ids for other sources. Run before the
+	/// reconnect's rebinds re-register what is still held.
+	fun reset(self) {
+		self.entries.write() = [];
+	}
+
+	/// Send the difference between what the wire carried and what it carries now —
+	/// subscribes first, for the revocation reason above.
+	fun settle(self, channel: i32, was_whole: bool, was_keys: List<WireEntry>) {
+		let now_whole = self.whole_on(channel);
+		let now_keys = self.keys_on(channel);
+		if now_whole && !was_whole {
+			(self.transport).send(encode_control(self.codec, "Subscribe", channel));
+		}
+		for entry in now_keys {
+			if !carries(was_keys, entry.key) {
+				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", channel, entry.describe));
+			}
+		}
+		for entry in was_keys {
+			if !carries(now_keys, entry.key) {
+				(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", channel, entry.describe));
+			}
+		}
+		if was_whole && !now_whole {
+			(self.transport).send(encode_control(self.codec, "Unsubscribe", channel));
+		}
+	}
+}
+
+/// Whether `entries` carries the demand `key`.
+fun carries(entries: List<WireEntry>, key: Option<Hash>): bool {
+	for entry in entries {
+		if same_demand(entry.key, key) {
+			ret true;
+		}
+	}
+	false
+}
+
 /// The reactive protocol's client half: routes each inbound `Update` frame to the
 /// typed mirror of its subscribed channel. `source<T>` hands out a
 /// `RemoteSource<T>` — the type binds at the call site (an annotated `let`, or the
@@ -3330,6 +3506,9 @@ export struct ReactiveClient {
 	// generated stub's table — which is program-lifetime, because the stub's
 	// element type is known only where it is generated (`MirrorTable`).
 	tables: Shared<List<(i32, || void)>>,
+	// Every mirror's demand, and the ONE forward per channel it adds up to on the
+	// wire (A143). Every mirror this client mints carries a copy.
+	wire: WireDemand,
 }
 
 export impl ReactiveClient {
@@ -3341,6 +3520,7 @@ export impl ReactiveClient {
 			dynamic = Shared::new([]),
 			replays = Shared::new([]),
 			tables = Shared::new([]),
+			wire = WireDemand::new(transport, codec),
 		};
 		(client.transport).on_frame(|frame| {
 			// every inbound frame is handled in a turn
@@ -3582,6 +3762,7 @@ export impl ReactiveClient {
 			closing,
 			join = || seed_from_sibling(routes, channel_cell, deliver),
 			revive = Shared::new(|| {}),
+			wire = self.wire,
 			settle_id = fresh_id(),
 			codec = self.codec,
 			transport = self.transport,
@@ -3651,7 +3832,8 @@ export impl ReactiveClient {
 		// flight holds no list yet and offers nothing: that frame reaches the
 		// joiner's route too.
 		let key_snapshot = |key: Hash| {
-			mut held = false;
+			// A whole-collection holder carries every key (A143).
+			mut held = count.read() > 0 || closing.read();
 			for lease in leases.read() {
 				if lease.key.eq(key) && lease.on_wire.read() {
 					held = true;
@@ -3688,6 +3870,7 @@ export impl ReactiveClient {
 			join = join_hook,
 			join_key = join_key_hook,
 			revive = Shared::new(|| {}),
+			wire = self.wire,
 			settle_id = fresh_id(),
 			leases,
 			positions,
@@ -3716,7 +3899,7 @@ export impl ReactiveClient {
 			(deserializer.end_list)();
 			match (deserializer.failed)() {
 				Some(let _reason) => {},
-				None => mirror.apply(ops),
+				None => mirror.accept(ops),
 			}
 		};
 		self.routes
@@ -3885,10 +4068,20 @@ export impl ReactiveClient {
 	/// What is left is the hand-wired shape, `ReactiveClient::source(channel)`,
 	/// where std genuinely never saw the call that produced the id.
 	fun invalidate_dynamic(self) {
+		// The fresh session knows none of the old demand (A143).
+		self.wire.reset();
 		for invalidate in self.dynamic.read() {
 			invalidate();
 		}
 		self.dynamic.write() = [];
+	}
+
+	/// Forget every demand this client put on the wire, sending nothing — the first
+	/// line of a reconnect (A143). The fresh session knows none of it and may mint
+	/// the old channel ids for other sources, so the rebinds that follow
+	/// re-register what each mirror still holds from nothing.
+	fun reset_wire(self) {
+		self.wire.reset();
 	}
 
 	/// One inbound frame: an `Update` or a `Patch` fans out to its channel's
@@ -3950,6 +4143,7 @@ export impl ReactiveClient with Disposable {
 		self.routes.write() = [];
 		self.replays.write() = [];
 		self.dynamic.write() = [];
+		self.wire.reset();
 	}
 }
 
@@ -4161,6 +4355,9 @@ export struct RemoteSource<T> {
 	// retired mirror comes back to a channel; a no-op on a mirror that is still
 	// enlisted, and on one no client enlisted (an `[expose]` field mirror).
 	revive: Shared<|| void>,
+	// The client's wire demand (A143): this mirror's `Subscribe`/`Unsubscribe` go
+	// through it, so siblings on one channel share one forward.
+	wire: WireDemand,
 }
 
 /// A mirror IS a `Source` (tracker A52) — at `Option<T>`, which is what it
@@ -4357,7 +4554,9 @@ export impl RemoteSource<type T> {
 			} else if self.released.read() {
 				self.remint();
 			} else {
-				(self.transport).send(self.subscribe.read());
+				// Through the client's wire (A143): a sibling already holding the
+				// channel means nothing is sent, and `join` seeds this mirror.
+				self.wire.open(self.channel.read(), self.channel.identity(), None, |_serializer| {});
 				(self.join)();
 			}
 		}
@@ -4426,7 +4625,12 @@ export impl RemoteSource<type T> {
 		if !self.leased.read() {
 			if !self.released.read() && self.minted() {
 				self.released.write() = true;
-				(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+				// Only while no mirror of this client holds the channel (A143): a
+				// sibling's demand keeps it, and this `Unsubscribe` would release
+				// the sibling's forward instead.
+				if !self.wire.holds(self.channel.read()) {
+					(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+				}
 			}
 			self.retired();
 		}
@@ -4518,7 +4722,8 @@ export impl RemoteSource<type T> {
 			// below is still owed — the next lease must ask again rather than
 			// `Subscribe` on an id the mirror never had.
 			if self.minted() {
-				(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+				// The wire carries it until no sibling holds it either (A143).
+				self.wire.close(self.channel.read(), self.channel.identity(), None);
 			}
 			match self.origin {
 				Some(let _minting) => {
@@ -4541,6 +4746,9 @@ export impl RemoteSource<type T> {
 		// Back on the client's routes and replays first, if a retire pruned them
 		// (A140): the `Subscribe` below may be answered inside the send.
 		(self.revive.read())();
+		// Whatever this mirror registered on the channel it leaves is a withdrawn
+		// id's or a dead session's: dropped, sending nothing (A143).
+		self.wire.forget(self.channel.identity());
 		self.channel.write() = channel;
 		self.subscribe.write() = subscribe;
 		self.closing.write() = false;
@@ -4551,7 +4759,7 @@ export impl RemoteSource<type T> {
 		// describes an attempt this one replaced (A92).
 		self.mint.set(None);
 		if self.count.read() > 0 {
-			(self.transport).send(subscribe);
+			self.wire.open(channel, self.channel.identity(), None, |_serializer| {});
 			(self.join)();
 		}
 	}
@@ -5047,6 +5255,9 @@ export struct KeyedSource<K, T> {
 	join_key: Shared<|Hash| void>,
 	/// `RemoteSource.revive`, at the keyed type (A140).
 	revive: Shared<|| void>,
+	/// `RemoteSource.wire`, at the keyed type (A143): every demand, whole or per
+	/// key, is registered here, and the wire carries their union.
+	wire: WireDemand,
 }
 
 /// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
@@ -5186,7 +5397,12 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		if !self.leased.read() {
 			if !self.released.read() && self.minted() {
 				self.released.write() = true;
-				(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+				// Only while no mirror of this client holds the channel (A143): a
+				// sibling's demand keeps it, and this `Unsubscribe` would release
+				// the sibling's forward instead.
+				if !self.wire.holds(self.channel.read()) {
+					(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+				}
 			}
 			self.retired();
 		}
@@ -5300,10 +5516,11 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		fresh
 	}
 
-	/// Take the whole-collection lease. 0→1 with no close pending subscribes — and
-	/// releases every per-key subscription, because the whole-collection forward
-	/// already carries those keys and a second forward for one of them would
-	/// deliver its ops twice (a duplicate `Remove` would even read as a protocol
+	/// Take the whole-collection lease. 0→1 with no close pending registers the
+	/// whole-collection demand with the client's wire (A143), which SUBSUMES every
+	/// per-key demand on the channel — this mirror's and its siblings': the whole
+	/// forward already carries those keys, and a second forward for one of them
+	/// would deliver its ops twice (a duplicate `Remove` reads as a protocol
 	/// fault). The whole forward seeds with a `Reset`, so nothing is lost in the
 	/// swap.
 	fun acquire(self) {
@@ -5320,14 +5537,8 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				// drops the per-key subscriptions this one subsumes.
 				self.remint();
 			} else {
-				(self.transport).send(encode_control(self.codec, "Subscribe", self.channel.read()));
+				self.wire.open(self.channel.read(), self.channel.identity(), None, |_serializer| {});
 				(self.join.read())();
-			}
-			for lease in self.leases.read() {
-				if lease.on_wire.read() {
-					lease.on_wire.write() = false;
-					(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", self.channel.read(), lease.describe));
-				}
 			}
 		}
 	}
@@ -5344,9 +5555,13 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	}
 
 	/// The deferred half of `release`. Whatever per-key demand outlives the
-	/// whole-collection lease takes the wire back: the mirror is emptied first (it
-	/// holds a whole collection it is about to stop being told about) and each
-	/// key's forward re-seeds it with an `Insert`.
+	/// whole-collection lease keeps its elements: the mirror is TRIMMED to the keys
+	/// it still holds (it held a whole collection it is about to stop being told
+	/// about), and from here on it accepts only those keys' ops (`accept`). The
+	/// client's wire then carries the per-key demands, unless a sibling still holds
+	/// the whole collection (A143): subscribes first, so a dynamic channel is never
+	/// left carrying nothing in between, and each fresh per-key forward re-seeds
+	/// its key with an `Insert`.
 	fun flush_close(self) {
 		if self.closing.read() {
 			self.closing.write() = false;
@@ -5356,31 +5571,115 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				self.surrendered();
 				ret;
 			}
-			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+			self.trim_to_keys();
+			self.wire.close(self.channel.read(), self.channel.identity(), None);
 			self.surrendered();
-			mut resumed = false;
-			for lease in self.leases.read() {
-				if lease.count.read() > 0 && !lease.on_wire.read() {
-					resumed = true;
-				}
-			}
-			if resumed {
-				self.positions.write() = Map::new();
-				self.cache.set(Some([]));
-			}
-			for lease in self.leases.read() {
-				if lease.count.read() > 0 && !lease.on_wire.read() {
-					lease.on_wire.write() = true;
-					(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
-					(self.join_key.read())(lease.key);
-				}
-			}
 		}
 	}
 
-	/// Take one key's lease — the same four-line rule, per key, with the
-	/// subsumption above: while the whole collection is held, the key is already
-	/// arriving and nothing goes on the wire.
+	/// Keep only the elements under the keys this mirror still leases — what a
+	/// mirror that stops holding the whole collection owes its cache (A143). A
+	/// mirror that leases no key keeps what it last held, as a released mirror
+	/// always has.
+	fun trim_to_keys(self) {
+		mut wanted: List<Hash> = [];
+		for lease in self.leases.read() {
+			if lease.on_wire.read() {
+				wanted.push(lease.key);
+			}
+		}
+		if wanted.len() == 0 {
+			ret;
+		}
+		match self.cache.get() {
+			None => {},
+			Some(let list) => {
+				mut kept: List<T> = [];
+				for element in list {
+					if wants(wanted, element.key().hash()) {
+						kept.push(element);
+					}
+				}
+				self.positions.write() = Map::new();
+				self.reindex(kept, 0);
+				self.cache.set(Some(kept));
+			},
+		}
+	}
+
+	/// Route one patch into THIS mirror by its own demand (A143): a mirror holding
+	/// the whole collection takes every op; one holding only keys takes those keys'
+	/// ops, with a `Reset` read as what it says about each held key (an `Insert` of
+	/// the key's element, or a `Remove` when the key is gone); a mirror holding
+	/// nothing takes nothing. A patch that carried ops, none of them this mirror's,
+	/// is dropped whole — applying the empty remainder would tell a mirror still
+	/// waiting for its own seed that it is in sync.
+	fun accept(self, ops: List<Delta<K, T>>) {
+		if self.count.read() > 0 || self.closing.read() {
+			self.apply(ops);
+			ret;
+		}
+		mut wanted: List<Hash> = [];
+		for lease in self.leases.read() {
+			if lease.on_wire.read() || lease.closing.read() {
+				wanted.push(lease.key);
+			}
+		}
+		if wanted.len() == 0 {
+			ret;
+		}
+		mut kept: List<Delta<K, T>> = [];
+		for op in ops {
+			match op {
+				Delta::Reset(let items) => {
+					for key in wanted {
+						mut found = false;
+						mut at = 0usize;
+						for item in items {
+							if !found {
+								if item.key().hash().eq(key) {
+									kept.push(Delta::Insert(item.key(), item, at));
+									found = true;
+								} else {
+									at += 1;
+								}
+							}
+						}
+						if !found {
+							match self.pick(self.cache.get(), key) {
+								Some(let held) => kept.push(Delta::Remove(held.key())),
+								None => {},
+							}
+						}
+					}
+				},
+				Delta::Insert(let key, let value, let at) => {
+					if wants(wanted, key.hash()) {
+						kept.push(Delta::Insert(key, value, at));
+					}
+				},
+				Delta::Update(let key, let value) => {
+					if wants(wanted, key.hash()) {
+						kept.push(Delta::Update(key, value));
+					}
+				},
+				Delta::Remove(let key) => {
+					if wants(wanted, key.hash()) {
+						kept.push(Delta::Remove(key));
+					}
+				},
+			}
+		}
+		if kept.len() == 0 && ops.len() > 0 {
+			ret;
+		}
+		self.apply(kept);
+	}
+
+	/// Take one key's lease — the same four-line rule, per key. The demand is
+	/// registered with the client's wire whatever else is held (A143); while the
+	/// whole collection is held — by this mirror or a sibling — the key is already
+	/// arriving, the wire sends nothing, and the key is seeded from a sibling.
 	fun acquire_key(self, lease: KeyLease) {
 		let before = lease.count.read();
 		lease.count.write() = before + 1;
@@ -5395,11 +5694,9 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				// included.
 				self.remint();
 			} else {
-				if self.count.read() == 0 {
-					lease.on_wire.write() = true;
-					(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
-					(self.join_key.read())(lease.key);
-				}
+				lease.on_wire.write() = true;
+				self.wire.open(self.channel.read(), self.channel.identity(), Some(lease.key), lease.describe);
+				(self.join_key.read())(lease.key);
 			}
 		}
 	}
@@ -5420,7 +5717,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 			lease.closing.write() = false;
 			if lease.on_wire.read() && self.minted() {
 				lease.on_wire.write() = false;
-				(self.transport).send(encode_control_keyed(self.codec, "Unsubscribe", self.channel.read(), lease.describe));
+				self.wire.close(self.channel.read(), self.channel.identity(), Some(lease.key));
 				// The last key on a channel nothing else holds is the channel
 				// (A79): a keyed channel carries one forward per demand, so its
 				// dynamic capability goes when the last of them does.
@@ -5560,6 +5857,8 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun rebind(self, channel: i32) {
 		// `RemoteSource::rebind`'s first line, for its reason (A140).
 		(self.revive.read())();
+		// `RemoteSource::rebind`'s forget, for its reason (A143).
+		self.wire.forget(self.channel.identity());
 		self.channel.write() = channel;
 		self.positions.write() = Map::new();
 		self.cache.set(None);
@@ -5569,20 +5868,31 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		self.released.write() = false;
 		self.mint.set(None);
 		if self.count.read() > 0 {
-			(self.transport).send(encode_control(self.codec, "Subscribe", channel));
+			self.wire.open(channel, self.channel.identity(), None, |_serializer| {});
 			(self.join.read())();
 		}
 		for lease in self.leases.read() {
 			lease.closing.write() = false;
 			lease.on_wire.write() = false;
-			// Only what the whole-collection lease does not already cover.
-			if lease.count.read() > 0 && self.count.read() == 0 {
+			// Every key still leased is registered; the wire sends only what the
+			// whole-collection demand does not already cover (A143).
+			if lease.count.read() > 0 {
 				lease.on_wire.write() = true;
-				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", channel, lease.describe));
+				self.wire.open(channel, self.channel.identity(), Some(lease.key), lease.describe);
 				(self.join_key.read())(lease.key);
 			}
 		}
 	}
+}
+
+/// Whether `wanted` holds `key`.
+fun wants(wanted: List<Hash>, key: Hash): bool {
+	for held in wanted {
+		if held.eq(key) {
+			ret true;
+		}
+	}
+	false
 }
 
 /// Keep the first fault a patch produced; later ones are its consequences.
@@ -6690,7 +7000,11 @@ export macro fun service(item: Item): Source {
 		"[]"
 	};
 	body.push(i"let rebinds: List<|i32, Frame| void> = {rebind_list};");
+	// The client's wire demand is forgotten first (A143): the rebinds and replays
+	// re-register what each mirror still holds on the fresh session's ids.
 	body.push("socket.on_reconnect.write().push(|| {\n"
+		+ indent("reactive.reset_wire();", 1)
+		+ "\n"
 		+ indent("rpc::reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds, || reactive.replay_dynamic());", 1)
 		+ "\n});");
 	let field_lines = join(ok_fields, ",\n");

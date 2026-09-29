@@ -3635,6 +3635,450 @@ fn a139_a_per_key_joiner_is_seeded_over_a_socket() {
     );
 }
 
+// --- A143: ONE forward per channel, ops fanned out by each mirror's demand ---
+
+/// A143 IN PROCESS (ruled door b): two mirrors on one keyed channel with
+/// DIFFERENT demands — the first holds the whole collection, the second one
+/// key. Each used to put its own forward on the server (`forwards=2`), a frame
+/// names a channel and not a forward, so every op on `a` reached both mirrors
+/// twice: the second `Remove` faulted on the first mirror, and the second
+/// mirror took `b`'s `Update` too and faulted on it (and was notified for it).
+/// Now the client keeps one forward per channel at the union of its mirrors'
+/// demands (`WireDemand`; whole subsumes per-key), and each mirror takes only
+/// its own demand's ops (`KeyedSource::accept`): the whole-collection mirror
+/// is notified once per op (seed, three edits = 4), the per-key one once per
+/// op on its key (the immediate call, the rebind's reset, the seed, the edit,
+/// the drop = 5; `b`'s edit reaches it not at all). When the whole lease
+/// goes, the wire hands `a` back to a per-key forward. Red before on
+/// `forwards=2`, both faults and `notified: first=5 second=6`.
+const A143_ONE_FORWARD: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, duplex_pair, local_rpc, register_session, session_of };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// Two methods answering ONE cell: one channel, two origins, two mirrors.
+[service(BoardClient)]
+struct Board {
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun edit(self, id: str, text: str): i32 {
+		self.rows.update(id, |&mut row| {
+			row.text = text;
+		});
+		0
+	}
+
+	[rpc]
+	fun drop(self, id: str): i32 {
+		self.rows.remove(id);
+		0
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+fun text_of(row: Option<Row>): str {
+	match row {
+		Some(let held) => held.text,
+		None => "-",
+	}
+}
+
+fun fault_of(fault: Option<str>): str {
+	match fault {
+		Some(let reason) => reason,
+		None => "none",
+	}
+}
+
+fun held(list: Option<List<Row>>): usize {
+	match list {
+		Some(let rows) => rows.len(),
+		None => 0,
+	}
+}
+
+fun forwards(): usize {
+	match session_of(3) {
+		Some(let session) => session.live.read().len(),
+		None => 0,
+	}
+}
+
+fun settle() {
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+}
+
+fun main() {
+	let board = Board { rows = KeyedCell::new([Row { id = "a", text = "one" }, Row { id = "b", text = "two" }]) };
+	let (client_end, server_end) = duplex_pair();
+	register_session(3, server_end, json_codec());
+	let transport = local_rpc(board.dispatcher().into_protocol(json_codec()).for_connection(3));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	let first: KeyedSource<str, Row> = client.rows();
+	let second: KeyedSource<str, Row> = client.rows_again();
+	let whole_seen: Shared<i32> = Shared::new(0);
+	let key_seen: Shared<List<str>> = Shared::new([]);
+	// The WHOLE collection on one mirror, one KEY on its sibling.
+	let _whole = first.sub(|list| whole_seen.write() += 1);
+	settle();
+	let _key = second.sub_key("a", |row| key_seen.write().push(text_of(row)));
+	settle();
+	print(i"mixed: same-channel={first.channel.read() == second.channel.read()} forwards={forwards()} first={held(first.get())} second={held(second.get())} a={text_of(second.pick(second.get(), "a".hash()))}");
+	print(i"edit a:{client.edit("a", "uno").unwrap_or(0 - 1)}");
+	settle();
+	print(i"edit b:{client.edit("b", "dos").unwrap_or(0 - 1)}");
+	settle();
+	print(i"drop a:{client.drop("a").unwrap_or(0 - 1)}");
+	settle();
+	print(i"after: first={held(first.get())} second={held(second.get())} first-fault={fault_of(first.fault())} second-fault={fault_of(second.fault())}");
+	print(i"notified: first={whole_seen.read()} second={key_seen.read().len()}");
+	for seen in key_seen.read() {
+		print(i"  second saw {seen}");
+	}
+	// The whole lease goes: the wire hands the key back to a per-key forward.
+	_whole.dispose();
+	settle();
+	settle();
+	print(i"key only: forwards={forwards()} second={held(second.get())} first-fault={fault_of(first.fault())} second-fault={fault_of(second.fault())}");
+}
+"#;
+
+#[test]
+fn a143_mixed_demands_on_one_keyed_channel_share_one_forward_and_fan_out_by_demand() {
+    let stdout = run_program("a143_one_forward", A143_ONE_FORWARD);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "mixed: same-channel=true forwards=1 first=2 second=1 a=one",
+            "edit a:0",
+            "edit b:0",
+            "drop a:0",
+            "after: first=1 second=0 first-fault=none second-fault=none",
+            "notified: first=4 second=5",
+            "second saw -",
+            "second saw -",
+            "second saw one",
+            "second saw uno",
+            "second saw -",
+            "key only: forwards=1 second=0 first-fault=none second-fault=none",
+        ],
+        "two demands on one keyed channel must share one forward, and each \
+         mirror must receive each of its ops exactly once; got:\n{stdout}"
+    );
+}
+
+/// A143 OVER A SOCKET: the same two demands over a real WebSocket. Red before
+/// on both faults and `notified: first=7 second=8`.
+const A143_ONE_FORWARD_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(BoardClient)]
+struct Board {
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun edit(self, id: str, text: str): i32 {
+		self.rows.update(id, |&mut row| {
+			row.text = text;
+		});
+		0
+	}
+
+	[rpc]
+	fun drop(self, id: str): i32 {
+		self.rows.remove(id);
+		0
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+let board: Board = Board { rows = KeyedCell::new([Row { id = "a", text = "one" }, Row { id = "b", text = "two" }]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 100 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+fun text_of(row: Option<Row>): str {
+	match row {
+		Some(let held) => held.text,
+		None => "-",
+	}
+}
+
+fun held(list: Option<List<Row>>): usize {
+	match list {
+		Some(let rows) => rows.len(),
+		None => 0,
+	}
+}
+
+fun fault_of(fault: Option<str>): str {
+	match fault {
+		Some(let reason) => reason,
+		None => "none",
+	}
+}
+
+async fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let first: KeyedSource<str, Row> = client.rows();
+			let second: KeyedSource<str, Row> = client.rows_again();
+			let whole_seen: Shared<i32> = Shared::new(0);
+			let key_seen: Shared<List<str>> = Shared::new([]);
+			let _whole = first.sub(|list| whole_seen.write() += 1);
+			until(|| first.get().is_some());
+			let _key = second.sub_key("a", |row| key_seen.write().push(text_of(row)));
+			until(|| second.channel.read() >= 0 && held(second.get()) == 1);
+			print(i"mixed: same-channel={first.channel.read() == second.channel.read()} first={held(first.get())} second={held(second.get())} a={text_of(second.pick(second.get(), "a".hash()))}");
+			print(i"edit a:{client.edit("a", "uno").unwrap_or(0 - 1)}");
+			until(|| text_of(second.pick(second.get(), "a".hash())) == "uno");
+			print(i"edit b:{client.edit("b", "dos").unwrap_or(0 - 1)}");
+			until(|| whole_seen.read() >= 3);
+			print(i"drop a:{client.drop("a").unwrap_or(0 - 1)}");
+			until(|| held(first.get()) == 1 && held(second.get()) == 0);
+			sleep(50);
+			print(i"after: first={held(first.get())} second={held(second.get())} first-fault={fault_of(first.fault())} second-fault={fault_of(second.fault())}");
+			print(i"notified: first={whole_seen.read()} second={key_seen.read().len()}");
+			for seen in key_seen.read() {
+				print(i"  second saw {seen}");
+			}
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a143_mixed_demands_share_one_forward_over_a_socket() {
+    let stdout = run_program("a143_one_forward_socket", A143_ONE_FORWARD_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "mixed: same-channel=true first=2 second=1 a=one",
+            "edit a:0",
+            "edit b:0",
+            "drop a:0",
+            "after: first=1 second=0 first-fault=none second-fault=none",
+            "notified: first=4 second=5",
+            "second saw -",
+            "second saw -",
+            "second saw one",
+            "second saw uno",
+            "second saw -",
+        ],
+        "over a socket, two demands on one keyed channel must share one \
+         forward and fan out by demand; got:\n{stdout}"
+    );
+}
+
+/// A143's ordering, on ONE minted (dynamic) keyed mirror holding the whole
+/// collection and key `a`: releasing the whole lease used to send the whole
+/// `Unsubscribe` FIRST, which left the channel carrying no forward, so the
+/// server REVOKED it, and the key's `Subscribe` that followed named nothing
+/// (`forwards=0`, `a=-` forever, the edit never arriving). The wire now sends
+/// subscribes before unsubscribes. In process; the revocation rule it hits is
+/// the server's and transport-independent.
+const A143_HANDOFF: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, duplex_pair, local_rpc, register_session, session_of };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+// Two methods answering ONE cell: one channel, two origins, two mirrors.
+[service(BoardClient)]
+struct Board {
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun edit(self, id: str, text: str): i32 {
+		self.rows.update(id, |&mut row| {
+			row.text = text;
+		});
+		0
+	}
+
+	[rpc]
+	fun drop(self, id: str): i32 {
+		self.rows.remove(id);
+		0
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+fun text_of(row: Option<Row>): str {
+	match row {
+		Some(let held) => held.text,
+		None => "-",
+	}
+}
+
+fun fault_of(fault: Option<str>): str {
+	match fault {
+		Some(let reason) => reason,
+		None => "none",
+	}
+}
+
+fun held(list: Option<List<Row>>): usize {
+	match list {
+		Some(let rows) => rows.len(),
+		None => 0,
+	}
+}
+
+fun forwards(): usize {
+	match session_of(3) {
+		Some(let session) => session.live.read().len(),
+		None => 0,
+	}
+}
+
+fun settle() {
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+}
+
+fun main() {
+	let board = Board { rows = KeyedCell::new([Row { id = "a", text = "one" }, Row { id = "b", text = "two" }]) };
+	let (client_end, server_end) = duplex_pair();
+	register_session(3, server_end, json_codec());
+	let transport = local_rpc(board.dispatcher().into_protocol(json_codec()).for_connection(3));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	let first: KeyedSource<str, Row> = client.rows();
+	let key_seen: Shared<str> = Shared::new("?");
+	let whole = first.sub(|list| {});
+	settle();
+	let _key = first.sub_key("a", |row| key_seen.write() = text_of(row));
+	settle();
+	whole.dispose();
+	settle();
+	settle();
+	print(i"key only: forwards={forwards()} a={key_seen.read()}");
+	print(i"edit a:{client.edit("a", "uno").unwrap_or(0 - 1)}");
+	settle();
+	print(i"after: a={key_seen.read()} fault={fault_of(first.fault())}");
+}
+"#;
+
+#[test]
+fn a143_releasing_the_whole_lease_hands_a_held_key_back_without_revoking_the_channel() {
+    let stdout = run_program("a143_handoff", A143_HANDOFF);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "key only: forwards=1 a=one",
+            "edit a:0",
+            "after: a=uno fault=none"
+        ],
+        "a key lease that outlives the whole lease must keep its channel; got:\n{stdout}"
+    );
+}
+
 // --- A140: a retired mirror's route and replay are pruned ------------------
 
 /// A140 IN PROCESS: five plain mints (five origins) and three keyed ones,

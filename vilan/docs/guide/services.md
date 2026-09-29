@@ -589,11 +589,15 @@ remount must find it on the same id.)
 "Last lease" means the last one on the **channel**, not on your mirror:
 where two mirrors ended up sharing a channel because they named the same
 source — two methods answering one cell, say — the first to let go
-withdraws nothing. The second one's `Subscribe` joins the forward the
-first already holds, so the server sends it no seed; the client seeds it
-from its sibling instead, and it reads the channel's value at once. The
-same holds per key: a keyed mirror's `sub_key(k)` that joins a sibling's
-lease on `k` is seeded with the sibling's element for `k`.
+withdraws nothing. The client keeps **one forward per channel**, at the
+union of its mirrors' demands: the second mirror's lease joins what the
+first already holds, nothing goes on the wire, and the client seeds it
+from its sibling, so it reads the channel's value at once. On a keyed
+channel a whole-collection lease covers every key: a sibling's
+`sub_key(k)` beside it asks the server for nothing and is seeded with
+the sibling's element for `k`. Each mirror takes only the changes its
+own leases ask for, so a mirror holding one key is never told about the
+others, and no change reaches a mirror twice.
 
 Two consequences worth having in mind. A dispose and a remount anywhere
 inside one macrotask — two event handlers, a route change, an `each`
