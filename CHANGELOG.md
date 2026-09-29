@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: feature -->
+**Two shapes A142's pipe nodes are written in build natively: a field read off a `Shared` cell's read, and a closure handing back one of its captures.** `(followed.read().pull)()` — a `switch` node calling its current inner instance — was refused by name ("a field read of an unresolved subject"), because a cell's `read()` recorded no type for the field read to find its struct in; it answers the cell's element now. And an expression-bodied closure returning a capture (`|| v` over a non-`Copy` `v`) moved its own capture out, which `rustc` refuses for a closure every closure type lowers to as `dyn Fn`: an expression body is now a value position like a block body's tail, so the read is the copy it is everywhere else. Found probing reactive-44's pipe layout (A142 S1) natively.
+
+<!-- family: feature -->
 **A closure whose body is erased to a trait object builds natively: `roots.map(|r| r)` into a `List<dyn Src>` — the spelling B435's steer recommends — no longer fails `rustc`.** An expression-bodied closure's value skipped the erasure every other value position applies, so the native build handed back the concrete `Root` where a `Dyn<..>` was wanted. The tail is now erased, and the closure literal names the object as its return, so a call through a closure-typed binding (`let erase: |Root| dyn Src = |r| r; erase(r).get()`) can dispatch on it; such a call — through a closure-typed local or parameter — also carries its return type now, where the slot call through it was refused by name. Tracker F53.
 
 <!-- family: feature -->

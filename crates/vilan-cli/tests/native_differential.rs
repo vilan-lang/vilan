@@ -6287,3 +6287,44 @@ const F53_PROBE: &str = concat!(
     "\t}\n",
     "}\n",
 );
+
+/// A142 parity (reactive-44's `Switch` node): a FIELD read off a `Shared`'s
+/// read — `(followed.read().pull)()`, a node calling its current inner
+/// instance's closure — builds natively. The read is an intrinsic call with no
+/// recorded type of its own, so the field read had no struct to name its field
+/// from and was refused by name; its type is the cell's element.
+#[test]
+fn a_field_read_off_a_shared_read_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_shared_field.vl"),
+        SHARED_FIELD_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_shared_field.vl"),
+        Verdict::Identical,
+        "a field read off a `Shared` read must build and print the same on both backends"
+    );
+}
+
+const SHARED_FIELD_PROBE: &str = concat!(
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Inst<T> {\n",
+    "\tpull: || T,\n",
+    "\tlabel: str,\n",
+    "}\n",
+    "\n",
+    "fun follow<T>(v: T): || T {\n",
+    "\tlet followed: Shared<Inst<T>> = Shared::new(Inst<T> { pull = || v, label = \"f\" });\n",
+    "\t|| (followed.read().pull)()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet s: Shared<Inst<i32>> = Shared::new(Inst<i32> { pull = || 1, label = \"s\" });\n",
+    "\tprint((s.read().pull)());\n",
+    "\tprint(s.read().label);\n",
+    "\tprint(follow(\"x\")());\n",
+    "}\n",
+);

@@ -897,12 +897,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
     ) -> Result<String, Error> {
         let boxed = self.boxed_parameter_prologue(&closure.parameters);
-        let body = self.expression(closure.return_, depth)?;
-        // F53: an expression body is the closure's VALUE, and a concrete value
-        // landing at a `dyn` return (`roots.map(|r| r)` into a `List<dyn Src>`)
-        // becomes the object here, as it does at every other value position
-        // ([`Self::value_of`]). A block body's tail already takes that path.
-        let body = self.erase_into_object(closure.return_, body)?;
+        // An expression body is the closure's VALUE, so it takes what every
+        // value position takes ([`Self::value_of`]); a block body's tail
+        // already did. F53: a concrete value landing at a `dyn` return
+        // (`roots.map(|r| r)` into a `List<dyn Src>`) becomes the object here.
+        // And a read of a CAPTURE handed back (`|| v`, A142's `Switch` node
+        // over a generic `v`) is a copy, or the closure moves its own capture
+        // out and is `FnOnce` where every closure type is a `dyn Fn`.
+        let body = self.value_of(closure.return_, depth)?;
         if closure.parameter_destructures.is_empty() {
             if boxed.is_empty() {
                 return Ok(body);
@@ -3016,8 +3018,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .inferred_return_types
                 .get(call_id)
                 .copied()
+                .or_else(|| self.shared_read_type(*call_id))
                 .or_else(|| self.declared_return_type(*call_id)),
             Expr::Await(awaited) => self.awaited_type(*awaited),
+            _ => None,
+        }
+    }
+
+    /// The element type a `Shared` cell's `read()` answers — the cell's own
+    /// argument. The intrinsic call records no type of its own, so a field
+    /// read off it (`(followed.read().pull)()`, A142's `Switch` node calling
+    /// its current inner instance) had no struct to name the field from.
+    ///
+    /// `read()` only. Natively it is a copy out of the cell (`get()`), so a
+    /// field of it is an ordinary value. A field of `write()` is a place behind
+    /// a live `borrow_mut`, and `a.write().n = a.write().n + 1` (`shared.vl`)
+    /// holds the right side's borrow across the left's — the runtime's
+    /// reentrancy stop, where node prints `2`. That shape stays refused by
+    /// name until it is lowered through a temporary.
+    fn shared_read_type(&self, call_id: Id) -> Option<TypeId> {
+        let call = self.program.function_calls.get(&call_id)?;
+        let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id) else {
+            return None;
+        };
+        if !matches!(
+            self.program.intrinsics.get(subject),
+            Some(Intrinsic::SharedValue)
+        ) {
+            return None;
+        }
+        let cell = self.type_of(*call.argument_ids.first()?)?;
+        match self.resolve(cell)? {
+            Type::Struct(id, arguments)
+                if self.program.structs.get(id).is_some_and(|declaration| {
+                    declaration.external && declaration.name == "Shared"
+                }) =>
+            {
+                arguments.first().copied()
+            }
             _ => None,
         }
     }
