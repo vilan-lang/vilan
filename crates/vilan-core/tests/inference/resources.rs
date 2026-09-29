@@ -8202,3 +8202,426 @@ fn b365_a_struct_literal_of_a_resource_type_enrols_its_body() {
         );
     }
 }
+
+// --- B463: a trait default's body under a resource `Self` --------------------
+//
+// Resource-ness is per instantiation (destruction.md §6.8), and a trait default
+// inherited by a resource runs with `Self` a resource. Its body was checked only
+// with `Self` abstract (a bare trait, never a resource), so a loaned `self`
+// moved into an aggregate COPIED the resource — the A142 pipe model's floor.
+// An impl whose subject is a resource outright is checked at the impl that
+// inherits the default (called or not), in the concrete impl's own words; a
+// generic subject whose resource-ness a call decides is R11's, at the call.
+
+/// `assert_fails_noting` for a note on a word that also occurs earlier in the
+/// source: the note must span `word` where it first follows `anchor`.
+#[track_caller]
+fn b463_assert_noting_after(
+    source: &str,
+    message_part: &str,
+    anchor: &str,
+    word: &str,
+    note_part: &str,
+) {
+    let from = source
+        .find(anchor)
+        .expect("the anchor occurs in the source");
+    let start = from
+        + source[from..]
+            .find(word)
+            .expect("the word follows the anchor");
+    let diagnostics = failure_diagnostics_with_notes(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _, note)| message.contains(message_part)
+                && note
+                    .as_ref()
+                    .is_some_and(|(msg, range, _)| msg.contains(note_part)
+                        && *range == (start..start + word.len()))),
+        "no {message_part:?} diagnostic notes {note_part:?} at {word:?} after {anchor:?}; got: \
+         {diagnostics:#?}"
+    );
+}
+
+const B463_WRAP: &str = r#"
+[resource]
+struct R { n: i32 }
+
+struct Holder<X> { inner: X }
+
+trait Wrap {
+    fun wrap(self): Holder<Self> {
+        Holder<Self> { inner = self }
+    }
+}
+
+impl R with Wrap {}
+
+fun main() {
+    let r = R { n = 1 };
+    let a = r.wrap();
+    let b = r.wrap();
+    print(a.inner.n);
+    print(b.inner.n);
+}
+"#;
+
+#[test]
+fn b463_a_loaned_self_moved_by_an_inherited_default_is_refused_in_the_concrete_words() {
+    // The item's repro: before the fix it compiled and printed `1 1`.
+    let diagnostics = failure_diagnostics_with_notes(B463_WRAP);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one root cause, one diagnostic: {diagnostics:#?}"
+    );
+    let (message, range, note) = &diagnostics[0];
+    assert_eq!(
+        message,
+        "cannot move the resource `self` out of this function: it is declared `self`, a loan, \
+         and a loan changes no ownership; declare it `own self` to take ownership, or \
+         restructure with `Option` + `take`"
+    );
+    let moved = B463_WRAP.find("inner = self").unwrap() + "inner = ".len();
+    assert_eq!(
+        *range,
+        moved..moved + "self".len(),
+        "spanned at the move, in the default body"
+    );
+    let (note_message, note_range, other_file) = note.as_ref().expect("a note at the impl");
+    let head = B463_WRAP.find("impl R with Wrap").unwrap();
+    assert_eq!(
+        *note_range,
+        head..head + "impl R with Wrap".len(),
+        "the impl's head, not its body"
+    );
+    assert!(!other_file);
+    assert_eq!(
+        note_message,
+        "`R` inherits the default `wrap` here, and `R` is a resource, so the default's `self` \
+         is one too; declare `wrap` in this impl, or fix the default"
+    );
+}
+
+#[test]
+fn b463_the_concrete_impl_refusal_is_unchanged() {
+    // The same body written in the impl: byte-identical message, same span, no note.
+    let source = B463_WRAP
+        .replace("trait Wrap {", "impl R {")
+        .replace("impl R with Wrap {}\n", "");
+    let diagnostics = failure_diagnostics_with_notes(&source);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let (message, range, note) = &diagnostics[0];
+    assert_eq!(
+        message,
+        "cannot move the resource `self` out of this function: it is declared `self`, a loan, \
+         and a loan changes no ownership; declare it `own self` to take ownership, or \
+         restructure with `Option` + `take`"
+    );
+    let moved = source.find("inner = self").unwrap() + "inner = ".len();
+    assert_eq!(*range, moved..moved + "self".len());
+    assert!(note.is_none(), "{note:?}");
+}
+
+#[test]
+fn b463_an_inherited_default_is_checked_even_when_nothing_calls_it() {
+    // A body written in the impl is checked at its declaration; so is one the
+    // impl inherits.
+    assert_fails_noting(
+        r#"
+        [resource] struct R { n: i32 }
+        struct Holder<X> { inner: X }
+        trait Wrap {
+            fun wrap(self): Holder<Self> {
+                Holder<Self> { inner = self }
+            }
+        }
+        impl R with Wrap {}
+        fun main() {
+            let r = R { n = 1 };
+            print(r.n);
+        }
+        "#,
+        "cannot move the resource `self` out of this function",
+        "impl R with Wrap",
+        "`R` inherits the default `wrap` here",
+    );
+}
+
+#[test]
+fn b463_a_generic_free_function_over_a_resource_stays_r11s() {
+    // The generic twin of the repro was already refused (R11, at the call); pinned
+    // beside it so the two stay one family.
+    b463_assert_noting_after(
+        r#"
+        [resource] struct R { n: i32 }
+        struct Holder<X> { inner: X }
+        fun wrap<T>(x: T): Holder<T> {
+            Holder<T> { inner = x }
+        }
+        fun main() {
+            let r = R { n = 1 };
+            let a = wrap(r);
+            print(a.inner.n);
+        }
+        "#,
+        "`wrap` is not move-clean when instantiated with a resource: a loaned resource-typed \
+         parameter is moved out",
+        "inner = ",
+        "x",
+        "in `wrap`, the loaned parameter `x` is moved out here",
+    );
+}
+
+/// A142 Appendix A's prototype, cut to the branch case: `Map` is a `[resource]`
+/// pipe node, `derive` a default on the flow trait, reached by `Map` through
+/// its own `with Up<U>` impl.
+const B463_PIPE: &str = r#"
+import std::shared::Shared;
+
+trait Src<T> {
+    fun get(self): T;
+    fun watch(self, wake: || void);
+}
+
+struct Cell<T> {
+    value: Shared<T>,
+    subs: Shared<List<|| void>>,
+}
+
+impl Cell<type T> {
+    fun new(v: T): Cell<T> {
+        Cell<T> { value = Shared::new(v), subs = Shared::new([]) }
+    }
+    fun set(self, v: T) {
+        self.value.write() = v;
+        for wake in self.subs.read() {
+            wake();
+        }
+    }
+}
+
+impl Cell<type T> with Src<T> {
+    fun get(self): T {
+        self.value.read()
+    }
+    fun watch(self, wake: || void) {
+        self.subs.write().push(wake);
+    }
+}
+
+trait Up<T> {
+    fun start(own self, react: |T| void);
+
+    fun derive<U>(RECEIVER, f: |T| U): Map<Self, T, U> {
+        Map<Self, T, U> { up = self, f }
+    }
+}
+
+impl type S: Src<type T> with Up<T> {
+    fun start(own self, react: |T| void) {
+        let me = self;
+        self.watch(|| react(me.get()));
+        react(self.get());
+    }
+}
+
+[resource]
+struct Map<S, T, U> {
+    up: S,
+    f: |T| U,
+}
+
+impl Map<type S: Up<type T>, T, type U> with Up<U> {
+    fun start(own self, react: |U| void) {
+        let f = self.f;
+        self.up.start(|x| react(f(x)));
+    }
+}
+
+trait Pipe<T> with Up<T> {
+    fun memo(own self): Cell<T> {
+        let first: Shared<Option<T>> = Shared::new(None);
+        let target: Shared<Option<Cell<T>>> = Shared::new(None);
+        self.start(|v| {
+            match target.read() {
+                Some(let c) => c.set(v),
+                None => {
+                    first.write() = Some(v);
+                },
+            }
+        });
+        let c = Cell::new(first.read().unwrap());
+        target.write() = Some(c);
+        c
+    }
+}
+
+impl Map<type S: Up<type T>, T, type U> with Pipe<U> {}
+
+fun main() {
+    let c = Cell::new(1);
+    let p = c.derive(|x| x * 3);
+    let q = p.derive(|x| x + 1);
+    let a = q.memo();
+    let b = p.memo();
+    print(i"{a.get()} {b.get()}");
+}
+"#;
+
+#[test]
+fn b463_the_prototype_derive_with_a_loaned_self_is_refused() {
+    // With `derive(self)` the branch compiled and printed `4 3`: `p` was copied
+    // into `q`'s node and sealed again.
+    let source = B463_PIPE.replace("RECEIVER", "self");
+    assert_fails_noting(
+        &source,
+        "cannot move the resource `self` out of this function: it is declared `self`, a loan",
+        "impl Map<type S: Up<type T>, T, type U> with Up<U>",
+        "`Map<S, T, U>` inherits the default `derive` here",
+    );
+}
+
+#[test]
+fn b463_the_prototype_derive_with_own_self_refuses_the_second_consumer() {
+    // The spelling A142 writes: the default is clean, and the branch is the
+    // use-after-move the affine rule exists for.
+    let source = B463_PIPE.replace("RECEIVER", "own self");
+    let diagnostics = failure_diagnostics(&source);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].0,
+        "use of `p` after it was moved: a resource has a single owner"
+    );
+}
+
+#[test]
+fn b463_a_generic_subject_made_a_resource_by_the_call_is_refused_at_the_call() {
+    // `Box<X>` is a resource only at `X := R`, which the call decides — R11's
+    // instantiation, spanned at the call with a note into the default.
+    let source = r#"
+        [resource] struct R { n: i32 }
+        struct Box<X> { item: X }
+        struct Holder<X> { inner: X }
+        trait Wrap {
+            fun wrap(self): Holder<Self> {
+                Holder<Self> { inner = self }
+            }
+        }
+        impl Box<type X> with Wrap {}
+        fun main() {
+            let b = Box<R> { item = R { n = 1 } };
+            let first = b.wrap();
+            print(first.inner.item.n);
+        }
+    "#;
+    assert_fails_spanning(
+        source,
+        "b.wrap()",
+        "`wrap` is not move-clean when instantiated with a resource: a loaned resource-typed \
+         parameter is moved out",
+    );
+    b463_assert_noting_after(
+        source,
+        "`wrap` is not move-clean",
+        "inner = ",
+        "self",
+        "in `wrap`, the loaned parameter `self` is moved out here",
+    );
+}
+
+#[test]
+fn b463_an_own_self_default_that_never_consumes_a_resource_is_refused() {
+    // The exactly-once half: the default's teardown is planned without `Self`,
+    // so a resource that inherits `eat` was never destroyed (its `Drop` never
+    // ran). Refused at the impl, with the note in the body.
+    b463_assert_noting_after(
+        r#"
+        import std::drop::Drop;
+        [resource] struct R { n: i32 }
+        impl R with Drop {
+            fun drop(&mut self) { print("drop"); }
+        }
+        trait Eat {
+            fun eat(own self) {
+                print("eating");
+            }
+        }
+        impl R with Eat {}
+        fun main() {
+            let r = R { n = 1 };
+            r.eat();
+        }
+        "#,
+        "the trait default `eat` is not move-clean when a resource inherits it: an `own` \
+         parameter of resource type is never moved out",
+        "fun eat(own ",
+        "self",
+        "in `eat`, the `own` parameter `self` is never moved out",
+    );
+}
+
+#[test]
+fn b463_clean_defaults_on_a_resource_still_compile_and_run() {
+    // A default that only reads a loaned `self`, one that consumes an `own
+    // self`, and an override the impl declares (whose default is never what
+    // runs, so is never asked) — all fine on a resource.
+    assert_compiles_and_runs(
+        r#"
+        import std::drop::Drop;
+        [resource] struct R { n: i32 }
+        impl R with Drop {
+            fun drop(&mut self) { print(i"drop {self.n}"); }
+        }
+        struct Holder<X> { inner: X }
+        trait Peek {
+            fun peek(self): i32 { self.n() }
+            fun n(self): i32;
+            fun into_holder(own self): Holder<Self> {
+                Holder<Self> { inner = self }
+            }
+            fun copy_of(self): Option<Self> {
+                Some(self)
+            }
+        }
+        impl R with Peek {
+            fun n(self): i32 { self.n }
+            fun copy_of(self): Option<Self> {
+                None
+            }
+        }
+        fun main() {
+            let r = R { n = 7 };
+            print(r.peek());
+            let h = r.into_holder();
+            print(h.inner.n);
+        }
+        "#,
+        "7\n7\ndrop 7\n",
+    );
+}
+
+#[test]
+fn b463_a_data_type_inheriting_a_loan_moving_default_is_untouched() {
+    // Data copies: the same default on a non-resource subject is not asked.
+    assert_compiles_and_runs(
+        r#"
+        struct D { n: i32 }
+        struct Holder<X> { inner: X }
+        trait Wrap {
+            fun wrap(self): Holder<Self> {
+                Holder<Self> { inner = self }
+            }
+        }
+        impl D with Wrap {}
+        fun main() {
+            let d = D { n = 1 };
+            let a = d.wrap();
+            let b = d.wrap();
+            print(i"{a.inner.n} {b.inner.n}");
+        }
+        "#,
+        "1 1\n",
+    );
+}

@@ -1365,9 +1365,27 @@ impl ResourceMoveViolation {
 struct R11Instance {
     callee: Id,
     /// The callee's constraint ids bound to a resource here, sorted (the dedup
-    /// key alongside `callee`).
+    /// key alongside `callee`). For a trait default (B463) the one entry is the
+    /// declaring trait's `Self` — `Type::Trait(trait, [])`, the type a default
+    /// body's `self` has — which `classify_resource` answers from this set.
     resources: Vec<TypeId>,
     call_id: Id,
+    /// Where this instantiation was found, which decides how it speaks.
+    site: R11Site,
+}
+
+/// How an [`R11Instance`] was reached (B463).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum R11Site {
+    /// A call instantiates the callee at a resource: `call_id` is the call,
+    /// and the diagnostic is spanned there with a note into the body.
+    Call,
+    /// An `impl` whose subject is a resource INHERITS a trait default: the
+    /// default's body runs with `Self` a resource for every value of that
+    /// subject, called or not, exactly as a body written in the impl would.
+    /// `call_id` is the impl's id; a move violation is reported in the body
+    /// with the concrete impl's own message and a note at the impl.
+    Admission,
 }
 
 /// B389 — what [`Analyzer::literal_numeric_shape`] saw: whether any literal
@@ -1977,6 +1995,9 @@ pub struct Implementation<'src> {
     /// the key the visibility bit is read by (B318 S4). Minted by the walk that
     /// registers the block, so it is the same id `Expr::Impl(id)` carries.
     pub impl_id: Id,
+    /// The block's head, `impl Subject with A + B` without its body — where a
+    /// diagnostic about the block as a whole points (B463).
+    pub header_span: Span,
     /// The SCOPE the block was written in — a module's body scope at a file's
     /// top level, which is what `curated_modules` and `export_all_modules` are
     /// keyed on. Carried rather than looked up because the visibility question
@@ -3269,6 +3290,12 @@ pub struct Analyzer<'src> {
     /// NEVER marked a clone (R1: resources move, they do not copy). Empty when no
     /// resource is declared (std/corpus), so clone-site behavior is unchanged there.
     resource_value_places: HashSet<Id>,
+    /// B463: one canonical `Type::Trait(trait, [])` id per trait, minted on
+    /// first ask — the `Self` marker R11 puts in an instance's resource set
+    /// for a trait default. Types are not interned (`type_id_for_type`), so
+    /// the dedup key needs one id per trait; `classify_resource` compares
+    /// the marker structurally, since a default body's `self` carries its own.
+    trait_self_markers: HashMap<Id, TypeId>,
     /// Drop planning (destruction.md §5/§7): resource-typed local bindings still
     /// owned at their declaring scope's fall-through end — dropped there in
     /// reverse declaration order. Ownership at a program point is single-valued
@@ -6053,6 +6080,7 @@ impl<'src> Analyzer<'src> {
             generic_type_applications: Vec::new(),
             reported_container_structures: HashSet::default(),
             resource_value_places: HashSet::default(),
+            trait_self_markers: HashMap::default(),
             dropped_bindings: HashSet::default(),
             drop_extents: HashMap::default(),
             declared_binding_extents: HashMap::default(),
@@ -10480,8 +10508,24 @@ impl<'src> Analyzer<'src> {
                 | Type::Closure(..)
                 | Type::Function(_)
                 | Type::Module(_)
-                | Type::Trait(_, _)
                 | Type::Mapped(_, _, _) => Members::Answer(false, true),
+                // A trait default body's `Self` (B463): a resource iff THIS
+                // instantiation says so, exactly as a `Generic` above — R11
+                // puts the argument-free `Type::Trait(trait, [])` in the set
+                // when a resource subject inherits the default. The base query
+                // passes an empty set, so a bare trait is never a resource
+                // there.
+                Type::Trait(trait_id, arguments) => Members::Answer(
+                    arguments.is_empty()
+                        && resource_constraints.iter().any(|marker| {
+                            matches!(
+                                self.borrow_type_by_type_id(*marker),
+                                Type::Trait(marked, marked_arguments)
+                                    if marked == trait_id && marked_arguments.is_empty()
+                            )
+                        }),
+                    true,
+                ),
             }
         };
         match plan {
@@ -15924,152 +15968,227 @@ impl<'src> Analyzer<'src> {
             // The whole-program scan crosses every file, so each diagnostic is
             // placed in the one its own span indexes into (B112).
             let anchor = violation.anchor();
-            let error = match violation {
-                ResourceMoveViolation::UseAfterMove {
-                    use_id,
-                    binding,
-                    move_span,
-                } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "use of `{name}` after it was moved: a resource has a single owner"
-                        ),
-                        note: Some(crate::error::Note::here(
-                            move_span,
-                            format!(
-                                "`{name}` was moved here: a resource has one owner; loan it with \
-                                 `&{name}` / `&mut {name}`, or restructure with `Option` + `take`"
-                            ),
-                        )),
-                    }
-                }
-                ResourceMoveViolation::PartialMove { at } => Error { trace: Vec::new(),
-                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                    msg: "cannot move a resource field out of a live aggregate: a resource has \
-                          one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make \
-                          the field an `Option` and use `take`"
-                        .to_string(),
-                    note: None,
-                },
-                ResourceMoveViolation::ConditionalMove { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is moved on one path through this branch but not another: a \
-                             resource's end-of-scope ownership must be static; move it on every path, \
-                             or restructure with `Option` + `take`"
-                        ),
-                        note: None,
-                    }
-                }
-                ResourceMoveViolation::LoopMove { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is declared outside this loop and moved inside it: the move \
-                             would repeat on the next iteration; move a value declared inside the \
-                             loop, or loan `{name}` with `&` / `&mut`"
-                        ),
-                        note: None,
-                    }
-                }
-                ResourceMoveViolation::LoanConsumed { at, binding } => {
-                    let name = self.binding_name(binding);
-                    let convention = self
-                        .parameters
-                        .get(&binding)
-                        .map(|parameter| parameter.convention)
-                        .unwrap_or(Convention::Bare);
-                    let declared = if name == "self" {
-                        Self::receiver_form(convention).to_string()
-                    } else {
-                        match convention {
-                            Convention::Ref => format!("&{name}"),
-                            Convention::RefMut => format!("&mut {name}"),
-                            Convention::Bare | Convention::Own => name.to_string(),
-                        }
-                    };
-                    let owned = format!("own {name}");
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "cannot move the resource `{name}` out of this function: it is declared \
-                             `{declared}`, a loan, and a loan changes no ownership; declare it \
-                             `{owned}` to take ownership, or restructure with `Option` + `take`"
-                        ),
-                        note: None,
-                    }
-                }
-                // B65. Deliberately NOT the `LoanConsumed` text: there is no
-                // convention to redeclare on a capture, so `own x` is not the fix
-                // here — consuming the SUBJECT is. The advice is spellable on
-                // both counts (B4): `match o` by value is R6's consuming form,
-                // and `take` is the sanctioned partial move. It does not offer a
-                // copy: vilan has no user-facing copy spelling, and R1 forbids
-                // copying a resource anyway.
-                ResourceMoveViolation::LoanedCaptureConsumed { at, binding, subject } => {
-                    let name = self.binding_name(binding);
-                    let subject = match self.pattern_subject_name(subject) {
-                        Some(subject_name) => format!("`{subject_name}`"),
-                        None => "the subject".to_string(),
-                    };
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "cannot move the resource `{name}` out of this pattern: it captures \
-                             from {subject}, which is matched by loan — `is` and `match &` inspect \
-                             without consuming, so {subject} still owns the payload and still \
-                             drops at its scope end; match {subject} by value to move the payload \
-                             into the capture, or restructure with `Option` + `take`"
-                        ),
-                        note: None,
-                    }
-                }
-                ResourceMoveViolation::Capture {
-                    reference_id,
-                    binding,
-                } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "a closure cannot capture the resource `{name}`; pass a loan into the \
-                             call, give ownership to the struct that owns this closure's lifetime, \
-                             or hoist the resource to module level (process lifetime)"
-                        ),
-                        note: None,
-                    }
-                }
-                ResourceMoveViolation::ModuleLevelMove { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is a module-level resource: it has process lifetime and \
-                             cannot be moved; loan it with `&{name}` / `&mut {name}` or a method \
-                             call (`drop({name})` moves it, so it is rejected too)"
-                        ),
-                        note: None,
-                    }
-                }
-                ResourceMoveViolation::ModuleLevelOverwrite { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is a module-level resource: it has process lifetime and \
-                             cannot be overwritten (the old value's drop has nowhere to run); \
-                             its initializer is the one write, and everything after is a loan"
-                        ),
-                        note: None,
-                    }
-                }
-            };
+            let error = self.resource_move_violation_error(violation);
             self.push_anchored(error, anchor);
+        }
+    }
+
+    /// B463: the violations of a trait default's body under a resource `Self`,
+    /// found at an impl that inherits it (`R11Site::Admission`). The body is
+    /// the impl's as much as a member written inside the impl would be, so it
+    /// speaks in exactly that member's words, at the same place in the body —
+    /// the concrete refusal, not R11's instantiation framing. What the body
+    /// alone cannot say — why `self` is a resource here — is a note at the
+    /// impl, unless the violation already carries its own note (use after
+    /// move points at the move, which is the half the author acts on).
+    fn emit_inherited_default_violations(
+        &mut self,
+        instance: &R11Instance,
+        violations: Vec<ResourceMoveViolation>,
+    ) {
+        for violation in violations {
+            let anchor = violation.anchor();
+            let mut error = self.resource_move_violation_error(violation);
+            if error.note.is_none() {
+                error.note = Some(self.inherited_default_admission_note(instance, anchor));
+            }
+            self.push_anchored(error, anchor);
+        }
+    }
+
+    /// The note an admission-site diagnostic carries (B463): the impl that
+    /// inherits the default, and why its `Self` is a resource.
+    fn inherited_default_admission_note(
+        &mut self,
+        instance: &R11Instance,
+        body_anchor: Id,
+    ) -> crate::error::Note {
+        let member = self
+            .functions
+            .get(&instance.callee)
+            .map(|function| function.name)
+            .unwrap_or("this default");
+        let admitting = self
+            .implementations
+            .iter()
+            .find(|implementation| implementation.impl_id == instance.call_id)
+            .map(|implementation| (implementation.subject, implementation.header_span));
+        let subject_label = admitting
+            .map(|(subject, _)| self.declaration_type_label(subject))
+            .unwrap_or_else(|| "this type".to_string());
+        let body_source = self.source_of_id(body_anchor).unwrap_or(SourceId(0));
+        crate::error::Note {
+            span: admitting.map_or(EMPTY_SPAN, |(_, header)| header),
+            msg: format!(
+                "`{subject_label}` inherits the default `{member}` here, and `{subject_label}` \
+                 is a resource, so the default's `self` is one too; declare `{member}` in this \
+                 impl, or fix the default"
+            ),
+            source: self.note_source_against(instance.call_id, body_source),
+        }
+    }
+
+    /// One affine-rule violation, in the concrete scan's words (destruction.md
+    /// §4/§11). Shared by chunk 3 and by a trait default checked at the impl
+    /// that inherits it (B463), which must read the same.
+    fn resource_move_violation_error(&self, violation: ResourceMoveViolation) -> Error {
+        match violation {
+            ResourceMoveViolation::UseAfterMove {
+                use_id,
+                binding,
+                move_span,
+            } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "use of `{name}` after it was moved: a resource has a single owner"
+                    ),
+                    note: Some(crate::error::Note::here(
+                        move_span,
+                        format!(
+                            "`{name}` was moved here: a resource has one owner; loan it with \
+                             `&{name}` / `&mut {name}`, or restructure with `Option` + `take`"
+                        ),
+                    )),
+                }
+            }
+            ResourceMoveViolation::PartialMove { at } => Error {
+                trace: Vec::new(),
+                span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                msg: "cannot move a resource field out of a live aggregate: a resource has \
+                      one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make \
+                      the field an `Option` and use `take`"
+                    .to_string(),
+                note: None,
+            },
+            ResourceMoveViolation::ConditionalMove { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is moved on one path through this branch but not another: a \
+                         resource's end-of-scope ownership must be static; move it on every path, \
+                         or restructure with `Option` + `take`"
+                    ),
+                    note: None,
+                }
+            }
+            ResourceMoveViolation::LoopMove { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is declared outside this loop and moved inside it: the move \
+                         would repeat on the next iteration; move a value declared inside the \
+                         loop, or loan `{name}` with `&` / `&mut`"
+                    ),
+                    note: None,
+                }
+            }
+            ResourceMoveViolation::LoanConsumed { at, binding } => {
+                let name = self.binding_name(binding);
+                let convention = self
+                    .parameters
+                    .get(&binding)
+                    .map(|parameter| parameter.convention)
+                    .unwrap_or(Convention::Bare);
+                let declared = if name == "self" {
+                    Self::receiver_form(convention).to_string()
+                } else {
+                    match convention {
+                        Convention::Ref => format!("&{name}"),
+                        Convention::RefMut => format!("&mut {name}"),
+                        Convention::Bare | Convention::Own => name.to_string(),
+                    }
+                };
+                let owned = format!("own {name}");
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "cannot move the resource `{name}` out of this function: it is declared \
+                         `{declared}`, a loan, and a loan changes no ownership; declare it \
+                         `{owned}` to take ownership, or restructure with `Option` + `take`"
+                    ),
+                    note: None,
+                }
+            }
+            // B65. Deliberately NOT the `LoanConsumed` text: there is no
+            // convention to redeclare on a capture, so `own x` is not the fix
+            // here — consuming the SUBJECT is. The advice is spellable on
+            // both counts (B4): `match o` by value is R6's consuming form,
+            // and `take` is the sanctioned partial move. It does not offer a
+            // copy: vilan has no user-facing copy spelling, and R1 forbids
+            // copying a resource anyway.
+            ResourceMoveViolation::LoanedCaptureConsumed {
+                at,
+                binding,
+                subject,
+            } => {
+                let name = self.binding_name(binding);
+                let subject = match self.pattern_subject_name(subject) {
+                    Some(subject_name) => format!("`{subject_name}`"),
+                    None => "the subject".to_string(),
+                };
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "cannot move the resource `{name}` out of this pattern: it captures \
+                         from {subject}, which is matched by loan — `is` and `match &` inspect \
+                         without consuming, so {subject} still owns the payload and still \
+                         drops at its scope end; match {subject} by value to move the payload \
+                         into the capture, or restructure with `Option` + `take`"
+                    ),
+                    note: None,
+                }
+            }
+            ResourceMoveViolation::Capture {
+                reference_id,
+                binding,
+            } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "a closure cannot capture the resource `{name}`; pass a loan into the \
+                         call, give ownership to the struct that owns this closure's lifetime, \
+                         or hoist the resource to module level (process lifetime)"
+                    ),
+                    note: None,
+                }
+            }
+            ResourceMoveViolation::ModuleLevelMove { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is a module-level resource: it has process lifetime and \
+                         cannot be moved; loan it with `&{name}` / `&mut {name}` or a method \
+                         call (`drop({name})` moves it, so it is rejected too)"
+                    ),
+                    note: None,
+                }
+            }
+            ResourceMoveViolation::ModuleLevelOverwrite { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is a module-level resource: it has process lifetime and \
+                         cannot be overwritten (the old value's drop has nowhere to run); \
+                         its initializer is the one write, and everything after is a loan"
+                    ),
+                    note: None,
+                }
+            }
         }
     }
 
@@ -16109,6 +16228,10 @@ impl<'src> Analyzer<'src> {
         // inside a generic whose parameter is bound to that generic's own `T`
         // seeds nothing until the generic is itself known to be instantiated at a
         // resource, which propagation below discovers.)
+        // B463: the defaults a resource subject inherits come first, so a
+        // default both admitted and called reports once, at the body, in the
+        // concrete impl's words.
+        self.seed_inherited_default_admissions(&mut worklist, &mut enqueued);
         let empty: HashSet<TypeId> = HashSet::default();
         let mut seed_memo: HashMap<TypeId, bool> = HashMap::default();
         let all_calls: Vec<Id> = self.function_calls.keys().copied().collect();
@@ -16156,7 +16279,12 @@ impl<'src> Analyzer<'src> {
             };
             let body_is_move_clean = violations.is_empty();
             let reported_before = self.diagnostics.len();
-            self.emit_r11_violations(instance.callee, instance.call_id, violations);
+            match instance.site {
+                R11Site::Call => {
+                    self.emit_r11_violations(instance.callee, instance.call_id, violations)
+                }
+                R11Site::Admission => self.emit_inherited_default_violations(&instance, violations),
+            }
             self.check_own_generic_exactly_once(
                 &instance,
                 &resource_bindings,
@@ -16389,7 +16517,7 @@ impl<'src> Analyzer<'src> {
                 ),
             ),
         };
-        let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let site = self.r11_site_span(instance);
         // The primary is the INSTANTIATION site, so it belongs to the file that
         // wrote it — an imported module, not the entry (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
@@ -16398,15 +16526,29 @@ impl<'src> Analyzer<'src> {
             msg: detail,
             source: self.note_source_against(note_anchor, call_source),
         };
+        // B463: a default an impl inherits is planned once, for every type
+        // that inherits it (codegen specializes the body, but its drops are
+        // the unspecialized plan's), so it is in a generic body's position —
+        // but its escape hatch is the impl's own declaration, not a concrete
+        // parameter type.
+        let msg = match instance.site {
+            R11Site::Call => format!(
+                "`{name}` is not move-clean when instantiated with a resource: {summary}, \
+                 and a generic body cannot destroy a `T`; move it out on every path, or \
+                 take a concrete type"
+            ),
+            R11Site::Admission => format!(
+                "the trait default `{name}` is not move-clean when a resource inherits it: \
+                 {summary}, and a trait default cannot destroy a resource `Self` (its teardown \
+                 is planned once, before any implementing type is known); move it out on every \
+                 path, or declare `{name}` in this impl"
+            ),
+        };
         self.push_anchored(
             Error {
                 trace: Vec::new(),
                 span: site,
-                msg: format!(
-                    "`{name}` is not move-clean when instantiated with a resource: {summary}, \
-                     and a generic body cannot destroy a `T`; move it out on every path, or \
-                     take a concrete type"
-                ),
+                msg,
                 note: Some(note),
             },
             instance.call_id,
@@ -16471,7 +16613,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
-        let call_span = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let call_span = self.r11_site_span(instance);
         // The primary is the INSTANTIATION, so it belongs to the caller's file —
         // which is not the entry when the instantiating code was imported (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
@@ -16775,7 +16917,7 @@ impl<'src> Analyzer<'src> {
             Some(rendered) => format!("the resource `{rendered}`"),
             None => "a resource type".to_string(),
         };
-        let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let site = self.r11_site_span(instance);
         // The primary is the INSTANTIATION site: the caller's file (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
         let note = crate::error::Note {
@@ -16842,7 +16984,7 @@ impl<'src> Analyzer<'src> {
             .get(&instance.callee)
             .map(|function| function.name)
             .unwrap_or("this generic");
-        let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let site = self.r11_site_span(instance);
         // The primary is the INSTANTIATION site: the caller's file (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
         let note = crate::error::Note {
@@ -17013,6 +17155,15 @@ impl<'src> Analyzer<'src> {
     /// are not descended into (impl-plan §2 R12); the per-instantiation re-check
     /// of the concrete impl a resource selects is chunk 3's when that impl's own
     /// `self` is the concrete resource.
+    ///
+    /// B463: an INHERITED trait default called on a concrete receiver is not
+    /// residue — the analyzer resolved it to one body, the default's — so a
+    /// receiver that is a resource here instantiates that body with its `Self`
+    /// a resource. An impl whose subject is a resource outright was already
+    /// seeded at its admission (`seed_inherited_default_admissions`), and the
+    /// shared dedup key makes this the per-instantiation remainder: a generic
+    /// subject (`impl Holder<type X> with Wrap`) whose resource-ness this call's
+    /// arguments decide.
     fn r11_discover(
         &mut self,
         call_id: Id,
@@ -17021,6 +17172,19 @@ impl<'src> Analyzer<'src> {
         worklist: &mut VecDeque<R11Instance>,
         enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
     ) {
+        if let Some((callee, receiver, self_marker)) = self.r11_inherited_default_call(call_id) {
+            if self.type_is_resource_with(receiver, current_resources, memo)
+                && enqueued.insert((callee, vec![self_marker]))
+            {
+                worklist.push_back(R11Instance {
+                    callee,
+                    resources: vec![self_marker],
+                    call_id,
+                    site: R11Site::Call,
+                });
+            }
+            return;
+        }
         let Some(callee) = self.r11_direct_callee(call_id) else {
             return;
         };
@@ -17042,7 +17206,152 @@ impl<'src> Analyzer<'src> {
                 callee,
                 resources,
                 call_id,
+                site: R11Site::Call,
             });
+        }
+    }
+
+    /// Where an R11 instantiation's own diagnostic is spanned: the call, or —
+    /// for a default an impl inherits (B463) — that impl's head, not the whole
+    /// block.
+    fn r11_site_span(&self, instance: &R11Instance) -> Span {
+        match instance.site {
+            R11Site::Call => **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN),
+            R11Site::Admission => self
+                .implementations
+                .iter()
+                .find(|implementation| implementation.impl_id == instance.call_id)
+                .map_or(EMPTY_SPAN, |implementation| implementation.header_span),
+        }
+    }
+
+    /// B463: the trait default a call reaches as an INHERITED member on a
+    /// concrete receiver (`GenericDispatch::OnType(Some(receiver))`, which
+    /// method lookup records for `FoundInheritedDefault` and the Gap E
+    /// fallback alike), with the receiver's type and the declaring trait's
+    /// `Self` marker. `None` for every other call, including a `self`-typed
+    /// call inside a default body (`OnType(None)`): which body that reaches
+    /// is decided per specialization, so it stays residue.
+    fn r11_inherited_default_call(&mut self, call_id: Id) -> Option<(Id, TypeId, TypeId)> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(GenericDispatch::OnType(Some(receiver), _)) = self.generic_dispatch.get(&call_id)
+        else {
+            return None;
+        };
+        let receiver = *receiver;
+        let Some(Expr::Local(member)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let member = *member;
+        if !self
+            .functions
+            .get(&member)
+            .is_some_and(|function| function.has_body)
+        {
+            return None;
+        }
+        let trait_id = self.declaring_trait_of_member(member)?;
+        Some((member, receiver, self.trait_self_marker(trait_id)))
+    }
+
+    /// The trait whose body DECLARES `member` (a default or a requirement).
+    fn declaring_trait_of_member(&self, member: Id) -> Option<Id> {
+        self.traits
+            .values()
+            .find(|trait_| trait_.declared_members.iter().any(|(_, id)| *id == member))
+            .map(|trait_| trait_.id)
+    }
+
+    /// The type a trait default body's `Self` (and `self`) has — the trait
+    /// itself, argument-free (`register_self_type` at the trait's body
+    /// scope). R11 names it in an instance's resource set to say "`Self` is a
+    /// resource here" (B463).
+    fn trait_self_marker(&mut self, trait_id: Id) -> TypeId {
+        if let Some(marker) = self.trait_self_markers.get(&trait_id) {
+            return *marker;
+        }
+        let marker = Type::Trait(trait_id, Vec::new()).get_type_id(self);
+        self.trait_self_markers.insert(trait_id, marker);
+        marker
+    }
+
+    /// B463: seed R11 with every trait default an `impl` whose subject is a
+    /// resource INHERITS. Resource-ness is per instantiation (destruction.md
+    /// §6.8), and for such a subject every instantiation is one, so the
+    /// default's body runs with a resource `Self` whether or not anything calls
+    /// it — the same footing as a body written in that impl, which chunk 3
+    /// checks at its declaration. A default the subject's own impls declare
+    /// (an override, in the trait's block or any other on that subject) is not
+    /// what runs, and is skipped. Seeded in implementation order, so the first
+    /// admitting impl is the one a diagnostic names; the dedup key is shared
+    /// with call discovery, which then adds nothing for the same default.
+    fn seed_inherited_default_admissions(
+        &mut self,
+        worklist: &mut VecDeque<R11Instance>,
+        enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
+    ) {
+        let implementations: Vec<(TypeId, Id, Vec<Id>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| !implementation.trait_ids.is_empty())
+            .map(|implementation| {
+                (
+                    implementation.subject,
+                    implementation.impl_id,
+                    implementation.trait_ids.clone(),
+                )
+            })
+            .collect();
+        for (subject, impl_id, trait_ids) in implementations {
+            if !self.type_is_resource(subject) {
+                continue;
+            }
+            let declared_on_subject: HashSet<&'src str> = self
+                .implementations
+                .iter()
+                .filter(|implementation| implementation.subject == subject)
+                .flat_map(|implementation| implementation.declarations.keys().copied())
+                .collect();
+            let mut chain: Vec<Id> = Vec::new();
+            for trait_id in trait_ids {
+                for (reached, _) in self.trait_with_supertraits_at(trait_id, &[]) {
+                    if !chain.contains(&reached) {
+                        chain.push(reached);
+                    }
+                }
+            }
+            for trait_id in chain {
+                let defaults: Vec<Id> = self
+                    .traits
+                    .get(&trait_id)
+                    .map(|trait_| {
+                        trait_
+                            .declarations
+                            .iter()
+                            .filter(|(name, _)| !declared_on_subject.contains(*name))
+                            .map(|(_, member)| *member)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let self_marker = self.trait_self_marker(trait_id);
+                for member in defaults {
+                    let Some(function) = self.functions.get(&member) else {
+                        continue;
+                    };
+                    if !function.has_body {
+                        continue;
+                    }
+                    if enqueued.insert((member, vec![self_marker])) {
+                        worklist.push_back(R11Instance {
+                            callee: member,
+                            resources: vec![self_marker],
+                            call_id: impl_id,
+                            site: R11Site::Admission,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -33185,6 +33494,12 @@ impl<'src> Analyzer<'src> {
                 None
             }
             Node::Impl(subject, traits, body, labels) => {
+                // B463: the head — `impl R with Wrap`, without the body — for a
+                // note that points at the block rather than covering it.
+                let header_span = Span {
+                    start: node.1.start,
+                    end: traits.last().map_or(subject.1.end, |trait_| trait_.1.end),
+                };
                 // F27 R1: an impl's `[platform(..)]` rides the item labels.
                 if let Some(labels) = labels {
                     self.item_labels.insert(id, (**labels).clone());
@@ -33336,6 +33651,7 @@ impl<'src> Analyzer<'src> {
                 self.implementations.push(Implementation {
                     subject,
                     impl_id: id,
+                    header_span,
                     module_scope: scope_id,
                     source: self.current_source_id,
                     declarations,

@@ -613,3 +613,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 588	-	both twins of {label} admit `{host}`, so a build for `{host}` would have two: platform-fenced twins are coherent only when their fences share no platform
 589	-	the {fence} and {fence} twins of {label} must agree on their signature — parameters, return type and generics — or code that calls it would check under one platform and not the other
 590	-	this twin of {label} is fenced {fence} inside a file that declares {fence} — no build compiles it; move the twins to a file that declares no platform
+NEW	-	the trait default `{name}` is not move-clean when a resource inherits it: {summary}, and a trait default cannot destroy a resource `Self` (its teardown is planned once, before any implementing type is known); move it out on every path, or declare `{name}` in this impl

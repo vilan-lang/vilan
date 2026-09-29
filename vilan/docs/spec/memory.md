@@ -633,6 +633,16 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   hands a payload to a closure and then discards it — the closure only *loans*
   it — cannot be resource-clean, whatever its receiver convention.
 
+  A **trait default** is in the same position for its `Self`: its body is
+  written once for every implementing type, so an impl whose subject is a
+  resource inherits a body whose `self` is one. It is checked under that
+  instantiation at the impl that inherits it, called or not, and a move
+  violation there is refused with the words a body written in the impl would
+  get ("declare it `own self`"), noting the impl; an `own self` default must
+  move `self` out on every path. When the subject is a resource only for some
+  arguments (`impl Box<type X> with Wrap` at `Box<Guard>`), the call that
+  makes it one is the instantiation site, as for any generic.
+
   Read the same sentence at R2's seam and it reaches **writes**, not only
   scope ends. Overwriting a `T`-typed place destroys the outgoing value, and a
   generic body cannot run that destructor either — so a body that writes
