@@ -544,12 +544,15 @@ the *cell* it carries, so a getter that answers a cell the service keeps
 — a field, a row's cell — is one channel however often it is asked. A
 body that ends in `.derive(..).cell()` mints a fresh cell per call instead:
 the dedup never hits (one capability and one forward per call), and the
-compiler warns at that `.cell()`. Every handler runs under its
-**connection's owner**, so such a cell's subscription is released when
-the connection closes rather than kept for the life of the process —
-but the fix is to keep the derived cell, keyed by the arguments, in a
-[`Memo`](../std/collections.md#memokv) on the service whose maker writes
-`.cell_global()`:
+compiler warns at that `.cell()`. Every handler runs under the owner of
+the **instance** that answers it: a `Service::factory` instance is one
+per connection, so its handlers run under the **connection's owner** and
+such a cell's subscription is released when the connection closes; a
+`Service::new` instance answers every client, so its handlers run under
+the **service's owner** and what they build lives as long as the service.
+Either way the fix is to keep the derived cell, keyed by the arguments,
+in a [`Memo`](../std/collections.md#memokv) on the service whose maker
+writes `.cell_global()`:
 
 ```vilan,fragment
 [rpc]
@@ -557,6 +560,15 @@ fun get_channel_ids(self): SignalCell<List<i32>> {
 	self.derived.get_or_insert("ids", || self.channels.derive(|all| all.keys()).cell_global())
 }
 ```
+
+**A cache the connections share outlives each of them.** A
+`Service::factory` handler that stores a derived cell on a store every
+instance shares — a module-level cell, through `Shared::write` or a
+`get_or_insert` maker — builds it under its connection's owner, and the
+store hands it out dead once that connection closes. The compiler warns
+at a `.cell()` a handler stores that way (a `Memo` maker's warns
+wherever it is written). A derivation cached across calls is
+`.cell_global()`.
 
 **When the server frees it.** Demand decides. A mirror's last lease
 going away sends `Unsubscribe`, and for a channel a reply minted that

@@ -1,5 +1,6 @@
-//! Two LIFETIME steers over resolved calls: a derivation built where it will
-//! outlive the scope that owns it (tracker A135 door c, A136 door b).
+//! Three LIFETIME steers over resolved calls: a derivation built where it will
+//! outlive the scope that owns it (tracker A135 door c, A136 door b, A141's
+//! door a under R-f).
 //!
 //! `std::reactive`'s `.cell()` is OWNER-TIED: its registration on the upstream
 //! goes to the ambient owner and is released with it. Two std seams hold what a
@@ -18,15 +19,26 @@
 //!   CELL's identity (A92). A body whose tail is `.cell()` mints a fresh cell per
 //!   call, so the dedup never hits — a capability and a forward per call for a
 //!   value the connection already carries — and the cell's upstream
-//!   registration lives until the connection closes (the dispatcher runs the
-//!   handler under the connection's owner since A135 door b; before that, for
-//!   the process). Return a cell that outlives the call.
+//!   registration lives as long as the handler's owner: the connection's under
+//!   `Service::factory` (A135 door b), the service's under `Service::new` (A141
+//!   door b); before A135, the process's. Return a cell that outlives the call.
+//! - **A store written in an `[rpc]` handler** (A141, R-f). A handler runs
+//!   under the connection's owner when its instance is per connection
+//!   (`Service::factory`), and a structure the instances share — a
+//!   module-level store — outlives that connection. A `.cell()` the handler
+//!   STORES there (through `Shared::write`, or built in a `Shared<Option<T>>::
+//!   get_or_insert` maker) dies with the connection that built it while the
+//!   store keeps handing it out. A `Memo` maker is the first steer's, raised
+//!   everywhere.
 //!
 //! Both are WARNINGS and both are STATIC and SYNTACTIC in the rulings' sense:
 //! the first reads the calls a maker closure literal makes DIRECTLY (a closure
 //! the maker merely creates is its own node, and inert until something runs
 //! it); the second reads the method's TAIL expression (a `ret` elsewhere in the
-//! body is not followed). Code inside the standard library is exempt, as every
+//! body is not followed); the third reads a handler's own statements — the
+//! value stored through a `write()` view (assigned, or an argument of a method
+//! called on the view) and the calls a `get_or_insert` maker literal makes
+//! directly. Code inside the standard library is exempt, as every
 //! std-internal use of a deprecation is: std's own seams are written knowingly.
 
 use crate::analyzer::{Expr, Program, SourceId};
@@ -36,12 +48,13 @@ use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::span::Span;
 
-/// Run both steers and add their warnings to the program.
+/// Run the three steers and add their warnings to the program.
 pub fn check_lifetime_steers(program: &mut Program) {
     let found = {
         let targets = call_targets(program);
         let mut found = memo_maker_warnings(program, &targets);
         found.extend(handle_tail_warnings(program, &targets));
+        found.extend(handler_store_warnings(program, &targets));
         found
     };
     let mut seen: HashSet<(u32, usize, usize)> = HashSet::default();
@@ -76,6 +89,25 @@ fn call_targets(program: &Program) -> HashMap<Id, CallTarget> {
 fn std_functions(program: &Program, file: &str, names: &[&str]) -> HashSet<Id> {
     program
         .functions
+        .values()
+        .filter(|function| names.contains(&function.name))
+        .filter_map(|function| {
+            let source = program.source_of(function.id)?;
+            let in_file = program.std_sources.contains(&source)
+                && program
+                    .sources
+                    .get(source.0 as usize)
+                    .is_some_and(|path| path.ends_with(file));
+            in_file.then_some(function.id)
+        })
+        .collect()
+}
+
+/// The `external` functions named `name` declared in the std file `file` —
+/// [`std_functions`]' twin for a leaf with no body (`Shared::write`).
+fn std_externals(program: &Program, file: &str, names: &[&str]) -> HashSet<Id> {
+    program
+        .external_functions
         .values()
         .filter(|function| names.contains(&function.name))
         .filter_map(|function| {
@@ -256,9 +288,10 @@ fn handle_tail_warnings(
                     "`{name}` returns a signal handle it builds with `.cell()` on every call: \
                      each call mints a fresh cell, so the reply never matches a channel this \
                      connection already carries (a capability and a forward per call), and \
-                     the cell's subscription lives until the connection closes. Return a cell \
-                     that outlives the call — keep it on the service, keyed by the arguments \
-                     (a `Memo` whose maker writes `.cell_global()`)"
+                     the cell's subscription lives as long as the handler's owner (the \
+                     connection under `Service::factory`, the service under `Service::new`). \
+                     Return a cell that outlives the call — keep it on the service, keyed by \
+                     the arguments (a `Memo` whose maker writes `.cell_global()`)"
                 ),
                 note: None,
             },
@@ -266,6 +299,152 @@ fn handle_tail_warnings(
         ));
     }
     found
+}
+
+/// A141 (R-f, door a's warning): a `.cell()` an `[rpc]` handler STORES on a
+/// structure that outlives the call — through `Shared::write` (assigned to the
+/// view, or an argument of a method called on it) or built directly in a
+/// `Shared<Option<T>>::get_or_insert` maker.
+///
+/// A handler is found through the generated route that runs it: every route
+/// the `[service]` expansion writes wraps its turn in `rpc::under_connection(
+/// __request, || ..)`, and the user functions the route's closures call are
+/// the handlers.
+fn handler_store_warnings(
+    program: &Program,
+    targets: &HashMap<Id, CallTarget>,
+) -> Vec<(Error, SourceId)> {
+    let wrappers = std_functions(program, "rpc.vl", &["under_connection"]);
+    if wrappers.is_empty() {
+        return Vec::new();
+    }
+    let writes = std_externals(program, "shared.vl", &["write"]);
+    let makers = std_functions(program, "shared.vl", &["get_or_insert"]);
+    let derivations = std_functions(program, "reactive.vl", &["cell"]);
+    let graph = program.call_graph();
+    // The handlers, and every call their bodies make directly.
+    let mut handlers: Vec<Id> = Vec::new();
+    for (call_id, target) in targets {
+        let CallTarget::Function(callee) = target else {
+            continue;
+        };
+        if !wrappers.contains(callee) || !in_user_code(program, *call_id) {
+            continue;
+        }
+        let mut closures: Vec<Id> = program
+            .function_calls
+            .get(call_id)
+            .and_then(|call| call.argument_ids.last())
+            .and_then(|argument| closure_of(program, *argument))
+            .into_iter()
+            .collect();
+        while let Some(closure) = closures.pop() {
+            for inner in graph.calls_of(closure) {
+                if let CallTarget::Function(function) = inner.target
+                    && in_user_code(program, function)
+                    && program.functions.contains_key(&function)
+                    && !handlers.contains(&function)
+                {
+                    handlers.push(function);
+                }
+                if let Some(call) = program.function_calls.get(&inner.call_id) {
+                    closures.extend(
+                        call.argument_ids
+                            .iter()
+                            .filter_map(|argument| closure_of(program, *argument)),
+                    );
+                }
+            }
+        }
+    }
+    let mut handler_calls: HashSet<Id> = HashSet::default();
+    for handler in &handlers {
+        for inner in graph.calls_of(*handler) {
+            handler_calls.insert(inner.call_id);
+        }
+    }
+    let is_write = |expression: Id| -> bool {
+        let mut expression = expression;
+        while let Some(Expr::Dereference(inner)) = program.entity_map.get(&expression) {
+            expression = *inner;
+        }
+        match program.entity_map.get(&expression) {
+            Some(Expr::Call(call_id)) => matches!(
+                targets.get(call_id),
+                Some(CallTarget::External(callee)) if writes.contains(callee)
+            ),
+            _ => false,
+        }
+    };
+    let mut stored: Vec<Id> = Vec::new();
+    // Assigned to a `write()` view: `self.slot.write() = Some(… .cell())`.
+    for expression in program.entity_map.values() {
+        let Expr::Assignment(target, value) = expression else {
+            continue;
+        };
+        if !is_write(*target) {
+            continue;
+        }
+        if let Some(cell) = tail_derivation(program, targets, &derivations, *value)
+            && handler_calls.contains(&cell)
+        {
+            stored.push(cell);
+        }
+    }
+    for call_id in &handler_calls {
+        let Some(call) = program.function_calls.get(call_id) else {
+            continue;
+        };
+        // An argument of a method called on a `write()` view:
+        // `self.kept.write().push(… .cell())`.
+        if call
+            .argument_ids
+            .first()
+            .is_some_and(|receiver| is_write(*receiver))
+        {
+            for argument in call.argument_ids.iter().skip(1) {
+                if let Some(cell) = tail_derivation(program, targets, &derivations, *argument) {
+                    stored.push(cell);
+                }
+            }
+        }
+        // Built in a `Shared<Option<T>>::get_or_insert` maker (I8).
+        if named_callee(program, *call_id).is_some_and(|callee| makers.contains(&callee))
+            && let Some(maker) = call
+                .argument_ids
+                .last()
+                .and_then(|argument| closure_of(program, *argument))
+        {
+            for inner in graph.calls_of(maker) {
+                if named_callee(program, inner.call_id)
+                    .is_some_and(|callee| derivations.contains(&callee))
+                {
+                    stored.push(inner.call_id);
+                }
+            }
+        }
+    }
+    stored.sort_unstable_by_key(|call_id| call_id.0);
+    stored.dedup();
+    stored
+        .into_iter()
+        .map(|cell| {
+            program.anchored(
+                Error {
+                    trace: Vec::new(),
+                    span: call_span(program, cell),
+                    msg: "`.cell()` stored on a structure that outlives the call, in an `[rpc]` \
+                          handler: the cell is owned by the handler's owner — the CONNECTION's \
+                          under `Service::factory` — so a store every connection shares keeps \
+                          handing it out dead once that connection closes. A derivation cached \
+                          across calls is `.cell_global()`"
+                        .to_string(),
+                    note: None,
+                },
+                cell,
+            )
+        })
+        .collect()
 }
 
 /// The function a call NAMES — the declaration its subject resolved to — before

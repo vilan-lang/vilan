@@ -1962,6 +1962,103 @@ fn a135_a_handle_method_returning_what_outlives_the_call_does_not_warn() {
     assert!(found.is_empty(), "{found:#?}");
 }
 
+// --- A141 (R-f, door a's warning): a `.cell()` a handler STORES -------------
+
+/// The `[service]` both A141 pins share: a shared store's caches (a
+/// `Shared<Option<..>>` slot, a list, a map) and the cell they derive from.
+/// `{BODY}` is replaced per pin; `{FREE}` is code outside the service.
+const A141_SERVICE: &str = r#"
+    import std::reactive::{ Signal, SignalCell };
+    import std::map::Map;
+    import std::shared::Shared;
+
+    [service(StoreClient)]
+    struct Store {
+        names: SignalCell<Map<i32, str>>,
+        slot: Shared<Option<SignalCell<usize>>>,
+        kept: Shared<List<SignalCell<usize>>>,
+        by_id: Shared<Map<i32, SignalCell<usize>>>,
+    }
+
+    impl Store {
+        {BODY}
+    }
+
+    {FREE}
+
+    fun main() {}
+"#;
+
+/// The warnings a program raises that name A141's hazard, as the text each
+/// spans.
+fn a141_warnings(body: &str, free: &str) -> Vec<String> {
+    let source = A141_SERVICE.replace("{BODY}", body).replace("{FREE}", free);
+    warning_diagnostics(&source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("stored on a structure that outlives the call"))
+        .map(|(_, range)| source[range].to_string())
+        .collect()
+}
+
+/// A141 (R-f: door b, plus door a's warning), the warning's cases: inside an
+/// `[rpc]` handler, a `.cell()` STORED through `Shared::write` — assigned to
+/// the slot (bare and as `Some(..)`), pushed onto a list, inserted into a map
+/// — and one built in a `Shared<Option<T>>::get_or_insert` maker (I8's). A
+/// handler's `.cell()` is owned by the connection under `Service::factory`, so
+/// a store every connection shares hands it out dead after that connection
+/// closes. (A `Memo` maker is A136's warning, raised everywhere.)
+#[test]
+fn a141_a_cell_a_handler_stores_through_shared_write_or_a_maker_warns() {
+    let found = a141_warnings(
+        r#"
+        [rpc]
+        fun fill(self): usize {
+            self.slot.write() = Some(self.names.map(|names| names.len()).cell());
+            self.kept.write().push(self.names.map(|names| names.len()).cell());
+            self.by_id.write().insert(1, self.names.map(|names| names.len()).cell());
+            0
+        }
+
+        [rpc]
+        fun count(self): SignalCell<usize> {
+            self.slot.get_or_insert(|| self.names.map(|names| names.len()).cell())
+        }
+        "#,
+        "",
+    );
+    assert_eq!(found, vec!["cell", "cell", "cell", "cell"], "{found:#?}");
+}
+
+/// A141, the controls: the same stores written `.cell_global()` (the rule's
+/// spelling), a `.cell()` kept in a LOCAL (A135's per-call shape, not a
+/// store), and the identical store through `Shared::write` in a free function
+/// that is no handler — the ruling scopes the warning to handlers. None warns.
+#[test]
+fn a141_a_handler_storing_what_outlives_the_connection_does_not_warn() {
+    let found = a141_warnings(
+        r#"
+        [rpc]
+        fun fill(self): usize {
+            self.slot.write() = Some(self.names.map(|names| names.len()).cell_global());
+            self.kept.write().push(self.names.map(|names| names.len()).cell_global());
+            let local = self.names.map(|names| names.len()).cell();
+            local.get()
+        }
+
+        [rpc]
+        fun count(self): SignalCell<usize> {
+            self.slot.get_or_insert(|| self.names.map(|names| names.len()).cell_global())
+        }
+        "#,
+        r#"
+        fun outside(store: Store) {
+            store.slot.write() = Some(store.names.map(|names| names.len()).cell());
+        }
+        "#,
+    );
+    assert!(found.is_empty(), "{found:#?}");
+}
+
 // --- A136 door (b): an owner-taking call inside a `Memo` maker ---------------
 
 /// The warnings a program raises that name A136's hazard, as the text each

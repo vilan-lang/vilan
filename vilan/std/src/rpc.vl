@@ -1285,6 +1285,13 @@ export struct RpcRequest {
 	/// written on a `Service::factory` instance, whose fields the connection's
 	/// session built.
 	session: Session,
+	/// The owner of the INSTANCE that answers this request, when that instance
+	/// outlives the connection (tracker A141, door b): `Service::new`'s one
+	/// process-wide instance stamps its service's owner here, and a handler runs
+	/// under it (`under_connection`). `None` — a `Service::factory` instance, a
+	/// hand-stamped protocol — runs under the connection's owner. Stamped by the
+	/// protocol like `connection`, and never read off the frame.
+	owner: Option<Owner>,
 }
 
 export impl RpcRequest {
@@ -1301,6 +1308,13 @@ export impl RpcRequest {
 	/// reason: a frame carries neither.
 	fun in_session(own self, session: Session): RpcRequest {
 		self.session = session;
+		self
+	}
+
+	/// The same request, carrying the owner of the instance that answers it (A141)
+	/// — stamped by `RpcProtocol::respond` beside the connection.
+	fun under_owner(own self, owner: Option<Owner>): RpcRequest {
+		self.owner = owner;
 		self
 	}
 }
@@ -1377,7 +1391,14 @@ export fun open_request(codec: Codec, frame: Frame): RpcRequest {
 	let method = (deserializer.str_value)();
 	(deserializer.field)("args");
 	let arity = (deserializer.begin_list)();
-	RpcRequest { method, deserializer, arity, connection = 0 - 1, session = Session::anonymous() }
+	RpcRequest {
+		method,
+		deserializer,
+		arity,
+		connection = 0 - 1,
+		session = Session::anonymous(),
+		owner = None,
+	}
 }
 
 /// One reply envelope: an externally-tagged `Success` carrying the described
@@ -1428,6 +1449,15 @@ export struct RpcProtocol {
 	/// refuse a handle service it has no connection for at WIRING time,
 	/// rather than at the first such call.
 	handle_methods: List<str>,
+	/// The owner every route of this protocol runs under, when the instance behind
+	/// it outlives any one connection (tracker A141, door b). `Service::new` stamps
+	/// one — its SERVICE's owner — because its one instance answers every client,
+	/// so what a handler caches on it (a derivation in a `Memo` on the shared
+	/// store) must not die with whichever connection happened to build it. `None`
+	/// until something stamps it, which is what `Service::factory` leaves: a
+	/// per-connection instance's handlers run under that connection's owner (A135),
+	/// released at its close.
+	owner: Option<Owner>,
 }
 
 export impl RpcProtocol {
@@ -1445,6 +1475,16 @@ export impl RpcProtocol {
 	/// `authorize_request` session). Only the stamp differs.
 	fun in_session(own self, session: Session): RpcProtocol {
 		self.session = session;
+		self
+	}
+
+	/// The same protocol, whose routes run under `owner` rather than under the
+	/// connection a request arrived on (A141, door b) — what `Service::new` stamps
+	/// with its service's owner. An instance that outlives the connection owns what
+	/// its handlers build for as long as it lives; a per-connection instance
+	/// (`Service::factory`) is left unstamped.
+	fun under_owner(own self, owner: Owner): RpcProtocol {
+		self.owner = Some(owner);
 		self
 	}
 
@@ -1467,7 +1507,8 @@ export impl RpcProtocol {
 	fun respond_with_status(self, frame: Frame): (Frame, i32) {
 		let request = open_request(self.codec, frame)
 			.on_connection(self.connection)
-			.in_session(self.session);
+			.in_session(self.session)
+			.under_owner(self.owner);
 		let outcome = match (request.deserializer.failed)() {
 			Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),
 			None => (self.dispatch)(request),
@@ -1913,6 +1954,7 @@ export impl Dispatcher {
 			connection = 0 - 1,
 			session = Session::anonymous(),
 			handle_methods = self.handle_methods.read(),
+			owner = None,
 		}
 	}
 }
@@ -2039,33 +2081,49 @@ export fun session_of(connection: i32): Option<ReactiveServer> {
 	None
 }
 
-/// Run `body` — one `[rpc]` route's handler — under the owner of the CONNECTION the
-/// request arrived on (tracker A135, door b). What the generated dispatcher wraps
-/// every route in.
+/// Run `body` — one `[rpc]` route's handler — under the owner of the INSTANCE that
+/// answers it: the SERVICE's owner under `Service::new`, the CONNECTION's under
+/// `Service::factory` (tracker A141, door b, over A135's door b). What the
+/// generated dispatcher wraps every route in. The owner follows the instance's
+/// lifetime.
 ///
 /// A handler that builds something owner-tied — a `.cell()` over the store's cell,
 /// an `effect` — used to run under NO owner: the route closure is built once, where
 /// no scope is ambient, and a closure captures its context at creation. A
 /// `.cell()` made per call then kept its registration on the store's cell for the
-/// life of the PROCESS, one more per call, re-lease and reconnect. Under the
-/// connection's owner it is released with the connection (`ReactiveServer::
-/// dispose`, which `drop_session` runs) — bounded by the connection, where a
-/// cell that must outlive the CALL is still the author's to keep (a `Memo` on the
-/// service whose maker writes `.cell_global()`; the compiler warns at a
-/// handle-returning method whose tail is `.cell()`).
+/// life of the PROCESS, one more per call, re-lease and reconnect.
 ///
-/// A request on NO session — the connectionless `{mount}rpc` leg, a
-/// `local_rpc` transport nothing stamped, a client-side handler — runs under a
-/// fresh owner nothing ever disposes, which is exactly the ownerless behaviour it
-/// had: nothing is released early, and nothing new is kept.
+/// - **`Service::factory`**: one instance per connection, so its handlers run
+///   under the connection's owner and what they build is released with the
+///   connection (`ReactiveServer::dispose`, which `drop_session` runs). A
+///   derivation such a handler caches on a structure that outlives the
+///   connection (a module-level store) is `.cell_global()`, or it dies with the
+///   connection that built it — the compiler warns at a `.cell()` stored through
+///   `Shared::write` or a `get_or_insert` maker in a handler.
+/// - **`Service::new`**: ONE instance answers every client, and the protocol
+///   carries its service's owner (`RpcProtocol::under_owner`), which nothing
+///   disposes while the service lives. A derivation a handler caches on the
+///   shared store survives every connection's close — the case A135's
+///   per-connection owner broke: the first connection to close took the
+///   cached cell with it while the store kept handing it out. The cost is the
+///   other side of the same line: a `.cell()` a `Service::new` handler mints
+///   PER CALL lives as long as the service, which is what the compiler's
+///   warning at a handle method's tail `.cell()` steers away from.
+///
+/// A request on NO session and no stamped owner — a `local_rpc` transport nothing
+/// stamped, a client-side handler — runs under a fresh owner nothing ever disposes,
+/// which is exactly the ownerless behaviour it had.
 ///
 /// `body` is an INJECTED closure (`context owner_scope`, spec §8.5): the literal
 /// the route writes here takes the owner at each call, where a stored closure would
 /// have taken whatever was ambient when the dispatcher was built.
 export fun under_connection<T>(request: RpcRequest, body: (|| T) context owner_scope): T {
-	let owner = match session_of(request.connection) {
-		Some(let session) => session.owner,
-		None => Owner::new(),
+	let owner = match request.owner {
+		Some(let instance) => instance,
+		None => match session_of(request.connection) {
+			Some(let session) => session.owner,
+			None => Owner::new(),
+		},
 	};
 	owner_scope.run(owner, body)
 }
@@ -2264,8 +2322,9 @@ export struct ReactiveServer {
 	// retained — until a client asks.
 	sources: Shared<List<(i32, Capability)>>,
 	live: Shared<List<LiveForward>>,
-	// The CONNECTION's owner (A135): every `[rpc]` handler this connection's
-	// requests reach runs under it (`under_connection`), so what a handler builds
+	// The CONNECTION's owner (A135): every `[rpc]` handler of a per-connection
+	// instance (`Service::factory`) runs under it (`under_connection`; a
+	// `Service::new` handler runs under its service's owner, A141), so what a handler builds
 	// that ties itself to an owner — a `.cell()`'s registration on the store's
 	// cell, an `effect` — is released with the connection, when `dispose` runs,
 	// rather than kept for the life of the process.
@@ -5609,10 +5668,10 @@ export macro fun route_block(name: str, statements: List<str>): str {
 	// user's handler method — so the turn threads compile-time into real handler
 	// code, and one request's signal writes settle as one wave.
 	//
-	// And the turn runs under the CONNECTION's owner (A135): `under_connection`
-	// establishes it per call, so a handler's `.cell()` or `effect` is released
-	// with the connection rather than kept for the process — the route closure
-	// itself is built once, where no owner is ambient.
+	// And the turn runs under the owner of the instance that answers it: the
+	// CONNECTION's for a `Service::factory` instance (A135), the SERVICE's for
+	// `Service::new`'s shared one (A141). `under_connection` establishes it per
+	// call — the route closure itself is built once, where no owner is ambient.
 	let label = quote(name);
 	mut closure = i".on({label}, |__request| \{\n";
 	closure = closure

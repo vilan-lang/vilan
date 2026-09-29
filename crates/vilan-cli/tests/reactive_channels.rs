@@ -3504,7 +3504,11 @@ fn a135_n_calls_of_a_per_call_cell_leave_one_registration_after_disconnect() {
 
 /// A135 OVER A SOCKET: the same three calls over a real WebSocket, and the
 /// disconnect the real way — the client's socket closes, and the server's
-/// teardown drops the connection's session (and its owner).
+/// teardown drops the connection's session (and its owner). A
+/// `Service::factory` service: one instance per connection, so its handlers
+/// run under the connection's owner. (Under `Service::new` the one shared
+/// instance's handlers run under the SERVICE's owner since A141, and a
+/// per-call cell lives with the service — the A141 pins below.)
 const A135_CONNECTION_OWNER_SOCKET: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
@@ -3546,7 +3550,7 @@ fun live_on<T>(cell: SignalCell<T>): i32 {
 fun main() {
 	Server::builder()
 		.port(0)
-		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.with_service(Service::factory(|connection| store, json_codec()))
 		.on_request(|request| Response::builder().code(404).body("nope").build())
 		.on_start(|server| run(server.port()))
 		.build()
@@ -3609,6 +3613,220 @@ fn a135_a_closed_socket_releases_its_handlers_per_call_cells() {
         ],
         "over a socket, a handler's per-call cell must be released when the \
          connection closes; got:\n{stdout}"
+    );
+}
+
+// --- A141: a `Service::new` handler runs under the SERVICE's owner ----------
+
+/// A141 OVER A SOCKET (R-f, door b): kolt's `get_user` shape on a
+/// `Service::new` service — a handle method that caches a derived `.cell()`
+/// in a `Memo` on the ONE shared store. Three connections, one after
+/// another; each subscribes, bumps the source, reads the derivation, and
+/// closes. Under A135's per-connection owner the cached cell died with the
+/// FIRST connection and the store kept handing it out: `doubled=20` for
+/// every later connection (red before on `conn 1`/`conn 2`). Under the
+/// service's owner it survives every close.
+const A141_SERVICE_OWNER_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::memo::Memo;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell, Source };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+[service(StoreClient)]
+struct Store {
+	source: SignalCell<i32>,
+	cache: Memo<i32, SignalCell<i32>>,
+}
+
+impl Store {
+	[rpc]
+	fun bump(self, to: i32): i32 {
+		self.source.set(to);
+		to
+	}
+
+	// Cached on the shared store: the first call builds it, every later call
+	// (any connection's) is answered with the same cell.
+	[rpc]
+	fun doubled(self): SignalCell<i32> {
+		self.cache.get_or_insert(0, || self.source.map(|x| x * 2).cell())
+	}
+}
+
+let source: SignalCell<i32> = Signal::new(1);
+let store: Store = Store { source, cache = Memo::new() };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+/// Poll until `ready` holds — the harness's own sequencing, never a bare sleep.
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+fun shown(value: Option<i32>): i32 {
+	match value {
+		Some(let held) => held,
+		None => 0 - 1,
+	}
+}
+
+async fun run(port: i32) {
+	mut round = 0;
+	for round < 3 {
+		match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+			Ok(let client) => {
+				let mirror: RemoteSource<i32> = client.doubled();
+				let _lease = mirror.sub(|value| {});
+				until(|| mirror.get().is_some());
+				let want = (round + 1) * 10;
+				let bumped = client.bump(want).unwrap_or(0 - 1);
+				until(|| shown(mirror.get()) == want * 2);
+				print(i"conn {round}: bump={bumped} doubled={shown(mirror.get())}");
+				// This connection goes away for good before the next one comes.
+				client.transport.duplex.socket.read().close();
+				sleep(50);
+			},
+			Err(let error) => print(i"err:{error.debug()}"),
+		}
+		round += 1;
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a141_a_service_new_handlers_cached_cell_survives_every_close_over_a_socket() {
+    let stdout = run_program_warning(
+        "a141_service_owner_socket",
+        A141_SERVICE_OWNER_SOCKET,
+        "inside a `Memo` maker ties what it builds",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "conn 0: bump=10 doubled=20",
+            "conn 1: bump=20 doubled=40",
+            "conn 2: bump=30 doubled=60",
+        ],
+        "a derivation a `Service::new` handler caches on the shared store must \
+         survive the connection that built it; got:\n{stdout}"
+    );
+}
+
+/// A141 IN PROCESS: the same store, two sessions on two `duplex_pair`s, and
+/// the instance-owner line drawn both ways over ONE shared `Store` value.
+/// `shared` is a protocol stamped with a service owner (what `Service::new`
+/// stamps, `RpcProtocol::under_owner`); `per_connection` is left unstamped
+/// (what `Service::factory` leaves), so its handlers run under the
+/// connection's owner. Connection 1 builds each cache and is dropped;
+/// connection 2 is then answered from the cache. The stamped cache keeps
+/// following (`shared:2=6`); the unstamped one was built under connection 1's
+/// owner and is dead (`per_connection:2=3`, never 6) — the case the compiler's A141
+/// warning steers to `.cell_global()`.
+const A141_SERVICE_OWNER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Owner, Signal, SignalCell, Source };
+import std::rpc::{ ReactiveClient, RemoteSource, drop_session, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+
+[service(StoreClient)]
+struct Store {
+	source: SignalCell<i32>,
+	slot: Shared<Option<SignalCell<i32>>>,
+}
+
+impl Store {
+	[rpc]
+	fun tripled(self): SignalCell<i32> {
+		self.slot.get_or_insert(|| self.source.map(|x| x * 3).cell())
+	}
+}
+
+fun shown(value: Option<i32>): i32 {
+	match value {
+		Some(let held) => held,
+		None => 0 - 1,
+	}
+}
+
+fun settle() {
+	sleep_for(Duration::millis(0));
+	sleep_for(Duration::millis(0));
+}
+
+/// Connection 1 builds the cache and goes; connection 2 reads it after a bump.
+fun twice(label: str, store: Store, stamp: bool) {
+	mut connection = 1;
+	for connection <= 2 {
+		let id = if stamp { 20 + connection } else { 30 + connection };
+		let (client_end, server_end) = duplex_pair();
+		register_session(id, server_end, json_codec());
+		let base = store.dispatcher().into_protocol(json_codec()).for_connection(id);
+		let protocol = if stamp { base.under_owner(Owner::new()) } else { base };
+		let client = StoreClient { transport = local_rpc(protocol), codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+		let mirror: RemoteSource<i32> = client.tripled();
+		let lease = mirror.sub(|value| {});
+		settle();
+		if connection == 2 {
+			store.source.set(2);
+			settle();
+			print(i"{label}:2={shown(mirror.get())}");
+		} else {
+			print(i"{label}:1={shown(mirror.get())}");
+		}
+		lease.dispose();
+		settle();
+		drop_session(id);
+		connection += 1;
+	}
+}
+
+fun main() {
+	let shared_store = Store { source = Signal::new(1), slot = Shared::new(None) };
+	twice("shared", shared_store, true);
+	let per_connection = Store { source = Signal::new(1), slot = Shared::new(None) };
+	twice("per_connection", per_connection, false);
+}
+"#;
+
+#[test]
+fn a141_a_stamped_instance_owner_keeps_a_cached_cell_past_its_connection() {
+    let stdout = run_program_warning(
+        "a141_service_owner",
+        A141_SERVICE_OWNER,
+        "stored on a structure that outlives the call",
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "shared:1=3",
+            "shared:2=6",
+            "per_connection:1=3",
+            "per_connection:2=3",
+        ],
+        "a stamped (Service::new) owner keeps the cache alive; an unstamped \
+         (Service::factory) one releases it with its connection; got:\n{stdout}"
     );
 }
 

@@ -15,7 +15,7 @@ import pkg::compare::Ordering;
 import pkg::http::{ NodeRequest, NodeSocket, Request, Response, ServerBuilder };
 import pkg::json::{ FromJson, JsonKind, JsonValue, coerce_str, has_json_field };
 import pkg::option::Option::{ self, None, Some };
-import pkg::reactive::{ FlushPolicy, batch, turn };
+import pkg::reactive::{ FlushPolicy, Owner, batch, turn };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::rpc::{
 	ClientProxy,
@@ -464,7 +464,14 @@ export impl Service {
 	/// shared by every client. `Service::factory(|_connection| shared, codec)`
 	/// is the same service written the long way — reach for `factory` the
 	/// moment a method needs to know who called.
+	///
+	/// The one instance outlives every connection, so its handlers run under the
+	/// SERVICE's owner (tracker A141, door b): a derivation a handler caches on the
+	/// shared store survives whichever connection built it. Under `factory` the
+	/// owner is the connection's, released at its close.
 	fun new(protocol: RpcProtocol): Service {
+		// One owner for the one instance, for as long as the service lives.
+		let protocol = protocol.under_owner(Owner::new());
 		Service {
 			// One protocol for every client (the stateless shorthand), stamped per
 			// connection: a source-returning route exports through THIS
@@ -512,7 +519,10 @@ export impl Service {
 	///
 	/// The instance is dropped with the connection: `on_disconnect` releases the
 	/// reactive session, and the dispatcher (with the instance every route
-	/// captured) goes with the socket that held it.
+	/// captured) goes with the socket that held it. Its handlers run under the
+	/// CONNECTION's owner (A135), so what they build is released with it too — a
+	/// derivation one caches on a store the instances SHARE (a module-level cell)
+	/// is `.cell_global()`, or it dies with the connection that built it.
 	///
 	/// The connectionless `{mount}rpc` POST leg has no connection to build for, so
 	/// a factory service refuses it (501) — a factory service is reached over the
