@@ -71,7 +71,7 @@ path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
 set-element = path-branch | impl-selector ;
 impl-selector = "(" "impl" type ")"
-                [ "::" ( NAME | "{" NAME { "," NAME } [ "," ] "}" ) ] ;
+                [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
 export      = "export" [ "(" "in" path-branch ")" ]
@@ -144,7 +144,7 @@ function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "async" ] [ "external" ]
-           "fun" IDENT [ generic-params ]
+           "fun" MEMBER [ generic-params ]   (* IDENT unless an impl/trait member *)
            "(" [ parameter { "," parameter } [ "," ] ] ")"
            [ ":" type ] [ "borrows" IDENT ] [ context-clause ]
            ( block | ";" ) ;
@@ -287,7 +287,7 @@ struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-at
          (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
 field  = [ internal-label ]
-         [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
+         [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] MEMBER [ ":" type ] ;
 internal-label = "[" "internal" "(" STRING ")" "]" ;
 deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
 resource-attr    = "[" "resource" "]" ;   (* B413 *)
@@ -514,11 +514,12 @@ The tightest expression tier, `chain`:
 chain   = path { call-suffix | postfix } ;
 path    = ( IDENT generic-args ␣"::"  (* generic static head *)
           | atom )
-          { "::" IDENT } ;
+          { "::" MEMBER } ;
 call-suffix = [ generic-args ] "(" [ entry { "," entry } [ "," ] ] ")" ;
 member  = NUMBER                          (* tuple index: .0 *)
-        | IDENT [ call-suffix ] ;         (* field / ONE fused method call *)
-postfix = "." member
+        | MEMBER [ call-suffix ] ;        (* field / ONE fused method call *)
+MEMBER  = IDENT | RESERVED ;              (* any word, B414 S4 (§2.2) *)
+postfix = "." member                     (* span-adjacent: `.` then the member *)
         | "[" expression "]"             (* index *)
         | "!"                            (* try-assert, §5.10 *)
         | "(" [ entry { "," entry } [ "," ] ] ")"
@@ -556,11 +557,29 @@ css-item     = css-declaration | css-rule | css-link ;
 css-declaration = css-property "(" [ expression { "," expression } [ "," ] ]
                ")" ";" ;               (* a CALL: the property is the name *)
 css-property = { "-" } element-name ;  (* span-adjacent, as an element name is *)
-css-rule     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
+css-rule     = "." MEMBER [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                css-body ;
-css-link     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
+css-link     = "." MEMBER [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                ";" ;                   (* a chain link, verbatim *)
 ```
+
+A **member name** is any word, a reserved one included (B414 S4, §2.2):
+`event.type`, `bag.if()`, `found?.match()`, `Kit::if()`. The positions that
+take one — the name after a member `.`/`?.`, a head item's or a `css`
+item's dot, a segment after `::`, a struct field, a literal field given with
+`=`, a method declared in an `impl` or `trait`, an impl selector's member —
+are each entered after a token that commits to them, so no keyword reading
+can begin there and the admission needs no lookahead. A member dot and its
+name are **span-adjacent**: nothing, not a space and not a line break,
+stands between `.` (or `?.`) and the member (R-k). Without the rule a
+half-typed `list.` at the end of a line would take whatever the next line
+starts with as its member — `helper` in `helper();`, and under the member
+tier even `let` — and swallow the next statement, the way E142's rule keeps
+a `::` path from doing (§3.2). A chain written over several lines breaks
+BEFORE each dot — `value` on one line, `.name()` opening the next — which
+the rule leaves exactly as it was. A space on the dot's own line is refused
+with the member still read; a line break after the dot takes nothing from
+the next line.
 
 `Name<Args>` is read as a generic path head only when `::` immediately
 follows (`List<str>::new()`); otherwise `<` is a comparison. A member
@@ -683,7 +702,8 @@ condition-expr = secondary-expr ;    (* struct-init and css-block excluded *)
 
 struct-init   = type-path                      (* §3.9; qualified heads too *)
                 "{" [ init-field { "," init-field } [ "," ] ] "}" ;
-init-field    = IDENT [ "=" expression ] ;   (* shorthand: name alone *)
+init-field    = IDENT [ "=" expression ]      (* shorthand: name alone *)
+              | MEMBER "=" expression ;     (* a reserved field name, B414 S4 *)
 closure       = ( "||" | "|" [ closure-param { "," closure-param } [ "," ] ] "|" )
                 [ ":" type ] expression ;
 closure-param = parameter ;   (* the same rule as a function's, less "..." *)

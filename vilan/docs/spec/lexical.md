@@ -28,6 +28,7 @@ block comments.
 
 ```text
 IDENT = ascii_letter | "_" , { ascii_letter | digit | "_" } ;
+RESERVED = (* a word of the reserved list below: its own token, never IDENT *) ;
 ```
 
 Identifiers are ASCII. The following words are **reserved**; they lex as
@@ -41,6 +42,17 @@ ret       struct    trait    type    use     true    false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
+
+A reserved word is still a **member name** (B414 S4): the name after a
+member `.` or `?.`, a field declared in a struct or given with `=` in a
+struct literal, a method declared in an `impl` or a `trait`, and a segment
+after `::` in an expression path — `event.type`, `Event { type = kind }`,
+`fun match(self)`, `Kit::if()`. Each of those positions is entered after a
+token that commits to it, so no keyword reading can begin there (§3.6). A
+reserved word never names a binding, a parameter, a free function or a
+type, and the struct-literal shorthand `{ type }` — which reads a binding
+of that name — stays refused. After a member dot the name is written
+AGAINST the dot, with nothing between them (§3.6).
 
 The following words are **contextual keywords**: they lex as `IDENT` and
 take meaning only by position, and are ordinary identifiers everywhere

@@ -121,6 +121,7 @@ macro_rules! corpus_manifest {
             iterator_protocol => "iterator-protocol.vl",
             iterator => "iterator.vl",
             json_roundtrip => "json-roundtrip.vl",
+            keyword_members => "keyword-members.vl",
             lift_chain => "lift-chain.vl",
             list_build_infer => "list-build-infer.vl",
             list_cell => "list-cell.vl",

@@ -183,6 +183,7 @@ const FOLDS: &[&str] = &[
     "interpolated-multiline-string.vl",
     "iterator-adapters.vl",
     "json-roundtrip.vl",
+    "keyword-members.vl",
     "list-sort.vl",
     "macro-block.vl",
     "map.vl",

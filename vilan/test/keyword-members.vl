@@ -1,0 +1,64 @@
+import std::io::print;
+import std::json::{ FromJson, Json };
+
+// B414 S4, the member tier: every word — a reserved one included — names a
+// member, at each position that takes one. Pinned on both backends, since a
+// member named for a keyword must survive the JS emitter's and the Rust
+// emitter's own reserved words (`type`, `match`, `if`, `in` are Rust's too).
+
+[derive(Json)]
+struct Event {
+	type: str,
+	if: i32,
+	match: bool,
+}
+
+trait Shape {
+	fun type(self): str;
+	fun in(self): str {
+		i"a {self.type()}"
+	}
+}
+
+struct Square {
+	side: i32,
+}
+
+impl Square with Shape {
+	fun type(self): str {
+		"square"
+	}
+}
+
+impl Square {
+	fun for(self, times: i32): i32 {
+		self.side * times
+	}
+
+	fun ret(): Square {
+		Square { side = 3 }
+	}
+}
+
+fun main() {
+	let event = Event { type = "click", if = 1, match = true };
+	print(event.type);
+	print(event.if + 1);
+	print(event.to_json());
+	match Event::from_json("{\"type\":\"key\",\"if\":2,\"match\":false}") {
+		Ok(let decoded) => print(i"{decoded.type} {decoded.if} {decoded.match}"),
+		Err(let message) => print(i"refused: {message}"),
+	}
+	let square = Square::ret();
+	print(square.type());
+	print(square.in());
+	print(square.for(2));
+	let found: Option<Square> = Some(square);
+	let kind: Option<str> = found?.type();
+	match kind {
+		Some(let name) => print(name),
+		None => print("none"),
+	}
+}
+
+main();

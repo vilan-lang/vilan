@@ -192,6 +192,18 @@ pub enum Found {
     EndOfInput,
 }
 
+/// What a member position holds right after its `.` ([`Parser::member_after_dot`],
+/// R-k).
+enum DotMember {
+    /// A name written against the dot (or reported and read on the same line).
+    Read,
+    /// No member: the mid-edit `Error` member, silent at parse.
+    Missing,
+    /// A name stranded on the next line: the chain declines, the expectation
+    /// noted.
+    Decline,
+}
+
 /// What [`Parser::recover_missing_terminator`] did with the statement it read —
 /// three outcomes where there used to be two, because "reported it" and "kept
 /// it" are not the same decision.
@@ -242,6 +254,26 @@ const A_NAME_AFTER_PATH_SEPARATOR: &str = "a name after `::`";
 const A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE: &str = "a name after `::` on the same line: a `::` path does not cross a line break, because `a::` \
      at the end of a line joins whatever the next line starts with — join the line, or import \
      the path under a shorter name (`import a::b::c as d;`) and write `d`";
+
+/// The expectation a member `.` records when its name does not follow it
+/// directly (B414 S4, R-k RULED 2026-09-29: "only `.{NAME}` is legal").
+///
+/// E142's argument, one token over: `value.` at the end of a line joined
+/// whatever the next line started with, so a half-typed `list.` above
+/// `helper();` was the member call `list.helper()` and no diagnostic could
+/// exist. The member tier makes that worse rather than rare — every word is a
+/// member name after `.` now, so `list.` above `let x = 1;` would read
+/// `list.let` — and the owner's ruling is the strict form: nothing at all
+/// between the dot and the name, on one line or across two. A chain written
+/// over several lines breaks BEFORE the dot, which the rule leaves exactly as
+/// it was.
+///
+/// Spelled as an expectation, like its E142 sibling, so the "found X expected
+/// …" frame puts the stranded name into the message.
+const A_MEMBER_NAME_AGAINST_ITS_DOT: &str = "a member name written against its `.` — `value.name`, with no space or line \
+     break between them, because a `.` at the end of a line would join whatever the next line \
+     starts with. A chain continued on the next line breaks BEFORE the dot, and the next line \
+     begins `.name()`";
 
 /// The rule `fun f(): || void context c` breaks (B343, R9 RULED 2026-09-17).
 /// Curated (diagnostics-standard.md B6): the prohibition explains itself, and
@@ -726,6 +758,14 @@ fn hoist_clause_out_of_a_view(annotation: Spanned<Node<'_>>) -> Spanned<Node<'_>
     }
 }
 
+/// Whether `token` is one of the RESERVED words (`lexing::KEYWORDS`) — the
+/// words the lexer hands back as their own token rather than as a name. The
+/// member tier (B414 S4) admits them wherever a member name stands; a
+/// contextual keyword needs no admitting, since it lexes as an identifier.
+fn is_reserved_word(token: &Token<'_>) -> bool {
+    lexing::KEYWORDS.iter().any(|(_, keyword)| keyword == token)
+}
+
 fn starts_item(token: &Token<'_>) -> bool {
     matches!(
         token,
@@ -992,6 +1032,25 @@ pub fn contextual_keyword_readings(source: &str) -> Vec<Span> {
         .collect()
 }
 
+/// The spans of `source`'s RESERVED words the parser read as MEMBER names
+/// (B414 S4) — `type` in `event.type` or in a field `type: str`, `match` in an
+/// `impl`'s `fun match(self)`. The editor's raw-parse read, the member tier's
+/// twin of [`contextual_keyword_readings`]: a reserved word lexes as its own
+/// token, so a keyword hover would otherwise answer for every one of them.
+/// Sorted, without duplicates.
+pub fn keyword_member_readings(source: &str) -> Vec<Span> {
+    let (tokens, _) = lexing::tokenize(source);
+    let mut parser = Parser::new(&tokens, source, false);
+    parser.parse_program();
+    let mut indices = std::mem::take(&mut parser.member_readings);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+        .into_iter()
+        .filter_map(|index| tokens.get(index).map(|(_, span)| *span))
+        .collect()
+}
+
 struct Parser<'a, 'src> {
     tokens: &'a [Spanned<Token<'src>>],
     position: usize,
@@ -1107,6 +1166,13 @@ struct Parser<'a, 'src> {
     /// [`contextual_keyword_readings`], the editor's raw-parse question "is
     /// this `with` the keyword or a name?" (hover, contextual-keywords.md Q5).
     contextual_readings: Vec<usize>,
+    /// The token indices at which a RESERVED word was read as a MEMBER name
+    /// (B414 S4) — `x.type`, `fun match(self)` in an `impl`, a field `if: i32`.
+    /// Pushed by [`Parser::eat_member_name`] and rolled back with
+    /// `contextual_readings` when an [`Parser::attempt`] declines; read only by
+    /// [`keyword_member_readings`], so the editor hovers such a word as the
+    /// member it is and not as the keyword it spells.
+    member_readings: Vec<usize>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1337,6 +1403,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             nesting_refusal: None,
             import_path_failure: None,
             contextual_readings: Vec::new(),
+            member_readings: Vec::new(),
         }
     }
 
@@ -1488,6 +1555,105 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
+    /// A MEMBER name (B414 S4, contextual-keywords.md §5): an identifier, or
+    /// any RESERVED word — `event.type`, `fun match(self)` in an `impl`, a
+    /// field `if: i32`. Each member position is entered after a token that
+    /// commits to it (`.`, `::`, `fun` inside a member body, a struct body's
+    /// `{`/`,`), so no production can start there with the keyword and the
+    /// admission costs no lookahead. The word is the source text of the
+    /// token (a reserved word's token carries none), and a reserved reading is
+    /// recorded for the editor ([`Parser::member_readings`]).
+    fn eat_member_name(&mut self) -> Option<&'src str> {
+        let (token, span) = self.tokens.get(self.position)?;
+        match token {
+            Token::Ident(name) => {
+                let name = *name;
+                self.bump();
+                Some(name)
+            }
+            token if is_reserved_word(token) => {
+                let word = self.source.get(span.into_range())?;
+                self.member_readings.push(self.position);
+                self.bump();
+                Some(word)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the token at the cursor can be a member name — an identifier,
+    /// a reserved word, or a tuple index (`.0`).
+    fn peek_is_member_name(&self) -> bool {
+        match self.peek() {
+            Some(Token::Ident(_) | Token::Number(..)) => true,
+            Some(token) => is_reserved_word(token),
+            None => false,
+        }
+    }
+
+    /// R-k (B414 S4, RULED 2026-09-29): the name after a member `.` is
+    /// written against it. Called with the dot just consumed, before its name
+    /// is read; answers what the member position holds.
+    ///
+    /// - Nothing between them: the member, read as before.
+    /// - No name at all (`list.` before a `}` or a `;`): the mid-edit shape
+    ///   completion lives on — an `Error` member, silent here, the receiver
+    ///   still analyzed.
+    /// - A space on the same line (`list. len()`): reported, and the member is
+    ///   read anyway — the reading is not in doubt, only the spelling.
+    /// - A line break before a word that BEGINS a statement or an item
+    ///   (`list.` ⏎ `let x = 1;`): the half-typed dot above the next line. The
+    ///   word is not taken — under the member tier it could be — and the dot
+    ///   gets the `Error` member it always got, so the statement's missing-`;`
+    ///   recovery keeps it and the receiver stays analyzed for completion.
+    /// - A line break before any other word (`list.` ⏎ `helper();`): declined
+    ///   with the expectation noted, exactly as E142 declines a `::` that ends
+    ///   its line, so the next line is never swallowed as the member and the
+    ///   statement's recovery reports the one mistake, at the stranded name.
+    fn member_after_dot(&mut self) -> DotMember {
+        if !self.peek_is_member_name() {
+            return DotMember::Missing;
+        }
+        let Some(dot) = self
+            .position
+            .checked_sub(1)
+            .and_then(|at| self.tokens.get(at))
+        else {
+            return DotMember::Read;
+        };
+        let dot_span = dot.1;
+        let name_span = self.here_span();
+        let gap = self
+            .source
+            .get(dot_span.into_range().end..name_span.into_range().start)
+            .unwrap_or("");
+        if gap.is_empty() {
+            return DotMember::Read;
+        }
+        if gap.contains('\n') {
+            if starts_statement_or_item(self.tokens, self.position) {
+                return DotMember::Missing;
+            }
+            self.note_expected(A_MEMBER_NAME_AGAINST_ITS_DOT);
+            return DotMember::Decline;
+        }
+        let found = self
+            .source
+            .get(name_span.into_range())
+            .unwrap_or_default()
+            .to_string();
+        self.errors.push(ParseError {
+            span: Span::from(dot_span.into_range().start..name_span.into_range().end),
+            reason: ParseErrorReason::Expected {
+                found: Found::Token(found),
+                expected: vec![A_MEMBER_NAME_AGAINST_ITS_DOT.to_string()],
+            },
+            context: self.context_stack.clone(),
+            hint: None,
+        });
+        DotMember::Read
+    }
+
     // --- Contextual keywords (B414, proposal/contextual-keywords.md) --------
 
     /// Whether the cursor is at the identifier `word` — how every contextual
@@ -1585,6 +1751,13 @@ impl<'a, 'src> Parser<'a, 'src> {
                 .is_some_and(|index| *index >= start)
             {
                 self.contextual_readings.pop();
+            }
+            while self
+                .member_readings
+                .last()
+                .is_some_and(|index| *index >= start)
+            {
+                self.member_readings.pop();
             }
             // `nesting_refusal` is deliberately NOT restored: like
             // `farthest_failure`, it records how deep the input went, which no
@@ -3232,7 +3405,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_ctrl('.') {
             let dot_span = self.here_span();
             self.bump();
-            let member = self.parse_member_call();
+            let member = match self.member_after_dot() {
+                DotMember::Read => self.parse_member_call(),
+                DotMember::Missing => None,
+                DotMember::Decline => return None,
+            };
             return Some(Some(Postfix::Member(
                 member.unwrap_or((Node::Error, dot_span)),
             )));
@@ -3260,7 +3437,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.bump(); // `?`
             self.bump(); // `.`
             let dot_span = self.span_from(start);
-            let member = self.parse_member_call();
+            let member = match self.member_after_dot() {
+                DotMember::Read => self.parse_member_call(),
+                DotMember::Missing => None,
+                DotMember::Decline => return None,
+            };
             return Some(Some(Postfix::LiftMember(
                 member.unwrap_or((Node::Error, dot_span)),
             )));
@@ -3284,7 +3465,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some((node, span));
         }
         let start = self.position;
-        let name = self.eat_ident()?;
+        let name = self.eat_member_name()?;
         let accessor = (Node::Accessor(name), self.span_from(start));
         // An optional single fused call: `<generics>? ( args )`. If generics parse
         // but no `(` follows, they are backtracked and the bare accessor is kept.
@@ -3452,7 +3633,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.position = save;
                 return None;
             }
-            match self.eat_ident() {
+            // B414 S4: a segment after `::` is a member position — any word
+            // (`Event::type(..)`, a static named for a reserved word).
+            match self.eat_member_name() {
                 Some(member) => {
                     // No generic arguments: in expression position a `<...>`
                     // after the member belongs to the CALL that follows, which
@@ -3463,25 +3646,6 @@ impl<'a, 'src> Parser<'a, 'src> {
                     );
                 }
                 None => {
-                    // `Length::css(…)` — the spelling the keyword promotion
-                    // renamed. RECOVER over the word rather than rolling the
-                    // `::` back: rolled back, the failure surfaces at the
-                    // operator as a missing `;` and the word the reader has to
-                    // change is never named. Consuming it into an error
-                    // stand-in lets the enclosing statement parse, so the rule
-                    // is the one diagnostic the mistake raises.
-                    if self.peek_is(&Token::Css) {
-                        let span = self.here_span();
-                        self.bump();
-                        self.errors.push(ParseError {
-                            span,
-                            reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
-                            context: self.context_stack.clone(),
-                            hint: None,
-                        });
-                        current = (Node::Error, self.span_from(start));
-                        continue;
-                    }
                     // `style::` with nothing after it — the shape a path is in
                     // while it is being TYPED. The roll-back alone told the
                     // reader nothing: `style` became the whole value, the `::`
@@ -3678,7 +3842,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         &mut self,
     ) -> Option<Spanned<(&'src str, Option<Spanned<Node<'src>>>)>> {
         let start = self.position;
-        let name = self.eat_ident()?;
+        // B414 S4: a field given WITH `=` is a member position, so any word
+        // names it (`Event { type = kind }`); the shorthand `{ type }` reads a
+        // binding of that name, which a reserved word can never be.
+        let name = if !matches!(self.peek(), Some(Token::Ident(_))) && self.peek_at_is_op(1, "=") {
+            self.eat_member_name()?
+        } else {
+            self.eat_ident()?
+        };
         let value = if self.eat_op("=") {
             Some(self.parse_expression()?)
         } else {
@@ -4082,8 +4253,14 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_css_dotted_inner(&mut self) -> Option<CssItem<'src>> {
         let start = self.position;
         self.expect_ctrl('.')?;
+        // R-k: a dotted item's name is written against its dot, as a member's
+        // is everywhere else.
+        if self.peek_is_member_name() && !self.previous_token_is_adjacent() {
+            self.report_css_failure(A_MEMBER_NAME_AGAINST_ITS_DOT);
+            return None;
+        }
         let name_span = self.here_span();
-        let Some(name) = self.eat_ident() else {
+        let Some(name) = self.eat_member_name() else {
             self.report_css_failure(
                 "a condition combinator (`.hover { … }`) or a chain link (`.ghost();`)",
             );
@@ -4292,6 +4469,20 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
+    /// Whether the token at the cursor touches the one before it — no trivia
+    /// between them. `false` at the start of the stream.
+    fn previous_token_is_adjacent(&self) -> bool {
+        match (
+            self.position
+                .checked_sub(1)
+                .and_then(|at| self.tokens.get(at)),
+            self.tokens.get(self.position),
+        ) {
+            (Some(previous), Some(current)) => previous.1.end == current.1.start,
+            _ => false,
+        }
+    }
+
     fn peek_at_is_op(&self, offset: usize, symbol: &str) -> bool {
         matches!(self.peek_at(offset), Some(Token::Op(found)) if *found == symbol)
     }
@@ -4438,6 +4629,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         // Chain form — the link node exactly as a written chain builds it.
         if self.peek_is_ctrl('.') {
             self.bump();
+            // R-k: a head's items are separated by whitespace, so a name that
+            // does not touch the dot is the NEXT item (`<input . disabled>`)
+            // and the link is the unfinished one — reported the way a dot with
+            // no name is, with the rule's own expectation.
+            if self.peek_is_member_name() && !self.previous_token_is_adjacent() {
+                let context = self.context_stack.clone();
+                self.emit_failure(
+                    self.position,
+                    vec![A_MEMBER_NAME_AGAINST_ITS_DOT.to_string()],
+                    context,
+                );
+                return Some(None);
+            }
             let Some(link) = self.attempt(Self::parse_member_call) else {
                 // A dot with no name after it: the shape a head is in while a
                 // chain link is being TYPED (`<div .`). The dot has already
@@ -5987,7 +6191,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         let external = self.eat(&Token::External);
         self.expect(&Token::Fun)?;
         let name_start = self.position;
-        let name = self.eat_ident()?;
+        // B414 S4: a METHOD — a `fun` in an `impl` or `trait` item list — is
+        // reached through a receiver or a `::` path, never through the atom
+        // production, so any word names it; a free function binds a name and
+        // keeps the identifier rule.
+        let name = if self.in_member_body {
+            self.eat_member_name()?
+        } else {
+            self.eat_ident()?
+        };
         let name = (name, self.span_from(name_start));
         let generic_parameters = self.parse_generic_parameters();
         let parameters = self.parse_function_parameters()?;
@@ -6549,7 +6761,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.refuse_misplaced_resource_attribute();
         let exposed = self.eat_expose_attribute();
         let name_start = self.position;
-        let name = self.eat_ident()?;
+        // B414 S4: a declared field is a member position — any word.
+        let name = self.eat_member_name()?;
         let name = (name, self.span_from(name_start));
         let type_ = if self.eat_op(":") {
             Some(self.parse_type()?)
@@ -7082,7 +7295,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.eat_op("::") {
             if self.eat_ctrl('{') {
                 let names =
-                    self.comma_list(Self::eat_member_name, |parser| parser.peek_is_ctrl('}'));
+                    self.comma_list(Self::eat_selector_member, |parser| parser.peek_is_ctrl('}'));
                 match names {
                     Some(names) => members = names,
                     None => {
@@ -7101,7 +7314,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                     ));
                 }
             } else {
-                match self.eat_member_name() {
+                match self.eat_selector_member() {
                     Some(member) => members.push(member),
                     None => {
                         return Some(self.selector_refusal(
@@ -7125,9 +7338,12 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// One member name inside a selector's `::name` / `::{ a, b }` tail, with
     /// its span. `as` on one is refused where it is written
     /// ([`IMPL_SELECTOR_REFUSES_AS`]) and eaten, so the set still reads.
-    fn eat_member_name(&mut self) -> Option<(&'src str, Span)> {
+    ///
+    /// A selector names METHODS, so the name is a member name (B414 S4): a
+    /// method declared `fun type(self)` is selected as `(impl T)::type`.
+    fn eat_selector_member(&mut self) -> Option<(&'src str, Span)> {
         let start = self.position;
-        let name = self.eat_name()?;
+        let name = self.eat_member_name()?;
         let span = self.span_from(start);
         self.refuse_selector_alias();
         Some((name, span))
@@ -10516,6 +10732,106 @@ mod tests {
         assert_eq!(
             rendered_errors("fun main() {\n\tlet s = dyn Shape;\n}\n"),
             vec![DYN_IS_A_TYPE_MARKER.to_string()]
+        );
+    }
+
+    // --- B414 S4: the member tier, and R-k --------------------------------------
+
+    /// The RESERVED words the parser read as MEMBER names in `source`, in order.
+    fn member_readings(source: &str) -> Vec<&str> {
+        keyword_member_readings(source)
+            .into_iter()
+            .map(|span| &source[span.into_range()])
+            .collect()
+    }
+
+    #[test]
+    fn b414_s4_a_reserved_word_is_read_as_a_member_at_each_member_position() {
+        let source = concat!(
+            "struct Event { type: str, if: i32 }\n",
+            "trait Shape { fun match(self): str; }\n",
+            "impl Event { fun for(self): i32 { self.if } fun in(): Event { Event { type = \"x\", if = 1 } } }\n",
+            "import a::{ (impl Event)::ret };\n",
+            "fun main() {\n",
+            "\tlet e = Event::in();\n",
+            "\tlet n = e.for() + e.if;\n",
+            "\tlet kind = found?.match();\n",
+            "\tif e.if == 1 { ret; } else { ret; }\n",
+            "}\n",
+        );
+        let (_, errors) = parse(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            member_readings(source),
+            vec![
+                // declared: fields, a trait method, two impl methods
+                "type", "if", "match", "for", "if", "in", "type", "if",
+                // an impl selector's member
+                "ret", // `::`, `.`, `?.`
+                "in", "for", "if", "match", "if",
+            ],
+        );
+    }
+
+    #[test]
+    fn b414_s4_a_reserved_word_is_no_member_where_a_name_is_bound() {
+        // A free function, a binding, a parameter and the literal shorthand
+        // (`{ type }` reads a binding) keep the identifier rule.
+        for source in [
+            "fun type(): i32 { 1 }\n",
+            "fun main() { let type = 1; }\n",
+            "fun f(type: i32) {}\n",
+            "fun main() { let e = Event { type }; }\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(!errors.is_empty(), "{source:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn b414_s4_r_k_a_member_name_is_written_against_its_dot() {
+        let steer = format!("found 'n' expected {A_MEMBER_NAME_AGAINST_ITS_DOT}");
+        // Same line: reported, and the member is still read — one error.
+        assert_eq!(
+            rendered_errors("fun main() { let a = s. n; }\n"),
+            vec![steer.clone()]
+        );
+        assert_eq!(
+            rendered_errors("fun main() { let a = s?. n; }\n"),
+            vec![steer.clone()]
+        );
+        // Across a line: the next line's first word is never the member.
+        assert_eq!(
+            rendered_errors("fun main() {\n\tlet a = s.\n\t\tn;\n}\n"),
+            vec![steer]
+        );
+        let (tree, errors) = parse("fun main() {\n\tlet a = s.\n\tlet b = 2;\n}\n");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let (statements, _) = tree.expect("a tree");
+        let Node::Func(main) = &statements[0].0 else {
+            panic!("expected main");
+        };
+        let body = main.body.as_ref().expect("a body");
+        assert!(
+            body.0
+                .0
+                .iter()
+                .any(|statement| matches!(&statement.0, Node::Let(..))),
+            "the next line's `let b` survives as its own statement"
+        );
+        // Nothing between the dot and its name, and nothing after a trailing
+        // dot at all — both unchanged, as is the chain broken BEFORE its dot.
+        for source in [
+            "fun main() { let a = s.n; }\n",
+            "fun main() {\n\tlet a = xs\n\t\t.len();\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source:?}: {errors:?}");
+        }
+        let (_, errors) = parse("fun main() { s. }\n");
+        assert!(
+            errors.is_empty(),
+            "the mid-edit `s.` still recovers silently: {errors:?}"
         );
     }
 }

@@ -41,7 +41,11 @@ see [the memory model](memory-model.md)), `jump` (the prefix on `break`
 and `continue`), `lazy`, `dyn`, `with`, `borrows`, `self`, `Self`, `void`,
 `context`, `sync`, `as`, and the attribute names in `[...]`. So `let own =
 owner();`, a field called `with` and a method called `jump` are all fine,
-beside the keyword readings in the same file. Spec
+beside the keyword readings in the same file. Even a reserved word names a
+MEMBER — a field `type`, a method `match`, read as `event.type` and called
+as `shape.match()` — because a member is reached through a receiver or a
+`::` path, never on its own; it still cannot name a binding, a parameter
+or a free function. Spec
 [§2.2](../spec/lexical.md#22-identifiers-and-keywords) lists them, and
 [§A.2](../spec/appendix.md#a2-reserved-words) is the table.
 
