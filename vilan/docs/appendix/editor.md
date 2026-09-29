@@ -97,6 +97,15 @@ declared`, `analyzed as: node — default-entry` — with the whole reason in
 its tooltip. A file can say it itself: `[platform("browser")] mod self;` as
 its first line — and at the top of a file, completion offers that line.
 
+A file holding platform-fenced **twins** (a function or a trait `impl`
+written once under `[platform("browser")]` and once under
+`[platform("@process")]`) is analyzed under each twin's platform, and the
+editor keeps every one of those analyses: inside the twin the file's own
+platform excludes, hover, completion, inlay hints and colour come from the
+analysis that admits it, as they do everywhere else. Go-to-definition on a
+call to a twin offers both twins, the one the file's platform compiles
+first.
+
 **A generic `<` closes itself.** `List<`, `HashMap<`, `fun pair<` and a
 generic call's own argument list each get their `>` as you type the `<`.
 The editor's static bracket pairs cannot do this — `<` is also the

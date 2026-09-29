@@ -3930,7 +3930,9 @@ impl LanguageServer for Backend {
             // Program-space lookup: the position converts through the ANALYZED
             // index, so it names the same character the analysis saw there (S1).
             let offset = document.analyzed_offset(position);
-            Ok(document.hover(offset).map(|label| Hover {
+            // F27 R3: inside a twin this leg fenced out, the leg that admits
+            // it answers.
+            Ok(document.answering(offset).hover(offset).map(|label| Hover {
                 contents: HoverContents::Scalar(MarkedString::String(label)),
                 range: None,
             }))
@@ -3979,7 +3981,10 @@ impl LanguageServer for Backend {
             // whole-program sweeps behind the index (`auto_import_completions`,
             // `modules_in_root`'s per-request `read_dir`) is the next tranche;
             // this is the seam it happens at.
-            let items = document
+            // F27 R3: inside a twin this leg fenced out, the leg that admits
+            // it completes — its live text follows this document's.
+            let answering = document.answering(document.analyzed_offset(position));
+            let items = answering
                 .keystroke_completion(offset, self.schedule.dependency_moved(&uri))
                 .into_iter()
                 .map(|completion| {
@@ -4003,12 +4008,21 @@ impl LanguageServer for Backend {
                 return Ok(None);
             };
             let offset = document.analyzed_offset(position);
-            let Some((source, span)) = document.definition(offset) else {
-                return Ok(None);
-            };
-            Ok(self
-                .location_for(&document, &uri, source, span)
-                .map(GotoDefinitionResponse::Scalar))
+            // F27 R3 (§8.4 item 4): every leg's answer, the answering leg's
+            // first — a call to a twin names the twin each platform compiles.
+            // One location (every file without twins) stays a scalar.
+            let mut locations: Vec<Location> = document
+                .definitions(offset)
+                .into_iter()
+                .filter_map(|(analysis, source, span)| {
+                    self.location_for(analysis, &uri, source, span)
+                })
+                .collect();
+            Ok(match locations.len() {
+                0 => None,
+                1 => locations.pop().map(GotoDefinitionResponse::Scalar),
+                _ => Some(GotoDefinitionResponse::Array(locations)),
+            })
         })
     }
 
