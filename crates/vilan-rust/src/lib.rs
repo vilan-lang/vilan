@@ -898,6 +898,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ) -> Result<String, Error> {
         let boxed = self.boxed_parameter_prologue(&closure.parameters);
         let body = self.expression(closure.return_, depth)?;
+        // F53: an expression body is the closure's VALUE, and a concrete value
+        // landing at a `dyn` return (`roots.map(|r| r)` into a `List<dyn Src>`)
+        // becomes the object here, as it does at every other value position
+        // ([`Self::value_of`]). A block body's tail already takes that path.
+        let body = self.erase_into_object(closure.return_, body)?;
         if closure.parameter_destructures.is_empty() {
             if boxed.is_empty() {
                 return Ok(body);
@@ -3051,10 +3056,32 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// exactly those sites.
     fn declared_return_type(&self, call_id: Id) -> Option<TypeId> {
         let call = self.program.function_calls.get(&call_id)?;
-        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
-            return None;
+        let target = match self.program.entity_map.get(&call.subject_id) {
+            Some(Expr::Local(target)) | Some(Expr::Parameter(target)) => *target,
+            _ => return None,
         };
-        self.program.functions.get(target)?.return_type_id
+        if let Some(function) = self.program.functions.get(&target) {
+            return function.return_type_id;
+        }
+        // F53: a call through a CLOSURE-typed binding answers the closure
+        // type's return — `erase(r).get()` with `erase: |Root| dyn Src` is a
+        // slot call whose receiver is that call, and it had no type to
+        // dispatch on.
+        let binding_type = self
+            .program
+            .variables
+            .get(&target)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.program
+                    .parameters
+                    .get(&target)
+                    .map(|parameter| parameter.type_id)
+            })?;
+        match self.resolve(binding_type)? {
+            Type::Closure(_, return_type_id, _) => Some(*return_type_id),
+            _ => None,
+        }
     }
 
     // --------------------------------------------------------- functions ---
@@ -6408,7 +6435,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // the closure). The parameter types are the literal's own, so a view
         // parameter keeps its higher-ranked `&mut`; the return is left to
         // inference, which the body answers.
-        let as_counted = format!(" as std::rc::Rc<dyn Fn({}) -> _>", signature.join(", "));
+        // F53: ...except where the body is erased to an OBJECT. The object is
+        // then the answer, and a caller that dispatches through it
+        // (`erase(r).get()`) needs the type before the body has settled it —
+        // rustc will not resolve a method on `_`. A synchronous body only: an
+        // async one answers a future of the object.
+        let returns = match self.program.dyn_coercions.get(&closure.return_).cloned() {
+            Some((subject, trait_id, arguments))
+                if !is_async_closure
+                    && !matches!(
+                        self.program
+                            .type_id_to_type_map
+                            .get(&self.concrete(subject)),
+                        Some(Type::Dyn(..))
+                    ) =>
+            {
+                let object = self.ensure_object_trait(trait_id, &arguments, span)?;
+                format!("vilan_rt::Dyn<dyn {}>", object.name)
+            }
+            _ => "_".to_string(),
+        };
+        let as_counted = format!(
+            " as std::rc::Rc<dyn Fn({}) -> {returns}>",
+            signature.join(", ")
+        );
         // A `move` closure takes its captures by value, so a captured CELL has
         // to be a handle of its own — otherwise the binding outside is moved
         // into the closure and every later read of it is a use-after-move.

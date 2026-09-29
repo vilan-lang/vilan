@@ -6232,3 +6232,58 @@ const DROP_ENUM_PROBE: &str = concat!(
     "\t}\n",
     "}\n",
 );
+
+/// F53: a closure whose BODY is erased to `dyn` — `roots.map(|r| r)` into a
+/// `List<dyn Src>`, the very spelling B435's steer gives — wraps its tail
+/// natively as the JS emitter pairs it. The expression-bodied closure's tail
+/// was rendered without the erasure every other value position applies, and
+/// rustc refused the closure (`expected Dyn<..>, found Root`). Beside it: a
+/// block-bodied twin, a closure-typed binding and parameter answering `dyn`,
+/// whose CALL is then a receiver (it had no recorded type, so the slot call
+/// through it was refused by name), and the `Some(r)` shape that always worked.
+#[test]
+fn a_closure_body_erased_to_an_object_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_f53.vl"), F53_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f53.vl"),
+        Verdict::Identical,
+        "a closure body erased to `dyn` must build and print the same on both backends"
+    );
+}
+
+const F53_PROBE: &str = concat!(
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "fun apply(f: |Root| dyn Src, r: Root): i32 {\n",
+    "\tf(r).get()\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet roots: List<Root> = [Root { n = 1 }, Root { n = 2 }];\n",
+    "\tlet ys: List<dyn Src> = roots.map(|r| r);\n",
+    "\tprint(ys[1].get());\n",
+    "\tlet zs: List<dyn Src> = roots.map(|r| {\n",
+    "\t\tlet doubled = Root { n = r.n * 2 };\n",
+    "\t\tdoubled\n",
+    "\t});\n",
+    "\tprint(zs[1].get());\n",
+    "\tlet erase: |Root| dyn Src = |r| r;\n",
+    "\tprint(erase(Root { n = 5 }).get());\n",
+    "\tprint(apply(|r| r, Root { n = 7 }));\n",
+    "\tlet r = Root { n = 3 };\n",
+    "\tlet o: Option<dyn Src> = Some(r);\n",
+    "\tmatch o {\n",
+    "\t\tSome(let s) => print(s.get()),\n",
+    "\t\tNone => print(0),\n",
+    "\t}\n",
+    "}\n",
+);
