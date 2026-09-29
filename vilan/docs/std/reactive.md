@@ -493,6 +493,12 @@ fun main() {
 The [guide](../guide/reactive.md#derived-state-derive-pipes-and-memo) has the
 rule for where a derivation lives.
 
+A pipe's type spells its whole upstream, so the editor shows a pipe stage by
+the trait it is used as — `: ~Pipe<Option<str>>` — through the
+`[hint(Pipe<U>)]` each stage declares, and a sealed `MemoCell` as the
+`~Source<T>` it is; a package author's own stage takes the same attribute
+([the editor](../appendix/editor.md)).
+
 ### Resource — a value that may still be loading
 
 ```vilan,fragment

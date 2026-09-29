@@ -60,6 +60,10 @@ const UNION_IDLE_MS: u64 = 600;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Config {
     inlay_hints_enabled: bool,
+    /// E227: `vilan.inlayHints.abbreviate` — show a `[hint]`ed type by the
+    /// trait it is used as (`: ~Source<i32>`). On by default; read per
+    /// request, so it switches live.
+    inlay_hints_abbreviate: bool,
     semantic_tokens_enabled: bool,
     completion_function_call: CompletionFunctionCall,
     /// E222: the client pairs a generic `<` ITSELF — it asked
@@ -77,6 +81,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             inlay_hints_enabled: true,
+            inlay_hints_abbreviate: true,
             semantic_tokens_enabled: true,
             completion_function_call: CompletionFunctionCall::Full,
             client_closes_generics: false,
@@ -98,6 +103,12 @@ impl Config {
             .and_then(|v| v.as_bool())
         {
             config.inlay_hints_enabled = enabled;
+        }
+        if let Some(abbreviate) = root
+            .pointer("/inlayHints/abbreviate")
+            .and_then(|v| v.as_bool())
+        {
+            config.inlay_hints_abbreviate = abbreviate;
         }
         if let Some(enabled) = root
             .pointer("/semanticTokens/enabled")
@@ -748,6 +759,26 @@ mod config_tests {
     use serde_json::json;
 
     // Defaults preserve today's behavior: every provider on, full completion.
+    /// E227 (Q4): `vilan.inlayHints.abbreviate` is on unless a client says
+    /// otherwise, in either payload shape, and a wrong-typed value keeps the
+    /// default rather than flipping it.
+    #[test]
+    fn config_parses_inlay_hints_abbreviate() {
+        assert!(Config::default().inlay_hints_abbreviate);
+        assert!(
+            !Config::from_settings(&json!({ "inlayHints": { "abbreviate": false } }))
+                .inlay_hints_abbreviate
+        );
+        let wrapped = Config::from_settings(&json!({
+            "vilan": { "inlayHints": { "abbreviate": false, "enabled": true } },
+        }));
+        assert!(!wrapped.inlay_hints_abbreviate && wrapped.inlay_hints_enabled);
+        assert!(
+            Config::from_settings(&json!({ "inlayHints": { "abbreviate": "no" } }))
+                .inlay_hints_abbreviate
+        );
+    }
+
     #[test]
     fn defaults_preserve_todays_behavior() {
         let config = Config::default();
@@ -3264,11 +3295,23 @@ impl LanguageServer for Backend {
         // — the language client also emits a bare `{ settings: null }` on any
         // config change, which must NOT reset our settings to their defaults.
         if params.settings.get("vilan").is_some() {
-            *self
-                .config
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Config::from_settings(&params.settings);
+            let config = Config::from_settings(&params.settings);
+            let abbreviate_moved = {
+                let mut current = self
+                    .config
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let moved = current.inlay_hints_abbreviate != config.inlay_hints_abbreviate;
+                *current = config;
+                moved
+            };
+            // E227 (Q4): `vilan.inlayHints.abbreviate` switches the hints
+            // already on screen at once. Both labels are in every landed
+            // capture, so nothing re-analyzes — the client is only asked to
+            // re-request.
+            if abbreviate_moved {
+                send_refreshes(&self.client, &[Refresh::InlayHints]).await;
+            }
         }
     }
 
@@ -3661,6 +3704,11 @@ impl LanguageServer for Backend {
             {
                 return Ok(None);
             }
+            let abbreviate = self
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .inlay_hints_abbreviate;
             let uri = params.text_document.uri;
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
@@ -3672,17 +3720,25 @@ impl LanguageServer for Backend {
                 // no longer jumps the moment typing starts (E121 withheld them
                 // there). The offsets are already live-space, so one index
                 // answers both the hint's position and the viewport compare.
-                .keystroke_hints(self.schedule.dependency_moved(&uri))
+                //
+                // E227: a `[hint]`ed type shows by the trait it is used as
+                // (`: ~Source<i32>`), with the full type as its tooltip. The
+                // abbreviated hint carries no `text_edits`, ever: an editor that
+                // inserts a hint on double-click must never write `~Source<..>`
+                // into a file — it does not lex.
+                .keystroke_hints_served(self.schedule.dependency_moved(&uri), abbreviate)
                 .into_iter()
-                .filter_map(|(offset, label)| {
-                    let position = document.line_index.position(offset);
+                .filter_map(|hint| {
+                    let position = document.line_index.position(hint.offset);
                     let visible = position >= range.start && position <= range.end;
                     visible.then_some(InlayHint {
                         position,
-                        label: InlayHintLabel::String(label),
+                        label: InlayHintLabel::String(hint.label),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
-                        tooltip: None,
+                        tooltip: hint.full.map(|full| {
+                            InlayHintTooltip::String(full.trim_start_matches(": ").to_string())
+                        }),
                         padding_left: Some(false),
                         padding_right: Some(false),
                         data: None,
@@ -5376,6 +5432,59 @@ mod snapshot_consistency_tests {
             .await
             .expect("hints while typing");
         assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+    }
+
+    /// E227 (§4.3): an abbreviated hint carries the full type as its tooltip
+    /// and NO `text_edits` — an editor that inserts a hint on double-click
+    /// must never write `~Source<..>` into a file — and with
+    /// `vilan.inlayHints.abbreviate` off the same request answers the full
+    /// type, live, with no re-analysis.
+    #[tokio::test]
+    async fn an_abbreviated_hint_carries_the_full_type_as_its_tooltip_and_no_edit() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        let text = "fun main() {\n\tlet taken = [1, 2, 3].iter().map(|x| x * 2).take(1);\n\
+                    \tprint(taken.count());\n}\n";
+        backend.documents.insert(uri.clone(), document(text));
+        let params = InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::new(Position::new(0, 0), Position::new(100, 0)),
+            work_done_progress_params: Default::default(),
+        };
+        let taken = |hints: Vec<InlayHint>| {
+            hints
+                .into_iter()
+                .find(|hint| hint.position.line == 1)
+                .expect("the hint on `taken`")
+        };
+        let label = |hint: &InlayHint| match &hint.label {
+            InlayHintLabel::String(label) => label.clone(),
+            InlayHintLabel::LabelParts(_) => panic!("a plain label"),
+        };
+        let tooltip = |hint: &InlayHint| match &hint.tooltip {
+            Some(InlayHintTooltip::String(tooltip)) => Some(tooltip.clone()),
+            Some(InlayHintTooltip::MarkupContent(_)) => panic!("a plain tooltip"),
+            None => None,
+        };
+        let hint = taken(backend.inlay_hint(params.clone()).await.unwrap().unwrap());
+        assert_eq!(label(&hint), ": ~Iterator<i32>");
+        assert_eq!(
+            tooltip(&hint).as_deref(),
+            Some("Taken<Mapped<ListIterator<i32>, i32, i32>, i32>")
+        );
+        assert!(hint.text_edits.is_none());
+        backend
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inlay_hints_abbreviate = false;
+        let hint = taken(backend.inlay_hint(params).await.unwrap().unwrap());
+        assert_eq!(
+            label(&hint),
+            ": Taken<Mapped<ListIterator<i32>, i32, i32>, i32>"
+        );
+        assert!(tooltip(&hint).is_none() && hint.text_edits.is_none());
     }
 
     // --- Handler wiring: the S1 index switch, pinned per handler ------------

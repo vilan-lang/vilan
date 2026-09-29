@@ -78,8 +78,8 @@ Beside them, two families of words are matched by text in one position
 and are ordinary identifiers everywhere else: the ATTRIBUTE names in
 `[...]` position (`derive`, `service`, `client_service`, `extern`,
 `must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated`, `internal`, `resource` — `resource` was a keyword until B413
-made it the `[resource]` attribute), and the jump TARGETS `break` and
+`deprecated`, `internal`, `resource`, `hint` — `resource` was a keyword
+until B413 made it the `[resource]` attribute), and the jump TARGETS `break` and
 `continue` after `jump`. All remain usable as ordinary identifiers
 elsewhere, with one exception: `void` may not be a
 BINDER's name (a `let`, a `for` binder, a function parameter, a match

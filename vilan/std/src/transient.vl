@@ -136,7 +136,8 @@ async external fun guarded_async<T>(body: async || T): Result<T, str>;
 /// reply it produces anyway is dropped, so a slow answer to an old question never
 /// overwrites a fast answer to the new one. Releasing the seal (its owner going)
 /// drops the in-flight reply too.
-export struct Transient<T, E> {
+export [hint(TransientSource<T, E>)]
+struct Transient<T, E> {
 	cell: SignalCell<TransientState<T, E>>,
 	// Claimed per task; an outcome is applied only while its claim is the newest.
 	generation: Shared<i32>,

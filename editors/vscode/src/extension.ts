@@ -216,7 +216,11 @@ const installDirectory = process.platform === 'win32' ? '%USERPROFILE%\\.vilan\\
 function readFeatureConfig(): object {
     const config = workspace.getConfiguration('vilan');
     return {
-        inlayHints: { enabled: config.get<boolean>('inlayHints.enabled', true) },
+        inlayHints: {
+            enabled: config.get<boolean>('inlayHints.enabled', true),
+            // E227: a `[hint]`ed type by the trait it is used as (`~Source<T>`).
+            abbreviate: config.get<boolean>('inlayHints.abbreviate', true),
+        },
         semanticTokens: { enabled: config.get<boolean>('semanticTokens.enabled', true) },
         completion: { functionCall: config.get<string>('completion.functionCall', 'full') },
         // E222: not the setting — whether the override is INSTALLED. The two

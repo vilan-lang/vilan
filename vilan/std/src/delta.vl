@@ -1277,7 +1277,8 @@ fun apply_ops<T>(cell: ListCell<T>, ops: List<SeqOp<T>>) {
 /// What `.memo()` seals a collection pipe into: a read-only granular source over
 /// one `ListCell` (R23, R28's read-only face). It is a `CollSource`, so a pipeline
 /// starts from it again, `each` follows its ops, and it is data — pass it anywhere.
-export struct ListMemo<T> {
+export [hint(CollSource<T>)]
+struct ListMemo<T> {
 	cell: ListCell<T>,
 }
 
@@ -1913,7 +1914,8 @@ fun mapped_ops<T, U>(events: List<ElementEvent<T, U>>): List<SeqOp<U>> {
 }
 
 /// `flatten` as a stage: `map` over the identity, every element followed.
-export [resource] struct CollFlatten<F, S, U> {
+export [hint(CollPipe<U>)]
+[resource] struct CollFlatten<F, S, U> {
 	up: F,
 }
 
@@ -1941,7 +1943,8 @@ export impl CollFlatten<type F: CollFlow<type S>, type S: Source<type U>, U> wit
 /// `filter` as a stage: the core's `bool` per element, a mirror of it the events
 /// are replayed on (their positions are each event's own), and the Fenwick index
 /// over the mirror.
-export [resource] struct CollFilter<F, T, R> {
+export [hint(CollPipe<T>)]
+[resource] struct CollFilter<F, T, R> {
 	up: F,
 	keep: (|T| R) context (owner_scope, ambient_nursery),
 }
@@ -2152,7 +2155,8 @@ fun kept_ops<T, V, U>(
 /// `any`/`all`/`count` as a stage: a SCALAR pipe over a counter (§6.2) — what
 /// arrived is added, what left subtracted, a flip moves it by one — finished into
 /// the answer on every pull.
-export [resource] struct CollTally<F, T, R, U> {
+export [hint(Pipe<U>)]
+[resource] struct CollTally<F, T, R, U> {
 	up: F,
 	test: (|T| R) context (owner_scope, ambient_nursery),
 	finish: |usize, usize| U,
@@ -2285,7 +2289,8 @@ export impl type F: Flow<List<type T: PartialEq>> {
 }
 
 /// `.coll()` as a stage.
-export [resource] struct Coll<F, T> {
+export [hint(CollPipe<T>)]
+[resource] struct Coll<F, T> {
 	up: F,
 }
 
@@ -2345,7 +2350,8 @@ fun span_of<T>(list: List<T>, from: usize, to: usize): List<T> {
 }
 
 /// `.coll_by(key)` as a stage.
-export [resource] struct CollBy<F, T, K> {
+export [hint(CollPipe<T>)]
+[resource] struct CollBy<F, T, K> {
 	up: F,
 	key: |T| K,
 }

@@ -23,9 +23,9 @@ use vilan_core::{
 use vilan_ide::numeric_fix::NumericEdit;
 
 use crate::keystroke::{
-    Anchor, CursorContext, EditTrail, LandedHint, LandedSnapshot, ModuleSymbols, SymbolEntry,
-    SymbolIndex, Verdict, candidates, cursor_context, is_identifier_char, module_name_of,
-    shape_stamp, sort_and_deoverlap, syntax_tokens_in,
+    Anchor, CursorContext, EditTrail, LandedHint, LandedSnapshot, ModuleSymbols, ServedHint,
+    SymbolEntry, SymbolIndex, Verdict, candidates, cursor_context, is_identifier_char,
+    module_name_of, shape_stamp, sort_and_deoverlap, syntax_tokens_in,
 };
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
@@ -3741,6 +3741,22 @@ impl Document {
                 signature.push_str(&format!(" = {value}"));
             }
             let mut out = format!("```vilan\n{signature}\n```");
+            // E227 (Q5): the abbreviation beneath the full type, when the inlay
+            // hint shows one — outside the fence, because the fence is vilan
+            // and `~` is not. The reader who wonders what the hint means
+            // hovers the name, and learns the mapping here.
+            if let Some(hint) = program.hint_labels.get(&binding) {
+                let hosts = hint
+                    .hosts
+                    .iter()
+                    .map(|host| format!("`{host}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "\n\nShown as `{}` (`[hint]` on {hosts})",
+                    hint.label
+                ));
+            }
             if let Some(docs) = self.analysis(program).doc_comment_of(binding) {
                 out.push_str("\n\n");
                 out.push_str(&docs);
@@ -4162,6 +4178,11 @@ impl Document {
             hints.push(LandedHint {
                 name: variable.name_span,
                 label: format!(": {label}"),
+                // E227: the abbreviated form, where a `[hint]` gave one.
+                abbreviated: program
+                    .hint_labels
+                    .get(id)
+                    .map(|hint| format!(": {}", hint.label)),
             });
         }
         hints.sort_by_key(|hint| hint.name.end);
@@ -4623,10 +4644,27 @@ impl Document {
     /// follows the edits since its analysis (E232 — the edited line's hints
     /// stay in place instead of jumping), served unchanged rather than
     /// flickered off when stale, withheld entirely when no anchor survives.
+    #[cfg(test)]
     pub fn keystroke_hints(&self, dependency_moved: bool) -> Vec<(usize, String)> {
+        self.keystroke_hints_served(dependency_moved, false)
+            .into_iter()
+            .map(|hint| (hint.offset, hint.label))
+            .collect()
+    }
+
+    /// [`keystroke_hints`](Self::keystroke_hints) as the handler serves them:
+    /// with `abbreviate` (`vilan.inlayHints.abbreviate`, E227) a hinted node's
+    /// abbreviated label, carrying the full type for the hint's tooltip. Both
+    /// forms are in the landed capture, so the setting switches live, with no
+    /// re-analysis.
+    pub fn keystroke_hints_served(
+        &self,
+        dependency_moved: bool,
+        abbreviate: bool,
+    ) -> Vec<ServedHint> {
         let verdict = self.keystroke_verdict(dependency_moved);
         let trail = EditTrail::of(self.live_edits.as_deref(), self.analyzed_text(), &self.text);
-        self.landed.hints_for(&trail, verdict)
+        self.landed.hints_for(&trail, verdict, abbreviate)
     }
 
     /// Completion candidates at a LIVE `offset`, answered from the symbol
@@ -29483,6 +29521,224 @@ mod twin_routing_tests {
             document.twin_legs.is_empty(),
             "released with the program (M63)"
         );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E227 (`proposal/inlay-hint-abbreviation.md` §7, ruled R-d): a type shown
+/// by the trait it is used as, in the inlay hint only.
+#[cfg(test)]
+mod hint_abbreviation_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    fn analyzed(tag: &str, text: &str) -> (PathBuf, Document) {
+        let directory =
+            std::env::temp_dir().join(format!("vilan_e227_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let entry = directory.join("main.vl");
+        let document = Document::analyze(text, &std_root(), &entry);
+        (directory, document)
+    }
+
+    /// The served hint after `name`'s first occurrence, abbreviated.
+    fn served(document: &Document, text: &str, name: &str) -> Option<ServedHint> {
+        let at = text.find(name)? + name.len();
+        document
+            .keystroke_hints_served(false, true)
+            .into_iter()
+            .find(|hint| hint.offset == at)
+    }
+
+    const NODES: &str = "import std::reactive::{ Flow, Pipe, SignalCell, Source, combine };\n\n\
+         fun main() {\n\
+         \tlet names = SignalCell::new([\"a\", \"b\"]);\n\
+         \tlet index = SignalCell::new(0usize);\n\
+         \tlet selected = combine((names, index)).derive(|(list, at)| list.get(at));\n\
+         \tlet pair = (combine((names, index)).derive(|(list, at)| list.get(at)), 3);\n\
+         \tlet sealed = combine((names, index)).memo();\n\
+         \tlet taken = [1, 2, 3, 4].iter().map(|x| x * 2).filter(|x| x > 2).take(1);\n\
+         \tlet cell = SignalCell::new(1);\n\
+         \tlet numbers = [1, 2];\n\
+         \tprint(i\"{selected.sample()} {pair.1} {sealed.get().1} {taken.count()} {cell.get()} {numbers.len()}\");\n\
+         }\n";
+
+    #[test]
+    fn inlay_hint_abbreviates_a_hinted_node() {
+        let (directory, document) = analyzed("node", NODES);
+        let hint = served(&document, NODES, "selected").expect("a hint on `selected`");
+        assert_eq!(hint.label, ": ~Pipe<Option<str>>");
+        assert_eq!(
+            hint.full.as_deref(),
+            Some(": Derive<Combine<(List<str>, usize)>, (List<str>, usize), Option<str>>"),
+            "the full type rides along, for the tooltip"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn inlay_hint_abbreviates_a_nested_node_inside_a_tuple() {
+        let (directory, document) = analyzed("nested", NODES);
+        let hint = served(&document, NODES, "pair").expect("a hint on `pair`");
+        assert_eq!(hint.label, ": (~Pipe<Option<str>>, i32)");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// tracking-44's tracked `derive(|| ..)` is a pipe stage like any other,
+    /// and collections-44's stages and seal show as the collection traits
+    /// they are: `.coll()` as `~CollPipe<T>`, `.memo()`'s `ListMemo` as
+    /// `~CollSource<T>`.
+    #[test]
+    fn inlay_hint_abbreviates_tracked_and_collection_stages() {
+        let text = "import std::option::Option::{ self, None, Some };\n\
+             import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, comp, derive };\n\n\
+             fun main() {\n\
+             \tlet a = SignalCell::new(1);\n\
+             \tlet tracked = derive(|| a.track() + 1);\n\
+             \tlet fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);\n\
+             \tlet kept = fetched.coll();\n\
+             \tlet (evens, scope) = comp(|| fetched.coll().filter(|n| n % 2 == 0).memo());\n\
+             \tprint(i\"{tracked.sample()} {evens.get().len()}\");\n\
+             \tscope.dispose();\n}\n";
+        let (directory, document) = analyzed("tracked_coll", text);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the fixture compiles: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| error.msg.clone())
+                .collect::<Vec<_>>()
+        );
+        let label = |name: &str| served(&document, text, name).map(|hint| hint.label);
+        assert_eq!(label("tracked").as_deref(), Some(": ~Pipe<i32>"));
+        assert_eq!(label("kept").as_deref(), Some(": ~CollPipe<i32>"));
+        assert_eq!(label("evens").as_deref(), Some(": ~CollSource<i32>"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// `.transient()`'s seal (A142 S3) is shown as the `TransientSource` it
+    /// is — the trait that carries `state()`, `latest()` and `is_pending()`,
+    /// which a bare `~Source<Option<T>>` would hide.
+    #[test]
+    fn inlay_hint_abbreviates_a_transient_seal_as_its_transient_source() {
+        let text = "import std::reactive::{ Flow, Pipe, SignalCell, Source };\n\
+             import std::transient::{ Transient, TransientSource };\n\n\
+             async fun double(x: i32): i32 {\n\tx * 2\n}\n\n\
+             fun main() {\n\tlet id = SignalCell::new(1);\n\
+             \tlet loaded = id.derive(|x: i32| async double(x)).transient();\n\
+             \tprint(i\"{loaded.get()}\");\n}\n";
+        let (directory, document) = analyzed("transient", text);
+        let hint = served(&document, text, "loaded").expect("a hint on `loaded`");
+        assert_eq!(hint.label, ": ~TransientSource<i32, str>");
+        assert_eq!(hint.full.as_deref(), Some(": Transient<i32, str>"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A SEALED face (A142 R11): `.memo()` hands back a `MemoCell`, shown
+    /// as the `Source` it is.
+    #[test]
+    fn inlay_hint_abbreviates_a_sealed_memo_as_its_source() {
+        let (directory, document) = analyzed("sealed", NODES);
+        let hint = served(&document, NODES, "sealed").expect("a hint on `sealed`");
+        assert_eq!(hint.label, ": ~Source<(List<str>, usize)>");
+        assert_eq!(hint.full.as_deref(), Some(": MemoCell<(List<str>, usize)>"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn inlay_hint_abbreviates_an_iterator_adapter_chain() {
+        let (directory, document) = analyzed("iterator", NODES);
+        let hint = served(&document, NODES, "taken").expect("a hint on `taken`");
+        assert_eq!(hint.label, ": ~Iterator<i32>");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn inlay_hint_leaves_an_unhinted_type_whole() {
+        let (directory, document) = analyzed("whole", NODES);
+        for (name, full) in [("cell", ": SignalCell<i32>"), ("numbers", ": List<i32>")] {
+            let hint = served(&document, NODES, name).expect("a hint");
+            assert_eq!(hint.label, full, "{name}");
+            assert_eq!(hint.full, None, "{name}: nothing abbreviated, no tooltip");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+        // A program that names no hinted type has an EMPTY table.
+        let plain = "import std::reactive::{ SignalCell, Source };\n\nfun main() {\n\tlet cell = SignalCell::new(1);\n\tprint(i\"{cell.get()}\");\n}\n";
+        let (directory, document) = analyzed("plain", plain);
+        let program = document.program.as_ref().expect("a program");
+        assert!(program.hint_labels.is_empty(), "{:?}", program.hint_labels);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_setting_off_serves_every_hint_whole() {
+        let (directory, document) = analyzed("off", NODES);
+        let at = NODES.find("selected").unwrap() + "selected".len();
+        let hint = document
+            .keystroke_hints_served(false, false)
+            .into_iter()
+            .find(|hint| hint.offset == at)
+            .expect("a hint");
+        assert_eq!(
+            hint.label,
+            ": Derive<Combine<(List<str>, usize)>, (List<str>, usize), Option<str>>"
+        );
+        assert_eq!(hint.full, None);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn hover_shows_both_forms_and_only_when_they_differ() {
+        let (directory, document) = analyzed("hover", NODES);
+        let hover = document
+            .hover(NODES.find("selected").unwrap() + 1)
+            .expect("a hover");
+        assert!(
+            hover.contains(
+                "let selected: Derive<Combine<(List<str>, usize)>, (List<str>, usize), Option<str>>"
+            ),
+            "the fence keeps the full type: {hover}"
+        );
+        assert!(
+            hover.contains("Shown as `~Pipe<Option<str>>` (`[hint]` on `Derive`)"),
+            "{hover}"
+        );
+        let plain = document
+            .hover(NODES.find("cell =").unwrap() + 1)
+            .expect("a hover");
+        assert!(!plain.contains("Shown as"), "{plain}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A package author's own lever, and Q3's rule: the abbreviation is
+    /// admitted PER INSTANTIATION. `Node`'s impl provides `Stream<U>` only over
+    /// a `Stream` upstream, so a `Node` over an `i32` — a value the struct
+    /// admits and the impl does not — hints its full type: the abbreviation
+    /// never promises what the value lacks.
+    #[test]
+    fn an_instantiation_the_impl_does_not_admit_hints_its_full_type() {
+        let text = "trait Stream<T> {\n\tfun peek(self): T;\n}\n\n\
+             struct Cell<T> {\n\tvalue: T,\n}\n\n\
+             impl Cell<type T> with Stream<T> {\n\tfun peek(self): T {\n\t\tself.value\n\t}\n}\n\n\
+             [hint(Stream<U>)]\n\
+             struct Node<S, T, U> {\n\tup: S,\n\tstep: |T| U,\n}\n\n\
+             impl Node<type S: Stream<type T>, T, type U> with Stream<U> {\n\
+             \tfun peek(self): U {\n\t\t(self.step)(self.up.peek())\n\t}\n}\n\n\
+             fun main() {\n\
+             \tlet streamed = Node { up = Cell { value = 2 }, step = |x: i32| x > 1 };\n\
+             \tlet stranded = Node { up = 5, step = |x: i32| x > 1 };\n\
+             \tprint(i\"{streamed.peek()} {stranded.up}\");\n}\n";
+        let (directory, document) = analyzed("admission", text);
+        let streamed = served(&document, text, "streamed").expect("a hint");
+        assert_eq!(streamed.label, ": ~Stream<bool>");
+        let stranded = served(&document, text, "stranded").expect("a hint");
+        assert_eq!(
+            stranded.label, ": Node<i32, i32, bool>",
+            "not admitted: the full type, never a claim the value cannot keep"
+        );
+        assert_eq!(stranded.full, None);
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

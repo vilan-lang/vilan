@@ -1452,6 +1452,27 @@ pub struct Labels<'src> {
     /// enum the attribute is the declaration's own kind flag and never lands
     /// here.
     pub resource: bool,
+    /// `[hint(Trait<..>)]` (E227): the trait application a struct or an enum
+    /// is SHOWN as in an inlay hint — `[hint(Source<U>)]` on
+    /// `struct Map<S, T, U>` hints a `Map<..>` as `~Source<..>`. The argument
+    /// is a TYPE, in the declaration's own generic parameters (the one
+    /// built-in attribute whose argument is). As written, every occurrence:
+    /// empty when absent, and more than one is the analyzer's refusal, not a
+    /// parse error. It changes nothing a program means.
+    pub hint: Vec<HintArgument<'src>>,
+}
+
+/// One `[hint(..)]`'s written type (E227). Shared, not owned: [`Labels`] is
+/// cloned wherever a declaration's labels are recorded (`item_labels`), and a
+/// [`Node`] is deliberately not `Clone` — the argument is one tree, read in
+/// place. Two are equal when they are the SAME written argument.
+#[derive(Debug, Clone)]
+pub struct HintArgument<'src>(pub std::sync::Arc<Spanned<Node<'src>>>);
+
+impl PartialEq for HintArgument<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 // An explicit enum backing value, `= ( (-)? NUMBER | STRING )`

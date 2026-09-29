@@ -87,6 +87,7 @@ uses that working tree instead; **`vilan.stdPath`** overrides both.
 | `vilan.server.path` | string | `vilan-lsp` | Path to the `vilan-lsp` executable (on `PATH`, or absolute). |
 | `vilan.stdPath` | string | `""` | Path to the `std` source root (`vilan/std/src`). Overrides auto-discovery; sets `VILAN_STD` for the server. |
 | `vilan.inlayHints.enabled` | boolean | `true` | Show inlay type hints. Applies live. |
+| `vilan.inlayHints.abbreviate` | boolean | `true` | Show a type that declares `[hint(Trait<..>)]` by the trait it is used as — `: ~Source<Option<str>>` rather than its whole pipeline type; the full type stays in the tooltip and hover. Applies live. |
 | `vilan.semanticTokens.enabled` | boolean | `true` | Use analyzer-based semantic highlighting; when off, the TextMate grammar is used. Applies live. |
 | `vilan.completion.functionCall` | `none` \| `parensOnly` \| `full` | `full` | How completion inserts a function or method call. |
 | `vilan.organizeImports.onSave` | boolean | `false` | Run Organize Imports before each save. |

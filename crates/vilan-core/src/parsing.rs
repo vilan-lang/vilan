@@ -1424,6 +1424,7 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "deprecated",
     "internal",
     "resource",
+    "hint",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -8277,8 +8278,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         // function's prefix gives the three.
         let deprecated = self.parse_deprecated_attribute();
         let internal = self.parse_internal_attribute();
+        // E227: `[hint(..)]` is a label ABOUT the declaration, so it sits with
+        // the two above and ahead of `[platform]`, which is about analysis.
+        let mut hint = Vec::new();
+        while let Some(written) = self.parse_hint_attribute() {
+            hint.push(crate::node::HintArgument(std::sync::Arc::new(written)));
+        }
         let platform = self.parse_platform_attribute().unwrap_or_default();
-        if deprecated.is_none() && internal.is_none() && platform.is_empty() {
+        if deprecated.is_none() && internal.is_none() && hint.is_empty() && platform.is_empty() {
             return None;
         }
         Some(Box::new(Labels {
@@ -8286,7 +8293,27 @@ impl<'a, 'src> Parser<'a, 'src> {
             internal,
             platform,
             resource: false,
+            hint,
         }))
+    }
+
+    /// `[hint(Trait<..>)]` (E227) — the trait application an inlay hint shows
+    /// the declaration as, parsed by the ordinary `parse_type`: it names the
+    /// declaration's generic parameters before they are declared, which is
+    /// resolution's business, not the parser's. `None` when no hint leads.
+    fn parse_hint_attribute(&mut self) -> Option<Spanned<Node<'src>>> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("hint")) {
+                return None;
+            }
+            parser.bump();
+            parser.expect_ctrl('(')?;
+            let written = parser.parse_type()?;
+            parser.expect_ctrl(')')?;
+            parser.expect_ctrl(']')?;
+            Some(written)
+        })
     }
 
     /// `[platform("…", …)]? mod self;` — the host of the FILE's own
@@ -10099,6 +10126,46 @@ mod tests {
         match only_item("impl Region { fun f(self) {} }") {
             Node::Impl(_, _, _, None) => {}
             other => panic!("an unlabelled impl carries none: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hint_label_carries_its_type_and_sits_between_internal_and_platform() {
+        // E227: the argument is parsed as a TYPE; every occurrence is kept
+        // (a second is the analyzer's refusal, not a parse error).
+        fn hints_of(source: &str) -> Vec<String> {
+            match only_item(source) {
+                Node::Struct(.., labels) | Node::Enum(.., labels) => labels
+                    .map(|labels| {
+                        labels
+                            .hint
+                            .iter()
+                            .map(|hint| source[hint.0.1.into_range()].to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                other => panic!("expected a labelled declaration, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            hints_of("[hint(Source<U>)] struct Map<S, T, U> { up: S }"),
+            vec!["Source<U>"]
+        );
+        assert_eq!(
+            hints_of(
+                "[internal(\"n\")] [hint(Iterator<(usize, T)>)] [platform(\"browser\")] [resource] struct E<I, T> { up: I }"
+            ),
+            vec!["Iterator<(usize, T)>"]
+        );
+        assert_eq!(
+            hints_of("[hint(A<T>)] [hint(B<T>)] enum Two<T> { One(T) }"),
+            vec!["A<T>", "B<T>"]
+        );
+        assert!(hints_of("struct Plain {}").is_empty());
+        // Still an ordinary name everywhere else.
+        match only_item("let hint = 3;") {
+            Node::Let(..) => {}
+            other => panic!("`hint` is a plain binder: {other:?}"),
         }
     }
 

@@ -860,22 +860,51 @@ impl LandedSnapshot {
     /// bytes. [`Verdict::Unusable`] (nothing byte-identical survives, or
     /// nothing landed) still withholds everything: there is no position left
     /// to follow.
-    pub fn hints_for(&self, trail: &EditTrail<'_>, verdict: Verdict) -> Vec<(usize, String)> {
+    ///
+    /// `abbreviate` (E227, `vilan.inlayHints.abbreviate`) serves a hinted
+    /// node's abbreviated label (`: ~Source<i32>`) with the full one as its
+    /// tooltip; off, every hint is the full type, as before E227.
+    pub fn hints_for(
+        &self,
+        trail: &EditTrail<'_>,
+        verdict: Verdict,
+        abbreviate: bool,
+    ) -> Vec<ServedHint> {
         if verdict == Verdict::Unusable {
             return Vec::new();
         }
-        let mut hints: Vec<(usize, String)> = self
+        let mut hints: Vec<ServedHint> = self
             .hints
             .iter()
             .filter_map(|hint| {
-                trail
-                    .follow(hint.name)
-                    .map(|name| (name.end, hint.label.clone()))
+                let name = trail.follow(hint.name)?;
+                Some(match (&hint.abbreviated, abbreviate) {
+                    (Some(abbreviated), true) => ServedHint {
+                        offset: name.end,
+                        label: abbreviated.clone(),
+                        full: Some(hint.label.clone()),
+                    },
+                    _ => ServedHint {
+                        offset: name.end,
+                        label: hint.label.clone(),
+                        full: None,
+                    },
+                })
             })
             .collect();
-        hints.sort();
+        hints.sort_by(|left, right| (left.offset, &left.label).cmp(&(right.offset, &right.label)));
         hints
     }
+}
+
+/// One inlay hint as the handler sends it: its LIVE offset, the label shown,
+/// and — when the label is an abbreviation (E227) — the full type, which the
+/// hint's tooltip carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedHint {
+    pub offset: usize,
+    pub label: String,
+    pub full: Option<String>,
 }
 
 /// One inlay hint as an analysis landed it: the binding NAME it follows, in
@@ -887,7 +916,12 @@ impl LandedSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LandedHint {
     pub name: Span,
+    /// The full type, `: Map<..>` — hover's, and every hint's when
+    /// `vilan.inlayHints.abbreviate` is off.
     pub label: String,
+    /// E227: `: ~Source<..>` where a `[hint]` abbreviates the type, else
+    /// `None`.
+    pub abbreviated: Option<String>,
 }
 
 /// How the live buffer got from the analyzed text (E232): the ordered edits

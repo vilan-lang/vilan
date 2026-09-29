@@ -125,6 +125,7 @@ fn member_name_of<'src>(program: &Program<'src>, access: Id) -> Option<&'src str
 pub fn check(program: &mut Program) {
     refuse_local_labels(program);
     refuse_impl_labels(program);
+    refuse_misplaced_hints(program);
     warn_deprecated_uses(program);
     if program.lints.internal_use == LintLevel::Warn {
         warn_internal_uses(program);
@@ -308,6 +309,45 @@ fn refuse_impl_labels(program: &mut Program) {
                       and nobody names an `impl` block — write the label on the members it \
                       is about"
                     .to_string(),
+            },
+            source,
+        );
+    }
+}
+
+/// E227: `[hint(Trait<..>)]` abbreviates a TYPE in an inlay hint, so it
+/// labels a struct or an enum. The shared prefix admits it ahead of a trait,
+/// a module `let` and an `impl` block too, where there is no type of the
+/// declaration's own to abbreviate: refused, at the argument.
+fn refuse_misplaced_hints(program: &mut Program) {
+    let mut refused: Vec<(Span, SourceId, &'static str)> = program
+        .item_labels
+        .iter()
+        .filter(|(id, _)| !program.structs.contains_key(*id) && !program.enums.contains_key(*id))
+        .flat_map(|(id, labels)| {
+            let kind = if program.traits.contains_key(id) {
+                "a trait"
+            } else if program.variables.contains_key(id) {
+                "a module binding"
+            } else {
+                "an `impl` block"
+            };
+            let source = program.diagnostic_source_of(*id);
+            labels.hint.iter().map(move |hint| (hint.0.1, source, kind))
+        })
+        .collect();
+    refused.sort_by_key(|(span, source, _)| (source.0, span.start));
+    for (span, source, kind) in refused {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`[hint(..)]` names the trait a struct or an enum is shown as in an inlay \
+                     hint, and {kind} is not a type — write it on the struct or enum whose \
+                     values the hint is about"
+                ),
             },
             source,
         );

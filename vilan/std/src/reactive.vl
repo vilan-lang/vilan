@@ -1792,7 +1792,8 @@ export fun derive<T>(
 }
 
 /// The free `derive` as a stage: its body, and nothing upstream.
-export [resource] struct TrackedDerive<T> {
+export [hint(Pipe<T>)]
+[resource] struct TrackedDerive<T> {
 	body: (|| T) context (owner_scope, tracking, ambient_nursery),
 }
 
@@ -2535,7 +2536,8 @@ export impl SignalCell<type T> {
 ///
 /// One cell underneath, so a memo read by N consumers ran its chain once per change,
 /// whatever N is.
-export struct MemoCell<T> {
+export [hint(Source<T>)]
+struct MemoCell<T> {
 	cell: SignalCell<T>,
 }
 
@@ -2771,7 +2773,8 @@ fun detach_held(handle: Shared<Option<Subscription>>) {
 /// every type it mentions, so the upstream's `T` is a parameter of the struct. The
 /// transform is held plain (`|T| U`, not `sync |T| U`): `sync` is accepted on a
 /// parameter and not on a field, so it is checked where the stage is built.
-export [resource] struct Derive<S, T, U> {
+export [hint(Pipe<U>)]
+[resource] struct Derive<S, T, U> {
 	up: S,
 	transform: (|T| U) context (owner_scope, tracking, ambient_nursery),
 }
@@ -2832,7 +2835,8 @@ export impl Derive<type S: Flow<type T>, T, type U> with Pipe<U> {}
 /// (`type I: Flow<U>, type U`) rather than read out of `I`'s bound (A124 S2b: read
 /// out of the bound, an inherited default's observer parameter is the trait's
 /// unsubstituted `T`).
-export [resource] struct Switch<S, T, I, U> {
+export [hint(Pipe<U>)]
+[resource] struct Switch<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
 }
@@ -2896,7 +2900,8 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Pipe<U
 /// `switch_some` as a stage (A142 R8): `Switch` over a flow of `Option<T>`, where
 /// `None` DETACHES — nothing is followed and the stage reads `None` — and `Some(x)`
 /// follows the flow `select` builds for `x`, wrapped.
-export [resource] struct SwitchSome<S, T, I, U> {
+export [hint(Pipe<Option<U>>)]
+[resource] struct SwitchSome<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
 }
@@ -2991,7 +2996,8 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 /// `None`; `Some(value)` follows the `Flow<Option<U>>` that `select` builds for it,
 /// and the two absences collapse into one. The instance is `SwitchSome`'s, without
 /// the wrapping.
-export [resource] struct AndThen<S, T, I, U> {
+export [hint(Pipe<Option<U>>)]
+[resource] struct AndThen<S, T, I, U> {
 	up: S,
 	select: (|T| I) context (owner_scope, tracking, ambient_nursery),
 }
@@ -3086,7 +3092,8 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 /// the stage follows `source`, as `Some`; while it is false it reads `None` and is
 /// detached. It takes a `Source` rather than a pipe because it starts the followed
 /// flow afresh each time the flag TURNS true, and a pipe starts once.
-export [resource] struct ThenSome<F, S, T> {
+export [hint(Pipe<Option<T>>)]
+[resource] struct ThenSome<F, S, T> {
 	up: F,
 	source: S,
 }
@@ -3142,7 +3149,8 @@ export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Pipe<Op
 /// current values. Its attach forwards the SAME subscriber to every input, so a
 /// diamond standing on one root puts one consumer's record on it once per arm — and
 /// a turn calls it once. The handle disposes every arm.
-export [resource] struct Combine<T: (2..)> {
+export [hint(Pipe<T>)]
+[resource] struct Combine<T: (2..)> {
 	sources: (U in T: dyn Source<U>),
 }
 
@@ -3182,7 +3190,8 @@ export impl Combine<type T> with Pipe<T> {}
 /// The last value is the INSTANCE's state: the relay reads the upstream once per
 /// change, keeps what it read, and the consumer's pull reads what was kept — so the
 /// chain above runs once per change, not once per read.
-export [resource] struct Distinct<S, T> {
+export [hint(Pipe<T>)]
+[resource] struct Distinct<S, T> {
 	up: S,
 }
 
@@ -3223,7 +3232,8 @@ export impl Distinct<type S: Flow<T>, type T: PartialEq> with Pipe<T> {}
 
 /// `.distinct_by(key)` as a stage (A142 R7): `Distinct`, comparing `key` of the
 /// value rather than the value, and passing the whole value on.
-export [resource] struct DistinctBy<S, T, K> {
+export [hint(Pipe<T>)]
+[resource] struct DistinctBy<S, T, K> {
 	up: S,
 	key: |T| K,
 }

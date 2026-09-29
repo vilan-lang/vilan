@@ -68,6 +68,23 @@ it down, typing after it or below it leaves it alone — and keeps its last
 analysed type until the next analysis replaces the set; deleting the name
 it follows removes it.
 
+A pipeline node's type spells its whole upstream, so a type whose
+declaration carries **`[hint(Trait<..>)]`** is hinted by the trait it is
+used as: `let selected = combine((names, index)).derive(..)` shows
+`: ~Pipe<Option<str>>`, not `: Derive<Combine<(List<str>, usize)>, …>`. The
+`~` marks the abbreviation — it lexes nowhere, so it cannot be mistaken
+for a type you could write — and a node nested in another type
+abbreviates in place (`(~Pipe<Option<str>>, i32)`). It is printed only
+when the value's own instantiation is admitted by an impl of that trait,
+so it never promises what the value lacks. The hint's tooltip carries the
+full type, and hover shows both: the full type in the declaration, and
+*Shown as `~Pipe<Option<str>>`* beneath it. std's pipe stages
+(`~Pipe<T>`) and collection stages (`~CollPipe<T>`, sealed as
+`~CollSource<T>`), its sealed `MemoCell` and `RemoteSource` (`~Source<..>`),
+`.transient()`'s seal (`~TransientSource<T, E>`) and
+its iterator adapters (`~Iterator<T>`) carry the attribute, and a package's
+own types can too. `vilan.inlayHints.abbreviate` turns it off.
+
 **Semantic highlighting** from the analyzer, over the TextMate grammar,
 which also highlights `vilan` fences inside Markdown.
 
@@ -362,6 +379,7 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 | `vilan.server.path` | — | an explicit `vilan-lsp` binary; changing it restarts the client |
 | `vilan.stdPath` | — | an explicit `std` root, overriding discovery |
 | `vilan.inlayHints.enabled` | `true` | |
+| `vilan.inlayHints.abbreviate` | `true` | show a `[hint]`ed type by its trait, `~Source<T>`; off shows every full type |
 | `vilan.semanticTokens.enabled` | `true` | off falls back to the TextMate grammar |
 | `vilan.completion.functionCall` | `full` | `parensOnly`, or `none` |
 | `vilan.autoClosing.generics` | `true` | pair a generic `<` and type over its `>`; off for Vim emulation |

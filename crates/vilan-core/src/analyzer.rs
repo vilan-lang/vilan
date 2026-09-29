@@ -15,8 +15,10 @@ use crate::target::{Platform, PlatformPattern};
 use crate::type_::{SubstitutionContext, Type, TypeId};
 use crate::util::{join_with, plural};
 
+mod hint_labels;
 mod liveness;
 
+pub use hint_labels::HintLabel;
 pub use liveness::DropExtent;
 
 /// Distinguishes the recursive type operations that resolve generics through a
@@ -3999,6 +4001,13 @@ pub struct Analyzer<'src> {
     /// `labels::check` reads to tell an import line's own name rows (which are
     /// not uses) from the uses it warns at.
     import_statement_spans: Vec<(SourceId, Span)>,
+    /// E227: every `[hint(..)]` a struct or an enum carries, banked by the walk
+    /// in the declaration's generic scope (`hint_labels.rs`).
+    pending_hints: Vec<hint_labels::PendingHint>,
+    /// E227: the resolved `[hint(..)]` table — declaration → the trait
+    /// application it is shown as — rebuilt from `pending_hints` once names
+    /// have resolved. The one table the inlay-hint renderer reads.
+    hint_attributes: HashMap<Id, hint_labels::HintAttribute>,
     /// B318 S4: the cross-module inherent collisions the declaration-site rule
     /// banks for the IMPORT pass ([`MemberCollision`]). Empty for every program
     /// in which no two files declare one inherent name for one subject — the
@@ -6380,6 +6389,8 @@ impl<'src> Analyzer<'src> {
             declined_default_calls: HashMap::default(),
             source_paths: Vec::new(),
             import_statement_spans: Vec::new(),
+            pending_hints: Vec::new(),
+            hint_attributes: HashMap::default(),
             cross_module_collisions: Vec::new(),
             blanket_residues: Vec::new(),
             scoped_reach_checks: Vec::new(),
@@ -34629,6 +34640,10 @@ impl<'src> Analyzer<'src> {
                     generic_parameters.as_deref(),
                     body_scope_id,
                 );
+                // E227: a `[hint(..)]` names the declaration's own parameters.
+                if let Some(labels) = labels {
+                    self.bank_hint_attributes(id, labels, body_scope_id);
+                }
                 // A bodyless `struct Name;` is only valid when `external`; an
                 // ordinary struct must list its fields in `{ .. }` (possibly
                 // empty).
@@ -34767,6 +34782,10 @@ impl<'src> Analyzer<'src> {
                     generic_parameters.as_deref(),
                     body_scope_id,
                 );
+                // E227: a `[hint(..)]` names the declaration's own parameters.
+                if let Some(labels) = labels {
+                    self.bank_hint_attributes(id, labels, body_scope_id);
+                }
                 // Variants live in the enum's own namespace, reachable through
                 // `use Enum::{ ... }` or `Enum::Variant` — not the outer scope.
                 let variants_scope = self.create_scope(None);
@@ -59600,6 +59619,13 @@ pub struct Program<'src> {
     // language-server hover. Keyed by expr id; `expr_id_to_type_id_map` wins
     // over `resolved_types` where both apply (matching `type_of_expr`).
     pub expr_types: HashMap<Id, String>,
+    /// E227: a VARIABLE's inlay-hint label where it differs from its
+    /// `expr_types` label — a hinted node (`[hint(Source<U>)] struct Map`)
+    /// abbreviated to `~Source<..>` because its instantiation is admitted by
+    /// the hinted impl. Sparse: empty for a program with no hinted type. Read
+    /// by the inlay hint and hover's second line only; everything else keeps
+    /// the full type.
+    pub hint_labels: HashMap<Id, HintLabel>,
     /// Full declaration labels for hover (E9): function signatures,
     /// struct/enum blocks — keyed by declaration id, fenced by the LSP.
     pub declaration_labels: HashMap<Id, String>,
@@ -67934,6 +67960,9 @@ fn analyze_over_world<'src>(
         analyzer.check_partialeq_boundary();
         analyzer.check_rpc_signatures();
         analyzer.check_expose_fields();
+        // E227: every name has resolved and every impl's provided set is
+        // closed, so a `[hint(..)]` can be checked against the impl table.
+        analyzer.resolve_hint_attributes();
         analyzer.check_generic_bound_satisfaction();
         // B161's binding-position twin of the bound check above, in the same place
         // and for the same reason: every binding's type has settled by here.
@@ -68559,6 +68588,11 @@ fn analyze_over_world<'src>(
     // consults it only under `BuildOptions.hmr`, so non-HMR output is unaffected.
     let hmr_bindings = analyzer.compute_hmr_bindings(global_scope_id);
 
+    // E227: the abbreviated inlay-hint labels, where they differ — asked
+    // BEFORE the label loop below, which borrows the analyzer immutably, since
+    // admission is the solver's `&mut` question.
+    let hint_labels = analyzer.hint_labels();
+
     // Pre-render a type label for every typed expression (for hover). Done here
     // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
     // is applied last so it wins over `resolved_types`, matching `type_of_expr`.
@@ -69150,6 +69184,7 @@ fn analyze_over_world<'src>(
         module_children_scopes: std::mem::take(&mut analyzer.module_children_scopes),
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
+        hint_labels,
         declaration_labels,
         call_signature_labels,
         expr_type_ids,

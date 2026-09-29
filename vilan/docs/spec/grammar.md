@@ -288,7 +288,8 @@ std's and a dependency's stay silent.
 ### Structs and enums
 
 ```text
-struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-attr ]
+struct = [ deprecated-label ] [ internal-label ] { hint-label } [ platform-attr ]
+         [ resource-attr ]
          [ "external" ] "struct"
          (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
@@ -297,8 +298,10 @@ field  = [ internal-label ]
 internal-label = "[" "internal" "(" STRING ")" "]" ;
 deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
 resource-attr    = "[" "resource" "]" ;   (* B413 *)
+hint-label       = "[" "hint" "(" type ")" "]" ;   (* E227 *)
 
-enum          = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-attr ]
+enum          = [ deprecated-label ] [ internal-label ] { hint-label } [ platform-attr ]
+                [ resource-attr ]
                 "enum" IDENT
                 [ generic-params ] "{" [ variant { "," variant } [ "," ] ] "}" ;
 variant       = [ internal-label ] NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
@@ -369,6 +372,18 @@ resource (§5.12). `resource` is not a keyword (B413 dissolved
 it into the attribute): it is an ordinary name everywhere else, and the
 retired spelling `resource struct` is refused with a steer to
 `[resource] struct`.
+
+`[hint(Trait<..>)]` (E227) names the trait application a struct or an
+enum is SHOWN as in an editor's inlay hint, written in the declaration's
+own parameters: `[hint(Pipe<U>)] [resource] struct Derive<S, T, U>`
+makes a `Derive<..>` binding hint as `: ~Pipe<..>`. It is the one built-in
+attribute whose argument is a type. It changes nothing a program means,
+and it is checked where it is written: the argument must be a trait
+application, it may name only the declaration's parameters and concrete
+types, some impl of the type must provide that application, and a
+declaration carries at most one. The shared label prefix also reads it
+ahead of a trait, a labelled `let` and an `impl`, where it is refused —
+none of them is a type to abbreviate.
 
 ### Impls and traits
 

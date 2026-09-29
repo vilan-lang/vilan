@@ -186,6 +186,7 @@ impl ListIterator<type T> with Iterator<T> {
 // A closure held in a FIELD is called parenthesized — `(self.fn)(value)` — because
 // method lookup does not fall back to fields.
 
+[hint(Iterator<U>)]
 struct Mapped<I, T, U> {
 	upstream: I,
 	fn: |T| U,
@@ -200,6 +201,7 @@ impl Mapped<type I: Iterator<T>, type T, type U> with Iterator<U> {
 	}
 }
 
+[hint(Iterator<T>)]
 struct Filtered<I, T> {
 	upstream: I,
 	predicate: |T| bool,
@@ -226,6 +228,7 @@ impl Filtered<type I: Iterator<T>, type T> with Iterator<T> {
 	}
 }
 
+[hint(Iterator<U>)]
 struct FilterMapped<I, T, U> {
 	upstream: I,
 	fn: |T| Option<U>,
@@ -253,6 +256,7 @@ impl FilterMapped<type I: Iterator<T>, type T, type U> with Iterator<U> {
 	}
 }
 
+[hint(Iterator<T>)]
 struct Taken<I, T> {
 	upstream: I,
 	remaining: usize,
@@ -268,6 +272,7 @@ impl Taken<type I: Iterator<T>, type T> with Iterator<T> {
 	}
 }
 
+[hint(Iterator<T>)]
 struct Skipped<I, T> {
 	upstream: I,
 	pending: usize,
@@ -288,6 +293,7 @@ impl Skipped<type I: Iterator<T>, type T> with Iterator<T> {
 	}
 }
 
+[hint(Iterator<(usize, T)>)]
 struct Enumerated<I, T> {
 	upstream: I,
 	index: usize,
@@ -304,6 +310,7 @@ impl Enumerated<type I: Iterator<T>, type T> with Iterator<(usize, T)> {
 	}
 }
 
+[hint(Iterator<(T, U)>)]
 struct Zipped<I, J, T, U> {
 	left: I,
 	right: J,
@@ -323,6 +330,7 @@ impl Zipped<type I: Iterator<T>, type J: Iterator<U>, type T, type U> with Itera
 	}
 }
 
+[hint(Iterator<T>)]
 struct Chained<I, J, T> {
 	left: I,
 	right: J,
