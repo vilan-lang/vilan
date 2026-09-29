@@ -497,6 +497,7 @@ tour/coming-from-javascript.md h2 things-to-unlearn
 tour/coming-from-javascript.md h2 where-to-go-next
 tour/control-flow.md h1 control-flow
 tour/control-flow.md h2 if--else
+tour/control-flow.md h2 then--else
 tour/control-flow.md h2 match
 tour/control-flow.md h2 loops
 tour/control-flow.md h2 early-return-ret

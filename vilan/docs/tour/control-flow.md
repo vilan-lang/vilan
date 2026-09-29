@@ -15,7 +15,53 @@ fun main() {
 }
 ```
 
-There is no ternary operator because `if` already is one.
+There is no ternary operator because `if` already is one — and when both
+branches are short, `then`/`else` spells it without the braces.
+
+## `then` / `else`
+
+`cond then a else b` is `if cond { a } else { b }` written infix. It is sugar:
+the compiler reads it as that `if`, so typing, scoping and errors are the
+`if`'s. As a value it needs both branches, exactly as `if` does, and a chain
+reads left to right as an `else if` ladder:
+
+```vilan
+fun sign(n: i32): str {
+	n < 0 then "negative" else n == 0 then "zero" else "positive"
+}
+
+fun main() {
+	let verbose = true;
+	let label = verbose then "loud" else "quiet";
+	print(i"{label} {sign(-3)}");
+}
+```
+
+Written as a STATEMENT — ended by its `;` — each branch is one statement, so
+the two branches need not produce the same type, and either may be left out.
+`cond then S;` runs `S` when `cond` holds, and `cond else S;` runs it when it
+does not — the **guard**, which reads best before the work it protects:
+
+```vilan
+fun first_positive(xs: List<i32>): i32 {
+	for x in xs {
+		x > 0 then ret x;
+	}
+	-1
+}
+
+fun main() {
+	let ready = first_positive([ -1, 4 ]) > 0;
+	ready else print("nothing to do");
+	ready then print("ready") else print("waiting");
+}
+```
+
+The word binds looser than `||` and tighter than `=`: `a || b then x else y`
+tests `a || b`, and `label = ok then "yes" else "no";` assigns the whole form.
+A branch is a single statement with no block of its own, so a `let` there is
+refused — bind it first, or write an `if`. `then` is a keyword only in this
+position; `promise.then(f)` and `let then = 1;` are ordinary names.
 
 ## `match`
 

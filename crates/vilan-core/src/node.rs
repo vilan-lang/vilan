@@ -450,6 +450,33 @@ pub struct If<'src> {
     pub condition: Box<Spanned<Node<'src>>>,
     pub then: Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
     pub else_: Option<Spanned<NodeIfBranch<'src>>>,
+    /// How the `if` was WRITTEN (B459). Read by the formatter, which reprints
+    /// the spelling, by the editor's hover, and by the one rule the sugar adds
+    /// (R15, the guard's bindings); every other pass reads an `if`.
+    pub spelling: IfSpelling,
+}
+
+/// The two spellings of an `if` (B459). The `then`/`else` forms are SUGAR over
+/// the keyword form — `c then a else b` is `if c { a } else { b }`, and the
+/// statement forms `c then S;`, `c else S;` (the guard) and `c then S else S;`
+/// are `if c { S; }`, `if c {} else { S; }` and `if c { S; } else { S; }` — so
+/// they parse to this same node and analysis, emission and diagnostics are the
+/// `if`'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IfSpelling {
+    /// `if c { .. } else { .. }`.
+    Keyword,
+    /// The infix form. `then_word` is the `then` keyword's span (`None` for
+    /// the guard `c else S;`), `else_word` the `else`'s (`None` for `c then
+    /// S;`). `statement` is the READING: a form written at statement position
+    /// and terminated by its `;` is a statement — each branch a statement
+    /// whose value is discarded, so the branches need not unify — and any
+    /// other form is an expression, which needs both branches.
+    Then {
+        then_word: Option<Span>,
+        else_word: Option<Span>,
+        statement: bool,
+    },
 }
 
 #[derive(Debug)]

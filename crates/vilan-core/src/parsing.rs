@@ -60,9 +60,9 @@ use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, ComprehensionBinding, Convention,
     CssBody, CssDeclaration, CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem,
     EnumVariant, ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
-    GenericParameters, If, ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels,
-    Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField,
-    TupleBound,
+    GenericParameters, If, IfSpelling, ImplSelector, ImportBranch, ImportModifier, ImportTail,
+    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr,
+    StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -274,6 +274,27 @@ const A_MEMBER_NAME_AGAINST_ITS_DOT: &str = "a member name written against its `
      break between them, because a `.` at the end of a line would join whatever the next line \
      starts with. A chain continued on the next line breaks BEFORE the dot, and the next line \
      begins `.name()`";
+
+/// The rule a `then` form read as a VALUE without its `else` breaks (B459
+/// Q3, RULED 2026-09-29: "no bare `then` in expression position"). Curated
+/// (diagnostics-standard.md B6): a value needs both branches, exactly as an
+/// `if` used for its value needs its `else`, and the bare form has one reading
+/// — the statement — whose spelling the rule names.
+const THEN_NEEDS_ITS_ELSE: &str = "a `then` used as a VALUE needs its `else`, as an `if` used for its value does — \
+     `ready then a else b`. Without one, `ready then go();` is a STATEMENT, which stands where a \
+     statement does and ends with its `;`";
+
+/// The rule the guard read as a VALUE breaks (B459). Curated: `c else S;` has
+/// no value to give — the branch it names runs when `c` is false and the
+/// other one does not exist — so it is a statement or nothing.
+const THE_GUARD_IS_A_STATEMENT: &str = "`value else S;` is the GUARD, a statement: it stands where a statement does \
+     and ends with its `;` — a value needs both branches, `ready then a else b`";
+
+/// The rule a `let` as a `then`/`else` branch breaks (B459 Q8). Curated: a
+/// branch is ONE statement with no block of its own, so the binding would be
+/// scoped to a block nobody wrote and read by nothing.
+const A_BRANCH_BINDS_NOTHING: &str = "a `then`/`else` branch is one statement with no block of its own, so a `let` \
+     there binds a name nothing can read — bind it before the form, or write an `if` with a block";
 
 /// The rule `fun f(): || void context c` breaks (B343, R9 RULED 2026-09-17).
 /// Curated (diagnostics-standard.md B6): the prohibition explains itself, and
@@ -758,7 +779,104 @@ fn hoist_clause_out_of_a_view(annotation: Spanned<Node<'_>>) -> Spanned<Node<'_>
     }
 }
 
-/// Whether `token` is one of the RESERVED words (`lexing::KEYWORDS`) — the
+/// Whether `node` is a `then`/`else` form (B459) — the one `Node::If` that
+/// is not block-like: it ends at an expression, not at a `}`, so as a
+/// statement it takes the `;` every expression statement takes.
+fn is_then_form(node: &Node<'_>) -> bool {
+    matches!(
+        node,
+        Node::If(NodeIfBranch::If(if_)) if matches!(if_.spelling, IfSpelling::Then { .. })
+    )
+}
+
+/// B459: a `then`/`else` form terminated at STATEMENT position, re-read as
+/// the statement it is (Q6) — each branch a statement whose value is
+/// discarded, so the branches need not unify: `c then f() else g();` is
+/// `if c { f(); } else { g(); }`. A branch that is itself a form is at
+/// statement position too, so the reading recurses (`a then b then f();`,
+/// and the `else`-chain `a then f() else b then g() else h();`). Anything
+/// else comes back unchanged.
+fn read_as_statement(node: Spanned<Node<'_>>) -> Spanned<Node<'_>> {
+    let (Node::If(NodeIfBranch::If(mut if_)), span) = node else {
+        return node;
+    };
+    let IfSpelling::Then {
+        then_word,
+        else_word,
+        statement: false,
+    } = if_.spelling
+    else {
+        return (Node::If(NodeIfBranch::If(if_)), span);
+    };
+    if_.spelling = IfSpelling::Then {
+        then_word,
+        else_word,
+        statement: true,
+    };
+    if_.then = branch_as_statement(if_.then);
+    if_.else_ = if_.else_.map(|(branch, branch_span)| match branch {
+        NodeIfBranch::Else(block) => (NodeIfBranch::Else(branch_as_statement(block)), branch_span),
+        chained => (chained, branch_span),
+    });
+    (Node::If(NodeIfBranch::If(if_)), span)
+}
+
+/// One branch body of [`read_as_statement`]: `{ a }` becomes `{ a; }`, the
+/// tail moved into the statements (itself re-read) and the tail left `Void`
+/// at the branch's last character — where an `if` block's own `Void` sits, on
+/// its `}`. An empty branch (the guard's `then`) is already a statement.
+fn branch_as_statement<'src>(
+    block: Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+) -> Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)> {
+    let ((mut statements, tail), span) = block;
+    if matches!(tail.0, Node::Void) {
+        return ((statements, tail), span);
+    }
+    let end = tail.1.end;
+    statements.push(read_as_statement(*tail));
+    let void_span = Span::from(end.saturating_sub(1)..end);
+    ((statements, Box::new((Node::Void, void_span))), span)
+}
+
+/// The `then`/`else` forms still read as VALUES once the parse is done
+/// (B459): each needs both branches (Q3), and the guard, which has one,
+/// is a statement only. Run over the finished tree, because a form's reading
+/// is its enclosing statement's to decide — `a then b then f();` is a
+/// statement whose inner form, without its own `else`, is legal only once the
+/// outer one has been read as a statement.
+fn refuse_then_forms_read_as_values(root: &Spanned<NodeList<'_>>, errors: &mut Vec<ParseError>) {
+    fn visit(node: &Spanned<Node<'_>>, errors: &mut Vec<ParseError>) {
+        if let Node::If(NodeIfBranch::If(if_)) = &node.0
+            && let IfSpelling::Then {
+                then_word,
+                else_word,
+                statement: false,
+            } = if_.spelling
+        {
+            let refusal = match (then_word, else_word) {
+                (None, Some(word)) => {
+                    Some((word, ParseErrorReason::Rule(THE_GUARD_IS_A_STATEMENT)))
+                }
+                (Some(word), None) => Some((word, ParseErrorReason::Rule(THEN_NEEDS_ITS_ELSE))),
+                _ => None,
+            };
+            if let Some((span, reason)) = refusal {
+                errors.push(ParseError {
+                    span,
+                    reason,
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
+        node.0.for_each_child(&mut |child| visit(child, errors));
+    }
+    for statement in &root.0 {
+        visit(statement, errors);
+    }
+}
+
+/// Whether `token` is one of the RESERVED words (`lexing::KEYWORDS`) — the/// Whether `token` is one of the RESERVED words (`lexing::KEYWORDS`) — the
 /// words the lexer hands back as their own token rather than as a name. The
 /// member tier (B414 S4) admits them wherever a member name stands; a
 /// contextual keyword needs no admitting, since it lexes as an identifier.
@@ -969,6 +1087,8 @@ fn parse_with(
 
     let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
     let root = parser.parse_program();
+    let mut then_form_errors = Vec::new();
+    refuse_then_forms_read_as_values(&root, &mut then_form_errors);
     debug_assert_eq!(
         parser.position,
         tokens.len(),
@@ -1000,6 +1120,7 @@ fn parse_with(
         })
         .collect();
     errors.append(&mut parser.errors);
+    errors.append(&mut then_form_errors);
     // The depth bound's refusal (B142), which was held off `parser.errors` so
     // that `attempt` could not roll it back — see `Parser::nesting_refusal`. It
     // sorts into place with the rest below.
@@ -1173,6 +1294,13 @@ struct Parser<'a, 'src> {
     /// [`keyword_member_readings`], so the editor hovers such a word as the
     /// member it is and not as the keyword it spells.
     member_readings: Vec<usize>,
+    /// The token index at which the statement being parsed begins, while its
+    /// expression is read (B459). A `then`/`else` form that starts THERE may
+    /// be the statement reading — the only place the guard `c else S;` can
+    /// stand — and one that starts anywhere else is an operand. Set and
+    /// restored around each statement's expression, so a statement nested in
+    /// a block inside it has its own.
+    statement_head: Option<usize>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1404,6 +1532,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             import_path_failure: None,
             contextual_readings: Vec::new(),
             member_readings: Vec::new(),
+            statement_head: None,
         }
     }
 
@@ -2319,8 +2448,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         let Some(statement) = self.attempt(|parser| {
             // The three forms that take a terminator — the same three
             // `note_terminator` records one for.
+            let head = parser.position;
             let body = parser
-                .attempt(Self::parse_expression)
+                .attempt(Self::parse_statement_expression)
+                .map(|expression| parser.read_at_statement_position(expression, head))
                 .or_else(|| parser.attempt(Self::parse_import))
                 .or_else(|| parser.attempt(Self::parse_use))?;
             let at_a_fresh_statement = parser.at_end()
@@ -2756,9 +2887,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         // (`if`/`for`/`match`/`{ }`) used as a statement — which needs no `;` but
         // must not be the last thing in its block (chumsky's `not_block_end`).
         if let Some(statement) = self.attempt(|parser| {
-            let expression = parser.parse_expression()?;
+            let head = parser.position;
+            let expression = parser.parse_statement_expression()?;
             if parser.eat_ctrl(';') {
-                return Some(expression);
+                return Some(parser.read_at_statement_position(expression, head));
             }
             // A block-bearing form needs no `;` (chumsky's `not_block_end`). Its
             // own continuation rule is stated where the form is parsed
@@ -3006,6 +3138,37 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.parse_secondary(false)
     }
 
+    /// An expression statement's expression: [`Parser::parse_expression`] with
+    /// the statement's head recorded, so a `then`/`else` form starting there
+    /// may be the statement reading and the guard may stand (B459).
+    fn parse_statement_expression(&mut self) -> Option<Spanned<Node<'src>>> {
+        let outer = self.statement_head.replace(self.position);
+        let expression = self.parse_expression();
+        self.statement_head = outer;
+        expression
+    }
+
+    /// A statement's expression, terminated: a `then`/`else` form that IS the
+    /// statement is re-read as one ([`read_as_statement`]). "Is the statement"
+    /// means it begins at the statement's first token — a parenthesized form
+    /// keeps its inner span, so `(c then f());` is an operand in parentheses
+    /// and stays a value, in the compiler's parse and the formatter's alike.
+    fn read_at_statement_position(
+        &self,
+        expression: Spanned<Node<'src>>,
+        head: usize,
+    ) -> Spanned<Node<'src>> {
+        let starts_the_statement = self
+            .tokens
+            .get(head)
+            .is_some_and(|(_, span)| span.start == expression.1.start);
+        if starts_the_statement {
+            read_as_statement(expression)
+        } else {
+            expression
+        }
+    }
+
     /// The condition-position expression (`if`/`for` conditions, a `for … in`
     /// iterable, a `match` subject): the secondary grammar with struct literals
     /// excluded as operands, so the `{` after `if Foo` is the block, not a literal
@@ -3072,7 +3235,116 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// then `&&`, then `||` (each looser than the last). Built over the chain in the
     /// selected struct-literal mode.
     fn parse_operators(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        self.parse_logical_or(no_struct)
+        self.parse_conditional(no_struct)
+    }
+
+    /// B459: the infix conditional — `c then a else b`, and at a statement's
+    /// head the statement forms `c then S;`, `c else S;` (the guard) and `c
+    /// then S else S;`. Sugar over `if`: the form parses to a `Node::If`
+    /// spelled [`IfSpelling::Then`], and the statement reading is decided by
+    /// the statement that ends it ([`read_as_statement`]).
+    ///
+    /// The tier sits above assignment and below `||` (Q1): `a || b then x
+    /// else y` tests `a || b`, and `v = c then x else y` assigns the form.
+    /// Each branch is a whole expression, so a chain is right-associative
+    /// (Q2): `a then x else b then y else z` is an `else`-if chain, and an
+    /// `else` binds to the nearest `then` without one. `then` is CONTEXTUAL
+    /// (Q4): only here, after a complete operand, where no name can stand —
+    /// vilan never puts two names side by side — so `let then = 1;` and
+    /// `promise.then(f)` are unaffected. A bare `else` after an operand is the
+    /// guard, and is read only at a statement's head: anywhere else the
+    /// `else` belongs to an enclosing form's `then` (`c then f() else g();`).
+    ///
+    /// The part after the condition is ATTEMPTED: a `then` whose branches do
+    /// not parse is taken back, so a missing `;` before a line that starts
+    /// with a name `then` is still reported as the missing `;`.
+    fn parse_conditional(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let at_statement_head = self.statement_head == Some(start);
+        let condition = self.parse_logical_or(no_struct)?;
+        let guard = at_statement_head && self.peek_is(&Token::Else);
+        if !self.peek_is_word("then") && !guard {
+            return Some(condition);
+        }
+        let after_condition = self.position;
+        let form = self.attempt(|parser| {
+            let then = if parser.peek_is_word("then") {
+                let word = parser.here_span();
+                parser.contextual_readings.push(parser.position);
+                parser.bump();
+                Some((word, parser.parse_then_branch(no_struct)?))
+            } else {
+                None
+            };
+            let otherwise = if parser.peek_is(&Token::Else) {
+                let word = parser.here_span();
+                parser.bump();
+                Some((word, parser.parse_then_branch(no_struct)?))
+            } else {
+                None
+            };
+            Some((then, otherwise))
+        });
+        let Some((then, otherwise)) = form else {
+            self.position = after_condition;
+            return Some(condition);
+        };
+        let then_word = then.as_ref().map(|(word, _)| *word);
+        let else_word = otherwise.as_ref().map(|(word, _)| *word);
+        let then_block = match then {
+            Some((_, branch)) => {
+                let span = branch.1;
+                ((Vec::new(), Box::new(branch)), span)
+            }
+            // The guard's `then` is the empty block `if c {} else { S; }`
+            // has, placed at its `else`.
+            None => {
+                let at = else_word.map_or(condition.1.end, |word| word.start);
+                let span = Span::from(at..at);
+                ((Vec::new(), Box::new((Node::Void, span))), span)
+            }
+        };
+        let else_ = otherwise.map(|(_, branch)| {
+            let span = branch.1;
+            (
+                NodeIfBranch::Else(((Vec::new(), Box::new(branch)), span)),
+                span,
+            )
+        });
+        Some((
+            Node::If(NodeIfBranch::If(Box::new(If {
+                condition: Box::new(condition),
+                then: then_block,
+                else_,
+                spelling: IfSpelling::Then {
+                    then_word,
+                    else_word,
+                    statement: false,
+                },
+            }))),
+            self.span_from(start),
+        ))
+    }
+
+    /// One branch of a `then`/`else` form: a whole expression (a statement, at
+    /// statement position — every statement vilan has is an expression
+    /// production), in the enclosing condition mode. A `let` parses and is
+    /// refused (Q8, [`A_BRANCH_BINDS_NOTHING`]).
+    fn parse_then_branch(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        let branch = if no_struct {
+            self.parse_secondary(true)?
+        } else {
+            self.parse_expression()?
+        };
+        if matches!(branch.0, Node::Let(..)) {
+            self.errors.push(ParseError {
+                span: branch.1,
+                reason: ParseErrorReason::Rule(A_BRANCH_BINDS_NOTHING),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
+        Some(branch)
     }
 
     fn parse_logical_or(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
@@ -4994,6 +5266,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 condition: Box::new(condition),
                 then,
                 else_,
+                spelling: IfSpelling::Keyword,
             })),
             self.span_from(start),
         ))
@@ -8287,7 +8560,7 @@ fn is_block_like(node: &Node<'_>) -> bool {
     matches!(
         node,
         Node::If(_) | Node::For(..) | Node::ForIn(..) | Node::Match(..) | Node::Block(_)
-    )
+    ) && !is_then_form(node)
 }
 
 /// Apply one plain postfix to a subject, spanning from the chain's start. A
@@ -10833,5 +11106,160 @@ mod tests {
             errors.is_empty(),
             "the mid-edit `s.` still recovers silently: {errors:?}"
         );
+    }
+
+    // --- B459: the `then`/`else` forms -----------------------------------------
+
+    /// The `If` a `then` form parses to, and its spelling.
+    fn then_form<'a, 'src>(node: &'a Node<'src>) -> (&'a If<'src>, bool, bool, bool) {
+        let Node::If(NodeIfBranch::If(if_)) = node else {
+            panic!("expected a `then` form, got {node:?}");
+        };
+        let IfSpelling::Then {
+            then_word,
+            else_word,
+            statement,
+        } = if_.spelling
+        else {
+            panic!("expected the `then` spelling, got {:?}", if_.spelling);
+        };
+        (if_, then_word.is_some(), else_word.is_some(), statement)
+    }
+
+    /// The statements of `fun main() { … }`'s body.
+    fn main_statements(source: &str) -> Vec<Spanned<Node<'_>>> {
+        let (mut statements, _) = program(source);
+        let Node::Func(main) = statements.remove(0).0 else {
+            panic!("expected `fun main`");
+        };
+        main.body.expect("a body").0.0
+    }
+
+    #[test]
+    fn b459_the_expression_form_sits_above_assignment_and_below_or() {
+        // `a || b then x else y` tests `a || b` (Q1).
+        let node = expr("a || b then x else y");
+        let (if_, then, otherwise, statement) = then_form(&node.0);
+        assert!(then && otherwise && !statement);
+        assert!(matches!(if_.condition.0, Node::Binary(BinaryOp::Or, _, _)));
+        // `v = c then x else y` assigns the whole form.
+        let node = expr("v = c then x else y");
+        let Node::Assign(_, None, value) = &node.0 else {
+            panic!("expected an assignment, got {node:?}");
+        };
+        then_form(&value.0);
+        // The expression form's branches are the block TAILS: `if c { x } else { y }`.
+        let node = expr("c then x else y");
+        let (if_, ..) = then_form(&node.0);
+        assert!(if_.then.0.0.is_empty());
+        assert!(matches!(if_.then.0.1.0, Node::Accessor("x")));
+        let Some((NodeIfBranch::Else(block), _)) = &if_.else_ else {
+            panic!("expected an else block");
+        };
+        assert!(matches!(block.0.1.0, Node::Accessor("y")));
+    }
+
+    #[test]
+    fn b459_a_chain_is_right_associative_and_else_binds_the_nearest_then() {
+        // Q2: `a then x else b then y else z` is an `else`-if chain.
+        let node = expr("a then x else b then y else z");
+        let (if_, ..) = then_form(&node.0);
+        let Some((NodeIfBranch::Else(block), _)) = &if_.else_ else {
+            panic!("expected an else block");
+        };
+        let (inner, then, otherwise, _) = then_form(&block.0.1.0);
+        assert!(then && otherwise);
+        assert!(matches!(inner.condition.0, Node::Accessor("b")));
+        // The dangling `else`: `a then b then x else y` nests the `else` in.
+        let node = expr("a then b then x else y");
+        let (outer, _, outer_else, _) = then_form(&node.0);
+        assert!(!outer_else, "the `else` is the nearest `then`'s");
+        let (_, _, inner_else, _) = then_form(&outer.then.0.1.0);
+        assert!(inner_else);
+    }
+
+    #[test]
+    fn b459_at_statement_position_the_statement_reading_applies() {
+        let statements = main_statements(concat!(
+            "fun main() {\n",
+            "\tc then f() else g();\n",
+            "\tc then f();\n",
+            "\tc else ret;\n",
+            "\ta then b then f() else g();\n",
+            "\tlet v = c then 1 else 2;\n",
+            "\t(c then 1 else 2);\n",
+            "}\n",
+        ));
+        // `c then f() else g();` is `if c { f(); } else { g(); }` (Q6).
+        let (if_, then, otherwise, statement) = then_form(&statements[0].0);
+        assert!(then && otherwise && statement);
+        assert_eq!(if_.then.0.0.len(), 1);
+        assert!(matches!(if_.then.0.1.0, Node::Void));
+        // `c then f();` and the guard `c else ret;`.
+        let (_, then, otherwise, statement) = then_form(&statements[1].0);
+        assert!(then && !otherwise && statement);
+        let (guard, then, otherwise, statement) = then_form(&statements[2].0);
+        assert!(!then && otherwise && statement);
+        assert!(
+            guard.then.0.0.is_empty(),
+            "the guard's `then` is the empty block"
+        );
+        // A form that is a statement's branch is read as a statement too.
+        let (outer, ..) = then_form(&statements[3].0);
+        let (_, _, _, inner_statement) = then_form(&outer.then.0.0[0].0);
+        assert!(inner_statement);
+        // An initializer and a parenthesized form are VALUES.
+        let Node::Let(_, _, Some(value), ..) = &statements[4].0 else {
+            panic!("expected a let, got {:?}", statements[4].0);
+        };
+        let (_, _, _, statement) = then_form(&value.0);
+        assert!(!statement);
+        let (_, _, _, statement) = then_form(&statements[5].0);
+        assert!(!statement, "`(c then 1 else 2);` is a value in parentheses");
+    }
+
+    #[test]
+    fn b459_a_value_needs_both_branches_and_the_guard_is_a_statement() {
+        assert_eq!(
+            rendered_errors("fun main() { let x = c then 1; }\n"),
+            vec![THEN_NEEDS_ITS_ELSE.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("fun main() { (c then f()); }\n"),
+            vec![THEN_NEEDS_ITS_ELSE.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("fun main() { c then let x = 1; }\n"),
+            vec![A_BRANCH_BINDS_NOTHING.to_string()]
+        );
+        // The guard reads only at a statement's head.
+        assert!(declines("fun main() { let x = c else 1; }\n"));
+        // A form with both branches is a value anywhere, a block's tail included.
+        for source in [
+            "fun f(): i32 { c then 1 else 2 }\n",
+            "fun main() { let pick = |x: bool| x then 1 else 2; }\n",
+            "fun main() { print(1 + (a then 10 else 20)); }\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn b459_then_is_a_keyword_only_after_a_complete_operand() {
+        let source = concat!(
+            "fun then(then: i32): i32 { then }\n",
+            "fun main() {\n",
+            "\tlet then = 1;\n",
+            "\tlet next = then + then;\n",
+            "\tpromise.then(done);\n",
+            "\tready then go() else then(2);\n",
+            "}\n",
+        );
+        let (_, errors) = parse(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(readings(source), vec!["then"]);
+        let at = source.find("then go").expect("the keyword");
+        assert_eq!(contextual_keyword_readings(source)[0].start, at);
     }
 }

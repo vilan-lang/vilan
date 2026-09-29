@@ -137,6 +137,14 @@
 			begin: "\\b[a-z_][A-Za-z0-9_]*(?=\\s*(?::(?!:)|=(?![=>])))",
 			relevance: 0,
 		};
+		// B459: `then`, the infix conditional, is CONTEXTUAL — a keyword only
+		// after a complete operand and before a branch, never where a NAME
+		// stands (`let then = 1`, `for then in xs`, `then: i32`,
+		// `promise.then(f)`): guarded on both sides, like `context`.
+		const CONTEXTUAL_THEN = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_\\)\\]\\}\"']\\s{1,8})then\\b(?=\\s{1,8}(?![=.:,;\\)\\]\\}]|i[ns]\\b|as\\b)\\S)",
+		};
 		const TYPE = {
 			className: "type",
 			begin: "\\b[A-Z][a-zA-Z0-9_]*",
@@ -200,6 +208,7 @@
 				CONTEXTUAL_LAZY,
 				CONTEXTUAL_DYN,
 				CONTEXTUAL_JUMP,
+				CONTEXTUAL_THEN,
 				ELEMENT_TAG,
 				ELEMENT_EVENT,
 				FIELD_NAME,

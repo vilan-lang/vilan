@@ -823,6 +823,50 @@ fn b414_s4_a_reserved_word_in_a_member_position_is_painted_as_a_name() {
     }
 }
 
+/// B459: `then`, the infix conditional, colours as a keyword in BOTH grammars
+/// after a complete operand and before its branch, and stays a name wherever
+/// a name stands — a binding, a `for` binder, a parameter, a member, a call.
+#[test]
+fn b459_then_is_coloured_by_position_in_both_grammars() {
+    let keywords: &[&str] = &[
+        "let label = ready then \"on\" else \"off\";",
+        "x > 0 then ret x;",
+        "n < 0 then -1 else 1",
+        "f(a) then go();",
+        "list[0] then a else b",
+        "i\"x\" == s then a else b",
+        "a || b then print(x) else print(y);",
+    ];
+    let names: &[&str] = &[
+        "let then = 1;",
+        "mut then: i32 = 2;",
+        "for then in thens {",
+        "fun then(self) {",
+        "promise.then(f)",
+        "ret then;",
+        "f(then, other)",
+        "x = then;",
+    ];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "then");
+        assert_eq!(
+            regex_matches(&rule.regex, keywords),
+            vec![true; keywords.len()],
+            "{file}: {:?} misses `then` in a keyword position among {keywords:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, names),
+            vec![false; names.len()],
+            "{file}: {:?} colours `then` where it is an ordinary name ({names:?})",
+            rule.regex,
+        );
+    }
+}
+
 // --- Primitive types ---------------------------------------------------------
 
 #[test]
@@ -2651,6 +2695,39 @@ fn b414_s4_reserved_members_are_names_to_the_textmate_engine() {
             assert!(
                 !scope.starts_with("keyword") && !scope.starts_with("storage"),
                 "{needle:?} is a MEMBER and is painted {scope}"
+            );
+        }
+    }
+}
+
+/// B459 through the real TextMate engine: `then` in the three forms is the
+/// control keyword, and a binding named `then` and a `.then(..)` call are not.
+#[test]
+fn b459_then_is_a_keyword_to_the_textmate_engine_only_in_its_position() {
+    let Some(painting) = painting(concat!(
+        "fun main() {\n",
+        "\tlet label = ready then \"on\" else \"off\";\n",
+        "\tready else ret;\n",
+        "\tlet then = promise.then(done);\n",
+        "}\n",
+    )) else {
+        return;
+    };
+    assert_eq!(painting.scope_at("then \"on\""), "keyword.control.vilan");
+    assert_eq!(painting.scope_at("else \"off\""), "keyword.control.vilan");
+    assert_eq!(painting.scope_at("else ret"), "keyword.control.vilan");
+    for needle in ["then = promise", "then(done)"] {
+        let (start, _, line) = painting.locate(needle);
+        let word_end = start + "then".len();
+        for token in painting
+            .tokens
+            .iter()
+            .filter(|token| token.line == line && token.start < word_end && token.end > start)
+        {
+            let scope = token.innermost();
+            assert!(
+                !scope.starts_with("keyword"),
+                "{needle:?} is a NAME and is painted {scope}"
             );
         }
     }

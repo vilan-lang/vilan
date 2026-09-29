@@ -15049,6 +15049,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// B459: `then` hovers as the infix conditional where the parser read it
+    /// as one, and as nothing of the kind where it is a name — a binding and a
+    /// `.then(..)` call — in the same file.
+    #[test]
+    fn b459_then_hovers_as_the_keyword_only_where_it_is_one() {
+        let text = concat!(
+            "struct Promise { value: i32 }\n",
+            "impl Promise { fun then(self): i32 { self.value } }\n",
+            "fun main() {\n",
+            "\tlet ready = true;\n",
+            "\tlet label = ready then \"on\" else \"off\";\n",
+            "\tlet then = Promise { value = 1 }.then();\n",
+            "}\n",
+        );
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let hover_at = |needle: &str| {
+            let offset = text.match_indices(needle).next().expect(needle).0;
+            document.hover(offset + 1)
+        };
+        assert!(
+            hover_at("then \"on\"").is_some_and(
+                |hover| hover.starts_with("**`then`**") && hover.contains("infix conditional")
+            ),
+            "{:?}",
+            hover_at("then \"on\"")
+        );
+        for needle in ["then = Promise", "then();"] {
+            let hover = hover_at(needle);
+            assert!(
+                hover
+                    .as_deref()
+                    .is_none_or(|hover| !hover.starts_with("**`then`**")),
+                "`then` as a NAME at {needle:?} must not hover as the keyword: {hover:?}"
+            );
+        }
+    }
+
     /// B414 S4: a RESERVED word read as a MEMBER — a field declared, given in
     /// a literal and read, a method declared and called — hovers as that
     /// member (the field's or method's own hover), never as the keyword it

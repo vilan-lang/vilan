@@ -159,6 +159,10 @@ pub const CONTEXTUAL_KEYWORDS: &[(&str, &str)] = &[
         "sync",
         "the marker opening a closure type: `(sync || View)`",
     ),
+    (
+        "then",
+        "the infix conditional, after a complete operand: `ready then go() else wait()`, `ready then go();`",
+    ),
     ("void", "the unit type and value; never a binder's name"),
     (
         "with",

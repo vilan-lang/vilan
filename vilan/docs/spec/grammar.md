@@ -5,8 +5,8 @@ The full syntactic grammar, in the notation of §1.3. Token classes
 `module`.
 
 A quoted terminal that is a **contextual keyword** (§2.2 — `with`,
-`borrows`, `own`, `lazy`, `dyn`, `jump`, `as`, `only`, `context`, `sync`,
-`self`) matches an `IDENT` of that spelling, and only at the position its
+`borrows`, `own`, `lazy`, `dyn`, `jump`, `then`, `as`, `only`, `context`,
+`sync`, `self`) matches an `IDENT` of that spelling, and only at the position its
 production puts it; everywhere else the same word is an ordinary `IDENT`
 (B414). Each is decided without backtracking. `with` (after an `impl`
 subject or a `trait` head) and `borrows` (after a return type) sit where no
@@ -15,7 +15,8 @@ head, `lazy` before `let`/`mut`, `jump` before its target and `dyn` at a
 type's head are PREFIXES of a name, and the grammar never puts two names side
 by side, so the word is the keyword when a name follows it (for `dyn`, when
 anything but `::` follows it) and a name otherwise: `fun f(own: Owner)`,
-`|lazy| lazy.force()`, `jump.height`, `dyn::Registry`.
+`|lazy| lazy.force()`, `jump.height`, `dyn::Registry`. `then` follows a
+complete operand (§3.8), which is where no name can stand either.
 
 ## 3.1 Modules and statements
 
@@ -32,6 +33,7 @@ statement = derived-item
           | macro-invocation [ ";" ]
           | export         (* the visibility marker, §3.2 *)
           | expression ";"
+          | then-statement ";"   (* B459, §3.8 *)
           | if-expr        (* not before "}" — see below *)
           | for-expr       (* not before "}" *)
           | match-expr     (* not before "}" *)
@@ -686,6 +688,7 @@ From tightest to loosest; every binary level is left-associative:
 | 10 | `is` pattern | at most one per operand (no chaining) |
 | 11 | `&&` | |
 | 12 | `\|\|` | |
+| 13 | `then` … `else` | B459; right-associative, above assignment (§3.8) |
 
 Bitwise operators bind tighter than comparisons (`a & b == c` is
 `(a & b) == c`).
@@ -697,7 +700,11 @@ expression     = "const" expression        (* weak prefix: captures to the end *
                | secondary-expr ;
 secondary-expr = closure | block | if-expr | for-expr | match-expr
                | jump | let | ret | assignment
-               | operator-expr ;           (* §3.7 levels 1–12 *)
+               | conditional-expr ;        (* §3.7 levels 1–13 *)
+conditional-expr = operator-expr [ "then" expression "else" expression ] ;
+then-statement = operator-expr             (* at a statement's head only *)
+                 ( "then" expression [ "else" expression ]
+                 | "else" expression ) ;   (* the guard *)
 condition-expr = secondary-expr ;    (* struct-init and css-block excluded *)
 
 struct-init   = type-path                      (* §3.9; qualified heads too *)
@@ -741,6 +748,28 @@ Two consequences of the tier split are normative:
 A closure's body is one expression (commonly a block). `||` in operand
 position always begins a zero-parameter closure; logical-or is only
 recognized between two operands.
+
+**`then` / `else`** (B459) is SUGAR over `if`, desugared before analysis:
+`c then a else b` is `if c { a } else { b }`, and typing, the scope of `c`'s
+`is` bindings (they reach `a`, not `b`), emission and diagnostics are the
+`if`'s. As a `conditional-expr` — a VALUE — the form needs both branches,
+exactly as an `if` used for its value does; a `then` without its `else`, or a
+bare `else`, in value position is refused. It binds looser than `||` and
+tighter than assignment: `a || b then x else y` tests `a || b`, and `v = c
+then x else y` assigns the form. Each branch is a whole expression, so the
+form is right-associative: `a then x else b then y else z` is an `else if`
+chain, and an `else` belongs to the nearest `then` that has none.
+
+At a statement's HEAD, a form ended by the statement's `;` is a
+`then-statement`, read as the statement forms `c then S;` (`if c { S; }`),
+`c else S;` (`if c {} else { S; }`, the **guard**) and `c then S else S;`
+(`if c { S; } else { S; }`): each branch is one statement whose value is
+discarded, so the branches need not unify, and a branch that is itself a form
+is read as a statement too. A branch has no block of its own, so a `let` as
+a branch is refused. The same form parenthesized, or at a block's end with no
+`;`, is a value. `then` is a contextual keyword: it is read only after a
+complete operand, where no name can stand, so `let then = 1;` and
+`promise.then(f)` are unaffected.
 
 ## 3.9 Types
 
