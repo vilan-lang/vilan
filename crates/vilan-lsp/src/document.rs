@@ -23,9 +23,9 @@ use vilan_core::{
 use vilan_ide::numeric_fix::NumericEdit;
 
 use crate::keystroke::{
-    Anchor, CursorContext, LandedSnapshot, ModuleSymbols, SymbolEntry, SymbolIndex, Verdict,
-    candidates, cursor_context, is_identifier_char, module_name_of, shape_stamp,
-    sort_and_deoverlap, syntax_tokens_in,
+    Anchor, CursorContext, EditTrail, LandedHint, LandedSnapshot, ModuleSymbols, SymbolEntry,
+    SymbolIndex, Verdict, candidates, cursor_context, is_identifier_char, module_name_of,
+    shape_stamp, sort_and_deoverlap, syntax_tokens_in,
 };
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
@@ -1957,7 +1957,7 @@ impl Document {
             stamp: shape_stamp(self.analyzed_text()),
             tokens: self.semantic_tokens(),
             token_lines: Vec::new(),
-            hints: self.inlay_hints(),
+            hints: self.landed_hints(),
             index: self.landed_symbol_index(entry_path),
             landed: true,
         };
@@ -3867,14 +3867,29 @@ impl Document {
     /// Inlay type hints: `: T` after each UNANNOTATED binding whose type
     /// resolved — inference made a decision the source doesn't show, so the
     /// editor shows it in place. Sorted by position.
+    ///
+    /// The point-and-label view the pins read; the server serves the landed
+    /// capture ([`landed_hints`](Self::landed_hints)) through the keystroke
+    /// path, so this is compiled with the tests.
+    #[cfg(test)]
     pub fn inlay_hints(&self) -> Vec<(usize, String)> {
+        self.landed_hints()
+            .into_iter()
+            .map(|hint| (hint.name.end, hint.label))
+            .collect()
+    }
+
+    /// [`inlay_hints`](Self::inlay_hints) with the binding NAME each hint
+    /// follows — what the landed snapshot keeps, so a hint can follow the
+    /// edits after it (E232).
+    pub fn landed_hints(&self) -> Vec<LandedHint> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
         // The same hoist as `semantic_tokens`, for the same reason and over the
         // same whole-program table (M27/M58).
         let source_of = program.source_lookup();
-        let mut hints: Vec<(usize, String)> = Vec::new();
+        let mut hints: Vec<LandedHint> = Vec::new();
         for (id, variable) in &program.variables {
             if variable.annotated || source_of.of(*id) != Some(SourceId(0)) {
                 continue;
@@ -3885,13 +3900,15 @@ impl Document {
             if label.is_empty() || label == "?" || label.contains("Unknown") {
                 continue;
             }
-            let range = variable.name_span.into_range();
-            if range.is_empty() {
+            if variable.name_span.into_range().is_empty() {
                 continue;
             }
-            hints.push((range.end, format!(": {label}")));
+            hints.push(LandedHint {
+                name: variable.name_span,
+                label: format!(": {label}"),
+            });
         }
-        hints.sort();
+        hints.sort_by_key(|hint| hint.name.end);
         hints
     }
 
@@ -4346,14 +4363,14 @@ impl Document {
             - self.analyzed_index.position(analyzed_suffix_start).line as i64
     }
 
-    /// Inlay hints for the LIVE buffer, in LIVE coordinates — Q1/Q4's ruling:
-    /// re-mapped through the anchor, withheld inside the edit window, served
-    /// unchanged rather than flickered off when stale, withheld entirely when
-    /// no anchor survives.
+    /// Inlay hints for the LIVE buffer, in LIVE coordinates: every landed hint
+    /// follows the edits since its analysis (E232 — the edited line's hints
+    /// stay in place instead of jumping), served unchanged rather than
+    /// flickered off when stale, withheld entirely when no anchor survives.
     pub fn keystroke_hints(&self, dependency_moved: bool) -> Vec<(usize, String)> {
-        let anchor = self.keystroke_anchor();
         let verdict = self.keystroke_verdict(dependency_moved);
-        self.landed.hints_for(&anchor, verdict)
+        let trail = EditTrail::of(self.live_edits.as_deref(), self.analyzed_text(), &self.text);
+        self.landed.hints_for(&trail, verdict)
     }
 
     /// Completion candidates at a LIVE `offset`, answered from the symbol

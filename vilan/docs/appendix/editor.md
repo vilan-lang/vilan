@@ -61,7 +61,12 @@ the declaration itself, show the one line they always did.
 
 **Inlay hints** — the inferred type of a binding you left unannotated
 (`let`/`mut`, a `for` binder, a comprehension binder). A parameter is not
-hinted: its type is written in the signature already.
+hinted: its type is written in the signature already. While you type, a
+hint stays where it is and follows the text like any other position —
+typing before it on its line moves it right, a line inserted above moves
+it down, typing after it or below it leaves it alone — and keeps its last
+analysed type until the next analysis replaces the set; deleting the name
+it follows removes it.
 
 **Semantic highlighting** from the analyzer, over the TextMate grammar,
 which also highlights `vilan` fences inside Markdown.

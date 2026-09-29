@@ -3667,18 +3667,11 @@ impl LanguageServer for Backend {
             };
             let range = params.range;
             let hints = document
-                // E121 (Q1/Q4): the landed hints re-mapped through the
-                // two-sided anchor, WITHHELD inside the edit window — a hint on
-                // the line you are typing is the most likely to be wrong and
-                // the least useful, and its absence there is invisible because
-                // it was about to move anyway. A hint outside the window sits
-                // on byte-identical text, so its position is exact.
-                //
-                // That exactness is what retires the analyzed/live index dance
-                // this filter used to need: the offsets are already live-space,
-                // so one index answers both the hint's position and the
-                // viewport compare, and there is no approximation left to
-                // fall back to.
+                // E232 (door 2): the landed hints, each following the edits
+                // since its analysis — the edited line's included, so the line
+                // no longer jumps the moment typing starts (E121 withheld them
+                // there). The offsets are already live-space, so one index
+                // answers both the hint's position and the viewport compare.
                 .keystroke_hints(self.schedule.dependency_moved(&uri))
                 .into_iter()
                 .filter_map(|(offset, label)| {
