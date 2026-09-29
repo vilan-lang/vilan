@@ -6,6 +6,7 @@
 // underlying native map; the original value is stored alongside so `for x in set`
 // yields real `T`s in INSERTION order, on both backends: a duplicate insert keeps
 // its value's place, and a value removed and inserted again goes to the end.
+import pkg::compare::PartialEq;
 import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::native_map::NativeMap;
@@ -93,6 +94,25 @@ impl HashSet<type T: Hashable> {
 			}
 		}
 		result
+	}
+}
+
+/// Two sets are equal when they hold the same members (the owner's Q8 ruling,
+/// reactive-maps-sets.md): ORDER-INSENSITIVE, as `HashMap`'s equality is —
+/// insertion order is what iteration presents, not part of the value. Equal
+/// sizes and every member of `self` in `other` is both inclusions. Members compare
+/// by their canonical `Hash`, so this needs no bound beyond the set's own.
+impl HashSet<type T: Hashable> with PartialEq {
+	fun eq(self, other: HashSet<T>): bool {
+		if self.table.len() != other.table.len() {
+			ret false;
+		}
+		for value in self.table.values() {
+			if !other.table.contains_key(value.hash()) {
+				ret false;
+			}
+		}
+		true
 	}
 }
 

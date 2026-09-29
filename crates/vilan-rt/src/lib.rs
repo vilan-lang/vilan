@@ -1144,13 +1144,14 @@ impl<T: std::hash::Hash + Eq + Clone> Clone for Set<T> {
 /// Entry-wise, in insertion order.
 ///
 /// **This is not reachable from a vilan program**, and it is here because the
-/// emitter derives `PartialEq` for every aggregate it writes: `std::hash_map`
-/// gives `HashMap` no `impl PartialEq`, so `a == b` on two maps does not
-/// type-check, and `[derive(PartialEq)]` on a struct with a `HashMap` field is rejected by the
-/// analyzer's all-fields-comparable check. What the derive would mean on the JS
-/// backend is `===` — reference equality on two `Map` objects — and a value
-/// struct has no reference to compare, which is the other half of why this stays
-/// unreachable rather than becoming the answer to a question a program can ask.
+/// emitter derives `PartialEq` for every aggregate it writes. A vilan `==` on
+/// two `HashMap`s/`HashSet`s — and a derived `PartialEq` over a struct holding
+/// one — goes through std's own `impl .. with PartialEq` (tracker I9, the Q8
+/// ruling), which is ORDER-INSENSITIVE: the same keys with equal values. This
+/// impl is order-SENSITIVE and would disagree with it, so it must stay
+/// unreachable; `native_differential`'s
+/// `i9_hash_collection_equality_is_order_insensitive_on_both_backends` holds
+/// the two backends to the std answer.
 impl<K: std::hash::Hash + Eq + Clone, V: PartialEq> PartialEq for Map<K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.live == other.live && self.iter().eq(other.iter())

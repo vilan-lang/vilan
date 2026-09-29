@@ -119,6 +119,35 @@ impl HashMap<type K: Hashable, type V: PartialEq> {
 	}
 }
 
+/// Two maps are equal when they hold the same keys with equal values under each
+/// (the owner's Q8 ruling, reactive-maps-sets.md): ORDER-INSENSITIVE. Insertion
+/// order is what iteration presents, not part of the value, so a map built in
+/// another order is the same map. It is what lets a struct holding a map derive
+/// `PartialEq`, and a map of maps be compared at all.
+///
+/// Equal lengths, then every key of `self` found in `other` with an equal value:
+/// that is both inclusions, since two key sets of one size with one inside the
+/// other are the same set. Keys compare by their canonical `Hash` — the identity
+/// the map itself keys by.
+impl HashMap<type K: Hashable, type V: PartialEq> with PartialEq {
+	fun eq(self, other: HashMap<K, V>): bool {
+		if self.table.len() != other.table.len() {
+			ret false;
+		}
+		for entry in self.table.values() {
+			match other.table.get(entry.0.hash()) {
+				Some(let theirs) => {
+					if !entry.1.eq(theirs.1) {
+						ret false;
+					}
+				},
+				None => ret false,
+			}
+		}
+		true
+	}
+}
+
 /// The map half of the explicit termination family: a list of `(key, value)`
 /// pairs becomes a `HashMap`, so an iterator chain ends
 /// `xs.iter().map(|w| (w, w.len())).to_list().to_map()`. A repeated key keeps

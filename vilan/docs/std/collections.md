@@ -177,6 +177,7 @@ impl HashMap<type K: Hashable, type V> {
 impl HashMap<type K: Hashable, type V: PartialEq> {
 	fun contains_value(self, value: V): bool
 }
+impl HashMap<type K: Hashable, type V: PartialEq> with PartialEq   // same keys, equal values; order ignored
 impl List<(type K: Hashable, type V)> { fun to_map(self): HashMap<K, V> }
 impl HashMap<type K: Hashable, type V> with Default {
 	fun default(): HashMap<K, V>                 // the empty map
@@ -187,7 +188,9 @@ A `HashMap` iterates in **insertion order**, on both backends: `keys()`,
 `values()` and `entries()` walk the keys in the order they first arrived, an
 overwrite keeps its key's place, and a key removed and inserted again goes to
 the end. The name says how it keys — by `Hashable` value — not that its order
-is arbitrary. Before v0.42 the type was `std::map::Map`; that name is
+is arbitrary. Equality follows the same line: two maps are `==` when they hold the same keys
+with equal values, whatever order either was built in, so a struct holding a
+map can `[derive(PartialEq)]`. Before v0.42 the type was `std::map::Map`; that name is
 kept one release as a deprecated alias of the same type (`Map` *is* `HashMap`),
 and a use of it warns with the new spelling.
 
@@ -291,6 +294,7 @@ impl HashSet<type T: Hashable> {
 }
 impl List<type T: Hashable> { fun to_set(self): HashSet<T> }
 impl HashSet<type T: Hashable> with Default { fun default(): HashSet<T> }  // the empty set
+impl HashSet<type T: Hashable> with PartialEq                             // same members; order ignored
 ```
 
 Value-keyed like `HashMap` (element `T` must be `Hashable`); `for x in set`

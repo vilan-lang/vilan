@@ -856,6 +856,66 @@ const HASH_PROBE: &str = concat!(
     "}\n",
 );
 
+/// I9 / Q8: `HashMap` and `HashSet` equality is ORDER-INSENSITIVE on both
+/// backends — the same keys with equal values (the same members), whatever the
+/// insertion order. The native runtime's own `PartialEq for Map` is
+/// order-SENSITIVE and must stay unreachable: `==` goes through std's
+/// `impl .. with PartialEq`, and so does a derived `PartialEq` over a struct
+/// holding a map, and a map of maps compares its values through the same impl.
+/// Each line pairs an order-only difference (equal) with a value, a size or a
+/// member difference (unequal).
+#[test]
+fn i9_hash_collection_equality_is_order_insensitive_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_hash_eq.vl"), HASH_EQUALITY_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_hash_eq.vl"),
+        Verdict::Identical,
+        "map and set equality must ignore insertion order on both backends"
+    );
+}
+
+const HASH_EQUALITY_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::hash_map::HashMap;\n",
+    "import std::hash_set::HashSet;\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Holder {\n",
+    "\tscores: HashMap<str, i32>,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a: HashMap<str, i32> = HashMap::new();\n",
+    "\ta.insert(\"x\", 1);\n",
+    "\ta.insert(\"y\", 2);\n",
+    "\tmut b: HashMap<str, i32> = HashMap::new();\n",
+    "\tb.insert(\"y\", 2);\n",
+    "\tb.insert(\"x\", 1);\n",
+    "\tprint(a == b);\n",
+    "\tb.insert(\"y\", 3);\n",
+    "\tprint(a == b);\n",
+    "\tprint(a != b);\n",
+    "\tmut c: HashMap<str, i32> = HashMap::new();\n",
+    "\tc.insert(\"x\", 1);\n",
+    "\tprint(a == c);\n",
+    "\tc.insert(\"z\", 2);\n",
+    "\tprint(a == c);\n",
+    "\tprint(Holder { scores = a } == Holder { scores = [(\"y\", 2), (\"x\", 1)].to_map() });\n",
+    "\tprint(Holder { scores = a } == Holder { scores = c });\n",
+    "\tlet s: HashSet<i32> = [1, 2, 3].to_set();\n",
+    "\tprint(s == [3, 2, 1].to_set());\n",
+    "\tprint(s == [3, 2].to_set());\n",
+    "\tprint(s == [3, 2, 4].to_set());\n",
+    "\tmut nested: HashMap<str, HashMap<str, i32>> = HashMap::new();\n",
+    "\tnested.insert(\"a\", a);\n",
+    "\tmut other: HashMap<str, HashMap<str, i32>> = HashMap::new();\n",
+    "\tother.insert(\"a\", [(\"y\", 2), (\"x\", 1)].to_map());\n",
+    "\tprint(nested == other);\n",
+    "}\n",
+);
+
 /// F23: a context-threaded hidden parameter is typed from the flavour the
 /// CONTEXT PASS recorded, and one program carries both readings.
 ///

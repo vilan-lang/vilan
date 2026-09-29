@@ -452,6 +452,78 @@ fn i9_hash_map_and_hash_set_iterate_in_insertion_order() {
     );
 }
 
+/// Q8 (ruled with I9): `==` on the hash collections is ORDER-INSENSITIVE — the
+/// same keys with equal values, the same members. Each order-only difference
+/// is equal, each value/size/member difference is not, a derived `PartialEq`
+/// over a struct holding a map compares through it, and a map of maps compares
+/// its values with it. `native_differential` holds the Rust backend to the same
+/// answers.
+#[test]
+fn i9_hash_collection_equality_ignores_insertion_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        [derive(PartialEq)]
+        struct Holder {
+            scores: HashMap<str, i32>,
+        }
+
+        fun main() {
+            mut a: HashMap<str, i32> = HashMap::new();
+            a.insert("x", 1);
+            a.insert("y", 2);
+            mut b: HashMap<str, i32> = HashMap::new();
+            b.insert("y", 2);
+            b.insert("x", 1);
+            print(a == b);
+            b.insert("y", 3);
+            print(a == b);
+            print(a != b);
+            mut c: HashMap<str, i32> = HashMap::new();
+            c.insert("x", 1);
+            print(a == c);
+            c.insert("z", 2);
+            print(a == c);
+            print(Holder { scores = a } == Holder { scores = [("y", 2), ("x", 1)].to_map() });
+            print(Holder { scores = a } == Holder { scores = c });
+            let s: HashSet<i32> = [1, 2, 3].to_set();
+            print(s == [3, 2, 1].to_set());
+            print(s == [3, 2].to_set());
+            print(s == [3, 2, 4].to_set());
+            mut nested: HashMap<str, HashMap<str, i32>> = HashMap::new();
+            nested.insert("a", a);
+            mut other: HashMap<str, HashMap<str, i32>> = HashMap::new();
+            other.insert("a", [("y", 2), ("x", 1)].to_map());
+            print(nested == other);
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\nfalse\nfalse\ntrue\n",
+    );
+}
+
+/// A map whose VALUE type has no `PartialEq` has no `==`: the impl is bounded
+/// `V: PartialEq`, so the refusal is the ordinary one, at the operator.
+#[test]
+fn i9_a_map_of_incomparable_values_has_no_equality() {
+    assert_fails_with(
+        r#"
+        import std::hash_map::HashMap;
+
+        struct Opaque { n: i32 }
+
+        fun main() {
+            let a: HashMap<str, Opaque> = HashMap::new();
+            let b: HashMap<str, Opaque> = HashMap::new();
+            let same = a == b;
+        }
+        "#,
+        "PartialEq",
+    );
+}
+
 /// The alias IS the type: an old-spelled value goes where the new type is
 /// declared and back, the old import still reaches the `List` terminators
 /// (`to_map`/`to_set`, extension impls declared in the new modules), and a
