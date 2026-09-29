@@ -1,3 +1,5 @@
 node_modules/
 out/
 *.vsix
+# E231: the packaging's commit stamp (scripts/install-dev.sh, release.yml).
+build-sha.txt

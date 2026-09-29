@@ -759,11 +759,54 @@ fn e229_the_extension_compares_its_version_with_the_servers_once() {
     );
     assert!(source.contains("client.initializeResult?.serverInfo?.version"));
     assert!(source.contains("context.extension.packageJSON.version"));
-    assert!(source.contains("versionGap(extensionVersion, serverVersion)"));
+    assert!(source.contains("versionGap(extensionVersion, serverVersion, extensionSha)"));
     assert!(
         source.contains("if (gap === undefined || versionNoticeShown) {")
             && source.contains("versionNoticeShown = true;"),
         "one notification per window, not one per restart"
     );
     assert!(source.contains(".showWarningMessage(gap.message, 'Copy Command', 'Open Release')"));
+}
+
+// --- E231: the commit on both halves ----------------------------------------
+
+/// The extension compares commits when the versions agree (the decision is
+/// `versionGap`'s, pinned by `npm test`); its own commit is the file every
+/// packaging writes just before `vsce package` — the dev refresh AND the
+/// release's `vsix` job, so a gallery install carries one too — from the same
+/// `git rev-parse --short=9 HEAD` the server's build stamp takes.
+#[test]
+fn e231_every_packaging_embeds_the_commit_the_extension_compares() {
+    let source = extension_source();
+    assert!(source.contains("versionGap(extensionVersion, serverVersion, extensionSha)"));
+    assert!(source.contains("path.join(context.extensionPath, BUILD_SHA_FILE)"));
+    let versions =
+        std::fs::read_to_string(extension_dir().join("src/versions.ts")).expect("versions.ts");
+    assert_eq!(
+        single_quoted_constant(&versions, "BUILD_SHA_FILE"),
+        "build-sha.txt"
+    );
+    let stamp = "git rev-parse --short=9 HEAD > build-sha.txt";
+    for script in ["scripts/install-dev.sh", ".github/workflows/release.yml"] {
+        let text = std::fs::read_to_string(repo_root().join(script)).expect(script);
+        let written = text
+            .find(stamp)
+            .unwrap_or_else(|| panic!("{script} writes the stamp"));
+        let packaged = text[written..]
+            .find("vsce package")
+            .unwrap_or_else(|| panic!("{script} packages AFTER writing the stamp"));
+        assert!(packaged > 0, "{script}");
+    }
+    let ignored =
+        std::fs::read_to_string(extension_dir().join(".vscodeignore")).expect(".vscodeignore");
+    assert!(
+        !ignored.contains("build-sha"),
+        "the stamp ships inside the vsix"
+    );
+    let build_stamp = std::fs::read_to_string(repo_root().join("crates/vilan-cli/build_stamp.rs"))
+        .expect("build_stamp.rs");
+    assert!(
+        build_stamp.contains("\"--short=9\""),
+        "the server's stamp is the same length"
+    );
 }

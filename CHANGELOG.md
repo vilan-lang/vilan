@@ -298,6 +298,9 @@ written down.
 <!-- family: tooling -->
 **An `import` line alone no longer warns for a deprecated or `[internal]` TYPE, binding or variant — the USE warns, the one rule a function's import has always followed.** `import pkg::inner::{ KeyedThing };` warned `` `KeyedThing` is deprecated; … `` at the import leaf AND at each use (B382), and `[lints] internal_use = "warn"` warned at the import line of every internal item, functions included (E221), while a deprecated function's import was silent: two rules for one label. Now every labelled item warns at its uses only (an annotation, a literal's head, a read, a call), never at the `import`/`use` line that binds it — the uses are the fix sites, and a dead import falls out with the last one. A deprecated RE-EXPORT still warns at the import that reaches through it: its renamed name is transparent everywhere else, so that import is its only use. Tracker E224 (R-j).
 
+<!-- family: tooling -->
+**The language server reports `<version> (<sha>)`, and the VS Code extension compares commits when the versions agree — a dev build between releases can no longer pass for a stale extension of the same version.** `vilan-lsp --version` and the `initialize` result's `serverInfo.version` read `0.41.1 (07e8db372)`, `vilan --version`'s shape, from one build stamp both binaries' build scripts share. Every packaging of the extension (`scripts/install-dev.sh`, the release's `vsix` job) writes the commit it was packaged from into the vsix, and when both halves carry a commit and name one version, two different commits are named once, with the refresh that installs both halves (`scripts/install-dev.sh`). A half without a commit (an older server, a tarball build's `unknown`) is compared by version alone, as before. The stamp also follows a linked git worktree's HEAD now, so a commit there re-stamps without `install-dev.sh`'s touch-and-rebuild retry. Tracker E231.
+
 ## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->

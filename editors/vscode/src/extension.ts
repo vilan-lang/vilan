@@ -24,7 +24,7 @@ import {
     Uri,
 } from 'vscode';
 import { PlacedClosers } from './closers';
-import { versionGap } from './versions';
+import { BUILD_SHA_FILE, versionGap } from './versions';
 import {
     DidChangeConfigurationNotification,
     ExecuteCommandRequest,
@@ -499,16 +499,31 @@ function forgetDistantClosers(editor: TextEditor): void {
 /// Whether this window has already named a version gap.
 let versionNoticeShown = false;
 
+/// E231: the commit this extension was packaged from — `build-sha.txt` beside
+/// `package.json`, which `scripts/install-dev.sh` and release.yml's `vsix` job
+/// write from `git rev-parse --short=9 HEAD` just before `vsce package`, the
+/// stamp the server's build script takes. `undefined` for a vsix packaged
+/// without one, which is then compared by version alone.
+function packagedSha(context: ExtensionContext): string | undefined {
+    try {
+        return fs.readFileSync(path.join(context.extensionPath, BUILD_SHA_FILE), 'utf8').trim() || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 function checkServerVersion(context: ExtensionContext): void {
     if (!client) {
         return;
     }
     const extensionVersion: string = context.extension.packageJSON.version;
+    const extensionSha = packagedSha(context);
     const serverVersion = client.initializeResult?.serverInfo?.version;
     outputChannel?.info(
-        `language server version ${serverVersion ?? '(none reported)'}, extension ${extensionVersion}`,
+        `language server version ${serverVersion ?? '(none reported)'}, extension ${extensionVersion}` +
+            (extensionSha ? ` (${extensionSha})` : ''),
     );
-    const gap = versionGap(extensionVersion, serverVersion);
+    const gap = versionGap(extensionVersion, serverVersion, extensionSha);
     if (gap === undefined || versionNoticeShown) {
         return;
     }

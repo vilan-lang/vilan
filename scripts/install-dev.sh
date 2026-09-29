@@ -33,21 +33,24 @@ command -v npm > /dev/null 2>&1 || fail "npm is required (for the VS Code extens
 say "building vilan and vilan-lsp (release) ..."
 cargo build --release -p vilan-cli -p vilan-lsp
 
-# `vilan --version` carries the commit it was built from, stamped by
-# crates/vilan-cli/build.rs — which re-runs only when the `.git/HEAD` it
-# resolved changes. In a linked worktree `.git` is a FILE, so a new commit there
-# never re-runs it and the stamp stays at an older commit. Refuse to install a
-# binary that names the wrong commit: re-stamp and build once more.
+# `vilan --version` and `vilan-lsp --version` carry the commit they were built
+# from, stamped by crates/vilan-cli/build_stamp.rs (both build scripts read it),
+# which re-runs when the HEAD it resolved moves — a linked worktree's too, since
+# E231. Still refuse to install a binary that names the wrong commit (a stamp
+# can go stale in ways no rerun-if-changed sees): re-stamp and build once more.
 head="$(git rev-parse --short=9 HEAD 2> /dev/null || true)"
 if [ -n "$head" ]; then
-    case "$(target/release/vilan --version)" in
-        *"($head)"* | *"($head-dirty)"*) ;;
-        *)
-            say "the version stamp is stale (not $head) — re-stamping ..."
-            touch crates/vilan-cli/build.rs
-            cargo build --release -p vilan-cli
-            ;;
-    esac
+    for binary in vilan vilan-lsp; do
+        case "$(target/release/$binary --version)" in
+            *"($head)"* | *"($head-dirty)"*) ;;
+            *)
+                say "the $binary version stamp is stale (not $head) — re-stamping ..."
+                touch crates/vilan-cli/build.rs crates/vilan-lsp/build.rs
+                cargo build --release -p vilan-cli -p vilan-lsp
+                break
+                ;;
+        esac
+    done
 fi
 
 mkdir -p "$BIN_DIR"
@@ -62,8 +65,8 @@ say "installed $("$BIN_DIR/vilan" --version) to $BIN_DIR"
 # A `vilan` that predates this script keeps answering from wherever it sits on
 # PATH — most often a `cargo install` copy in ~/.cargo/bin, which rustup's shell
 # setup prepends — and a stale one is indistinguishable from a fresh build until
-# you compare `--version` commit hashes. Worse for `vilan-lsp`, which has no
-# `--version`: an old server squiggles syntax the new compiler accepts. So
+# you compare `--version` commit hashes. Worse for `vilan-lsp`, whose stale
+# copy squiggles syntax the new compiler accepts. So
 # refresh a copy that is *already* there, and leave a directory without one
 # alone — creating install locations is install.sh's business, not this script's.
 MIRROR_DIR="${VILAN_MIRROR_DIR:-$HOME/.cargo/bin}"
@@ -86,6 +89,11 @@ say "packaging the VS Code extension ..."
     else
         npm ci
     fi
+    # E231: the commit this extension is packaged from, which the extension
+    # compares with the server's `serverInfo.version` stamp when the versions
+    # agree — the one drift a dev build between releases can have. The
+    # server's stamp reads `<sha>` or `<sha>-dirty` from the same HEAD.
+    git rev-parse --short=9 HEAD > build-sha.txt 2> /dev/null || rm -f build-sha.txt
     # vsce's prepublish hook runs the esbuild bundle; the .vsix lands beside
     # the sources as vilan-<version>.vsix, as a release build's would. Named
     # explicitly, so an older one left beside it is never the one installed.

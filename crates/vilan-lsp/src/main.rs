@@ -2861,9 +2861,20 @@ pub const ANALYSIS_PLATFORM: &str = "vilan/analysisPlatform";
 /// release behind its server lacks what the server's notes promise, silently —
 /// the owner ran 0.40.0 against 0.41.1), and as `vilan-lsp --version`, for a
 /// human or a script asking the binary directly.
-pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+///
+/// E231: `<version> (<short-sha>)`, the shape `vilan --version` prints and
+/// from the same stamp (`crates/vilan-cli/build_stamp.rs`, read by both build
+/// scripts). The crate version alone cannot tell a sealed-tip server from a
+/// stale extension of the same version between releases; the commit can, and
+/// the extension compares it when its own packaging embedded one.
+pub const SERVER_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("VILAN_BUILD_SHA"),
+    ")"
+);
 
-/// `vilan-lsp --version`'s line: `vilan-lsp <version>`.
+/// `vilan-lsp --version`'s line: `vilan-lsp <version> (<sha>)`.
 fn version_line() -> String {
     format!("vilan-lsp {SERVER_VERSION}")
 }
@@ -9900,13 +9911,16 @@ mod server_version_tests {
     use super::snapshot_consistency_tests::backend;
     use super::*;
 
-    /// `initialize` answers `serverInfo.version` = the crate version, which
-    /// `bump-version.sh` keeps equal to the extension's (the
-    /// `vscode_extension` pin `the_extension_version_is_the_toolchain_version`
-    /// holds that half). Before E229 the field was `None`, so a client had
-    /// nothing to compare with.
+    /// `initialize` answers `serverInfo.version` = `<version> (<sha>)` (E231):
+    /// the crate version, which `bump-version.sh` keeps equal to the
+    /// extension's (the `vscode_extension` pin
+    /// `the_extension_version_is_the_toolchain_version` holds that half), and
+    /// the commit the build was stamped with — the same stamp `vilan
+    /// --version` prints, from the same `build_stamp.rs`. Before E229 the
+    /// field was `None`; before E231 it was the bare version, so a dev build
+    /// between releases compared equal to a stale extension of that version.
     #[tokio::test]
-    async fn initialize_reports_the_toolchain_version() {
+    async fn initialize_reports_the_toolchain_version_and_its_commit() {
         let (service, _socket) = backend();
         let result = service
             .inner()
@@ -9915,15 +9929,43 @@ mod server_version_tests {
             .expect("initialize answers");
         let info = result.server_info.expect("serverInfo is present");
         assert_eq!(info.name, "vilan-lsp");
-        assert_eq!(info.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            info.version.as_deref(),
+            Some(
+                format!(
+                    "{} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("VILAN_BUILD_SHA")
+                )
+                .as_str()
+            )
+        );
     }
 
-    /// `vilan-lsp --version` prints one line, `vilan-lsp <version>`.
+    /// The stamp is a short sha (with `-dirty` on a modified tree) or
+    /// `unknown` outside git — never empty, and never parenthesized twice.
     #[test]
-    fn the_version_line_names_the_binary_and_the_version() {
+    fn the_stamp_is_a_sha_or_unknown() {
+        let stamp = env!("VILAN_BUILD_SHA");
+        let sha = stamp.strip_suffix("-dirty").unwrap_or(stamp);
+        assert!(
+            sha == "unknown"
+                || (sha.len() >= 7 && sha.chars().all(|character| character.is_ascii_hexdigit())),
+            "{stamp:?}"
+        );
+    }
+
+    /// `vilan-lsp --version` prints one line, `vilan-lsp <version> (<sha>)`
+    /// — `vilan --version`'s shape (E231).
+    #[test]
+    fn the_version_line_names_the_binary_the_version_and_the_commit() {
         assert_eq!(
             version_line(),
-            format!("vilan-lsp {}", env!("CARGO_PKG_VERSION"))
+            format!(
+                "vilan-lsp {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("VILAN_BUILD_SHA")
+            )
         );
     }
 }
