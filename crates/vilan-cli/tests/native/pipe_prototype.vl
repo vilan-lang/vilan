@@ -1,0 +1,118 @@
+// A142 Appendix A's prototype library (0.41.1), as formatted: a toy root `Cell`
+// whose `watch` takes a wake-up closure, the `Up` flow trait with `own self`
+// combinators, and two move-only pipe nodes (`Map`, `Switch`) declared
+// `[resource]` with NO `Drop` impl. `native_differential.rs` appends a `main`
+// per case (F56).
+import std::shared::Shared;
+
+// ---- Sources: things with state. Readable.
+trait Src<T> {
+	fun get(self): T;
+	fun watch(self, wake: || void);
+}
+
+struct Cell<T> {
+	value: Shared<T>,
+	subs: Shared<List<|| void>>,
+}
+
+impl Cell<type T> {
+	fun new(v: T): Cell<T> {
+		Cell<T> { value = Shared::new(v), subs = Shared::new([]) }
+	}
+	fun set(self, v: T) {
+		self.value.write() = v;
+		for wake in self.subs.read() {
+			wake();
+		}
+	}
+}
+
+impl Cell<type T> with Src<T> {
+	fun get(self): T {
+		self.value.read()
+	}
+	fun watch(self, wake: || void) {
+		self.subs.write().push(wake);
+	}
+}
+
+// ---- Upstream: anything a pipeline can start from. `start` INSTANTIATES:
+// it runs `react` once now and once per change, for this one consumer.
+trait Up<T> {
+	fun start(own self, react: |T| void);
+
+	fun derive<U>(own self, f: |T| U): Map<Self, T, U> {
+		Map<Self, T, U> { up = self, f }
+	}
+
+	fun switch<I: Up<U>, U>(own self, select: |T| I): Switch<Self, T, I, U> {
+		Switch<Self, T, I, U> { up = self, select }
+	}
+}
+
+impl type S: Src<type T> with Up<T> {
+	fun start(own self, react: |T| void) {
+		let me = self;
+		self.watch(|| react(me.get()));
+		react(self.get());
+	}
+}
+
+// ---- A transformation: a description. NOT a Src: no get().
+[resource] struct Map<S, T, U> {
+	up: S,
+	f: |T| U,
+}
+
+impl Map<type S: Up<type T>, T, type U> with Up<U> {
+	fun start(own self, react: |U| void) {
+		let f = self.f;
+		self.up.start(|x| react(f(x)));
+	}
+}
+
+// ---- Sealing: only a pipe has memo.
+trait Pipe<T> with Up<T> {
+	fun memo(own self): Cell<T> {
+		let first: Shared<Option<T>> = Shared::new(None);
+		let target: Shared<Option<Cell<T>>> = Shared::new(None);
+		self.start(|v| {
+			match target.read() {
+				Some(let c) => c.set(v),
+				None => {
+					first.write() = Some(v);
+				},
+			}
+		});
+		let c = Cell::new(first.read().unwrap());
+		target.write() = Some(c);
+		c
+	}
+}
+
+impl Map<type S: Up<type T>, T, type U> with Pipe<U> {}
+
+// A stateful stage: its state (the generation) lives in the INSTANTIATION.
+[resource] struct Switch<S, T, I, U> {
+	up: S,
+	select: |T| I,
+}
+
+impl Switch<type S: Up<type T>, T, type I: Up<type U>, U> with Up<U> {
+	fun start(own self, react: |U| void) {
+		let generation = Shared::new(0);
+		let select = self.select;
+		self.up.start(|x| {
+			generation.write() = generation.read() + 1;
+			let mine = generation.read();
+			select(x).start(|v| {
+				if generation.read() == mine {
+					react(v);
+				}
+			});
+		});
+	}
+}
+
+impl Switch<type S: Up<type T>, T, type I: Up<type U>, U> with Pipe<U> {}

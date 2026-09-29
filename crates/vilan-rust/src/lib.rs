@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    AdaptedInstance, Backing, BackingValue, Expr, ExprIfBranch, ExprMatchLeg, ExprPattern,
-    GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
+    ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -173,6 +173,45 @@ const PRELUDE: &str = "\
 use vilan_rt::Js as _;
 use vilan_rt::Json as _;
 ";
+
+/// F56: every nominal declaration (struct or enum) with an `impl … with Drop`.
+///
+/// Read off `drop_method_checks`, which the analyzer fills with each impl's
+/// `drop` function keyed on the RESOLVED std `Drop` entity — so a user's own
+/// `trait Drop` never counts — and then off the impl blocks declaring those
+/// functions, whose subject names the declaration. A generic resource
+/// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
+/// answer is per declaration, not per instantiation.
+fn drop_implementing_nominals(program: &Program<'_>) -> HashSet<Id> {
+    let drop_functions: HashSet<Id> = program
+        .drop_method_checks
+        .iter()
+        .map(|(function_id, _, _)| *function_id)
+        .collect();
+    let mut nominals = HashSet::new();
+    if drop_functions.is_empty() {
+        return nominals;
+    }
+    for implementation in &program.implementations {
+        let Some(member) = implementation.declarations.get("drop") else {
+            continue;
+        };
+        let function_id = match program.entity_map.get(member) {
+            Some(Expr::Function(function_id)) => *function_id,
+            _ => *member,
+        };
+        if !drop_functions.contains(&function_id) {
+            continue;
+        }
+        match program.type_id_to_type_map.get(&implementation.subject) {
+            Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) => {
+                nominals.insert(*id);
+            }
+            _ => {}
+        }
+    }
+    nominals
+}
 
 fn unsupported(what: &str, span: Span) -> Error {
     Error {
@@ -445,6 +484,12 @@ struct Emitter<'a, 'src> {
     /// trait's name and the RENDERED concrete type — rendered, because two
     /// vilan types that lower to one Rust type must share one impl.
     object_impls: HashSet<(String, String)>,
+    /// F56: the nominal declarations (struct or enum) that implement std's
+    /// `Drop`. A `[resource]` type among them owes a teardown this backend
+    /// does not emit yet (F1's later slice) and is refused; a `[resource]`
+    /// type NOT among them is emitted as an ordinary type. See
+    /// [`drop_implementing_nominals`].
+    drop_nominals: HashSet<Id>,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -565,6 +610,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             copies_elided: 0,
             object_traits: HashMap::default(),
             object_impls: HashSet::new(),
+            drop_nominals: drop_implementing_nominals(program),
         }
     }
 
@@ -2469,7 +2515,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // The refusal comes BEFORE the once-only mark, or a first call that
         // swallowed the error would let a second one through on the mark alone
         // and emit a reference to a type nothing declared.
-        if declaration.resource {
+        // F56: only a resource with a `Drop` impl owes a teardown. A Drop-less
+        // one (A142's pipe nodes) is move-only and nothing more — the
+        // analyzer's move checker enforces that on both backends — so it is
+        // emitted as an ordinary struct. Its resource MEMBERS still ask this
+        // question for themselves when their field types are rendered below,
+        // so a Drop-less wrapper around a `Drop` resource is still refused, at
+        // the member that owes the teardown.
+        if declaration.resource && self.drop_nominals.contains(&id) {
             return Err(unsupported(
                 &format!(
                     "the `resource` type `{}` (destruction.md's teardown is a later slice)",
@@ -2630,7 +2683,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
         self.refuse_an_any_argument(arguments, span)?;
-        if declaration.resource {
+        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown.
+        if declaration.resource && self.drop_nominals.contains(&id) {
             return Err(unsupported(
                 &format!(
                     "the `resource` enum `{}` (destruction.md's teardown is a later slice)",
@@ -4033,7 +4087,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("({text}).clone()"));
         }
         let text = self.expression(id, depth)?;
-        if self.program.clone_sites.contains_key(&id) {
+        if self.copy_applies(self.program.clone_sites.get(&id)) {
             return Ok(format!("({text}).clone()"));
         }
         // F16 / the probe's R-1, from the other side: a closure value is a
@@ -4068,6 +4122,53 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("({text}).clone()"));
         }
         Ok(text)
+    }
+
+    /// Whether a recorded copy decision fires AT THIS EMISSION — the JS
+    /// emitter's `copy_applies`, read under this backend's substitution. A
+    /// value whose type no instantiation can change always copies; a
+    /// generic-dependent one does not when this instance binds one of its
+    /// constraints to a RESOURCE (F56): the read is a move, the source is dead,
+    /// and a copy is a second owner (R11, `docs/spec/memory.md`).
+    fn copy_applies(&self, decision: Option<&CopyDecision>) -> bool {
+        match decision {
+            None => false,
+            Some(CopyDecision::Always) => true,
+            Some(CopyDecision::UnlessResource(constraint_ids)) => {
+                !constraint_ids.iter().any(|constraint_id| {
+                    self.current_substitution
+                        .get(constraint_id)
+                        .is_some_and(|bound| self.is_resource_type(*bound))
+                })
+            }
+        }
+    }
+
+    /// Whether `type_id`, resolved under the active substitution, classifies
+    /// as a resource (destruction.md §3). The analyzer answered the question
+    /// for every type id it minted (`Program::resource_types`), and this
+    /// backend mints none, so the concrete id is looked up directly.
+    fn is_resource_type(&self, type_id: TypeId) -> bool {
+        let concrete = self.concrete(type_id);
+        self.program.resource_types.contains(&concrete)
+    }
+
+    /// F56: whether `id` reads a binding this frame OWNS whose type is a
+    /// resource. Handing one on is a MOVE — the analyzer's move checker has
+    /// already refused any later read — so a copy there is a second owner
+    /// minted for nothing. A loan (`self` by reference, a view) is not owned
+    /// and keeps whatever copy its position owes.
+    fn moves_an_owned_resource(&self, id: Id) -> bool {
+        let binding = match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
+            _ => return false,
+        };
+        !self.reads_a_loaned_parameter(id)
+            && !self.binding_holds_a_view(binding)
+            && !self.reads_a_captured_binding(id)
+            && self
+                .type_of(id)
+                .is_some_and(|type_id| self.is_resource_type(type_id))
     }
 
     /// Whether `id` is a leaf that names STORAGE without being a place — a
@@ -5490,6 +5591,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.program.entity_map.get(&subject),
                 Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
             )
+            && !self.moves_an_owned_resource(subject)
         {
             subject_text = format!("({subject_text}).clone()");
         }

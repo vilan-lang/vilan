@@ -44,8 +44,9 @@ What the backend reaches today:
 
 What it does **not** reach yet — each refused by name, with the construct in the
 message, rather than silently mis-compiled: the browser platform (`std::dom`,
-`std::ui`, `std::web`, `std::router`), `resource` types (deterministic
-teardown natively is its own slice), a handful of host bindings (the `fs`
+`std::ui`, `std::web`, `std::router`), a `resource` type with a `Drop` impl
+(deterministic teardown natively is its own slice; a resource with no `Drop`,
+such as a pipe node, builds as an ordinary move-only type), a handful of host bindings (the `fs`
 calls that take an options object), and
 `--watch` (a native round is a full `cargo build`; the dev loop's hot-swap
 belongs to the JS backend).

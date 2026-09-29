@@ -5952,3 +5952,283 @@ fn the_enumeration_finds_a_corpus_and_excludes_the_platform_programs() {
     );
     assert!(programs.iter().any(|program| program == "bool.vl"));
 }
+
+/// F56: a `[resource]` type with NO `Drop` impl needs no teardown — move-only
+/// is the analyzer's, and it reads the same on both backends — so the native
+/// build emits it as an ordinary type. A142's pipe nodes are exactly that
+/// (Drop-less `[resource]` structs holding closures), and before F56 every
+/// program deriving a signal was refused at its first node.
+///
+/// The cases are Appendix A's prototype (`native/pipe_prototype.vl`): a fused
+/// chain sealed once, a counting `switch` selector, a root and a pipe handed to
+/// an `own` parameter, two chains sealed in sequence, and a pipe chosen by a
+/// branch beside a Drop-less resource ENUM carrying one.
+#[test]
+fn a_resource_without_drop_builds_the_same_on_both_backends() {
+    let staged = stage();
+    let library = include_str!("native/pipe_prototype.vl");
+    for (name, main) in [
+        ("fused", PIPE_FUSED_MAIN),
+        ("switch", PIPE_SWITCH_MAIN),
+        ("own_parameter", PIPE_OWN_PARAMETER_MAIN),
+        ("sealed_twice", PIPE_SEALED_TWICE_MAIN),
+        ("branch", PIPE_BRANCH_MAIN),
+    ] {
+        let program = format!("native_probe_pipe_{name}.vl");
+        std::fs::write(staged.join(&program), format!("{library}\n{main}"))
+            .expect("write the probe program");
+        assert_eq!(
+            compare(&staged, &program),
+            Verdict::Identical,
+            "{program}: a Drop-less resource must build and print the same on both backends"
+        );
+    }
+}
+
+/// F56: a Drop-less resource handed on is MOVED natively, never copied. The
+/// source binding is dead (the analyzer's move checker says so on both
+/// backends), so a copy would be harmless for a type with no teardown — and
+/// wasted, and a second owner of what the language says has one. Two move
+/// sites, each of which copied before:
+///
+/// - a generic field read at a resource instantiation: the outer `Map`'s
+///   `start` hands `self.up` — itself a `Map` — to the inner `start`. The
+///   analyzer's decision is per instantiation (`UnlessResource`), and this
+///   backend read only that a decision EXISTED;
+/// - a destructuring `match` over an owned resource parameter, which copied
+///   its subject as it does a data place's.
+#[test]
+fn a_resource_is_moved_not_copied_at_its_move_sites_natively() {
+    let staged = stage();
+    let library = include_str!("native/pipe_prototype.vl");
+    let emit = |program: &str, main: &str| -> String {
+        std::fs::write(staged.join(program), format!("{library}\n{main}"))
+            .expect("write the probe program");
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("build the probe");
+        assert!(
+            emitted.status.success(),
+            "{program} was refused:\n{}",
+            String::from_utf8_lossy(&emitted.stderr)
+        );
+        String::from_utf8_lossy(&emitted.stdout).into_owned()
+    };
+    // The function whose signature names a parameter of a Rust type minted
+    // from `prefix`, as (its parameter's name, its body).
+    let owners_of = |source: &str, prefix: &str, name_prefix: &str| -> Vec<(String, String)> {
+        source
+            .split("\nfn ")
+            .skip(1)
+            .filter_map(|function| {
+                let signature = function.lines().next()?;
+                let marker = format!(": {prefix}");
+                let at = signature.find(&marker)?;
+                let name = signature[..at].rsplit(['(', ' ']).next()?.to_string();
+                name.starts_with(name_prefix)
+                    .then(|| (name, function.to_string()))
+            })
+            .collect()
+    };
+
+    // The fused chain: `Map<Map<Cell, ..>, ..>`. The Rust struct whose `up`
+    // is itself a `Map` is the outer node.
+    let fused = emit("native_probe_pipe_moves_fused.vl", PIPE_FUSED_MAIN);
+    let outer = fused
+        .split("\nstruct ")
+        .skip(1)
+        .find(|declaration| {
+            declaration
+                .lines()
+                .nth(1)
+                .is_some_and(|field| field.contains("up: Map_"))
+        })
+        .and_then(|declaration| declaration.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no `Map` over a `Map` in the emitted source:\n{fused}"))
+        .to_string();
+    let starts = owners_of(&fused, &outer, "this");
+    assert!(
+        !starts.is_empty(),
+        "no function takes the outer node `{outer}` by value:\n{fused}"
+    );
+    for (_, body) in &starts {
+        assert!(
+            !body.contains("(this.up).clone()"),
+            "the outer node's `up` (a resource) is copied where it is moved:\n{body}"
+        );
+    }
+
+    // A destructuring `match` over an owned resource parameter.
+    let branch = emit("native_probe_pipe_moves_branch.vl", PIPE_BRANCH_MAIN);
+    let runs = owners_of(&branch, "Stage_", "s_");
+    assert!(
+        !runs.is_empty(),
+        "no function takes a `Stage` by value:\n{branch}"
+    );
+    for (name, body) in &runs {
+        assert!(
+            body.contains(&format!("match {name} {{")),
+            "the owned resource `{name}` is copied into its `match`:\n{body}"
+        );
+    }
+}
+
+/// F56's other half: a resource WITH a `Drop` impl is still refused by name —
+/// its teardown is F1's later slice — as a struct and as an enum.
+#[test]
+fn a_resource_with_drop_is_still_refused_by_name_natively() {
+    let staged = stage();
+    for (program, source, named) in [
+        (
+            "native_probe_drop_struct.vl",
+            DROP_STRUCT_PROBE,
+            "the `resource` type `Guard`",
+        ),
+        (
+            "native_probe_drop_enum.vl",
+            DROP_ENUM_PROBE,
+            "the `resource` enum `Slot`",
+        ),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        match compare(&staged, program) {
+            Verdict::Refused(reason) => assert!(
+                reason.contains(named),
+                "{program} refused for another reason: {reason}"
+            ),
+            other => panic!("{program}: expected a refusal by name, got {other:?}"),
+        }
+    }
+}
+
+const PIPE_FUSED_MAIN: &str = concat!(
+    "fun main() {\n",
+    "\tlet runs = Shared::new(0);\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tlet m = c\n",
+    "\t\t.derive(|x| {\n",
+    "\t\t\truns.write() = runs.read() + 1;\n",
+    "\t\t\tx * 2\n",
+    "\t\t})\n",
+    "\t\t.derive(|x| x + 1)\n",
+    "\t\t.memo();\n",
+    "\tprint(i\"m={m.get()} runs={runs.read()}\");\n",
+    "\tc.set(5);\n",
+    "\tprint(i\"m={m.get()} {m.get()} {m.get()} runs={runs.read()}\");\n",
+    "}\n",
+);
+
+const PIPE_SWITCH_MAIN: &str = concat!(
+    "fun main() {\n",
+    "\tlet made = Shared::new(0);\n",
+    "\tlet flag = Cell::new(true);\n",
+    "\tlet count = Cell::new(1);\n",
+    "\tlet m = flag\n",
+    "\t\t.switch(|on| {\n",
+    "\t\t\tmade.write() = made.read() + 1;\n",
+    "\t\t\tcount.derive(|x| if on { x * 100 } else { 0 - x })\n",
+    "\t\t})\n",
+    "\t\t.memo();\n",
+    "\tprint(i\"m={m.get()} made={made.read()}\");\n",
+    "\tcount.set(2);\n",
+    "\tprint(i\"m={m.get()} {m.get()} made={made.read()}\");\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(i\"m={m.get()} made={made.read()}\");\n",
+    "}\n",
+);
+
+const PIPE_OWN_PARAMETER_MAIN: &str = concat!(
+    "fun show(label: str, own x: Up<i32>) {\n",
+    "\tx.start(|v| print(i\"{label}: {v}\"));\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tshow(\"root\", c);\n",
+    "\tshow(\"root again\", c);\n",
+    "\tshow(\"pipe\", c.derive(|x| x * 10));\n",
+    "\tc.set(2);\n",
+    "}\n",
+);
+
+const PIPE_SEALED_TWICE_MAIN: &str = concat!(
+    "fun main() {\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tlet m = c.derive(|x| x * 2).derive(|x| x + 1).memo();\n",
+    "\tc.set(5);\n",
+    "\tprint(i\"{m.get()}\");\n",
+    "\tlet p = c.derive(|x| x * 3);\n",
+    "\tlet q = p.derive(|x| x + 1);\n",
+    "\tlet n = q.memo();\n",
+    "\tprint(i\"{n.get()}\");\n",
+    "}\n",
+);
+
+const PIPE_BRANCH_MAIN: &str = concat!(
+    "[resource]\n",
+    "enum Stage {\n",
+    "\tDoubled(Map<Cell<i32>, i32, i32>),\n",
+    "\tPlain(Cell<i32>),\n",
+    "}\n",
+    "fun stage(on: bool, c: Cell<i32>): Stage {\n",
+    "\tif on {\n",
+    "\t\tStage::Doubled(c.derive(|x| x * 2))\n",
+    "\t} else {\n",
+    "\t\tStage::Plain(c)\n",
+    "\t}\n",
+    "}\n",
+    "fun run(label: str, own s: Stage) {\n",
+    "\tmatch s {\n",
+    "\t\tStage::Doubled(let p) => p.start(|v| print(i\"{label} doubled {v}\")),\n",
+    "\t\tStage::Plain(let c) => c.start(|v| print(i\"{label} plain {v}\")),\n",
+    "\t}\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tlet p = if c.get() > 0 { c.derive(|x| x + 1) } else { c.derive(|x| x - 1) };\n",
+    "\tlet m = p.memo();\n",
+    "\trun(\"a\", stage(true, c));\n",
+    "\trun(\"b\", stage(false, c));\n",
+    "\tc.set(7);\n",
+    "\tprint(i\"m={m.get()}\");\n",
+    "}\n",
+);
+
+const DROP_STRUCT_PROBE: &str = concat!(
+    "import std::drop::Drop;\n",
+    "[resource]\n",
+    "struct Guard {\n",
+    "\tname: str,\n",
+    "}\n",
+    "impl Guard with Drop {\n",
+    "\tfun drop(&mut self) {\n",
+    "\t\tprint(i\"closing {self.name}\");\n",
+    "\t}\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet g = Guard { name = \"a\" };\n",
+    "\tprint(g.name);\n",
+    "}\n",
+);
+
+const DROP_ENUM_PROBE: &str = concat!(
+    "import std::drop::Drop;\n",
+    "[resource]\n",
+    "enum Slot {\n",
+    "\tFull(str),\n",
+    "\tEmpty,\n",
+    "}\n",
+    "impl Slot with Drop {\n",
+    "\tfun drop(&mut self) {\n",
+    "\t\tprint(\"closing\");\n",
+    "\t}\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet s = Slot::Full(\"a\");\n",
+    "\tmatch s {\n",
+    "\t\tSlot::Full(let name) => print(name),\n",
+    "\t\tSlot::Empty => print(\"empty\"),\n",
+    "\t}\n",
+    "}\n",
+);
