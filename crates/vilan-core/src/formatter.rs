@@ -8283,6 +8283,25 @@ mod reformats {
         );
     }
 
+    // E233: the same one order for a VIEW return type. `&i32 context c
+    // borrows xs` used to reprint as written: the `&` production took the
+    // clause onto `i32`, so there was no declaration clause for the printer to
+    // put last.
+    #[test]
+    fn e233_a_view_return_types_clause_normalizes_after_borrows() {
+        let canonical =
+            "fun first(xs: &List<i32>): &i32 borrows xs context settings {\n\t&xs[0]\n}\n";
+        assert_formats(
+            "fun first(xs: &List<i32>): &i32 context settings borrows xs {\n\t&xs[0]\n}\n",
+            canonical,
+        );
+        assert_formats(canonical, canonical);
+        assert_formats(
+            "fun first(xs: &mut List<i32>): &mut i32 context (a, b) borrows xs {\n\t&mut xs[0]\n}\n",
+            "fun first(xs: &mut List<i32>): &mut i32 borrows xs context (a, b) {\n\t&mut xs[0]\n}\n",
+        );
+    }
+
     // E146 rule 3, in full: both written orders in, ONE order out, for a
     // declaration with a return type and for one without, for a single-name
     // clause and for a list, and for a bodyless declaration (a trait

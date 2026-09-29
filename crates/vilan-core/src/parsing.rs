@@ -690,6 +690,42 @@ fn take_misbound_return_clause(node: &mut Node<'_>) -> bool {
     true
 }
 
+/// E233 — a declaration's return type `&T context c` (or `&mut T …`) as the
+/// peel in [`Parser::parse_function`] expects it: the clause lifted off the
+/// view's target onto the view, so `TypeWithContexts(&T, c)` and not
+/// `&TypeWithContexts(T, c)`.
+///
+/// The `&` production parses a whole TYPE after it, clause suffix included,
+/// so the clause a writer put after `&i32` lands on `i32`, where it means
+/// nothing — the analyzer refused it ("a `context` clause is only supported on
+/// a closure type") and the formatter, finding no function clause to print,
+/// reprinted the written order. A target that carries its own clause (a
+/// closure type, B309) keeps it: `&(|| View) context owner` is a view of an
+/// injected closure. Every other shape comes back unchanged.
+fn hoist_clause_out_of_a_view(annotation: Spanned<Node<'_>>) -> Spanned<Node<'_>> {
+    let (node, span) = annotation;
+    let Node::Reference(mutable, target) = node else {
+        return (node, span);
+    };
+    let (target, target_span) = hoist_clause_out_of_a_view(*target);
+    match target {
+        Node::TypeWithContexts(inner, names) if !return_type_carries_its_own_clause(&inner.0) => {
+            let view_span = Span::from(span.start..inner.1.end);
+            (
+                Node::TypeWithContexts(
+                    Box::new((Node::Reference(mutable, inner), view_span)),
+                    names,
+                ),
+                span,
+            )
+        }
+        other => (
+            Node::Reference(mutable, Box::new((other, target_span))),
+            span,
+        ),
+    }
+}
+
 fn starts_item(token: &Token<'_>) -> bool {
     matches!(
         token,
@@ -6041,6 +6077,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         let mut contexts: Option<(Vec<Spanned<&'src str>>, Span)> = None;
         if let Some(annotation) = return_type.take() {
+            // E233: `&T context c` reads the clause on the VIEW's target (the
+            // `&` production takes a whole type), which is the same mis-binding
+            // the peel below undoes for a bare `T` — hoisted first so both
+            // spellings reach it as one shape.
+            let annotation = hoist_clause_out_of_a_view(*annotation);
             match annotation.0 {
                 Node::TypeWithContexts(inner, names)
                     if !return_type_carries_its_own_clause(&inner.0) =>
@@ -8746,6 +8787,53 @@ mod tests {
                     vec!["a", "b"]
                 );
             }
+            other => panic!("expected Func, got {other:?}"),
+        }
+    }
+
+    // E233: a VIEW return type (`&T`, `&mut T`) takes the clause the same way —
+    // the `&` production parses a whole type, so the clause first lands on the
+    // view's target and is hoisted onto the declaration from there. The return
+    // type keeps its `&`, and spans only the view.
+    #[test]
+    fn e233_a_view_return_types_context_clause_binds_to_the_declaration() {
+        for (source, mutable) in [
+            (
+                "fun pick(xs: &L): &i32 context settings borrows xs { xs }",
+                false,
+            ),
+            (
+                "fun pick(xs: &L): &i32 borrows xs context settings { xs }",
+                false,
+            ),
+            (
+                "fun pick(xs: &mut L): &mut i32 context settings borrows xs { xs }",
+                true,
+            ),
+        ] {
+            match only_item(source) {
+                Node::Func(function) => {
+                    let (names, _) = function.contexts.as_ref().expect("a declared clause");
+                    assert_eq!(names[0].0, "settings", "{source}");
+                    assert_eq!(function.borrows, Some("xs"), "{source}");
+                    let returns = function.return_type.as_ref().expect("a return type");
+                    match &returns.0 {
+                        Node::Reference(written, target) => {
+                            assert_eq!(*written, mutable, "{source}");
+                            assert!(matches!(target.0, Node::Accessor("i32")), "{source}");
+                        }
+                        other => panic!("expected a view return type, got {other:?} ({source})"),
+                    }
+                    let view = if mutable { "&mut i32" } else { "&i32" };
+                    assert_eq!(&source[returns.1.into_range()], view, "{source}");
+                }
+                other => panic!("expected Func, got {other:?}"),
+            }
+        }
+        // A view of a CLOSURE type keeps the clause on the closure (B309): the
+        // hoist is the non-closure peel's, not a second rule.
+        match only_item("fun pick(): &(|| i32) context settings { x }") {
+            Node::Func(function) => assert!(function.contexts.is_none()),
             other => panic!("expected Func, got {other:?}"),
         }
     }
