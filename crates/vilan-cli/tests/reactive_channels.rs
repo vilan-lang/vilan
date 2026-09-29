@@ -3405,6 +3405,236 @@ fn a137_a_joining_mirror_is_seeded_over_a_socket() {
     );
 }
 
+// --- A139: a PER-KEY lease joining a sibling's per-key forward is seeded -----
+
+/// A139 IN PROCESS: A137's two origins on one keyed cell, now per KEY. The
+/// first mirror leases key `a` (its per-key `Subscribe` starts the forward and
+/// the server seeds it); the second then leases the same key, and its
+/// `Subscribe` JOINS that forward (`LiveForward.holds` is per demand), so the
+/// server sends it nothing. Before the fix the joiner held nothing under the
+/// key (`second=-`, `Waiting`) and the key's next `Update` landed on a mirror
+/// that did not hold it: a protocol FAULT, desynced for good. The socket twin
+/// is next.
+const A139_KEY_JOIN_SEED: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, duplex_pair, local_rpc, register_session };
+import std::shared::Shared;
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(BoardClient)]
+struct Board {
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun edit(self, id: str, text: str): i32 {
+		self.rows.update(id, |&mut row| {
+			row.text = text;
+		});
+		0
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+fun text_of(row: Option<Row>): str {
+	match row {
+		Some(let held) => held.text,
+		None => "-",
+	}
+}
+
+fun fault_of(fault: Option<str>): str {
+	match fault {
+		Some(let reason) => reason,
+		None => "none",
+	}
+}
+
+fun main() {
+	let board = Board { rows = KeyedCell::new([Row { id = "a", text = "one" }, Row { id = "b", text = "two" }]) };
+	let (client_end, server_end) = duplex_pair();
+	register_session(3, server_end, json_codec());
+	let transport = local_rpc(board.dispatcher().into_protocol(json_codec()).for_connection(3));
+	let client = BoardClient { transport, codec = json_codec(), reactive = ReactiveClient::new(client_end, json_codec()) };
+	let first: KeyedSource<str, Row> = client.rows();
+	let second: KeyedSource<str, Row> = client.rows_again();
+	let seen_first: Shared<str> = Shared::new("?");
+	let seen_second: Shared<str> = Shared::new("?");
+	let _first = first.sub_key("a", |row| seen_first.write() = text_of(row));
+	sleep_for(Duration::millis(0));
+	let _second = second.sub_key("a", |row| seen_second.write() = text_of(row));
+	sleep_for(Duration::millis(0));
+	print(i"join: same-channel={first.channel.read() == second.channel.read()} first={seen_first.read()} second={seen_second.read()} second-status={second.known().debug()}");
+	print(i"edit:{client.edit("a", "uno").unwrap_or(0 - 1)}");
+	sleep_for(Duration::millis(0));
+	print(i"after: first={seen_first.read()} second={seen_second.read()} fault={fault_of(second.fault())}");
+}
+"#;
+
+#[test]
+fn a139_a_per_key_lease_joining_a_siblings_forward_is_seeded() {
+    let stdout = run_program("a139_key_join", A139_KEY_JOIN_SEED);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "join: same-channel=true first=one second=one second-status=Ready",
+            "edit:0",
+            "after: first=uno second=uno fault=none",
+        ],
+        "a per-key lease whose Subscribe joins a sibling's per-key forward must \
+         hold the key's element; got:\n{stdout}"
+    );
+}
+
+/// A139 OVER A SOCKET: the same two per-key leases over a real WebSocket.
+/// Red before on the same three values (`second=-`, `Waiting`, the fault).
+const A139_KEY_JOIN_SEED_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ KeyedCell, KeyedSource };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq)]
+struct Row {
+	id: str,
+	text: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(BoardClient)]
+struct Board {
+	rows: KeyedCell<str, Row>,
+}
+
+impl Board {
+	[rpc]
+	fun edit(self, id: str, text: str): i32 {
+		self.rows.update(id, |&mut row| {
+			row.text = text;
+		});
+		0
+	}
+
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		self.rows
+	}
+
+	[rpc]
+	fun rows_again(self): KeyedCell<str, Row> {
+		self.rows
+	}
+}
+
+let board: Board = Board { rows = KeyedCell::new([Row { id = "a", text = "one" }, Row { id = "b", text = "two" }]) };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 100 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+fun text_of(row: Option<Row>): str {
+	match row {
+		Some(let held) => held.text,
+		None => "-",
+	}
+}
+
+fun fault_of(fault: Option<str>): str {
+	match fault {
+		Some(let reason) => reason,
+		None => "none",
+	}
+}
+
+async fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let first: KeyedSource<str, Row> = client.rows();
+			let second: KeyedSource<str, Row> = client.rows_again();
+			let seen_first: Shared<str> = Shared::new("?");
+			let seen_second: Shared<str> = Shared::new("?");
+			let _first = first.sub_key("a", |row| seen_first.write() = text_of(row));
+			until(|| seen_first.read() == "one");
+			let _second = second.sub_key("a", |row| seen_second.write() = text_of(row));
+			until(|| second.channel.read() >= 0);
+			until(|| seen_second.read() == "one");
+			print(i"join: same-channel={first.channel.read() == second.channel.read()} first={seen_first.read()} second={seen_second.read()} second-status={second.known().debug()}");
+			print(i"edit:{client.edit("a", "uno").unwrap_or(0 - 1)}");
+			until(|| seen_first.read() == "uno" && (seen_second.read() == "uno" || second.fault().is_some()));
+			print(i"after: first={seen_first.read()} second={seen_second.read()} fault={fault_of(second.fault())}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a139_a_per_key_joiner_is_seeded_over_a_socket() {
+    let stdout = run_program("a139_key_join_socket", A139_KEY_JOIN_SEED_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "join: same-channel=true first=one second=one second-status=Ready",
+            "edit:0",
+            "after: first=uno second=uno fault=none",
+        ],
+        "over a socket, a per-key lease whose Subscribe joins a sibling's \
+         per-key forward must hold the key's element; got:\n{stdout}"
+    );
+}
+
 // --- A135: a handler runs under its CONNECTION's owner ----------------------
 
 /// A135 IN PROCESS: kolt's shape — a handle method whose body is

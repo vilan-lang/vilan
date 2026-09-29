@@ -3191,6 +3191,12 @@ export struct MirrorRoute {
 	/// holds the server's forward on its channel and has a value; `None`
 	/// otherwise.
 	snapshot: || Option<Frame>,
+	/// `snapshot` for ONE key of a keyed mirror (A139): the `Patch` a fresh per-key
+	/// forward would seed with — an `Insert` of the element this mirror holds under
+	/// the key, or no ops when the key is absent — while this mirror holds the
+	/// server's PER-KEY forward for it. `None` otherwise, and always `None` on a
+	/// plain mirror.
+	key_snapshot: |Hash| Option<Frame>,
 }
 
 /// Seed a mirror whose `Subscribe` has just gone out on a channel a SIBLING on this
@@ -3211,6 +3217,8 @@ export struct MirrorRoute {
 /// A sibling that holds the forward but has no value yet has its seed in flight,
 /// and that frame reaches every route on the channel, the joiner's included — so
 /// "nothing to offer" needs no second path.
+///
+/// The PER-KEY join is `seed_key_from_sibling`, below.
 fun seed_from_sibling(
 	routes: Shared<List<MirrorRoute>>,
 	joiner: Shared<i32>,
@@ -3223,6 +3231,41 @@ fun seed_from_sibling(
 	for route in routes.read() {
 		if route.channel.read() == channel && route.channel.identity() != joiner.identity() {
 			match (route.snapshot)() {
+				Some(let frame) => {
+					deliver(frame);
+					ret;
+				},
+				None => {},
+			}
+		}
+	}
+}
+
+/// `seed_from_sibling` for one KEY (A139): a keyed mirror whose per-key
+/// `Subscribe` has just gone out, for a key a SIBLING on this client already holds
+/// the per-key forward of. The server counts that `Subscribe` into the sibling's
+/// forward (`LiveForward.holds` is per DEMAND, and a key is one) and sends nothing,
+/// so the joiner held nothing under the key — and the key's next `Update` landed
+/// on a mirror that did not hold it, a protocol FAULT that left it desynced. The
+/// sibling's route offers the `Patch` a fresh per-key forward seeds with, and the
+/// joiner's own deliverer lands it.
+///
+/// A whole-collection holder offers nothing here, correctly: a per-key `Subscribe`
+/// beside a whole-collection forward is a DIFFERENT demand, so the server starts a
+/// fresh per-key forward and seeds it itself.
+fun seed_key_from_sibling(
+	routes: Shared<List<MirrorRoute>>,
+	joiner: Shared<i32>,
+	key: Hash,
+	deliver: |Frame| void,
+) {
+	let channel = joiner.read();
+	if channel < 0 {
+		ret;
+	}
+	for route in routes.read() {
+		if route.channel.read() == channel && route.channel.identity() != joiner.identity() {
+			match (route.key_snapshot)(key) {
 				Some(let frame) => {
 					deliver(frame);
 					ret;
@@ -3429,7 +3472,14 @@ export impl ReactiveClient {
 				None => None,
 			}
 		};
-		self.routes.write().push(MirrorRoute { channel = channel_cell, deliver, snapshot });
+		self.routes
+			.write()
+			.push(MirrorRoute {
+				channel = channel_cell,
+				deliver,
+				snapshot,
+				key_snapshot = |_key| None,
+			});
 		let routes = self.routes;
 		RemoteSource {
 			channel = channel_cell,
@@ -3477,8 +3527,8 @@ export impl ReactiveClient {
 		let codec = self.codec;
 		// `mirror_of`'s snapshot at the keyed type (A137): a WHOLE-collection
 		// holder offers what it holds as the `Reset` a fresh forward would seed
-		// with. A per-key holder offers nothing — a joining per-key lease is not
-		// seeded by this path (the report's find).
+		// with. A per-key holder offers nothing HERE — a joining per-key lease is
+		// seeded per key, by `key_snapshot` below (A139).
 		let snapshot = || {
 			if count.read() == 0 && !closing.read() {
 				ret None;
@@ -3494,6 +3544,44 @@ export impl ReactiveClient {
 		let routes = self.routes;
 		// Filled in below, once `deliver` exists: the join seeds through it.
 		let join_hook: Shared<|| void> = Shared::new(|| {});
+		let join_key_hook: Shared<|Hash| void> = Shared::new(|_key| {});
+		let leases: Shared<List<KeyLease>> = Shared::new([]);
+		let positions: Shared<Map<Hash, usize>> = Shared::new(Map::new());
+		// The per-key snapshot (A139): offered for a key while THIS mirror holds
+		// the server's per-key forward for it (`on_wire`: its `Subscribe` went out
+		// and no `Unsubscribe` has). The seed a fresh per-key forward sends is an
+		// `Insert` of the element under the key, or no ops at all when the key is
+		// absent (`keyed_cell_key_forward`), and this re-encodes the same thing
+		// from what the mirror holds. A mirror whose own per-key seed is still in
+		// flight holds no list yet and offers nothing: that frame reaches the
+		// joiner's route too.
+		let key_snapshot = |key: Hash| {
+			mut held = false;
+			for lease in leases.read() {
+				if lease.key.eq(key) && lease.on_wire.read() {
+					held = true;
+				}
+			}
+			if !held {
+				ret None;
+			}
+			match cache.get() {
+				None => None,
+				Some(let list) => {
+					mut ops: List<Delta<K, T>> = [];
+					match positions.read().get(key) {
+						None => {},
+						Some(let at) => match list.get(at) {
+							Some(let element) => ops.push(Delta::Insert(element.key(), element, at)),
+							None => {},
+						},
+					}
+					Some(encode_patch(codec, channel_cell.read(), |mut serializer: Serializer| {
+						ops.describe(&mut serializer);
+					}))
+				},
+			}
+		};
 		let mirror: KeyedSource<K, T> = KeyedSource {
 			channel = channel_cell,
 			codec = self.codec,
@@ -3503,9 +3591,10 @@ export impl ReactiveClient {
 			count,
 			closing,
 			join = join_hook,
+			join_key = join_key_hook,
 			settle_id = fresh_id(),
-			leases = Shared::new([]),
-			positions = Shared::new(Map::new()),
+			leases,
+			positions,
 			origin,
 			released = Shared::new(false),
 			leased = Shared::new(false),
@@ -3534,8 +3623,11 @@ export impl ReactiveClient {
 				None => mirror.apply(ops),
 			}
 		};
-		self.routes.write().push(MirrorRoute { channel = channel_cell, deliver, snapshot });
+		self.routes
+			.write()
+			.push(MirrorRoute { channel = channel_cell, deliver, snapshot, key_snapshot });
 		join_hook.write() = || seed_from_sibling(routes, channel_cell, deliver);
+		join_key_hook.write() = |key| seed_key_from_sibling(routes, channel_cell, key, deliver);
 		mirror
 	}
 
@@ -4843,6 +4935,10 @@ export struct KeyedSource<K, T> {
 	/// `Subscribe`'s seed when it joined a sibling's forward. A cell, because the
 	/// hook closes over the mirror's own deliverer, which is built after it.
 	join: Shared<|| void>,
+	/// `join` for ONE key (A139): run after every per-key `Subscribe` this mirror
+	/// sends, so a lease that JOINS a sibling's per-key forward is seeded from the
+	/// sibling (`seed_key_from_sibling`). A cell for `join`'s reason.
+	join_key: Shared<|Hash| void>,
 }
 
 /// A keyed mirror IS a `Source` too (tracker A55) — at `Option<List<T>>`,
@@ -5168,6 +5264,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				if lease.count.read() > 0 && !lease.on_wire.read() {
 					lease.on_wire.write() = true;
 					(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
+					(self.join_key.read())(lease.key);
 				}
 			}
 		}
@@ -5193,6 +5290,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 				if self.count.read() == 0 {
 					lease.on_wire.write() = true;
 					(self.transport).send(encode_control_keyed(self.codec, "Subscribe", self.channel.read(), lease.describe));
+					(self.join_key.read())(lease.key);
 				}
 			}
 		}
@@ -5371,6 +5469,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 			if lease.count.read() > 0 && self.count.read() == 0 {
 				lease.on_wire.write() = true;
 				(self.transport).send(encode_control_keyed(self.codec, "Subscribe", channel, lease.describe));
+				(self.join_key.read())(lease.key);
 			}
 		}
 	}
