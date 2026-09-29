@@ -39,6 +39,34 @@ use std::process::{Command, Output};
 
 mod support;
 
+/// The release's extension asset (E229).
+const VSIX: &str = "vilan-vscode.vsix";
+
+/// The fixture's VS Code CLI: records each call in `$HOME/editor.log` (and the
+/// bytes of any `.vsix` it is handed), answers `--list-extensions` with
+/// `$VILAN_FIXTURE_LISTED`, and exits `$VILAN_FIXTURE_GALLERY_EXIT` for an
+/// install by gallery id (an unreachable gallery) and
+/// `$VILAN_FIXTURE_VSIX_EXIT` for an install from a file.
+const EDITOR_SHIM: &str = r#"#!/bin/sh
+printf '%s\n' "${0##*/} $*" >> "$HOME/editor.log"
+for argument in "$@"; do
+    case "$argument" in
+        --list-extensions) printf '%s\n' "${VILAN_FIXTURE_LISTED:-}"; exit 0 ;;
+        *.vsix)
+            cat "$argument" >> "$HOME/editor.log"
+            if [ "${VILAN_FIXTURE_VSIX_EXIT:-0}" != 0 ]; then
+                echo "the editor refused the file" >&2
+            fi
+            exit "${VILAN_FIXTURE_VSIX_EXIT:-0}"
+            ;;
+    esac
+done
+if [ "${VILAN_FIXTURE_GALLERY_EXIT:-0}" != 0 ]; then
+    echo "Failed Installing Extensions: the gallery is unreachable" >&2
+fi
+exit "${VILAN_FIXTURE_GALLERY_EXIT:-0}"
+"#;
+
 /// A scratch install: a copied `vilan` in its own bin dir, plus a fake
 /// release tree for `$VILAN_UPGRADE_BASE`.
 struct Fixture {
@@ -80,12 +108,24 @@ impl Fixture {
                 .arg(&stage)
                 .args(["vilan", "vilan-lsp"]),
         );
+        // E230: the release's extension beside the toolchain, checksummed in
+        // the same `sha256sums.txt` — the offline fallback `vilan upgrade`
+        // installs when the gallery cannot be reached. The CURRENT version's
+        // release holds one too: an up-to-date toolchain still brings a stale
+        // extension to its own version.
+        fs::write(assets.join(VSIX), "the 9.9.9 extension\n").expect("write the vsix");
         let sums = run_ok(
             Command::new("sha256sum")
                 .arg(&asset_name)
+                .arg(VSIX)
                 .current_dir(&assets),
         );
         fs::write(assets.join("sha256sums.txt"), sums.stdout).expect("write sums");
+        let current = root.join(format!("releases/download/v{}", env!("CARGO_PKG_VERSION")));
+        fs::create_dir_all(&current).expect("create the current release dir");
+        fs::write(current.join(VSIX), "the current extension\n").expect("write the vsix");
+        let sums = run_ok(Command::new("sha256sum").arg(VSIX).current_dir(&current));
+        fs::write(current.join("sha256sums.txt"), sums.stdout).expect("write sums");
 
         // A scratch HOME with a pre-seeded std cache: one entry backdated past
         // the prune guard, one fresh — a successful upgrade prunes exactly the
@@ -107,6 +147,12 @@ impl Fixture {
             home,
             base_url,
         }
+    }
+
+    fn release_vsix(&self, version: &str) -> PathBuf {
+        self.root
+            .join(format!("releases/download/v{version}"))
+            .join(VSIX)
     }
 
     fn cache_entry(&self, name: &str) -> PathBuf {
@@ -140,6 +186,7 @@ impl Fixture {
             .args(arguments)
             .env("HOME", &self.home)
             .env("VILAN_UPGRADE_BASE", base)
+            .env("VILAN_NO_VSCODE", "1")
             .env_remove("VILAN_UPGRADE_LATEST");
         if let Some(latest) = latest {
             command.env("VILAN_UPGRADE_LATEST", latest);
@@ -147,6 +194,9 @@ impl Fixture {
         run_retrying(&mut command)
     }
 
+    /// `vilan upgrade` against the fixture's release tree, with the editor
+    /// step OFF: this machine's own `code` (a WSL launcher, say) must never be
+    /// handed a fixture's extension. The E230 pins use [`Fixture::upgrade_with_editor`].
     fn upgrade(&self, arguments: &[&str], latest: &str) -> Output {
         run_retrying(
             Command::new(self.bin.join("vilan"))
@@ -154,8 +204,47 @@ impl Fixture {
                 .args(arguments)
                 .env("HOME", &self.home)
                 .env("VILAN_UPGRADE_BASE", &self.base_url)
-                .env("VILAN_UPGRADE_LATEST", latest),
+                .env("VILAN_UPGRADE_LATEST", latest)
+                .env("VILAN_NO_VSCODE", "1"),
         )
+    }
+
+    /// E230: `vilan upgrade` with the fixture's own VS Code CLI — a `code`
+    /// shim first on PATH ([`EDITOR_SHIM`]) — and the environment `extra` sets.
+    fn upgrade_with_editor(
+        &self,
+        arguments: &[&str],
+        latest: &str,
+        extra: &[(&str, &str)],
+    ) -> Output {
+        let shims = self.root.join("editor-bin");
+        fs::create_dir_all(&shims).expect("create the shim dir");
+        let code = shims.join("code");
+        fs::write(&code, EDITOR_SHIM).expect("write the editor shim");
+        fs::set_permissions(&code, fs::Permissions::from_mode(0o755)).expect("chmod the shim");
+        let path = std::env::join_paths(std::iter::once(shims).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .expect("join PATH");
+        let mut command = Command::new(self.bin.join("vilan"));
+        command
+            .arg("upgrade")
+            .args(arguments)
+            .env("HOME", &self.home)
+            .env("PATH", path)
+            .env("VILAN_UPGRADE_BASE", &self.base_url)
+            .env("VILAN_UPGRADE_LATEST", latest)
+            .env_remove("VILAN_NO_VSCODE");
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        run_retrying(&mut command)
+    }
+
+    /// What the editor shim was asked, one line per call, and the bytes of any
+    /// extension file it was handed.
+    fn editor_log(&self) -> String {
+        fs::read_to_string(self.home.join("editor.log")).unwrap_or_default()
     }
 
     /// `vilan cache prune` against the fixture's scratch `HOME`, so the
@@ -478,4 +567,176 @@ fn cache_prune_deletes_the_stale_entry_and_keeps_the_fresh_one() {
     let text = String::from_utf8_lossy(&again.stdout).to_string();
     assert!(again.status.success());
     assert!(text.contains("nothing to prune"), "{text}");
+}
+
+// --- E230: `vilan upgrade` brings the editor along ---------------------------
+//
+// The installers install the release's extension beside the toolchain (E229);
+// the in-place upgrade did not, so a vsix install — which VS Code pins and
+// never auto-updates — sat a release behind its server. `vilan upgrade` runs
+// the same step now: the GALLERY id first, which VS Code keeps updated from
+// then on, and the release's checksummed vsix when the gallery cannot be
+// reached. The editor refusing either is reported, never a failed upgrade.
+
+/// After the swap, the gallery id — unversioned, so the install is not pinned
+/// and follows the gallery from then on.
+#[test]
+fn e230_upgrade_installs_the_extension_from_the_gallery_after_the_swap() {
+    let fixture = Fixture::new("e230-gallery");
+    let output = fixture.upgrade_with_editor(&[], "9.9.9", &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.installed_banner(), "vilan 9.9.9 (fake)");
+    assert_eq!(
+        fixture.editor_log(),
+        "code --install-extension vilan-lang.vilan --force\n",
+        "one call, by gallery id"
+    );
+    assert!(
+        stdout.contains("VS Code extension: installed vilan-lang.vilan from the gallery")
+            && stdout.contains("reload VS Code"),
+        "{stdout}"
+    );
+}
+
+/// The gallery unreachable: the release's own vsix, verified against the
+/// release's `sha256sums.txt` before the editor sees it.
+#[test]
+fn e230_an_unreachable_gallery_falls_back_to_the_checked_vsix() {
+    let fixture = Fixture::new("e230-offline");
+    let output = fixture.upgrade_with_editor(&[], "9.9.9", &[("VILAN_FIXTURE_GALLERY_EXIT", "1")]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    let log = fixture.editor_log();
+    let calls: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        calls[0], "code --install-extension vilan-lang.vilan --force",
+        "{log}"
+    );
+    assert!(
+        calls[1].starts_with("code --install-extension ")
+            && calls[1].ends_with("vilan-vscode.vsix --force"),
+        "{log}"
+    );
+    assert_eq!(
+        calls[2], "the 9.9.9 extension",
+        "the release's file, the new version's: {log}"
+    );
+    assert!(
+        stdout.contains(
+            "VS Code extension: installed vilan-vscode.vsix (the gallery was unreachable)"
+        ),
+        "{stdout}"
+    );
+}
+
+/// A vsix that does not verify is never handed to the editor, and the
+/// toolchain — already swapped — stays swapped: the summary says why the
+/// extension is missing.
+#[test]
+fn e230_a_fallback_vsix_that_does_not_verify_is_never_installed() {
+    let fixture = Fixture::new("e230-badsum");
+    fs::write(fixture.release_vsix("9.9.9"), "tampered\n").expect("tamper");
+    let output = fixture.upgrade_with_editor(&[], "9.9.9", &[("VILAN_FIXTURE_GALLERY_EXIT", "1")]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the toolchain upgrade stands: {stdout}"
+    );
+    assert_eq!(fixture.installed_banner(), "vilan 9.9.9 (fake)");
+    assert_eq!(
+        fixture.editor_log(),
+        "code --install-extension vilan-lang.vilan --force\n",
+        "only the gallery was asked"
+    );
+    assert!(
+        stdout.contains("VS Code extension: NOT installed")
+            && stdout.contains("checksum mismatch for vilan-vscode.vsix"),
+        "{stdout}"
+    );
+}
+
+/// The owner's case: the toolchain is already the newest release, and the
+/// extension is not its version. `vilan upgrade` brings the extension to it —
+/// and leaves an extension that already matches alone.
+#[test]
+fn e230_an_up_to_date_toolchain_still_brings_a_stale_extension_to_its_version() {
+    let fixture = Fixture::new("e230-newest");
+    let output = fixture.upgrade_with_editor(
+        &[],
+        "0.1.0",
+        &[("VILAN_FIXTURE_LISTED", "vilan-lang.vilan@0.40.0")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("is the newest release"), "{stdout}");
+    assert_eq!(
+        fixture.editor_log(),
+        "code --list-extensions --show-versions\ncode --install-extension vilan-lang.vilan --force\n",
+    );
+    assert!(
+        stdout.contains("VS Code extension: installed vilan-lang.vilan from the gallery"),
+        "{stdout}"
+    );
+
+    let current = Fixture::new("e230-current");
+    let listed = format!("vilan-lang.vilan@{}", env!("CARGO_PKG_VERSION"));
+    let output = current.upgrade_with_editor(&[], "0.1.0", &[("VILAN_FIXTURE_LISTED", &listed)]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(
+        current.editor_log(),
+        "code --list-extensions --show-versions\n",
+        "a matching extension is not reinstalled"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "VS Code extension: {listed} matches the toolchain"
+        )),
+        "{stdout}"
+    );
+
+    // Offline, the fallback is the CURRENT version's release vsix.
+    let offline = Fixture::new("e230-newest-offline");
+    let output = offline.upgrade_with_editor(&[], "0.1.0", &[("VILAN_FIXTURE_GALLERY_EXIT", "1")]);
+    assert!(output.status.success());
+    assert!(
+        offline.editor_log().contains("the current extension"),
+        "{}",
+        offline.editor_log()
+    );
+}
+
+/// The installers' opt-out, both spellings: nothing asks the editor anything.
+#[test]
+fn e230_the_editor_step_is_opted_out_by_flag_or_environment() {
+    for (name, arguments, environment) in [
+        ("e230-flag", &["--no-vscode"][..], &[][..]),
+        ("e230-env", &[][..], &[("VILAN_NO_VSCODE", "1")][..]),
+    ] {
+        let fixture = Fixture::new(name);
+        let output = fixture.upgrade_with_editor(arguments, "9.9.9", environment);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{name}: {stdout}");
+        assert_eq!(fixture.installed_banner(), "vilan 9.9.9 (fake)", "{name}");
+        assert_eq!(fixture.editor_log(), "", "{name}: the editor was touched");
+        assert!(
+            stdout.contains("VS Code extension: not touched (--no-vscode / VILAN_NO_VSCODE)"),
+            "{name}: {stdout}"
+        );
+    }
+}
+
+/// `--check` asks the release page one question and changes nothing — the
+/// editor included.
+#[test]
+fn e230_check_never_touches_the_editor() {
+    let fixture = Fixture::new("e230-check");
+    let output = fixture.upgrade_with_editor(&["--check"], "9.9.9", &[]);
+    assert!(output.status.success());
+    assert_eq!(fixture.editor_log(), "");
 }

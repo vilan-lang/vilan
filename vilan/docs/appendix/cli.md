@@ -803,6 +803,18 @@ release, downloading for your platform and swapping the pair atomically
 licenses and third-party notices travel along. `--check` reports whether
 a newer release exists and changes nothing.
 
+The VS Code extension comes along. After the swap — and when the
+toolchain is already the newest release but the installed extension is
+not its version — `vilan upgrade` runs the installers' extension step:
+`code --install-extension vilan-lang.vilan` from the Marketplace or Open
+VSX first (an install VS Code keeps updated from then on), and the
+release's own `vilan-vscode.vsix`, verified against its checksum, when
+the gallery cannot be reached. The editor is found as the installers find
+it: `code` on your `PATH`, else a VS Code Server's own CLI. Its last line
+says which it did; an editor that refuses the extension is reported,
+never a failed upgrade. `--no-vscode` (or `VILAN_NO_VSCODE=1`) leaves the
+editor alone.
+
 `vilan upgrade` also prunes the std cache described below while it has
 `~/.vilan` open.
 

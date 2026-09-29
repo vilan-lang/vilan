@@ -1208,15 +1208,28 @@ esac
 
 /// The fixture's VS Code CLI (`code` on PATH, or a VS Code Server's
 /// `code-server`): records its arguments and the bytes of the extension it was
-/// handed in `$HOME/editor.log`, then exits with `$VILAN_FIXTURE_EDITOR_EXIT`.
+/// handed in `$HOME/editor.log`, then exits with `$VILAN_FIXTURE_EDITOR_EXIT`
+/// — or, for an install by gallery id (no `.vsix` argument), with
+/// `$VILAN_FIXTURE_GALLERY_EXIT` when that is set: an unreachable gallery
+/// (E230).
 const EDITOR_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "${0##*/} $*" >> "$HOME/editor.log"
+from_file=""
 for argument in "$@"; do
     case "$argument" in
         # builtins only: the fixture PATH holds no `cat`.
-        *.vsix) while IFS= read -r line; do printf '%s\n' "$line"; done < "$argument" >> "$HOME/editor.log" ;;
+        *.vsix)
+            from_file=1
+            while IFS= read -r line; do printf '%s\n' "$line"; done < "$argument" >> "$HOME/editor.log"
+            ;;
     esac
 done
+if [ -z "$from_file" ] && [ -n "${VILAN_FIXTURE_GALLERY_EXIT:-}" ]; then
+    if [ "$VILAN_FIXTURE_GALLERY_EXIT" != 0 ]; then
+        echo "Failed Installing Extensions: the gallery is unreachable" >&2
+    fi
+    exit "$VILAN_FIXTURE_GALLERY_EXIT"
+fi
 if [ "${VILAN_FIXTURE_EDITOR_EXIT:-0}" != 0 ]; then
     echo "the editor refused the extension" >&2
 fi
@@ -1454,8 +1467,10 @@ fn the_installer_refuses_when_no_sha256_tool_can_verify_the_download() {
 // installs it wherever a VS Code CLI is found, verified against the same
 // `sha256sums.txt` as the toolchain, behind an opt-out.
 
-/// `code` on PATH: the extension is downloaded, verified, and handed to
-/// `code --install-extension … --force`, and the summary says so.
+/// `code` on PATH: the extension is downloaded and verified with the
+/// toolchain, and then installed from the GALLERY by id (E230) — an
+/// unversioned gallery install is one VS Code keeps updated, where a vsix
+/// install is pinned — forced over whatever is there, and the summary says so.
 #[test]
 fn e229_the_installer_installs_the_extension_when_code_is_on_path() {
     let Some(tool) = sha256_tool() else {
@@ -1468,19 +1483,48 @@ fn e229_the_installer_installs_the_extension_when_code_is_on_path() {
         installer.installed().exists(),
         "the toolchain was not installed:\n{report}"
     );
-    let log = installer.editor_log();
+    assert_eq!(
+        installer.editor_log(),
+        "code --install-extension vilan-lang.vilan --force\n",
+        "`code` must be asked for the gallery id, forced over an older one"
+    );
     assert!(
-        log.starts_with("code --install-extension ") && log.contains("vilan-vscode.vsix --force"),
-        "`code` must be asked to install the release's vsix, forced over an older one:\n{log}"
+        report.contains("VS Code extension: installed vilan-lang.vilan from the gallery")
+            && report.contains("reload VS Code"),
+        "the summary must say the extension was installed and what to do next:\n{report}"
+    );
+}
+
+/// E230: the gallery unreachable, the release's own vsix — the file the
+/// installer downloaded and VERIFIED before anything was installed.
+#[test]
+fn e230_an_unreachable_gallery_falls_back_to_the_verified_vsix() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    let installer = Installer::new("e230-offline", Some(&tool)).with_code_on_path();
+    let (ok, report) = installer.run_with("real", &[], &[("VILAN_FIXTURE_GALLERY_EXIT", "1")]);
+    assert!(ok, "the install failed:\n{report}");
+    let log = installer.editor_log();
+    let calls: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        calls[0], "code --install-extension vilan-lang.vilan --force",
+        "{log}"
+    );
+    assert!(
+        calls[1].starts_with("code --install-extension ")
+            && calls[1].ends_with("vilan-vscode.vsix --force"),
+        "{log}"
     );
     assert!(
         log.contains("a stand-in for the extension"),
         "`code` must be handed the DOWNLOADED file, not a path to nothing:\n{log}"
     );
     assert!(
-        report.contains("VS Code extension: installed vilan-vscode.vsix")
-            && report.contains("reload VS Code"),
-        "the summary must say the extension was installed and what to do next:\n{report}"
+        report.contains(
+            "VS Code extension: installed vilan-vscode.vsix (the gallery was unreachable)"
+        ),
+        "{report}"
     );
 }
 
@@ -1552,7 +1596,7 @@ fn e229_a_vscode_server_cli_installs_the_extension_when_code_is_absent() {
         "the server's CLI must be asked to install the vsix:\n{log}"
     );
     assert!(
-        report.contains("VS Code extension: installed vilan-vscode.vsix"),
+        report.contains("VS Code extension: installed vilan-lang.vilan from the gallery"),
         "{report}"
     );
 }

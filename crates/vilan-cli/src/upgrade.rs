@@ -32,11 +32,22 @@
 //! old version. So `vilan upgrade` reads where it is running from and steers
 //! instead (distribution.md §2, call (b) — steer, never overwrite).
 //!
+//! E230: the EDITOR comes along. The installers install the release's VS Code
+//! extension beside the toolchain (E229), and an upgrade that left it behind
+//! left a vsix install — which VS Code pins and never updates — a release
+//! behind its server. So after a swap, and when the toolchain is already the
+//! newest but the installed extension is not its version, `vilan upgrade` runs
+//! the installers' extension step: the gallery id first (an unversioned
+//! install is not pinned, so the gallery keeps it current from then on), the
+//! release's checksummed `vilan-vscode.vsix` when the gallery cannot be
+//! reached. `--no-vscode` / `$VILAN_NO_VSCODE` opt out, exactly as the
+//! installers' do; the editor refusing is reported, never a failed upgrade.
+//!
 //! Test seams (undocumented, for the integration tests): `$VILAN_UPGRADE_BASE`
 //! replaces the repository base URL (a `file://` tree works — `curl` speaks
 //! it), and `$VILAN_UPGRADE_LATEST` skips the redirect discovery.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use sha2::{Digest, Sha256};
@@ -196,8 +207,15 @@ fn steer_message(colored: bool, owner: (&str, &str), current: &str, newer: Optio
     )
 }
 
-pub fn upgrade(check_only: bool) -> ExitCode {
-    match run(check_only) {
+pub fn upgrade(check_only: bool, no_vscode: bool) -> ExitCode {
+    let editor = if no_vscode
+        || std::env::var_os("VILAN_NO_VSCODE").is_some_and(|value| !value.is_empty())
+    {
+        EditorStep::OptedOut
+    } else {
+        EditorStep::Run
+    };
+    match run(check_only, editor) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{} {message}", paint::error_prefix());
@@ -206,7 +224,7 @@ pub fn upgrade(check_only: bool) -> ExitCode {
     }
 }
 
-fn run(check_only: bool) -> Result<(), String> {
+fn run(check_only: bool, editor: EditorStep) -> Result<(), String> {
     let current = parse_version(env!("CARGO_PKG_VERSION"))
         .ok_or_else(|| "this binary's own version is unparseable".to_string())?;
 
@@ -257,6 +275,22 @@ fn run(check_only: bool) -> Result<(), String> {
                 )
             )
         );
+        // E230: the toolchain is current; the extension may not be — the
+        // owner's case, a vsix install pinned a release behind. Only a
+        // self-managed install (a package manager's channel ships no editor
+        // step of its own to follow), and never on `--check`.
+        if channel.owner().is_none() && !check_only {
+            let current = env!("CARGO_PKG_VERSION");
+            let workdir = scratch_dir("vilan-upgrade-editor")?;
+            let line = editor.run(
+                &format!("{base}/releases/download/v{current}"),
+                current,
+                &workdir,
+                true,
+            );
+            let _ = std::fs::remove_dir_all(&workdir);
+            println!("{line}");
+        }
         return Ok(());
     }
     if check_only {
@@ -296,10 +330,7 @@ fn run(check_only: bool) -> Result<(), String> {
 
     let asset = asset_name(env!("VILAN_TARGET"));
     let download_base = format!("{base}/releases/download/v{latest_label}");
-    let workdir = std::env::temp_dir().join(format!("vilan-upgrade-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&workdir);
-    std::fs::create_dir_all(&workdir)
-        .map_err(|error| format!("cannot create {}: {error}", workdir.display()))?;
+    let workdir = scratch_dir("vilan-upgrade")?;
     let result = download_verify_swap(
         &download_base,
         &asset,
@@ -307,8 +338,217 @@ fn run(check_only: bool) -> Result<(), String> {
         &install_dir,
         &latest_label,
     );
+    // E230: the toolchain is in place — now the editor, from the same
+    // release (its `sha256sums.txt` is already in `workdir`).
+    if result.is_ok() {
+        println!(
+            "{}",
+            editor.run(&download_base, &latest_label, &workdir, false)
+        );
+    }
     let _ = std::fs::remove_dir_all(&workdir);
     result
+}
+
+/// A fresh per-process scratch directory under the system temp dir.
+fn scratch_dir(stem: &str) -> Result<PathBuf, String> {
+    let workdir = std::env::temp_dir().join(format!("{stem}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir)
+        .map_err(|error| format!("cannot create {}: {error}", workdir.display()))?;
+    Ok(workdir)
+}
+
+// --- E230: the editor's half of an upgrade ------------------------------------
+
+/// The extension's gallery identity — `publisher.name` in
+/// `editors/vscode/package.json` (the extension's own `EXTENSION_ID`).
+const EXTENSION_ID: &str = "vilan-lang.vilan";
+
+/// The release asset every release carries beside the toolchain (E229).
+const VSIX_ASSET: &str = "vilan-vscode.vsix";
+
+/// Whether `vilan upgrade` touches the editor at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorStep {
+    Run,
+    /// `--no-vscode` or `$VILAN_NO_VSCODE` — the installers' opt-out.
+    OptedOut,
+}
+
+impl EditorStep {
+    /// Bring the VS Code extension to `version`, the toolchain's, and answer
+    /// the summary line. `release` is that version's download directory, and
+    /// `workdir` a scratch directory that may already hold its
+    /// `sha256sums.txt`. `unless_current` asks the editor first and leaves an
+    /// extension that already IS `version` alone (the already-newest path —
+    /// after a swap the extension cannot be the new version yet).
+    fn run(self, release: &str, version: &str, workdir: &Path, unless_current: bool) -> String {
+        if self == EditorStep::OptedOut {
+            return "VS Code extension: not touched (--no-vscode / VILAN_NO_VSCODE)".to_string();
+        }
+        let Some(editor) = vscode_cli() else {
+            return format!(
+                "VS Code extension: no VS Code CLI found (`code` on PATH, or a VS Code Server) — \
+                 install {EXTENSION_ID} from the Marketplace or Open VSX"
+            );
+        };
+        let name = editor
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "code".to_string());
+        if unless_current
+            && let Some(installed) = installed_extension_version(&editor)
+            && installed == version
+        {
+            return format!("VS Code extension: {EXTENSION_ID}@{installed} matches the toolchain");
+        }
+        let gallery = editor_run(&editor, &["--install-extension", EXTENSION_ID, "--force"]);
+        let gallery_reason = match gallery {
+            Ok(()) => {
+                return format!(
+                    "VS Code extension: installed {EXTENSION_ID} from the gallery with `{name}` \
+                     (it updates itself from now on) — reload VS Code to use it"
+                );
+            }
+            Err(reason) => reason,
+        };
+        // The gallery is unreachable (offline, a proxy, a VS Code build
+        // without one): the release's own file, verified like the toolchain.
+        let vsix = workdir.join(VSIX_ASSET);
+        let checked = (|| {
+            if !workdir.join("sha256sums.txt").is_file() {
+                fetch(
+                    &format!("{release}/sha256sums.txt"),
+                    &workdir.join("sha256sums.txt"),
+                )?;
+            }
+            fetch(&format!("{release}/{VSIX_ASSET}"), &vsix)?;
+            verify_checksum(workdir, VSIX_ASSET)
+        })();
+        if let Err(error) = checked {
+            let error = error.trim_end_matches("; aborting");
+            return format!(
+                "VS Code extension: NOT installed — the gallery was unreachable ({gallery_reason}), \
+                 and {error}"
+            );
+        }
+        let vsix_argument = vsix.to_string_lossy().into_owned();
+        match editor_run(&editor, &["--install-extension", &vsix_argument, "--force"]) {
+            Ok(()) => format!(
+                "VS Code extension: installed {VSIX_ASSET} (the gallery was unreachable) with \
+                 `{name}` — reload VS Code to use it"
+            ),
+            Err(reason) => format!(
+                "VS Code extension: NOT installed — `{name} --install-extension` failed: {reason}"
+            ),
+        }
+    }
+}
+
+/// Run the editor's CLI, its output captured (a summary line reports it);
+/// `Err` carries the last line it printed.
+fn editor_run(editor: &Path, arguments: &[&str]) -> Result<(), String> {
+    let output = Command::new(editor)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", editor.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(stderr
+        .lines()
+        .chain(stdout.lines())
+        .rfind(|line| !line.trim().is_empty())
+        .unwrap_or("it exited unsuccessfully")
+        .trim()
+        .to_string())
+}
+
+/// The installed extension's version, from `--list-extensions
+/// --show-versions` (`publisher.name@version` per line), or `None`.
+fn installed_extension_version(editor: &Path) -> Option<String> {
+    let output = Command::new(editor)
+        .args(["--list-extensions", "--show-versions"])
+        .output()
+        .ok()?;
+    installed_version_in(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// [`installed_extension_version`]'s parse, pinnable without an editor.
+fn installed_version_in(listing: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (id, version) = line.trim().split_once('@')?;
+        id.eq_ignore_ascii_case(EXTENSION_ID)
+            .then(|| version.to_string())
+    })
+}
+
+/// The command that installs a VS Code extension on this machine, in the
+/// installers' order (`scripts/install.sh`'s `vscode_cli`): `code` on PATH —
+/// on a desktop the editor itself, inside WSL the launcher that forwards to
+/// the WSL server — and failing that the newest VS Code Server's own CLI under
+/// the home directory (Remote-SSH, Tunnels, WSL without the launcher).
+fn vscode_cli() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["code.cmd", "code.exe"]
+    } else {
+        &["code"]
+    };
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            for name in names {
+                let candidate = directory.join(name);
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    let server = vilan_embedded::home_dir()?.join(".vscode-server");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for (parent, tail) in [
+        (server.join("bin"), Path::new("bin/code-server")),
+        (
+            server.join("cli/servers"),
+            Path::new("server/bin/code-server"),
+        ),
+    ] {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(tail);
+            if !is_executable(&candidate) {
+                continue;
+            }
+            let modified = candidate
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if newest.as_ref().is_none_or(|(best, _)| modified > *best) {
+                newest = Some((modified, candidate));
+            }
+        }
+    }
+    newest.map(|(_, candidate)| candidate)
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 fn download_verify_swap(
@@ -618,9 +858,9 @@ fn parse_version(label: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Channel, UPGRADE_LOGO, asset_name, install_binaries, is_aside_leftover, parse_version,
-        recorded_checksum, sha256_file, steer_message, success_banner, sweep_aside_leftovers,
-        verify_checksum, version_from_tag_url,
+        Channel, UPGRADE_LOGO, asset_name, install_binaries, installed_version_in,
+        is_aside_leftover, parse_version, recorded_checksum, sha256_file, steer_message,
+        success_banner, sweep_aside_leftovers, verify_checksum, version_from_tag_url,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1208,5 +1448,16 @@ mod tests {
                 "a line is not self-contained: {line:?}"
             );
         }
+    }
+
+    /// E230: `--list-extensions --show-versions` prints `publisher.name@version`
+    /// per line; the gallery id is case-insensitive (VS Code lowercases it in
+    /// some builds), and another publisher's `vilan` is not ours.
+    #[test]
+    fn the_installed_extension_version_is_read_from_the_listing() {
+        let listing = "ms-python.python@2026.1.0\nVilan-Lang.Vilan@0.40.0\nother.vilan@9.9.9\n";
+        assert_eq!(installed_version_in(listing).as_deref(), Some("0.40.0"));
+        assert_eq!(installed_version_in("other.vilan@9.9.9\n"), None);
+        assert_eq!(installed_version_in(""), None);
     }
 }

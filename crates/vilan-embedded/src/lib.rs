@@ -351,7 +351,7 @@ pub fn materialize_into(cache_root: &Path) -> Result<PathBuf, String> {
 /// than fall through. Unix keeps `HOME` first, exactly as before. Each
 /// candidate is checked for emptiness on its own, so a set-but-empty variable
 /// falls through to the next instead of ending the search.
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     home_dir_from(cfg!(windows), |name| std::env::var_os(name))
 }
 

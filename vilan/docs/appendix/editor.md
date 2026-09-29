@@ -10,8 +10,11 @@ tests is the VS Code extension.
 ## Getting it
 
 The [toolchain install](../tour/hello-vilan.md#install-the-toolchain) puts
-`vilan-lsp` next to `vilan` in `~/.vilan/bin`. Then install **Vilan**
-(`vilan-lang.vilan`) from the VS Code Marketplace or Open VSX. The
+`vilan-lsp` next to `vilan` in `~/.vilan/bin`, and — when VS Code's `code`
+is on your `PATH` — installs **Vilan** (`vilan-lang.vilan`) from the VS
+Code Marketplace or Open VSX too; `vilan upgrade` brings the extension to
+the toolchain's version each time it runs. Otherwise install it from
+either gallery yourself. The
 extension activates on a `.vl` file or a workspace containing a
 `vilan.toml`, and finds the server by looking, in order, at
 `vilan.server.path`, a `target/release/vilan-lsp` or `target/debug/`
