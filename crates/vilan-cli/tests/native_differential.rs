@@ -3591,6 +3591,7 @@ fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
     drop(stream);
 }
 
+#[cfg(unix)]
 const OPEN_STREAM_PROBE: &str = concat!(
     "import std::io::print;\n",
     "import std::http::{ Server, Response };\n",

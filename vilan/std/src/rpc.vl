@@ -3124,7 +3124,7 @@ export impl ReactiveServer with Disposable {
 /// id cell it shares with the mirror, so a rebind moves both in one write), the
 /// deliverer that lands a routed frame in it at the mirror's own type, and what a
 /// sibling joining the same channel is seeded from (A137).
-struct MirrorRoute {
+export struct MirrorRoute {
 	channel: Shared<i32>,
 	deliver: |Frame| void,
 	/// This mirror's value as the frame that would carry it, while this mirror
