@@ -7755,3 +7755,53 @@ fn a_pseudo_class_name_cannot_claim_the_pseudo_element_marker() {
         "a pseudo-class name cannot start with '%'",
     );
 }
+
+// --- B471: the `css` rename's did-you-mean, in the ANALYZER -------------------
+//
+// B414 S4 (syntax-44) puts `css` in the member tier, so `space(4).css`,
+// `Length::css(..)` and `style().css(..)` stop reaching the parser's rename note
+// and land on the analyzer's ordinary misses. RULED 2026-09-29: the misses name
+// the rename. These pins assert only what the rename note and the analyzer's
+// did-you-mean SHARE, so they hold on either side of the member tier; with it
+// in, they are red with `css_rename_steer` planted out.
+
+/// The half of the rename both readings spell.
+const CSS_FIELD_RENAME_NOTE: &str = "the `.css` field of a `Length` or a `Color` is now `.text`";
+
+#[test]
+fn b471_a_css_field_read_on_a_length_names_the_rename() {
+    let source = r#"
+        import std::io::print;
+        import std::style::space;
+        fun main() {
+            print(space(4).css);
+        }
+        main();
+        "#;
+    assert_fails_with(source, CSS_RENAME_NOTE);
+    assert_fails_with(source, CSS_FIELD_RENAME_NOTE);
+}
+
+#[test]
+fn b471_a_css_static_on_length_names_the_rename() {
+    let source = r#"
+        import std::style::{ Length, style };
+        let _x = const style().left(Length::css("1px"));
+        fun main() {}
+        main();
+        "#;
+    assert_fails_with(source, CSS_RENAME_NOTE);
+    assert_fails_with(source, CSS_FIELD_RENAME_NOTE);
+}
+
+#[test]
+fn b471_a_css_call_on_a_style_names_the_rename() {
+    let source = r#"
+        import std::style::style;
+        fun main() {
+            let _s = style().css("color", "red");
+        }
+        main();
+        "#;
+    assert_fails_with(source, CSS_RENAME_NOTE);
+}

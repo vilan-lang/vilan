@@ -30837,6 +30837,40 @@ impl<'src> Analyzer<'src> {
         });
     }
 
+    /// B471 (RULED 2026-09-29): the did-you-mean a retired `css` member earns
+    /// on std's style values. `css` became the `css { … }` block's keyword in
+    /// v0.38 and the values renamed their `css` members out of its way; since
+    /// B414 S4 the word names a MEMBER again, so an old spelling no longer
+    /// reaches the parser's rename note and lands on the analyzer's ordinary
+    /// miss — which names the rename instead. Keyed on std's own `Length`,
+    /// `Color`, `Style` and `Declarations`: a user type's `css` miss is an
+    /// ordinary one.
+    fn css_rename_steer(&self, subject_type: &Type, member_name: &str) -> Option<String> {
+        if member_name != "css" {
+            return None;
+        }
+        let Type::Struct(struct_id, _) = subject_type else {
+            return None;
+        };
+        let name = self.structs.get(struct_id)?.name;
+        if !matches!(name, "Length" | "Color" | "Style" | "Declarations")
+            || !self
+                .source_of_id(*struct_id)
+                .is_some_and(|source| self.std_sources.contains(&source))
+        {
+            return None;
+        }
+        let meant = match name {
+            "Length" | "Color" => "`.text` (the field) or `Length::raw(…)`",
+            _ => "`.raw(…)`",
+        };
+        Some(format!(
+            "; did you mean {meant}? `css` became the `css {{ … }}` block's keyword, and the \
+             style values' `css` members were renamed out of its way: `Length::css(…)` is now \
+             `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.text`"
+        ))
+    }
+
     /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for
     /// a member only the SOURCE trait declares (`get`, and the other reads).
     /// A pipe is a description consumed once; reading it means sealing it, or
@@ -46750,7 +46784,10 @@ impl<'src> Analyzer<'src> {
                 // A142 §3.3: a READ on a pipe — the member a `Source` has and a
                 // pipe deliberately does not — is sealed or sampled, and the
                 // import the steer below would offer is the wrong fix.
-                let pipe_read_steer = self.pipe_read_steer(&subject_type, member_name);
+                let pipe_read_steer = self
+                    .pipe_read_steer(&subject_type, member_name)
+                    // B471: a style value's retired `css` member names its rename.
+                    .or_else(|| self.css_rename_steer(&subject_type, member_name));
                 let import_steer = match pipe_read_steer {
                     Some(steer) => steer,
                     None => self
@@ -52124,7 +52161,17 @@ impl<'src> Analyzer<'src> {
                                 Some(member_name),
                             ),
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!("struct '{}' has no field '{}'", struct_name, member_name),
+                            msg: format!(
+                                "struct '{}' has no field '{}'{}",
+                                struct_name,
+                                member_name,
+                                // B471: a style value's retired `.css` field.
+                                self.css_rename_steer(
+                                    &Type::Struct(struct_id, Vec::new()),
+                                    member_name
+                                )
+                                .unwrap_or_default()
+                            ),
                         });
                         self.expr_id_to_expr_map.insert(id, Expr::Error);
                         Resolution::Failed
@@ -54334,8 +54381,13 @@ impl<'src> Analyzer<'src> {
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
-                                    "cannot find '{}' in {}{}",
-                                    member_name, subject_str, trait_only_note
+                                    "cannot find '{}' in {}{}{}",
+                                    member_name,
+                                    subject_str,
+                                    trait_only_note,
+                                    // B471: `Length::css(…)`, renamed `raw`.
+                                    self.css_rename_steer(&subject_type, member_name)
+                                        .unwrap_or_default()
                                 ),
                             });
                         }
