@@ -22,6 +22,8 @@ import pkg::tuple::Tuple;
 // `proposal/incremental-collections.md` §4 is the design; `std::rpc`'s `KeyedCell`
 // is the first consumer (A54's machinery, lifted).
 export import pkg::delta::{
+	Coll,
+	CollBy,
 	CollFilter,
 	CollFilterMap,
 	CollFlatten,
@@ -42,6 +44,7 @@ export import pkg::delta::{
 	ListMemo,
 	MapOp,
 	RowFeed,
+	SameElement,
 	SeqOp,
 	Sequence,
 	SequenceCell,

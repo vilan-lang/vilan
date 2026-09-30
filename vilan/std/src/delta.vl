@@ -42,6 +42,7 @@ import pkg::reactive::{
 	Instance,
 	Owner,
 	Pipe,
+	RowStep,
 	Signal,
 	SignalCell,
 	Source,
@@ -55,6 +56,7 @@ import pkg::reactive::{
 	mint_subscriber,
 	observe_flow,
 	owner_scope,
+	reconcile,
 	register_with_owner,
 	run_element,
 	subscriber_of,
@@ -2232,6 +2234,249 @@ export impl CollTally<type F: CollFlow<type T>, T, type R: IntoFlow<bool>, type 
 }
 
 export impl CollTally<type F: CollFlow<type T>, T, type R: IntoFlow<bool>, type U> with Pipe<U> {}
+
+// --- Boundary conversions (A142 S5, §6.3) ------------------------------------
+
+/// Whether two elements a keyed reconcile matched by key are the SAME element, so
+/// nothing is emitted for it: equality where the element has one, and "the same key
+/// is the same element" where it has none — a collection of sources keyed by id
+/// (§6.3's own case) keeps each source, where a `SetAt` would restart whatever
+/// follows it.
+export trait SameElement {
+	fun same_element(self, other: Self): bool;
+}
+
+/// No equality: the key decides.
+export impl type T with SameElement {
+	fun same_element(self, other: T): bool {
+		true
+	}
+}
+
+/// Equality: a matched element whose value changed is a `SetAt`.
+export impl type T: PartialEq with SameElement {
+	fun same_element(self, other: T): bool {
+		self == other
+	}
+}
+
+/// The coarse-to-granular doors (R10): a flow of whole lists, turned into a
+/// collection pipe by DIFFING each new list against the last. Only ever a diff —
+/// the coarse source threw the change away upstream (§1); the real fix is a
+/// granular source of truth, and these are for the boundaries (a fetch result, a
+/// wire snapshot).
+export impl type F: Flow<List<type T>> {
+	/// The KEYED diff: `each_by`'s `ReconcilePlan` per change, O(n) with hashing.
+	/// It can emit `Move` — a reordered element keeps its identity, and so does
+	/// what follows it downstream. A matched element whose value changed is a
+	/// `SetAt` when the element has `==`; without one, the same key is the same
+	/// element.
+	fun coll_by<K: PartialEq + Hashable>(own self, key: sync |T| K): CollBy<F, T, K> {
+		CollBy<F, T, K> { up = self, key }
+	}
+}
+
+export impl type F: Flow<List<type T: PartialEq>> {
+	/// The POSITIONAL diff: trim the common prefix and suffix and splice what is
+	/// between them. O(n) compares, and minimal for the common edits — an append,
+	/// an insertion, a removal is one op of one element.
+	fun coll(own self): Coll<F, T> {
+		Coll<F, T> { up = self }
+	}
+}
+
+/// `.coll()` as a stage.
+export [resource] struct Coll<F, T> {
+	up: F,
+}
+
+export impl Coll<type F: Flow<List<type T: PartialEq>>, T> with CollFlow<T> {
+	fun open(own self): CollInstance<T> {
+		let upstream = self.up.start();
+		let pull = upstream.pull;
+		let held: Shared<List<T>> = Shared::new(fresh_list(pull()));
+		CollInstance<T> {
+			snapshot = || fresh_list(held.read()),
+			attach = upstream.attach,
+			drain = || {
+				let next = pull();
+				let ops = positional_ops(held.read(), next);
+				held.write() = fresh_list(next);
+				ops
+			},
+			release = upstream.release,
+		}
+	}
+}
+
+export impl Coll<type F: Flow<List<type T: PartialEq>>, T> with CollPipe<T> {}
+
+/// The prefix/suffix trim: nothing, or one `Splice` over what lies between.
+fun positional_ops<T: PartialEq>(before: List<T>, after: List<T>): List<SeqOp<T>> {
+	let old_length = before.len();
+	let new_length = after.len();
+	mut prefix = 0;
+	for prefix < old_length && prefix < new_length && before[prefix] == after[prefix] {
+		prefix += 1;
+	}
+	mut suffix = 0;
+	for prefix + suffix < old_length
+		&& prefix + suffix < new_length
+		&& before[old_length - 1 - suffix] == after[new_length - 1 - suffix] {
+		suffix += 1;
+	}
+	mut ops: List<SeqOp<T>> = [];
+	let removed = span_of(before, prefix, old_length - suffix);
+	let inserted = span_of(after, prefix, new_length - suffix);
+	if removed.len() > 0 || inserted.len() > 0 {
+		ops.push(SeqOp::Splice(prefix, removed, inserted));
+	}
+	ops
+}
+
+/// The elements of `list` at `from .. to`.
+fun span_of<T>(list: List<T>, from: usize, to: usize): List<T> {
+	mut span: List<T> = [];
+	mut index = from;
+	for index < to {
+		span.push(list[index]);
+		index += 1;
+	}
+	span
+}
+
+/// `.coll_by(key)` as a stage.
+export [resource] struct CollBy<F, T, K> {
+	up: F,
+	key: |T| K,
+}
+
+export impl CollBy<type F: Flow<List<type T: SameElement>>, T, type K: PartialEq + Hashable> with CollFlow<
+	T,
+> {
+	fun open(own self): CollInstance<T> {
+		let key = self.key;
+		let upstream = self.up.start();
+		let pull = upstream.pull;
+		let held: Shared<List<T>> = Shared::new(fresh_list(pull()));
+		CollInstance<T> {
+			snapshot = || fresh_list(held.read()),
+			attach = upstream.attach,
+			drain = || {
+				let next = pull();
+				let ops = keyed_ops(held.read(), next, key);
+				held.write() = fresh_list(next);
+				ops
+			},
+			release = upstream.release,
+		}
+	}
+}
+
+export impl CollBy<type F: Flow<List<type T: SameElement>>, T, type K: PartialEq + Hashable> with CollPipe<
+	T,
+> {}
+
+/// A `ReconcilePlan` as ops (§6.3). The elements that left go first, as one splice
+/// per contiguous run (from the end, so the positions still hold); then the new
+/// order is built front to back: an arriving run is one splice, a matched element
+/// standing elsewhere is a `Move` to where it belongs, and a matched element whose
+/// value changed is a `SetAt` there. A list that did not reorder finds every
+/// matched element already in place, so the pass is linear.
+fun keyed_ops<T: SameElement, K: PartialEq + Hashable>(
+	before: List<T>,
+	after: List<T>,
+	key: |T| K,
+): List<SeqOp<T>> {
+	mut old_keys: List<K> = [];
+	for item in before {
+		old_keys.push(key(item));
+	}
+	let plan = reconcile(old_keys, before, after, |item: T| key(item), |was: T, now: T| was.same_element(now));
+	mut ops: List<SeqOp<T>> = [];
+	// What stands now, as old indices (`None` for an arrival), with its values.
+	mut standing: List<Option<usize>> = [];
+	mut values: List<T> = fresh_list(before);
+	mut index = 0;
+	for index < before.len() {
+		standing.push(Some(index));
+		index += 1;
+	}
+	// The departures, from the end: each contiguous run of removed indices is one
+	// splice, and removing from the end keeps every earlier position valid.
+	mut run_end = plan.removed.len();
+	for run_end > 0 {
+		mut run_start = run_end - 1;
+		for run_start > 0 && plan.removed[run_start - 1] + 1 == plan.removed[run_start] {
+			run_start -= 1;
+		}
+		let at = plan.removed[run_start];
+		let count = run_end - run_start;
+		let left = span_of(values, at, at + count);
+		mut taken = 0;
+		for taken < count {
+			let _gone = standing.remove(at);
+			let _value = values.remove(at);
+			taken += 1;
+		}
+		ops.push(SeqOp::Splice(at, left, []));
+		run_end = run_start;
+	}
+	// The new order, front to back. Everything before `position` is final.
+	mut position = 0;
+	let steps = plan.steps;
+	for position < steps.len() {
+		match steps[position] {
+			RowStep::Fresh => {
+				mut end = position + 1;
+				for end < steps.len() && steps[end] is RowStep::Fresh {
+					end += 1;
+				}
+				let arriving = span_of(after, position, end);
+				mut offset = 0;
+				for item in arriving {
+					standing.insert(position + offset, None);
+					values.insert(position + offset, item);
+					offset += 1;
+				}
+				ops.push(SeqOp::Splice(position, [], arriving));
+				position = end;
+			},
+			RowStep::Keep(let old) => {
+				place_matched(&mut standing, &mut values, &mut ops, old, position);
+				position += 1;
+			},
+			RowStep::Refresh(let old) => {
+				place_matched(&mut standing, &mut values, &mut ops, old, position);
+				ops.push(SeqOp::SetAt(position, values[position], after[position]));
+				values[position] = after[position];
+				position += 1;
+			},
+		}
+	}
+	ops
+}
+
+/// Bring old element `old` to `position`, with a `Move` when it stands later.
+fun place_matched<T>(
+	standing: &mut List<Option<usize>>,
+	values: &mut List<T>,
+	ops: &mut List<SeqOp<T>>,
+	old: usize,
+	position: usize,
+) {
+	mut at = position;
+	for at < standing.len() && standing[at] != Some(old) {
+		at += 1;
+	}
+	if at != position && at < standing.len() {
+		let moved = standing.remove(at);
+		standing.insert(position, moved);
+		let value = values.remove(at);
+		values.insert(position, value);
+		ops.push(SeqOp::Move(at, 1, position));
+	}
+}
 
 // --- What `each`/`each_by` read their rows from ------------------------------
 

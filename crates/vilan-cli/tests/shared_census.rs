@@ -51,7 +51,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "delta.vl",
-        22,
+        24,
         "E: the delta log's ops/version/base/cursors (twice — `new` and \
          `with_limit`) plus a cursor's own sequence. Every one of them is \
          minted by the CELL that holds the log and read by the CONSUMERS that \
@@ -67,7 +67,9 @@ const CENSUS: &[(&str, usize, &str)] = &[
          slots, the next slot id, the consumer's subscriber), the kept mirror \
          of `filter`, `filter_map` and the tally (one each) and the Fenwick \
          index's tree; plus `element_holds_allocated_count`, the module-level \
-         counter the per-element allocation pin reads (R).",
+         counter the per-element allocation pin reads (R). +2 at A142 S5: \
+         `.coll()`'s and `.coll_by()`'s last list, the one each diffs the next \
+         against (O, per instance).",
     ),
     (
         "memo.vl",
@@ -258,7 +260,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 172,
+        total, 174,
         "the total number of `Shared` construction sites in std changed"
     );
 

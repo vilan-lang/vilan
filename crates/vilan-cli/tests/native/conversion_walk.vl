@@ -1,0 +1,53 @@
+// A142 S5's random walk (`inference/collections.rs`), run on both backends.
+import std::reactive::{ Signal, SignalCell, comp };
+
+mut seed = 99;
+
+fun next(bound: usize): usize {
+	seed = (seed * 75 + 74) % 65537;
+	(seed % bound.as_i32()).as_usize()
+}
+
+fun main() {
+	let source: SignalCell<List<i32>> = Signal::new([1, 2, 3, 4]);
+	let (outs, scope) = comp(|| {
+		let doubled = source.coll().map(|x| x * 2).memo();
+		let keyed = source.coll_by(|x| x % 7).memo();
+		let derived = source.derive(|xs| xs).coll().memo();
+		(doubled, keyed, derived)
+	});
+	let (doubled, keyed, derived) = outs;
+	mut failures = 0;
+	mut step = 0;
+	for step < 600 {
+		mut next_list: List<i32> = source.get();
+		let choice = next(5);
+		let size = next_list.len();
+		if choice == 0 {
+			next_list.push(next(30).as_i32());
+		} else if choice == 1 && size > 0 {
+			let _gone = next_list.remove(next(size));
+		} else if choice == 2 && size > 1 {
+			let moved = next_list.remove(next(size));
+			next_list.insert(next(size - 1), moved);
+		} else if choice == 3 && size > 0 {
+			next_list[next(size)] = next(30).as_i32();
+		} else {
+			next_list = [next(9).as_i32(), next(9).as_i32(), next(9).as_i32()];
+		}
+		source.set(next_list);
+		let now = source.get();
+		if doubled.get() != now.map(|x| x * 2) {
+			failures += 1;
+		}
+		if keyed.get() != now {
+			failures += 1;
+		}
+		if derived.get() != now {
+			failures += 1;
+		}
+		step += 1;
+	}
+	print(i"failures {failures}");
+	scope.dispose();
+}

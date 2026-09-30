@@ -916,9 +916,10 @@ const HASH_EQUALITY_PROBE: &str = concat!(
     "}\n",
 );
 
-/// A142 S4: the collection pipes on both backends — the operators' seeded
-/// random walk against an oracle recomputed after every step (the same walk as
-/// `inference/collections.rs`'s), and the following shapes: `map` over a
+/// A142 S4 and S5: the collection pipes on both backends — the operators' and
+/// the boundary conversions' seeded random walks against an oracle recomputed
+/// after every step (the same walks as `inference/collections.rs`'s), and the
+/// following shapes: `map` over a
 /// returned pipe and a returned source, `flatten`, `filter_map(|m| m)` and
 /// `any(|m| m.is_pending())` over `Option`-valued sources, and the element
 /// runs' owners released on leave, re-run and disposal.
@@ -933,6 +934,10 @@ fn a142_collection_pipes_build_the_same_on_both_backends() {
         (
             "native_probe_collection_follow.vl",
             include_str!("native/collection_follow.vl"),
+        ),
+        (
+            "native_probe_conversion_walk.vl",
+            include_str!("native/conversion_walk.vl"),
         ),
     ] {
         std::fs::write(staged.join(name), program).expect("write the probe program");

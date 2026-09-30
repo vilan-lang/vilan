@@ -1,11 +1,14 @@
-//! Collections per shape (`proposal/reactive-layers.md` §6, tracker A142 S4):
-//! the collection pipe (`CollPipe`, R33) and its operators, which follow the
-//! reactive value a closure returns (R9, `IntoFlow` R31, `map`'s R35).
+//! Collections per shape (`proposal/reactive-layers.md` §6, tracker A142 S4 and
+//! S5): the collection pipe (`CollPipe`, R33) and its operators, which follow
+//! the reactive value a closure returns (R9, `IntoFlow` R31, `map`'s R35), and
+//! the boundary conversions from a coarse flow of lists (`.coll_by(key)`,
+//! `.coll()`, R10).
 //!
 //! What the pins hold is the COST model as much as the values: a plain closure
 //! allocates nothing per element, a following closure holds one subscription
-//! per element and an element's change is one op, and a removed element releases
-//! what its run built. The values are held against an oracle recomputed from scratch
+//! per element and an element's change is one op, a removed element releases
+//! what its run built, and the boundary diffs emit the minimal op for the
+//! common edits. The values are held against an oracle recomputed from scratch
 //! after every edit of a seeded random walk, on both backends
 //! (`native_differential`'s collection probe runs the same walk natively).
 //!
@@ -442,6 +445,192 @@ fun main() {
         if counted.get() != flagged { failures += 1; }
         if everything.get() != all_positive { failures += 1; }
         if anything.get() != (flagged > 0) { failures += 1; }
+        step += 1;
+    }
+    print(i"failures {failures}");
+    scope.dispose();
+}
+main();
+"#;
+
+// --- S5: the boundary conversions (§6.3) ---------------------------------------
+
+/// What a boundary conversion emits, as a line per drain: a `ListMemo` sealed
+/// from it is a `DeltaSource`, so a cursor reads the ops the pipe produced.
+const DESCRIBE: &str = r#"
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ DeltaSource, Signal, SignalCell, SeqOp, comp };
+
+fun describe(ops: List<SeqOp<i32>>): str {
+    mut out = "";
+    for op in ops {
+        match op {
+            SeqOp::Splice(let at, let removed, let inserted) => out = out + i"splice({at},-{removed.len()},+{inserted.len()}) ",
+            SeqOp::SetAt(let at, let _was, let _now) => out = out + i"set({at}) ",
+            SeqOp::Reset(let items) => out = out + i"reset({items.len()}) ",
+            SeqOp::Move(let from, let count, let to) => out = out + i"move({from},{count},{to}) ",
+        }
+    }
+    out
+}
+"#;
+
+/// `.coll()` is minimal for the common edits: an append, an insertion and a
+/// removal are each ONE splice of ONE element, and an unchanged list is nothing.
+#[test]
+fn a142_s5_coll_emits_one_splice_for_append_insert_and_remove() {
+    assert_compiles_and_runs(
+        &format!(
+            "{DESCRIBE}\n{}",
+            r#"
+            fun main() {
+                let fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3, 4]);
+                let (rows, scope) = comp(|| fetched.coll().memo());
+                let cursor = rows.cursor();
+                fetched.set([1, 2, 3, 4, 5]);
+                print(describe(rows.since(cursor)));
+                fetched.set([1, 2, 9, 3, 4, 5]);
+                print(describe(rows.since(cursor)));
+                fetched.set([1, 2, 3, 4, 5]);
+                print(describe(rows.since(cursor)));
+                fetched.set([1, 2, 3, 4, 5]);
+                print(describe(rows.since(cursor)).len());
+                print(rows.get());
+                scope.dispose();
+            }
+            main();
+            "#
+        ),
+        "splice(4,-0,+1) \nsplice(2,-0,+1) \nsplice(2,-1,+0) \n0\n[ 1, 2, 3, 4, 5 ]\n",
+    );
+}
+
+/// `.coll_by(key)` over `ReconcilePlan` (§6.3): a reordered element is a
+/// `Move` — it keeps its identity — a matched element whose value changed is a
+/// `SetAt`, and departures and arrivals are splices.
+#[test]
+fn a142_s5_coll_by_moves_a_reordered_element_and_sets_a_changed_one() {
+    assert_compiles_and_runs(
+        &format!(
+            "{DESCRIBE}\n{}",
+            r#"
+            fun main() {
+                let fetched: SignalCell<List<i32>> = Signal::new([11, 12, 13, 14]);
+                let (rows, scope) = comp(|| fetched.coll_by(|n| n % 10).memo());
+                let cursor = rows.cursor();
+                fetched.set([14, 11, 12, 13]);
+                print(describe(rows.since(cursor)));
+                fetched.set([14, 21, 12, 13]);
+                print(describe(rows.since(cursor)));
+                fetched.set([14, 12, 15]);
+                print(describe(rows.since(cursor)));
+                print(rows.get());
+                scope.dispose();
+            }
+            main();
+            "#
+        ),
+        "move(3,1,0) \nset(1) \nsplice(3,-1,+0) splice(1,-1,+0) splice(2,-0,+1) \n[ 14, 12, 15 ]\n",
+    );
+}
+
+/// §6.3's two steps for the sketch's first rough edge: a coarse list OF sources,
+/// keyed (`.coll_by`) and joined (`.filter_map(|x| x)`). Elements with no `==`
+/// are the same element under the same key, so a re-sent list keeps each source
+/// and what follows it.
+#[test]
+fn a142_s5_coll_by_then_filter_map_joins_a_coarse_list_of_sources() {
+    assert_compiles_and_runs(
+        r#"
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription, comp };
+
+        struct Row {
+            id: i32,
+            state: SignalCell<Option<str>>,
+        }
+
+        impl Row with Source<Option<str>> {
+            fun get(self): Option<str> {
+                self.state.get()
+            }
+
+            [must_use]
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.state.on_settle(subscriber)
+            }
+        }
+
+        fun main() {
+            let a = Row { id = 1, state = Signal::new(Some("a")) };
+            let b = Row { id = 2, state = Signal::new(None) };
+            let c = Row { id = 3, state = Signal::new(Some("c")) };
+            let coarse: SignalCell<List<Row>> = Signal::new([a, b]);
+            let (loaded, scope) = comp(|| coarse.coll_by(|row| row.id).filter_map(|row| row).memo());
+            print(loaded.get());
+            b.state.set(Some("b"));
+            print(loaded.get());
+            coarse.set([c, a, b]);
+            print(loaded.get());
+            a.state.set(None);
+            print(loaded.get());
+            scope.dispose();
+        }
+        main();
+        "#,
+        "[ 'a' ]\n[ 'a', 'b' ]\n[ 'c', 'a', 'b' ]\n[ 'c', 'b' ]\n",
+    );
+}
+
+/// The conversions agree with the list they convert under a random walk of
+/// whole-list writes (appends, removals, moves, edits, replacements), keyed with
+/// duplicate keys and positional alike.
+#[test]
+fn a142_s5_the_conversions_agree_with_the_list_under_a_random_walk() {
+    assert_compiles_and_runs(CONVERSION_WALK, "failures 0\n");
+}
+
+pub const CONVERSION_WALK: &str = r#"
+import std::reactive::{ Signal, SignalCell, comp };
+
+mut seed = 99;
+
+fun next(bound: usize): usize {
+    seed = (seed * 75 + 74) % 65537;
+    (seed % bound.as_i32()).as_usize()
+}
+
+fun main() {
+    let source: SignalCell<List<i32>> = Signal::new([1, 2, 3, 4]);
+    let (outs, scope) = comp(|| (
+        source.coll().map(|x| x * 2).memo(),
+        source.coll_by(|x| x % 7).memo(),
+        source.derive(|xs| xs).coll().memo()
+    ));
+    let (doubled, keyed, derived) = outs;
+    mut failures = 0;
+    mut step = 0;
+    for step < 600 {
+        mut next_list: List<i32> = source.get();
+        let choice = next(5);
+        let size = next_list.len();
+        if choice == 0 {
+            next_list.push(next(30).as_i32());
+        } else if choice == 1 && size > 0 {
+            let _gone = next_list.remove(next(size));
+        } else if choice == 2 && size > 1 {
+            let moved = next_list.remove(next(size));
+            next_list.insert(next(size - 1), moved);
+        } else if choice == 3 && size > 0 {
+            next_list[next(size)] = next(30).as_i32();
+        } else {
+            next_list = [next(9).as_i32(), next(9).as_i32(), next(9).as_i32()];
+        }
+        source.set(next_list);
+        let now = source.get();
+        if doubled.get() != now.map(|x| x * 2) { failures += 1; }
+        if keyed.get() != now { failures += 1; }
+        if derived.get() != now { failures += 1; }
         step += 1;
     }
     print(i"failures {failures}");

@@ -878,6 +878,15 @@ and when one flips, one row arrives or leaves — nothing else is re-read. A
 closure returning a plain value (`|task| task.id > 3`) subscribes to nothing at
 all. What a closure registers is released when its element leaves.
 
+A list that arrives whole — a fetch result, a `SignalCell<List<T>>` — has no
+changes to follow, only values. `.coll_by(key)` diffs each new list against the
+last by key (a reorder becomes a move) and `.coll()` by position, and either
+hands back a collection pipe the operators work on:
+
+```vilan,fragment
+let visible = fetched.coll_by(|row| row.id).filter(|row| row.visible).memo();
+```
+
 ## Traps
 
 - `sub` gives you a `Subscription` to dispose manually. Prefer `effect`

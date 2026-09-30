@@ -55,6 +55,7 @@ import std::reactive::{
 | `map`, `filter`, `filter_map`, `any`, `all`, `count`, `flatten` | methods | the collection operators — each returns a pipe, and follows the flow its closure returns (`IntoFlow`, `IntoElement`) |
 | `ListMemo<T>` | struct | a sealed collection pipe: a read-only granular source |
 | `RowFeed<T>` | trait | what `each`/`each_by` read their rows from: a list source or a collection pipe |
+| `coll`, `coll_by`, `Coll`, `CollBy`, `SameElement` | methods/structs/trait | a flow of whole lists into a collection pipe: the positional diff (prefix/suffix trim) and the keyed one (`ReconcilePlan`, emits `Move`) |
 
 ## Signal and SignalCell
 
@@ -1364,8 +1365,8 @@ fun main() {
 ```
 
 The operators start from a granular source — a `ListCell`, a `ListMemo` — and
-from a collection pipe. A coarse `Source<List<T>>` has no change to follow, and
-no operators.
+from a collection pipe. A coarse `Source<List<T>>` converts at the boundary
+(`.coll()`, `.coll_by(key)`, below).
 
 **An operator follows the flow its closure returns.** A closure may answer a
 plain value or any `Flow` — a source or a pipe (`IntoFlow`). The
@@ -1411,6 +1412,48 @@ and a removed element's followed flow is detached. The owner is split off
 only when the run registered something, so a plain closure costs no owner at
 all. A task a closure starts belongs to the stage and is cancelled when the
 pipe's consumer releases it.
+
+## coll and coll_by — coarse into granular
+
+```vilan,fragment
+impl type F: Flow<List<type T>> {
+	fun coll_by<K: PartialEq + Hashable>(own self, key: sync |T| K): CollBy<F, T, K>
+}
+impl type F: Flow<List<type T: PartialEq>> {
+	fun coll(own self): Coll<F, T>
+}
+```
+
+A flow of WHOLE lists — a `SignalCell<List<T>>`, a derivation, a mirror sealed
+with `.memo()` — threw its change away upstream, so the only way back to a
+granular collection is a diff, and these two are the doors. Both return a
+collection pipe.
+
+- **`.coll_by(key)`** is the keyed diff `each_by` already runs
+  (`ReconcilePlan`), O(n) per change with hashing. A reordered element is a
+  `Move`, so it keeps its identity — and so does whatever follows it
+  downstream. A matched element whose value changed is a `SetAt` when the
+  element has `==`; without one (a collection of sources), the same key is the
+  same element.
+- **`.coll()`** is the positional fallback for `T: PartialEq`: it trims the
+  common prefix and suffix and splices what is between, so an append, an
+  insertion and a removal are each one op of one element.
+
+```vilan
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell, comp };
+
+fun main() {
+	let fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+	let (evens, scope) = comp(|| fetched.coll().filter(|n| n % 2 == 0).memo());
+	fetched.set([1, 2, 3, 4]);   // one splice of one element: 4 arrived
+	print(evens.get());          // [ 2, 4 ]
+	scope.dispose();
+}
+```
+
+The real fix is upstream — keep the source of truth granular (`ListCell`), and
+diff only at the boundaries: a fetch result, a wire snapshot.
 
 ## reconcile: keyed list diffing
 
