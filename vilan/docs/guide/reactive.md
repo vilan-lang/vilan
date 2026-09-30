@@ -224,6 +224,12 @@ A selector must **build** the flow it answers: a closure cannot capture a pipe
 built outside it (a pipe is consumed once, and the selector runs once per
 change). Selecting between sources, as above, is always fine — a source is data.
 
+Every dependency so far is named where the pipe is built. A body may also read a
+source with `.track()`, which makes it a dependency of that body wherever the read
+happens — `derive(|| if flag.track() { a.track() } else { b.track() })` follows
+whichever branch it read last. That optional layer has its own chapter:
+[Tracked reads](tracked-reads.md).
+
 When an unchanged value should stay quiet, `.distinct()` passes a change on only
 when the value differs from the last one (it asks `T: PartialEq`), and
 `.distinct_by(key)` compares `key` of the value. Sealing does not compare: every

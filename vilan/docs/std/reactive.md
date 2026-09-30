@@ -8,7 +8,7 @@ Import what you use:
 ```vilan,fragment
 import std::reactive::{
 	Signal, SignalCell, Source, Flow, Pipe, MemoCell, MaybeSignal, Subscriber, Subscription,
-	Disposable, combine, divorce, selector, Selector,
+	Disposable, combine, divorce, selector, Selector, derive, tracking,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -30,6 +30,9 @@ import std::reactive::{
 | `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
 | `Instance<T>` | struct | a started flow — the one consumer's `pull`/`attach`/`release` (for stage authors) |
 | `TransientState`, `TransientSource`, `.transient()` | `std::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::transient](transient.md)) |
+| `track` | method (every `Source`) | read AND make the source a dependency of the body that is running — tracked reads (A142 §7) |
+| `derive` (free), `TrackedDerive<T>` | fn / `[resource]` struct | a pipe whose only dependencies are the ones its body tracks |
+| `tracking`, `TrackScope`, `Tracker` | context / structs | the tracking scope a body's run establishes; `tracking.clear(..)` is `untrack` |
 | `Resource<T>`, `ResourceState<T>` | struct/enum | a value that may still be loading — pending, settled, failed — built by `source.load(fetch)` or `Resource::pending()`, read through its fallbacks |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
@@ -253,7 +256,9 @@ trait Source<T> with Flow<T> {
 	fun on_settle(self, subscriber: Subscriber): Subscription          // required; no payload
 	[must_use]
 	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription  // default
+	fun identity(self): Option<i32>                                   // default `None`; for tracked reads
 	fun constant(value: T): Constant<T>                               // `Source::constant(v)`
+	fun track(self): T                                                // a blanket: read + track (§ below)
 }
 
 [resource]
@@ -266,10 +271,10 @@ trait Flow<T> {
 	fun sub(own self, observer: |T| void): Subscription               // + one immediate call
 	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
 	                                                                  // owner-registered; an owner per run
-	fun effect(own self, body: (|T| void) context (owner_scope, ambient_nursery))
-	                                                                  // the same, eager
-	fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, ambient_nursery)): Derive<Self, T, U>
-	fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, ambient_nursery)): Switch<Self, T, I, U>
+	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
+	                                                                  // the same, eager; the body tracks
+	fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
+	fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, tracking, ambient_nursery)): Switch<Self, T, I, U>
 	fun distinct_by<K: PartialEq>(own self, key: sync |T| K): DistinctBy<Self, T, K>
 	…
 }
@@ -538,10 +543,10 @@ fun main() {
 ### An owner per run — every body a pipe runs
 
 ```vilan,fragment
-fun effect(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
 fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
-fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, ambient_nursery)): Derive<Self, T, U>
-fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, ambient_nursery)): Switch<Self, T, I, U>
+fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
+fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, tracking, ambient_nursery)): Switch<Self, T, I, U>
 fun on_cleanup(cleanup: || void)
 [deprecated] fun scoped_effect(own self, body: (sync |T| void) context owner_scope)   // = effect
 ```
@@ -607,6 +612,79 @@ the two merged, kept one release as deprecated aliases.
 
 `swap`, `when` and `each` are **not** built on this — they keep their own
 per-instantiation owners.
+
+### Tracked reads — `track()` and the free `derive`
+
+```vilan,fragment
+let tracking: Context<TrackScope>                                  // the scope of the running body
+impl type S: Source<type T> {
+	fun track(self): T                                             // get() + a dependency of the scope
+}
+fun derive<T>(body: (sync || T) context (owner_scope, tracking, ambient_nursery)): TrackedDerive<T>
+trait Source<T> { fun identity(self): Option<i32> … }               // `None` by default
+```
+
+The optional sugar layer (A142 §7, R6): inside a body a pipe runs, `source.track()`
+reads the source and makes it a **dependency of that body**. Nothing else
+tracks — `get()` never registers — so code that does not opt in is unchanged.
+The guide's [tracked reads](../guide/tracked-reads.md) chapter is the tour.
+
+- **Which bodies open a scope.** Every body a pipe runs: a `derive` transform
+  (`count.derive(|c| c + other.track())` follows `other` too), a `switch`/
+  `switch_some`/`and_then` selector (a tracked change re-selects), an `effect`
+  body (a tracked change re-runs it with the input's latest value), and the free
+  `derive(|| body)`, a pipe whose only dependencies are the ones it tracks —
+  a stage like any other, sealed once or consumed once. Callbacks (`on_change`,
+  `sub`, `effect_on_change`) and collection operators' per-element closures open
+  none.
+- **Strict, at compile time.** `tracking` is a context and `track()` reads it
+  with the strict `get`: a `track()` no body encloses is the coverage error, with
+  the uncovered path traced. There is no run-time lookup.
+- **Dependencies are the last run's reads.** After each run the stage compares
+  its reads with the edges it holds, in order: an edge to a source read again is
+  kept, a new read attaches one, an edge nothing read is detached. A source keeps
+  its edge across runs when it can say what state it is — `Source::identity()`,
+  answered by `SignalCell` and `MemoCell` (their cell); `None`, the default,
+  re-attaches each run and releases the old edge. A source that names its identity
+  and is read twice in one run is one edge.
+- **Glitch-free.** An edge wakes through a DERIVATION relay (the turn's first
+  phase), where the consumer's own wake from its input dedups with it: a turn
+  that changes an input and a tracked read runs the body once, on settled values.
+  An `effect`'s re-run is ordered after its input's delivery, so the same holds
+  for an effect.
+- **A scope is one run.** A closure created inside a body captures the run's
+  scope; a `track()` through it after the run returned registers nothing (a
+  run-time guard; the static form, callbacks run with the scope cleared, is a
+  planned follow-up — A142 §7.3).
+  `tracking.clear(body)` (B458) runs `body` with no scope: a closure minted
+  inside holds none, and a `track()` written inside is refused — the layer's
+  `untrack`.
+- **`on_change` primes.** A consumer that does not read at once runs a pipe's
+  bodies once when it subscribes (the value discarded, the observer not called),
+  so a tracked read is a dependency before the first change.
+
+```vilan
+import std::reactive::{ Owner, Signal, SignalCell, Source, derive, run_with_owner };
+
+fun main() {
+	let flag: SignalCell<bool> = Signal::new(true);
+	let a: SignalCell<i32> = Signal::new(1);
+	let b: SignalCell<i32> = Signal::new(100);
+	let owner = Owner::new();
+	run_with_owner(owner, || {
+		derive(|| if flag.track() { a.track() } else { b.track() })
+			.effect(|value: i32| print(i"saw {value}"));   // saw 1
+	});
+	b.set(200);        // nothing: the last run read `a`
+	flag.set(false);   // saw 200
+	a.set(2);          // nothing: the branch that read `a` was not taken
+	owner.dispose();
+}
+```
+
+`TrackScope`, `Tracker`, `Dependency` and `TrackedEdge` are the layer's own
+records (a run's scope, a stage's dependencies across runs, one read, one edge);
+an application never builds them.
 
 ## selector — per-key selection
 

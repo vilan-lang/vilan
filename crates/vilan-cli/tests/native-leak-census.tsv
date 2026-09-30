@@ -29,8 +29,8 @@ usize-literals	0	0
 unsigned-saturate	0	0
 bytes-aliasing	0	0
 delta-law	2842	0
-reactive-on-change	38	0
-reactive-flatten	39	0
+reactive-on-change	43	0
+reactive-flatten	49	0
 list-cell	2231	0
 reactive-selector	36	0
 f64-print-boundary	0	0
