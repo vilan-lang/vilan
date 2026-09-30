@@ -300,15 +300,15 @@ function $k(self, $l) {
 	let $n = null;
 	if ($m[0] === 0) {
 		const turn = $m[1];
-		$n = enqueue(turn, self[1].v);
+		$n = enqueue(turn, __clone(self[1].v));
 	} else {
 		const $t = $q(draining_turns.v);
 		let $u = null;
 		if ($t[0] === 0) {
 			const draining = $t[1];
-			$u = enqueue(draining, self[1].v);
+			$u = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
@@ -410,15 +410,15 @@ function $af(self, $l) {
 	let $ah = null;
 	if ($ag[0] === 0) {
 		const turn = $ag[1];
-		$ah = enqueue(turn, self[1].v);
+		$ah = enqueue(turn, __clone(self[1].v));
 	} else {
 		const $ai = $q(draining_turns.v);
 		let $aj = null;
 		if ($ai[0] === 0) {
 			const draining = $ai[1];
-			$aj = enqueue(draining, self[1].v);
+			$aj = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}

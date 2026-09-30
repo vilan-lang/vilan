@@ -1692,6 +1692,47 @@ const B423_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B457: a `Shared::read()` live across a CALL that writes the cell reads the
+/// same on both backends — a notify loop whose subscriber adds a subscriber,
+/// and a read handed by value to a callee that writes the cell.
+#[test]
+fn a_read_across_a_writing_call_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b457.vl"), B457_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b457.vl"),
+        Verdict::Identical,
+        "a read across a writing call must read the same on both backends"
+    );
+}
+
+const B457_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun direct(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+    "\tcell.write().push(9);\n",
+    "\tseen.len()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet log: Shared<List<str>> = Shared::new([]);\n",
+    "\tlet subs: Shared<List<|| void>> = Shared::new([]);\n",
+    "\tsubs.write().push(|| {\n",
+    "\t\tlog.write().push(\"first\");\n",
+    "\t\tsubs.write().push(|| log.write().push(\"late\"));\n",
+    "\t});\n",
+    "\tsubs.write().push(|| log.write().push(\"second\"));\n",
+    "\tfor sub in subs.read() {\n",
+    "\t\tsub();\n",
+    "\t}\n",
+    "\tprint(log.read().len());\n",
+    "\tlet cell = Shared::new([1, 2]);\n",
+    "\tprint(direct(cell, cell.read()));\n",
+    "}\n",
+);
+
 /// B462: a tuple variant where a closure is expected is its constructor on
 /// both backends — `Some` into `map`, a user variant with two payloads into a
 /// two-parameter closure, the generics taken from the expected type.

@@ -28367,9 +28367,15 @@ impl<'src> Analyzer<'src> {
                 // CALL in the body is not seen here — B267's call-conservative
                 // reading would copy std's every notify loop (a subscriber is a
                 // call); that is the copy-policy question, left to its ruling.
+                //
+                // B457 (RULED 2026-09-29, R-e door (a)): a write reached THROUGH
+                // A CALL in the body counts too — `for sub in subs.read() {
+                // sub() }` where a subscriber unsubscribes — asked of the
+                // callee's write summary (`call_reaches_an_in_place_write`).
                 Expr::ForEach(iterable_id, _, _) => {
                     if let Some(cell) = self.shared_cells.reads.get(iterable_id).copied()
-                        && self.spans_an_in_place_write(*expr_id, cell)
+                        && (self.spans_an_in_place_write(*expr_id, cell)
+                            || self.spans_a_call_reaching_a_write(*expr_id, cell))
                     {
                         consider(self, *iterable_id, None);
                     }
@@ -28435,7 +28441,29 @@ impl<'src> Analyzer<'src> {
                         let is_shared_read_receiver = parameter.convention == Convention::RefMut
                             && parameter.name == "self"
                             && self.is_shared_read(*argument_id);
-                        if parameter.convention == Convention::Own || is_shared_read_receiver {
+                        // B457 (R-e door (a)): a `Shared::read()` handed BY VALUE
+                        // to a callee that can reach an in-place write of that
+                        // cell would read its own write through the argument
+                        // on JS (the read aliases the cell's storage) and not
+                        // natively (which copies): the argument is a copy.
+                        let read_the_callee_writes = parameter.convention == Convention::Bare
+                            && parameter.name != "self"
+                            && self
+                                .shared_cells
+                                .reads
+                                .get(argument_id)
+                                .copied()
+                                .is_some_and(|cell| {
+                                    self.function_reaches_an_in_place_write(
+                                        callee_id,
+                                        cell,
+                                        &mut HashMap::default(),
+                                    )
+                                });
+                        if parameter.convention == Convention::Own
+                            || is_shared_read_receiver
+                            || read_the_callee_writes
+                        {
                             consider(self, *argument_id, None);
                         }
                     }
@@ -29464,6 +29492,153 @@ impl<'src> Analyzer<'src> {
                         write_span.start >= start && write_span.end <= end
                     })
             })
+    }
+
+    /// B457 (RULED 2026-09-29, R-e door (a)): whether a CALL inside
+    /// `expr_id`'s source span can reach an in-place write of `cell` — the
+    /// call-through half of B400's loop test. Spans, for the same reason.
+    fn spans_a_call_reaching_a_write(&self, expr_id: Id, cell: CellSlot) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        let (start, end) = (span.start, span.end);
+        let calls: Vec<Id> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter(|(other_id, other)| {
+                matches!(other, Expr::Call(_))
+                    && **other_id != expr_id
+                    && self.source_of_id(**other_id) == Some(source)
+                    && self.span_map.get(other_id).is_some_and(|other_span| {
+                        other_span.start >= start && other_span.end <= end
+                    })
+            })
+            .map(|(other_id, _)| *other_id)
+            .collect();
+        let mut summaries: HashMap<Id, bool> = HashMap::default();
+        calls
+            .into_iter()
+            .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, &mut summaries))
+    }
+
+    /// B457: whether one call can reach an in-place write of `cell` — the
+    /// callee's WRITE SUMMARY. A function with a body answers for its own span
+    /// and every call in it (memoized per function, and a function already
+    /// being asked answers no, so recursion terminates; its own writes are
+    /// counted where it is first asked). An external writes no vilan cell
+    /// (`Shared::write` IS the write, counted by the span test), and a variant
+    /// builds a value. A dispatched member answers for every body of its name.
+    /// A call through a closure VALUE (a subscriber) is unknown statically,
+    /// and answers whether ANY write mutates the cell in place.
+    fn call_reaches_an_in_place_write(
+        &self,
+        call_id: Id,
+        cell: CellSlot,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        if self.shared_cells.reads.contains_key(&call_id)
+            || self.shared_cells.writes.contains_key(&call_id)
+        {
+            return false;
+        }
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return false;
+        };
+        // A DISPATCHED member reaches whatever any body of that name does —
+        // every impl's declaration and every trait's default (the candidate
+        // set dispatch picks from; `hash` writes no subscriber list).
+        let dispatched_name = [call_id, function_call.subject_id]
+            .iter()
+            .find_map(|id| match self.generic_dispatch.get(id) {
+                Some(GenericDispatch::OnConstraint(_, name) | GenericDispatch::OnType(_, name)) => {
+                    Some(*name)
+                }
+                None => None,
+            });
+        if let Some(name) = dispatched_name {
+            let candidates: Vec<Id> = self
+                .implementations
+                .iter()
+                .filter_map(|implementation| implementation.declarations.get(name).copied())
+                .chain(
+                    self.traits
+                        .values()
+                        .filter_map(|trait_| trait_.declarations.get(name).copied()),
+                )
+                .filter(|member| {
+                    self.functions
+                        .get(member)
+                        .is_some_and(|function| function.has_body)
+                })
+                .collect();
+            return candidates
+                .into_iter()
+                .any(|member| self.function_reaches_an_in_place_write(member, cell, summaries));
+        }
+        match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+            Some(Expr::Local(callee)) => {
+                if self.external_functions.contains_key(callee)
+                    || matches!(
+                        self.expr_id_to_expr_map.get(callee),
+                        Some(Expr::EnumVariant(..))
+                    )
+                {
+                    return false;
+                }
+                if self
+                    .functions
+                    .get(callee)
+                    .is_some_and(|function| function.has_body)
+                {
+                    return self.function_reaches_an_in_place_write(*callee, cell, summaries);
+                }
+                self.shared_cells.mutated.contains(&cell)
+            }
+            _ => self.shared_cells.mutated.contains(&cell),
+        }
+    }
+
+    /// B457: a function's write summary for `cell` — an in-place write inside
+    /// its span, or a call inside it that reaches one.
+    fn function_reaches_an_in_place_write(
+        &self,
+        function_id: Id,
+        cell: CellSlot,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        if let Some(answer) = summaries.get(&function_id) {
+            return *answer;
+        }
+        // In progress: no until proven otherwise (a recursive call adds no
+        // write the function's own span does not already hold).
+        summaries.insert(function_id, false);
+        let answer = self.spans_an_in_place_write(function_id, cell) || {
+            let (Some(source), Some(span)) = (
+                self.source_of_id(function_id),
+                self.span_map.get(&function_id),
+            ) else {
+                return true;
+            };
+            let (start, end) = (span.start, span.end);
+            let calls: Vec<Id> = self
+                .expr_id_to_expr_map
+                .iter()
+                .filter(|(other_id, other)| {
+                    matches!(other, Expr::Call(_))
+                        && self.source_of_id(**other_id) == Some(source)
+                        && self.span_map.get(other_id).is_some_and(|other_span| {
+                            other_span.start >= start && other_span.end <= end
+                        })
+                })
+                .map(|(other_id, _)| *other_id)
+                .collect();
+            calls
+                .into_iter()
+                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, summaries))
+        };
+        summaries.insert(function_id, answer);
+        answer
     }
 
     /// Every straight-line STATEMENT SEQUENCE in the program — the intervals

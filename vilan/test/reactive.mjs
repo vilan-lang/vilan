@@ -264,15 +264,15 @@ function $C(self, $D) {
 	let $F = null;
 	if ($E[0] === 0) {
 		const turn = $E[1];
-		$F = enqueue(turn, self[1].v);
+		$F = enqueue(turn, __clone(self[1].v));
 	} else {
 		const $I = $r(draining_turns.v);
 		let $J = null;
 		if ($I[0] === 0) {
 			const draining = $I[1];
-			$J = enqueue(draining, self[1].v);
+			$J = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}

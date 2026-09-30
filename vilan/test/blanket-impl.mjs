@@ -186,15 +186,15 @@ function $o(self, $p) {
 	let $r = null;
 	if ($q[0] === 0) {
 		const turn = $q[1];
-		$r = enqueue(turn, self[1].v);
+		$r = enqueue(turn, __clone(self[1].v));
 	} else {
 		const $x = $u(draining_turns.v);
 		let $y = null;
 		if ($x[0] === 0) {
 			const draining = $x[1];
-			$y = enqueue(draining, self[1].v);
+			$y = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}

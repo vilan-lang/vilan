@@ -10511,6 +10511,97 @@ fn b400_a_for_over_a_read_that_does_not_write_in_place_copies_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// B457 — a write reached THROUGH A CALL (RULED 2026-09-29, R-e door (a))
+// ---------------------------------------------------------------------------
+//
+// A `Shared::read()` still live across a call that may write the cell read the
+// write on JS (the read aliases the cell's storage) and not natively (which
+// copies). The call is asked through its callee's WRITE SUMMARY: a body's own
+// in-place writes and those its calls reach (a dispatched member answers for
+// every body of its name; a call through a closure value for any in-place
+// write of the cell). Two shapes: a notify loop whose subscriber writes the
+// list, and a read handed by value to a callee that writes the cell.
+
+#[test]
+fn b457_a_loop_over_a_read_whose_call_writes_the_cell_iterates_a_copy() {
+    // The subscriber adds a subscriber mid-notify: native iterated a copy
+    // (log 2); JS iterated the growing list and ran the new one too (3).
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun main() {\n",
+            "\tlet log: Shared<List<str>> = Shared::new([]);\n",
+            "\tlet subs: Shared<List<|| void>> = Shared::new([]);\n",
+            "\tsubs.write().push(|| {\n",
+            "\t\tlog.write().push(\"first\");\n",
+            "\t\tsubs.write().push(|| log.write().push(\"late\"));\n",
+            "\t});\n",
+            "\tsubs.write().push(|| log.write().push(\"second\"));\n",
+            "\tfor sub in subs.read() {\n",
+            "\t\tsub();\n",
+            "\t}\n",
+            "\tprint(log.read().len());\n",
+            "\tprint(subs.read().len());\n",
+            "}\n",
+        ),
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn b457_a_read_passed_by_value_to_a_callee_that_writes_the_cell_is_a_copy() {
+    // Directly, and through a callee two calls down.
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun grow(cell: Shared<List<i32>>) {\n",
+            "\tcell.write().push(9);\n",
+            "}\n",
+            "fun direct(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+            "\tcell.write().push(9);\n",
+            "\tseen.len()\n",
+            "}\n",
+            "fun transitive(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+            "\tgrow(cell);\n",
+            "\tseen.len()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet first = Shared::new([1, 2]);\n",
+            "\tprint(direct(first, first.read()));\n",
+            "\tlet second = Shared::new([1, 2]);\n",
+            "\tprint(transitive(second, second.read()));\n",
+            "}\n",
+        ),
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn b457_a_read_passed_to_a_callee_that_writes_nothing_is_not_copied() {
+    // The summary is what spares the copy: a callee with no in-place write
+    // (and no call that reaches one) takes the read as it is.
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "import std::shared::Shared;\n",
+        "fun count(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+        "\tseen.len() + cell.read().len()\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tcell.write().push(3);\n",
+        "\tprint(count(cell, cell.read()));\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a callee that writes nothing must not force a copy:\n{emitted}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B418 — a place or a `Shared` read reaching a binding THROUGH a branch copies
 // ---------------------------------------------------------------------------
 //
