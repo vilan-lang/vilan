@@ -489,9 +489,9 @@ fun navigate_replace(path: str)       // replaceState — same, WITHOUT a new hi
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
 fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
-fun parse_query(query: str): Map<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
+fun parse_query(query: str): HashMap<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
 
-struct PathParts { segments: List<str>, query: Map<str, str>, fragment: Option<str> }
+struct PathParts { segments: List<str>, query: HashMap<str, str>, fragment: Option<str> }
 fun parse_path(path: str): PathParts  // cut, then decode — the READ direction
 
 trait Routable { fun to_path(self): str }              // route → URL

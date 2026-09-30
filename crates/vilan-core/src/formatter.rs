@@ -4935,7 +4935,7 @@ impl<'src> Printer<'src> {
         self.out.push('}');
     }
 
-    /// Prints a type expression: `i32`, `List<T>`, `Map<str, i32>`, `&mut T`.
+    /// Prints a type expression: `i32`, `List<T>`, `HashMap<str, i32>`, `&mut T`.
     /// Bails (falling `format` back to the source) on any type form not yet handled.
     fn print_type(&mut self, node: &Node<'src>) {
         match node {

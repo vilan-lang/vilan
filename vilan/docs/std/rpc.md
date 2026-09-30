@@ -190,19 +190,19 @@ mirror does not hold; that op is refused rather than applied.
 
 Hand-wired exposures use `ReactiveServer::expose_keyed(source, key_of)`
 (for a `Source<List<T>>`) or `expose_keyed_map(source, key_of)` (for a
-`Source<Map<K, V>>`), with `ReactiveClient::attached_keyed_source` /
+`Source<HashMap<K, V>>`), with `ReactiveClient::attached_keyed_source` /
 `keyed_source` on the other end. `key_of` is a value parameter rather than
 a `Keyed<K>` bound alone because `K` appears nowhere else in the
 signature, and vilan infers a type parameter from a call's types, not from
 its bounds.
 
 The attribute generates whichever of the two the field's collection calls for,
-and the key type comes from wherever it is written (tracker A51): a `Map<K, V>`
+and the key type comes from wherever it is written (tracker A51): a `HashMap<K, V>`
 element names it and takes the bare `[expose(keyed)]`, and every other
 collection names it in the attribute — `[expose(keyed = str)] items:
 SignalCell<List<Task>>`. Naming it in both places is redundant rather than
 wrong, but the two spellings must AGREE: an argument that disagrees with the
-`Map`'s own key is refused at the attribute (tracker A56), because the
+`HashMap`'s own key is refused at the attribute (tracker A56), because the
 expansion reads `K` from the annotation before any type resolves and cannot
 pick between them. The generated wiring is the hand-written call, frame
 for frame, and the two spellings are one contract: same `Patch` frames, same

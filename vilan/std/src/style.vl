@@ -42,8 +42,8 @@
 
 import pkg::asset::{ emit, schedule_at_end, stage, staged };
 import pkg::compare::{ Ord, Ordering };
+import pkg::hash_map::HashMap;
 import pkg::io::panic;
-import pkg::map::Map;
 import pkg::operators::Add;
 import pkg::option::Option::{ self, None, Some };
 import pkg::range::Range;
@@ -879,14 +879,14 @@ export struct Style {
 	// The slot key (`slot_key`) -> (class name, declaration). The declaration
 	// is kept so a condition combinator can re-mint it under its own selector;
 	// the key's three fields are read through `slot_of`, never split by hand.
-	rules: Map<str, (str, str)>,
+	rules: HashMap<str, (str, str)>,
 }
 
 /// Opens a builder chain. Property methods reach the const-only asset channel, so
 /// construction belongs inside a `const` expression; selection and merging (`+`,
 /// `class_list`) are ordinary runtime code.
 export fun style(): Style {
-	Style { rules = Map::new() }
+	Style { rules = HashMap::new() }
 }
 
 /// The shorthand-to-longhand table (§0bis.4): the properties a property COVERS,
@@ -936,11 +936,11 @@ fun border_longhands(): str {
 /// A map removal and nothing else: no emission, so `+` resolves a family exactly as
 /// a chain does even though it is runtime-legal.
 fun without_covered(
-	rules: Map<str, (str, str)>,
+	rules: HashMap<str, (str, str)>,
 	media: str,
 	condition: str,
 	property: str,
-): Map<str, (str, str)> {
+): HashMap<str, (str, str)> {
 	let longhands = family_longhands(property);
 	if longhands == "" {
 		ret rules;

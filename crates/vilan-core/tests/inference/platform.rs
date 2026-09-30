@@ -3912,10 +3912,10 @@ fn an_unknown_struct_steers_to_its_import() {
     assert_fails_with(
         r#"
         fun main() {
-            mut table = Map { };
+            mut table = HashMap { };
         }
         "#,
-        "unknown struct: Map; import it first (`import std::map::Map;`)",
+        "unknown struct: HashMap; import it first (`import std::hash_map::HashMap;`)",
     );
 }
 
@@ -4341,9 +4341,9 @@ fn consistent_later_calls_stay_clean() {
 fn an_unannotated_map_new_requires_an_annotation() {
     assert_fails_with(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table = Map::new();
+            mut table = HashMap::new();
             table.insert("k", 1);
         }
         "#,
@@ -4355,9 +4355,9 @@ fn an_unannotated_map_new_requires_an_annotation() {
 fn an_unannotated_set_new_requires_an_annotation() {
     assert_fails_with(
         r#"
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut seen = Set::new();
+            mut seen = HashSet::new();
             seen.insert(7);
         }
         "#,
@@ -4371,9 +4371,9 @@ fn an_annotated_map_checks_its_inserts() {
     // real error (the B16 substitution-applied argument check).
     assert_fails(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert(2, "v");
         }
         "#,
@@ -4381,9 +4381,9 @@ fn an_annotated_map_checks_its_inserts() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert("k", 1);
             print(table.get("k").unwrap_or(-1));
         }
@@ -10684,6 +10684,34 @@ fn b304_a_closure_that_never_touches_its_parameter_compiles() {
         }
 
         fun main() { }
+        "#,
+    );
+}
+
+/// A bound-directed call of a SUPERTRAIT's member (`P: Pipe<T>` calling
+/// `Flow::start`) reaches the impls of the trait that declares it, and nothing
+/// else. The dispatch record names only the bound's own trait, which declares
+/// no `start`, and the candidate set fell back to EVERY member named `start`
+/// in the program — `std::http`'s `Server::start` among them — so a browser
+/// build that sealed a derivation while `std::http` was loaded was refused as
+/// reaching the `process` layer (collections-44's find, kolt's client build:
+/// `.cell()` → `Flow::start` → a collection stage → `IntoElement`'s pipe arm →
+/// `start (std::http)`). Beside it the same class for `get` through
+/// `CollSource`'s supertrait chain coloured a `CollInstance`'s closures async
+/// in any program that also spelled an async `get` (`generics.rs`'s
+/// `service_client_name_defaults_to_struct_client`).
+#[test]
+fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
+    assert_compiles_browser(
+        r#"
+        import std::http::Server;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let next = count.derive(|value| value + 1).cell();
+            print(next.get());
+        }
         "#,
     );
 }

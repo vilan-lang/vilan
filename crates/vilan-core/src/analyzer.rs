@@ -4669,7 +4669,7 @@ pub struct Analyzer<'src> {
     // counts a still-generic element as one slot; the transformer walks a
     // MONOMORPHIZED body, where that element's binding is known, and recomputes
     // both from this path under the active substitution. Without it a
-    // `Map<str, (str, str)>`'s `(K, V)` was boxed inside `insert` and read flat
+    // `HashMap<str, (str, str)>`'s `(K, V)` was boxed inside `insert` and read flat
     // at the caller — silent `undefined`s out of `entries()`.
     tuple_index_paths: HashMap<Id, (TypeId, Vec<usize>)>,
     scope_id: u32,
@@ -8616,7 +8616,7 @@ impl<'src> Analyzer<'src> {
                             msg: format!(
                                 "{label} of `[derive(Wire)]` type `{type_name}` is `{rendered}`, \
                              which is not Wire: every field of a Wire type must itself be Wire \
-                             (a scalar, `str`, `bool`, `List`/`Option`/`Map` of Wire, another \
+                             (a scalar, `str`, `bool`, `List`/`Option`/`HashMap` of Wire, another \
                              `[derive(Wire)]` type, or a type with an `impl .. with Wire`)"
                             ),
                         },
@@ -11002,7 +11002,7 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a type is plain data safe to carry across a hot swap by reference
     /// (`hmr.md` §4): a scalar, or a fixed array / `List` / `Option` / `Result` /
-    /// `Map` / `Set` / tuple / struct / enum whose components are all transferable.
+    /// `HashMap` / `HashSet` / tuple / struct / enum whose components are all transferable.
     /// Modeled on `type_is_resource`'s per-instantiation containment (arguments are
     /// substituted before members are classified), but with the polarity flipped —
     /// EVERY component must be transferable — and drawn conservatively: a closure,
@@ -11092,7 +11092,7 @@ impl<'src> Analyzer<'src> {
                 }
                 // The native containers hold exactly what their element arguments
                 // describe — transferable iff those are.
-                if name.is_some_and(|name| matches!(name, "List" | "Map" | "Set")) {
+                if name.is_some_and(|name| matches!(name, "List" | "HashMap" | "HashSet")) {
                     return self.all_members_transferable(
                         &arguments,
                         &SubstitutionContext::default(),
@@ -11335,7 +11335,7 @@ impl<'src> Analyzer<'src> {
         buf.push('>');
     }
 
-    /// R10 (destruction.md §4): a native container (`List`/`Map`/`Set`) or
+    /// R10 (destruction.md §4): a native container (`List`/`HashMap`/`HashSet`) or
     /// external generic (`Shared`/`Task`/`Promise`/`Context`) rejects a resource
     /// type argument — their internals are host code the move checker cannot see
     /// in v1. `Option` (a vilan enum, checkable under the affine rules) is the
@@ -11575,24 +11575,24 @@ impl<'src> Analyzer<'src> {
     /// sanctioned resource container (a vilan enum, checkable under R11), so it
     /// is deliberately absent.
     ///
-    /// `NativeMap` — the raw `std::native_map` layer the public `Map`/`Set` are
+    /// `NativeMap` — the raw `std::native_map` layer the public `HashMap`/`HashSet` are
     /// built on — belongs in the set for the same reason its wrappers do, and
     /// omitting it was B154: its `insert(&mut self, key: Hash, value: V)`
     /// declares `value` bare, so the widened temporary predicate destroys a
     /// resource argument at the insert statement while the table goes on
     /// holding it (a host-side use-after-free). Declaring `own value: V`
     /// instead would close it by buying a redundant deep copy on EVERY
-    /// `Map`/`Set` insert in the language, to fence a module no public path
-    /// reaches; the head is the zero-cost fix. Because `Map`/`Set` hold their
+    /// `HashMap`/`HashSet` insert in the language, to fence a module no public path
+    /// reaches; the head is the zero-cost fix. Because `HashMap`/`HashSet` hold their
     /// own `NativeMap` member, this head is also reachable BENEATH a
-    /// `Map<K, Res>` — see `check_container_resource_arguments`, where the
+    /// `HashMap<K, Res>` — see `check_container_resource_arguments`, where the
     /// member descent is what keeps that one mistake to one diagnostic.
     fn resource_rejecting_containers(&self) -> Vec<(Id, &'static str)> {
         let mut containers: Vec<(Id, &'static str)> = Vec::new();
         for name in [
             "List",
-            "Map",
-            "Set",
+            "HashMap",
+            "HashSet",
             "NativeMap",
             "Shared",
             "Weak",
@@ -17036,9 +17036,9 @@ impl<'src> Analyzer<'src> {
     /// the instantiation is the only place to say so. When the signature IS
     /// refused, the opposite is true — the caller holds the offending type
     /// itself, was told at the type it wrote, and the body's container is that
-    /// same refusal one layer in. `Map<K, V>`'s storage is a `NativeMap<(K,
-    /// V)>` and `Set<T>`'s is a `NativeMap<T>`, so with the internal head in
-    /// R10's list (B154) `Map<str, Database>` reported at `Map` and again at
+    /// same refusal one layer in. `HashMap<K, V>`'s storage is a `NativeMap<(K,
+    /// V)>` and `HashSet<T>`'s is a `NativeMap<T>`, so with the internal head in
+    /// R10's list (B154) `HashMap<str, Database>` reported at `HashMap` and again at
     /// the `NativeMap` inside `Map::new`'s body — one mistake, two heads.
     ///
     /// E98's shape, generalized: a consequence is dropped when the thing it is
@@ -17053,7 +17053,7 @@ impl<'src> Analyzer<'src> {
     /// anything the caller saw. `fun two<A, B>(a: Map<str, A>, own b: B) { let
     /// items = [b]; }` at `A := Guard, B := Other` lost its `List<Other>`
     /// entirely. Returning the covered PARAMETERS instead lets the question be
-    /// asked per offending type (`traces_only_to`): `Map<str, A>` covers `A`,
+    /// asked per offending type (`traces_only_to`): `HashMap<str, A>` covers `A`,
     /// the body's `List<B>` is written in `B`, and `B` is nobody's consequence.
     fn instantiated_signature_reported_parameters(
         &mut self,
@@ -17099,8 +17099,8 @@ impl<'src> Analyzer<'src> {
     /// parameter at all is never vacuously covered.
     ///
     /// The "traces to" of E104's stand-down: the body's `NativeMap<(K, V)>` is
-    /// the signature's refused `Map<K, V>` a layer deeper, while its `List<B>`
-    /// under a signature that only refused `Map<str, A>` is its own offense.
+    /// the signature's refused `HashMap<K, V>` a layer deeper, while its `List<B>`
+    /// under a signature that only refused `HashMap<str, A>` is its own offense.
     fn traces_only_to(&self, type_id: TypeId, covered: &HashSet<TypeId>) -> bool {
         let parameters = self.generic_parameters_of(type_id);
         !parameters.is_empty()
@@ -18480,7 +18480,7 @@ impl<'src> Analyzer<'src> {
                                          itself stays on the server and the client mirrors it \
                                          over a channel, so it is the ELEMENT that crosses the \
                                          wire and it must be Wire (a scalar, `str`, `bool`, \
-                                         `List`/`Option`/`Map` of Wire, a `[derive(Wire)]` \
+                                         `List`/`Option`/`HashMap` of Wire, a `[derive(Wire)]` \
                                          type, or a type with an `impl .. with Wire`)"
                                 ),
                             },
@@ -18565,7 +18565,7 @@ impl<'src> Analyzer<'src> {
                                 msg: format!(
                                     "{label} of `[rpc]` method `{method_name}` is `{rendered}`, \
                                  which is not Wire: every `[rpc]` parameter and return must be \
-                                 Wire (a scalar, `str`, `bool`, `List`/`Option`/`Map` of Wire, a \
+                                 Wire (a scalar, `str`, `bool`, `List`/`Option`/`HashMap` of Wire, a \
                                  `[derive(Wire)]` type, or a type with an `impl .. with Wire`)"
                                 ),
                             },
@@ -18697,7 +18697,7 @@ impl<'src> Analyzer<'src> {
                             msg: format!(
                                 "{label} is `[expose]`d, but its element `{rendered}` is not Wire: \
                              an exposed source's values cross the wire, so the element must be \
-                             Wire (a scalar, `str`, `bool`, `List`/`Option`/`Map` of Wire, a \
+                             Wire (a scalar, `str`, `bool`, `List`/`Option`/`HashMap` of Wire, a \
                              `[derive(Wire)]` type, or a type with an `impl .. with Wire`)"
                             ),
                         },
@@ -18747,7 +18747,7 @@ impl<'src> Analyzer<'src> {
                 // annotation where the whole-value form reads one: the mirror
                 // is a `KeyedSource<K, T>`, and vilan has no associated types,
                 // so `K` has nowhere to come from but what the author wrote.
-                // `Map<K, V>` names both in the collection; every other keyed
+                // `HashMap<K, V>` names both in the collection; every other keyed
                 // collection names only its element, and A51's attribute
                 // argument is where the key goes for those — `[expose(keyed =
                 // str)] SignalCell<List<T>>`. Said here for the arm above's
@@ -18769,7 +18769,7 @@ impl<'src> Analyzer<'src> {
                                 "{label} is `[expose(keyed)]`d, but nothing names its KEY type: \
                              a keyed mirror is a `KeyedSource<K, T>`, and the `[service]` \
                              expansion reads both types off the annotation (there are no \
-                             associated types to read the key from). A `Map<K, V>` element \
+                             associated types to read the key from). A `HashMap<K, V>` element \
                              names both and takes the bare form; anything else names the key \
                              in the attribute — write `[expose(keyed = K)]`, or drop `keyed` \
                              for a channel that resends the whole value on every change"
@@ -18780,7 +18780,7 @@ impl<'src> Analyzer<'src> {
                 }
                 // The key was named, and the collection has to be one the
                 // exposure can read: `expose_keyed` takes a `Source<List<T>>`.
-                // A `Map<K, V>` with an argument beside it is fine as long as
+                // A `HashMap<K, V>` with an argument beside it is fine as long as
                 // the two agree on what a key is — the arm below is where they
                 // do not.
                 Some(_)
@@ -18798,7 +18798,7 @@ impl<'src> Analyzer<'src> {
                             span,
                             msg: format!(
                                 "{label} names a key with `[expose(keyed = …)]`, but its \
-                             collection is not written as a `List<T>` or a `Map<K, V>`: those \
+                             collection is not written as a `List<T>` or a `HashMap<K, V>`: those \
                              are the two the keyed exposure can read, and the `[service]` \
                              expansion picks between them off the annotation before any type \
                              resolves. Write the field as `SignalCell<List<T>>`"
@@ -18807,7 +18807,7 @@ impl<'src> Analyzer<'src> {
                         declaration_id,
                     );
                 }
-                // A56 / ruling R6: the `Map<K, V>` element names a key, the
+                // A56 / ruling R6: the `HashMap<K, V>` element names a key, the
                 // attribute argument names one too, and they DISAGREE.
                 //
                 // The argument used to simply win (`std/src/rpc.vl`, the keyed
@@ -18858,10 +18858,10 @@ impl<'src> Analyzer<'src> {
                             msg: format!(
                                 "{label} names its key twice and the two disagree: \
                              `[expose(keyed = {written})]` says `{written}`, and its \
-                             `Map` element says `{map_key}`. A keyed mirror is a \
+                             `HashMap` element says `{map_key}`. A keyed mirror is a \
                              `KeyedSource<K, T>` and the `[service]` expansion reads `K` \
                              off the annotation before any type resolves, so it cannot \
-                             pick between them. Drop the argument — a `Map<K, V>` names \
+                             pick between them. Drop the argument — a `HashMap<K, V>` names \
                              both types and takes the bare `[expose(keyed)]` — or write \
                              the map with `{written}` as its key"
                             ),
@@ -18870,7 +18870,7 @@ impl<'src> Analyzer<'src> {
                     );
                 }
                 // B285: the `KeyedCell<K, T>` twin of the arm above, and the
-                // same family R6 settled for the `Map` form — the field names
+                // same family R6 settled for the `HashMap` form — the field names
                 // its key twice and the two do not agree.
                 //
                 // Here one spelling really is authoritative: the cell's own
@@ -18886,7 +18886,7 @@ impl<'src> Analyzer<'src> {
                 // wrong — the cell's type is not.
                 //
                 // The comparison is on the two SPELLINGS with whitespace
-                // removed, for the `Map` arm's reason: the attribute reaches
+                // removed, for the `HashMap` arm's reason: the attribute reaches
                 // the macro engine as source text and the annotation through
                 // `render_type`, and neither has resolved.
                 Some(_)
@@ -18951,7 +18951,7 @@ impl<'src> Analyzer<'src> {
     /// element check.
     ///
     /// Until B289 this was a SYNTACTIC ALLOWLIST — six scalar spellings,
-    /// `List`/`Option`/`Map` of Wire, and the `[derive(Wire)]` names — so a
+    /// `List`/`Option`/`HashMap` of Wire, and the `[derive(Wire)]` names — so a
     /// hand-written `impl Result<type T: Wire, type E: Wire> with Wire` was
     /// invisible to every one of them: kolt carried forty lines of exactly
     /// that impl and still could not return a `Result<i53, str>` from an
@@ -18979,10 +18979,10 @@ impl<'src> Analyzer<'src> {
     ///    Wire`. Were the declaration rule ever relaxed to admit a
     ///    parameter-typed field, the argument check would land with it AND
     ///    `Wire`'s reached parameters would start binding, both on the same day.
-    /// 3. **`List`/`Option`/`Map` of Wire**, recursing into the arguments —
-    ///    the fast path for std's own conditional impls (`Map` joined the pair
+    /// 3. **`List`/`Option`/`HashMap` of Wire**, recursing into the arguments —
+    ///    the fast path for std's own conditional impls (`HashMap` joined the pair
     ///    with A39, narrating as a list of `{key, value}` pairs; its key must
-    ///    also be `Hashable`, which is `Map`'s own declaration bound rather
+    ///    also be `Hashable`, which is `HashMap`'s own declaration bound rather
     ///    than this predicate's business).
     /// 4. **The impl table**, via [`Self::satisfies_trait_bound`] — which is
     ///    what makes arm 3 redundant rather than load-bearing, and what reads
@@ -19004,8 +19004,8 @@ impl<'src> Analyzer<'src> {
     /// The descent is what makes the set match what the BOUND check computes:
     /// a refused `List<Password>` parameter is reported at the collection, and
     /// `List<T: Wire>`'s own `describe` fails at the element — two labels for
-    /// one mistake. A Wire component is not recorded, so a `Map<str, Password>`
-    /// contributes `Map<str, Password>` and `Password` and never `str`.
+    /// one mistake. A Wire component is not recorded, so a `HashMap<str, Password>`
+    /// contributes `HashMap<str, Password>` and `Password` and never `str`.
     fn record_refused_rpc_wire_type(&mut self, type_id: TypeId) {
         if self.resolved_type_is_wire(type_id) {
             return;
@@ -19014,7 +19014,7 @@ impl<'src> Analyzer<'src> {
         let label = self.pretty_print_type(&type_, &HashMap::default());
         if !self.rpc_refused_wire_types.insert(without_spaces(&label)) {
             // Already recorded: a type that contains itself through a field is
-            // not expressible here, but a shape like `Map<Password, Password>`
+            // not expressible here, but a shape like `HashMap<Password, Password>`
             // reaches the same argument twice and the walk must end.
             return;
         }
@@ -19043,7 +19043,7 @@ impl<'src> Analyzer<'src> {
         if self.wire_names.contains(name) {
             return true;
         }
-        if matches!(name, "List" | "Option" | "Map")
+        if matches!(name, "List" | "Option" | "HashMap")
             && arguments
                 .iter()
                 .all(|argument| self.resolved_type_is_wire(*argument))
@@ -20645,7 +20645,7 @@ impl<'src> Analyzer<'src> {
                     Some(caller_generic) => {
                         self.caller_generic_trait_arguments(caller_generic, trait_id)
                     }
-                    None => self.trait_args_for(&concrete, trait_id),
+                    None => self.trait_args_for_pattern(&concrete, trait_id, &bound_arguments),
                 };
                 let Some(provided) = provided else {
                     continue;
@@ -36512,7 +36512,7 @@ impl<'src> Analyzer<'src> {
     /// The iterator-protocol method a `for` loop drives an iterable with:
     /// `next_mut` for a `for e in &mut container` (each binding a writable view),
     /// otherwise `next` (a copying iterator, or a readonly view). A built-in
-    /// `List`/`Set` view loop ignores this — it lowers to an indexed loop.
+    /// `List`/`HashSet` view loop ignores this — it lowers to an indexed loop.
     fn for_each_next_method(&self, item_id: Option<Id>) -> &'static str {
         match item_id.and_then(|id| self.for_each_views.get(&id)) {
             Some(true) => "next_mut",
@@ -36550,11 +36550,11 @@ impl<'src> Analyzer<'src> {
     /// treats as `any`.
     fn iterable_element_type(&mut self, iterable_type: &Type, next_method: &str) -> Option<Type> {
         match iterable_type {
-            // `List<T>` and `Set<T>` both iterate their single element type `T`
-            // (a JS array / `Set` are natively iterable, yielding elements).
+            // `List<T>` and `HashSet<T>` both iterate their single element type
+            // `T` (a JS array / `Set` are natively iterable, yielding elements).
             Type::Struct(id, arguments)
                 if Some(*id) == self.primitive_struct_ids.get("List").copied()
-                    || Some(*id) == self.primitive_struct_ids.get("Set").copied() =>
+                    || Some(*id) == self.primitive_struct_ids.get("HashSet").copied() =>
             {
                 arguments
                     .first()
@@ -36754,7 +36754,7 @@ impl<'src> Analyzer<'src> {
                  `{next_method}(&mut self): Option<T>`, and {kind} is not \
                  natively iterable — the loop would walk its representation. \
                  Implement the iterator protocol on it, or iterate a `List` / \
-                 `Set` / `Range` (a `Map` iterates through `entries()`, \
+                 `HashSet` / `Range` (a `HashMap` iterates through `entries()`, \
                  `keys()` or `values()`)"
             ),
         );
@@ -36936,7 +36936,7 @@ impl<'src> Analyzer<'src> {
     ///   `Bytes` (a `Uint8Array`), `NativeMap` (a JS `Map`). It declares no
     ///   vilan fields, so there is no field array to walk by mistake, and a
     ///   host value that is not iterable throws AT the loop — loud, not silent.
-    /// - `Set<T>`: the one ordinary vilan struct with a lowering of its own,
+    /// - `HashSet<T>`: the one ordinary vilan struct with a lowering of its own,
     ///   `__set_iter` over the backing map's stored originals
     ///   (`transformer.rs`'s `is_set_typed`).
     ///
@@ -36946,7 +36946,7 @@ impl<'src> Analyzer<'src> {
         let Type::Struct(id, _) = iterable_type else {
             return false;
         };
-        if Some(*id) == self.primitive_struct_ids.get("Set").copied() {
+        if Some(*id) == self.primitive_struct_ids.get("HashSet").copied() {
             return true;
         }
         self.structs.get(id).is_some_and(|struct_| struct_.external)
@@ -39528,7 +39528,7 @@ impl<'src> Analyzer<'src> {
                     // ran last. One expr id is one entry, but a generic body is
                     // walked once and emitted per instantiation, so an element
                     // typed under a substitution describes that instantiation
-                    // alone: `(key, value)` in `Map<K, V>::insert` is
+                    // alone: `(key, value)` in `HashMap<K, V>::insert` is
                     // `(str, (str, str))` under one and `(str, str)` under the
                     // next. Recording the abstract type keeps this entry on the
                     // same walk the `.n` offsets were baked from. A construction
@@ -39893,7 +39893,7 @@ impl<'src> Analyzer<'src> {
                                     // generic is ITSELF has inferred nothing
                                     // (B102): `Map::new()` under an expectation
                                     // substitution has already made abstract
-                                    // unifies `Map<K, V>` with `Map<K, V>` and
+                                    // unifies `HashMap<K, V>` with `HashMap<K, V>` and
                                     // reports `{K: K, V: V}`. Recording it would
                                     // put a whole instance key's worth of
                                     // nothing on the call — emitting the generic
@@ -40732,6 +40732,87 @@ impl<'src> Analyzer<'src> {
     /// [`bindings_for_binders`] is what makes it true of a reconciliation that
     /// is merely a unification (B168).
     fn trait_args_for(&mut self, concrete: &Type, trait_id: Id) -> Option<Vec<TypeId>> {
+        let (answered, fallback) = self.trait_args_candidates(concrete, trait_id, true);
+        answered
+            .into_iter()
+            .next()
+            .map(|(_, arguments)| arguments)
+            .or(fallback)
+    }
+
+    /// [`Self::trait_args_for`] for a caller holding the bound that asks — its
+    /// WRITTEN arguments, binders and all (`IntoFlow<Option<type U>>`) — which
+    /// is every binder grounding a subject's bound (collections-44's find).
+    ///
+    /// A type may provide one trait at several instantiations: `impl type T with
+    /// IntoElement<T>` gives a `Derive<..>` `IntoElement<Derive<..>>`, and
+    /// `impl type P: Pipe<type T> with IntoElement<T>` gives it
+    /// `IntoElement<i32>`. The first concrete provider in declaration order is
+    /// not the answer then: the bound's own arguments keep the instantiations it
+    /// can mean (a `bool` written there turns the `SignalCell<bool>` one down),
+    /// and when more than one survives — a bare `type U` agrees with all of
+    /// them — the specificity order picks, as it picks a member's body (§13.4(a)
+    /// tier 3). Unranked survivors keep declaration order, the old answer.
+    fn trait_args_for_pattern(
+        &mut self,
+        concrete: &Type,
+        trait_id: Id,
+        pattern: &[TypeId],
+    ) -> Option<Vec<TypeId>> {
+        let (answered, fallback) = self.trait_args_candidates(concrete, trait_id, false);
+        let agreeing: Vec<(TypeId, Vec<TypeId>)> = answered
+            .into_iter()
+            .filter(|(_, arguments)| {
+                arguments.len() != pattern.len()
+                    || pattern
+                        .iter()
+                        .zip(arguments)
+                        .all(|(written, provided)| self.impl_subject_matches(*written, *provided))
+            })
+            .collect();
+        let maxima: Vec<&(TypeId, Vec<TypeId>)> = agreeing
+            .iter()
+            .filter(|(subject, _)| {
+                !agreeing
+                    .iter()
+                    .any(|(other, _)| self.impl_subjects_outrank(*other, *subject))
+            })
+            .collect();
+        match maxima.as_slice() {
+            [only] => Some(only.1.clone()),
+            _ => agreeing
+                .first()
+                .map(|(_, arguments)| arguments.clone())
+                .or(fallback),
+        }
+    }
+
+    /// [`Self::impl_outranks`] over bare subjects.
+    fn impl_subjects_outrank(&self, subject: TypeId, other_subject: TypeId) -> bool {
+        if subject == other_subject {
+            return false;
+        }
+        let matches_forward = self.impl_subject_matches(subject, other_subject);
+        let matches_backward = self.impl_subject_matches(other_subject, subject);
+        if matches_backward && !matches_forward {
+            return true;
+        }
+        if matches_forward && !matches_backward {
+            return false;
+        }
+        matches_forward && self.subject_bounds_are_stronger(subject, other_subject)
+    }
+
+    /// The providers of `trait_id` for `concrete`: those whose arguments came out
+    /// CONCRETE, with their subjects, in declaration order — stopping at the first
+    /// when `first_only` — and the first one that did not, as the fallback.
+    fn trait_args_candidates(
+        &mut self,
+        concrete: &Type,
+        trait_id: Id,
+        first_only: bool,
+    ) -> (Vec<(TypeId, Vec<TypeId>)>, Option<Vec<TypeId>>) {
+        let mut answered: Vec<(TypeId, Vec<TypeId>)> = Vec::new();
         let candidates: Vec<(TypeId, Vec<TypeId>)> = self
             .implementations
             .iter()
@@ -40810,12 +40891,16 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
                 {
-                    return Some(resolved);
+                    answered.push((subject_id, resolved));
+                    if first_only {
+                        break;
+                    }
+                    continue;
                 }
                 first_match.get_or_insert(resolved);
             }
         }
-        first_match
+        (answered, first_match)
     }
 
     /// The half of a receiver/subject reconciliation that grounds an impl's
@@ -49067,7 +49152,7 @@ impl<'src> Analyzer<'src> {
 
     /// The first UNEXPORTED nominal type inside `type_id`, by a depth-first walk
     /// through generic arguments, tuple elements, array elements and closure
-    /// signatures — `List<S>` and `Map<K, S>` reach `S`, which is B318 §4's
+    /// signatures — `List<S>` and `HashMap<K, S>` reach `S`, which is B318 §4's
     /// "a generic argument in any of the above".
     fn first_unexported_type(
         &self,
@@ -55359,14 +55444,14 @@ impl<'src> Analyzer<'src> {
             // iterable stores no type on its own expr id — a parameter (`self`
             // included), a call, an `if`, a block, an `await`, a `*view` — read
             // back untyped on the emission side, and every type-driven lowering
-            // silently didn't fire (B85: `for x in set` walked the `Set` struct's
+            // silently didn't fire (B85: `for x in set` walked the `HashSet` struct's
             // one-element backing array instead of its elements).
             let iterable_type_id = iterable_type.clone().get_type_id(self);
             self.for_each_iterable_types
                 .insert(for_each_id, iterable_type_id);
             // `for e in &mut container` drives a `next_mut(&mut self): Option<&mut
             // T>` iterator (each binding a writable view); a plain `for x in
-            // container` drives `next`. A built-in `List`/`Set` has neither and
+            // container` drives `next`. A built-in `List`/`HashSet` has neither and
             // falls through to the indexed/native loop.
             let item_id = match self.expr_id_to_expr_map.get(&for_each_id) {
                 Some(Expr::ForEach(_, item_id, _)) => *item_id,
@@ -57702,7 +57787,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let variable_type = self.infer_type(variable_id, &Type::Unknown, &HashMap::default());
-            // Only STRUCT-headed types (the container shape — `Map<K, V>`)
+            // Only STRUCT-headed types (the container shape — `HashMap<K, V>`)
             // reject. An enum keeping a payload parameter (`Ok("done")` with
             // its `E` never named, `let x = None`) is commonplace and its
             // residual sits in the leg that never constructs — recorded as a
@@ -58410,7 +58495,7 @@ pub enum Intrinsic {
     JsonKind,
     // `hash::canonical_hash(value): Hash` -> the value's canonical key: a
     // primitive as-is (JS keys those by value), an aggregate as its
-    // `JSON.stringify` string. The basis of `Hashable` / value-keyed `Map`/`Set`
+    // `JSON.stringify` string. The basis of `Hashable` / value-keyed `HashMap`/`HashSet`
     // (proposal/hashable-keys.md, I1).
     CanonicalHash,
     // `hash::hashes_equal(a, b): bool` -> `a === b`, the native comparison
@@ -58959,7 +59044,7 @@ pub struct Program<'src> {
     pub generic_dispatch: HashMap<Id, GenericDispatch<'src>>,
     pub for_each_next: HashMap<Id, Id>,
     /// Per `for x in iterable` loop: the type the ITERABLE inferred to. The
-    /// native lowerings are chosen by it (`Set` walks its backing map's values,
+    /// native lowerings are chosen by it (`HashSet` walks its backing map's values,
     /// everything else is a plain `for...of`), and emission cannot recover it —
     /// an iterable written as a parameter (`self`), a call, an `if`, a block, an
     /// `await` or a `*view` stores no type on its own expr id, so the lookup
@@ -60981,7 +61066,7 @@ fn render_type(node: &Node<'_>) -> String {
     }
 }
 
-/// Whether an exposed field's SOLE written type argument is a `Map<K, V>` — the
+/// Whether an exposed field's SOLE written type argument is a `HashMap<K, V>` — the
 /// one shape `[expose(keyed)]` can read both a key and an element from.
 /// [`sole_argument_is_map`]'s sibling for A51's `List<T>` keyed form: the
 /// source's sole type argument is a `List` of exactly one thing.
@@ -61041,6 +61126,15 @@ fn annotation_is_keyed_cell(type_node: Option<&Node<'_>>) -> bool {
     )
 }
 
+/// Whether a WRITTEN type head names the hash map: `HashMap`, or `Map`, its
+/// spelling before tracker I9, which `std::map` keeps one release as a
+/// deprecated re-export of the same type. The `[expose]` shape checks read the
+/// annotation before any type resolves, so both spellings are the map here —
+/// drop `Map` with the alias.
+fn is_hash_map_head(head: &str) -> bool {
+    matches!(head, "HashMap" | "Map")
+}
+
 fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
     let Some(Node::AccessorWithGenerics(_, arguments)) = type_node else {
         return false;
@@ -61051,13 +61145,13 @@ fn sole_argument_is_map(type_node: Option<&Node<'_>>) -> bool {
     matches!(
         &element.0,
         Node::AccessorWithGenerics(head, key_and_value)
-            if *head == "Map" && key_and_value.0.len() == 2
+            if is_hash_map_head(head) && key_and_value.0.len() == 2
     )
 }
 
-/// The KEY a `[expose]`d field's `Map<K, V>` element names, as written (tracker
-/// A56). [`sole_argument_is_map`]'s reader: the shape check answers whether the
-/// element is a `Map` at all, this answers what it says the key is, so the
+/// The KEY a `[expose]`d field's `HashMap<K, V>` element names, as written
+/// (tracker A56). [`sole_argument_is_map`]'s reader: the shape check answers
+/// whether the element is a `HashMap` at all, this answers what it says the key is, so the
 /// refusal of a disagreeing `[expose(keyed = K)]` argument can quote both
 /// spellings. `None` for every other written shape.
 fn sole_argument_map_key(type_node: Option<&Node<'_>>) -> Option<String> {
@@ -61070,7 +61164,7 @@ fn sole_argument_map_key(type_node: Option<&Node<'_>>) -> Option<String> {
     let Node::AccessorWithGenerics(head, key_and_value) = &element.0 else {
         return None;
     };
-    if *head != "Map" {
+    if !is_hash_map_head(head) {
         return None;
     }
     let [key, _value] = key_and_value.0.as_slice() else {
@@ -61651,7 +61745,7 @@ pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) ->
 /// returns a non-object unchanged, so `Align::Start.hash()` and
 /// `"flex-start".hash()` produce the identical key. Nothing here is a new
 /// semantics — it is the same identity `value()` already is, stated as a trait
-/// impl so `Map<Align, V>` and `Set<Align>` can find it.
+/// impl so `HashMap<Align, V>` and `HashSet<Align>` can find it.
 ///
 /// Synthesized rather than derived for §7.3's reason, unchanged: writing
 /// `= "flex-start"` is already the opt-in, so `[derive(Hashable)]` would be a
@@ -67112,32 +67206,40 @@ fn analyze_inner<'src>(
             .insert("List", list_struct_id);
     }
 
-    // The `std::set` `Set` struct, if `set.vl` loaded. Its `new`/`insert`/... method
-    // ids are captured below after `build()`. `Set` is imported explicitly (not an
-    // always-loaded core module), so it isn't bound into the global scope.
+    // The `std::hash_set` `HashSet` struct, if `hash_set.vl` loaded. Its
+    // `new`/`insert`/... method ids are captured below after `build()`. `HashSet`
+    // is imported explicitly (not an always-loaded core module), so it isn't bound
+    // into the global scope. Read from the DECLARING module: `std::set`'s
+    // deprecated `Set` (I9) is a re-export of this same entity, so a program that
+    // still spells the old name lands here too.
     let set_struct_id = module_scopes
-        .get("set")
+        .get("hash_set")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
-        .and_then(|scope| scope.name_to_id_map.get("Set").copied());
+        .and_then(|scope| scope.name_to_id_map.get("HashSet").copied());
     if let Some(set_struct_id) = set_struct_id {
-        analyzer.primitive_struct_ids.insert("Set", set_struct_id);
+        analyzer
+            .primitive_struct_ids
+            .insert("HashSet", set_struct_id);
     }
 
-    // The `std::map` `Map` struct, if `map.vl` loaded — captured so R10
-    // (destruction.md §4) can reject a resource type argument (`Map<str,
-    // Database>`). `Map` is a vilan wrapper over `NativeMap`, so its element
-    // still lands in host-opaque storage.
+    // The `std::hash_map` `HashMap` struct, if `hash_map.vl` loaded — captured so
+    // R10 (destruction.md §4) can reject a resource type argument (`HashMap<str,
+    // Database>`). `HashMap` is a vilan wrapper over `NativeMap`, so its element
+    // still lands in host-opaque storage. `std::map`'s deprecated `Map` is the same
+    // entity (I9), as `HashSet` is above.
     let map_struct_id = module_scopes
-        .get("map")
+        .get("hash_map")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
-        .and_then(|scope| scope.name_to_id_map.get("Map").copied());
+        .and_then(|scope| scope.name_to_id_map.get("HashMap").copied());
     if let Some(map_struct_id) = map_struct_id {
-        analyzer.primitive_struct_ids.insert("Map", map_struct_id);
+        analyzer
+            .primitive_struct_ids
+            .insert("HashMap", map_struct_id);
     }
 
     // The raw `std::native_map` `NativeMap` struct, if loaded (imported by the
-    // public `Map`/`Set` wrappers). It carries the map intrinsics; the public
-    // `Map`/`Set` are ordinary vilan structs over it (I1).
+    // public `HashMap`/`HashSet` wrappers). It carries the map intrinsics; the public
+    // `HashMap`/`HashSet` are ordinary vilan structs over it (I1).
     let native_map_struct_id = module_scopes
         .get("native_map")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
@@ -67691,8 +67793,8 @@ fn analyze_over_world<'src>(
         };
         let list_struct = analyzer.primitive_struct_ids.get("List").copied();
         let native_map_struct = analyzer.primitive_struct_ids.get("NativeMap").copied();
-        let map_struct = analyzer.primitive_struct_ids.get("Map").copied();
-        let set_struct = analyzer.primitive_struct_ids.get("Set").copied();
+        let map_struct = analyzer.primitive_struct_ids.get("HashMap").copied();
+        let set_struct = analyzer.primitive_struct_ids.get("HashSet").copied();
         // `Arena` is reached only by `import std::arena`, so it is not among the
         // globally-bound `primitive_struct_ids` — resolve it from its module scope.
         let arena_struct = module_scopes
@@ -68121,7 +68223,7 @@ fn analyze_over_world<'src>(
         }
     }
     // The raw `NativeMap` (the JS `Map`) carries the map intrinsics; the public
-    // `Map`/`Set` are vilan wrappers over it that dispatch `key.hash()` (I1), so
+    // `HashMap`/`HashSet` are vilan wrappers over it that dispatch `key.hash()` (I1), so
     // their own methods are ordinary vilan code, not intrinsics.
     if let Some(native_map_struct_id) = analyzer.primitive_struct_ids.get("NativeMap").copied() {
         for implementation in &analyzer.implementations {

@@ -3511,13 +3511,13 @@ fn a_toggle_front_end_steers_at_the_prelude_toggle_not_the_manifest() {
 
 #[test]
 fn a_name_in_neither_std_prelude_keeps_the_ordinary_import_steer() {
-    // The arm must be narrow: `Map` is in no prelude, so the B4 import steer
+    // The arm must be narrow: `HashMap` is in no prelude, so the B4 import steer
     // still answers, and the LSP quickfix it drives still fires.
     let errors = analyze_under_prelude(
         base_prelude(),
         &[(
             "main.vl",
-            "fun main() { let m: Map<str, i32> = Map::new(); print(\"x\"); }\n",
+            "fun main() { let m: HashMap<str, i32> = HashMap::new(); print(\"x\"); }\n",
         )],
         "main.vl",
         Platform::default(),
@@ -3525,7 +3525,7 @@ fn a_name_in_neither_std_prelude_keeps_the_ordinary_import_steer() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("import it first (`import std::map::Map;`)")),
+            .any(|e| e.contains("import it first (`import std::hash_map::HashMap;`)")),
         "{errors:#?}"
     );
 }
@@ -3538,7 +3538,7 @@ fn a_package_already_on_the_web_set_never_gets_the_web_steer() {
         web_prelude(),
         &[(
             "main.vl",
-            "fun main() { let m: Map<str, i32> = Map::new(); print(\"x\"); }\n",
+            "fun main() { let m: HashMap<str, i32> = HashMap::new(); print(\"x\"); }\n",
         )],
         "main.vl",
         Platform::Browser,

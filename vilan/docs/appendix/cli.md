@@ -102,7 +102,7 @@ its own, with the default prelude and no dependencies.
   and builds it with the host's `cargo` — **in debug**, because rustc is
   the inner loop from there on (`--release` is yours to run over the
   generated project). It is a first cut whose scope is structs, enums,
-  `Option`/`Result`, `str`, `List`, `Map`/`Set`, closures, `impl`s,
+  `Option`/`Result`, `str`, `List`, `HashMap`/`HashSet`, closures, `impl`s,
   `print` and `panic`; anything outside that — a generic function, a
   module-level binding, `async`, any host binding — is refused by name
   rather than mis-compiled. [Native binaries](../guide/native.md) has the
@@ -729,7 +729,7 @@ the crossing. The same fact rules out three tempting mappings:
   `[tag, …payload]` — unless it is a **backed** enum, which is the bare
   backing value and *does* cross (that is what a closed string set maps to,
   below);
-- `Map<str, T>` is a Vilan struct over a hashed native map, not a plain
+- `HashMap<str, T>` is a Vilan struct over a hashed native map, not a plain
   host object;
 - `List<T>` is a real JS array, and an array-*like* (`{[index: number]:
   T}` — numeric keys and `length`, no `Symbol.iterator`) is not one:

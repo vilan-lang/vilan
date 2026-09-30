@@ -32,22 +32,37 @@
 // the log is as long as one turn's writes.
 import pkg::compare::PartialEq;
 import pkg::hash::Hashable;
+import pkg::hash_map::HashMap;
+import pkg::hash_set::HashSet;
 import pkg::io::panic;
-import pkg::map::Map;
+import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
+	Flow,
+	Instance,
+	Owner,
+	Pipe,
+	RowStep,
 	Signal,
 	SignalCell,
 	Source,
 	Subscriber,
 	Subscription,
+	also_releasing,
 	as_derivation,
 	defer_to_owner,
+	detach,
 	fresh_id,
+	observe_flow,
+	owner_scope,
+	reconcile,
 	register_with_owner,
+	run_element,
+	subscriber_of,
+	wake,
 };
-import pkg::set::Set;
 import pkg::shared::Shared;
+import pkg::task::ambient_nursery;
 
 /// How many ops a `DeltaLog` will hold for a consumer that has stopped
 /// draining. Past it the history is dropped and every lagging cursor falls
@@ -113,10 +128,10 @@ export enum SeqOp<T> {
 /// A map's change. `Put`'s `Option<V>` is the difference between an insert and an
 /// overwrite, which a group fold over the values needs.
 ///
-/// Recorded, not slated: nothing asks for a reactive `Map` cell yet. It is written
+/// Recorded, not slated: nothing asks for a reactive map cell yet. It is written
 /// here so the log's shape is chosen against more than one collection.
 ///
-/// `K: Hashable` is the `Reset` arm's bound, not the op's: `Map<K, V>` demands it,
+/// `K: Hashable` is the `Reset` arm's bound, not the op's: `HashMap<K, V>` demands it,
 /// and an op that carries the whole collection carries its bounds with it.
 export enum MapOp<K: Hashable, V> {
 	/// The key, what was there, and what is there now.
@@ -124,14 +139,14 @@ export enum MapOp<K: Hashable, V> {
 	/// The key and the value that left.
 	Delete(K, V),
 	/// The collection BECAME this map.
-	Reset(Map<K, V>),
+	Reset(HashMap<K, V>),
 }
 
 /// A set's change. Recorded, not slated — `MapOp`'s sentence applies.
 export enum SetOp<T: Hashable> {
 	Add(T),
 	Remove(T),
-	Reset(Set<T>),
+	Reset(HashSet<T>),
 }
 
 // === The log =================================================================
@@ -1075,8 +1090,8 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	// `on_change`, through the blanket `Flow` over `Source` (F58 built that hop
 	// natively). Not `attach_observer` directly: through this SUBTRAIT bound a
 	// supertrait default's override is not dispatched (both backends), and
-	// `Source`'s default captures the source, the loop A132 took out; the
-	// blanket's own `Source` bound reaches the cell's override.
+	// `Source`'s default captures the source, the loop A132 took out; the blanket's
+	// own `Source` bound reaches the cell's override.
 	let _owned = register_with_owner(source.on_change(|_published| {
 		for op in read(cursor) {
 			match op {
@@ -1097,4 +1112,1408 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	}));
 	defer_to_owner(|| source.drop_cursor(cursor));
 	out
+}
+
+// === Collection pipes (A142 S4, `proposal/reactive-layers.md` §6) ============
+//
+// §3's split, one level up. A collection OPERATOR (`map`, `filter`, `filter_map`,
+// `any`/`all`/`count`, `flatten`) returns a move-only COLLECTION PIPE (R33), and a
+// pipe is consumed once: sealed with `.memo()` into a `CollSource<T>`, handed to
+// `each`/`each_by`, or read once with `.sample()`. What travels between stages is
+// not a value but the change: a stage is started once for its one consumer, seeds
+// from a snapshot, and from then on answers the ops since the last drain —
+// `SeqOp`, the shape's one vocabulary (A112), so an operator is written once per
+// shape and serves every cell kind.
+//
+// **Operators follow the reactive value their closure returns (R9).** A closure
+// may answer a plain value or a `Flow`; the result trait (`IntoFlow`, R31) is
+// resolved per closure when the code is generated, so `filter(|x| x > 3)` never
+// subscribes, and `filter(|src| src.is_pending())` starts the pipe `is_pending`
+// builds for each element and follows it. A flow-following element holds ONE
+// subscription, and a change there re-reads one element and emits one op (§6.2).
+//
+// **Every run has an owner (§6.4), allocated lazily.** An operator's closure runs
+// once per element that arrives and again per element that changes, under the
+// stage's scratch owner; what a run registers is split off into an owner of the
+// element's own, released when the element leaves or re-runs. A run that registers
+// nothing and answers a plain value leaves no record at all — the element is a slot
+// id and a value in the stage's lists.
+
+/// A STARTED collection flow — `Instance`'s twin for a collection's one consumer.
+///
+/// The consumer reads `snapshot` once, at its start, as its seed; attaches its ONE
+/// subscriber; and on every wake-up calls `drain`, which answers what changed since
+/// the last drain (the first drain: since the snapshot) as ops. Disposing the
+/// attach handle detaches every registration the instance made, and `release`
+/// releases what its bodies built — the consumer chains it onto the handle.
+export struct CollInstance<T> {
+	snapshot: || List<T>,
+	attach: |Subscriber| Subscription,
+	drain: || List<SeqOp<T>>,
+	release: || void,
+}
+
+/// Anything a collection pipeline starts from: every `CollSource` (through the
+/// blanket below) and every collection pipe stage. It carries the operators; the
+/// sealing operations are `CollPipe`'s.
+///
+/// `[resource]`, like `Flow` (R39): a stage is move-only, and its object is too. A
+/// source is data — the blanket's `own self` on a `ListCell` is a copy of the
+/// handle.
+export [resource] trait CollFlow<T> {
+	/// Start this collection flow for its one consumer — the node author's member.
+	[must_use]
+	fun open(own self): CollInstance<T>;
+}
+
+/// A granular collection source (R23): a `Source<List<T>>` whose writes are its
+/// ops, so a collection pipeline can start from it without diffing. `ListCell` is
+/// one, and so is what `.memo()` seals a collection pipe into (`ListMemo`).
+///
+/// A COARSE source — a `SignalCell<List<T>>`, a derivation of a list — is not: the
+/// change description was thrown away upstream, and the only way back is a diff,
+/// which is spelled at the boundary (`.coll_by(key)`, `.coll()`, R10 / §6.3).
+export trait CollSource<T> with DeltaSource<List<T>, SeqOp<T>> {}
+
+/// Every granular source starts as a collection flow: a cursor into its log,
+/// minted before the seed is read (`map_each`'s order), drained through the
+/// source's `reader` (A132), and retired at the release.
+export impl type S: CollSource<type T> with CollFlow<T> {
+	fun open(own self): CollInstance<T> {
+		let cursor = self.cursor();
+		let read = self.reader();
+		CollInstance<T> {
+			snapshot = || self.get(),
+			attach = |subscriber: Subscriber| self.on_settle(subscriber),
+			drain = || read(cursor),
+			release = || self.drop_cursor(cursor),
+		}
+	}
+}
+
+export impl ListCell<type T> with CollSource<T> {}
+
+/// A collection TRANSFORMATION (R33): a `CollFlow` with no `get`, consumed exactly
+/// once — sealed here, or handed to `each`/`each_by`. The stage types are
+/// `[resource]`s and implement this with no body.
+///
+/// **Sharing is sealing**, as for a scalar pipe (§3.3): two consumers of one
+/// derived collection need a `CollSource` between them.
+///
+///     let loaded = ids.map(|id| fetch_row(id)).memo();   // one instance
+///     let pending = loaded.any(|row| row.is_pending()).memo();
+///     each(loaded, |row| row.id, render);                 // a source is data
+export [resource] trait CollPipe<T> with CollFlow<T> {
+	/// Seal into a READ-ONLY granular source (R23): the pipe's one consumer, its
+	/// ops applied to one `ListCell` as they arrive, the collection cached for
+	/// every reader. Owner-tied like `Pipe::memo` (A28); a module binding says
+	/// `.memo_global()`.
+	fun memo(own self): ListMemo<T> {
+		ListMemo<T> { cell = seal_collection(self.open(), true) }
+	}
+
+	/// `.memo()` for a collection that lives as long as the PROGRAM (A130).
+	fun memo_global(own self): ListMemo<T> {
+		ListMemo<T> { cell = seal_collection(self.open(), false) }
+	}
+
+	/// A one-off read (R32): start the pipe, take the collection, release it —
+	/// including anything its per-element runs built.
+	fun sample(own self): List<T> {
+		let instance = self.open();
+		let value = (instance.snapshot)();
+		(instance.release)();
+		value
+	}
+}
+
+/// The seal both `memo`s share: seed a `ListCell` from the snapshot and apply every
+/// drain to it, op for op, so the cell's own log says what the pipe said — a
+/// consumer of the sealed source is told the same changes, not a diff of them. A
+/// DERIVATION (A110 door 2): it publishes, so an effect over it reads it settled.
+fun seal_collection<T>(instance: CollInstance<T>, owned: bool): ListCell<T> {
+	let sealed: ListCell<T> = ListCell<T>::of(fresh_list((instance.snapshot)()));
+	let drain = instance.drain;
+	if owned {
+		let refreshed = (instance.attach)(subscriber_of(|| apply_ops(sealed, drain()), true));
+		also_releasing(refreshed, instance.release);
+		let _owned = register_with_owner(refreshed);
+	} else {
+		// NAMED for the no-cycle gate, as `Pipe::cell_global`'s refresh is: the
+		// loop a program-lifetime seal holds is the design (`reactive-pipeline.md`
+		// §2.4).
+		let cell_global_refresh = || apply_ops(sealed, drain());
+		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+	}
+	sealed
+}
+
+/// A copy of `list` built element by element — the seed of a cell a stage will
+/// write IN PLACE. Handing a list read out of another cell to `Shared::new` does
+/// not copy it today (collections-44's find: the argument is not an `own`
+/// parameter, so the JS backend aliases the two cells and a write through one is
+/// visible in the other), so every list a stage stores is built here.
+fun fresh_list<T>(list: List<T>): List<T> {
+	mut copy: List<T> = [];
+	for item in list {
+		copy.push(item);
+	}
+	copy
+}
+
+/// Write `ops` into `cell` as the same ops: a splice as a splice, an in-place
+/// change as `set_at`, a reorder as `move_range`, a reset as `set`.
+fun apply_ops<T>(cell: ListCell<T>, ops: List<SeqOp<T>>) {
+	for op in ops {
+		match op {
+			SeqOp::Splice(let at, let removed, let inserted) => cell.splice(at, removed.len(), inserted),
+			SeqOp::SetAt(let at, let _was, let value) => cell.set_at(at, value),
+			SeqOp::Reset(let items) => cell.set(items),
+			SeqOp::Move(let from, let count, let to) => cell.move_range(from, count, to),
+		}
+	}
+}
+
+/// What `.memo()` seals a collection pipe into: a read-only granular source over
+/// one `ListCell` (R23, R28's read-only face). It is a `CollSource`, so a pipeline
+/// starts from it again, `each` follows its ops, and it is data — pass it anywhere.
+export struct ListMemo<T> {
+	cell: ListCell<T>,
+}
+
+export impl ListMemo<type T> {
+	/// Read the collection in place, as `ListCell::peek` does.
+	fun peek<U>(self, read: sync |&List<T>| U): U {
+		self.cell.peek(read)
+	}
+
+	/// How many elements it holds — read in place.
+	fun size(self): usize {
+		self.cell.size()
+	}
+}
+
+export impl ListMemo<type T> with Source<List<T>> {
+	fun get(self): List<T> {
+		self.cell.get()
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |List<T>| void, immediately: bool): Subscription {
+		self.cell.attach_observer(observer, immediately)
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+export impl ListMemo<type T> with DeltaSource<List<T>, SeqOp<T>> {
+	fun cursor(self): DeltaCursor {
+		self.cell.cursor()
+	}
+
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.cell.drop_cursor(cursor);
+	}
+
+	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
+		self.cell.since(cursor)
+	}
+
+	fun reader(self): |DeltaCursor| List<SeqOp<T>> {
+		self.cell.reader()
+	}
+}
+
+export impl ListMemo<type T> with CollSource<T> {}
+
+// --- What a closure answers (R9, R31, R35) -----------------------------------
+
+/// One element's closure result, started: a plain value, or the instance of the
+/// flow it answered.
+export enum ElementRun<T> {
+	/// A plain value — no subscription, nothing to release.
+	Constant(T),
+	/// A started flow: the element's value is its `pull`, and it is followed.
+	Live(Instance<T>),
+}
+
+/// The result trait of a FOLLOWING operator — `filter`, `filter_map`, `any`,
+/// `all`, `count` (R22, renamed by R31). A closure answering a plain value is a
+/// constant; one answering any `Flow` — a source or a pipe — has that flow started
+/// for the element and followed. The implementation is chosen per closure when the
+/// code is generated (B158's tiers, as `MaybeSignal`'s), so a plain predicate pays
+/// for nothing.
+export trait IntoFlow<T> {
+	/// Start this answer for one element.
+	fun start_element(own self): ElementRun<T>;
+}
+
+/// A plain value: a constant, no subscription.
+export impl type T with IntoFlow<T> {
+	fun start_element(own self): ElementRun<T> {
+		ElementRun<T>::Constant(self)
+	}
+}
+
+/// A flow — a source or a pipe: started per element and followed.
+export impl type F: Flow<type T> with IntoFlow<T> {
+	fun start_element(own self): ElementRun<T> {
+		ElementRun<T>::Live(self.start())
+	}
+}
+
+/// `map`'s result trait (R35). A returned PIPE is started per element and its value
+/// carried — a pipe cannot be an element, so that is the only thing it can mean.
+/// Anything else, a `Source` included, IS the element: `ids.map(open_mirror)` is a
+/// collection OF sources, and `.flatten()` is the explicit follow.
+export trait IntoElement<T> {
+	/// Start this answer for one element.
+	fun start_element_value(own self): ElementRun<T>;
+}
+
+/// A value — a source included — is the element itself.
+export impl type T with IntoElement<T> {
+	fun start_element_value(own self): ElementRun<T> {
+		ElementRun<T>::Constant(self)
+	}
+}
+
+/// A pipe is started per element, and the element is its value.
+export impl type P: Pipe<type T> with IntoElement<T> {
+	fun start_element_value(own self): ElementRun<T> {
+		ElementRun<T>::Live(self.start())
+	}
+}
+
+// --- The per-element core (§6.2, §6.4) ---------------------------------------
+
+/// A followed element's live parts: its flow's instance and the handle on it, and
+/// the owner its run's registrations were split into. A plain element that
+/// registered nothing has no record; one that registered something and answered a
+/// plain value has a record that follows nothing (`follows` false, a `pull` that
+/// answers the value, a `release` that does nothing). Closures are held bare rather
+/// than as `Option`s, which the native backend does not hold.
+struct ElementHold<V> {
+	follows: bool,
+	pull: || V,
+	handle: Option<Subscription>,
+	release: || void,
+	owner: Option<Owner>,
+}
+
+/// How many element records collection stages have made since the program started —
+/// the instrument behind "a plain `filter` allocates nothing per element" (A142
+/// §6.1). A pin's instrument; it decides nothing.
+let element_holds_allocated_count: Shared<i32> = Shared::new(0);
+
+export [internal("an instrument for the per-element allocation pin (A142 §6.1); it counts, it decides nothing")]
+fun element_holds_allocated(): i32 {
+	element_holds_allocated_count.read()
+}
+
+/// One element change the core resolved, in the core's positions: what the
+/// operators translate into their own ops.
+enum ElementEvent<T, V> {
+	/// At `at`, the elements (and their values) that left, and those that arrived.
+	Spliced(usize, List<(T, V)>, List<(T, V)>),
+	/// The element at `at` changed: the old pair, then the new. `true` when its
+	/// INPUT was replaced (an upstream `SetAt`, so the element re-ran); `false`
+	/// when only the flow it answered moved (the input is the same).
+	Changed(usize, (T, V), (T, V), bool),
+	/// The collection became these, and these left.
+	Reset(List<(T, V)>, List<(T, V)>),
+	/// `count` elements moved from `from` to `to`, unchanged.
+	Moved(usize, usize, usize),
+}
+
+/// The per-element state every following operator keeps, as PARALLEL lists, so an
+/// element costs a slot id, its input and its value and nothing else unless its run
+/// needed an owner or answered a flow (`holds`, keyed by slot id).
+///
+/// **Stable slot ids (§6.2).** An element's position moves under splices, so its
+/// followed flow's subscriber names the SLOT, and the core looks the slot's current
+/// position up when it resolves the change.
+struct ElementCore<T, V> {
+	ids: Shared<List<i32>>,
+	items: Shared<List<T>>,
+	values: Shared<List<V>>,
+	holds: Shared<NativeMap<ElementHold<V>>>,
+	/// Slots whose followed flow changed since the last resolve, in arrival order.
+	dirty: Shared<List<i32>>,
+	next_id: Shared<i32>,
+	/// The stage's scratch owner: every run starts here, and is split off only when
+	/// it registered something.
+	stage: Owner,
+	/// The consumer's subscriber, once attached: a followed flow wakes it.
+	consumer: Shared<Option<Subscriber>>,
+	/// One element's run: the operator's closure, under `stage`, its answer
+	/// started.
+	run: |T| (ElementRun<V>, Option<Owner>),
+}
+
+fun element_core<T, V>(stage: Owner, run: |T| (ElementRun<V>, Option<Owner>)): ElementCore<T, V> {
+	// Every empty container is annotated: a struct-literal field does not direct a
+	// generic call's element type (`HashSet::new`'s note), and the native backend
+	// spells every type it holds.
+	let ids: List<i32> = [];
+	let items: List<T> = [];
+	let values: List<V> = [];
+	let holds: NativeMap<ElementHold<V>> = NativeMap::new();
+	let dirty: List<i32> = [];
+	let consumer: Option<Subscriber> = None;
+	ElementCore<T, V> {
+		ids = Shared::new(ids),
+		items = Shared::new(items),
+		values = Shared::new(values),
+		holds = Shared::new(holds),
+		dirty = Shared::new(dirty),
+		next_id = Shared::new(0),
+		stage,
+		consumer = Shared::new(consumer),
+		run,
+	}
+}
+
+/// Run the closure for `item` and admit the answer: a slot id, and the value now. A
+/// flow is attached here, with a relay that marks the slot and wakes the consumer.
+fun admit<T, V>(core: ElementCore<T, V>, item: T): (i32, V) {
+	let id = core.next_id.read();
+	core.next_id.write() = id + 1;
+	let (answer, owner) = (core.run)(item);
+	match answer {
+		ElementRun::Constant(let value) => {
+			match owner {
+				Some(let held) => keep_hold(core, id, ElementHold<V> {
+					follows = false,
+					pull = || value,
+					handle = None,
+					release = || {},
+					owner = Some(held),
+				}),
+				None => {},
+			}
+			(id, value)
+		},
+		ElementRun::Live(let instance) => {
+			let pull = instance.pull;
+			let dirty = core.dirty;
+			let consumer = core.consumer;
+			let handle = (instance.attach)(subscriber_of(|| {
+				dirty.write().push(id);
+				match consumer.read() {
+					Some(let downstream) => wake(downstream),
+					None => {},
+				}
+			}, true));
+			keep_hold(core, id, ElementHold<V> {
+				follows = true,
+				pull,
+				handle = Some(handle),
+				release = instance.release,
+				owner,
+			});
+			(id, pull())
+		},
+	}
+}
+
+fun keep_hold<T, V>(core: ElementCore<T, V>, id: i32, hold: ElementHold<V>) {
+	element_holds_allocated_count.write() = element_holds_allocated_count.read() + 1;
+	core.holds.write().insert(id.hash(), hold);
+}
+
+/// Release what slot `id`'s run built: its subscription, its flow's instance, its
+/// owner. A plain element has nothing to release.
+fun retire<T, V>(core: ElementCore<T, V>, id: i32) {
+	match core.holds.read().get(id.hash()) {
+		Some(let hold) => {
+			core.holds.write().remove(id.hash());
+			match hold.handle {
+				Some(let handle) => detach(handle),
+				None => {},
+			}
+			(hold.release)();
+			match hold.owner {
+				Some(let owner) => owner.dispose(),
+				None => {},
+			}
+		},
+		None => {},
+	}
+}
+
+/// Seed the core from `items`, in order.
+fun seed<T, V>(core: ElementCore<T, V>, items: List<T>) {
+	for item in items {
+		let (id, value) = admit(core, item);
+		core.ids.write().push(id);
+		core.items.write().push(item);
+		core.values.write().push(value);
+	}
+}
+
+/// The pairs the core holds at `at .. at + count`.
+fun held_pairs<T, V>(core: ElementCore<T, V>, at: usize, count: usize): List<(T, V)> {
+	mut pairs: List<(T, V)> = [];
+	mut index = at;
+	for index < at + count {
+		pairs.push((core.items.read()[index], core.values.read()[index]));
+		index += 1;
+	}
+	pairs
+}
+
+/// Everything the core holds, as pairs.
+fun all_pairs<T, V>(core: ElementCore<T, V>): List<(T, V)> {
+	held_pairs(core, 0, core.ids.read().len())
+}
+
+/// Apply the upstream's ops, then the followed flows that changed, and answer the
+/// element events they made — in order, positions as of each event.
+fun resolve<T, V>(core: ElementCore<T, V>, ops: List<SeqOp<T>>): List<ElementEvent<T, V>> {
+	mut events: List<ElementEvent<T, V>> = [];
+	for op in ops {
+		match op {
+			SeqOp::Splice(let at, let removed, let inserted) => {
+				let held = core.ids.read().len();
+				let start = splice_start(held, at);
+				let taking = splice_count(held, start, removed.len());
+				let left = held_pairs(core, start, taking);
+				mut taken = 0;
+				for taken < taking {
+					let id = core.ids.write().remove(start);
+					retire(core, id);
+					let _item = core.items.write().remove(start);
+					let _value = core.values.write().remove(start);
+					taken += 1;
+				}
+				mut arrived: List<(T, V)> = [];
+				mut offset = 0;
+				for item in inserted {
+					let (id, value) = admit(core, item);
+					core.ids.write().insert(start + offset, id);
+					core.items.write().insert(start + offset, item);
+					core.values.write().insert(start + offset, value);
+					arrived.push((item, value));
+					offset += 1;
+				}
+				events.push(ElementEvent::Spliced(start, left, arrived));
+			},
+			SeqOp::SetAt(let at, let _was, let item) => {
+				match core.ids.read().get(at) {
+					Some(let old_id) => {
+						let before = (core.items.read()[at], core.values.read()[at]);
+						// The element RE-RUNS: its last run is released first, and
+						// the new run is a slot of its own (a wake the old run
+						// queued is skipped, its slot gone).
+						retire(core, old_id);
+						let (id, value) = admit(core, item);
+						core.ids.write()[at] = id;
+						core.items.write()[at] = item;
+						core.values.write()[at] = value;
+						events.push(ElementEvent::Changed(at, before, (item, value), true));
+					},
+					None => {},
+				}
+			},
+			SeqOp::Reset(let items) => {
+				let left = all_pairs(core);
+				for id in core.ids.read() {
+					retire(core, id);
+				}
+				core.ids.write() = [];
+				core.items.write() = [];
+				core.values.write() = [];
+				seed(core, items);
+				events.push(ElementEvent::Reset(left, all_pairs(core)));
+			},
+			SeqOp::Move(let from, let count, let to) => {
+				mut lifted_ids: List<i32> = [];
+				mut lifted_items: List<T> = [];
+				mut lifted_values: List<V> = [];
+				mut taken = 0;
+				for taken < count {
+					lifted_ids.push(core.ids.write().remove(from));
+					lifted_items.push(core.items.write().remove(from));
+					lifted_values.push(core.values.write().remove(from));
+					taken += 1;
+				}
+				mut offset = 0;
+				for offset < count {
+					core.ids.write().insert(to + offset, lifted_ids[offset]);
+					core.items.write().insert(to + offset, lifted_items[offset]);
+					core.values.write().insert(to + offset, lifted_values[offset]);
+					offset += 1;
+				}
+				events.push(ElementEvent::Moved(from, count, to));
+			},
+		}
+	}
+	// The followed flows that moved. Each slot is re-read once however many times
+	// it woke, and a slot the ops above retired is skipped: its element left.
+	let woke = core.dirty.read();
+	if woke.len() > 0 {
+		core.dirty.write() = [];
+		mut positions: NativeMap<usize> = NativeMap::new();
+		mut index = 0;
+		for id in core.ids.read() {
+			positions.insert(id.hash(), index);
+			index += 1;
+		}
+		mut seen: NativeMap<bool> = NativeMap::new();
+		for id in woke {
+			if seen.contains_key(id.hash()) {
+				jump continue;
+			}
+			seen.insert(id.hash(), true);
+			match positions.get(id.hash()) {
+				Some(let at) => match core.holds.read().get(id.hash()) {
+					Some(let hold) => {
+						if hold.follows {
+							let item = core.items.read()[at];
+							let before = core.values.read()[at];
+							let now = (hold.pull)();
+							core.values.write()[at] = now;
+							events.push(ElementEvent::Changed(at, (item, before), (item, now), false));
+						}
+					},
+					None => {},
+				},
+				None => {},
+			}
+		}
+	}
+	events
+}
+
+/// Release every element's run, then the stage's own owner (whatever registered
+/// into it late, and the tasks its runs started).
+fun release_core<T, V>(core: ElementCore<T, V>) {
+	for id in core.ids.read() {
+		retire(core, id);
+	}
+	core.stage.dispose();
+}
+
+/// A core-backed stage's instance: the upstream's attach forwarded (the consumer's
+/// one subscriber) with the subscriber remembered for the followed flows to wake,
+/// and a release that takes the elements' runs down with the upstream.
+fun core_attach<T, V>(
+	core: ElementCore<T, V>,
+	upstream: CollInstance<T>,
+): |Subscriber| Subscription {
+	let consumer = core.consumer;
+	let attach = upstream.attach;
+	|subscriber: Subscriber| {
+		consumer.write() = Some(subscriber);
+		attach(subscriber)
+	}
+}
+
+fun core_release<T, V>(core: ElementCore<T, V>, upstream: CollInstance<T>): || void {
+	let release = upstream.release;
+	|| {
+		release_core(core);
+		release();
+	}
+}
+
+// --- The Fenwick index (§6.2) --------------------------------------------------
+
+/// Output positions for `filter`/`filter_map`: an element's position in the output
+/// is the count of KEPT elements before it. A Fenwick tree over kept/dropped gives
+/// it in O(log n) and moves it in O(log n) when one element flips; the input's
+/// splices rebuild it, O(n), which is what the splice already cost.
+///
+/// One-based internally: `tree[i]` covers the `lowbit(i)` flags ending at `i`.
+struct KeptIndex {
+	tree: Shared<List<i32>>,
+}
+
+fun kept_index(flags: List<bool>): KeptIndex {
+	let index = KeptIndex { tree = Shared::new([]) };
+	rebuild_kept(index, flags);
+	index
+}
+
+/// Rebuild from `flags` in O(n): each node adds itself into its parent.
+fun rebuild_kept(index: KeptIndex, flags: List<bool>) {
+	mut tree: List<i32> = [0];
+	for flag in flags {
+		tree.push(if flag { 1 } else { 0 });
+	}
+	let size = flags.len().as_i32();
+	mut at = 1;
+	for at <= size {
+		let parent = at + (at & (0 - at));
+		if parent <= size {
+			tree[parent.as_usize()] = tree[parent.as_usize()] + tree[at.as_usize()];
+		}
+		at += 1;
+	}
+	index.tree.write() = tree;
+}
+
+/// How many flags before `position` are set.
+fun kept_before(index: KeptIndex, position: usize): usize {
+	mut total = 0;
+	mut at = position.as_i32();
+	for at > 0 {
+		total += index.tree.read()[at.as_usize()];
+		at = at - (at & (0 - at));
+	}
+	total.as_usize()
+}
+
+/// Flag `position` flipped by `delta` (+1 kept, -1 dropped).
+fun kept_add(index: KeptIndex, position: usize, delta: i32) {
+	let size = index.tree.read().len().as_i32() - 1;
+	mut at = position.as_i32() + 1;
+	for at <= size {
+		index.tree.write()[at.as_usize()] = index.tree.read()[at.as_usize()] + delta;
+		at = at + (at & (0 - at));
+	}
+}
+
+// --- The operators (§6.1) ----------------------------------------------------
+
+/// The operators every collection flow has — a BLANKET over `CollFlow`, as `Flow`'s
+/// combinators are, so a granular source and a collection pipe both have them. A
+/// coarse `Source<List<T>>` does not: it converts at the boundary (`.coll()`,
+/// `.coll_by(key)`).
+///
+/// Every closure is a BODY (`derive`'s shape, R14): it runs once per element that
+/// arrives and again per element that changes, under an owner of the run's own that
+/// is released when the element leaves or re-runs (§6.4) — allocated only when the
+/// run registers something.
+export impl type F: CollFlow<type T> {
+	/// Each element through `transform` (R35). A returned PIPE is started per
+	/// element and its value carried (`ids.map(|id| total_of(id))` follows each
+	/// total); a returned `Source` is the element itself — `ids.map(open_mirror)` is
+	/// a collection OF mirrors, and `.flatten()` follows them. A changed element is
+	/// `SetAt(i, old, new)` (§6.2).
+	fun map<R>(
+		own self,
+		transform: (sync |T| R) context (owner_scope, ambient_nursery),
+	): CollMap<F, T, R> {
+		CollMap<F, T, R> { up = self, transform }
+	}
+
+	/// The elements `keep` answers `true` for, following a flow it answers (R9): an
+	/// element that flips in or out is a `Splice` at its OUTPUT position, the count
+	/// of kept elements before it (the Fenwick index, §6.2). `filter(|x| x > 3)`
+	/// subscribes to nothing and keeps no per-element record.
+	fun filter<R>(
+		own self,
+		keep: (sync |T| R) context (owner_scope, ambient_nursery),
+	): CollFilter<F, T, R> {
+		CollFilter<F, T, R> { up = self, keep }
+	}
+
+	/// `map` and `filter` at once: the elements `select` answers `Some` for, as
+	/// their payloads, following a flow it answers. `filter_map(|x| x)` over a
+	/// collection of `Option`-valued flows is the join §6.3 ends with; a closure
+	/// answering `Option<Source<X>>` keeps the sources (it binds `U = Source<X>`
+	/// and does not flatten).
+	fun filter_map<R>(
+		own self,
+		select: (sync |T| R) context (owner_scope, ambient_nursery),
+	): CollFilterMap<F, T, R> {
+		CollFilterMap<F, T, R> { up = self, select }
+	}
+
+	/// Whether `test` answers `true` for ANY element — a pipe of `bool`, sealed
+	/// with `.memo()` (R21). A counter: an element that arrives, leaves or flips
+	/// moves it by one, O(1) per change, so a thousand pending mirrors cost nothing
+	/// to watch.
+	fun any<R>(
+		own self,
+		test: (sync |T| R) context (owner_scope, ambient_nursery),
+	): CollTally<F, T, R, bool> {
+		CollTally<F, T, R, bool> { up = self, test, finish = |kept: usize, total: usize| kept > 0 }
+	}
+
+	/// Whether `test` answers `true` for EVERY element (and so for none of none).
+	fun all<R>(
+		own self,
+		test: (sync |T| R) context (owner_scope, ambient_nursery),
+	): CollTally<F, T, R, bool> {
+		CollTally<F, T, R, bool> {
+			up = self,
+			test,
+			finish = |kept: usize, total: usize| kept == total,
+		}
+	}
+
+	/// How many elements `test` answers `true` for.
+	fun count<R>(
+		own self,
+		test: (sync |T| R) context (owner_scope, ambient_nursery),
+	): CollTally<F, T, R, usize> {
+		CollTally<F, T, R, usize> { up = self, test, finish = |kept: usize, total: usize| kept }
+	}
+}
+
+/// A collection of SOURCES, followed (§3.1's explicit flatten): the value of each
+/// element's source, and a `SetAt` when one of them changes. `map` never does this
+/// for a returned source — a source is data and may BE the element.
+export impl type F: CollFlow<type S: Source<type U>> {
+	fun flatten(own self): CollFlatten<F, S, U> {
+		CollFlatten<F, S, U> { up = self }
+	}
+}
+
+/// `map` as a stage.
+export [resource] struct CollMap<F, T, R> {
+	up: F,
+	transform: (|T| R) context (owner_scope, ambient_nursery),
+}
+
+export impl CollMap<type F: CollFlow<type T>, T, type R: IntoElement<type U>> with CollFlow<U> {
+	fun open(own self): CollInstance<U> {
+		let transform = self.transform;
+		let upstream = self.up.open();
+		let stage = Owner::new();
+		let core: ElementCore<T, U> = element_core(stage, |item: T| {
+			let (answer, owner) = run_element(stage, || transform(item));
+			(answer.start_element_value(), owner)
+		});
+		seed(core, (upstream.snapshot)());
+		let drain = upstream.drain;
+		CollInstance<U> {
+			snapshot = || fresh_list(core.values.read()),
+			attach = core_attach(core, upstream),
+			drain = || mapped_ops(resolve(core, drain())),
+			release = core_release(core, upstream),
+		}
+	}
+}
+
+export impl CollMap<type F: CollFlow<type T>, T, type R: IntoElement<type U>> with CollPipe<U> {}
+
+/// `map`'s derivative: every event, its values.
+fun mapped_ops<T, U>(events: List<ElementEvent<T, U>>): List<SeqOp<U>> {
+	mut ops: List<SeqOp<U>> = [];
+	for event in events {
+		match event {
+			ElementEvent::Spliced(let at, let left, let arrived) => {
+				ops.push(SeqOp::Splice(at, left.map(|pair| pair.1), arrived.map(|pair| pair.1)));
+			},
+			ElementEvent::Changed(let at, let before, let after, let _rerun) => {
+				ops.push(SeqOp::SetAt(at, before.1, after.1));
+			},
+			ElementEvent::Reset(let _left, let now) => ops.push(SeqOp::Reset(now.map(|pair| pair.1))),
+			ElementEvent::Moved(let from, let count, let to) => ops.push(SeqOp::Move(from, count, to)),
+		}
+	}
+	ops
+}
+
+/// `flatten` as a stage: `map` over the identity, every element followed.
+export [resource] struct CollFlatten<F, S, U> {
+	up: F,
+}
+
+export impl CollFlatten<type F: CollFlow<type S>, type S: Source<type U>, U> with CollFlow<U> {
+	fun open(own self): CollInstance<U> {
+		let upstream = self.up.open();
+		// Each source is started as the `Source` blanket starts one, written out:
+		// read with `get`, attached with `on_settle`, nothing to release.
+		let core: ElementCore<S, U> = element_core(Owner::new(), |source: S| {
+			(ElementRun<U>::Live(Instance<U> { pull = || source.get(), attach = |subscriber: Subscriber| source.on_settle(subscriber), release = || {} }), None)
+		});
+		seed(core, (upstream.snapshot)());
+		let drain = upstream.drain;
+		CollInstance<U> {
+			snapshot = || fresh_list(core.values.read()),
+			attach = core_attach(core, upstream),
+			drain = || mapped_ops(resolve(core, drain())),
+			release = core_release(core, upstream),
+		}
+	}
+}
+
+export impl CollFlatten<type F: CollFlow<type S>, type S: Source<type U>, U> with CollPipe<U> {}
+
+/// `filter` as a stage: the core's `bool` per element, a mirror of it the events
+/// are replayed on (their positions are each event's own), and the Fenwick index
+/// over the mirror.
+export [resource] struct CollFilter<F, T, R> {
+	up: F,
+	keep: (|T| R) context (owner_scope, ambient_nursery),
+}
+
+export impl CollFilter<type F: CollFlow<type T>, T, type R: IntoFlow<bool>> with CollFlow<T> {
+	fun open(own self): CollInstance<T> {
+		let keep = self.keep;
+		let upstream = self.up.open();
+		let stage = Owner::new();
+		let core: ElementCore<T, bool> = element_core(stage, |item: T| {
+			let (answer, owner) = run_element(stage, || keep(item));
+			(answer.start_element(), owner)
+		});
+		seed(core, (upstream.snapshot)());
+		let kept: Shared<List<bool>> = Shared::new(fresh_list(core.values.read()));
+		let index = kept_index(kept.read());
+		let drain = upstream.drain;
+		CollInstance<T> {
+			snapshot = || {
+				mut out: List<T> = [];
+				mut at = 0;
+				for item in core.items.read() {
+					if core.values.read()[at] {
+						out.push(item);
+					}
+					at += 1;
+				}
+				out
+			},
+			attach = core_attach(core, upstream),
+			drain = || kept_ops(kept, index, resolve(core, drain()), |pair: (T, bool)| {
+				if pair.1 {
+					Some(pair.0)
+				} else {
+					None
+				}
+			}, false),
+			release = core_release(core, upstream),
+		}
+	}
+}
+
+export impl CollFilter<type F: CollFlow<type T>, T, type R: IntoFlow<bool>> with CollPipe<T> {}
+
+/// `filter_map` as a stage: `filter`'s index over `is_some`, the payloads out.
+export [resource] struct CollFilterMap<F, T, R> {
+	up: F,
+	select: (|T| R) context (owner_scope, ambient_nursery),
+}
+
+export impl CollFilterMap<type F: CollFlow<type T>, T, type R: IntoFlow<Option<type U>>> with CollFlow<
+	U,
+> {
+	fun open(own self): CollInstance<U> {
+		let select = self.select;
+		let upstream = self.up.open();
+		let stage = Owner::new();
+		let core: ElementCore<T, Option<U>> = element_core(stage, |item: T| {
+			let (answer, owner) = run_element(stage, || select(item));
+			(answer.start_element(), owner)
+		});
+		seed(core, (upstream.snapshot)());
+		mut flags: List<bool> = [];
+		for value in core.values.read() {
+			flags.push(value.is_some());
+		}
+		let index = kept_index(flags);
+		let kept: Shared<List<bool>> = Shared::new(flags);
+		let drain = upstream.drain;
+		CollInstance<U> {
+			snapshot = || {
+				mut out: List<U> = [];
+				for value in core.values.read() {
+					match value {
+						Some(let payload) => out.push(payload),
+						None => {},
+					}
+				}
+				out
+			},
+			attach = core_attach(core, upstream),
+			drain = || kept_ops(kept, index, resolve(core, drain()), |pair: (T, Option<U>)| pair.1, true),
+			release = core_release(core, upstream),
+		}
+	}
+}
+
+export impl CollFilterMap<type F: CollFlow<type T>, T, type R: IntoFlow<Option<type U>>> with CollPipe<
+	U,
+> {}
+
+/// `filter`'s and `filter_map`'s derivative, over the kept mirror and its index:
+/// `out` answers an element's output (`None` when it is dropped). An element that
+/// flips is a one-element `Splice` at its output position; one that stays kept and
+/// changed is a `SetAt` there; a splice upstream is ONE splice out, of the kept
+/// elements that left and arrived.
+fun kept_ops<T, V, U>(
+	kept: Shared<List<bool>>,
+	index: KeptIndex,
+	events: List<ElementEvent<T, V>>,
+	out: |(T, V)| Option<U>,
+	payload_follows: bool,
+): List<SeqOp<U>> {
+	mut ops: List<SeqOp<U>> = [];
+	for event in events {
+		match event {
+			ElementEvent::Spliced(let at, let left, let arrived) => {
+				let position = kept_before(index, at);
+				mut removed: List<U> = [];
+				for pair in left {
+					match out(pair) {
+						Some(let value) => removed.push(value),
+						None => {},
+					}
+				}
+				mut inserted: List<U> = [];
+				mut flags: List<bool> = [];
+				for pair in arrived {
+					match out(pair) {
+						Some(let value) => {
+							inserted.push(value);
+							flags.push(true);
+						},
+						None => flags.push(false),
+					}
+				}
+				mut taken = 0;
+				for taken < left.len() {
+					let _flag = kept.write().remove(at);
+					taken += 1;
+				}
+				mut offset = 0;
+				for flag in flags {
+					kept.write().insert(at + offset, flag);
+					offset += 1;
+				}
+				rebuild_kept(index, kept.read());
+				if removed.len() > 0 || inserted.len() > 0 {
+					ops.push(SeqOp::Splice(position, removed, inserted));
+				}
+			},
+			ElementEvent::Changed(let at, let before, let after, let rerun) => {
+				let position = kept_before(index, at);
+				match (out(before), out(after)) {
+					(Some(let was), Some(let now)) => {
+						// Kept both sides. The output changed when the input was
+						// replaced, or — for `filter_map` — when the followed
+						// payload moved; `filter`'s output is the INPUT, so a
+						// predicate flow re-notifying `true` moved nothing.
+						if rerun || payload_follows {
+							ops.push(SeqOp::SetAt(position, was, now));
+						}
+					},
+					(Some(let was), None) => {
+						kept.write()[at] = false;
+						kept_add(index, at, -1);
+						ops.push(SeqOp::Splice(position, [was], []));
+					},
+					(None, Some(let now)) => {
+						kept.write()[at] = true;
+						kept_add(index, at, 1);
+						ops.push(SeqOp::Splice(position, [], [now]));
+					},
+					(None, None) => {},
+				}
+			},
+			ElementEvent::Reset(let _left, let now) => {
+				mut flags: List<bool> = [];
+				mut values: List<U> = [];
+				for pair in now {
+					match out(pair) {
+						Some(let value) => {
+							values.push(value);
+							flags.push(true);
+						},
+						None => flags.push(false),
+					}
+				}
+				kept.write() = flags;
+				rebuild_kept(index, kept.read());
+				ops.push(SeqOp::Reset(values));
+			},
+			ElementEvent::Moved(let from, let count, let to) => {
+				let out_from = kept_before(index, from);
+				let moved = kept_before(index, from + count) - out_from;
+				mut lifted: List<bool> = [];
+				mut taken = 0;
+				for taken < count {
+					lifted.push(kept.write().remove(from));
+					taken += 1;
+				}
+				mut offset = 0;
+				for flag in lifted {
+					kept.write().insert(to + offset, flag);
+					offset += 1;
+				}
+				rebuild_kept(index, kept.read());
+				let out_to = kept_before(index, to);
+				if moved > 0 && out_from != out_to {
+					ops.push(SeqOp::Move(out_from, moved, out_to));
+				}
+			},
+		}
+	}
+	ops
+}
+
+/// `any`/`all`/`count` as a stage: a SCALAR pipe over a counter (§6.2) — what
+/// arrived is added, what left subtracted, a flip moves it by one — finished into
+/// the answer on every pull.
+export [resource] struct CollTally<F, T, R, U> {
+	up: F,
+	test: (|T| R) context (owner_scope, ambient_nursery),
+	finish: |usize, usize| U,
+}
+
+export impl CollTally<type F: CollFlow<type T>, T, type R: IntoFlow<bool>, type U> with Flow<U> {
+	[must_use]
+	fun on_change(own self, observer: |U| void): Subscription {
+		observe_flow(self, observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |U| void): Subscription {
+		observe_flow(self, observer, true)
+	}
+
+	fun start(own self): Instance<U> {
+		let test = self.test;
+		let finish = self.finish;
+		let upstream = self.up.open();
+		let stage = Owner::new();
+		let core: ElementCore<T, bool> = element_core(stage, |item: T| {
+			let (answer, owner) = run_element(stage, || test(item));
+			(answer.start_element(), owner)
+		});
+		seed(core, (upstream.snapshot)());
+		mut seeded: usize = 0;
+		for flag in core.values.read() {
+			if flag {
+				seeded += 1;
+			}
+		}
+		let kept: Shared<usize> = Shared::new(seeded);
+		let drain = upstream.drain;
+		Instance<U> {
+			pull = || {
+				for event in resolve(core, drain()) {
+					match event {
+						ElementEvent::Spliced(let _at, let left, let arrived) => {
+							mut count = kept.read();
+							for pair in left {
+								if pair.1 {
+									count -= 1;
+								}
+							}
+							for pair in arrived {
+								if pair.1 {
+									count += 1;
+								}
+							}
+							kept.write() = count;
+						},
+						ElementEvent::Changed(let _at, let before, let after, let _rerun) => {
+							if before.1 && !after.1 {
+								kept.write() = kept.read() - 1;
+							} else if !before.1 && after.1 {
+								kept.write() = kept.read() + 1;
+							}
+						},
+						ElementEvent::Reset(let _left, let now) => {
+							mut count: usize = 0;
+							for pair in now {
+								if pair.1 {
+									count += 1;
+								}
+							}
+							kept.write() = count;
+						},
+						ElementEvent::Moved(let _from, let _count, let _to) => {},
+					}
+				}
+				finish(kept.read(), core.ids.read().len())
+			},
+			attach = core_attach(core, upstream),
+			release = core_release(core, upstream),
+		}
+	}
+}
+
+export impl CollTally<type F: CollFlow<type T>, T, type R: IntoFlow<bool>, type U> with Pipe<U> {}
+
+// --- Boundary conversions (A142 S5, §6.3) ------------------------------------
+
+/// Whether two elements a keyed reconcile matched by key are the SAME element, so
+/// nothing is emitted for it: equality where the element has one, and "the same key
+/// is the same element" where it has none — a collection of sources keyed by id
+/// (§6.3's own case) keeps each source, where a `SetAt` would restart whatever
+/// follows it.
+export trait SameElement {
+	fun same_element(self, other: Self): bool;
+}
+
+/// No equality: the key decides.
+export impl type T with SameElement {
+	fun same_element(self, other: T): bool {
+		true
+	}
+}
+
+/// Equality: a matched element whose value changed is a `SetAt`.
+export impl type T: PartialEq with SameElement {
+	fun same_element(self, other: T): bool {
+		self == other
+	}
+}
+
+/// The coarse-to-granular doors (R10): a flow of whole lists, turned into a
+/// collection pipe by DIFFING each new list against the last. Only ever a diff —
+/// the coarse source threw the change away upstream (§1); the real fix is a
+/// granular source of truth, and these are for the boundaries (a fetch result, a
+/// wire snapshot).
+export impl type F: Flow<List<type T>> {
+	/// The KEYED diff: `each_by`'s `ReconcilePlan` per change, O(n) with hashing.
+	/// It can emit `Move` — a reordered element keeps its identity, and so does
+	/// what follows it downstream. A matched element whose value changed is a
+	/// `SetAt` when the element has `==`; without one, the same key is the same
+	/// element.
+	fun coll_by<K: PartialEq + Hashable>(own self, key: sync |T| K): CollBy<F, T, K> {
+		CollBy<F, T, K> { up = self, key }
+	}
+}
+
+export impl type F: Flow<List<type T: PartialEq>> {
+	/// The POSITIONAL diff: trim the common prefix and suffix and splice what is
+	/// between them. O(n) compares, and minimal for the common edits — an append,
+	/// an insertion, a removal is one op of one element.
+	fun coll(own self): Coll<F, T> {
+		Coll<F, T> { up = self }
+	}
+}
+
+/// `.coll()` as a stage.
+export [resource] struct Coll<F, T> {
+	up: F,
+}
+
+export impl Coll<type F: Flow<List<type T: PartialEq>>, T> with CollFlow<T> {
+	fun open(own self): CollInstance<T> {
+		let upstream = self.up.start();
+		let pull = upstream.pull;
+		let held: Shared<List<T>> = Shared::new(fresh_list(pull()));
+		CollInstance<T> {
+			snapshot = || fresh_list(held.read()),
+			attach = upstream.attach,
+			drain = || {
+				let next = pull();
+				let ops = positional_ops(held.read(), next);
+				held.write() = fresh_list(next);
+				ops
+			},
+			release = upstream.release,
+		}
+	}
+}
+
+export impl Coll<type F: Flow<List<type T: PartialEq>>, T> with CollPipe<T> {}
+
+/// The prefix/suffix trim: nothing, or one `Splice` over what lies between.
+fun positional_ops<T: PartialEq>(before: List<T>, after: List<T>): List<SeqOp<T>> {
+	let old_length = before.len();
+	let new_length = after.len();
+	mut prefix = 0;
+	for prefix < old_length && prefix < new_length && before[prefix] == after[prefix] {
+		prefix += 1;
+	}
+	mut suffix = 0;
+	for prefix + suffix < old_length
+		&& prefix + suffix < new_length
+		&& before[old_length - 1 - suffix] == after[new_length - 1 - suffix] {
+		suffix += 1;
+	}
+	mut ops: List<SeqOp<T>> = [];
+	let removed = span_of(before, prefix, old_length - suffix);
+	let inserted = span_of(after, prefix, new_length - suffix);
+	if removed.len() > 0 || inserted.len() > 0 {
+		ops.push(SeqOp::Splice(prefix, removed, inserted));
+	}
+	ops
+}
+
+/// The elements of `list` at `from .. to`.
+fun span_of<T>(list: List<T>, from: usize, to: usize): List<T> {
+	mut span: List<T> = [];
+	mut index = from;
+	for index < to {
+		span.push(list[index]);
+		index += 1;
+	}
+	span
+}
+
+/// `.coll_by(key)` as a stage.
+export [resource] struct CollBy<F, T, K> {
+	up: F,
+	key: |T| K,
+}
+
+export impl CollBy<type F: Flow<List<type T: SameElement>>, T, type K: PartialEq + Hashable> with CollFlow<
+	T,
+> {
+	fun open(own self): CollInstance<T> {
+		let key = self.key;
+		let upstream = self.up.start();
+		let pull = upstream.pull;
+		let held: Shared<List<T>> = Shared::new(fresh_list(pull()));
+		CollInstance<T> {
+			snapshot = || fresh_list(held.read()),
+			attach = upstream.attach,
+			drain = || {
+				let next = pull();
+				let ops = keyed_ops(held.read(), next, key);
+				held.write() = fresh_list(next);
+				ops
+			},
+			release = upstream.release,
+		}
+	}
+}
+
+export impl CollBy<type F: Flow<List<type T: SameElement>>, T, type K: PartialEq + Hashable> with CollPipe<
+	T,
+> {}
+
+/// A `ReconcilePlan` as ops (§6.3). The elements that left go first, as one splice
+/// per contiguous run (from the end, so the positions still hold); then the new
+/// order is built front to back: an arriving run is one splice, a matched element
+/// standing elsewhere is a `Move` to where it belongs, and a matched element whose
+/// value changed is a `SetAt` there. A list that did not reorder finds every
+/// matched element already in place, so the pass is linear.
+fun keyed_ops<T: SameElement, K: PartialEq + Hashable>(
+	before: List<T>,
+	after: List<T>,
+	key: |T| K,
+): List<SeqOp<T>> {
+	mut old_keys: List<K> = [];
+	for item in before {
+		old_keys.push(key(item));
+	}
+	let plan = reconcile(old_keys, before, after, |item: T| key(item), |was: T, now: T| was.same_element(now));
+	mut ops: List<SeqOp<T>> = [];
+	// What stands now, as old indices (`None` for an arrival), with its values.
+	mut standing: List<Option<usize>> = [];
+	mut values: List<T> = fresh_list(before);
+	mut index = 0;
+	for index < before.len() {
+		standing.push(Some(index));
+		index += 1;
+	}
+	// The departures, from the end: each contiguous run of removed indices is one
+	// splice, and removing from the end keeps every earlier position valid.
+	mut run_end = plan.removed.len();
+	for run_end > 0 {
+		mut run_start = run_end - 1;
+		for run_start > 0 && plan.removed[run_start - 1] + 1 == plan.removed[run_start] {
+			run_start -= 1;
+		}
+		let at = plan.removed[run_start];
+		let count = run_end - run_start;
+		let left = span_of(values, at, at + count);
+		mut taken = 0;
+		for taken < count {
+			let _gone = standing.remove(at);
+			let _value = values.remove(at);
+			taken += 1;
+		}
+		ops.push(SeqOp::Splice(at, left, []));
+		run_end = run_start;
+	}
+	// The new order, front to back. Everything before `position` is final.
+	mut position = 0;
+	let steps = plan.steps;
+	for position < steps.len() {
+		match steps[position] {
+			RowStep::Fresh => {
+				mut end = position + 1;
+				for end < steps.len() && steps[end] is RowStep::Fresh {
+					end += 1;
+				}
+				let arriving = span_of(after, position, end);
+				mut offset = 0;
+				for item in arriving {
+					standing.insert(position + offset, None);
+					values.insert(position + offset, item);
+					offset += 1;
+				}
+				ops.push(SeqOp::Splice(position, [], arriving));
+				position = end;
+			},
+			RowStep::Keep(let old) => {
+				place_matched(&mut standing, &mut values, &mut ops, old, position);
+				position += 1;
+			},
+			RowStep::Refresh(let old) => {
+				place_matched(&mut standing, &mut values, &mut ops, old, position);
+				ops.push(SeqOp::SetAt(position, values[position], after[position]));
+				values[position] = after[position];
+				position += 1;
+			},
+		}
+	}
+	ops
+}
+
+/// Bring old element `old` to `position`, with a `Move` when it stands later.
+fun place_matched<T>(
+	standing: &mut List<Option<usize>>,
+	values: &mut List<T>,
+	ops: &mut List<SeqOp<T>>,
+	old: usize,
+	position: usize,
+) {
+	mut at = position;
+	for at < standing.len() && standing[at] != Some(old) {
+		at += 1;
+	}
+	if at != position && at < standing.len() {
+		let moved = standing.remove(at);
+		standing.insert(position, moved);
+		let value = values.remove(at);
+		values.insert(position, value);
+		ops.push(SeqOp::Move(at, 1, position));
+	}
+}
+
+// --- What `each`/`each_by` read their rows from ------------------------------
+
+/// A run's input (A142 §6): any collection SOURCE — granular or coarse, as `each`
+/// has always taken — or a collection PIPE, which the run consumes. Opened once: a
+/// source with a positional log is followed by its ops, one without by a `Reset`
+/// per change (the whole-list pass it has always had), and a pipe by the ops its
+/// stages produce.
+export [resource] trait RowFeed<T> {
+	/// Start this input for its one run.
+	[must_use]
+	fun open_rows(own self): CollInstance<T>;
+}
+
+/// Every collection source: its log when it keeps one (`DeltaFeed`'s choice, B378),
+/// the whole list per change when it does not.
+export impl type S: DeltaFeed<type T> with RowFeed<T> {
+	fun open_rows(own self): CollInstance<T> {
+		match self.delta_cursor() {
+			Some(let cursor) => CollInstance<T> {
+				snapshot = || self.get(),
+				attach = |subscriber: Subscriber| self.on_settle(subscriber),
+				drain = || self.delta_since(cursor),
+				release = || self.drop_delta_cursor(cursor),
+			},
+			None => CollInstance<T> {
+				snapshot = || self.get(),
+				attach = |subscriber: Subscriber| self.on_settle(subscriber),
+				drain = || [SeqOp::Reset(self.get())],
+				release = || {},
+			},
+		}
+	}
+}
+
+/// Every collection pipe: consumed by the run.
+export impl type P: CollPipe<type T> with RowFeed<T> {
+	fun open_rows(own self): CollInstance<T> {
+		self.open()
+	}
 }

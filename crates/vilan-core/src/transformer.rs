@@ -1946,7 +1946,7 @@ fn helper_source(name: &str) -> &'static str {
         "__map_values" => {
             "function __map_values(map) {\n\treturn [ ...map.values() ].map(__clone);\n}"
         }
-        // `for x in set`: `Set` is a struct `[table]` over a `NativeMap`, so the
+        // `for x in set`: `HashSet` is a struct `[table]` over a `NativeMap`, so the
         // elements are the backing map's stored originals, in insertion order (I1).
         "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
         // proposal/lazy.md §5 — the memo cell, and the ONE forcing helper both
@@ -6645,7 +6645,7 @@ impl<'src> Transformer<'src> {
                     self.tuple_for_each(view_id, t_iterable, *item_id, body, block);
                     return Some(js::Node::Void);
                 }
-                // `Set` is a vilan struct over a `NativeMap`; iterate the backing
+                // `HashSet` is a vilan struct over a `NativeMap`; iterate the backing
                 // map's stored originals (`set[0].values()`), in insertion order.
                 //
                 // The type comes from the analyzer's own record for this loop
@@ -11591,7 +11591,7 @@ impl<'src> Transformer<'src> {
     /// Emission now recomputes those offsets from the analyzer's recorded path
     /// under the instance's substitution (`tuple_index_slot`), so both halves
     /// read the SAME layout: the instantiated one, which is also the layout the
-    /// concrete caller builds and reads. Boxing a `(K, V)` inside `Map::insert`
+    /// concrete caller builds and reads. Boxing a `(K, V)` inside `HashMap::insert`
     /// and reslicing it flat at `entries()` was the miscompile.
     fn is_tuple_typed(&self, expr_id: Id) -> bool {
         if matches!(self.program.entity_map.get(&expr_id), Some(Expr::Tuple(_))) {
@@ -11615,7 +11615,7 @@ impl<'src> Transformer<'src> {
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
-    /// Whether a `for x in ...` loop's iterable is the built-in `Set` — a vilan
+    /// Whether a `for x in ...` loop's iterable is the built-in `HashSet` — a vilan
     /// struct wrapping a `NativeMap` (I1). Its elements are the backing map's
     /// stored originals, so such a loop iterates `set[0].values()`.
     ///
@@ -11623,7 +11623,7 @@ impl<'src> Transformer<'src> {
     /// the type it inferred there (`for_each_iterable_types`), which is the only
     /// total answer. Re-deriving it here from the iterable's own expr id was
     /// what B85 was — silent for every form that stores no type of its own, so
-    /// `for x in self` inside `Set`'s own impl, `for x in make_set()` and `for
+    /// `for x in self` inside `HashSet`'s own impl, `for x in make_set()` and `for
     /// x in *view` all walked the struct's one-element field array instead.
     fn for_each_iterates_a_set(&self, for_each_id: Id) -> bool {
         self.program
@@ -11636,7 +11636,7 @@ impl<'src> Transformer<'src> {
                     .program
                     .structs
                     .get(id)
-                    .is_some_and(|struct_| struct_.name == "Set"),
+                    .is_some_and(|struct_| struct_.name == "HashSet"),
                 _ => false,
             })
     }

@@ -585,8 +585,8 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   so the closure can never own it and no second owner is created: the
   reference is a per-call loan, exactly like a parameter. Captures of a
   **local** or a **parameter** stay rejected.
-- **R10: no resource elements in the native containers.** `List` / `Map` /
-  `Set` and every external generic (`Shared`, `Task`, `Promise`, `Context`)
+- **R10: no resource elements in the native containers.** `List` / `HashMap` /
+  `HashSet` and every external generic (`Shared`, `Task`, `Promise`, `Context`)
   reject resource type arguments in v1: their internals are host code the
   move checker cannot see. `Option` is the sanctioned container (it is a
   Vilan enum, checkable under R11). The rule is read **per instantiation**,
@@ -597,9 +597,9 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   is the sanctioned alternative, and stays legal.
 
   The set is closed over the standard library's own internals, not just the
-  surface it publishes: the raw `NativeMap` that `Map` and `Set` are built on
+  surface it publishes: the raw `NativeMap` that `HashMap` and `HashSet` are built on
   rejects a resource the same way, so the rule holds however the raw layer is
-  reached. Because a `Map<K, Database>` offends at *both* heads — its own and
+  reached. Because a `HashMap<K, Database>` offends at *both* heads — its own and
   the `NativeMap` inside it — and one mistake is one diagnostic, the refusal
   is reported at the head you wrote, and never a second time at the storage
   behind it. That collapse is scoped to the one mistake: it silences only the

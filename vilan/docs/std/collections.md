@@ -1,7 +1,8 @@
 # Collections reference
 
-The container types: `List` (built in), `std::map::Map`, `std::set::Set`,
-`std::range::Range`, and the `std::iterator` protocol underneath `for`.
+The container types: `List` (built in), `std::hash_map::HashMap`,
+`std::hash_set::HashSet`, `std::range::Range`, and the `std::iterator` protocol
+underneath `for`.
 
 ## `List<T>`
 
@@ -157,13 +158,14 @@ fun main() {
 }
 ```
 
-## `Map<K, V>`
+## `HashMap<K, V>`
 
 ```vilan,fragment
-impl Map<type K: Hashable, type V> {
-	fun new(): Map<K, V>
+impl HashMap<type K: Hashable, type V> {
+	fun new(): HashMap<K, V>
 	fun insert(&mut self, key: K, value: V)
 	fun get(self, key: K): Option<V>
+	fun get_or_insert(&mut self, key: K, make: || V): V   // the held value, or make() stored and answered
 	fun contains_key(self, key: K): bool
 	fun remove(&mut self, key: K)
 	fun len(self): usize
@@ -172,26 +174,37 @@ impl Map<type K: Hashable, type V> {
 	fun values(self): List<V>
 	fun entries(self): List<(K, V)>
 }
-impl Map<type K: Hashable, type V: PartialEq> {
+impl HashMap<type K: Hashable, type V: PartialEq> {
 	fun contains_value(self, value: V): bool
 }
-impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
-impl Map<type K: Hashable, type V> with Default {
-	fun default(): Map<K, V>                 // the empty map
+impl HashMap<type K: Hashable, type V: PartialEq> with PartialEq   // same keys, equal values; order ignored
+impl List<(type K: Hashable, type V)> { fun to_map(self): HashMap<K, V> }
+impl HashMap<type K: Hashable, type V> with Default {
+	fun default(): HashMap<K, V>                 // the empty map
 }
 ```
+
+A `HashMap` iterates in **insertion order**, on both backends: `keys()`,
+`values()` and `entries()` walk the keys in the order they first arrived, an
+overwrite keeps its key's place, and a key removed and inserted again goes to
+the end. The name says how it keys — by `Hashable` value — not that its order
+is arbitrary. Equality follows the same line: two maps are `==` when they hold the same keys
+with equal values, whatever order either was built in, so a struct holding a
+map can `[derive(PartialEq)]`. Before v0.42 the type was `std::map::Map`; that name is
+kept one release as a deprecated alias of the same type (`Map` *is* `HashMap`),
+and a use of it warns with the new spelling.
 
 Keys compare **by value**. Scalars work directly, and so does a **backed enum**
 — one with explicit backing values, which *is* that value at runtime, so the
 backing value is the key and no derive is needed:
 
 ```vilan
-import std::map::Map;
+import std::hash_map::HashMap;
 
 enum Align { Start = "flex-start", End = "flex-end" }
 
 fun main() {
-	mut widths: Map<Align, i32> = Map::new();
+	mut widths: HashMap<Align, i32> = HashMap::new();
 	widths.insert(Align::Start, 1);
 	print(widths.get(Align::Start).unwrap_or(0)); // 1
 }
@@ -203,7 +216,7 @@ with every other aggregate. A struct, an unbacked or payload-carrying enum, or a
 `List` key works as long as it is `Hashable`. Derive it:
 
 ```vilan
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::hash::Hashable;
 import std::option::Option::{ self, Some, None };
 
@@ -214,7 +227,7 @@ struct Point {
 }
 
 fun main() {
-	mut seen: Map<Point, str> = Map::new();
+	mut seen: HashMap<Point, str> = HashMap::new();
 	seen.insert(Point { x = 1, y = 2 }, "origin-ish");
 	// A fresh, distinct Point with equal fields hits.
 	match seen.get(Point { x = 1, y = 2 }) {
@@ -229,14 +242,14 @@ on insert, so mutating the original afterward can't desync the map.
 
 `entries()` pairs `keys()`/`values()` into one `List<(K, V)>` snapshot, so
 walking both together needs no hand-zipping; `contains_value` (needing
-`V: PartialEq`, unlike the rest of `Map`) is the value-side counterpart to
+`V: PartialEq`, unlike the rest of `HashMap`) is the value-side counterpart to
 `contains_key`:
 
 ```vilan
-import std::map::Map;
+import std::hash_map::HashMap;
 
 fun main() {
-	mut scores: Map<str, i32> = Map::new();
+	mut scores: HashMap<str, i32> = HashMap::new();
 	scores.insert("alice", 1);
 	scores.insert("bob", 2);
 	mut total = 0;
@@ -249,40 +262,58 @@ fun main() {
 }
 ```
 
-## `Set<T>`
+`get_or_insert` is the entry idiom: the value held for `key`, or — on a miss,
+and only there — the one `make` builds, inserted and then answered. The maker
+runs once per key, at the call site:
+
+```vilan
+import std::hash_map::HashMap;
+
+fun main() {
+	mut lengths: HashMap<str, usize> = HashMap::new();
+	print(lengths.get_or_insert("alpha", || "alpha".len()));  // 5 -- made and stored
+	print(lengths.get_or_insert("alpha", || 0));              // 5 -- held; the maker did not run
+	print(lengths.len());                                     // 1
+}
+```
+
+## `HashSet<T>`
 
 ```vilan,fragment
-impl Set<type T: Hashable> {
-	fun new(): Set<T>
+impl HashSet<type T: Hashable> {
+	fun new(): HashSet<T>
 	fun insert(&mut self, value: T)
 	fun contains(self, value: T): bool
 	fun remove(&mut self, value: T)
 	fun len(self): usize
 	fun is_empty(self): bool
 	fun values(self): List<T>
-	fun union(self, other: Set<T>): Set<T>
-	fun intersection(self, other: Set<T>): Set<T>
-	fun difference(self, other: Set<T>): Set<T>
+	fun union(self, other: HashSet<T>): HashSet<T>
+	fun intersection(self, other: HashSet<T>): HashSet<T>
+	fun difference(self, other: HashSet<T>): HashSet<T>
 }
-impl List<type T: Hashable> { fun to_set(self): Set<T> }
-impl Set<type T: Hashable> with Default { fun default(): Set<T> }  // the empty set
+impl List<type T: Hashable> { fun to_set(self): HashSet<T> }
+impl HashSet<type T: Hashable> with Default { fun default(): HashSet<T> }  // the empty set
+impl HashSet<type T: Hashable> with PartialEq                             // same members; order ignored
 ```
 
-Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
-iterates the elements in insertion order.
+Value-keyed like `HashMap` (element `T` must be `Hashable`); `for x in set`
+iterates the elements in insertion order (a duplicate insert keeps its value's
+place; a value removed and inserted again goes to the end). `std::set::Set` is its deprecated
+name, kept one release as an alias, as `Map` is.
 
 `union`/`intersection`/`difference` are the standard set operations, each
-returning a new `Set` and leaving both receivers untouched:
+returning a new `HashSet` and leaving both receivers untouched:
 
 ```vilan
-import std::set::Set;
+import std::hash_set::HashSet;
 
 fun main() {
-	mut a: Set<i32> = Set::new();
+	mut a: HashSet<i32> = HashSet::new();
 	a.insert(1);
 	a.insert(2);
 	a.insert(3);
-	mut b: Set<i32> = Set::new();
+	mut b: HashSet<i32> = HashSet::new();
 	b.insert(2);
 	b.insert(3);
 	b.insert(4);
@@ -356,7 +387,8 @@ It holds a `Shared` table inside, so a `Memo` bound with `let` at module level
 is written by every call site that reads it; no `mut` is needed.
 
 The one-slot twin is `Shared<Option<T>>::get_or_insert(make)`: the held value,
-or `make()` stored and answered — the same rule about what `make` builds.
+or `make()` stored and answered — the same rule about what `make` builds. The
+unshared form is `HashMap::get_or_insert(key, make)` on a map you hold `mut`.
 
 ## `Hashable`
 
@@ -373,12 +405,12 @@ routes reach it:
   resource cannot be hashed by value.
 - **`[derive(Hashable)]`** — for a struct or an enum whose fields are all
   `Hashable` (scalars, `str`, `bool`, `List`/`Option` of `Hashable`, a backed
-  enum, or another derived type); a closure, `Set`, `Map`, or `Shared` field is
+  enum, or another derived type); a closure, `HashSet`, `HashMap`, or `Shared` field is
   rejected. Writing it on a backed enum is harmless and does nothing.
 
 You can also hand-write `impl Hashable` to key by a subset of fields — except on
 a backed enum, whose impl the compiler already provides — and build your own
-container by bounding on `K: Hashable` and keying a `Map<Hash, …>` yourself.
+container by bounding on `K: Hashable` and keying a `HashMap<Hash, …>` yourself.
 
 A `Hash` is opaque: you can hold it, compare two with `==`, hash it again (it is
 itself `Hashable`, being already a canonical key), and use it as a key. You
@@ -526,7 +558,7 @@ Exactly two things:
 - **A type with `next`** (or `next_mut`, for `for e in &mut it`) — the protocol
   above, declared on the type or inherited from a trait default.
 - **A natively iterable value**: `List<T>`, a fixed array `[T; n]`, a tuple, a
-  `str` (yielding its characters), `Set<T>` (insertion order), and any host type
+  `str` (yielding its characters), `HashSet<T>` (insertion order), and any host type
   an `external struct` names.
 
 Anything else is a compile error. A struct or enum of your own that provides no
@@ -544,8 +576,8 @@ fun main() {
 }
 ```
 
-`Map` is in that group: walk it through `entries()`, `keys()` or `values()`, as
-the `Map` section above does.
+`HashMap` is in that group: walk it through `entries()`, `keys()` or
+`values()`, as the `HashMap` section above does.
 
 ### Adapters
 
@@ -616,10 +648,10 @@ put it after a `filter` and you get the positions in the *output*, not in the
 source.
 
 The adapter types are named in the past participle — `Mapped`, `Taken`,
-`Filtered` — while the methods keep the plain names. That is deliberate: `Map`
-is already a std type, and vilan's method resolution picks by registration order
-rather than reporting a collision, so the type names stay out of each other's
-way.
+`Filtered` — while the methods keep the plain names. That is deliberate: a verb's
+bare name can be a std type too (the hash map was `Map` until v0.42), and vilan's
+method resolution picks by registration order rather than reporting a collision,
+so the type names stay out of each other's way.
 
 A `for` binding gets the element type the iterator was instantiated at, whatever
 shape it is — a tuple, a struct, another container, a closure:
@@ -684,16 +716,16 @@ unbounded source. (A lazy reverse needs a double-ended protocol, where every
 adapter decides whether it can walk backwards. That is purely additive later:
 `rev`'s signature would not change, only its body.)
 
-For a `Set` or a `Map`, terminate with `to_list()` and convert:
+For a `HashSet` or a `HashMap`, terminate with `to_list()` and convert:
 
 ```vilan,fragment
-impl List<type T: Hashable>            { fun to_set(self): Set<T> }
-impl List<(type K: Hashable, type V)>  { fun to_map(self): Map<K, V> }
+impl List<type T: Hashable>            { fun to_set(self): HashSet<T> }
+impl List<(type K: Hashable, type V)>  { fun to_map(self): HashMap<K, V> }
 ```
 
 ```vilan
-import std::map::Map;
-import std::set::Set;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
 import std::option::Option::{ self, Some, None };
 
 fun main() {

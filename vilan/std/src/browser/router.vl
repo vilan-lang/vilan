@@ -13,7 +13,7 @@
 // building for the browser.
 
 import pkg::dom::{ Event, window };
-import pkg::map::Map;
+import pkg::hash_map::HashMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{ FlushPolicy, SignalCell, turn };
 import pkg::shared::Shared;
@@ -140,7 +140,7 @@ export struct PathParts {
 	segments: List<str>,
 	/// The query string as key → value, decoded. An empty or absent query is an
 	/// empty map; a repeated key keeps the LAST value.
-	query: Map<str, str>,
+	query: HashMap<str, str>,
 	/// The fragment, decoded and without its `#` — `None` when the URL carries
 	/// no `#` at all, `Some("")` for a bare trailing `#`. The distinction is
 	/// real: `"/a"` and `"/a#"` are different URLs.
@@ -203,8 +203,8 @@ export fun parse_path(path: str): PathParts {
 /// is skipped, so `"&&a=1&"` is `{ "a": "1" }`, and a repeated key keeps the last
 /// value — a map, not a multimap, because a route reads one value per key and the
 /// alternative is a `List` at every call site.
-export fun parse_query(query: str): Map<str, str> {
-	mut values: Map<str, str> = Map::new();
+export fun parse_query(query: str): HashMap<str, str> {
+	mut values: HashMap<str, str> = HashMap::new();
 	for pair in query.split("&") {
 		if pair != "" {
 			let equals = pair.split("=");

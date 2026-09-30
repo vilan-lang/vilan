@@ -47,23 +47,25 @@ import pkg::hash::Hashable;
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
-	DeltaFeed,
 	Disposable,
 	Draft,
 	Flow,
 	FlushPolicy,
 	Owner,
+	RowFeed,
 	RowStep,
 	SeqOp,
 	Signal,
 	SignalCell,
 	Source,
+	also_releasing,
 	comp,
 	get_owner,
 	owner_scope,
 	queue_microtask,
 	reconcile,
 	run_with_owner,
+	subscriber_of,
 	turn,
 	turn_scope,
 };
@@ -77,11 +79,6 @@ import pkg::style::Style;
 /// `each`) keeps the owners it makes itself.
 fun follow<T, F: Flow<T>>(own flow: F, observer: |T| void) {
 	get_owner().take(flow.sub(observer));
-}
-
-/// `follow` without the immediate call.
-fun follow_changes<T, F: Flow<T>>(own flow: F, observer: |T| void) {
-	get_owner().take(flow.on_change(observer));
 }
 
 /// A handle to a DOM element under construction — nothing more: ownership is the
@@ -1077,20 +1074,20 @@ export struct Swap<T: PartialEq, S: Flow<T>, C: Slot> {
 }
 
 /// A keyed reactive run as a child — the `each` slot value (A85/A99).
-export struct Each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct Each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export struct EachValues<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachValues<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export struct EachBy<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachBy<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|SignalCell<T>| C) context owner_scope,
@@ -1207,9 +1204,10 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 ///
 /// Over a `ListCell` or any other `DeltaSource` the run follows the source's ops
 /// rather than re-diffing the list (A112 S3; `place_each` says how). Placement asks
-/// for `S: DeltaFeed<T>`, which every `Source<List<T>>` answers.
-export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+/// for `S: RowFeed<T>`, which every `Source<List<T>>` answers, and every collection
+/// pipe (`CollPipe`, A142 §6), which the run consumes.
+export fun each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ): Each<T, K, S, C> {
@@ -1217,8 +1215,8 @@ export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Sl
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export fun each_values<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_values<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 ): EachValues<T, S, C> {
 	EachValues { source, render }
@@ -1228,8 +1226,8 @@ export fun each_values<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 ///
 /// Over a `ListCell` or any other `DeltaSource` the run follows the source's ops,
 /// as `each`'s does (A112 S3b; `place_each_by` says how).
-export fun each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): EachBy<T, K, S, C> {
@@ -1307,27 +1305,25 @@ export impl Swap<type T: PartialEq, type S: Flow<T>, type C: Slot> with Slot {
 	}
 }
 
-/// Placing a run asks its source for a delta feed (A112 S3), which every
-/// `Source<List<T>>` has. The bound sits HERE and not on `each`/`Each`: at the
-/// call, a source that is not a list source (an rpc mirror, `a52`'s pin) is
-/// refused with the one error that names `Source<List<Todo>>`. Written there,
-/// alone it would name `DeltaFeed<T>` with `T` unbound, and beside
-/// `Source<List<T>>` it leaves `T` unbound too — three or four errors naming an
-/// abstract `T` either way (B396).
-export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
+/// Placing a run OPENS its input (`RowFeed`, A142 §6): a list source hands over
+/// its ops when it keeps a log (A112 S3) and a `Reset` per change when it does
+/// not, and a collection pipe is consumed. An input that is neither — an rpc
+/// mirror of a list, `a52`'s pin — is refused at the call naming `RowFeed<Todo>`,
+/// at its instantiation (B304).
+export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
 	fun place(own self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-export impl EachValues<type T: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
+export impl EachValues<type T: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
 	fun place(own self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
 /// `each_by` asks the same of its source, for the same reason (A112 S3b).
-export impl EachBy<type T, type K: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
+export impl EachBy<type T, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
 	fun place(own self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
@@ -1549,9 +1545,9 @@ fun row_references(
 /// fall back to on the op path, and a splice that both removes and inserts is the
 /// pass over its own SPAN (A129), so a key that leaves and arrives in one splice
 /// keeps its row.
-fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
+fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ) {
@@ -1773,78 +1769,79 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			offset += 1;
 		}
 	};
-	match source.delta_cursor() {
-		// No log, so nothing to apply: the pass is the only answer there is.
-		None => follow(source, reconcile_pass),
-		Some(let cursor) => {
-			// The cursor is the boundary's, like every subscription here: a
-			// disposed `each` stops pinning the log's history.
-			get_owner().defer(|| source.drop_delta_cursor(cursor));
-			// Attached WITHOUT the immediate call, then seeded — `map_each`'s order
-			// and for its reason: the cursor was minted at the sequence the seed is
-			// read at, so the seed is exactly the state the cursor names.
-			follow_changes(source, |_published| {
-				for op in live_ops(source.delta_since(cursor)) {
-					match op {
-						// A splice that only removes or only inserts cannot re-meet
-						// a key, so it is applied by position. One that does both
-						// is the pass over its span (A129): a key that leaves and
-						// arrives in the same splice keeps its row.
-						SeqOp::Splice(let at, let removed, let inserted) => {
-							if removed.len() == 0 || inserted.len() == 0 {
-								splice_rows(at, removed.len(), inserted);
-							} else {
-								reconcile_span(at, removed.len(), inserted);
-							}
-						},
-						// An element changed IN PLACE. The pass's rule, one row at
-						// a time: the same key holding an equal item is a `Keep`
-						// and costs nothing; anything else is the row rebuilt.
-						SeqOp::SetAt(let at, let _was, let value) => {
-							// `.get(at)` copies the one element where binding the
-							// read would copy the run.
-							let same_key = match row_keys.read().get(at) {
-								Some(let held) => key(value) == held,
-								None => false,
-							};
-							let same_item = match row_items.read().get(at) {
-								Some(let held) => value == held,
-								None => false,
-							};
-							if !same_key || !same_item {
-								splice_rows(at, 1, [value]);
-							}
-						},
-						// The wholesale write, and the lag fallback: the run is
-						// diffed against what arrived, which is the pass.
-						SeqOp::Reset(let items) => reconcile_pass(items),
-						// A reorder is handed to the pass at the list AFTER the
-						// move — not at `source.get()`, which is the state after
-						// EVERY op this drain holds, and would leave the ops after
-						// this one applied to the wrong run. The moved rows keep
-						// their keys, so the pass keeps them (A98's scans move
-						// exactly the rows that moved).
-						SeqOp::Move(let from, let count, let to) => {
-							mut moved = row_items.read();
-							mut lifted: List<T> = [];
-							mut taken = 0;
-							for taken < count {
-								lifted.push(moved.remove(from));
-								taken += 1;
-							}
-							mut offset = 0;
-							for item in lifted {
-								moved.insert(to + offset, item);
-								offset += 1;
-							}
-							reconcile_pass(moved);
-						},
+	// The input, OPENED (A142 §6): a source with a positional log hands over its
+	// ops, one without a `Reset` per change — the whole-list pass it has always had
+	// — and a collection pipe the ops its stages made. The handle is the
+	// boundary's, like every subscription here, and disposing it releases the input
+	// (a disposed `each` stops pinning a log's history).
+	let instance = source.open_rows();
+	let drain = instance.drain;
+	// Attached WITHOUT an immediate call, then seeded — `map_each`'s order and for
+	// its reason: the input was opened at the state the seed reads, so the seed is
+	// exactly the state its first drain starts from. An EFFECT's subscriber (the
+	// run writes the DOM), minted here since `mint_subscriber` is reactive.vl's
+	// own.
+	let handle = (instance.attach)(subscriber_of(|| {
+		for op in live_ops(drain()) {
+			match op {
+				// A splice that only removes or only inserts cannot re-meet a key,
+				// so it is applied by position. One that does both is the pass over
+				// its span (A129): a key that leaves and arrives in the same splice
+				// keeps its row.
+				SeqOp::Splice(let at, let removed, let inserted) => {
+					if removed.len() == 0 || inserted.len() == 0 {
+						splice_rows(at, removed.len(), inserted);
+					} else {
+						reconcile_span(at, removed.len(), inserted);
 					}
-				}
-			});
-			reconcile_pass(source.get());
-		},
-	}
+				},
+				// An element changed IN PLACE. The pass's rule, one row at a time:
+				// the same key holding an equal item is a `Keep` and costs nothing;
+				// anything else is the row rebuilt.
+				SeqOp::SetAt(let at, let _was, let value) => {
+					// `.get(at)` copies the one element where binding the read
+					// would copy the run.
+					let same_key = match row_keys.read().get(at) {
+						Some(let held) => key(value) == held,
+						None => false,
+					};
+					let same_item = match row_items.read().get(at) {
+						Some(let held) => value == held,
+						None => false,
+					};
+					if !same_key || !same_item {
+						splice_rows(at, 1, [value]);
+					}
+				},
+				// The wholesale write, and the lag fallback: the run is diffed
+				// against what arrived, which is the pass.
+				SeqOp::Reset(let items) => reconcile_pass(items),
+				// A reorder is handed to the pass at the list AFTER the move — not
+				// at `source.get()`, which is the state after EVERY op this drain
+				// holds, and would leave the ops after this one applied to the
+				// wrong run. The moved rows keep their keys, so the pass keeps them
+				// (A98's scans move exactly the rows that moved).
+				SeqOp::Move(let from, let count, let to) => {
+					mut moved = row_items.read();
+					mut lifted: List<T> = [];
+					mut taken = 0;
+					for taken < count {
+						lifted.push(moved.remove(from));
+						taken += 1;
+					}
+					mut offset = 0;
+					for item in lifted {
+						moved.insert(to + offset, item);
+						offset += 1;
+					}
+					reconcile_pass(moved);
+				},
+			}
+		}
+	}, false));
+	also_releasing(handle, instance.release);
+	let _owned = get_owner().take(handle);
+	reconcile_pass((instance.snapshot)());
 }
 
 /// `each_by`'s body, against a region opened at `parent`'s current end.
@@ -1855,9 +1852,9 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 /// element changed in place under the same key is WRITTEN INTO that row's cell and
 /// nothing is built, exactly as the pass's `Keep` does it — but only for the row
 /// the op names, where the pass writes into every surviving row's cell.
-fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
+fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ) {
@@ -2073,77 +2070,71 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			offset += 1;
 		}
 	};
-	match source.delta_cursor() {
-		// No log, so nothing to apply: the pass is the only answer there is.
-		None => follow(source, reconcile_pass),
-		Some(let cursor) => {
-			// The cursor is the boundary's, like every subscription here.
-			get_owner().defer(|| source.drop_delta_cursor(cursor));
-			// Attached WITHOUT the immediate call, then seeded — `place_each`'s
-			// order, for its reason.
-			follow_changes(source, |_published| {
-				for op in live_ops(source.delta_since(cursor)) {
-					match op {
-						// Positional when it only removes or only inserts; the pass
-						// over its span when it does both (A129), as in
-						// `place_each`.
-						SeqOp::Splice(let at, let removed, let inserted) => {
-							if removed.len() == 0 || inserted.len() == 0 {
-								splice_rows(at, removed.len(), inserted);
-							} else {
-								reconcile_span(at, removed.len(), inserted);
-							}
-						},
-						// An element changed IN PLACE. The pass's rule, one row at
-						// a time: the same key is a `Keep`, and a kept row takes
-						// the new item through its CELL — nothing is built. A
-						// different key is the row that was there leaving and a new
-						// one arriving, which is what the pass would plan.
-						SeqOp::SetAt(let at, let _was, let value) => {
-							// `.get(at)` copies the one element where binding the
-							// read would copy the run.
-							let same_key = match row_keys.read().get(at) {
-								Some(let held) => key(value) == held,
-								None => false,
-							};
-							if same_key {
-								match row_cells.read().get(at) {
-									Some(let cell) => {
-										row_items.write()[at] = value;
-										cell.set(value);
-									},
-									None => {},
-								}
-							} else {
-								splice_rows(at, 1, [value]);
-							}
-						},
-						// The wholesale write, and the lag fallback: the pass.
-						SeqOp::Reset(let items) => reconcile_pass(items),
-						// A reorder is handed to the pass at the list AFTER the
-						// move, for the reason `place_each` gives. The moved rows
-						// keep their keys, so the pass keeps them and their cells.
-						SeqOp::Move(let from, let count, let to) => {
-							mut moved = row_items.read();
-							mut lifted: List<T> = [];
-							mut taken = 0;
-							for taken < count {
-								lifted.push(moved.remove(from));
-								taken += 1;
-							}
-							mut offset = 0;
-							for item in lifted {
-								moved.insert(to + offset, item);
-								offset += 1;
-							}
-							reconcile_pass(moved);
-						},
+	// The input, opened as `place_each` opens its own.
+	let instance = source.open_rows();
+	let drain = instance.drain;
+	let handle = (instance.attach)(subscriber_of(|| {
+		for op in live_ops(drain()) {
+			match op {
+				// Positional when it only removes or only inserts; the pass over
+				// its span when it does both (A129), as in `place_each`.
+				SeqOp::Splice(let at, let removed, let inserted) => {
+					if removed.len() == 0 || inserted.len() == 0 {
+						splice_rows(at, removed.len(), inserted);
+					} else {
+						reconcile_span(at, removed.len(), inserted);
 					}
-				}
-			});
-			reconcile_pass(source.get());
-		},
-	}
+				},
+				// An element changed IN PLACE. The pass's rule, one row at a time:
+				// the same key is a `Keep`, and a kept row takes the new item
+				// through its CELL — nothing is built. A different key is the row
+				// that was there leaving and a new one arriving, which is what the
+				// pass would plan.
+				SeqOp::SetAt(let at, let _was, let value) => {
+					// `.get(at)` copies the one element where binding the read
+					// would copy the run.
+					let same_key = match row_keys.read().get(at) {
+						Some(let held) => key(value) == held,
+						None => false,
+					};
+					if same_key {
+						match row_cells.read().get(at) {
+							Some(let cell) => {
+								row_items.write()[at] = value;
+								cell.set(value);
+							},
+							None => {},
+						}
+					} else {
+						splice_rows(at, 1, [value]);
+					}
+				},
+				// The wholesale write, and the lag fallback: the pass.
+				SeqOp::Reset(let items) => reconcile_pass(items),
+				// A reorder is handed to the pass at the list AFTER the move, for
+				// the reason `place_each` gives. The moved rows keep their keys, so
+				// the pass keeps them and their cells.
+				SeqOp::Move(let from, let count, let to) => {
+					mut moved = row_items.read();
+					mut lifted: List<T> = [];
+					mut taken = 0;
+					for taken < count {
+						lifted.push(moved.remove(from));
+						taken += 1;
+					}
+					mut offset = 0;
+					for item in lifted {
+						moved.insert(to + offset, item);
+						offset += 1;
+					}
+					reconcile_pass(moved);
+				},
+			}
+		}
+	}, false));
+	also_releasing(handle, instance.release);
+	let _owned = get_owner().take(handle);
+	reconcile_pass((instance.snapshot)());
 }
 
 /// Something that can fill an attribute value (proposal/element-syntax.md §5). This

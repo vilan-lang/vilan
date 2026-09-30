@@ -34,12 +34,12 @@
 // **Nothing is evicted by itself.** `forget` is the caller's, for a value that
 // turned out wrong.
 //
-// Where it lives: its own module, like every other collection in std (`Map`,
+// Where it lives: its own module, like every other collection in std (`HashMap`,
 // `Set`, `Arena`, `NativeMap` — one type, one file named for it). std has no
 // `collections` module and inventing one for this would be a second organizing
 // principle for the same shelf.
 import pkg::hash::Hashable;
-import pkg::map::Map;
+import pkg::hash_map::HashMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::shared::Shared;
 
@@ -51,13 +51,13 @@ export *;
 /// every call site that reads it — a module-level `let`, a field on a store — and
 /// `get_or_insert` is a read from the caller's point of view even when it writes.
 struct Memo<K: Hashable, V> {
-	entries: Shared<Map<K, V>>,
+	entries: Shared<HashMap<K, V>>,
 }
 
 impl Memo<type K: Hashable, type V> {
 	/// An empty memo.
 	fun new(): Memo<K, V> {
-		let entries: Map<K, V> = Map::new();
+		let entries: HashMap<K, V> = HashMap::new();
 		Memo { entries = Shared::new(entries) }
 	}
 
@@ -70,6 +70,14 @@ impl Memo<type K: Hashable, type V> {
 	/// handle mint, a parse) is paid for once. What it builds is kept for the life
 	/// of the memo, past the caller's owner: a derivation in a maker is
 	/// `.memo_global()`, and a lease belongs at the call site (the module's head).
+	///
+	/// This is `HashMap::get_or_insert` over the shared table, and deliberately
+	/// NOT a call to it: through `self.entries.write().get_or_insert(key, make)`
+	/// the maker would run while the table's `&mut` view is live, and a maker
+	/// that asks this same memo for another key — the memoized recursion,
+	/// `fibs.get_or_insert(n, || fib(n - 1) + fib(n - 2))` — would re-enter the
+	/// cell it is being written through. So the read, the make and the write are
+	/// three steps here, and the maker runs holding nothing.
 	fun get_or_insert(self, key: K, make: || V): V {
 		match self.entries.read().get(key) {
 			Some(let held) => held,
@@ -102,7 +110,7 @@ impl Memo<type K: Hashable, type V> {
 
 	/// Drop everything.
 	fun clear(self) {
-		let entries: Map<K, V> = Map::new();
+		let entries: HashMap<K, V> = HashMap::new();
 		self.entries.write() = entries;
 	}
 

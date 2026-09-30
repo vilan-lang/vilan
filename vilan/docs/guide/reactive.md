@@ -85,8 +85,8 @@ is exactly what makes the push land in the signal rather than in a copy.
 Subscribers are notified **once**, after the closure returns, whatever it
 did (a closure that writes nothing still notifies — `update` is a write,
 like `set`). Inside a `batch`, that notification defers and coalesces like
-any other write. `update` works for any `T` a closure can mutate: `Map`,
-`Set`, a struct's fields, a nested aggregate.
+any other write. `update` works for any `T` a closure can mutate: `HashMap`,
+`HashSet`, a struct's fields, a nested aggregate.
 
 `set_with` remains the read-**transform**-write form, and it still reads
 better when you're computing a new value rather than editing one:
@@ -839,6 +839,53 @@ diffs the ends and records only the span that moved — reach for it when a
 whole list arrives from somewhere (a fetch, a form) and you want the
 derivations to stay cheap. A `g` handed to `map_each` must be pure in its
 element: its result is kept, and nothing re-runs it.
+
+## Collections that follow: `filter`, `map`, `any` over a `ListCell`
+
+`map_each` is one operator. The rest of the family works the same way — a
+`ListCell` (or anything sealed from one) has `map`, `filter`, `filter_map`,
+`any`, `all`, `count` and `flatten`, and each returns a **collection pipe**:
+a move-only description, consumed once, exactly like a `derive` pipe. Seal it
+with `.memo()` where two things read it, or hand it straight to `each`:
+
+```vilan,browser
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::ui::{ each, mount_root, view };
+
+[derive(PartialEq)]
+struct Task {
+	id: usize,
+	title: str,
+}
+
+fun main() {
+	let finished: List<SignalCell<bool>> = [Signal::new(false), Signal::new(true)];
+	let tasks: ListCell<Task> = ListCell::of([
+		Task { id = 0, title = "write" },
+		Task { id = 1, title = "ship" },
+	]);
+	let _root = mount_root("app", || view("ul").child(each(
+		tasks.filter(|task| finished[task.id].derive(|done| !done)),
+		|task| task.id,
+		|task| view("li").text(task.title),
+	)));
+}
+```
+
+The closure may return a plain value or a reactive one, and the operator
+**follows** what it returns: here each task's `derive` is started for that task,
+and when one flips, one row arrives or leaves — nothing else is re-read. A
+closure returning a plain value (`|task| task.id > 3`) subscribes to nothing at
+all. What a closure registers is released when its element leaves.
+
+A list that arrives whole — a fetch result, a `SignalCell<List<T>>` — has no
+changes to follow, only values. `.coll_by(key)` diffs each new list against the
+last by key (a reorder becomes a move) and `.coll()` by position, and either
+hands back a collection pipe the operators work on:
+
+```vilan,fragment
+let visible = fetched.coll_by(|row| row.id).filter(|row| row.visible).memo();
+```
 
 ## Traps
 

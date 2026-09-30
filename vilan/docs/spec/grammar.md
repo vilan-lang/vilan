@@ -484,7 +484,7 @@ the optional `if` guard applies to the whole leg; the trailing comma
 after a leg is optional.
 
 A `for <binder> in` subject must have **one element type**, which the
-binder takes: a `List<T>`, a `Set<T>`, a `[T; n]`, a `str` (yielding
+binder takes: a `List<T>`, a `HashSet<T>`, a `[T; n]`, a `str` (yielding
 characters), or any type providing the iterator protocol
 `next(&mut self): Option<T>`
 (§5.7 dispatches it; `for e in &mut c` drives `next_mut` and binds each

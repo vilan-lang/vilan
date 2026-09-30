@@ -371,9 +371,9 @@ fn a_generic_residual_is_legal_in_every_file_that_declares_its_parameter() {
 #[test]
 fn a_leaked_generic_still_reports_on_the_cold_path() {
     let source = r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table = Map::new();
+            mut table = HashMap::new();
             table.insert("k", 1);
         }
         "#;
@@ -1508,10 +1508,10 @@ fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
 
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("alice", 1);
             for entry in scores {
                 print(entry);
@@ -1541,7 +1541,7 @@ fn the_deliberate_native_iteration_forms_still_iterate() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::bytes::{ Bytes, encode_utf8 };
 
         fun main() {
@@ -1549,7 +1549,7 @@ fn the_deliberate_native_iteration_forms_still_iterate() {
             for character in "ab" { print(character); }
             let fixed: [i32; 2] = [3, 4];
             for item in fixed { print(item); }
-            mut seen: Set<i32> = Set::new();
+            mut seen: HashSet<i32> = HashSet::new();
             seen.insert(7);
             for item in seen { print(item); }
             for byte in encode_utf8("h") { print(byte); }
@@ -2977,7 +2977,7 @@ fn to_set_collapses_duplicates_at_the_end_of_a_chain() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
 
         fun main() {
             let unique = [1, 2, 2, 3, 3, 3].iter().filter(|n| n > 1).to_list().to_set();
@@ -2998,7 +2998,7 @@ fn to_map_builds_a_map_out_of_pairs_and_the_last_key_wins() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::option::Option::{ self, Some, None };
 
         fun main() {
@@ -3029,13 +3029,13 @@ fn to_set_and_to_map_live_on_list_because_a_default_cannot_carry_a_bound() {
         r#"
         import std::hash::Hashable;
         import std::option::Option::{ self, Some, None };
-        import std::set::Set;
+        import std::hash_set::HashSet;
 
         trait Walk<T> {
             fun step(&mut self): Option<T>;
 
-            fun to_set(mut self): Set<T> {
-                mut result: Set<T> = Set::new();
+            fun to_set(mut self): HashSet<T> {
+                mut result: HashSet<T> = HashSet::new();
                 for value in self {
                     result.insert(value);
                 }
@@ -4012,9 +4012,9 @@ fn interned_type_count(source: &str) -> usize {
 
 #[test]
 fn the_constraint_fixpoint_stops_when_it_settles() {
-    // E43 (`suite-speed.md` §8). `import std::set` leaves ten constraints
-    // permanently deferred — legitimately unresolvable, committed to defaults
-    // by `finalize_build`. The solving loop is supposed to notice it has
+    // E43 (`suite-speed.md` §8). `import std::set` (now `std::hash_set`, I9)
+    // left ten constraints permanently deferred — legitimately unresolvable,
+    // committed to defaults by `finalize_build`. The solving loop is supposed to notice it has
     // settled and stop; instead it counted every attempt's unconditional
     // type-id MINTING as progress, so its quiescence test could never pass and
     // it ran to `max_iterations` — ~14 000 passes over those ten constraints,
@@ -4022,20 +4022,19 @@ fn the_constraint_fixpoint_stops_when_it_settles() {
     // world (`macro_std` re-exports `std::set`, so `[derive(Debug)]` paid it
     // twice over).
     //
-    // `std::map` is the control: the same 111 lines, the same shape, no stuck
-    // constraints — and it always converged. Pinning `set` AGAINST `map`
-    // states the property that actually matters ("set costs what map costs")
+    // `std::hash_map` is the control: the same shape, no stuck constraints —
+    // and it always converged. Pinning `set` AGAINST `map` states the property that actually matters ("set costs what map costs")
     // and stays honest as std grows, where an absolute bound would rot.
     let set = interned_type_count(
-        "import std::set::Set;\n\nfun main() {\n\tmut s: Set<i32> = Set::new();\n\ts.insert(1);\n}\n",
+        "import std::hash_set::HashSet;\n\nfun main() {\n\tmut s: HashSet<i32> = HashSet::new();\n\ts.insert(1);\n}\n",
     );
     let map = interned_type_count(
-        "import std::map::Map;\n\nfun main() {\n\tmut m: Map<str, i32> = Map::new();\n\tm.insert(\"a\", 1);\n}\n",
+        "import std::hash_map::HashMap;\n\nfun main() {\n\tmut m: HashMap<str, i32> = HashMap::new();\n\tm.insert(\"a\", 1);\n}\n",
     );
     assert!(
         set < map * 2,
-        "a settled fixpoint must stop: `import std::set` interned {set} types \
-         against `import std::map`'s {map}. A ratio this large means the loop is \
+        "a settled fixpoint must stop: `import std::hash_set` interned {set} types \
+         against `import std::hash_map`'s {map}. A ratio this large means the loop is \
          spinning on permanently deferred constraints again (E43)."
     );
 }
@@ -4392,10 +4391,10 @@ fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
         emitted_occurrences(
             r#"
             import std::io::print;
-            import std::map::Map;
+            import std::hash_map::HashMap;
             import std::reactive::{ Signal, SignalCell };
             fun main() {
-                let scores: SignalCell<Map<str, i32>> = Signal::new(Map::new());
+                let scores: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());
                 print(scores.get().len());
             }
             "#,

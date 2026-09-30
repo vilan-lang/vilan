@@ -5,7 +5,7 @@
 The type forms (grammar §3.9) denote:
 
 - **Nominal types**: structs and enums, possibly generic
-  (`Task`, `Option<i32>`, `Map<str, List<i32>>`). Two nominal types are
+  (`Task`, `Option<i32>`, `HashMap<str, List<i32>>`). Two nominal types are
   equal iff they name the same declaration and their arguments are
   equal. There is no structural typing of nominals.
 - **Primitives**: `bool`, `str`, `i8 i16 i32 i53 u8 u16 u32 u53`,
@@ -197,11 +197,11 @@ same opt-in and for the same reason `value()` costs nothing: the enum IS
 its backing value, and that value is already a key.
 
 ```vilan,fragment
-mut widths: Map<Align, i32> = Map::new();
+mut widths: HashMap<Align, i32> = HashMap::new();
 widths.insert(Align::Start, 1);          // keyed by "flex-start"
 ```
 
-So `Map<Align, V>` and `Set<Align>` need no `[derive(Hashable)]`, and
+So `HashMap<Align, V>` and `HashSet<Align>` need no `[derive(Hashable)]`, and
 `Align::Start.hash()` is `Align::Start.value().hash()`. Writing the derive
 anyway is harmless and does nothing; a hand-written `impl Align with
 Hashable` is a duplicate-impl error, because the compiler's is already

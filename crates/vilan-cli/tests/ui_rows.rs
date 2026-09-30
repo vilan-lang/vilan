@@ -5678,3 +5678,82 @@ fn m87_keyed_cell_locate_copies_no_whole_list() {
         "M87: `KeyedCell::locate` must read one element without copying the run; got:\n{stdout}"
     );
 }
+
+// --- A142 S4: a run over a collection pipe -----------------------------------
+
+/// `each` and `each_by` CONSUME a collection pipe (A142 §6): the run is fed the
+/// ops the stages made, so a task whose followed flow flips is ONE row arriving
+/// or leaving — built at its output position, nothing else re-rendered — and a
+/// push builds one row in each run.
+const PIPE_RUNS: &str = r#"import std::io::print;
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::ui::{ View, each, each_by, mount_root, view };
+
+[derive(PartialEq)]
+struct Task {
+	id: i32,
+	title: str,
+}
+
+fun main() {
+	let done: List<SignalCell<bool>> = [Signal::new(false), Signal::new(false), Signal::new(true), Signal::new(false), Signal::new(false)];
+	let tasks: ListCell<Task> = ListCell::of([
+		Task { id = 1, title = "one" },
+		Task { id = 2, title = "two" },
+		Task { id = 3, title = "three" },
+	]);
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("ul").child(each(tasks.filter(|task| done[task.id.as_usize()].derive(|finished| !finished)), |task| task.id, |task| {
+				print(i"open renders {task.id}");
+				view("li").text(task.title)
+			})))
+			.child(view("ol").child(each_by(tasks.map(|task| task.title), |title| title, |title| {
+				print(i"title renders {title.get()}");
+				view("li").bind_text(title)
+			})))
+	});
+	print("--- task 1 done ---");
+	done[1].set(true);
+	print("--- task 2 reopened ---");
+	done[2].set(false);
+	print("--- a task arrives ---");
+	tasks.push(Task { id = 4, title = "four" });
+}
+
+main();
+"#;
+
+#[test]
+fn a142_s4_a_run_over_a_collection_pipe_builds_only_what_arrived() {
+    let harness =
+        format!("{DOM_STUB}\nrequire(\"./app.js\");\nconsole.log(flatten(documentRoot));\n");
+    let stdout = build_and_run("pipe_runs", PIPE_RUNS, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        &lines[..lines.len() - 1],
+        &[
+            "open renders 1",
+            "open renders 3",
+            "title renders one",
+            "title renders two",
+            "title renders three",
+            "--- task 1 done ---",
+            "--- task 2 reopened ---",
+            "open renders 2",
+            "--- a task arrives ---",
+            "open renders 4",
+            "title renders four",
+        ],
+        "a flip is one row, a push one row per run, and nothing else renders; got:\n{stdout}"
+    );
+    // Task 2 arrived BEFORE task 3 (its output position), and task 1 left.
+    let tree = lines.last().expect("the flattened tree");
+    let ul = &tree[..tree.find("ol#").expect("the ol")];
+    assert!(
+        !ul.contains("'one'")
+            && ul.find("'two'") < ul.find("'three'")
+            && ul.find("'three'") < ul.find("'four'"),
+        "the open run must read two, three, four in order; got:\n{tree}"
+    );
+}

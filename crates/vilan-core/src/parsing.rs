@@ -8011,7 +8011,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// grammar and kept as the SOURCE TEXT it spans — the macro engine takes it
     /// as a string and the formatter reprints it, and nothing here resolves it.
     /// Its SPAN rides with the text (tracker A56): the analyzer's refusal of an
-    /// argument that disagrees with a `Map<K, V>` element's own key is about
+    /// argument that disagrees with a `HashMap<K, V>` element's own key is about
     /// the ARGUMENT, and has to point at it.
     fn eat_expose_attribute(&mut self) -> Exposure<'src> {
         let form = self.attempt(|parser| {
@@ -8070,7 +8070,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                             "`[expose(keyed = …)]`'s argument is a TYPE — the key type the \
                              mirror is keyed by, as in `[expose(keyed = str)]`. It is written \
                              here because a keyed mirror is a `KeyedSource<K, T>` and a \
-                             `List<T>` names only the element; a `Map<K, V>` element names both, \
+                             `List<T>` names only the element; a `HashMap<K, V>` element names both, \
                              and takes the bare `[expose(keyed)]`",
                         ),
                         context: Vec::new(),
@@ -8084,7 +8084,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                     span,
                     reason: ParseErrorReason::Rule(
                         "the only argument `[expose]` takes is `keyed` — write `[expose]` for a \
-                         whole-value channel, `[expose(keyed)]` for a keyed `Map<K, V>`, and \
+                         whole-value channel, `[expose(keyed)]` for a keyed `HashMap<K, V>`, and \
                          `[expose(keyed = K)]` for any other keyed collection",
                     ),
                     context: Vec::new(),

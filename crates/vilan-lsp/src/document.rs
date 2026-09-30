@@ -15626,7 +15626,7 @@ pub(crate) mod tests {
         for source in [
             // A std container, in an annotation and in a turbofish-style call.
             "fun main() {\n\tlet xs: List<¦\n}\n",
-            "fun main() {\n\tlet m: Map<¦\n}\n",
+            "fun main() {\n\tlet m: HashMap<¦\n}\n",
             "fun main() {\n\tlet o: Option<¦\n}\n",
             // A user struct and a user enum.
             "struct Holder<type T> {\n\tvalue: T,\n}\n\nfun main() {\n\tlet h: Holder<¦\n}\n",

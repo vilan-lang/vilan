@@ -1,0 +1,93 @@
+// A142 S4's following shapes on both backends: `map` over a returned pipe and a
+// returned source, `flatten`, `filter_map(|x| x)` over `Option`-valued sources
+// and `any` over their `is_pending()` pipes, and the element runs' owners.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{
+	Derive,
+	ListCell,
+	SequenceCell,
+	Signal,
+	SignalCell,
+	Source,
+	Subscriber,
+	Subscription,
+	comp,
+	on_cleanup,
+};
+import std::shared::Shared;
+
+struct Mirror {
+	state: SignalCell<Option<str>>,
+}
+
+impl Mirror with Source<Option<str>> {
+	fun get(self): Option<str> {
+		self.state.get()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.state.on_settle(subscriber)
+	}
+}
+
+impl Mirror {
+	fun is_pending(self): Derive<SignalCell<Option<str>>, Option<str>, bool> {
+		self.state.derive(|value| value.is_none())
+	}
+}
+
+fun cell_at(cells: List<SignalCell<i32>>, at: usize): SignalCell<i32> {
+	cells[at]
+}
+
+fun main() {
+	let cells: List<SignalCell<i32>> = [Signal::new(1), Signal::new(2), Signal::new(3)];
+	let ids: ListCell<usize> = ListCell::of([0usize, 1usize]);
+	let ((sources, values, doubled), scope) = comp(|| {
+		let sources = ids.map(|id| cell_at(cells, id)).memo();
+		let values = ids.map(|id| cell_at(cells, id)).flatten().memo();
+		let doubled = ids.map(|id| cell_at(cells, id).derive(|value| value * 2)).memo();
+		(sources, values, doubled)
+	});
+	cells[0].set(10);
+	ids.push(2usize);
+	cells[2].set(30);
+	print(sources.get().len());
+	print(values.get());
+	print(doubled.get());
+
+	let a = Mirror { state = Signal::new(Some("a")) };
+	let b = Mirror { state = Signal::new(None) };
+	let mirrors: ListCell<Mirror> = ListCell::of([a, b]);
+	let ((loaded, pending), scope2) = comp(|| {
+		let loaded = mirrors.filter_map(|m| m).memo();
+		let pending = mirrors.any(|m| m.is_pending()).memo();
+		(loaded, pending)
+	});
+	print(loaded.get());
+	print(pending.get());
+	b.state.set(Some("b"));
+	print(loaded.get());
+	print(pending.get());
+	mirrors.remove_at(0);
+	print(loaded.get());
+
+	let numbers: ListCell<i32> = ListCell::of([1, 2, 3]);
+	mut released: List<i32> = [];
+	let (tagged, scope3) = comp(|| numbers
+		.map(|n| {
+			on_cleanup(|| released.push(n));
+			n * 100
+		})
+		.memo());
+	numbers.remove_at(1);
+	numbers.set_at(0, 7);
+	print(released);
+	print(tagged.get());
+	scope3.dispose();
+	scope2.dispose();
+	scope.dispose();
+	print(released);
+}

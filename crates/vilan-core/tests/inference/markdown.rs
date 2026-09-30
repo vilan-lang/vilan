@@ -5709,7 +5709,8 @@ fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
 
 /// The boundary the impl does NOT cross, pinned so the sentence in `rpc.vl` is
 /// checkable: a `RemoteSource<List<T>>` is a `Source<Option<List<T>>>`, and
-/// `each` wants a `Source<List<T>>`. The mirror's value IS the option —
+/// `each` wants a list input (`RowFeed<T>` since A142 S4: a `Source<List<T>>`
+/// or a collection pipe). The mirror's value IS the option —
 /// `get` cannot invent a `T` before the first frame — so the seam into a list
 /// binding is still `or([])`, which the second half of this pin drives. (A142:
 /// `or` answers a pipe and `each` takes a `Source`, so the seam is sealed with
@@ -5739,7 +5740,7 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
         // the abstract `List<T>`) — `each`'s `T` binds from the key
         // closure before the bound is checked, where the render closure's
         // unannotated parameter used to freeze it abstract.
-        "'RemoteSource<List<Todo>>' does not implement trait 'Source<List<Todo>>'",
+        "'RemoteSource<List<Todo>>' does not implement trait 'RowFeed<Todo>'",
     );
     assert_compiles_browser(
         r#"

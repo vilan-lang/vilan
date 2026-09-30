@@ -21,7 +21,7 @@ What the backend reaches today:
 
 - structs, enums, `Option` and `Result`, generics (monomorphised per type
   argument), traits, trait objects (`dyn`), overloaded operators
-- `str`, `List`, `Map`, `Set`, closures, `impl` blocks, `match`, loops,
+- `str`, `List`, `HashMap`, `HashSet`, closures, `impl` blocks, `match`, loops,
   recursion, module-level bindings, `lazy`
 - `async`, `await`, `Task` and `Nursery`, on a single-threaded executor of the
   runtime's own

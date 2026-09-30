@@ -25,7 +25,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::rpc_server::Service;
 import std::wire::{ Keyed, Wire };
 
@@ -45,7 +45,7 @@ impl Message with Keyed<str> {
 [service(ChatClient)]
 struct Chat {
 	[expose] topic: SignalCell<str>,
-	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+	[expose(keyed)] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl Chat {
@@ -76,7 +76,7 @@ impl Chat {
 [service(PlainChatClient)]
 struct PlainChat {
 	[expose] topic: SignalCell<str>,
-	[expose] messages: SignalCell<Map<str, Message>>,
+	[expose] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl PlainChat {
@@ -91,7 +91,7 @@ impl PlainChat {
 	}
 }
 
-let chat: Chat = Chat { topic = Signal::new("general"), messages = Signal::new(Map::new()) };
+let chat: Chat = Chat { topic = Signal::new("general"), messages = Signal::new(HashMap::new()) };
 
 fun main() {
 	Server::builder()
@@ -129,7 +129,7 @@ fun run(port: i32) {
 			// the service's map holds two.
 			print(i"held:{render(client.messages.get().unwrap_or([]))}");
 			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
-			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(HashMap::new()) };
 			print(i"hash:{client.contract_hash()}");
 			print(i"plain-hash:{plain.contract_hash()}");
 			print(i"fault:{client.messages.fault().is_some()}");
@@ -1896,8 +1896,12 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
         stdout.contains("hash:43077e29"),
         "the keyed service's contract hash moved:\n{stdout}"
     );
+    // I9 moved this one on purpose: the whole-value channel hashes its element
+    // AS WRITTEN, and the element is spelled `HashMap<str, Message>` now
+    // (`c63e39e3` was the `Map<str, Message>` spelling's). The keyed hash above
+    // hashes the map's VALUE type and did not move.
     assert!(
-        stdout.contains("plain-hash:c63e39e3"),
+        stdout.contains("plain-hash:d093c571"),
         "the plain twin's contract hash moved:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2251,7 +2255,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::rpc_server::Service;
 import std::wire::{ Keyed, Wire };
 
@@ -2302,11 +2306,11 @@ impl ListChat {
 	}
 }
 
-// A39's shape, unchanged: the `Map` names both types and takes the bare form.
+// A39's shape, unchanged: the `HashMap` names both types and takes the bare form.
 [service(MapChatClient)]
 struct MapChat {
 	[expose] topic: SignalCell<str>,
-	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+	[expose(keyed)] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl MapChat {
@@ -2325,7 +2329,7 @@ impl MapChat {
 [service(PlainChatClient)]
 struct PlainChat {
 	[expose] topic: SignalCell<str>,
-	[expose] messages: SignalCell<Map<str, Message>>,
+	[expose] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl PlainChat {
@@ -2376,8 +2380,8 @@ fun run(port: i32) {
 			print(i"edit:{client.edit("m2", "world again").unwrap_or(false)}");
 			print(i"held:{render(client.messages.get().unwrap_or([]))}");
 			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
-			let map_twin = MapChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
-			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			let map_twin = MapChat { topic = Signal::new(""), messages = Signal::new(HashMap::new()) };
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(HashMap::new()) };
 			print(i"list-hash:{client.contract_hash()}");
 			print(i"map-hash:{map_twin.contract_hash()}");
 			print(i"plain-hash:{plain.contract_hash()}");
@@ -5009,7 +5013,7 @@ fun main() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
-import std::map::Map;
+import std::hash_map::HashMap;
 
 struct Password {
 	hash: str,
@@ -5027,8 +5031,8 @@ impl Vault {
 	}
 
 	[rpc]
-	fun lookup(self, who: str): Map<str, Password> {
-		Map::new()
+	fun lookup(self, who: str): HashMap<str, Password> {
+		HashMap::new()
 	}
 }
 
@@ -5043,7 +5047,7 @@ fun main() {
         "the parameter's refusal must still fire:\n{text}"
     );
     assert!(
-        text.contains("return type of `[rpc]` method `lookup` is `Map<str, Password>`"),
+        text.contains("return type of `[rpc]` method `lookup` is `HashMap<str, Password>`"),
         "the return's refusal must still fire:\n{text}"
     );
     assert_eq!(

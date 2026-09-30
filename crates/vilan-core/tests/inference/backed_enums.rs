@@ -1710,10 +1710,10 @@ fn a_resource_backed_enum_is_not_hashable() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         [resource] enum Handle { Open = 1, Closed = 2 }
         fun main() {
-            mut seen: Set<Handle> = Set::new();
+            mut seen: HashSet<Handle> = HashSet::new();
             seen.insert(Handle::Open);
             print(seen.len());
         }
@@ -2068,10 +2068,10 @@ fn b76_a_string_backed_enum_keys_a_map() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         enum Align { Start = "flex-start", End = "flex-end" }
         fun main() {
-            mut widths: Map<Align, i32> = Map::new();
+            mut widths: HashMap<Align, i32> = HashMap::new();
             widths.insert(Align::Start, 1);
             widths.insert(Align::End, 2);
             print(widths.get(Align::Start).unwrap_or(0));
@@ -2091,10 +2091,10 @@ fn b76_an_integer_backed_enum_keys_a_set() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         enum Level { Low = 0, High = 1 }
         fun main() {
-            mut seen: Set<Level> = Set::new();
+            mut seen: HashSet<Level> = HashSet::new();
             seen.insert(Level::High);
             print(seen.contains(Level::High));
             print(seen.contains(Level::Low));
@@ -2115,10 +2115,10 @@ fn b76_an_auto_incremented_backing_keys_a_set() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         enum Walked { A = 5, B, C }
         fun main() {
-            mut seen: Set<Walked> = Set::new();
+            mut seen: HashSet<Walked> = HashSet::new();
             seen.insert(Walked::B);
             print(seen.contains(Walked::B));
             print(seen.contains(Walked::C));
@@ -2139,11 +2139,11 @@ fn b76_a_backed_enums_hash_is_its_backing_values_hash() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::{ Hash, Hashable };
         enum Align { Start = "flex-start", End = "flex-end" }
         fun main() {
-            mut by_hash: Map<Hash, i32> = Map::new();
+            mut by_hash: HashMap<Hash, i32> = HashMap::new();
             by_hash.insert(Align::Start.hash(), 10);
             by_hash.insert(Align::End.hash(), 20);
             print(by_hash.len());
@@ -2167,11 +2167,11 @@ fn b76_an_integer_backed_enums_hash_is_its_numbers_hash() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::{ Hash, Hashable };
         enum Level { Low = 0, High = 1 }
         fun main() {
-            mut by_hash: Map<Hash, str> = Map::new();
+            mut by_hash: HashMap<Hash, str> = HashMap::new();
             by_hash.insert(Level::High.hash(), "high");
             print(by_hash.get(1.hash()).unwrap_or("miss"));
             print(by_hash.get("1".hash()).unwrap_or("miss"));
@@ -2187,10 +2187,10 @@ fn b76_std_ordering_keys_a_map() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::compare::Ordering;
         fun main() {
-            mut labels: Map<Ordering, str> = Map::new();
+            mut labels: HashMap<Ordering, str> = HashMap::new();
             labels.insert(Ordering::Less, "lt");
             labels.insert(Ordering::Greater, "gt");
             print(labels.get(Ordering::Less).unwrap_or("?"));
@@ -2209,10 +2209,10 @@ fn b76_a_backed_enum_key_emits_its_bare_value() {
     let javascript = compile(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         enum Align { Start = "flex-start", End = "flex-end" }
         fun main() {
-            mut widths: Map<Align, i32> = Map::new();
+            mut widths: HashMap<Align, i32> = HashMap::new();
             widths.insert(Align::Start, 1);
             print(widths.len());
         }
@@ -2232,10 +2232,10 @@ fn b76_a_plain_enum_is_still_not_hashable() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         enum Plain { A, B, C }
         fun main() {
-            mut seen: Set<Plain> = Set::new();
+            mut seen: HashSet<Plain> = HashSet::new();
             seen.insert(Plain::B);
             print(seen.len());
         }
@@ -2250,12 +2250,12 @@ fn b76_a_plain_enum_keys_a_set_with_the_derive() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
         [derive(Hashable)]
         enum Plain { A, B, C }
         fun main() {
-            mut seen: Set<Plain> = Set::new();
+            mut seen: HashSet<Plain> = HashSet::new();
             seen.insert(Plain::B);
             print(seen.contains(Plain::B));
             print(seen.contains(Plain::C));
@@ -2273,10 +2273,10 @@ fn b76_a_payload_enum_is_still_not_hashable() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         enum Payload { Num(i32), Text(str) }
         fun main() {
-            mut seen: Set<Payload> = Set::new();
+            mut seen: HashSet<Payload> = HashSet::new();
             seen.insert(Payload::Num(3));
             print(seen.len());
         }
@@ -2291,12 +2291,12 @@ fn b76_a_payload_enum_keys_a_set_with_the_derive() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
         [derive(Hashable)]
         enum Payload { Num(i32), Text(str) }
         fun main() {
-            mut seen: Set<Payload> = Set::new();
+            mut seen: HashSet<Payload> = HashSet::new();
             seen.insert(Payload::Num(3));
             print(seen.contains(Payload::Num(3)));
             print(seen.contains(Payload::Num(4)));
@@ -2313,13 +2313,13 @@ fn b76_a_backed_enum_field_of_a_derived_hashable_type_is_accepted() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
         enum Align { Start = "flex-start", End = "flex-end" }
         [derive(Hashable)]
         struct Slot { align: Align, index: i32 }
         fun main() {
-            mut seen: Set<Slot> = Set::new();
+            mut seen: HashSet<Slot> = HashSet::new();
             seen.insert(Slot { align = Align::Start, index = 1 });
             print(seen.contains(Slot { align = Align::Start, index = 1 }));
             print(seen.contains(Slot { align = Align::End, index = 1 }));
@@ -2354,12 +2354,12 @@ fn b76_a_redundant_hashable_derive_on_a_backed_enum_is_a_no_op() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
         [derive(Hashable)]
         enum Align { Start = "flex-start", End = "flex-end" }
         fun main() {
-            mut seen: Set<Align> = Set::new();
+            mut seen: HashSet<Align> = HashSet::new();
             seen.insert(Align::Start);
             print(seen.contains(Align::Start));
         }
@@ -2394,10 +2394,10 @@ fn b76_a_generic_backed_enum_gets_no_hashable() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         enum Phantom<T> { A = 1, B = 2 }
         fun main() {
-            mut seen: Set<Phantom<i32>> = Set::new();
+            mut seen: HashSet<Phantom<i32>> = HashSet::new();
             seen.insert(Phantom::A);
             print(seen.len());
         }
@@ -2969,13 +2969,13 @@ fn b111_a_walked_enum_is_hashable_and_keys_by_its_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::Hashable;
 
         enum Walked { A = 5, B, C }
 
         fun main() {
-            mut widths: Map<Walked, i32> = Map::new();
+            mut widths: HashMap<Walked, i32> = HashMap::new();
             widths.insert(Walked::B, 42);
             print(widths.contains_key(Walked::B));  // true
             print(Walked::B.hash() == 6.hash());    // true — the enum IS 6

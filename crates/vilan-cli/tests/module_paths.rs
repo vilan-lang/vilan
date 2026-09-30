@@ -264,7 +264,7 @@ fn a_std_root_that_is_not_utf8_still_loads_and_still_steers() {
         &package,
         &[(
             "main.vl",
-            "fun main() {\n\tlet m: Map<str, i32> = Map::new();\n}\n",
+            "fun main() {\n\tlet m: HashMap<str, i32> = HashMap::new();\n}\n",
         )],
     );
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
@@ -276,7 +276,7 @@ fn a_std_root_that_is_not_utf8_still_loads_and_still_steers() {
         .expect("run vilan");
     let text = combined(&output);
     assert!(
-        text.contains("import std::map::Map;"),
+        text.contains("import std::hash_map::HashMap;"),
         "the import steer must survive a non-UTF-8 std path: {text}"
     );
 

@@ -285,7 +285,7 @@ you and are the paths to prefer.
 
 It gives you the wire codec and nothing else: a type that also needs
 `to_json`/`from_json` asks for both, `[derive(Json, Wire)]`. The two are
-separate trait families with separate field rules — `Map` and any
+separate trait families with separate field rules — `HashMap` and any
 hand-written `impl … with Wire` type are Wire and are not Json — so a
 `Wire` derive that quietly emitted a JSON codec as well would refuse
 fields the wire boundary admits, in `to_json`'s vocabulary rather than
@@ -306,7 +306,7 @@ failure, so `decode` answers `Err(reason)` rather than panicking on a
 malformed frame. `std::json`'s direct pair writes the same tags, so the
 two spellings of a `Result` are one encoding.
 
-`Map<K, V>` is Wire when both its key and its value are (the key is
+`HashMap<K, V>` is Wire when both its key and its value are (the key is
 already `Hashable` by the type's own bound). It narrates as a list of
 `{key, value}` pairs — codec-neutral, readable in JSON, and
 insertion-ordered in both directions.

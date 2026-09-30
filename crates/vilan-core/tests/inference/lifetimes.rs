@@ -1864,11 +1864,11 @@ fn disposing_a_reactive_client_twice_is_harmless() {
 /// controls beside them. `{BODY}` is replaced per pin.
 const A135_SERVICE: &str = r#"
     import std::reactive::{ Signal, SignalCell };
-    import std::map::Map;
+    import std::hash_map::HashMap;
 
     [service(StoreClient)]
     struct Store {
-        names: SignalCell<Map<i32, str>>,
+        names: SignalCell<HashMap<i32, str>>,
         kept: SignalCell<str>,
     }
 
@@ -1969,15 +1969,15 @@ fn a135_a_handle_method_returning_what_outlives_the_call_does_not_warn() {
 /// `{BODY}` is replaced per pin; `{FREE}` is code outside the service.
 const A141_SERVICE: &str = r#"
     import std::reactive::{ MemoCell, Signal, SignalCell };
-    import std::map::Map;
+    import std::hash_map::HashMap;
     import std::shared::Shared;
 
     [service(StoreClient)]
     struct Store {
-        names: SignalCell<Map<i32, str>>,
+        names: SignalCell<HashMap<i32, str>>,
         slot: Shared<Option<SignalCell<usize>>>,
         kept: Shared<List<SignalCell<usize>>>,
-        by_id: Shared<Map<i32, SignalCell<usize>>>,
+        by_id: Shared<HashMap<i32, SignalCell<usize>>>,
         memos: Shared<List<MemoCell<usize>>>,
     }
 

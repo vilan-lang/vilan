@@ -25,9 +25,9 @@ impl Lookup {
 	external fun new(): Lookup;
 
 	// TODO(bindgen): string index signature `[key: string]: number` — vilan has
-	// no open keyed-object type at a host boundary: `Map<str, T>` is a vilan
-	// struct over a `NativeMap` keyed by `key.hash()`, not a plain host object.
-	// Bind the keys you need as `[extern(get, "key")]` accessors
+	// no open keyed-object type at a host boundary: `HashMap<str, T>` is a
+	// vilan struct over a `NativeMap` keyed by `key.hash()`, not a plain host
+	// object. Bind the keys you need as `[extern(get, "key")]` accessors
 }
 
 /// `ArrayLike` — a host object, bound opaquely: its fields are reached through
@@ -85,9 +85,9 @@ impl Records {
 	[extern("Object")]
 	external fun new(): Records;
 
-	// TODO(bindgen): `Record<K, V>` is an open keyed host object; vilan's `Map`
-	// is a struct over a `NativeMap` keyed by `key.hash()`, not a host object.
-	// Bind the keys you need as `[extern(get, "key")]` accessors
+	// TODO(bindgen): `Record<K, V>` is an open keyed host object; vilan's
+	// `HashMap` is a struct over a `NativeMap` keyed by `key.hash()`, not a
+	// host object. Bind the keys you need as `[extern(get, "key")]` accessors
 	[extern(get, "byName")]
 	[platform("node")]
 	external fun by_name(self): any;

@@ -26,11 +26,11 @@ fn std_root() -> PathBuf {
 /// The same wide-`std` closure `base_cache.rs`'s M36 measurement uses, so the
 /// two are comparable line for line.
 const WIDE_A: &str = "import std::io::print;\nimport std::list::List;\n\
-                      import std::map::Map;\nimport std::set::Set;\n\
+                      import std::hash_map::HashMap;\nimport std::hash_set::HashSet;\n\
                       import std::json;\nimport std::math::PI;\n\
                       fun main() { print(PI); }\n";
 const WIDE_B: &str = "import std::io::print;\nimport std::list::List;\n\
-                      import std::map::Map;\nimport std::set::Set;\n\
+                      import std::hash_map::HashMap;\nimport std::hash_set::HashSet;\n\
                       import std::json;\nimport std::math::PI;\n\
                       fun main() { print(PI + 1.0); }\n";
 
@@ -405,7 +405,7 @@ fn write_m74_package(root: &Path) -> PathBuf {
 }
 
 const M74_VIEWS: &str = "export *;\n\nimport std::io::print;\nimport std::list::List;\n\
-                         import std::map::Map;\nimport std::json;\n\
+                         import std::hash_map::HashMap;\nimport std::json;\n\
                          import pkg::theme::color;\n\n\
                          fun icon(): i32 {\n\t3\n}\n\n\
                          fun total(): i32 {\n\tcolor() + icon()\n}\n\n\

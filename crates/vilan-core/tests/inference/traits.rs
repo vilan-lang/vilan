@@ -2979,7 +2979,7 @@ fn an_expose_keyed_list_without_a_key_type_names_the_attribute_argument() {
 
 /// The key is named, and the collection is one the keyed exposure cannot read.
 /// `expose_keyed` takes a `Source<List<T>>` and `expose_keyed_map` a
-/// `Source<Map<K, V>>`; those two are what the expansion picks between, off the
+/// `Source<HashMap<K, V>>`; those two are what the expansion picks between, off the
 /// annotation, before any type resolves — so a third collection has to be told
 /// so here or it would simply not be exposed and nothing would say why (B202).
 #[test]
@@ -2997,7 +2997,7 @@ fn an_expose_keyed_with_a_key_type_still_needs_a_list_or_a_map() {
         fun main() { print("store"); }
         main();
         "#,
-        "its collection is not written as a `List<T>` or a `Map<K, V>`",
+        "its collection is not written as a `List<T>` or a `HashMap<K, V>`",
     );
 }
 
@@ -3033,7 +3033,7 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3043,7 +3043,7 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed)] by_map: SignalCell<Map<str, Task>>,
+            [expose(keyed)] by_map: SignalCell<HashMap<str, Task>>,
             [expose(keyed = str)] by_list: SignalCell<List<Task>>,
         }
         impl Store {
@@ -3051,10 +3051,68 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
             fun count(self): usize { self.by_list.get().len() }
         }
         fun main() {
-            print(Store { by_map = Signal::new(Map::new()), by_list = Signal::new([]) }.contract_hash());
+            print(Store { by_map = Signal::new(HashMap::new()), by_list = Signal::new([]) }.contract_hash());
         }
         main();
         "#,
+    );
+}
+
+/// I9: `Map` is `HashMap`'s spelling before the rename, kept one release as
+/// `std::map`'s deprecated alias — and the keyed exposure reads its annotation
+/// AS WRITTEN, before any type resolves, in two places (the analyzer's shape
+/// check and the `[service]` expansion). Both must take the old spelling as the
+/// map: the program compiles, and the contract it states is the `HashMap`
+/// spelling's, keyed — not the whole-value channel's, which is what the
+/// expansion would fall back to if it did not recognise the element.
+#[test]
+fn i9_the_deprecated_map_spelling_is_still_a_keyed_expose_map() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(NewClient)]
+        struct NewStore {
+            [expose(keyed)] tasks: SignalCell<HashMap<str, Task>>,
+        }
+        impl NewStore {
+            [rpc]
+            fun count(self): usize { self.tasks.get().len() }
+        }
+        [service(OldClient)]
+        struct OldStore {
+            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
+        }
+        impl OldStore {
+            [rpc]
+            fun count(self): usize { self.tasks.get().len() }
+        }
+        [service(WholeClient)]
+        struct WholeStore {
+            [expose] tasks: SignalCell<HashMap<str, Task>>,
+        }
+        impl WholeStore {
+            [rpc]
+            fun count(self): usize { self.tasks.get().len() }
+        }
+        fun main() {
+            let keyed = NewStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
+            let old = OldStore { tasks = Signal::new(Map::new()) }.contract_hash();
+            let whole = WholeStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
+            print(old == keyed);
+            print(keyed == whole);
+        }
+        main();
+        "#,
+        "true\nfalse\n",
     );
 }
 
@@ -3072,7 +3130,7 @@ fn a56_an_expose_keyed_argument_that_disagrees_with_the_map_key_is_refused() {
     assert_fails_once_with(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3082,7 +3140,7 @@ fn a56_an_expose_keyed_argument_that_disagrees_with_the_map_key_is_refused() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed = i32)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed = i32)] tasks: SignalCell<HashMap<str, Task>>,
         }
         fun main() { print("store"); }
         main();
@@ -3100,7 +3158,7 @@ fn a56_the_disagreeing_key_refusal_stands_down_the_generated_bound_failures() {
     assert_fails_without(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3110,7 +3168,7 @@ fn a56_the_disagreeing_key_refusal_stands_down_the_generated_bound_failures() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed = i32)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed = i32)] tasks: SignalCell<HashMap<str, Task>>,
         }
         fun main() { print("store"); }
         main();
@@ -3128,7 +3186,7 @@ fn a56_an_expose_keyed_argument_that_agrees_with_the_map_key_still_compiles() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3138,14 +3196,14 @@ fn a56_an_expose_keyed_argument_that_agrees_with_the_map_key_still_compiles() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed = str)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed = str)] tasks: SignalCell<HashMap<str, Task>>,
         }
         impl Store {
             [rpc]
             fun count(self): usize { self.tasks.get().len() }
         }
         fun main() {
-            print(Store { tasks = Signal::new(Map::new()) }.contract_hash());
+            print(Store { tasks = Signal::new(HashMap::new()) }.contract_hash());
         }
         main();
         "#,
@@ -3738,7 +3796,7 @@ fn b284_an_expose_keyed_on_a_client_service_only_struct_is_refused_once() {
     assert_fails_once_with(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3748,13 +3806,13 @@ fn b284_an_expose_keyed_on_a_client_service_only_struct_is_refused_once() {
         }
         [client_service]
         struct Handlers {
-            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed)] tasks: SignalCell<HashMap<str, Task>>,
         }
         impl Handlers {
             [rpc]
             fun session_revoked(self, reason: str) { print(reason); }
         }
-        fun main() { print(Handlers { tasks = Signal::new(Map::new()) }.contract_hash()); }
+        fun main() { print(Handlers { tasks = Signal::new(HashMap::new()) }.contract_hash()); }
         main();
         "#,
         "carries only `[client_service]`",
@@ -4950,9 +5008,9 @@ fn a_derive_wire_field_may_be_a_map() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         [derive(Wire)]
-        struct Row { id: i53, tags: Map<str, i32> }
+        struct Row { id: i53, tags: HashMap<str, i32> }
         fun main() { print("row"); }
         main();
         "#,
@@ -5103,7 +5161,7 @@ fn a_handle_returns_element_may_be_a_hand_implemented_wire_type() {
 /// they ARE four texts saying one thing.
 #[test]
 fn the_wire_refusal_names_map_and_the_impl_among_the_shapes_it_admits() {
-    let admitted = "`List`/`Option`/`Map` of Wire";
+    let admitted = "`List`/`Option`/`HashMap` of Wire";
     let escape = "or a type with an `impl .. with Wire`";
     for (source, head) in [
         (
@@ -8216,5 +8274,131 @@ fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
         main();
         "#,
         "the override\nthe override\n",
+    );
+}
+
+// --- One trait at two instantiations: every provider is asked ------------------
+//
+// A type may provide one trait at two instantiations: `impl type T with Into2<T>`
+// gives a `SignalCell<bool>` `Into2<SignalCell<bool>>`, and `impl type F:
+// Flow<type T> with Into2<T>` gives it `Into2<bool>`. Emission and the analyzer
+// each asked only the FIRST applying provider, so a binder bounded `R: Into2<bool>`
+// was turned down for a flow — the impl it guarded fell out of dispatch through a
+// trait default (a body-less requirement, refused at emission) — and a binder
+// bounded `R: Kind<type U>` grounded `U` from the plain blanket where the more
+// specific one applied (collections-44's find; A142 S4's `IntoFlow` and
+// `IntoElement` are the first customers).
+
+/// The bound holds when ANY provider gives the written instantiation: `Holder`'s
+/// impl is admitted for a flow, and a trait default reaches its member.
+#[test]
+fn a_bound_holds_through_a_second_provider_at_its_written_instantiation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Signal, SignalCell };
+
+        trait Into2<T> {
+            fun go(self): i32;
+        }
+        impl type T with Into2<T> {
+            fun go(self): i32 {
+                1
+            }
+        }
+        impl type F: Flow<type T> with Into2<T> {
+            fun go(self): i32 {
+                2
+            }
+        }
+        trait Runs {
+            fun run(self): i32;
+        }
+        struct Holder<R> {
+            r: R,
+        }
+        impl Holder<type R: Into2<bool>> with Runs {
+            fun run(self): i32 {
+                self.r.go()
+            }
+        }
+        trait Outer with Runs {
+            fun twice(self): i32 {
+                self.run() * 2
+            }
+        }
+        impl Holder<type R: Into2<bool>> with Outer {}
+
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            print(Holder { r = true }.run());
+            print(Holder { r = flag }.run());
+            print(Holder { r = true }.twice());
+            print(Holder { r = flag }.twice());
+        }
+        main();
+        "#,
+        "1\n2\n2\n4\n",
+    );
+}
+
+/// A binder written in a bound (`R: Kind<type U>`) grounds from the MOST
+/// SPECIFIC provider that agrees with the bound: the `Wrapped` blanket over the
+/// plain one for a `Cup`, so `U` is `i32` and not `Cup`; the plain one for a
+/// `str`, which nothing else provides for.
+#[test]
+fn a_bound_binder_grounds_from_the_most_specific_provider() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Kind<T> {
+            fun kind(self): str;
+        }
+        trait Wrapped<T> {
+            fun inner(self): T;
+        }
+        impl type T with Kind<T> {
+            fun kind(self): str {
+                "plain"
+            }
+        }
+        impl type W: Wrapped<type T> with Kind<T> {
+            fun kind(self): str {
+                "wrapped"
+            }
+        }
+        struct Cup {
+            v: i32,
+        }
+        impl Cup with Wrapped<i32> {
+            fun inner(self): i32 {
+                self.v
+            }
+        }
+        struct Holder<R> {
+            r: R,
+        }
+        impl Holder<type R: Kind<type U>> {
+            fun nothing(self): Option<U> {
+                None
+            }
+
+            fun which(self): str {
+                self.r.kind()
+            }
+        }
+        fun main() {
+            let held: Option<i32> = Holder { r = Cup { v = 1 } }.nothing();
+            print(held.is_none());
+            print(Holder { r = Cup { v = 1 } }.which());
+            let plain: Option<str> = Holder { r = "x" }.nothing();
+            print(plain.is_none());
+            print(Holder { r = "x" }.which());
+        }
+        main();
+        "#,
+        "true\nwrapped\ntrue\nplain\n",
     );
 }

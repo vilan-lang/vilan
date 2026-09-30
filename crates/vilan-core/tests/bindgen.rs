@@ -487,15 +487,16 @@ fn a_numeric_index_signature_is_never_mapped_to_list() {
 
 #[test]
 fn a_string_index_signature_is_never_mapped_to_map() {
-    // Same root cause: `std::map::Map` is a plain vilan struct wrapping a
+    // Same root cause: `std::hash_map::HashMap` is a plain vilan struct wrapping a
     // `NativeMap` keyed by `key.hash()`, not a host `{a: 1}` object.
     let output = bind("interface Lookup { [key: string]: number; }");
     assert!(
         output.contains("TODO(bindgen): string index signature"),
         "{output}"
     );
-    // The TODO prose MENTIONS `Map<str, T>` to say why it is wrong; what must
-    // not appear is `Map` in a type position.
+    // The TODO prose MENTIONS `HashMap<str, T>` to say why it is wrong; what
+    // must not appear is the map in a type position, under either name.
+    assert!(!output.contains(": HashMap<"), "{output}");
     assert!(!output.contains(": Map<"), "{output}");
 }
 

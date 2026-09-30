@@ -798,8 +798,8 @@ fn a_canonical_hash_keys_the_same_values_on_both_backends() {
 
 const HASH_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::map::Map;\n",
-    "import std::set::Set;\n",
+    "import std::hash_map::HashMap;\n",
+    "import std::hash_set::HashSet;\n",
     "\n",
     "[derive(Hashable, PartialEq)]\n",
     "struct Point { x: i32, y: i32 }\n",
@@ -807,12 +807,12 @@ const HASH_PROBE: &str = concat!(
     "fun main() {\n",
     // A string key and an integer key that render the same: two JS primitives,
     // two keys.
-    "\tmut mixed: Map<str, i32> = Map::new();\n",
+    "\tmut mixed: HashMap<str, i32> = HashMap::new();\n",
     "\tmixed.insert(\"1\", 10);\n",
     "\tmixed.insert(\"one\", 11);\n",
     "\tprint(mixed.len());\n",
     "\tprint(mixed.get(\"1\"));\n",
-    "\tmut numbers: Map<i32, str> = Map::new();\n",
+    "\tmut numbers: HashMap<i32, str> = HashMap::new();\n",
     "\tnumbers.insert(1, \"one\");\n",
     "\tnumbers.insert(2, \"two\");\n",
     "\tnumbers.insert(1, \"uno\");\n",
@@ -821,12 +821,12 @@ const HASH_PROBE: &str = concat!(
     // A re-insert keeps the ORIGINAL position, as a JS `Map` does.
     "\tfor key in numbers.keys() { print(key); }\n",
     // `bool` and `f64` keys — the other two primitive arms.
-    "\tmut flags: Map<bool, i32> = Map::new();\n",
+    "\tmut flags: HashMap<bool, i32> = HashMap::new();\n",
     "\tflags.insert(true, 1);\n",
     "\tflags.insert(false, 0);\n",
     "\tprint(flags.get(true));\n",
     "\tprint(flags.contains_key(false));\n",
-    "\tmut reals: Map<f64, str> = Map::new();\n",
+    "\tmut reals: HashMap<f64, str> = HashMap::new();\n",
     "\treals.insert(1.5, \"half\");\n",
     "\treals.insert(0.0, \"zero\");\n",
     "\tprint(reals.get(1.5));\n",
@@ -834,19 +834,19 @@ const HASH_PROBE: &str = concat!(
     // An AGGREGATE key: `[derive(Hashable)]` canonicalises through
     // `JSON.stringify`, so two equal points are one key and a different one is
     // its own.
-    "\tmut points: Map<Point, str> = Map::new();\n",
+    "\tmut points: HashMap<Point, str> = HashMap::new();\n",
     "\tpoints.insert(Point { x = 1, y = 2 }, \"a\");\n",
     "\tpoints.insert(Point { x = 1, y = 2 }, \"b\");\n",
     "\tpoints.insert(Point { x = 2, y = 1 }, \"c\");\n",
     "\tprint(points.len());\n",
     "\tprint(points.get(Point { x = 1, y = 2 }));\n",
     // A `List` key — `impl List<T: Hashable> with Hashable`.
-    "\tmut lists: Map<List<i32>, str> = Map::new();\n",
+    "\tmut lists: HashMap<List<i32>, str> = HashMap::new();\n",
     "\tlists.insert([1, 2], \"twelve\");\n",
     "\tprint(lists.get([1, 2]));\n",
     "\tprint(lists.get([2, 1]));\n",
     // A `Set`, which keys the same way.
-    "\tmut words: Set<str> = Set::new();\n",
+    "\tmut words: HashSet<str> = HashSet::new();\n",
     "\twords.insert(\"a\");\n",
     "\twords.insert(\"a\");\n",
     "\twords.insert(\"b\");\n",
@@ -855,6 +855,99 @@ const HASH_PROBE: &str = concat!(
     "\tprint(words.contains(\"z\"));\n",
     "}\n",
 );
+
+/// I9 / Q8: `HashMap` and `HashSet` equality is ORDER-INSENSITIVE on both
+/// backends — the same keys with equal values (the same members), whatever the
+/// insertion order. The native runtime's own `PartialEq for Map` is
+/// order-SENSITIVE and must stay unreachable: `==` goes through std's
+/// `impl .. with PartialEq`, and so does a derived `PartialEq` over a struct
+/// holding a map, and a map of maps compares its values through the same impl.
+/// Each line pairs an order-only difference (equal) with a value, a size or a
+/// member difference (unequal).
+#[test]
+fn i9_hash_collection_equality_is_order_insensitive_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_hash_eq.vl"), HASH_EQUALITY_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_hash_eq.vl"),
+        Verdict::Identical,
+        "map and set equality must ignore insertion order on both backends"
+    );
+}
+
+const HASH_EQUALITY_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::hash_map::HashMap;\n",
+    "import std::hash_set::HashSet;\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Holder {\n",
+    "\tscores: HashMap<str, i32>,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a: HashMap<str, i32> = HashMap::new();\n",
+    "\ta.insert(\"x\", 1);\n",
+    "\ta.insert(\"y\", 2);\n",
+    "\tmut b: HashMap<str, i32> = HashMap::new();\n",
+    "\tb.insert(\"y\", 2);\n",
+    "\tb.insert(\"x\", 1);\n",
+    "\tprint(a == b);\n",
+    "\tb.insert(\"y\", 3);\n",
+    "\tprint(a == b);\n",
+    "\tprint(a != b);\n",
+    "\tmut c: HashMap<str, i32> = HashMap::new();\n",
+    "\tc.insert(\"x\", 1);\n",
+    "\tprint(a == c);\n",
+    "\tc.insert(\"z\", 2);\n",
+    "\tprint(a == c);\n",
+    "\tprint(Holder { scores = a } == Holder { scores = [(\"y\", 2), (\"x\", 1)].to_map() });\n",
+    "\tprint(Holder { scores = a } == Holder { scores = c });\n",
+    "\tlet s: HashSet<i32> = [1, 2, 3].to_set();\n",
+    "\tprint(s == [3, 2, 1].to_set());\n",
+    "\tprint(s == [3, 2].to_set());\n",
+    "\tprint(s == [3, 2, 4].to_set());\n",
+    "\tmut nested: HashMap<str, HashMap<str, i32>> = HashMap::new();\n",
+    "\tnested.insert(\"a\", a);\n",
+    "\tmut other: HashMap<str, HashMap<str, i32>> = HashMap::new();\n",
+    "\tother.insert(\"a\", [(\"y\", 2), (\"x\", 1)].to_map());\n",
+    "\tprint(nested == other);\n",
+    "}\n",
+);
+
+/// A142 S4 and S5: the collection pipes on both backends — the operators' and
+/// the boundary conversions' seeded random walks against an oracle recomputed
+/// after every step (the same walks as `inference/collections.rs`'s), and the
+/// following shapes: `map` over a
+/// returned pipe and a returned source, `flatten`, `filter_map(|m| m)` and
+/// `any(|m| m.is_pending())` over `Option`-valued sources, and the element
+/// runs' owners released on leave, re-run and disposal.
+#[test]
+fn a142_collection_pipes_build_the_same_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_collection_walk.vl",
+            include_str!("native/collection_walk.vl"),
+        ),
+        (
+            "native_probe_collection_follow.vl",
+            include_str!("native/collection_follow.vl"),
+        ),
+        (
+            "native_probe_conversion_walk.vl",
+            include_str!("native/conversion_walk.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: a collection pipe must build and answer the same on both backends"
+        );
+    }
+}
 
 /// F23: a context-threaded hidden parameter is typed from the flavour the
 /// CONTEXT PASS recorded, and one program carries both readings.
@@ -2660,7 +2753,7 @@ fn a_closure_type_over_a_view_takes_its_argument_by_reference() {
 
 const VIEW_CLOSURE_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::map::Map;\n",
+    "import std::hash_map::HashMap;\n",
     "import std::reactive::{ Signal, SignalCell };\n",
     "\n",
     "struct Counter {\n",
@@ -2687,7 +2780,7 @@ const VIEW_CLOSURE_PROBE: &str = concat!(
     "\t\titems.push(4);\n",
     "\t\titems.push(5);\n",
     "\t});\n",
-    "\tlet names: SignalCell<Map<str, i32>> = Signal::new(Map::new());\n",
+    "\tlet names: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());\n",
     "\tnames.update(|&mut entries| {\n",
     "\t\tentries.insert(\"a\", 1);\n",
     "\t});\n",
@@ -2835,7 +2928,7 @@ fn a_generic_call_left_open_is_closed_by_its_position() {
 
 const OPEN_BINDING_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::map::Map;\n",
+    "import std::hash_map::HashMap;\n",
     "import std::reactive::{ Signal, SignalCell };\n",
     "\n",
     "enum Delta<K, T> {\n",
@@ -2856,7 +2949,7 @@ const OPEN_BINDING_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet cell: SignalCell<List<i32>> = SignalCell::new([]);\n",
-    "\tlet named: SignalCell<Map<str, i32>> = Signal::new(Map::new());\n",
+    "\tlet named: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());\n",
     "\tmut ops: List<Delta<str, i32>> = [];\n",
     "\tops.push(Delta::Reset([1, 2]));\n",
     "\tops.push(Delta::Remove(\"k\"));\n",

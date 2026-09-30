@@ -135,7 +135,7 @@ Everything that travels — an rpc's parameters, the values a call answers
 with, mirrored payloads — must be serializable, which Vilan calls
 **Wire**. The scalars
 are Wire (`bool`, every integer width from `i8` to `u53`, `usize`, both
-floats, `str`). `List`, `Option`, `Result` and `Map` of Wire types are Wire — so a
+floats, `str`). `List`, `Option`, `Result` and `HashMap` of Wire types are Wire — so a
 fallible reply, `Result<Row, str>`, is an ordinary return type. And your own
 types opt in with a derive:
 
@@ -640,7 +640,7 @@ thousand, to every connected client.
 crosses. Two things are required of it:
 
 - the **key type is written somewhere the expansion can read it**, before
-  any type resolves — a `Map<K, V>` element names it in the collection and
+  any type resolves — a `HashMap<K, V>` element names it in the collection and
   takes the bare `[expose(keyed)]`; every other collection names it in the
   attribute, as `[expose(keyed = K)]`;
 - the value implements **`Keyed<K>`** (its own identity) and
@@ -662,7 +662,7 @@ struct Tasks {
 ```
 
 ```vilan,fragment
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::reactive::SignalCell;
 import std::wire::{ Keyed, Wire };
 
@@ -682,7 +682,7 @@ impl Message with Keyed<str> {
 [service(ChatClient)]
 struct Chat {
 	[expose] topic: SignalCell<str>,
-	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+	[expose(keyed)] messages: SignalCell<HashMap<str, Message>>,
 }
 ```
 
@@ -844,10 +844,10 @@ Three things that table says out loud:
   a keeping mirror could hold an element deleted while the connection was
   down and no later op would ever name it. The keys you still hold are
   re-subscribed and re-seeded.
-- **A key written twice has to agree.** A `Map<K, V>` element names the key
+- **A key written twice has to agree.** A `HashMap<K, V>` element names the key
   and takes the bare `[expose(keyed)]`; writing the argument beside it as
   well is redundant but fine — *while the two spellings agree*. A
-  `[expose(keyed = i32)]` over a `SignalCell<Map<str, Message>>` is
+  `[expose(keyed = i32)]` over a `SignalCell<HashMap<str, Message>>` is
   **refused at the attribute**, naming both spellings. Neither is knowably
   the intended one, and the expansion reads `K` off the annotation before
   any type resolves, so it has nothing to pick between them with: drop the
@@ -858,7 +858,7 @@ Three things that table says out loud:
   keyed. That is the point: the frames differ.
 - **Hand-wired exposures have the same three shapes.**
   `ReactiveServer::expose_keyed(source, key_of)` for a `List<T>`,
-  `expose_keyed_map(source, key_of)` for a `Map<K, V>` and
+  `expose_keyed_map(source, key_of)` for a `HashMap<K, V>` and
   `expose_keyed_cell(cell)` for a `KeyedCell<K, T>` (no `key_of` — the cell
   names its key), with `ReactiveClient::attached_keyed_source` /
   `keyed_source` on the other end. `[expose(keyed = K)]` generates the first,

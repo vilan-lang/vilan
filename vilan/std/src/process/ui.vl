@@ -35,6 +35,7 @@ import pkg::reactive::{
 	Draft,
 	Flow,
 	Owner,
+	RowFeed,
 	Signal,
 	SignalCell,
 	Source,
@@ -543,20 +544,20 @@ export struct Swap<T: PartialEq, S: Flow<T>, C: Slot> {
 }
 
 /// A keyed reactive run as a child — the `each` slot value (A85/A99).
-export struct Each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct Each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export struct EachValues<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachValues<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export struct EachBy<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachBy<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|SignalCell<T>| C) context owner_scope,
@@ -581,8 +582,8 @@ export fun swap<T: PartialEq, S: Flow<T>, C: Slot>(
 }
 
 /// A keyed reactive run at THIS position, rendered from the current items.
-export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ): Each<T, K, S, C> {
@@ -590,16 +591,16 @@ export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Sl
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export fun each_values<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_values<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 ): EachValues<T, S, C> {
 	EachValues { source, render }
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export fun each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): EachBy<T, K, S, C> {
@@ -622,19 +623,19 @@ export impl Swap<type T: PartialEq, type S: Flow<T>, type C: Slot> with Slot {
 	}
 }
 
-export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
 	fun place(own self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-export impl EachValues<type T: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachValues<type T: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
 	fun place(own self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
-export impl EachBy<type T, type K: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachBy<type T, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
 	fun place(own self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
@@ -663,18 +664,27 @@ fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 /// No op path (A112 S3): the browser twin follows a `DeltaSource`'s ops after its
 /// first build, and a server render IS only a first build — it reads the list once
 /// and never hears a change, so there is nothing for ops to say.
-fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
+fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ) {
 	let region = Region::open(parent);
-	let items: List<T> = source.get();
+	let items: List<T> = read_rows(source);
 	for item in items {
 		let owner = Owner::new();
 		let _row = run_with_owner(owner, || region.open_row(render(item)));
 	}
+}
+
+/// A run's input read ONCE — opened, its snapshot taken, released: a server render
+/// hears no later change (`read_once`'s shape, for a collection input).
+fun read_rows<T, S: RowFeed<T>>(own source: S): List<T> {
+	let instance = source.open_rows();
+	let items = (instance.snapshot)();
+	(instance.release)();
+	items
 }
 
 /// `each_by`'s body, server side: one child per element of the CURRENT list, each
@@ -684,14 +694,14 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slo
 ///
 /// No op path (A112 S3b), for `place_each`'s reason: a server render is only a
 /// first build.
-fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
+fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ) {
 	let region = Region::open(parent);
-	let items: List<T> = source.get();
+	let items: List<T> = read_rows(source);
 	// The key is client business — it decides which row survives a change, and no
 	// row here outlives the request. Accepted and dropped, like the event binders'
 	// handlers.

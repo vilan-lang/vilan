@@ -51,6 +51,11 @@ import std::reactive::{
 | `ListCell<T>` | struct | a `List` cell whose writes ARE its deltas |
 | `SequenceCell<T>`, `Sequence<T>`, `Tracked<T>` | traits/struct | twelve mutators over one `splice` primitive; the `&mut` twin and its recorder |
 | `map_each` | fn | `g` element-wise and incrementally — one call of `g` per arriving element |
+| `CollFlow<T>`, `CollPipe<T>`, `CollSource<T>` | traits | collections per shape (A142 §6): anything a collection pipeline starts from; a move-only collection pipe (`memo`/`memo_global`/`sample`); a granular source |
+| `map`, `filter`, `filter_map`, `any`, `all`, `count`, `flatten` | methods | the collection operators — each returns a pipe, and follows the flow its closure returns (`IntoFlow`, `IntoElement`) |
+| `ListMemo<T>` | struct | a sealed collection pipe: a read-only granular source |
+| `RowFeed<T>` | trait | what `each`/`each_by` read their rows from: a list source or a collection pipe |
+| `coll`, `coll_by`, `Coll`, `CollBy`, `SameElement` | methods/structs/trait | a flow of whole lists into a collection pipe: the positional diff (prefix/suffix trim) and the keyed one (`ReconcilePlan`, emits `Move`) |
 
 ## Signal and SignalCell
 
@@ -651,7 +656,7 @@ defer every key's cleanup to whatever owner was ambient where `selector` was
 *called* — the component, never the row. A method call threads the caller's
 ambient owner the ordinary way.
 
-The key type is bounded on `Hashable` (the canonical key `Map` and `Set` use)
+The key type is bounded on `Hashable` (the canonical key `HashMap` and `HashSet` use)
 and on `PartialEq` (to seed a fresh cell against the current value). A key
 nobody has asked about has no cell and costs nothing: a change into it writes
 only the outgoing one.
@@ -1084,8 +1089,8 @@ enum SeqOp<T> {
 	Move(usize, usize, usize),        // from, count, to — the same elements, elsewhere
 }
 
-enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(Map<K, V>) }
-enum SetOp<T: Hashable> { Add(T), Remove(T), Reset(Set<T>) }
+enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(HashMap<K, V>) }
+enum SetOp<T: Hashable> { Add(T), Remove(T), Reset(HashSet<T>) }
 ```
 
 Every arm carries **what left** as well as what arrived. That is a requirement,
@@ -1311,6 +1316,144 @@ disposed derivation stops pinning the source's history. And `g` must be pure IN
 THE ELEMENT: its result is kept, so a `g` that reads another signal will not
 re-run when that signal changes. That is `derive`'s contract already; here nothing
 re-runs it at all, which makes the contract sharper rather than different.
+
+## Collection pipes — operators per shape
+
+```vilan,fragment
+[resource] trait CollFlow<T> {                 // anything a collection pipeline starts from
+	fun open(own self): CollInstance<T>;       // the node author's member
+}
+trait CollSource<T> with DeltaSource<List<T>, SeqOp<T>> {}   // ListCell, ListMemo
+[resource] trait CollPipe<T> with CollFlow<T> {
+	fun memo(own self): ListMemo<T>            // seal: a read-only CollSource
+	fun memo_global(own self): ListMemo<T>     // ... for the program (A130)
+	fun sample(own self): List<T>              // one read: start, take, release
+}
+impl type F: CollFlow<type T> {
+	fun map<R>(own self, transform: |T| R): CollMap<F, T, R>            // R: IntoElement<U>
+	fun filter<R>(own self, keep: |T| R): CollFilter<F, T, R>           // R: IntoFlow<bool>
+	fun filter_map<R>(own self, select: |T| R): CollFilterMap<F, T, R>  // R: IntoFlow<Option<U>>
+	fun any<R>(own self, test: |T| R): CollTally<F, T, R, bool>         // a scalar Pipe<bool>
+	fun all<R>(own self, test: |T| R): CollTally<F, T, R, bool>
+	fun count<R>(own self, test: |T| R): CollTally<F, T, R, usize>
+}
+impl type F: CollFlow<type S: Source<type U>> {
+	fun flatten(own self): CollFlatten<F, S, U>                        // follow each source
+}
+```
+
+A collection OPERATOR returns a move-only **collection pipe** (`CollPipe`),
+§3's split one level up: it is consumed once — sealed with `.memo()` into a
+`ListMemo` (a granular source, so a pipeline starts from it again), handed to
+`each`/`each_by`, or read once with `.sample()`. What travels between stages
+is not a value but the CHANGE, in the shape's one vocabulary (`SeqOp`), so an
+operator is written once per shape and every stage does work proportional to
+what changed:
+
+```vilan
+import std::reactive::{ ListCell, SequenceCell, comp };
+
+fun main() {
+	let numbers: ListCell<i32> = ListCell::of([1, 2, 3, 4]);
+	let (big, scope) = comp(|| numbers.filter(|n| n > 2).map(|n| n * 10).memo());
+	print(big.get());            // [ 30, 40 ]
+	numbers.push(7);             // the closures run for 7 alone
+	numbers.remove_at(0);        // nothing runs
+	print(big.get());            // [ 30, 40, 70 ]
+	scope.dispose();
+}
+```
+
+The operators start from a granular source — a `ListCell`, a `ListMemo` — and
+from a collection pipe. A coarse `Source<List<T>>` converts at the boundary
+(`.coll()`, `.coll_by(key)`, below).
+
+**An operator follows the flow its closure returns.** A closure may answer a
+plain value or any `Flow` — a source or a pipe (`IntoFlow`). The
+implementation is chosen per closure when the code is generated, so
+`filter(|n| n > 2)` subscribes to nothing and keeps no record per element,
+while `filter(|row| row.is_pending())` starts the pipe `is_pending` builds for
+each element and follows it: an element that flips in or out is ONE splice at
+its output position (the count of kept elements before it, from a Fenwick
+index), and `any`/`all`/`count` are counters that move by one.
+
+```vilan
+import std::reactive::{ ListCell, Signal, SignalCell, comp };
+
+fun main() {
+	let online: List<SignalCell<bool>> = [Signal::new(true), Signal::new(false)];
+	let people: ListCell<usize> = ListCell::of([0usize, 1usize]);
+	let ((here, anyone), scope) = comp(|| (
+		people.filter(|at| online[at].derive(|on| on)).memo(),
+		people.any(|at| online[at].derive(|on| on)).memo()
+	));
+	print(here.get());           // [ 0 ]
+	online[0].set(false);        // one splice out
+	print(anyone.get());         // false
+	online[1].set(true);         // one splice in; the counter moves once
+	print(here.get());           // [ 1 ]
+	scope.dispose();
+}
+```
+
+`filter`, `filter_map`, `any`, `all` and `count` follow a returned flow,
+because their output shape fixes what the flow's value means. **`map` never
+follows a returned `Source`**: a source is data and may be the element —
+`ids.map(open_mirror)` is a collection OF mirrors, and `.flatten()` is the
+explicit follow. A returned PIPE is started per element and its value carried
+(`IntoElement`), since a pipe cannot be an element. `filter_map(|x| x)` over a
+collection of `Option`-valued flows is the join; a closure answering
+`Option<Source<X>>` keeps the sources.
+
+**Every run has an owner.** A closure runs once per element that arrives and
+again per element that changes; what a run registers — an `on_cleanup`, a
+`.memo()`, a subscription — is released when the element leaves or re-runs,
+and a removed element's followed flow is detached. The owner is split off
+only when the run registered something, so a plain closure costs no owner at
+all. A task a closure starts belongs to the stage and is cancelled when the
+pipe's consumer releases it.
+
+## coll and coll_by — coarse into granular
+
+```vilan,fragment
+impl type F: Flow<List<type T>> {
+	fun coll_by<K: PartialEq + Hashable>(own self, key: sync |T| K): CollBy<F, T, K>
+}
+impl type F: Flow<List<type T: PartialEq>> {
+	fun coll(own self): Coll<F, T>
+}
+```
+
+A flow of WHOLE lists — a `SignalCell<List<T>>`, a derivation, a mirror sealed
+with `.memo()` — threw its change away upstream, so the only way back to a
+granular collection is a diff, and these two are the doors. Both return a
+collection pipe.
+
+- **`.coll_by(key)`** is the keyed diff `each_by` already runs
+  (`ReconcilePlan`), O(n) per change with hashing. A reordered element is a
+  `Move`, so it keeps its identity — and so does whatever follows it
+  downstream. A matched element whose value changed is a `SetAt` when the
+  element has `==`; without one (a collection of sources), the same key is the
+  same element.
+- **`.coll()`** is the positional fallback for `T: PartialEq`: it trims the
+  common prefix and suffix and splices what is between, so an append, an
+  insertion and a removal are each one op of one element.
+
+```vilan
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell, comp };
+
+fun main() {
+	let fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+	let (evens, scope) = comp(|| fetched.coll().filter(|n| n % 2 == 0).memo());
+	fetched.set([1, 2, 3, 4]);   // one splice of one element: 4 arrived
+	print(evens.get());          // [ 2, 4 ]
+	scope.dispose();
+}
+```
+
+The real fix is upstream — keep the source of truth granular (`ListCell`), and
+diff only at the boundaries: a fetch result, a wire snapshot.
 
 ## reconcile: keyed list diffing
 
