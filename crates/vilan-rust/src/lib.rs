@@ -513,6 +513,11 @@ struct ObjectSlot {
     signature: String,
     /// The non-receiver parameters' names, in order — what an impl forwards.
     forwarded: Vec<String>,
+    /// B470: the declaration takes `own self`, so the slot CONSUMES the
+    /// object — `self: Rc<Self>` — and hands the value on unshared when the
+    /// pointer is the only one (a `[resource]` object always is), rather than
+    /// copying it out from behind a borrow.
+    consumes: bool,
 }
 
 /// F31's walk state: where each binding was declared, and the last read of it
@@ -2933,7 +2938,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn reference_equality_reaches(rendered: &str) -> bool {
-        if rendered.starts_with("std::rc::Rc<") {
+        // A counted closure compares by pointer, and so does a CELL, whatever
+        // it holds (`vilan_rt::ReferenceEq` for `Shared`/`Weak`).
+        if rendered.starts_with("std::rc::Rc<") || compares_by_cell_identity(rendered) {
             return true;
         }
         for wrapper in ["Option<", "Vec<"] {
@@ -3098,8 +3105,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(Expr::Local(target)) | Some(Expr::Parameter(target)) => *target,
             _ => return None,
         };
+        // F59: the callee's return as its signature is EMITTED — written, or
+        // the analyzer's inference for an unannotated one (`fun make() { Square
+        // { .. } }`, and B460's checked returns). A field read off the call
+        // (`make(2).side`) had no struct to find its field in.
         if let Some(function) = self.program.functions.get(&target) {
-            return function.return_type_id;
+            return self.return_type_of(function);
         }
         // F53: a call through a CLOSURE-typed binding answers the closure
         // type's return — `erase(r).get()` with `erase: |Root| dyn Src` is a
@@ -9509,8 +9520,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         // A member a SUPERTRAIT declares is written in that trait's terms, and
         // the chain's `with` clauses say what its parameters are here.
+        let consumes = self.receiving_form(&receiver) == Receiving::ByValue;
         let saved = self.enter_substitution(chain);
-        let rendered = self.object_slot_signature(member, rest, &function, span);
+        let rendered = self.object_slot_signature(member, rest, &function, consumes, span);
         self.current_substitution = saved;
         let (signature, forwarded) = rendered?;
         Ok(Some(ObjectSlot {
@@ -9518,6 +9530,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             declaration,
             signature,
             forwarded,
+            consumes,
         }))
     }
 
@@ -9526,9 +9539,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         member: &str,
         parameters: &[Id],
         function: &vilan_core::analyzer::Function<'src>,
+        consumes: bool,
         span: Span,
     ) -> Result<(String, Vec<String>), Error> {
-        let mut rendered = vec!["&self".to_string()];
+        let receiver = if consumes {
+            "self: std::rc::Rc<Self>"
+        } else {
+            "&self"
+        };
+        let mut rendered = vec![receiver.to_string()];
         let mut forwarded = Vec::new();
         for parameter in parameters {
             // A trait method with no body takes no binding patterns, so the
@@ -9613,7 +9632,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .and_then(|parameter| self.program.parameters.get(parameter))
                 .map(|parameter| self.receiving_form(parameter))
             {
+                Some(Receiving::Ref) if slot.consumes => "&*self".to_string(),
                 Some(Receiving::Ref) => "self".to_string(),
+                // B470: the consuming slot takes the value out of its pointer —
+                // without a copy when the pointer is the only one.
+                Some(Receiving::ByValue) if slot.consumes => "vilan_rt::unshare(self)".to_string(),
                 Some(Receiving::ByValue) => "self.clone()".to_string(),
                 _ => {
                     self.object_impls
@@ -9703,7 +9726,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if !rendered.is_empty() {
             rendered.remove(0);
         }
-        let mut parts = vec![format!("({receiver}).object()")];
+        // B470: a consuming slot takes the object's POINTER. A receiver at its
+        // last use (or a temporary) hands its own over, so a `[resource]`
+        // object — move-only, so the pointer is unique — reaches the member
+        // uncopied; any other keeps its value and hands on a counted copy of
+        // the pointer, and the slot copies the value out as before.
+        let receiver = if slot.consumes {
+            if self.hands_over_its_object(*receiver_id) {
+                format!("({receiver}).into_object()")
+            } else {
+                format!("({receiver}).clone().into_object()")
+            }
+        } else {
+            format!("({receiver}).object()")
+        };
+        let mut parts = vec![receiver];
         parts.extend(rendered);
         Ok(Self::with_argument_prelude(
             prelude,
@@ -9714,6 +9751,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 parts.join(", ")
             ),
         ))
+    }
+
+    /// Whether a consuming slot call's receiver may give its object pointer
+    /// away: a value that is not a place (a call's result), or a place read at
+    /// its last use in storage this frame owns — never a loan, a capture, a
+    /// view or a cell-resident binding.
+    fn hands_over_its_object(&self, receiver: Id) -> bool {
+        match self.program.entity_map.get(&receiver) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => {
+                let binding = *binding;
+                self.last_uses.contains(&receiver)
+                    && !self.reads_a_captured_binding(receiver)
+                    && !self.reads_a_loaned_parameter(receiver)
+                    && !self.binding_holds_a_view(binding)
+                    && !self.boxed.contains(&binding)
+                    && !self.module_bindings.contains(&binding)
+            }
+            Some(Expr::Field(..)) | Some(Expr::TupleIndex(..)) => {
+                self.last_field_uses.contains(&receiver)
+                    && self
+                        .owned_field_spine_root(receiver)
+                        .is_some_and(|root| !self.reads_a_captured_binding(root))
+            }
+            Some(Expr::Index(..)) | Some(Expr::Dereference(..)) | Some(Expr::Reference(..)) => {
+                false
+            }
+            _ => true,
+        }
     }
 
     fn resolve_dispatch(
@@ -9864,6 +9929,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             type_id,
             &mut substitution,
         );
+        // F58: a blanket's bound binder can come back written in its
+        // PROVIDER's binder (`T = List<E>` for a `ListCell<E>` source); bind
+        // that one too, so the instance renders `List<str>`.
+        impl_select::bind_provider_binders(self.program, selected.impl_subject, &mut substitution);
         substitution.extend(self.own_generic_entries(member_id, own_generic_values));
         let name = self.ensure_function(member_id, &substitution)?.name;
         Ok(NativeDispatch::Call(name))

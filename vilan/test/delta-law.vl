@@ -240,7 +240,7 @@ fun map_each<S: DeltaSource<List<i32>, SeqOp<i32>>>(source: S): ListCell<i32> {
 	}
 	let out: ListCell<i32> = ListCell<i32>::new(seeded);
 	let read = source.reader();
-	let _owned = observe(source, |_list| {
+	let _owned = source.on_change(|_list| {
 		notifications.write() = notifications.read() + 1;
 		for op in read(cursor) {
 			match op {
@@ -275,15 +275,6 @@ fun map_each<S: DeltaSource<List<i32>, SeqOp<i32>>>(source: S): ListCell<i32> {
 		}
 	});
 	out
-}
-
-/// `on_change`, reached through a `Source` bound. Two finds route it here
-/// (A142 S1, reactive-44): under `map_each`'s `DeltaSource` bound, a subtrait of
-/// `Source`, a call of `attach_observer` runs `Source`'s default and not the
-/// cell's own; and `on_change`'s blanket `Flow` hop is not yet built natively
-/// under a generic `S` whose value is a list of the cell's parameter.
-fun observe<S: Source<List<i32>>>(source: S, observer: |List<i32>| void): Subscription {
-	source.attach_observer(observer, false)
 }
 
 fun same(left: List<i32>, right: List<i32>): bool {

@@ -721,6 +721,22 @@ impl<T: ReferenceEq> ReferenceEq for Vec<T> {
     }
 }
 
+/// A cell compares by IDENTITY (its `PartialEq` is `ptr_eq` already), which is
+/// JavaScript's `===` on the object it is there. So an `Option` or a `Vec` of a
+/// cell holding closures has reference equality too: `Option<Shared<List<||
+/// void>>>`, an owner's lazily allocated cleanup list.
+impl<T> ReferenceEq for Shared<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl<T> ReferenceEq for Weak<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 /// [`ReferenceEq::reference_eq`] as a free function, so the emitter can spell it
 /// without naming the trait at the site.
 pub fn reference_eq<T: ReferenceEq + ?Sized>(left: &T, right: &T) -> bool {
@@ -760,6 +776,19 @@ impl<T: ?Sized> Dyn<T> {
     pub fn object(&self) -> &T {
         &self.object
     }
+
+    /// The erased value's POINTER, for a slot that consumes its receiver
+    /// (`own self`, B470): `ObjectFlow::start(x.into_object())`.
+    pub fn into_object(self) -> Rc<T> {
+        self.object
+    }
+}
+
+/// The value behind a consuming slot's pointer: moved out when the pointer is
+/// the only one — a `[resource]` object always is, since it is move-only — and
+/// copied out otherwise, as a borrowing slot always did (B470).
+pub fn unshare<T: Clone>(object: Rc<T>) -> T {
+    Rc::try_unwrap(object).unwrap_or_else(|shared| (*shared).clone())
 }
 
 impl<T: ?Sized> Clone for Dyn<T> {

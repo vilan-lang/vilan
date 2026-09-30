@@ -725,6 +725,75 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
     }
 }
 
+/// F58: the PROVIDER's own binders, for a consumer that grounds types by
+/// substitution rather than by interning (the native emitter).
+///
+/// [`bind_bound_binders`] grounds a blanket's bound binder one step deep: in
+/// `impl type S: Source<type T> with Flow<T>` at `S = ListCell<str>`, the
+/// provider `impl ListCell<type E> with Source<List<E>>` answers `T =
+/// List<E>` — written in the PROVIDER's binder `E`, which a shallow walk cannot
+/// substitute without interning `List<str>`. This adds `E = str` (the
+/// provider's subject bound from the receiver) to `out`, so a type rendered
+/// under the substitution reaches `List<str>` through it.
+///
+/// Only binders `out` does not already hold are added, and a provider binder
+/// two receivers would bind differently is added for NEITHER: an unbound
+/// binder is refused by name downstream, where a wrong one would be a
+/// miscompile.
+pub fn bind_provider_binders(
+    program: &Program,
+    subject: TypeId,
+    out: &mut HashMap<TypeId, TypeId>,
+) {
+    let Some(_guard) = crate::util::RecursionGuard::enter() else {
+        return;
+    };
+    let mut binders = Vec::new();
+    collect_subject_binders(program, subject, &mut binders);
+    let mut added: HashMap<TypeId, TypeId> = HashMap::default();
+    let mut conflicted: Vec<TypeId> = Vec::new();
+    for binder in binders {
+        let Some(concrete) = out.get(&binder).copied() else {
+            continue;
+        };
+        for bound_id in bound_type_ids(program, binder) {
+            let Some(Type::Trait(trait_id, _)) = program.type_id_to_type_map.get(&bound_id) else {
+                continue;
+            };
+            // The provider `provided_trait_arguments` answers from: the first
+            // impl providing the trait that applies to the receiver.
+            let Some(provider) = program.implementations.iter().find(|implementation| {
+                implementation
+                    .provided_trait_args
+                    .iter()
+                    .any(|(provided, _)| provided == trait_id)
+                    && subject_applies(program, implementation.subject, concrete)
+            }) else {
+                continue;
+            };
+            let mut bindings = HashMap::default();
+            bind_subject(program, provider.subject, concrete, &mut bindings);
+            for (provider_binder, value) in bindings {
+                if out.contains_key(&provider_binder) {
+                    continue;
+                }
+                match added.get(&provider_binder) {
+                    Some(previous) if *previous != value => conflicted.push(provider_binder),
+                    Some(_) => {}
+                    None => {
+                        added.insert(provider_binder, value);
+                    }
+                }
+            }
+        }
+    }
+    for (provider_binder, value) in added {
+        if !conflicted.contains(&provider_binder) {
+            out.insert(provider_binder, value);
+        }
+    }
+}
+
 /// The bound type ids a binder carries — the `Src<type T>` of
 /// `type S: Src<type T>`, arguments and all. [`bound_trait_ids`] reads the same
 /// list for its ids alone.

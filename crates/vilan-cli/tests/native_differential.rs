@@ -6590,3 +6590,285 @@ const SHARED_FIELD_PROBE: &str = concat!(
     "\tprint(follow(\"x\")());\n",
     "}\n",
 );
+
+/// F58: `on_change` through the blanket `Flow` impl, reached under a generic
+/// bound `S: Source<List<X>>` whose value is a `ListCell<X>`. The blanket's
+/// binder `T` grounds from the provider `impl ListCell<type E> with
+/// Source<List<E>>` as `List<E>` — written in the PROVIDER's binder, which
+/// the substitution never bound, so the instance was refused by name ("an
+/// unbound generic type parameter (parameter 1 of struct `ListCell`)"). The
+/// provider's own binder now binds from the receiver. Two shapes: a toy
+/// source and std's own `ListCell` observed through a generic.
+#[test]
+fn a_blanket_reached_through_a_list_source_bound_builds_the_same_on_both_backends() {
+    let staged = stage();
+    for (program, source) in [
+        ("native_probe_f58_toy.vl", F58_TOY_PROBE),
+        ("native_probe_f58_list_cell.vl", F58_LIST_CELL_PROBE),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: a blanket reached through a `Source<List<X>>` bound must build and \
+             print the same on both backends"
+        );
+    }
+}
+
+const F58_TOY_PROBE: &str = concat!(
+    "trait Src<T> {\n",
+    "\tfun get(self): T;\n",
+    "}\n",
+    "struct LC<T> {\n",
+    "\titems: List<T>,\n",
+    "}\n",
+    "impl LC<type T> with Src<List<T>> {\n",
+    "\tfun get(self): List<T> {\n",
+    "\t\tself.items\n",
+    "\t}\n",
+    "}\n",
+    "trait Fl<T> {\n",
+    "\tfun now(own self): T;\n",
+    "}\n",
+    "impl type S: Src<type T> with Fl<T> {\n",
+    "\tfun now(own self): T {\n",
+    "\t\tself.get()\n",
+    "\t}\n",
+    "}\n",
+    "fun watch<S: Src<List<str>>>(source: S) {\n",
+    "\tprint(source.now().len());\n",
+    "}\n",
+    "fun main() {\n",
+    "\twatch(LC<str> { items = [\"a\", \"b\"] });\n",
+    "}\n",
+);
+
+const F58_LIST_CELL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::delta::ListCell;\n",
+    "import std::reactive::{ Disposable, Source };\n",
+    "\n",
+    "fun watch<S: Source<List<str>>>(source: S) {\n",
+    "\tlet watching = source.on_change(|list| print(i\"changed {list.len()}\"));\n",
+    "\tsource.get();\n",
+    "\twatching.dispose();\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet source: ListCell<str> = ListCell::new();\n",
+    "\twatch(source);\n",
+    "\tlet kept = source.on_change(|list| print(i\"kept {list.len()}\"));\n",
+    "\tsource.push(\"b\");\n",
+    "\tkept.dispose();\n",
+    "}\n",
+    "main();\n",
+);
+
+/// F59: a field read on a call whose return type is INFERRED — `fun make(..)
+/// { Square { .. } }` has no written return, and neither has B460's checked
+/// return — builds natively. The call's type was read off the written
+/// signature alone, so `make(2).side` had no struct to name its field from.
+#[test]
+fn a_field_read_on_an_inferred_return_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_f59.vl"), F59_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f59.vl"),
+        Verdict::Identical,
+        "a field read on an inferred return must build and print the same on both backends"
+    );
+}
+
+const F59_PROBE: &str = concat!(
+    "struct Square {\n",
+    "\tside: i32,\n",
+    "\tname: str,\n",
+    "}\n",
+    "fun make_square(side: i32) {\n",
+    "\tSquare { side = side, name = \"sq\" }\n",
+    "}\n",
+    "fun relabel(side: i32) {\n",
+    "\tlet made = make_square(side);\n",
+    "\tSquare { side = made.side * 2, name = i\"{made.name}!\" }\n",
+    "}\n",
+    "fun main() {\n",
+    "\tprint(make_square(2).side);\n",
+    "\tprint(relabel(3).side);\n",
+    "\tprint(relabel(3).name);\n",
+    "}\n",
+);
+
+/// A142 parity: an `Option` of a CELL holding closures — an owner's lazily
+/// allocated cleanup list, `Option<Shared<List<|| void>>>` — has reference
+/// equality natively (a cell compares by identity, as the JS object does), so
+/// the struct holding it builds. It was refused by name, and reactive-44
+/// wrote S2's `OwnerCell` around the refusal.
+#[test]
+fn an_option_of_a_cell_of_closures_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_option_cell.vl"),
+        OPTION_CELL_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_option_cell.vl"),
+        Verdict::Identical,
+        "an `Option` of a cell of closures must build and print the same on both backends"
+    );
+}
+
+const OPTION_CELL_PROBE: &str = concat!(
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Cell {\n",
+    "\tcleanups: Option<Shared<List<|| void>>>,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet c: Shared<Cell> = Shared::new(Cell { cleanups = None });\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => list.write().push(|| print(\"x\")),\n",
+    "\t\tNone => {\n",
+    "\t\t\tc.write() = Cell { cleanups = Some(Shared::new([|| print(\"first\")])) };\n",
+    "\t\t},\n",
+    "\t}\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => list.write().push(|| print(\"second\")),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => {\n",
+    "\t\t\tfor f in list.read() {\n",
+    "\t\t\t\tf();\n",
+    "\t\t\t}\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// B470's native half: a `[resource]` trait's object is MOVED into its
+/// consuming members. `Flow` is declared `[resource]` (A142 R39), so a
+/// `dyn Flow<i32>` is move-only and its pointer unique; a slot whose member
+/// takes `own self` takes the pointer (`self: Rc<Self>`) and moves the value
+/// out of it (`vilan_rt::unshare`), where it copied the pipe out from behind a
+/// borrow. Two programs: the mixed-arm selector (`dyn_objects`'
+/// `a142_a_mixed_arm_selector_…`), whose arms are a `Derive` pipe and a root,
+/// and a `dyn Flow` handed to an `own` parameter and consumed once.
+#[test]
+fn a_resource_trait_object_is_moved_into_its_consuming_members_natively() {
+    let staged = stage();
+    for (program, source) in [
+        ("native_probe_b470_selector.vl", B470_SELECTOR_PROBE),
+        ("native_probe_b470_once.vl", B470_ONCE_PROBE),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: a `dyn Flow` must build and print the same on both backends"
+        );
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("build the probe");
+        let source = String::from_utf8_lossy(&emitted.stdout);
+        // The table's consuming slots move the value out of the pointer.
+        let slots: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains("fn start(") || line.contains("fn on_change("))
+            .filter(|line| line.trim_start().starts_with("fn "))
+            .collect();
+        assert!(
+            !slots.is_empty()
+                && slots
+                    .iter()
+                    .all(|line| line.contains("self: std::rc::Rc<Self>")),
+            "{program}: a consuming slot must take the object's pointer:\n{}",
+            slots.join("\n")
+        );
+        assert!(
+            source.contains("vilan_rt::unshare(self)") && !source.contains("(self.clone(),"),
+            "{program}: the object's value must be moved out, not copied:\n{source}"
+        );
+    }
+    // The object handed to an `own` parameter is consumed by its one call:
+    // the parameter's pointer is given over, not bumped and copied.
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_b470_once.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    let watch = source
+        .split("\nfn ")
+        .find(|function| function.starts_with("watch_"))
+        .unwrap_or_else(|| panic!("no `watch` in the emitted source:\n{source}"));
+    assert!(
+        watch.contains(").into_object()") && !watch.contains(".clone().into_object()"),
+        "the `own` object must be handed over whole:\n{watch}"
+    );
+}
+
+const B470_SELECTOR_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Flow, MemoCell, Signal, SignalCell, Source };\n",
+    "\n",
+    "fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value * 100)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag = Signal::new(true);\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet picked: MemoCell<i32> = flag.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();\n",
+    "\tprint(i\"{picked.get()}\");\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(i\"{picked.get()}\");\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
+
+const B470_ONCE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Disposable, Flow, Signal, SignalCell, Source, Subscription };\n",
+    "\n",
+    "fun pick(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value + 1)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun watch(label: str, own flow: dyn Flow<i32>): Subscription {\n",
+    "\tflow.on_change(|value| print(i\"{label} {value}\"))\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet piped = pick(true, count);\n",
+    "\tlet a = watch(\"piped\", piped);\n",
+    "\tlet b = watch(\"root\", pick(false, count));\n",
+    "\tcount.set(5);\n",
+    "\ta.dispose();\n",
+    "\tb.dispose();\n",
+    "\tcount.set(9);\n",
+    "\tprint(\"done\");\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);

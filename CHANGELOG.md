@@ -26,6 +26,18 @@ written down.
 ## Unreleased
 
 <!-- family: feature -->
+**A `[resource]` trait's object is moved into its consuming members natively (B470's native half).** `Flow` is declared `[resource]`, so a `dyn Flow<T>` is move-only and its pointer unique; a table slot whose member takes `own self` now takes the object's pointer and moves the value out of it, where it copied the pipe out from behind a borrow at every `start`, `on_change` and `effect`. A receiver at its last use hands its pointer over whole; any other (a `dyn Source<T>`, still data) hands on a counted copy of the pointer and the value is copied out as before. A142's mixed-arm selector and a `dyn Flow` handed to an `own` parameter print the same bytes natively as on node.
+
+<!-- family: feature -->
+**A struct holding an `Option` of a cell of closures — `Option<Shared<List<|| void>>>`, an owner's lazily allocated cleanup list — builds natively.** A cell compares by identity (JavaScript's `===` on the object), so an `Option` or a `List` of one has reference equality too; the native backend refused the struct by name, and A142 S2's `OwnerCell` was written around the refusal.
+
+<!-- family: feature -->
+**A field read on a call whose return type is inferred builds natively: `make_square(2).side`, where `make_square` writes no return type — and B460's checked returns, which take the same path.** The call's type was read off the written signature alone, so the field read had no struct to find its field in and was refused by name. It now reads the return as the callee's emitted signature does (written, or the analyzer's inference). Tracker F59.
+
+<!-- family: feature -->
+**`on_change` (and every blanket `Flow` member) reached through a generic `Source<List<X>>` bound builds natively, and the two places written around it go back to `on_change`.** The blanket `impl type S: Source<type T> with Flow<T>` grounds its `T` from the receiver's own `Source` impl — for a `ListCell<E>`, `List<E>`, written in the PROVIDER's binder `E`, which the native substitution never bound, so `map_each`'s attach and `delta-law.vl`'s were refused by name ("an unbound generic type parameter (parameter 1 of struct `ListCell`)"). The provider's binder now binds from the receiver (`impl_select::bind_provider_binders`; a binder two receivers would bind differently is left unbound and refused, never guessed). `std::delta::map_each` attaches with `on_change` again rather than a hand-minted subscriber (so `mint_subscriber` is private again), and `delta-law.vl` drops its `observe` helper; the native leak census holds at `live = 0` on both. Tracker F58.
+
+<!-- family: feature -->
 **Two shapes A142's pipe nodes are written in build natively: a field read off a `Shared` cell's read, and a closure handing back one of its captures.** `(followed.read().pull)()` — a `switch` node calling its current inner instance — was refused by name ("a field read of an unresolved subject"), because a cell's `read()` recorded no type for the field read to find its struct in; it answers the cell's element now. And an expression-bodied closure returning a capture (`|| v` over a non-`Copy` `v`) moved its own capture out, which `rustc` refuses for a closure every closure type lowers to as `dyn Fn`: an expression body is now a value position like a block body's tail, so the read is the copy it is everywhere else. Found probing reactive-44's pipe layout (A142 S1) natively.
 
 <!-- family: feature -->
