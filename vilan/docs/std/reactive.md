@@ -22,8 +22,8 @@ import std::reactive::{
 | Item | Kind | One line |
 |---|---|---|
 | `Source<T>` | trait | anything with state that can be read (requires `get`/`on_settle`); every source is a `Flow` |
-| `Flow<T>` | trait | anything a pipeline starts from — every source and every pipe; carries the consumers (`on_change`/`sub`/`effect`/`effect_on_change`) and the combinators (`derive`/`switch`/`distinct_by`; `switch_some`/`and_then`/`then_some`/`flatten`/`distinct` as blankets), all `own self` |
-| `Pipe<T>` | trait | a move-only transformation; carries the sealing operations `memo`/`cell`/`memo_global`/`cell_global`/`sample` |
+| `Flow<T>` | `[resource]` trait | anything a pipeline starts from — every source and every pipe; carries the consumers (`on_change`/`sub`/`effect`/`effect_on_change`) and the combinators (`derive`/`switch`/`distinct_by`; `switch_some`/`and_then`/`then_some`/`flatten`/`distinct` as blankets), all `own self` |
+| `Pipe<T>` | `[resource]` trait | a move-only transformation; carries the sealing operations `memo`/`cell`/`memo_global`/`cell_global`/`sample` |
 | `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
 | `MemoCell<T>` | struct | a sealed derivation's read-only face — what `.memo()` returns |
 | `Constant<T>` | struct | `Source::constant(v)`: a source that never changes |
@@ -250,6 +250,7 @@ trait Source<T> with Flow<T> {
 	fun constant(value: T): Constant<T>                               // `Source::constant(v)`
 }
 
+[resource]
 trait Flow<T> {
 	[must_use]
 	fun start(own self): Instance<T>                                  // the stage author's member
@@ -267,6 +268,7 @@ trait Flow<T> {
 	…
 }
 
+[resource]
 trait Pipe<T> with Flow<T> {
 	fun memo(own self): MemoCell<T>          // seal: read-only, owner-tied
 	fun cell(own self): SignalCell<T>        // seal: writable, owner-tied
@@ -292,6 +294,39 @@ them takes `own self` — for a source that is a copy, for a pipe the move that
 makes a second consumer a compile error (`use of 'p' after it was moved`).
 **`Pipe`** adds the sealing operations, which exist only on pipes: a cell has no
 `.memo()`, and a pipe has no `get()`.
+
+**`dyn Flow<T>` holds either, once.** `Flow` and `Pipe` are declared
+`[resource]` (A142 R39), so a pipe stage erases into `dyn Flow<T>` and the
+object is move-only: consumed once, like the pipe it may hold. The attribute
+belongs to the trait that declares it, so `dyn Source<T>` stays copyable (a
+source is data) though `Source` extends `Flow`. Arms of different types meet in
+the object where one is expected, which is how a selector hands back a pipe from
+one arm and a root from the other:
+
+```vilan
+import std::reactive::{ Flow, MemoCell, Signal, SignalCell, Source };
+
+fun arm(scaled: bool, count: SignalCell<i32>): dyn Flow<i32> {
+	if scaled {
+		count.derive(|value| value * 100)
+	} else {
+		count
+	}
+}
+
+fun main() {
+	let scaled = Signal::new(true);
+	let count = Signal::new(1);
+	let shown: MemoCell<i32> = scaled.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();
+	print(shown.get());   // 100
+	scaled.set(false);
+	count.set(3);
+	print(shown.get());   // 3
+}
+```
+
+(The type arguments are written: `switch` does not yet infer its `U` through the
+object's trait argument.)
 
 A source of your own implements **`get` and `on_settle`**. Everything else —
 `on_change`, `sub`, `effect`, `derive` — arrives through `Flow`:
@@ -716,8 +751,8 @@ fun combine<T: (2..)>(sources: (U in T: dyn Source<U>)): Combine<T>
 A pipe of the tuple of the sources' current values, changing when any source
 changes. Variadic over tuples of mixed element types, and each element is any
 `Source` — a cell, a sealed memo, a mirror — erased to `dyn Source<U>` at the
-call. A derived input is sealed first: a pipe is a `[resource]`, and a resource
-cannot become a `dyn`:
+call. A derived input is sealed first: a pipe may become a `dyn Flow`, never a
+`dyn Source`, since a source is copied freely and a pipe is not:
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Source, combine };

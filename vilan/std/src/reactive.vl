@@ -1378,7 +1378,11 @@ export struct Instance<T> {
 /// so handing one pipe to two consumers, or branching it (`let q = p.derive(..);
 /// p.memo();`), is "use of `p` after it was moved". Two consumers of one derived
 /// value need a `Source` between them: seal it with `.memo()`.
-export trait Flow<T> {
+///
+/// Declared `[resource]` (R39): a pipe stage erases into `dyn Flow<T>`, and that
+/// object is move-only. The attribute is this trait's alone, so `dyn Source<T>`
+/// stays copyable though `Source` extends `Flow`.
+export [resource] trait Flow<T> {
 	/// Start this flow for its one consumer: the node author's member, where every
 	/// member below is the consumer's. A stage starts its upstream, keeps whatever
 	/// state its instance needs, and hands back how to read it, attach to it and
@@ -1533,7 +1537,7 @@ fun observe_flow<T, F: Flow<T>>(own flow: F, observer: |T| void, immediately: bo
 ///     let total = cart.derive(|c| c.sum()).memo();   // one instance, one run per change
 ///     text(total);                                    // a source is data: pass it anywhere
 ///     badge(total.derive(|t| t > 100));               // each consumer builds its own pipe
-export trait Pipe<T> with Flow<T> {
+export [resource] trait Pipe<T> with Flow<T> {
 	/// Seal into a READ-ONLY source backed by one cell (A142 R11/R20): the pipe's
 	/// one consumer, run once per change, with the value cached for every reader.
 	/// Nothing downstream can `set` a derivation.
