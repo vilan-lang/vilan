@@ -4699,27 +4699,101 @@ fn a86_two_blankets_bounded_the_same_way_still_collide() {
 }
 
 #[test]
-fn a86_a_blanket_and_a_constructor_headed_impl_still_collide() {
+fn a86_a_blanket_and_a_constructor_headed_impl_are_ranked() {
     // The other control: the bounds clause reaches BARE binders only. A
-    // blanket against a concrete subject is the overlap B73 named, and it is
-    // still refused.
-    assert_fails_with(
+    // blanket beside a concrete subject it claims was B73's overlap and was
+    // refused — but only in THIS declaration order (the blanket first); the
+    // other order compiled and the call took whichever block came first.
+    // B456 (RULED 2026-09-29, door (b)) ranks the pair in both orders: the
+    // concrete subject's member outranks the blanket's at a concrete
+    // receiver, and the blanket answers every other `Read`.
+    assert_compiles_and_runs(
         r#"
         trait Read<T> { fun get(self): T; }
         struct Cell<T> { value: T }
         impl Cell<type T> with Read<T> {
             fun get(self): T { self.value }
         }
+        struct Boxed<T> { value: T }
+        impl Boxed<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
 
         impl type S: Read<type T> {
-            fun peek(self): T { self.get() }
+            fun peek(self): T { print("blanket"); self.get() }
         }
         impl Cell<type T> {
-            fun peek(self): T { self.value }
+            fun peek(self): T { print("concrete"); self.value }
         }
 
-        fun main() { }
+        fun main() {
+            print(Cell { value = 1 }.peek());
+            print(Boxed { value = 2 }.peek());
+        }
         "#,
+        "concrete\n1\nblanket\n2\n",
+    );
+}
+
+/// B456 (RULED 2026-09-29, door (b)): a blanket and a concrete subject it
+/// claims share a name in EITHER declaration order, with one answer: the
+/// concrete member at a concrete receiver, the blanket's for every other type
+/// and through a bound. The same program is run in both orders.
+const B456_HEAD: &str = r#"
+trait Read<T> { fun get(self): T; }
+struct Cell<T> { value: T }
+impl Cell<type T> with Read<T> {
+    fun get(self): T { self.value }
+}
+struct Boxed<T> { value: T }
+impl Boxed<type T> with Read<T> {
+    fun get(self): T { self.value }
+}
+"#;
+const B456_CONCRETE: &str = r#"
+impl Cell<type T> {
+    fun peek(self): str { "concrete" }
+}
+"#;
+const B456_BLANKET: &str = r#"
+impl type S: Read<type T> {
+    fun peek(self): str { "blanket" }
+}
+"#;
+const B456_MAIN: &str = r#"
+fun through<S: Read<i32>>(source: S): str { source.peek() }
+fun main() {
+    print(Cell { value = 1 }.peek());
+    print(Boxed { value = 2 }.peek());
+    print(through(Cell { value = 3 }));
+}
+"#;
+
+#[test]
+fn b456_the_concrete_block_declared_first_is_ranked() {
+    assert_compiles_and_runs(
+        &format!("{B456_HEAD}{B456_CONCRETE}{B456_BLANKET}{B456_MAIN}"),
+        "concrete\nblanket\nblanket\n",
+    );
+}
+
+#[test]
+fn b456_the_blanket_declared_first_is_ranked_the_same() {
+    // Refused as "already defined" before the ruling.
+    assert_compiles_and_runs(
+        &format!("{B456_HEAD}{B456_BLANKET}{B456_CONCRETE}{B456_MAIN}"),
+        "concrete\nblanket\nblanket\n",
+    );
+}
+
+#[test]
+fn b456_two_concrete_blocks_still_collide() {
+    // The ranking is for a blanket beside a constructor-headed subject; two
+    // constructor-headed blocks declaring one name are still a duplicate.
+    assert_fails_with(
+        &format!(
+            "{B456_HEAD}{B456_CONCRETE}\nimpl Cell<i32> {{\n    fun peek(self): str {{ \"again\" }}\n}}\nfun main() {{}}\n"
+        ),
         "'peek' is already defined for",
     );
 }

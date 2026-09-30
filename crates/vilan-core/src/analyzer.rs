@@ -9360,6 +9360,17 @@ impl<'src> Analyzer<'src> {
         earlier_subject: TypeId,
     ) -> Option<SubjectCollision> {
         let earlier_type = earlier_subject.get_type(self);
+        // B456 (RULED 2026-09-29, door (b)): a BLANKET (`impl type S: Read<..>`)
+        // and a constructor-headed subject it claims (`impl Cell<type T>`) are
+        // not one name declared twice — they are RANKED, in either declaration
+        // order: at a concrete receiver the concrete subject's member outranks
+        // the blanket's (`rank_member_candidates`' tier 1), and through a bound
+        // the blanket answers. This rule used to refuse the pair only when the
+        // blanket came FIRST (the comparison below is asked concrete-against-
+        // blanket), so which body a call took was declaration and load order.
+        if matches!(subject_type, Type::Generic(_)) != matches!(earlier_type, Type::Generic(_)) {
+            return None;
+        }
         if !self.compare_type(subject_type, &earlier_type, &HashMap::default()) {
             return None;
         }
@@ -19463,11 +19474,25 @@ impl<'src> Analyzer<'src> {
         // definition-site error (`check_duplicate_inherent_members`); resolution
         // still takes the first in the deterministic order, so that one error
         // does not cascade into a second at every call site.
-        if let Some(inherent) = candidates
+        //
+        // B456 (RULED 2026-09-29, door (b)): the one pair that rule ADMITS — a
+        // blanket beside a constructor-headed subject it claims — is ranked,
+        // not ordered: the constructor-headed subject's member outranks the
+        // blanket's, whichever was declared or loaded first.
+        let inherent = |candidate: &&ImplMemberCandidate| candidate.home_trait.is_none();
+        let blanket = |candidate: &ImplMemberCandidate| {
+            matches!(
+                self.borrow_type_by_type_id(candidate.impl_subject),
+                Type::Generic(_)
+            )
+        };
+        if let Some(winner) = candidates
             .iter()
-            .find(|candidate| candidate.home_trait.is_none())
+            .filter(inherent)
+            .find(|candidate| !blanket(candidate))
+            .or_else(|| candidates.iter().find(inherent))
         {
-            return ImplMemberResolution::Found(inherent.member_id, inherent.impl_subject);
+            return ImplMemberResolution::Found(winner.member_id, winner.impl_subject);
         }
         // Tier 2: trait-provided. A home is `(trait, the arguments THIS receiver
         // instantiates)` — B73's R1. Keying on the trait id alone made std's

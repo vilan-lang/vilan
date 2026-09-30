@@ -70,6 +70,55 @@ fn analyze_package_raw(files: &[(&str, &str)], entry: &str, platform: Platform) 
     errors
 }
 
+/// B456: writes `files` into a fresh package, compiles `entry` through the
+/// whole pipeline and runs the result with `node`, returning its stdout — for
+/// the pins whose claim is WHICH body a cross-module call reached.
+fn run_package(files: &[(&str, &str)], entry: &str) -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_run_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "{:?}",
+        errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+    );
+    let js = vilan_core::transform(
+        &program.expect("a program"),
+        &vilan_core::BuildOptions::default(),
+    )
+    .expect("the program emits");
+    let script = dir.join("out.mjs");
+    std::fs::write(&script, js).unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&script)
+        .output()
+        .expect("run node");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// As [`analyze_package_raw`], but just the diagnostic messages.
 fn analyze_package(files: &[(&str, &str)], entry: &str, platform: Platform) -> Vec<String> {
     analyze_package_raw(files, entry, platform)
@@ -6975,6 +7024,69 @@ fn b318_a_files_own_block_colliding_with_an_imported_one_is_refused_at_the_impor
             && message.contains("`import shape::{ (impl Bag)::new };`")),
         "expected the import-site refusal naming `shape`: {diagnostics:?}"
     );
+}
+
+/// B456 (RULED 2026-09-29, door (b)): the concrete block and the blanket in
+/// two modules are RANKED, not refused, and the answer does not depend on
+/// which module loads first (`alpha` before `omega`) or which the file
+/// imports first — the concrete member at a concrete receiver, the blanket's
+/// for another `Read` type.
+fn b456_files(concrete: &str, blanket: &str, app: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "read.vl".to_string(),
+            "export trait Read<T> {\n\tfun get(self): T;\n}\n\n\
+             export struct Cell<T> {\n\tvalue: T,\n}\n\n\
+             export impl Cell<type T> with Read<T> {\n\tfun get(self): T {\n\t\tself.value\n\t}\n}\n\n\
+             export struct Boxed<T> {\n\tvalue: T,\n}\n\n\
+             export impl Boxed<type T> with Read<T> {\n\tfun get(self): T {\n\t\tself.value\n\t}\n}\n"
+                .to_string(),
+        ),
+        (
+            format!("{concrete}.vl"),
+            "import pkg::read::Cell;\n\n\
+             export impl Cell<type T> {\n\tfun peek(self): str {\n\t\t\"concrete\"\n\t}\n}\n"
+                .to_string(),
+        ),
+        (
+            format!("{blanket}.vl"),
+            "import pkg::read::Read;\n\n\
+             export impl type S: Read<type T> {\n\tfun peek(self): str {\n\t\t\"blanket\"\n\t}\n}\n"
+                .to_string(),
+        ),
+        ("app.vl".to_string(), app.to_string()),
+    ]
+}
+
+#[test]
+fn b456_the_cross_module_pair_is_ranked_in_every_order() {
+    for (concrete, blanket) in [("alpha", "omega"), ("omega", "alpha")] {
+        for concrete_first in [true, false] {
+            let (first, second) = match concrete_first {
+                true => (concrete, blanket),
+                false => (blanket, concrete),
+            };
+            let app = format!(
+                "import pkg::read::{{ Cell, Boxed }};\nimport pkg::{first};\nimport pkg::{second};\n\n\
+                 fun main() {{\n\tprint(Cell {{ value = 1 }}.peek());\n\tprint(Boxed {{ value = 2 }}.peek());\n}}\n"
+            );
+            let owned = b456_files(concrete, blanket, &app);
+            let files: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(name, body)| (name.as_str(), body.as_str()))
+                .collect();
+            let diagnostics = analyze_package(&files, "app.vl", Platform::default());
+            assert!(
+                diagnostics.is_empty(),
+                "concrete `{concrete}`, blanket `{blanket}`, `{first}` imported first: {diagnostics:?}"
+            );
+            let output = run_package(&files, "app.vl");
+            assert_eq!(
+                output, "concrete\nblanket\n",
+                "concrete `{concrete}`, blanket `{blanket}`, `{first}` imported first"
+            );
+        }
+    }
 }
 
 /// The `export impl` exhibit: a CURATED module (it exports its struct) whose

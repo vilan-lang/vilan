@@ -469,7 +469,9 @@ bounds and so reaches the blanket. The bounds must entail the blanket's,
 arguments included: a blanket over `Src<str>` is not reached through
 `S: Src<i32>`. Through the bound the parameter stays opaque. An inherent
 blanket member is called as written, and the concrete type's own
-same-named inherent member is out of scope there; a trait member the
+same-named inherent member is out of scope there — while at a CONCRETE
+receiver that member outranks the blanket's, whichever was declared or
+loaded first; a trait member the
 blanket provides dispatches at monomorphization to the most specific impl
 of that trait, as every call through a bound does.
 

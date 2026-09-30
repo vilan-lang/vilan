@@ -273,6 +273,12 @@ where it is called.
 A type has one namespace, so **receiver position is not part of the
 name**: a static `fun new()` and a method `fun new(self)` for the same
 type collide with each other too. Give one of them a different name.
+
+One pair is ranked rather than refused: a BLANKET (`impl type S: Read<type
+T> { fun peek … }`) beside a type it covers that declares the same name
+itself (`impl Cell<type T> { fun peek … }`). At a `Cell` receiver the
+type's own member answers; for every other `Read` type, and through a
+`S: Read<…>` bound, the blanket's does — in either declaration order.
 → [Names, modules, and packages](../spec/names.md)
 
 **"'…' is already implemented for '…'; remove or merge this impl"**
