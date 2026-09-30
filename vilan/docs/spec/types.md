@@ -602,6 +602,28 @@ call convention, erased before the annotation is read — so `&Display` is
 "a view of something implementing `Display`" at a parameter and at a
 binding alike.
 
+### A trait annotation on a return
+
+A free `fun`'s or an inherent method's return annotation takes a trait
+name too, and there it means the **one type the body picks**:
+
+```
+fun counter(start: i32): Source<i32> { SignalCell::new(start) }
+```
+
+The function types exactly as if its return were unannotated — the
+return is the body's own type, per instantiation of a generic function —
+and the annotation asserts that type implements `Source<i32>`, a compile
+error when it does not. Dispatch is static: a caller of `counter` holds a
+`SignalCell<i32>`. The return is **not hidden**: callers see the
+concrete type and may reach its own members (opacity, where callers see
+only the trait, is a later design). Every branch must produce that one
+type, so branches of different types are refused, with the steer to
+`dyn Source<i32>`, the trait object. A TRAIT method's return (declared
+in a trait, or implemented in an `impl … with` block) takes no trait
+name: each impl would pick its own type, which is an associated type
+vilan does not have — it returns `dyn Trait` or a concrete type.
+
 ### A trait annotation on a struct field
 
 A struct field's annotation is the third position a trait name can reach,

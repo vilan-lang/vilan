@@ -432,8 +432,11 @@ fn a_trait_nested_in_a_binding_annotation_is_one_type() {
 }
 
 #[test]
-fn a_trait_in_return_position_is_still_refused() {
-    assert_fails_with(
+fn a_trait_in_return_position_is_the_callees_one_type() {
+    // B460 (RULED 2026-09-29, door (i)) reverses B253: the callee picks ONE
+    // type, and the caller sees it — the return is NOT hidden, so the concrete
+    // type's own field reads through (opacity is a later slice).
+    assert_compiles_and_runs(
         &format!(
             r#"{GREET}
             fun get(): Greet {{ Dog {{ name = "rex" }} }}
@@ -441,7 +444,7 @@ fn a_trait_in_return_position_is_still_refused() {
             main();
             "#
         ),
-        "'Greet' is a trait, not a type",
+        "rex\n",
     );
 }
 
@@ -1156,8 +1159,8 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
     assert_fails_with(
         &format!(
             r#"{GREET}
-            fun get(): Greet {{ Dog {{ name = "rex" }} }}
-            fun main() {{ print(get().name); }}
+            fun get(): Option<Greet> {{ Some(Dog {{ name = "rex" }}) }}
+            fun main() {{ print(get().unwrap().name); }}
             main();
             "#
         ),
@@ -2279,13 +2282,17 @@ fn b252_a_refused_return_annotation_does_not_cascade_through_its_uses() {
     // refusal restated in the vocabulary of a type the author never wrote.
     let source = format!(
         r#"{GREET}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().greet());
+            print(Shelter {{ n = 1 }}.pick().greet());
         }}
         main();
         "#
     );
+    // B460 made a free fun's bare-trait return a reading; a TRAIT method's is
+    // the return that is still refused, and it is what this family reads now.
     assert_fails_once_with(&source, "'Greet' is a trait, not a type");
     assert_fails_without(&source, "on unknown");
     let diagnostics = failure_diagnostics(&source);
@@ -2303,9 +2310,11 @@ fn b252_a_field_read_through_a_refused_return_stands_down_as_well() {
     // answers for both halves at once.
     let source = format!(
         r#"{GREET}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().name);
+            print(Shelter {{ n = 1 }}.pick().name);
         }}
         main();
         "#
@@ -2331,9 +2340,11 @@ fn b252_an_unrelated_unknown_still_reports_beside_a_refused_return() {
         r#"{GREET}
         struct Holder<T> {{ v: T }}
         struct Other {{ held: Holder }}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().greet());
+            print(Shelter {{ n = 1 }}.pick().greet());
             let other = Other {{ held = 1 }};
             print(other.held.length());
         }}
@@ -7897,5 +7908,128 @@ fn b461_a_let_whose_value_does_not_meet_the_nested_trait_is_refused() {
         }
         "#,
         "'SignalCell<Option<i32>>' does not implement trait",
+    );
+}
+
+// --- B460: a bare trait in return position (RULED 2026-09-29, R-a door (i)) ---
+//
+// On a free `fun` or an inherent method the callee picks ONE concrete type — the
+// body's — checked to implement the trait and statically dispatched; the call
+// types as that concrete type per instantiation (B161's "checked wide, kept
+// narrow" applied to returns: NOT hidden, opacity is a later slice). Branches
+// that disagree are steered to `dyn`; a trait method's return stays refused.
+
+const B460_SHAPES: &str = r#"
+import std::reactive::{ Source, SignalCell };
+trait Shape {
+    fun area(self): i32;
+}
+struct Square { side: i32 }
+impl Square with Shape {
+    fun area(self): i32 { self.side * self.side }
+}
+struct Circle { r: i32 }
+impl Circle with Shape {
+    fun area(self): i32 { 3 * self.r * self.r }
+}
+"#;
+
+fn b460_program(rest: &str) -> String {
+    format!("{B460_SHAPES}\n{rest}")
+}
+
+#[test]
+fn b460_a_free_fun_returns_the_one_type_its_body_picks() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun make(side: i32): Shape { Square { side = side } }
+            fun counter(start: i32): Source<i32> { SignalCell::new(start) }
+            fun main() {
+                print(make(3).area());
+                print(counter(4).get());
+                // Not hidden: the caller sees `Square`.
+                print(make(2).side);
+            }
+            "#,
+        ),
+        "9\n4\n2\n",
+    );
+}
+
+#[test]
+fn b460_a_generic_fun_and_an_inherent_method_pick_per_instantiation() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun wrap<T>(value: T): Source<T> { SignalCell::new(value) }
+            struct Model { base: i32 }
+            impl Model {
+                fun doubled(self): Source<i32> { SignalCell::new(self.base * 2) }
+            }
+            fun main() {
+                print(wrap("x").get());
+                print(wrap(7).get());
+                print(Model { base = 5 }.doubled().get());
+            }
+            "#,
+        ),
+        "x\n7\n10\n",
+    );
+}
+
+#[test]
+fn b460_branches_of_two_types_steer_to_the_object() {
+    assert_fails_with(
+        &b460_program(
+            r#"
+            fun pick(square: bool): Shape {
+                if square { Square { side = 1 } } else { Circle { r = 1 } }
+            }
+            fun main() {}
+            "#,
+        ),
+        "`pick` returns `Shape`, a trait: that is ONE type the body picks, so every branch must \
+         produce it; for branches of different types return `dyn Shape`",
+    );
+    // ...and the object is the spelling that works.
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun pick(square: bool): dyn Shape {
+                if square { Square { side = 2 } } else { Circle { r = 1 } }
+            }
+            fun main() {
+                print(pick(true).area() + pick(false).area());
+            }
+            "#,
+        ),
+        "7\n",
+    );
+}
+
+#[test]
+fn b460_a_body_that_does_not_implement_the_trait_is_refused() {
+    assert_fails_with(
+        &b460_program("fun wrong(): Shape { 5 }\nfun main() {}\n"),
+        "'i32' does not implement trait 'Shape', which `wrong` returns: a trait written as a \
+         return type is the ONE type the body produces",
+    );
+}
+
+#[test]
+fn b460_a_trait_methods_bare_trait_return_stays_refused() {
+    let steer = "a TRAIT method cannot return a bare trait yet";
+    assert_fails_with(
+        &b460_program("trait Maker {\n    fun make(self): Shape;\n}\nfun main() {}\n"),
+        steer,
+    );
+    assert_fails_with(
+        &b460_program(
+            "trait Maker {\n    fun make(self): Square;\n}\nstruct Factory { n: i32 }\n\
+             impl Factory with Maker {\n    fun make(self): Shape { Square { side = 1 } }\n}\n\
+             fun main() {}\n",
+        ),
+        steer,
     );
 }

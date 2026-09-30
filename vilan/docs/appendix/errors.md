@@ -194,18 +194,20 @@ demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is a trait, not a type: a trait names a bound, and a value needs a type"**
-A trait's name was written where a type belongs — a return type, a struct
-field, or a generic argument like `List<Display>`. Traits are **bounds**,
+A trait's name was written where a type belongs — a struct field, a
+closure parameter, a trait method's return, or a generic argument like
+`Option<Display>` in a return type. Traits are **bounds**,
 not types, so no value can have that type: the impl is fine, the
 signature is not. Three spellings do what was meant, and the message names
 each. `dyn A` is the **trait object** — a value whose concrete type is
 erased, carrying the trait's members in a table — and it is what a field,
 an element type or any other value position takes when what it holds is
 decided at runtime. A **parameter** needs nothing: `fun f(x: A)` already
-IS `fun f<T: A>(x: T)`. A **return** takes the generic the message spells
-out, `<T: A>` with `T` written in the return position; inside the trait's
-own declaration it takes `Self`, which is what a trait naming itself in a
-return position always meant. A `let` binding's own annotation is not this
+IS `fun f<T: A>(x: T)`. A free `fun` or an inherent method may **return**
+`A` itself — the ONE type its body picks, which callers see (it is not
+hidden) — while a caller-chosen return is the generic the message spells
+out, `<T: A>`, and a TRAIT method's return is `dyn A` or a concrete type;
+inside the trait's own declaration a trait naming itself takes `Self`. A `let` binding's own annotation is not this
 error at all — there a trait is a *constraint* on the inferred type; see
 the next entry. The note points at the trait, which may live in another
 module. For a CLOSED set of alternatives, an enum is still better than an

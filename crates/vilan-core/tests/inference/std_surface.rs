@@ -4117,15 +4117,15 @@ fn b186_a_bare_trait_parameter_is_the_generic_the_steer_asked_for() {
 #[test]
 fn b72_the_bare_trait_steer_names_the_position_that_works() {
     // The actionable half — without it the message diagnoses without directing.
-    // Read at a RETURN, and the steer names all three spellings: the parameter
-    // (B186), `dyn A` for a field or any other value position (A124 R3), and
-    // the written generic, which is what a RETURN actually needs.
+    // Read at a NESTED return (B460 made the bare return a reading), and the
+    // steer names all three spellings: the parameter (B186), `dyn A` for a
+    // field or any other value position (A124 R3), and the written generic.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun main() { }
         "#,
         "Write `fun f(x: A)` for a parameter, `dyn A` for a field or any other position \
@@ -4161,7 +4161,7 @@ fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun subject(): A { Bag { n = 1 } }
+        fun subject(): Option<A> { Some(Bag { n = 1 }) }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4206,7 +4206,7 @@ fn b72_the_refusal_does_not_wait_for_an_argument() {
         struct Bag { n: i32 }
         struct Other { m: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(): A { Other { m = 1 } }
+        fun show(): Option<A> { Some(Other { m = 1 }) }
         fun main() { let s = show(); }
         "#,
         "'A' is a trait, not a type",
@@ -4224,7 +4224,7 @@ fn b72_an_unused_bare_trait_declaration_is_still_refused() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4350,18 +4350,20 @@ fn b186_a_bare_trait_method_parameter_is_the_generic_too() {
 }
 
 #[test]
-fn b72_a_bare_trait_return_is_refused() {
-    // The position std itself used, and the reason §11 sequenced the `Self`
-    // rewrites before the tightening.
-    assert_fails_with(
+fn b72_a_bare_trait_return_is_the_callees_one_type() {
+    // The position std itself used, refused since B72 (B253 kept it refused).
+    // B460 (RULED 2026-09-29, door (i)) reverses that for a free fun: the
+    // callee picks ONE concrete type — the body's — and the caller sees it.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun make(): A { Bag { n = 1 } }
-        fun main() { let v = make(); }
+        fun main() { let v = make(); print(v.name()); }
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4503,9 +4505,9 @@ fn b4_the_internal_error_route_through_a_return_is_a_clean_refusal() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let s = use_it(make()); }
+        fun main() { let s = use_it(make().unwrap()); }
         "#,
         "'A' is a trait, not a type",
     );
@@ -4538,9 +4540,9 @@ fn b4_no_route_to_the_internal_error_survives() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let s = use_it(make()); }
+        fun main() { let s = use_it(make().unwrap()); }
         "#,
     ] {
         let diagnostics = compile(source).expect_err("expected a compile error");

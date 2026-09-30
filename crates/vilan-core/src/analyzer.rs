@@ -4319,6 +4319,21 @@ pub struct Analyzer<'src> {
     /// Whether the walk is inside a trait or `impl` item list, so a `context`
     /// clause on the declaration can be refused there (B242 defers members).
     walking_member_body: bool,
+    /// B460: whether the walk is inside an `impl … with Trait` block — its
+    /// members implement a trait, so a bare-trait return there is a TRAIT
+    /// method's (refused until a paper), not an inherent method's.
+    walking_trait_impl_body: bool,
+    /// B460: each function's return annotation slot, with whether the
+    /// function is a trait method (declared in a trait, or in an `impl …
+    /// with` block) — the drain decides a bare trait there.
+    return_annotation_owners: HashMap<TypeId, (Id, bool)>,
+    /// B460 (RULED 2026-09-29, R-a door (i)): the functions whose return is a
+    /// bare trait — the callee picks ONE concrete type, the body's — with the
+    /// trait, its written arguments and the annotation's span.
+    opaque_returns: HashMap<Id, (Id, Vec<TypeId>, Span)>,
+    /// B460: the tail expressions of those functions (through blocks), for
+    /// the steer to `dyn` when their branches disagree.
+    opaque_return_tails: HashMap<Id, Id>,
     // Parameters and `let` bindings whose declared closure type carries the
     // `async` marker (J2): calls through them are implicitly awaited.
     async_values: HashSet<Id>,
@@ -6329,6 +6344,10 @@ impl<'src> Analyzer<'src> {
             function_context_clause_spans: HashMap::default(),
             function_signature_end_spans: HashMap::default(),
             walking_member_body: false,
+            walking_trait_impl_body: false,
+            return_annotation_owners: HashMap::default(),
+            opaque_returns: HashMap::default(),
+            opaque_return_tails: HashMap::default(),
             async_values: HashSet::default(),
             sync_values: HashSet::default(),
             async_fields: HashSet::default(),
@@ -30513,6 +30532,82 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// B460's steer at a tail whose arms disagree: the function returns a
+    /// trait, which is ONE type the body picks — branches of two types are
+    /// the object's job.
+    fn opaque_return_arm_steer(&self, expression_id: Id) -> String {
+        let Some(function_id) = self.opaque_return_tails.get(&expression_id) else {
+            return String::new();
+        };
+        let Some((trait_id, arguments, _)) = self.opaque_returns.get(function_id) else {
+            return String::new();
+        };
+        let name = self
+            .functions
+            .get(function_id)
+            .map(|function| function.name)
+            .unwrap_or("this function");
+        let trait_name = self
+            .traits
+            .get(trait_id)
+            .map(|trait_| trait_.name)
+            .unwrap_or("the trait");
+        let bound = self.trait_label_with_arguments(trait_name, arguments);
+        format!(
+            " `{name}` returns `{bound}`, a trait: that is ONE type the body picks, so every \
+             branch must produce it; for branches of different types return `dyn {bound}`"
+        )
+    }
+
+    /// B460 (RULED 2026-09-29, R-a door (i)): each function returning a bare
+    /// trait — the type its body produced must implement it. That type is
+    /// what callers see (the return is NOT hidden; opacity is a later slice).
+    fn check_opaque_returns(&mut self) {
+        let mut functions: Vec<(Id, Id, Vec<TypeId>, Span)> = self
+            .opaque_returns
+            .iter()
+            .map(|(function_id, (trait_id, arguments, span))| {
+                (*function_id, *trait_id, arguments.clone(), *span)
+            })
+            .collect();
+        functions.sort_by_key(|(function_id, ..)| function_id.0);
+        for (function_id, trait_id, arguments, span) in functions {
+            let produced = self.inferred_return_type_of(function_id);
+            if matches!(
+                produced,
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Never | Type::Trait(..)
+            ) {
+                continue;
+            }
+            if self.satisfies_trait_bound(&produced, trait_id, &arguments, 0) {
+                continue;
+            }
+            let name = self
+                .functions
+                .get(&function_id)
+                .map(|function| function.name)
+                .unwrap_or("this function");
+            let Some(trait_label) = self.bound_trait_label(trait_id, &arguments) else {
+                continue;
+            };
+            let produced_label = self.pretty_print_type(&produced, &HashMap::default());
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "'{produced_label}' does not implement trait '{trait_label}', which \
+                         `{name}` returns: a trait written as a return type is the ONE type the \
+                         body produces, and it must implement the trait (callers see that type — \
+                         the return is not hidden)"
+                    ),
+                },
+                function_id,
+            );
+        }
+    }
+
     /// B461: the drained arm turns a binding annotation that holds an
     /// existential into a constraint (the binding grounds from its
     /// initializer). A tuple or an array annotation is written at the walk and
@@ -33338,6 +33433,16 @@ impl<'src> Analyzer<'src> {
                 }
                 let return_type_id = return_type_node
                     .map(|return_type| self.walk_type_node(return_type, body_scope_id));
+                // B460: the drain decides whether a bare trait here is an
+                // opaque return (a free fun, an inherent method) or a trait
+                // method's (refused).
+                if let Some(return_type_id) = return_type_id
+                    && !function.external
+                {
+                    let trait_member = self.walking_trait_body || self.walking_trait_impl_body;
+                    self.return_annotation_owners
+                        .insert(return_type_id, (id, trait_member));
+                }
                 if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
                     self.record_type_context_clause(return_type_id, names, body_scope_id, None);
                 }
@@ -34470,7 +34575,10 @@ impl<'src> Analyzer<'src> {
                 let subject = subject_type_id;
                 let was_walking_member_body = self.walking_member_body;
                 self.walking_member_body = true;
+                let was_walking_trait_impl_body = self.walking_trait_impl_body;
+                self.walking_trait_impl_body = !traits.is_empty();
                 self.walk_expr_nodes(&body.0, body_scope_id);
+                self.walking_trait_impl_body = was_walking_trait_impl_body;
                 self.current_impl_subject_name = outer_impl_subject;
                 self.walking_member_body = was_walking_member_body;
                 let declared_members = self.collect_declared_members(body_scope_id);
@@ -49957,12 +50065,13 @@ impl<'src> Analyzer<'src> {
                                 .get(body_id)
                                 .map(|span| **span)
                                 .unwrap_or(fallback_span);
+                            let steer = self.opaque_return_arm_steer(expression_id);
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
                                 note: None,
                                 span: arm_span,
                                 msg: format!(
-                                    "{construct} have mismatched types: expected {expected}, but got {got} instead."
+                                    "{construct} have mismatched types: expected {expected}, but got {got} instead.{steer}"
                                 ),
                             });
                             current
@@ -53015,6 +53124,71 @@ impl<'src> Analyzer<'src> {
                                 owner_id,
                                 owner_scope_id,
                             ));
+                        } else if let Some((function_id, false)) =
+                            self.return_annotation_owners.get(&type_id).copied()
+                        {
+                            // B460 (RULED 2026-09-29, R-a door (i)): a bare
+                            // trait returned by a free fun or an inherent
+                            // method is ONE type the callee picks — the
+                            // body's. The function types as if unannotated
+                            // (its return inferred from its body, per
+                            // instantiation), and the body's type is checked
+                            // against the trait after the build. The type is
+                            // NOT hidden from callers; opacity is a later slice.
+                            self.opaque_returns
+                                .insert(function_id, (*trait_id, arguments.clone(), span));
+                            if let Some(function) = self.functions.get_mut(&function_id) {
+                                function.return_type_id = None;
+                            }
+                            let tail = self
+                                .functions
+                                .get(&function_id)
+                                .map(|function| function.body.1);
+                            let mut stack: Vec<Id> = tail.into_iter().collect();
+                            while let Some(tail_id) = stack.pop() {
+                                self.opaque_return_tails.insert(tail_id, function_id);
+                                if let Some(Expr::Block((_, inner))) =
+                                    self.expr_id_to_expr_map.get(&tail_id)
+                                {
+                                    stack.push(*inner);
+                                }
+                            }
+                        } else if let Some((function_id, true)) =
+                            self.return_annotation_owners.get(&type_id).copied()
+                        {
+                            // B460: a TRAIT method's return stays refused —
+                            // the type an impl picks would be the impl's, an
+                            // associated opaque type per impl, which is a
+                            // separate slice after a paper.
+                            let trait_name = self
+                                .traits
+                                .get(trait_id)
+                                .map(|trait_| trait_.name)
+                                .unwrap_or("this trait");
+                            let member = self
+                                .functions
+                                .get(&function_id)
+                                .map(|function| function.name)
+                                .unwrap_or("this method");
+                            self.push_at_written_type(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: format!(
+                                        "'{trait_name}' is a trait, not a type: a TRAIT method \
+                                         cannot return a bare trait yet — each impl would pick its \
+                                         own type, an associated type vilan does not have. Return \
+                                         `dyn {trait_name}` from `{member}` (the object), or a \
+                                         concrete type; a free `fun` or an inherent method may \
+                                         return `{trait_name}` itself"
+                                    ),
+                                },
+                                source_id,
+                                type_id,
+                            );
+                            self.refused_annotation_slots
+                                .insert(type_id, (source_id, span));
                         } else if let Some(owner) =
                             self.nested_annotation_owners.get(&type_id).copied()
                         {
@@ -67158,6 +67332,7 @@ fn analyze_over_world<'src>(
         // and for the same reason: every binding's type has settled by here.
         analyzer.check_binding_trait_constraints();
         analyzer.check_binding_existential_constraints();
+        analyzer.check_opaque_returns();
         analyzer.check_binding_hidden_nominal_constraints();
         // B251's twin of the bound check above, at the third binding channel:
         // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).

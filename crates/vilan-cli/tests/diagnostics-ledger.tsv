@@ -618,3 +618,5 @@ NEW	-	`{rendered}` is a resource, so it can become a `{object_label}` only when 
 NEW	-	`clear` must be called on a named context with a closure literal body
 NEW	-	'{type_label}' does not match the annotation on '{name}', '{annotation_label}': each trait written inside the annotation must be met by ONE type that implements it (values of different types need a trait object there, `dyn …`)
 NEW	-	`{name}` carries a payload, so it is not a value on its own: call it (`{name}({list})`), or pass it where a closure is expected, where it stands for `|{list}| {name}({list})`
+NEW	-	'{trait_name}' is a trait, not a type: a TRAIT method cannot return a bare trait yet — each impl would pick its own type, an associated type vilan does not have. Return `dyn {trait_name}` from `{member}` (the object), or a concrete type; a free `fun` or an inherent method may return `{trait_name}` itself
+NEW	-	'{produced_label}' does not implement trait '{trait_label}', which `{name}` returns: a trait written as a return type is the ONE type the body produces, and it must implement the trait (callers see that type — the return is not hidden)
