@@ -1,0 +1,108 @@
+// A142 S4's random walk (`inference/collections.rs`), run on both backends.
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, comp };
+
+mut seed = 4242;
+
+fun next(bound: usize): usize {
+	seed = (seed * 75 + 74) % 65537;
+	(seed % bound.as_i32()).as_usize()
+}
+
+fun flag_for(flags: List<SignalCell<bool>>, x: i32): SignalCell<bool> {
+	flags[x.as_usize() % 4]
+}
+
+fun main() {
+	let flags: List<SignalCell<bool>> = [
+		Signal::new(false),
+		Signal::new(true),
+		Signal::new(false),
+		Signal::new(false),
+	];
+	let cell: ListCell<i32> = ListCell::of([1, 2, 3, 4, 5, 6]);
+	let (outs, scope) = comp(|| {
+		let plain = cell.filter(|x| x % 2 == 0).memo();
+		let followed = cell.filter(|x| flag_for(flags, x).derive(|on| on || x % 3 == 0)).memo();
+		let mapped = cell.map(|x| x * 10).memo();
+		let picked = cell.filter_map(|x| if x > 4 { Some(x + 100) } else { None }).memo();
+		let counted = cell.count(|x| flag_for(flags, x)).memo();
+		let everything = cell.map(|x| x + 1).filter(|x| x % 2 == 0).all(|x| x > 1).memo();
+		let anything = cell.any(|x| flag_for(flags, x)).memo();
+		(plain, followed, mapped, picked, counted, everything, anything)
+	});
+	let (plain, followed, mapped, picked, counted, everything, anything) = outs;
+	mut failures = 0;
+	mut step = 0;
+	for step < 600 {
+		let size = cell.size();
+		let choice = next(8);
+		if choice == 0 {
+			cell.push(next(50).as_i32());
+		} else if choice == 1 && size > 0 {
+			cell.remove_at(next(size));
+		} else if choice == 2 && size > 0 {
+			cell.set_at(next(size), next(50).as_i32());
+		} else if choice == 3 {
+			cell.insert_all(next(size + 1), [next(50).as_i32(), next(50).as_i32()]);
+		} else if choice == 4 && size > 2 {
+			cell.move_range(0, 2, next(size - 1));
+		} else if choice == 5 {
+			let flag = flags[next(4)];
+			flag.set(!flag.get());
+		} else if choice == 6 && size > 3 {
+			cell.splice(next(size - 2), 2, [next(50).as_i32()]);
+		} else if choice == 7 && next(10) == 0 {
+			cell.set([3, 9, 12, 1]);
+		}
+		let xs = cell.get();
+		mut evens: List<i32> = [];
+		mut kept: List<i32> = [];
+		mut tens: List<i32> = [];
+		mut big: List<i32> = [];
+		mut flagged: usize = 0;
+		mut all_positive = true;
+		for x in xs {
+			if x % 2 == 0 {
+				evens.push(x);
+			}
+			if x % 3 == 0 || flags[x.as_usize() % 4].get() {
+				kept.push(x);
+			}
+			tens.push(x * 10);
+			if x > 4 {
+				big.push(x + 100);
+			}
+			if flags[x.as_usize() % 4].get() {
+				flagged += 1;
+			}
+			if (x + 1) % 2 == 0 && x + 1 <= 1 {
+				all_positive = false;
+			}
+		}
+		if plain.get() != evens {
+			failures += 1;
+		}
+		if followed.get() != kept {
+			failures += 1;
+		}
+		if mapped.get() != tens {
+			failures += 1;
+		}
+		if picked.get() != big {
+			failures += 1;
+		}
+		if counted.get() != flagged {
+			failures += 1;
+		}
+		if everything.get() != all_positive {
+			failures += 1;
+		}
+		if anything.get() != (flagged > 0) {
+			failures += 1;
+		}
+		step += 1;
+	}
+	print(i"failures {failures}");
+	scope.dispose();
+}

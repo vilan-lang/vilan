@@ -415,26 +415,28 @@ fn a_bounded_generic_satisfies_a_trait_annotation() {
 // --- B161: NARROWED, not repealed — every other position still refuses ---
 
 #[test]
-fn a_trait_nested_in_a_binding_annotation_is_still_refused() {
-    // §12.2's silently heterogeneous `List<Trait>`: the constraint reading is
-    // the binding's OWN annotation, not any trait spelled anywhere under it.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun main() {{
-                let pack: List<Greet> = [Dog {{ name = "a" }}];
-                print(pack.length());
-            }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
+fn a_trait_nested_in_a_binding_annotation_is_one_type() {
+    // §12.2's silently heterogeneous `List<Trait>` was why this was refused.
+    // B461 reads the nested trait as ONE type implementing it, grounded by the
+    // initializer — a homogeneous pack compiles; a mixed one is refused with
+    // the steer to the object (`b461_*`).
+    assert_compiles(&format!(
+        r#"{GREET}
+        fun main() {{
+            let pack: List<Greet> = [Dog {{ name = "a" }}];
+            print(pack.len());
+        }}
+        main();
+        "#
+    ));
 }
 
 #[test]
-fn a_trait_in_return_position_is_still_refused() {
-    assert_fails_with(
+fn a_trait_in_return_position_is_the_callees_one_type() {
+    // B460 (RULED 2026-09-29, door (i)) reverses B253: the callee picks ONE
+    // type, and the caller sees it — the return is NOT hidden, so the concrete
+    // type's own field reads through (opacity is a later slice).
+    assert_compiles_and_runs(
         &format!(
             r#"{GREET}
             fun get(): Greet {{ Dog {{ name = "rex" }} }}
@@ -442,7 +444,7 @@ fn a_trait_in_return_position_is_still_refused() {
             main();
             "#
         ),
-        "'Greet' is a trait, not a type",
+        "rex\n",
     );
 }
 
@@ -1157,8 +1159,8 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
     assert_fails_with(
         &format!(
             r#"{GREET}
-            fun get(): Greet {{ Dog {{ name = "rex" }} }}
-            fun main() {{ print(get().name); }}
+            fun get(): Option<Greet> {{ Some(Dog {{ name = "rex" }}) }}
+            fun main() {{ print(get().unwrap().name); }}
             main();
             "#
         ),
@@ -1168,21 +1170,9 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
     // withdrew the hidden parameter at that position — so a field is a refusal
     // again, steered to `dyn Greet` rather than to the sugar
     // (`b184_a_trait_at_a_struct_field_is_refused_and_steers_to_dyn`). The
-    // parameter leg left with B186 and stays gone. What this pins is the
-    // return, the nested spelling, and the CLOSURE parameter — the position
-    // that has no generic list to append to.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun main() {{
-                let pack: List<Greet> = [Dog {{ name = "a" }}];
-                print(pack.length());
-            }}
-            main();
-            "#
-        ),
-        steer,
-    );
+    // parameter leg left with B186 and stays gone, and the nested `let` leg
+    // left with B461. What this pins is the return and the CLOSURE parameter
+    // — the position that has no generic list to append to.
     assert_fails_with(
         &format!(
             r#"{GREET}
@@ -1198,20 +1188,17 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
 }
 
 #[test]
-fn b186_a_nested_trait_spelling_on_a_parameter_is_still_refused() {
-    // The sugar is the parameter's OWN annotation, not any trait spelled
-    // under it — `List<Greet>` mints an inner type id the sugar never sees,
-    // exactly as B161's nested case does.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun describe(pack: List<Greet>): i32 {{ pack.length() }}
-            fun main() {{ print(describe([Dog {{ name = "a" }}])); }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
+fn b186_a_nested_trait_spelling_on_a_parameter_mints_its_own_generic() {
+    // B461: the sugar reaches a trait spelled UNDER the parameter's annotation
+    // too — `List<Greet>` reads `<G: Greet> … List<G>`, one generic per
+    // mention.
+    assert_compiles(&format!(
+        r#"{GREET}
+        fun describe(pack: List<Greet>): usize {{ pack.len() }}
+        fun main() {{ print(describe([Dog {{ name = "a" }}])); }}
+        main();
+        "#
+    ));
 }
 
 #[test]
@@ -1354,7 +1341,7 @@ fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
     assert_compiles_browser(
         r#"
         import std::ui::{ View, view, mount_root };
-        import std::reactive::{ Signal, SignalCell, Source, Subscription, observe };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         import std::display::Display;
 
         // A user's own `Source` (A33's motivating shape), so the extension is
@@ -1363,8 +1350,8 @@ fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
         impl Doubled with Source<i32> {
             fun get(self): i32 { self.inner.get() * 2 }
             [must_use]
-            fun on_change(self, observer: |i32| void): Subscription {
-                observe(self.inner, |value| { observer(value * 2); })
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -1643,7 +1630,7 @@ fn an_exposed_source_whose_element_is_not_a_written_argument_is_refused() {
     // says so at the field instead.
     let source = r#"
         import std::io::print;
-        import std::reactive::{ Source, SignalCell, Subscription };
+        import std::reactive::{ Source, SignalCell, Subscriber, Subscription };
         [derive(Wire)]
         struct Note { id: i32 }
         struct Feed {
@@ -1651,7 +1638,7 @@ fn an_exposed_source_whose_element_is_not_a_written_argument_is_refused() {
         }
         impl Feed with Source<Note> {
             fun get(self): Note { self.inner.get() }
-            fun on_change(self, observer: |Note| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(FeedClient)]
         struct Store {
@@ -1676,7 +1663,7 @@ fn a_user_source_written_with_its_element_still_exposes() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Source, SignalCell, Subscription };
+        import std::reactive::{ Source, SignalCell, Subscriber, Subscription };
         [derive(Wire)]
         struct Note { id: i32 }
         struct Feed<T> {
@@ -1684,7 +1671,7 @@ fn a_user_source_written_with_its_element_still_exposes() {
         }
         impl Feed<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(FeedClient)]
         struct Store {
@@ -2295,13 +2282,17 @@ fn b252_a_refused_return_annotation_does_not_cascade_through_its_uses() {
     // refusal restated in the vocabulary of a type the author never wrote.
     let source = format!(
         r#"{GREET}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().greet());
+            print(Shelter {{ n = 1 }}.pick().greet());
         }}
         main();
         "#
     );
+    // B460 made a free fun's bare-trait return a reading; a TRAIT method's is
+    // the return that is still refused, and it is what this family reads now.
     assert_fails_once_with(&source, "'Greet' is a trait, not a type");
     assert_fails_without(&source, "on unknown");
     let diagnostics = failure_diagnostics(&source);
@@ -2319,9 +2310,11 @@ fn b252_a_field_read_through_a_refused_return_stands_down_as_well() {
     // answers for both halves at once.
     let source = format!(
         r#"{GREET}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().name);
+            print(Shelter {{ n = 1 }}.pick().name);
         }}
         main();
         "#
@@ -2347,9 +2340,11 @@ fn b252_an_unrelated_unknown_still_reports_beside_a_refused_return() {
         r#"{GREET}
         struct Holder<T> {{ v: T }}
         struct Other {{ held: Holder }}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().greet());
+            print(Shelter {{ n = 1 }}.pick().greet());
             let other = Other {{ held = 1 }};
             print(other.held.length());
         }}
@@ -2453,15 +2448,15 @@ fn b243_a_one_block_signal_impl_reaches_source_sub_and_effect_on_change() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Source, SignalCell, Subscription, comp };
+        import std::reactive::{ Signal, Source, SignalCell, Subscriber, Subscription, comp };
 
         struct Cell<T> { inner: SignalCell<T> }
 
         impl Cell<type T> with Signal<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
             fun set(self, value: T) { self.inner.set(value) }
             fun notify(self) { self.inner.notify() }
@@ -2486,25 +2481,27 @@ fn b243_a_one_block_signal_impl_reaches_source_sub_and_effect_on_change() {
 }
 
 /// The half of the pre-flip b243 pin the flip moved out of reach: `map` is a
-/// blanket over `S: Source<T>` since A124 S2c, and a blanket is not found on a
-/// type that implements `Source` only through a one-block `impl .. with
-/// Signal<T>` — "Cell<i32> has no method 'map'". Kept as the program the pin
-/// used to be, so the fix turns it green as written.
+/// blanket over `S: Source<T>` since A124 S2c, and a blanket was not found on
+/// a type that implements `Source` only through a one-block `impl .. with
+/// Signal<T>` — "Cell<i32> has no method 'map'" (B419). Kept as the program
+/// the pin used to be; an impl's PROVIDED set now closes over the supertrait
+/// chain. (A142: `map` is `Flow::derive`, reached through the blanket
+/// `impl type S: Source<T> with Flow<T>` — the same blanket-over-a-supertrait
+/// shape; the pipe is sealed with `.memo()` to be read across the `set`.)
 #[test]
-#[ignore = "B419: a blanket over a supertrait is not found through a one-block sub-trait impl"]
 fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Source, SignalCell, Subscription };
+        import std::reactive::{ Signal, Source, SignalCell, Subscriber, Subscription };
 
         struct Cell<T> { inner: SignalCell<T> }
 
         impl Cell<type T> with Signal<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
             fun set(self, value: T) { self.inner.set(value) }
             fun notify(self) { self.inner.notify() }
@@ -2512,7 +2509,7 @@ fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
 
         fun main() {
             let c = Cell { inner = Signal::new(1) };
-            let doubled = c.map(|v| v * 2);
+            let doubled = c.derive(|v| v * 2).memo();
             print(doubled.get());
             c.set(5);
             print(doubled.get());
@@ -2523,6 +2520,61 @@ fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
     );
 }
 
+/// B419's std-free shape (reactive-42's find S1): a blanket over the
+/// SUPERTRAIT, reached on a type whose one impl block names the subtrait.
+#[test]
+fn b419_a_blanket_over_a_supertrait_reaches_a_one_block_subtrait_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Src<T> { fun get(self): T; }
+        trait Sig<T> with Src<T> { fun label(self): str; }
+        struct Cell<T> { v: T }
+        impl Cell<type T> with Sig<T> {
+            fun get(self): T { self.v }
+            fun label(self): str { "cell" }
+        }
+        impl type S: Src<type T> {
+            fun pair(self): (T, T) { (self.get(), self.get()) }
+        }
+        fun main() {
+            let c = Cell { v = 3 };
+            let (a, b) = c.pair();
+            print(a + b);
+            print(c.label());
+        }
+        "#,
+        "6\ncell\n",
+    );
+}
+
+/// ...and at the supertrait's ARGUMENTS: a blanket written at `Src<i32>`
+/// applies to a `Cell<i32>` and not to a `Cell<str>`, through the subtrait's
+/// clause.
+#[test]
+fn b419_the_supertrait_is_provided_at_the_arguments_the_clause_reaches_it_through() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait Src<T> { fun get(self): T; }
+        trait Sig<T> with Src<T> { fun label(self): str; }
+        struct Cell<T> { v: T }
+        impl Cell<type T> with Sig<T> {
+            fun get(self): T { self.v }
+            fun label(self): str { "cell" }
+        }
+        impl type S: Src<i32> {
+            fun twice(self): i32 { self.get() * 2 }
+        }
+        fun main() {
+            print(Cell { v = 4 }.twice());
+            print(Cell { v = "x" }.twice());
+        }
+        "#,
+        "'Cell<str>' does not implement trait 'Src<i32>'",
+    );
+}
+
 #[test]
 fn b243_the_split_impl_still_works() {
     // A49's recipe, kept green: making `Source` a clause trait of its own was
@@ -2530,15 +2582,15 @@ fn b243_the_split_impl_still_works() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Source, SignalCell, Subscription };
+        import std::reactive::{ Signal, Source, SignalCell, Subscriber, Subscription };
 
         struct Cell<T> { inner: SignalCell<T> }
 
         impl Cell<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -2549,8 +2601,7 @@ fn b243_the_split_impl_still_works() {
 
         fun main() {
             let c = Cell { inner = Signal::new(1) };
-            let doubled = c.map(|v| v * 2);
-            print(doubled.get());
+            print(c.derive(|v| v * 2).sample());
         }
         main();
         "#,
@@ -2882,14 +2933,14 @@ fn a52_an_expose_of_a_user_source_type_is_accepted() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         [derive(Wire, PartialEq, Debug)]
         struct Task { id: i32 }
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(StoreClient)]
         struct Store {
@@ -2928,7 +2979,7 @@ fn an_expose_keyed_list_without_a_key_type_names_the_attribute_argument() {
 
 /// The key is named, and the collection is one the keyed exposure cannot read.
 /// `expose_keyed` takes a `Source<List<T>>` and `expose_keyed_map` a
-/// `Source<Map<K, V>>`; those two are what the expansion picks between, off the
+/// `Source<HashMap<K, V>>`; those two are what the expansion picks between, off the
 /// annotation, before any type resolves — so a third collection has to be told
 /// so here or it would simply not be exposed and nothing would say why (B202).
 #[test]
@@ -2946,7 +2997,7 @@ fn an_expose_keyed_with_a_key_type_still_needs_a_list_or_a_map() {
         fun main() { print("store"); }
         main();
         "#,
-        "its collection is not written as a `List<T>` or a `Map<K, V>`",
+        "its collection is not written as a `List<T>` or a `HashMap<K, V>`",
     );
 }
 
@@ -2982,7 +3033,7 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -2992,7 +3043,7 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed)] by_map: SignalCell<Map<str, Task>>,
+            [expose(keyed)] by_map: SignalCell<HashMap<str, Task>>,
             [expose(keyed = str)] by_list: SignalCell<List<Task>>,
         }
         impl Store {
@@ -3000,10 +3051,68 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
             fun count(self): usize { self.by_list.get().len() }
         }
         fun main() {
-            print(Store { by_map = Signal::new(Map::new()), by_list = Signal::new([]) }.contract_hash());
+            print(Store { by_map = Signal::new(HashMap::new()), by_list = Signal::new([]) }.contract_hash());
         }
         main();
         "#,
+    );
+}
+
+/// I9: `Map` is `HashMap`'s spelling before the rename, kept one release as
+/// `std::map`'s deprecated alias — and the keyed exposure reads its annotation
+/// AS WRITTEN, before any type resolves, in two places (the analyzer's shape
+/// check and the `[service]` expansion). Both must take the old spelling as the
+/// map: the program compiles, and the contract it states is the `HashMap`
+/// spelling's, keyed — not the whole-value channel's, which is what the
+/// expansion would fall back to if it did not recognise the element.
+#[test]
+fn i9_the_deprecated_map_spelling_is_still_a_keyed_expose_map() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::map::Map;
+        import std::reactive::{ Signal, SignalCell };
+        import std::wire::Keyed;
+        [derive(Wire, PartialEq, Debug)]
+        struct Task { id: str }
+        impl Task with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+        [service(NewClient)]
+        struct NewStore {
+            [expose(keyed)] tasks: SignalCell<HashMap<str, Task>>,
+        }
+        impl NewStore {
+            [rpc]
+            fun count(self): usize { self.tasks.get().len() }
+        }
+        [service(OldClient)]
+        struct OldStore {
+            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
+        }
+        impl OldStore {
+            [rpc]
+            fun count(self): usize { self.tasks.get().len() }
+        }
+        [service(WholeClient)]
+        struct WholeStore {
+            [expose] tasks: SignalCell<HashMap<str, Task>>,
+        }
+        impl WholeStore {
+            [rpc]
+            fun count(self): usize { self.tasks.get().len() }
+        }
+        fun main() {
+            let keyed = NewStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
+            let old = OldStore { tasks = Signal::new(Map::new()) }.contract_hash();
+            let whole = WholeStore { tasks = Signal::new(HashMap::new()) }.contract_hash();
+            print(old == keyed);
+            print(keyed == whole);
+        }
+        main();
+        "#,
+        "true\nfalse\n",
     );
 }
 
@@ -3021,7 +3130,7 @@ fn a56_an_expose_keyed_argument_that_disagrees_with_the_map_key_is_refused() {
     assert_fails_once_with(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3031,7 +3140,7 @@ fn a56_an_expose_keyed_argument_that_disagrees_with_the_map_key_is_refused() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed = i32)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed = i32)] tasks: SignalCell<HashMap<str, Task>>,
         }
         fun main() { print("store"); }
         main();
@@ -3049,7 +3158,7 @@ fn a56_the_disagreeing_key_refusal_stands_down_the_generated_bound_failures() {
     assert_fails_without(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3059,7 +3168,7 @@ fn a56_the_disagreeing_key_refusal_stands_down_the_generated_bound_failures() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed = i32)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed = i32)] tasks: SignalCell<HashMap<str, Task>>,
         }
         fun main() { print("store"); }
         main();
@@ -3077,7 +3186,7 @@ fn a56_an_expose_keyed_argument_that_agrees_with_the_map_key_still_compiles() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3087,14 +3196,14 @@ fn a56_an_expose_keyed_argument_that_agrees_with_the_map_key_still_compiles() {
         }
         [service(StoreClient)]
         struct Store {
-            [expose(keyed = str)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed = str)] tasks: SignalCell<HashMap<str, Task>>,
         }
         impl Store {
             [rpc]
             fun count(self): usize { self.tasks.get().len() }
         }
         fun main() {
-            print(Store { tasks = Signal::new(Map::new()) }.contract_hash());
+            print(Store { tasks = Signal::new(HashMap::new()) }.contract_hash());
         }
         main();
         "#,
@@ -3266,6 +3375,41 @@ fn a_handle_return_whose_element_is_not_wire_is_refused_at_the_element() {
         "#,
         "returns a signal handle whose element `Secret` is not Wire",
     );
+}
+
+/// A145: the read-only seal `MemoCell<T>` is a handle return too, so the same
+/// rule applies to it — the refusal names the element, bare and inside
+/// `Option`, where it used to say `MemoCell<Secret>` was not Wire.
+#[test]
+fn a145_a_memo_handle_return_whose_element_is_not_wire_is_refused_at_the_element() {
+    for returned in ["MemoCell<Secret>", "Option<MemoCell<Secret>>"] {
+        let body = if returned.starts_with("Option") {
+            "Some(self.secret)"
+        } else {
+            "self.secret"
+        };
+        let source = format!(
+            r#"
+        import std::io::print;
+        import std::reactive::{{ MemoCell, Pipe, Signal, SignalCell }};
+        struct Secret {{ token: str }}
+        [service(StoreClient)]
+        struct Store {{
+            secret: MemoCell<Secret>,
+        }}
+        impl Store {{
+            [rpc]
+            fun watch(self): {returned} {{ {body} }}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+        );
+        assert_fails_with(
+            &source,
+            "returns a signal handle whose element `Secret` is not Wire",
+        );
+    }
 }
 
 /// The control, and the two shapes the mapping admits: `SignalCell<T>` becomes
@@ -3586,14 +3730,14 @@ fn a_user_source_type_in_a_return_position_is_not_read_as_a_handle() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         [derive(Wire, PartialEq, Debug)]
         struct Task { id: i32 }
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(StoreClient)]
         struct Store {
@@ -3652,7 +3796,7 @@ fn b284_an_expose_keyed_on_a_client_service_only_struct_is_refused_once() {
     assert_fails_once_with(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::{ Signal, SignalCell };
         import std::wire::Keyed;
         [derive(Wire, PartialEq, Debug)]
@@ -3662,13 +3806,13 @@ fn b284_an_expose_keyed_on_a_client_service_only_struct_is_refused_once() {
         }
         [client_service]
         struct Handlers {
-            [expose(keyed)] tasks: SignalCell<Map<str, Task>>,
+            [expose(keyed)] tasks: SignalCell<HashMap<str, Task>>,
         }
         impl Handlers {
             [rpc]
             fun session_revoked(self, reason: str) { print(reason); }
         }
-        fun main() { print(Handlers { tasks = Signal::new(Map::new()) }.contract_hash()); }
+        fun main() { print(Handlers { tasks = Signal::new(HashMap::new()) }.contract_hash()); }
         main();
         "#,
         "carries only `[client_service]`",
@@ -4453,7 +4597,14 @@ fn b371_the_members_result_carries_the_callers_bound() {
 /// following the inner cell across a set. Since A124 S2c `map(f).flatten()`
 /// answers a cold node, so the four B371 bodies end in `.cell()` — the
 /// `SignalCell<U>` their signatures name; the generic `map` reaching the body
-/// at all is B408's.
+/// at all is B408's. A142 renamed `map` to `derive` and made `flatten` the
+/// `Option` join only: the TOTAL join of a source of sources is
+/// `.switch(|inner| inner)`, whose `I: Flow<U>` binds at the caller's abstract
+/// `I: Source<U>` — the same grounding B371 fixed — so the three total-join
+/// bodies spell it that way, and the `Option` twin keeps std's `flatten`. The
+/// selector's parameter is annotated (`|inner: I|`): unannotated, it is typed as
+/// an unsubstituted `T` in a generic body (reactive-44's find, pinned by
+/// `a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter`).
 #[test]
 fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
     assert_compiles_and_runs(
@@ -4463,7 +4614,7 @@ fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.map(f).flatten().cell()
+                self.derive(|value| f(value)).switch(|inner: I| inner).cell()
             }
         }
 
@@ -4490,7 +4641,7 @@ fn b371_switch_over_std_flatten_runs_as_a_free_function() {
         import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
 
         fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
-            source.map(f).flatten().cell()
+            source.derive(|value| f(value)).switch(|inner: I| inner).cell()
         }
 
         fun main() {
@@ -4508,8 +4659,8 @@ fn b371_switch_over_std_flatten_runs_as_a_free_function() {
 }
 
 /// The annotation the item's repro carried to keep B300(a)'s inference gap
-/// out of the picture is no longer needed: `flatten`'s `U` binds to the
-/// caller's `U` through the caller's own `I: Source<U>`.
+/// out of the picture is no longer needed: the join's `U` (A142: `switch`'s)
+/// binds to the caller's `U` through the caller's own `I: Source<U>`.
 #[test]
 fn b371_the_result_infers_without_an_annotation() {
     assert_compiles_and_runs(
@@ -4519,7 +4670,7 @@ fn b371_the_result_infers_without_an_annotation() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.map(f).flatten().cell()
+                self.derive(|value| f(value)).switch(|inner: I| inner).cell()
             }
         }
 
@@ -4548,7 +4699,7 @@ fn b371_the_optional_twin_is_unchanged() {
 
         impl type S: Source<type T> {
             fun and_then_to<U, I: Source<U>>(self, f: sync |T| Option<I>): SignalCell<Option<U>> {
-                self.map(f).flatten().cell()
+                self.derive(|value| f(value)).flatten().cell()
             }
         }
 
@@ -4644,27 +4795,101 @@ fn a86_two_blankets_bounded_the_same_way_still_collide() {
 }
 
 #[test]
-fn a86_a_blanket_and_a_constructor_headed_impl_still_collide() {
+fn a86_a_blanket_and_a_constructor_headed_impl_are_ranked() {
     // The other control: the bounds clause reaches BARE binders only. A
-    // blanket against a concrete subject is the overlap B73 named, and it is
-    // still refused.
-    assert_fails_with(
+    // blanket beside a concrete subject it claims was B73's overlap and was
+    // refused — but only in THIS declaration order (the blanket first); the
+    // other order compiled and the call took whichever block came first.
+    // B456 (RULED 2026-09-29, door (b)) ranks the pair in both orders: the
+    // concrete subject's member outranks the blanket's at a concrete
+    // receiver, and the blanket answers every other `Read`.
+    assert_compiles_and_runs(
         r#"
         trait Read<T> { fun get(self): T; }
         struct Cell<T> { value: T }
         impl Cell<type T> with Read<T> {
             fun get(self): T { self.value }
         }
+        struct Boxed<T> { value: T }
+        impl Boxed<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
 
         impl type S: Read<type T> {
-            fun peek(self): T { self.get() }
+            fun peek(self): T { print("blanket"); self.get() }
         }
         impl Cell<type T> {
-            fun peek(self): T { self.value }
+            fun peek(self): T { print("concrete"); self.value }
         }
 
-        fun main() { }
+        fun main() {
+            print(Cell { value = 1 }.peek());
+            print(Boxed { value = 2 }.peek());
+        }
         "#,
+        "concrete\n1\nblanket\n2\n",
+    );
+}
+
+/// B456 (RULED 2026-09-29, door (b)): a blanket and a concrete subject it
+/// claims share a name in EITHER declaration order, with one answer: the
+/// concrete member at a concrete receiver, the blanket's for every other type
+/// and through a bound. The same program is run in both orders.
+const B456_HEAD: &str = r#"
+trait Read<T> { fun get(self): T; }
+struct Cell<T> { value: T }
+impl Cell<type T> with Read<T> {
+    fun get(self): T { self.value }
+}
+struct Boxed<T> { value: T }
+impl Boxed<type T> with Read<T> {
+    fun get(self): T { self.value }
+}
+"#;
+const B456_CONCRETE: &str = r#"
+impl Cell<type T> {
+    fun peek(self): str { "concrete" }
+}
+"#;
+const B456_BLANKET: &str = r#"
+impl type S: Read<type T> {
+    fun peek(self): str { "blanket" }
+}
+"#;
+const B456_MAIN: &str = r#"
+fun through<S: Read<i32>>(source: S): str { source.peek() }
+fun main() {
+    print(Cell { value = 1 }.peek());
+    print(Boxed { value = 2 }.peek());
+    print(through(Cell { value = 3 }));
+}
+"#;
+
+#[test]
+fn b456_the_concrete_block_declared_first_is_ranked() {
+    assert_compiles_and_runs(
+        &format!("{B456_HEAD}{B456_CONCRETE}{B456_BLANKET}{B456_MAIN}"),
+        "concrete\nblanket\nblanket\n",
+    );
+}
+
+#[test]
+fn b456_the_blanket_declared_first_is_ranked_the_same() {
+    // Refused as "already defined" before the ruling.
+    assert_compiles_and_runs(
+        &format!("{B456_HEAD}{B456_BLANKET}{B456_CONCRETE}{B456_MAIN}"),
+        "concrete\nblanket\nblanket\n",
+    );
+}
+
+#[test]
+fn b456_two_concrete_blocks_still_collide() {
+    // The ranking is for a blanket beside a constructor-headed subject; two
+    // constructor-headed blocks declaring one name are still a duplicate.
+    assert_fails_with(
+        &format!(
+            "{B456_HEAD}{B456_CONCRETE}\nimpl Cell<i32> {{\n    fun peek(self): str {{ \"again\" }}\n}}\nfun main() {{}}\n"
+        ),
         "'peek' is already defined for",
     );
 }
@@ -4783,9 +5008,9 @@ fn a_derive_wire_field_may_be_a_map() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         [derive(Wire)]
-        struct Row { id: i53, tags: Map<str, i32> }
+        struct Row { id: i53, tags: HashMap<str, i32> }
         fun main() { print("row"); }
         main();
         "#,
@@ -4936,7 +5161,7 @@ fn a_handle_returns_element_may_be_a_hand_implemented_wire_type() {
 /// they ARE four texts saying one thing.
 #[test]
 fn the_wire_refusal_names_map_and_the_impl_among_the_shapes_it_admits() {
-    let admitted = "`List`/`Option`/`Map` of Wire";
+    let admitted = "`List`/`Option`/`HashMap` of Wire";
     let escape = "or a type with an `impl .. with Wire`";
     for (source, head) in [
         (
@@ -7279,21 +7504,23 @@ fn b408_a_trait_member_a_blanket_provides_is_reachable_through_a_bound() {
 
 /// std's shape, the item's own: `.cell()` and `.distinct()` — blankets over
 /// `S: Source<T>` — called in generic code, and what they return read at the
-/// concrete caller after a write.
+/// concrete caller after a write. (A142: both are reached through `Flow` now —
+/// `.cell()` seals a PIPE, so the generic body derives first, as a root has no
+/// `.cell()`; `.distinct()` answers a pipe, read once with `.sample()`.)
 #[test]
 fn b408_std_cell_and_distinct_are_reachable_in_generic_code() {
     assert_compiles_and_runs(
         concat!(
             "import std::io::print;\n",
             "import std::reactive::{ Distinct, Signal, SignalCell, Source };\n",
-            "fun cached<S: Source<i32>>(s: S): SignalCell<i32> { s.cell() }\n",
+            "fun cached<S: Source<i32>>(s: S): SignalCell<i32> { s.derive(|v| v).cell() }\n",
             "fun deduped<S: Source<i32>>(s: S): Distinct<S, i32> { s.distinct() }\n",
             "fun main() {\n",
             "\tlet a = Signal::new(3);\n",
             "\tlet c = cached(a);\n",
             "\tlet d = deduped(a);\n",
             "\ta.set(5);\n",
-            "\tprint(i\"{c.get()} {d.get()}\");\n",
+            "\tprint(i\"{c.get()} {d.sample()}\");\n",
             "}\n",
         ),
         "5 5\n",
@@ -7639,4 +7866,623 @@ fn b411_a_switch_shaped_node_reads_its_value_type_from_the_selected_source() {
         ),
         "w2!\nw2?\n",
     );
+}
+
+// --- B417: a member named `Self` is refused at its declaration ---------------
+
+#[test]
+fn b417_a_method_named_self_is_refused_where_it_is_declared() {
+    assert_fails_once_with(
+        r#"
+        struct Point { x: i32 }
+        impl Point {
+            fun Self(self): i32 { self.x }
+        }
+        fun main() {}
+        "#,
+        "a function cannot be named `Self`",
+    );
+    // The refusal is the one report: the body still reads the real `Self`, so
+    // `self.x` is not a second, confusing error.
+    assert_fails_without(
+        r#"
+        struct Point { x: i32 }
+        impl Point {
+            fun Self(self): i32 { self.x }
+        }
+        fun main() {}
+        "#,
+        "cannot access field",
+    );
+}
+
+// --- B461: a bare trait NESTED in an annotation --------------------------------
+//
+// Each nested mention reads as its position reads a top-level one: at a
+// parameter an implicit generic of the function (B186), at a `let` an
+// existential the initializer grounds (B161). ONE type per mention — a mixed
+// list is `List<dyn Trait>`, and the refusal says so. A field keeps A124 R3's
+// refusal (a trait at a field is the object).
+
+#[test]
+fn b461_the_owners_let_with_a_nested_signal_compiles_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        fun main() {
+            let b: Signal<Option<Signal<i32>>> = SignalCell::new(Some(SignalCell::new(4)));
+            print(b.get().unwrap().get());
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b461_a_let_with_a_concrete_outer_and_a_nested_trait_grounds_from_its_initializer() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let o: Option<Source<i32>> = Some(SignalCell::new(5));
+            print(o.unwrap().get());
+            let pair: (Source<i32>, str) = (SignalCell::new(6), "x");
+            print(pair.0.get());
+        }
+        "#,
+        "5\n6\n",
+    );
+}
+
+#[test]
+fn b461_nested_traits_at_a_parameter_each_mint_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun total(sources: List<Source<i32>>): i32 {
+            mut sum = 0;
+            for source in sources {
+                sum = sum + source.get();
+            }
+            sum
+        }
+        fun first(source: Source<List<Source<i32>>>): i32 {
+            source.get()[0].get()
+        }
+        fun both(left: List<Source<i32>>, right: List<Source<i32>>): i32 {
+            total(left) + total(right)
+        }
+        fun main() {
+            print(total([SignalCell::new(1), SignalCell::new(2)]));
+            print(first(SignalCell::new([SignalCell::new(9)])));
+            print(both([SignalCell::new(1)], [SignalCell::new(2).derive(|x| x * 10).memo()]));
+        }
+        "#,
+        "3\n9\n21\n",
+    );
+}
+
+#[test]
+fn b461_a_mixed_literal_at_a_let_steers_to_the_object() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let mixed: List<Source<i32>> = [SignalCell::new(1), SignalCell::new(2).derive(|x| x).memo()];
+            print(mixed.len());
+        }
+        "#,
+        "The elements' type was written `Source<i32>`, a trait: written inside a type it stands \
+         for ONE type that implements it, so every element must be that type; for elements of \
+         different types write `dyn Source<i32>` there",
+    );
+}
+
+#[test]
+fn b461_a_mixed_literal_at_a_parameter_steers_to_the_object() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun count(sources: List<Source<i32>>): usize { sources.len() }
+        fun main() {
+            print(count([SignalCell::new(1), SignalCell::new(2).derive(|x| x).memo()]));
+        }
+        "#,
+        "for elements of different types write `dyn Source<i32>` there",
+    );
+}
+
+#[test]
+fn b461_a_let_whose_value_does_not_meet_the_nested_trait_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::Source;
+        fun main() {
+            let o: Option<Source<i32>> = Some(5);
+        }
+        "#,
+        "'Option<i32>' does not match the annotation on 'o'",
+    );
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        fun main() {
+            let b: Signal<Option<Signal<i32>>> = SignalCell::new(Some(5));
+        }
+        "#,
+        "'SignalCell<Option<i32>>' does not implement trait",
+    );
+}
+
+// --- B460: a bare trait in return position (RULED 2026-09-29, R-a door (i)) ---
+//
+// On a free `fun` or an inherent method the callee picks ONE concrete type — the
+// body's — checked to implement the trait and statically dispatched; the call
+// types as that concrete type per instantiation (B161's "checked wide, kept
+// narrow" applied to returns: NOT hidden, opacity is a later slice). Branches
+// that disagree are steered to `dyn`; a trait method's return stays refused.
+
+const B460_SHAPES: &str = r#"
+import std::reactive::{ Source, SignalCell };
+trait Shape {
+    fun area(self): i32;
+}
+struct Square { side: i32 }
+impl Square with Shape {
+    fun area(self): i32 { self.side * self.side }
+}
+struct Circle { r: i32 }
+impl Circle with Shape {
+    fun area(self): i32 { 3 * self.r * self.r }
+}
+"#;
+
+fn b460_program(rest: &str) -> String {
+    format!("{B460_SHAPES}\n{rest}")
+}
+
+#[test]
+fn b460_a_free_fun_returns_the_one_type_its_body_picks() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun make(side: i32): Shape { Square { side = side } }
+            fun counter(start: i32): Source<i32> { SignalCell::new(start) }
+            fun main() {
+                print(make(3).area());
+                print(counter(4).get());
+                // Not hidden: the caller sees `Square`.
+                print(make(2).side);
+            }
+            "#,
+        ),
+        "9\n4\n2\n",
+    );
+}
+
+#[test]
+fn b460_a_generic_fun_and_an_inherent_method_pick_per_instantiation() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun wrap<T>(value: T): Source<T> { SignalCell::new(value) }
+            struct Model { base: i32 }
+            impl Model {
+                fun doubled(self): Source<i32> { SignalCell::new(self.base * 2) }
+            }
+            fun main() {
+                print(wrap("x").get());
+                print(wrap(7).get());
+                print(Model { base = 5 }.doubled().get());
+            }
+            "#,
+        ),
+        "x\n7\n10\n",
+    );
+}
+
+#[test]
+fn b460_branches_of_two_types_steer_to_the_object() {
+    assert_fails_with(
+        &b460_program(
+            r#"
+            fun pick(square: bool): Shape {
+                if square { Square { side = 1 } } else { Circle { r = 1 } }
+            }
+            fun main() {}
+            "#,
+        ),
+        "`pick` returns `Shape`, a trait: that is ONE type the body picks, so every branch must \
+         produce it; for branches of different types return `dyn Shape`",
+    );
+    // ...and the object is the spelling that works.
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun pick(square: bool): dyn Shape {
+                if square { Square { side = 2 } } else { Circle { r = 1 } }
+            }
+            fun main() {
+                print(pick(true).area() + pick(false).area());
+            }
+            "#,
+        ),
+        "7\n",
+    );
+}
+
+#[test]
+fn b460_a_body_that_does_not_implement_the_trait_is_refused() {
+    assert_fails_with(
+        &b460_program("fun wrong(): Shape { 5 }\nfun main() {}\n"),
+        "'i32' does not implement trait 'Shape', which `wrong` returns: a trait written as a \
+         return type is the ONE type the body produces",
+    );
+}
+
+#[test]
+fn b460_a_trait_methods_bare_trait_return_stays_refused() {
+    let steer = "a TRAIT method cannot return a bare trait yet";
+    assert_fails_with(
+        &b460_program("trait Maker {\n    fun make(self): Shape;\n}\nfun main() {}\n"),
+        steer,
+    );
+    assert_fails_with(
+        &b460_program(
+            "trait Maker {\n    fun make(self): Square;\n}\nstruct Factory { n: i32 }\n\
+             impl Factory with Maker {\n    fun make(self): Shape { Square { side = 1 } }\n}\n\
+             fun main() {}\n",
+        ),
+        steer,
+    );
+}
+
+// --- A142 §3.3: a read on a pipe steers to sealing (Order 44, item 12) ------
+//
+// A PLACEHOLDER fixture: the pipe layer is reactive-44's, so the traits are
+// local here and read BY NAME (`Pipe`, `Source`) — the steer's wording and the
+// std names are pinned against reactive-44's after the rebase.
+
+const PIPE_STEER_FIXTURE: &str = "
+trait Source<T> {
+    fun get(self): T;
+}
+trait Pipe<T> {
+    fun memo(own self): i32 { 0 }
+}
+[resource]
+struct Doubled { n: i32 }
+impl Doubled with Pipe<i32> {}
+struct Plain { n: i32 }
+";
+
+#[test]
+fn a_read_on_a_pipe_steers_to_sealing_or_sampling() {
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Doubled {{ n = 1 }};\n    print(p.get());\n}}\n"
+    );
+    assert_fails_with(
+        &source,
+        "Doubled has no method 'get'; a pipe has no `get`: seal it with `.memo()`, or read it \
+         once with `.sample()`",
+    );
+}
+
+#[test]
+fn a_missing_member_on_a_non_pipe_keeps_its_ordinary_message() {
+    // The control: the steer is for a PIPE's read — a type that is no pipe,
+    // asked for the same member, keeps the plain message.
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Plain {{ n = 1 }};\n    print(p.get());\n}}\n"
+    );
+    assert_fails_with(&source, "Plain has no method 'get'");
+    assert_fails_without(&source, "a pipe has no");
+}
+
+#[test]
+fn a_pipe_asked_for_a_member_no_source_declares_keeps_its_ordinary_message() {
+    // The steer names a READ: a member the source trait does not declare is
+    // an ordinary miss on a pipe too.
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Doubled {{ n = 1 }};\n    print(p.frob());\n}}\n"
+    );
+    assert_fails_with(&source, "Doubled has no method 'frob'");
+    assert_fails_without(&source, "a pipe has no");
+}
+
+/// reactive-44's find (REPORT-reactive-44): the total join written as a pipe in
+/// a generic body, with the selector's parameter UNannotated. `.derive(f)` is a
+/// `Derive<S, T, I>` over the caller's abstract `I`, and `.switch(|inner| inner)`
+/// types `inner` as an unsubstituted `T` — "cannot infer 'U'" and "generic
+/// parameter 'T' is missing the bound ': Flow<U>'". The same body at concrete
+/// types, or with `|inner: I|`, compiles (the three B371 pins above).
+#[test]
+#[ignore = "A142: reactive-44 find: a pipe stage's closure parameter in a generic body is typed as the trait's unsubstituted T"]
+fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
+
+        fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
+            source.derive(f).switch(|inner| inner).cell()
+        }
+
+        fun main() {
+            let n = Signal::new(1);
+            run_with_owner(Owner::new(), || {
+                let doubled: SignalCell<i32> = switch_to(n, |m| Signal::new(m * 2));
+                print(doubled.get());
+            });
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+#[ignore = "A142: reactive-44 find (MISCOMPILE, both backends, predates A142): through a subtrait bound, a supertrait method with a default runs the default even where the type overrides it"]
+fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
+    // `Mine` overrides `Base::name`. Through `S: Base` the override runs;
+    // through `S: Sub` (a subtrait of `Base`) the DEFAULT runs today, on JS and
+    // natively, and on the 0.41.1 toolchain as well. A142 reached it: `map_each`
+    // over a `DeltaSource` bound called `Source::attach_observer`, and a
+    // `ListCell`'s own observer was bypassed for the default, which captures the
+    // source (A132's loop, 92 cells live at `list-cell`'s native end).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base {
+            fun name(self): str {
+                "the default"
+            }
+        }
+
+        trait Sub with Base {
+            fun tag(self): i32;
+        }
+
+        struct Mine {}
+
+        impl Mine with Base {
+            fun name(self): str {
+                "the override"
+            }
+        }
+
+        impl Mine with Sub {
+            fun tag(self): i32 {
+                7
+            }
+        }
+
+        fun through_base<S: Base>(value: S): str {
+            value.name()
+        }
+
+        fun through_sub<S: Sub>(value: S): str {
+            value.name()
+        }
+
+        fun main() {
+            let mine = Mine {};
+            print(through_base(mine));
+            print(through_sub(mine));
+        }
+
+        main();
+        "#,
+        "the override\nthe override\n",
+    );
+}
+
+// --- One trait at two instantiations: every provider is asked ------------------
+//
+// A type may provide one trait at two instantiations: `impl type T with Into2<T>`
+// gives a `SignalCell<bool>` `Into2<SignalCell<bool>>`, and `impl type F:
+// Flow<type T> with Into2<T>` gives it `Into2<bool>`. Emission and the analyzer
+// each asked only the FIRST applying provider, so a binder bounded `R: Into2<bool>`
+// was turned down for a flow — the impl it guarded fell out of dispatch through a
+// trait default (a body-less requirement, refused at emission) — and a binder
+// bounded `R: Kind<type U>` grounded `U` from the plain blanket where the more
+// specific one applied (collections-44's find; A142 S4's `IntoFlow` and
+// `IntoElement` are the first customers).
+
+/// The bound holds when ANY provider gives the written instantiation: `Holder`'s
+/// impl is admitted for a flow, and a trait default reaches its member.
+#[test]
+fn a_bound_holds_through_a_second_provider_at_its_written_instantiation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Signal, SignalCell };
+
+        trait Into2<T> {
+            fun go(self): i32;
+        }
+        impl type T with Into2<T> {
+            fun go(self): i32 {
+                1
+            }
+        }
+        impl type F: Flow<type T> with Into2<T> {
+            fun go(self): i32 {
+                2
+            }
+        }
+        trait Runs {
+            fun run(self): i32;
+        }
+        struct Holder<R> {
+            r: R,
+        }
+        impl Holder<type R: Into2<bool>> with Runs {
+            fun run(self): i32 {
+                self.r.go()
+            }
+        }
+        trait Outer with Runs {
+            fun twice(self): i32 {
+                self.run() * 2
+            }
+        }
+        impl Holder<type R: Into2<bool>> with Outer {}
+
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            print(Holder { r = true }.run());
+            print(Holder { r = flag }.run());
+            print(Holder { r = true }.twice());
+            print(Holder { r = flag }.twice());
+        }
+        main();
+        "#,
+        "1\n2\n2\n4\n",
+    );
+}
+
+/// A binder written in a bound (`R: Kind<type U>`) grounds from the MOST
+/// SPECIFIC provider that agrees with the bound: the `Wrapped` blanket over the
+/// plain one for a `Cup`, so `U` is `i32` and not `Cup`; the plain one for a
+/// `str`, which nothing else provides for.
+#[test]
+fn a_bound_binder_grounds_from_the_most_specific_provider() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Kind<T> {
+            fun kind(self): str;
+        }
+        trait Wrapped<T> {
+            fun inner(self): T;
+        }
+        impl type T with Kind<T> {
+            fun kind(self): str {
+                "plain"
+            }
+        }
+        impl type W: Wrapped<type T> with Kind<T> {
+            fun kind(self): str {
+                "wrapped"
+            }
+        }
+        struct Cup {
+            v: i32,
+        }
+        impl Cup with Wrapped<i32> {
+            fun inner(self): i32 {
+                self.v
+            }
+        }
+        struct Holder<R> {
+            r: R,
+        }
+        impl Holder<type R: Kind<type U>> {
+            fun nothing(self): Option<U> {
+                None
+            }
+
+            fun which(self): str {
+                self.r.kind()
+            }
+        }
+        fun main() {
+            let held: Option<i32> = Holder { r = Cup { v = 1 } }.nothing();
+            print(held.is_none());
+            print(Holder { r = Cup { v = 1 } }.which());
+            let plain: Option<str> = Holder { r = "x" }.nothing();
+            print(plain.is_none());
+            print(Holder { r = "x" }.which());
+        }
+        main();
+        "#,
+        "true\nwrapped\ntrue\nplain\n",
+    );
+}
+
+// --- E227: `[hint(Trait<..>)]`, the declaration checks ------------------------
+//
+// The attribute names the trait application a struct or an enum is SHOWN as
+// in an inlay hint (`proposal/inlay-hint-abbreviation.md` §3.2). Every check
+// is a refusal with a steer, and none is a warning; a well-formed hint changes
+// nothing a program means.
+
+/// The shared shape: a node over an upstream, and the impl that provides
+/// `Stream<U>` only when the upstream is a stream — CONDITIONAL, as every std
+/// node's is. The declaration check is structural, so the bound does not stand
+/// in its way.
+const HINTED_NODE: &str = "trait Stream<T> {\n\tfun peek(self): T;\n}\n\n\
+    struct Cell<T> {\n\tvalue: T,\n}\n\n\
+    impl Cell<type T> with Stream<T> {\n\tfun peek(self): T {\n\t\tself.value\n\t}\n}\n\n\
+    [hint(Stream<U>)]\n\
+    struct Node<S, T, U> {\n\tup: S,\n\tstep: |T| U,\n}\n\n\
+    impl Node<type S: Stream<type T>, T, type U> with Stream<U> {\n\
+    \tfun peek(self): U {\n\t\t(self.step)(self.up.peek())\n\t}\n}\n";
+
+#[test]
+fn e227_a_hint_naming_an_implemented_trait_application_compiles() {
+    assert_compiles(&format!(
+        "{HINTED_NODE}\nfun main() {{\n\tlet cell = Cell {{ value = 2 }};\n\
+         \tlet node = Node {{ up = cell, step = |x: i32| x + 1 }};\n\tprint(node.peek());\n}}\n"
+    ));
+}
+
+#[test]
+fn e227_a_hint_no_impl_provides_is_refused() {
+    // `Source<T>` — the upstream's type, not the node's: the mistake the item's
+    // own first sketch made (`Signal` for `Map`) in another shape.
+    assert_fails_once_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(Stream<T>)]"),
+        "`[hint(Stream<T>)]`: no impl of `Stream<T>` for `Node<S, T, U>`",
+    );
+}
+
+#[test]
+fn e227_a_hint_that_is_not_a_trait_application_is_refused() {
+    assert_fails_once_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(List<U>)]"),
+        "`[hint(List<U>)]` must name a trait application",
+    );
+}
+
+#[test]
+fn e227_a_hint_naming_a_free_type_is_refused_at_the_name() {
+    assert_fails_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(Stream<Missing>)]"),
+        "Missing",
+    );
+}
+
+#[test]
+fn e227_two_hints_on_one_declaration_are_refused() {
+    assert_fails_once_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(Stream<U>)]\n[hint(Stream<U>)]"),
+        "`Node` carries more than one `[hint(..)]`",
+    );
+}
+
+#[test]
+fn e227_a_hint_on_a_trait_a_binding_or_an_impl_is_refused() {
+    for (written, kind) in [
+        (
+            "[hint(Source<i32>)]\ntrait Named {\n\tfun name(self): str;\n}\n",
+            "a trait is not a type",
+        ),
+        (
+            "[hint(Source<i32>)]\nlet shared = 3;\n",
+            "a module binding is not a type",
+        ),
+        (
+            "struct Plain {\n\tat: i32,\n}\n\n[hint(Source<i32>)]\nimpl Plain {\n\tfun at(self): i32 {\n\t\tself.at\n\t}\n}\n",
+            "an `impl` block is not a type",
+        ),
+    ] {
+        assert_fails_once_with(
+            &format!("import std::reactive::Source;\n\n{written}\nfun main() {{}}\n"),
+            kind,
+        );
+    }
 }

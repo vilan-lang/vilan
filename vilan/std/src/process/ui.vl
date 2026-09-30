@@ -33,11 +33,14 @@ import pkg::hash::Hashable;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Draft,
+	Flow,
 	Owner,
+	RowFeed,
 	Signal,
 	SignalCell,
 	Source,
 	owner_scope,
+	read_once,
 	run_with_owner,
 	turn_scope,
 };
@@ -147,15 +150,15 @@ export impl View {
 	/// A CSS custom property, read once and folded into the `style` attribute — the
 	/// server end of `width(Length::var("--w"))`. (No subscription: the value at
 	/// render time is the value served.)
-	fun style_var<S: Source<str>>(self, name: str, source: S): View {
-		add_style_declaration(self.attributes, name + ":" + source.get());
+	fun style_var<S: Flow<str>>(self, name: str, own source: S): View {
+		add_style_declaration(self.attributes, name + ":" + read_once(source));
 		self
 	}
 
 	/// An attribute. The value's TYPE decides its life (proposal/element-syntax.md
 	/// §5): a `str` sets once; a `SignalCell<str>` is read once, exactly
 	/// `bind_attr`. Anything `AttrValue` fills the slot.
-	fun attr<V: AttrValue>(self, name: str, value: V): View {
+	fun attr<V: AttrValue>(self, name: str, own value: V): View {
 		value.apply(self, name);
 		self
 	}
@@ -183,7 +186,7 @@ export impl View {
 	/// appends as an element, a `str` as a text node, a `List<View>` appends each,
 	/// and a `Source` of any of those three is READ ONCE, the value at render time
 	/// being the value served.
-	fun child<C: Slot>(self, content: C): View {
+	fun child<C: Slot>(self, own content: C): View {
 		content.place(self);
 		self
 	}
@@ -198,22 +201,22 @@ export impl View {
 
 	/// Reactive text content, READ ONCE: embeds `source`'s current value as text.
 	/// No subscription — nothing to notify at serve time.
-	fun bind_text<S: Source<str>>(self, source: S): View {
-		self.text.write() = source.get();
+	fun bind_text<S: Flow<str>>(self, own source: S): View {
+		self.text.write() = read_once(source);
 		self.children.write() = [];
 		self
 	}
 
 	/// Reactive CSS class, read once.
-	fun bind_class<S: Source<str>>(self, source: S): View {
-		set_attribute(self.attributes, "class", source.get());
+	fun bind_class<S: Flow<str>>(self, own source: S): View {
+		set_attribute(self.attributes, "class", read_once(source));
 		self
 	}
 
 	/// Reactive `Style`, read once: the style the signal holds at render time is
 	/// the one served.
-	fun bind_styled<S: Source<Style>>(self, source: S): View {
-		set_attribute(self.attributes, "class", source.get().class_list());
+	fun bind_styled<S: Flow<Style>>(self, own source: S): View {
+		set_attribute(self.attributes, "class", read_once(source).class_list());
 		self
 	}
 
@@ -222,7 +225,7 @@ export impl View {
 	/// There is no server counterpart to the browser twin's `remove_attribute`
 	/// because nothing was written in the first place, which is `toggle_attr`'s
 	/// arrangement exactly. KEEP IN STEP with the browser twin.
-	fun bind_attr<V: AttrBinding>(self, name: str, source: V): View {
+	fun bind_attr<V: AttrBinding>(self, name: str, own source: V): View {
 		source.bind_attribute(self, name);
 		self
 	}
@@ -232,8 +235,8 @@ export impl View {
 	/// nothing to render for the false case — the browser twin's `remove_attribute`
 	/// has no server counterpart because the attribute was never written. KEEP IN
 	/// STEP with the browser twin.
-	fun toggle_attr<S: Source<bool>>(self, name: str, source: S): View {
-		if source.get() {
+	fun toggle_attr<S: Flow<bool>>(self, name: str, own source: S): View {
+		if read_once(source) {
 			set_attribute(self.attributes, name, "");
 		}
 		self
@@ -294,8 +297,8 @@ export impl View {
 	/// `Style`'s rules are not — so serving the attribute alone would paint the
 	/// element until the client's first toggle took it away. KEEP IN STEP with the
 	/// browser twin.
-	fun show<S: Source<bool>>(self, condition: S): View {
-		if !condition.get() {
+	fun show<S: Flow<bool>>(self, own condition: S): View {
+		if !read_once(condition) {
 			set_attribute(self.attributes, "hidden", "");
 			add_style_declaration(self.attributes, "display:none");
 		}
@@ -351,7 +354,7 @@ export impl Region {
 	/// twin plants one, and `Row` is empty here for the same reason `Region` plants
 	/// no anchor. KEEP IN STEP with the browser twin.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
-	fun open_row<C: Slot>(self, content: C): Row {
+	fun open_row<C: Slot>(self, own content: C): Row {
 		content.place(self.parent);
 		Row {}
 	}
@@ -359,7 +362,7 @@ export impl Region {
 	/// Places a row before another one — a server render writes in source order and
 	/// never moves anything, so the position is `open_row`'s and the bound is
 	/// dropped (A98). KEEP IN STEP with the browser twin.
-	fun open_row_before<C: Slot>(self, content: C, end: Row): Row {
+	fun open_row_before<C: Slot>(self, own content: C, end: Row): Row {
 		self.open_row(content)
 	}
 
@@ -405,34 +408,50 @@ export impl Region {
 /// `render` walks, three declarations above. KEEP IN STEP with the browser twin's
 /// copy (browser/ui.vl).
 export trait Slot {
-	fun place(self, parent: View);
+	fun place(own self, parent: View);
 }
 
 /// A child element.
 export impl View with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		parent.children.write().push(Child::Element(self));
 	}
 }
 
 /// A static text node.
 export impl str with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		parent.children.write().push(Child::Text(self));
 	}
 }
 
 /// A text node, read once — the value at render time is the value served. A BLANKET
 /// over the read trait (B158/B165), like the browser twin.
-export impl type S: Source<str> with Slot {
-	fun place(self, parent: View) {
-		parent.children.write().push(Child::Text(self.get()));
+export impl type S: Flow<str> with Slot {
+	fun place(own self, parent: View) {
+		place_text_flow(self, parent);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<str> with Slot {
+	fun place(own self, parent: View) {
+		place_text_flow(self, parent);
+	}
+}
+
+fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
+	parent.children.write().push(Child::Text(read_once(flow)));
 }
 
 /// Several child elements, in order — the static run A46's fragment would lower to.
 export impl List<View> with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		for item in self {
 			parent.children.write().push(Child::Element(item));
 		}
@@ -444,22 +463,54 @@ export impl List<View> with Slot {
 /// `Region`, so the replacement keeps the hole's position (A71) — and here there is
 /// no later change to follow, so the value is written at its position directly and
 /// no anchor is served.
-export impl type S: Source<View> with Slot {
-	fun place(self, parent: View) {
-		parent.children.write().push(Child::Element(self.get()));
+export impl type S: Flow<View> with Slot {
+	fun place(own self, parent: View) {
+		place_view_flow(self, parent);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<View> with Slot {
+	fun place(own self, parent: View) {
+		place_view_flow(self, parent);
+	}
+}
+
+fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
+	parent.children.write().push(Child::Element(read_once(flow)));
 }
 
 /// A reactive run of element children, read once — the `List<View>` arm's server
 /// end, with the single-view arm's story above: the browser twin keeps the run in
 /// place through a `Region`, and a one-pass render needs no anchor to do the same.
 /// KEEP IN STEP with the browser twin.
+export impl type S: Flow<List<View>> with Slot {
+	fun place(own self, parent: View) {
+		place_views_flow(self, parent);
+	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
 export impl type S: Source<List<View>> with Slot {
-	fun place(self, parent: View) {
-		let items: List<View> = self.get();
-		for item in items {
-			parent.children.write().push(Child::Element(item));
-		}
+	fun place(own self, parent: View) {
+		place_views_flow(self, parent);
+	}
+}
+
+fun place_views_flow<F: Flow<List<View>>>(own flow: F, parent: View) {
+	let items: List<View> = read_once(flow);
+	for item in items {
+		parent.children.write().push(Child::Element(item));
 	}
 }
 // === The positional value forms (A85), server side =========================
@@ -479,7 +530,7 @@ export impl type S: Source<List<View>> with Slot {
 // (browser/ui.vl).
 
 /// Conditional content as a child — the `when` slot value (A85/A99).
-export struct Conditional<S: Source<bool>, C: Slot> {
+export struct Conditional<S: Flow<bool>, C: Slot> {
 	condition: S,
 	body: (|| C) context owner_scope,
 }
@@ -487,26 +538,26 @@ export struct Conditional<S: Source<bool>, C: Slot> {
 /// A dynamic subtree as a child — the `swap` slot value (A85/A99). No `gated`/`armed`
 /// half: route chunks are a browser thing (nothing is ever in flight here), so
 /// the server twin holds only what it renders.
-export struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
+export struct Swap<T: PartialEq, S: Flow<T>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A keyed reactive run as a child — the `each` slot value (A85/A99).
-export struct Each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct Each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export struct EachValues<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachValues<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export struct EachBy<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachBy<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|SignalCell<T>| C) context owner_scope,
@@ -514,8 +565,8 @@ export struct EachBy<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
 
 /// Conditional content at THIS position, read once: the body renders when
 /// `condition` is currently true and nothing when it is false.
-export fun when<S: Source<bool>, C: Slot>(
-	condition: S,
+export fun when<S: Flow<bool>, C: Slot>(
+	own condition: S,
 	body: (sync || C) context owner_scope,
 ): Conditional<S, C> {
 	Conditional { condition, body }
@@ -523,16 +574,16 @@ export fun when<S: Source<bool>, C: Slot>(
 
 /// The dynamic subtree at THIS position, read once: the branch for `source`'s
 /// CURRENT value.
-export fun swap<T: PartialEq, S: Source<T>, C: Slot>(
-	source: S,
+export fun swap<T: PartialEq, S: Flow<T>, C: Slot>(
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 ): Swap<T, S, C> {
 	Swap { source, render }
 }
 
 /// A keyed reactive run at THIS position, rendered from the current items.
-export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ): Each<T, K, S, C> {
@@ -540,25 +591,25 @@ export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Sl
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export fun each_values<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_values<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 ): EachValues<T, S, C> {
 	EachValues { source, render }
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export fun each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): EachBy<T, K, S, C> {
 	EachBy { source, key, render }
 }
 
-export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
-		if self.condition.get() {
+export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
+		if read_once(self.condition) {
 			let region = Region::open(parent);
 			let owner = Owner::new();
 			let _row = run_with_owner(owner, || region.open_row((self.body)()));
@@ -566,38 +617,38 @@ export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 	}
 }
 
-export impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl Swap<type T: PartialEq, type S: Flow<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_swap(parent, self.source, self.render);
 	}
 }
 
-export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-export impl EachValues<type T: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl EachValues<type T: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
-export impl EachBy<type T, type K: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl EachBy<type T, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
 }
 
 /// `swap`'s body, server side — the branch for the current value, in position.
-fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
+fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 ) {
 	let region = Region::open(parent);
-	let value = source.get();
+	let value = read_once(source);
 	let owner = Owner::new();
 	let _row = run_with_owner(owner, || region.open_row(render(value)));
 }
@@ -613,18 +664,27 @@ fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 /// No op path (A112 S3): the browser twin follows a `DeltaSource`'s ops after its
 /// first build, and a server render IS only a first build — it reads the list once
 /// and never hears a change, so there is nothing for ops to say.
-fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
+fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ) {
 	let region = Region::open(parent);
-	let items: List<T> = source.get();
+	let items: List<T> = read_rows(source);
 	for item in items {
 		let owner = Owner::new();
 		let _row = run_with_owner(owner, || region.open_row(render(item)));
 	}
+}
+
+/// A run's input read ONCE — opened, its snapshot taken, released: a server render
+/// hears no later change (`read_once`'s shape, for a collection input).
+fun read_rows<T, S: RowFeed<T>>(own source: S): List<T> {
+	let instance = source.open_rows();
+	let items = (instance.snapshot)();
+	(instance.release)();
+	items
 }
 
 /// `each_by`'s body, server side: one child per element of the CURRENT list, each
@@ -634,14 +694,14 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slo
 ///
 /// No op path (A112 S3b), for `place_each`'s reason: a server render is only a
 /// first build.
-fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
+fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ) {
 	let region = Region::open(parent);
-	let items: List<T> = source.get();
+	let items: List<T> = read_rows(source);
 	// The key is client business — it decides which row survives a change, and no
 	// row here outlives the request. Accepted and dropped, like the event binders'
 	// handlers.
@@ -658,27 +718,43 @@ fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 /// tracked arm is a BLANKET over `Source<str>` (B158/B165). KEEP IN STEP with the
 /// browser twin's copy (browser/ui.vl).
 export trait AttrValue {
-	fun apply(self, parent: View, name: str);
+	fun apply(own self, parent: View, name: str);
 }
 
 /// Set once.
 export impl str with AttrValue {
-	fun apply(self, parent: View, name: str) {
+	fun apply(own self, parent: View, name: str) {
 		set_attribute(parent.attributes, name, self);
 	}
 }
 
 /// Read once — exactly `bind_attr`, for every `Source<str>`.
-export impl type S: Source<str> with AttrValue {
-	fun apply(self, parent: View, name: str) {
-		set_attribute(parent.attributes, name, self.get());
+export impl type S: Flow<str> with AttrValue {
+	fun apply(own self, parent: View, name: str) {
+		apply_text_flow(self, parent, name);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<str> with AttrValue {
+	fun apply(own self, parent: View, name: str) {
+		apply_text_flow(self, parent, name);
+	}
+}
+
+fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
+	set_attribute(parent.attributes, name, read_once(flow));
 }
 
 /// Rendered only for a `Some` (A115): a `None` omits the attribute, which is the
 /// server's whole answer to the browser twin's "write nothing".
 export impl Option<str> with AttrValue {
-	fun apply(self, parent: View, name: str) {
+	fun apply(own self, parent: View, name: str) {
 		match self {
 			Some(let text) => set_attribute(parent.attributes, name, text),
 			None => {},
@@ -689,12 +765,28 @@ export impl Option<str> with AttrValue {
 /// Read once, rendered only for a `Some` (A115) — the twin of the browser's
 /// removing arm. Nothing was written, so there is no `remove_attribute` to mirror,
 /// which is `AttrBinding`'s arrangement exactly.
+export impl type S: Flow<Option<str>> with AttrValue {
+	fun apply(own self, parent: View, name: str) {
+		apply_optional_flow(self, parent, name);
+	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
 export impl type S: Source<Option<str>> with AttrValue {
-	fun apply(self, parent: View, name: str) {
-		match self.get() {
-			Some(let text) => set_attribute(parent.attributes, name, text),
-			None => {},
-		}
+	fun apply(own self, parent: View, name: str) {
+		apply_optional_flow(self, parent, name);
+	}
+}
+
+fun apply_optional_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
+	match read_once(flow) {
+		Some(let text) => set_attribute(parent.attributes, name, text),
+		None => {},
 	}
 }
 
@@ -704,24 +796,56 @@ export impl type S: Source<Option<str>> with AttrValue {
 /// above is the element-syntax one and does.
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
 export trait AttrBinding {
-	fun bind_attribute(self, parent: View, name: str);
+	fun bind_attribute(own self, parent: View, name: str);
 }
 
 /// Always present.
-export impl type S: Source<str> with AttrBinding {
-	fun bind_attribute(self, parent: View, name: str) {
-		set_attribute(parent.attributes, name, self.get());
+export impl type S: Flow<str> with AttrBinding {
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_text_attribute_flow(self, parent, name);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<str> with AttrBinding {
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_text_attribute_flow(self, parent, name);
+	}
+}
+
+fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
+	set_attribute(parent.attributes, name, read_once(flow));
 }
 
 /// Rendered only for a `Some`: a `None` omits the attribute, which is the server's
 /// whole answer to the browser twin's `remove_attribute`.
+export impl type S: Flow<Option<str>> with AttrBinding {
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_optional_attribute_flow(self, parent, name);
+	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
 export impl type S: Source<Option<str>> with AttrBinding {
-	fun bind_attribute(self, parent: View, name: str) {
-		match self.get() {
-			Some(let text) => set_attribute(parent.attributes, name, text),
-			None => {},
-		}
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_optional_attribute_flow(self, parent, name);
+	}
+}
+
+fun bind_optional_attribute_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
+	match read_once(flow) {
+		Some(let text) => set_attribute(parent.attributes, name, text),
+		None => {},
 	}
 }
 
@@ -812,7 +936,7 @@ export fun chunk_failure(): SignalCell<Option<str>> {
 
 /// Content that exists while `source` is `Some`, with the payload bound — the
 /// `when_some` slot value (A119).
-export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
+export struct WhenSome<T, S: Flow<Option<T>>, C: Slot> {
 	source: S,
 	render: (|SignalCell<T>| C) context owner_scope,
 }
@@ -820,15 +944,15 @@ export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
 /// `Some`-conditional content at THIS position, read once: the body renders when
 /// `source` currently holds a value and nothing when it is `None`. The body takes a
 /// `SignalCell<T>` for the browser twin's reason (R6).
-export fun when_some<T, S: Source<Option<T>>, C: Slot>(
-	source: S,
+export fun when_some<T, S: Flow<Option<T>>, C: Slot>(
+	own source: S,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): WhenSome<T, S, C> {
 	WhenSome { source, render }
 }
 
-export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl WhenSome<type T, type S: Flow<Option<T>>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_when_some(parent, self.source, self.render);
 	}
 }
@@ -836,12 +960,12 @@ export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot 
 /// `when_some`'s body, server side — the body for the CURRENT payload, in position,
 /// or nothing at all. A named helper beside `place_swap`'s and `place_each`'s,
 /// which is also what keeps the two twins' surfaces in parity (`std_twin_parity`).
-fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
+fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ) {
-	match source.get() {
+	match read_once(source) {
 		Some(let payload) => {
 			let region = Region::open(parent);
 			let cell: SignalCell<T> = SignalCell::new(payload);

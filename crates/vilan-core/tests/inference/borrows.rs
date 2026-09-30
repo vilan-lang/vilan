@@ -37,7 +37,7 @@ fn reactive_map_sub_and_set_with() {
         fun main() {
             let owner = Owner::new();
             let count = Signal::new(0);
-            let doubled = count.map(|n| n * 2);
+            let doubled = count.derive(|n| n * 2);
             owner.take(doubled.sub(|n| print(n)));
             count.set_with(|n| n + 1);
         }
@@ -223,7 +223,7 @@ fn generic_call_on_closure_parameter() {
         import std::display::Display;
         fun main() {
             let count = Signal::new(0);
-            let label = count.map(|n| n.to_string());
+            let label = count.derive(|n| n.to_string());
             label.sub(|s| print(s));
         }
         "#,
@@ -265,7 +265,7 @@ fn chained_derive_binds_method_generic_from_closure_return() {
         import std::display::format;
         fun main() {
             let count = Signal::new(3);
-            let label = count.map(|n| n * 2).map(|m| format(m));
+            let label = count.derive(|n| n * 2).derive(|m| format(m));
             label.sub(|s| print(s));
             count.set(10);
         }
@@ -290,7 +290,7 @@ fn format_in_closure_argument() {
         import std::display::format;
         fun main() {
             let count = Signal::new(0);
-            let label = count.map(|n| format(n));
+            let label = count.derive(|n| format(n));
             label.sub(|s| print(s));
             count.set(5);
         }
@@ -10100,5 +10100,576 @@ fn a_view_inside_a_nested_call_subject_is_a_closure_capture() {
         }
         "#,
         "a closure cannot capture the view 'seen'",
+    );
+}
+
+// --- B433: an assignment through a place that is not a plain `mut` local ----
+//
+// The value is checked against what the PLACE holds, by the plain place's rule
+// (`mut x: T; x = v`). Before B433 only a plain local and a struct field
+// (B166) were checked; a call answering `&mut T`, a subscript, a tuple
+// position, a `&mut`/`own` parameter and a view binding accepted any value,
+// and `Shared<Option<i32>>.write() = 5` stored a bare `i32` in an `Option`
+// slot that every later read misread (kolt's cache never cached).
+
+#[test]
+fn b433_a_bare_i32_through_write_into_an_option_cell_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let cell: Shared<Option<i32>> = Shared::new(None);
+            cell.write() = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_a_bare_struct_through_write_into_an_option_cell_is_refused() {
+    assert_fails_once_with(
+        r#"
+        import std::shared::Shared;
+        struct Plain { n: i32 }
+        fun main() {
+            let cell: Shared<Option<Plain>> = Shared::new(None);
+            cell.write() = Plain { n = 1 };
+        }
+        "#,
+        "Expected Option<Plain>, but got Plain",
+    );
+}
+
+#[test]
+fn b433_a_bare_list_through_write_into_an_option_cell_is_refused() {
+    // Kolt's shape: a cache slot `Shared<Option<List<..>>>` written bare.
+    assert_fails_once_with(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let cache: Shared<Option<List<i32>>> = Shared::new(None);
+            let made: List<i32> = [1, 2];
+            cache.write() = made;
+        }
+        "#,
+        "Expected Option<List<i32>>, but got List<i32>",
+    );
+}
+
+#[test]
+fn b433_some_through_write_into_an_option_cell_compiles_and_reads_back() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Plain { n: i32 }
+        fun main() {
+            let cell: Shared<Option<i32>> = Shared::new(None);
+            cell.write() = Some(5);
+            print(i"{cell.read().is_some()}");
+            let record: Shared<Option<Plain>> = Shared::new(None);
+            record.write() = Some(Plain { n = 2 });
+            print(i"{record.read().is_some()}");
+            cell.write() = None;
+            print(i"{cell.read().is_some()}");
+        }
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn b433_a_compound_assignment_through_write_at_a_u53_counter_compiles() {
+    // kolt store.vl:172's shape: the literal takes the place's type.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let next: Shared<u53> = Shared::new(0);
+            next.write() += 1;
+            next.write() += 1;
+            next.write() = 7;
+            print(i"{next.read()}");
+            let index: Shared<usize> = Shared::new(0);
+            index.write() += 2;
+            print(i"{index.read()}");
+        }
+        "#,
+        "7\n2\n",
+    );
+}
+
+#[test]
+fn b433_a_compound_assignment_of_the_wrong_type_through_write_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::shared::Shared;
+        fun main() {
+            let count: Shared<i32> = Shared::new(0);
+            count.write() += "one";
+        }
+        "#,
+        "",
+    );
+}
+
+#[test]
+fn b433_a_user_method_answering_a_mut_view_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        struct Holder { v: Option<i32> }
+        impl Holder {
+            fun slot(mut self): &mut Option<i32> borrows self { self.v }
+        }
+        fun main() {
+            mut holder = Holder { v = None };
+            holder.slot() = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_a_subscript_place_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut items: List<Option<i32>> = [None];
+            items[0] = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut items: List<i32> = [1];
+            items[0] = "c";
+        }
+        "#,
+        "Expected i32, but got str",
+    );
+}
+
+#[test]
+fn b433_a_tuple_position_place_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut pair: (Option<i32>, i32) = (None, 1);
+            pair.0 = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_a_mut_parameter_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun set(slot: &mut Option<i32>) { slot = 5; }
+        fun main() {
+            mut x: Option<i32> = None;
+            set(&mut x);
+        }
+        "#,
+        "Expected Option<i32>, but got i32",
+    );
+}
+
+#[test]
+fn b433_an_own_parameter_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun take(own n: i32) { n = "b"; }
+        fun main() { take(3); }
+        "#,
+        "Expected i32, but got str",
+    );
+}
+
+#[test]
+fn b433_a_mut_view_binding_checks_the_value() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut x = 1;
+            let view = &mut x;
+            view = "e";
+        }
+        "#,
+        "Expected i32, but got str",
+    );
+    assert_fails_once_with(
+        r#"
+        fun main() {
+            mut items: List<i32> = [1, 2];
+            for item in &mut items { item = "f"; }
+        }
+        "#,
+        "Expected i32, but got str",
+    );
+}
+
+#[test]
+fn b433_a_readonly_parameter_target_reports_only_the_mutation() {
+    // A place that cannot be written is refused as a target; a second
+    // "expected" diagnostic on it would say nothing more.
+    assert_fails_without(
+        r#"
+        fun set(n: i32) { n = "a"; }
+        fun main() { set(1); }
+        "#,
+        "Expected i32",
+    );
+}
+
+#[test]
+fn b433_well_typed_writes_at_every_place_compile_and_run() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun set(slot: &mut Option<i32>) { slot = Some(4); }
+        fun bump(own n: i32): i32 { n = n + 1; n }
+        fun main() {
+            mut items: List<Option<i32>> = [None];
+            items[0] = Some(1);
+            mut pair: (Option<i32>, i32) = (None, 1);
+            pair.0 = Some(2);
+            mut x: Option<i32> = None;
+            set(&mut x);
+            mut y = 1;
+            let view = &mut y;
+            view = 3;
+            print(i"{items[0].is_some()} {pair.0.is_some()} {x.is_some()} {y} {bump(4)}");
+        }
+        "#,
+        "true true true 3 5\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B400 — a CLOSURE's `&` parameter takes a view, as a `fun`'s does
+// ---------------------------------------------------------------------------
+//
+// A closure-typed value whose parameter is `&List<T>` accepted
+// `self.items.read()` — a VALUE — where a `fun`'s `&` parameter refuses the
+// same argument ("a `&` parameter takes a view; pass `& <place>`"). JS then
+// passed the cell's live list uncopied, so a write to the cell inside the
+// closure showed through the parameter (`seen=3`; natively `seen=2`). The
+// closure type carries its parameters' conventions, and the view-argument
+// check now reads them. `std::delta`'s `ListCell::peek` was written this way
+// and re-spells through `Weak::get` (collections-42's patch, in this change).
+
+const B400_HOLDER: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "struct Holder { items: Shared<List<i32>> }\n",
+);
+
+/// collections-41's repro: a closure PARAMETER.
+#[test]
+fn b400_a_closure_parameters_view_refuses_a_shared_read() {
+    assert_fails_with(
+        &format!(
+            "{B400_HOLDER}{}",
+            concat!(
+                "impl Holder {\n",
+                "\tfun peek(self, read: sync |&List<i32>| usize): usize { read(self.items.read()) }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tlet holder = Holder { items = Shared::new([1, 2]) };\n",
+                "\tprint(holder.peek(|list| list.len()));\n",
+                "}\n",
+            )
+        ),
+        "a `&` parameter takes a view; pass `& <place>` (there is no implicit borrow).",
+    );
+}
+
+/// A closure held in a LOCAL, and one held in a struct FIELD, refuse alike; a
+/// `&mut` one names its own spelling.
+#[test]
+fn b400_a_local_and_a_field_closure_refuse_a_value_at_a_view_parameter() {
+    assert_fails_with(
+        &format!(
+            "{B400_HOLDER}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet holder = Holder { items = Shared::new([1, 2]) };\n",
+                "\tlet count: |&List<i32>| usize = |list| list.len();\n",
+                "\tprint(count(holder.items.read()));\n",
+                "}\n",
+            )
+        ),
+        "a `&` parameter takes a view",
+    );
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "struct Reader { read: |&mut List<i32>| usize }\n",
+            "fun make(): List<i32> { [1, 2] }\n",
+            "fun main() {\n",
+            "\tlet reader = Reader { read = |list| list.len() };\n",
+            "\tprint((reader.read)(make()));\n",
+            "}\n",
+        ),
+        "a `&mut` parameter takes a view; pass `&mut <place>`",
+    );
+}
+
+/// The spellings that ARE views still pass: `&place`, and a view binding
+/// forwarded (the `Weak::get` lend `peek` re-spells through).
+#[test]
+fn b400_a_view_argument_to_a_closure_view_parameter_still_runs() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun lend(cell: Shared<List<i32>>, read: sync |&List<i32>| usize): usize {\n",
+            "\tlet weak = cell.downgrade();\n",
+            "\tmatch weak.get() {\n",
+            "\t\tSome(let list) => read(list),\n",
+            "\t\tNone => 0,\n",
+            "\t}\n",
+            "}\n",
+            "fun apply(items: List<i32>, read: sync |&List<i32>| usize): usize { read(&items) }\n",
+            "fun main() {\n",
+            "\tprint(apply([1, 2, 3], |list| list.len()));\n",
+            "\tprint(lend(Shared::new([4, 5]), |list| list.len()));\n",
+            "}\n",
+        ),
+        "3\n2\n",
+    );
+}
+
+/// The owner's scoping (2026-09-26): a PLACE fed to a closure's `&mut`
+/// parameter is not the temporary-read hazard — std's `KeyedCell::update`
+/// passes `mutate(list[at])` — and is not refused.
+#[test]
+fn b400_a_place_at_a_closure_view_parameter_is_not_refused() {
+    assert_compiles(concat!(
+        "fun update(items: List<i32>, at: usize, mutate: |&mut i32| void) {\n",
+        "\tmut list = items;\n",
+        "\tmutate(list[at]);\n",
+        "}\n",
+        "fun main() {\n",
+        "\tupdate([1, 2], 0, |&mut value| { value += 1; });\n",
+        "}\n",
+    ));
+}
+
+/// The `for` half: a loop over a `Shared::read()` temporary whose body writes
+/// the cell IN PLACE iterates a copy, as the native backend always did (JS
+/// iterated the growing array: `b=4`).
+#[test]
+fn b400_a_for_over_a_read_whose_body_writes_the_cell_iterates_a_copy() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun main() {\n",
+            "\tlet cell: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+            "\tmut seen = 0;\n",
+            "\tfor x in cell.read() {\n",
+            "\t\tif seen < 1 { cell.write().push(x); }\n",
+            "\t\tseen += 1;\n",
+            "\t}\n",
+            "\tprint(i\"b={seen} len={cell.read().len()}\");\n",
+            "}\n",
+        ),
+        "b=3 len=4\n",
+    );
+}
+
+/// ...and a loop that only reads, or only REBINDS the cell, still copies
+/// nothing — the promise shared.vl makes for a temporary that only reads.
+#[test]
+fn b400_a_for_over_a_read_that_does_not_write_in_place_copies_nothing() {
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "import std::shared::Shared;\n",
+        "fun main() {\n",
+        "\tlet cell: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+        "\tmut kept: List<i32> = [];\n",
+        "\tfor x in cell.read() {\n",
+        "\t\tif x > 1 { kept.push(x); }\n",
+        "\t}\n",
+        "\tcell.write() = kept;\n",
+        "\tprint(cell.read().len());\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a read-only loop over a read must not copy:\n{emitted}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B457 — a write reached THROUGH A CALL (RULED 2026-09-29, R-e door (a))
+// ---------------------------------------------------------------------------
+//
+// A `Shared::read()` still live across a call that may write the cell read the
+// write on JS (the read aliases the cell's storage) and not natively (which
+// copies). The call is asked through its callee's WRITE SUMMARY: a body's own
+// in-place writes and those its calls reach (a dispatched member answers for
+// every body of its name; a call through a closure value for any in-place
+// write of the cell). Two shapes: a notify loop whose subscriber writes the
+// list, and a read handed by value to a callee that writes the cell.
+
+#[test]
+fn b457_a_loop_over_a_read_whose_call_writes_the_cell_iterates_a_copy() {
+    // The subscriber adds a subscriber mid-notify: native iterated a copy
+    // (log 2); JS iterated the growing list and ran the new one too (3).
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun main() {\n",
+            "\tlet log: Shared<List<str>> = Shared::new([]);\n",
+            "\tlet subs: Shared<List<|| void>> = Shared::new([]);\n",
+            "\tsubs.write().push(|| {\n",
+            "\t\tlog.write().push(\"first\");\n",
+            "\t\tsubs.write().push(|| log.write().push(\"late\"));\n",
+            "\t});\n",
+            "\tsubs.write().push(|| log.write().push(\"second\"));\n",
+            "\tfor sub in subs.read() {\n",
+            "\t\tsub();\n",
+            "\t}\n",
+            "\tprint(log.read().len());\n",
+            "\tprint(subs.read().len());\n",
+            "}\n",
+        ),
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn b457_a_read_passed_by_value_to_a_callee_that_writes_the_cell_is_a_copy() {
+    // Directly, and through a callee two calls down.
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun grow(cell: Shared<List<i32>>) {\n",
+            "\tcell.write().push(9);\n",
+            "}\n",
+            "fun direct(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+            "\tcell.write().push(9);\n",
+            "\tseen.len()\n",
+            "}\n",
+            "fun transitive(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+            "\tgrow(cell);\n",
+            "\tseen.len()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet first = Shared::new([1, 2]);\n",
+            "\tprint(direct(first, first.read()));\n",
+            "\tlet second = Shared::new([1, 2]);\n",
+            "\tprint(transitive(second, second.read()));\n",
+            "}\n",
+        ),
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn b457_a_read_passed_to_a_callee_that_writes_nothing_is_not_copied() {
+    // The summary is what spares the copy: a callee with no in-place write
+    // (and no call that reaches one) takes the read as it is.
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "import std::shared::Shared;\n",
+        "fun count(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+        "\tseen.len() + cell.read().len()\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet cell = Shared::new([1, 2]);\n",
+        "\tcell.write().push(3);\n",
+        "\tprint(count(cell, cell.read()));\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a callee that writes nothing must not force a copy:\n{emitted}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B418 — a place or a `Shared` read reaching a binding THROUGH a branch copies
+// ---------------------------------------------------------------------------
+//
+// Rule 1 copies a place (and an unelided `Shared` read) at a binding, an
+// assignment and a construction slot — but only when the value IS the place.
+// Through an `if`/`match`/block tail it aliased on JS: `let b = if flag {
+// s.read() } else { [] }` saw a later `s.write().push` (4, native 3), and
+// `mut b = if flag { a } else { [] }; b.push(3)` grew `a`. The whole choosing
+// value copies now, as the native backend always did.
+
+#[test]
+fn b418_a_read_through_an_if_or_a_match_arm_is_copied_at_the_binding() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "fun main() {\n",
+            "\tlet s: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+            "\tlet flag = true;\n",
+            "\tlet b = if flag { s.read() } else { [] };\n",
+            "\ts.write().push(4);\n",
+            "\tprint(b.len());\n",
+            "\tlet c = match flag {\n",
+            "\t\ttrue => s.read(),\n",
+            "\t\tfalse => [],\n",
+            "\t};\n",
+            "\ts.write().push(5);\n",
+            "\tprint(c.len());\n",
+            "}\n",
+        ),
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn b418_a_place_through_a_branch_is_copied_at_a_binding_and_an_assignment() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet flag = true;\n",
+            "\tlet a: List<i32> = [1, 2];\n",
+            "\tmut d = if flag { a } else { [] };\n",
+            "\td.push(3);\n",
+            "\tmut e: List<i32> = [];\n",
+            "\te = if flag { { a } } else { [] };\n",
+            "\te.push(9);\n",
+            "\tlet f = [if flag { a } else { [] }];\n",
+            "\tprint(i\"{a.len()} {d.len()} {e.len()} {f[0].len()}\");\n",
+            "}\n",
+        ),
+        "2 3 3 2\n",
+    );
+}
+
+#[test]
+fn b418_a_branch_of_fresh_values_copies_nothing() {
+    let emitted = compile(concat!(
+        "import std::io::print;\n",
+        "fun main() {\n",
+        "\tlet flag = true;\n",
+        "\tlet b = if flag { [1] } else { [] };\n",
+        "\tprint(b.len());\n",
+        "}\n",
+    ))
+    .expect("compiles");
+    assert!(
+        !emitted.contains("__clone("),
+        "a branch of fresh values must not copy:\n{emitted}"
     );
 }

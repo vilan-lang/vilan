@@ -352,6 +352,219 @@ fn the_router_is_browser_only() {
     );
 }
 
+// --- F27 R3: platform-fenced twin items ------------------------------------
+//
+// Two items of one identity — module-level functions of one name, or `impl`s
+// of one trait for one subject — are TWINS when both are fenced and the
+// fences share no host (R3.1); a leg collects only the twin its platform
+// admits (R3.2), so each body is analyzed under a platform it admits and a
+// build compiles the one its entry's platform selects (R3.3). Twin functions
+// agree on their signature (R3.4); a missing twin is an ordinary miss (R3.5).
+// Rulings 2026-09-25 (platform-coloring.md §8.7): trait impls and free
+// functions only, no default-plus-override, a single-leg build checks one leg.
+
+/// The userland `Slot` twins F27 was filed for (kolt's `conditional_value.vl`),
+/// in exactly the shape of std's own twin pair — `ui.vl`'s `impl … with Slot`
+/// in the browser layer beside the process layer's: each twin reads members
+/// only its own platform's `View` has (`element` in the browser, `attributes`
+/// on the server), and each leg compiles clean because each twin is analyzed
+/// only under the platform its fence admits.
+const SLOT_TWINS: &str = r#"
+import std::io::print;
+import std::ui;
+import std::ui::{ Slot, View, view };
+
+struct Badge {
+    label: str,
+}
+
+[platform("browser")]
+impl Badge with Slot {
+    fun place(own self, parent: View) {
+        parent.element.set_attribute("data-badge", self.label);
+    }
+}
+
+[platform("@process")]
+impl Badge with Slot {
+    fun place(own self, parent: View) {
+        ui::set_attribute(parent.attributes, "data-badge", self.label);
+    }
+}
+
+fun main() {
+    let root = view("div");
+    Badge { label = "new" }.place(root);
+    print("placed");
+}
+"#;
+
+#[test]
+fn f27_r3_slot_twins_compile_under_each_platform_they_admit() {
+    // Before R3 each leg reported the OTHER twin's members as missing and the
+    // pair as a duplicate impl (B98).
+    let browser = compile_browser(SLOT_TWINS).expect("the browser leg compiles");
+    assert!(
+        browser.contains(".setAttribute(\"data-badge\""),
+        "{browser}"
+    );
+    assert_compiles_and_runs(SLOT_TWINS, "placed\n");
+    let node = compile(SLOT_TWINS).expect("the node leg compiles");
+    assert!(
+        !node.contains("setAttribute"),
+        "the browser twin leaked:\n{node}"
+    );
+}
+
+#[test]
+fn f27_r3_a_build_compiles_the_twin_function_its_platform_selects() {
+    let source = r#"
+        import std::io::print;
+
+        [platform("browser")]
+        fun where_am_i(): str { "browser" }
+
+        [platform("@process")]
+        fun where_am_i(): str { "process" }
+
+        fun main() { print(where_am_i()); }
+    "#;
+    assert_compiles_and_runs(source, "process\n");
+    let browser = compile_browser(source).expect("the browser leg compiles");
+    assert!(
+        browser.contains("\"browser\"") && !browser.contains("\"process\""),
+        "{browser}"
+    );
+    for platform in ["deno", "bun"] {
+        let js = compile_on(source, Platform::parse(platform).expect(platform)).expect(platform);
+        assert!(
+            js.contains("\"process\"") && !js.contains("\"browser\""),
+            "{platform}: {js}"
+        );
+    }
+}
+
+#[test]
+fn f27_r3_a_fenced_out_twin_is_not_type_checked_by_a_single_leg_build() {
+    // §8.5's new invariant, accepted (Q3): a browser build checks the browser
+    // leg's items and no others — `vilan check` is the all-legs answer.
+    let source = r#"
+        [platform("browser")]
+        fun pick(): i32 { 1 }
+
+        [platform("@process")]
+        fun pick(): i32 { "not an i32" }
+
+        fun main() { let _ = pick(); }
+    "#;
+    assert!(compile_browser(source).is_ok());
+    assert_fails_with(source, "Expected i32, but got str");
+}
+
+#[test]
+fn f27_r3_overlapping_fences_are_refused_naming_the_shared_host() {
+    assert_fails_with(
+        r#"
+        [platform("node")]
+        fun b(): i32 { 1 }
+
+        [platform("@process")]
+        fun b(): i32 { 2 }
+
+        fun main() { let _ = b(); }
+        "#,
+        "both twins of `b` admit `node`, so a build for `node` would have two",
+    );
+}
+
+#[test]
+fn f27_r3_an_unfenced_default_beside_a_fenced_override_is_refused() {
+    // Q4: no specialization by platform — the default is the complement fence,
+    // written out. And it is refused ONCE: the duplicate checks (B57/B98) do
+    // not report the same pair a second time.
+    for source in [
+        "fun c(): i32 { 1 }\n[platform(\"browser\")]\nfun c(): i32 { 2 }\nfun main() { let _ = c(); }\n",
+        concat!(
+            "trait Show { fun show(self): str; }\nstruct T {}\n",
+            "impl T with Show { fun show(self): str { \"any\" } }\n",
+            "[platform(\"browser\")]\nimpl T with Show { fun show(self): str { \"browser\" } }\n",
+            "fun main() {}\n",
+        ),
+    ] {
+        let diagnostics = failure_diagnostics_on(source, Platform::Browser);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .0
+                .contains("declared both with and without a `[platform(..)]` fence"),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn f27_r3_twin_functions_must_agree_on_their_signature() {
+    assert_fails_with(
+        r#"
+        [platform("browser")]
+        fun a(): i32 { 1 }
+
+        [platform("@process")]
+        fun a(x: i32): i32 { x }
+
+        fun main() {}
+        "#,
+        "twins of `a` must agree on their signature",
+    );
+}
+
+#[test]
+fn f27_r3_a_missing_twin_is_an_ordinary_miss_that_names_the_twins() {
+    // Q2: the fences need not cover every host.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        [platform("browser")]
+        fun only_here(): str { "b" }
+
+        [platform("deno")]
+        fun only_here(): str { "d" }
+
+        fun main() { print(only_here()); }
+        "#,
+        "`only_here` is declared only as platform-fenced twins (`[platform(\"browser\")]` \
+         and `[platform(\"deno\")]`), and none admits `node`",
+    );
+}
+
+#[test]
+fn f27_r3_a_twin_its_files_declaration_excludes_is_refused() {
+    // B415's host holds its file's twins to it: a `@process` twin in a file
+    // declared browser is compiled by no build.
+    assert_fails_with(
+        concat!(
+            "[platform(\"browser\")] mod self;\n\n",
+            "[platform(\"browser\")]\nfun f(): i32 { 1 }\n\n",
+            "[platform(\"@process\")]\nfun f(): i32 { 2 }\n\n",
+            "fun main() { let _ = f(); }\n",
+        ),
+        "is fenced `[platform(\"@process\")]` inside a file that declares \
+         `[platform(\"browser\")]`",
+    );
+}
+
+#[test]
+fn f27_r3_a_fence_alone_and_an_unfenced_pair_are_not_twins() {
+    // One fenced item is R1's, unchanged; two unfenced functions of one name
+    // are still B57's duplicate.
+    assert_compiles("[platform(\"@process\")]\nfun f(): i32 { 1 }\nfun main() { let _ = f(); }\n");
+    assert_fails_with(
+        "fun f(): i32 { 1 }\nfun f(): i32 { 2 }\nfun main() {}\n",
+        "'f' is already declared in this module",
+    );
+}
+
 // --- E98: one coloring mistake draws one diagnostic --------------------------
 //
 // The admission walk reaches a layer by every edge the program has — the call
@@ -3699,10 +3912,10 @@ fn an_unknown_struct_steers_to_its_import() {
     assert_fails_with(
         r#"
         fun main() {
-            mut table = Map { };
+            mut table = HashMap { };
         }
         "#,
-        "unknown struct: Map; import it first (`import std::map::Map;`)",
+        "unknown struct: HashMap; import it first (`import std::hash_map::HashMap;`)",
     );
 }
 
@@ -4128,9 +4341,9 @@ fn consistent_later_calls_stay_clean() {
 fn an_unannotated_map_new_requires_an_annotation() {
     assert_fails_with(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table = Map::new();
+            mut table = HashMap::new();
             table.insert("k", 1);
         }
         "#,
@@ -4142,9 +4355,9 @@ fn an_unannotated_map_new_requires_an_annotation() {
 fn an_unannotated_set_new_requires_an_annotation() {
     assert_fails_with(
         r#"
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut seen = Set::new();
+            mut seen = HashSet::new();
             seen.insert(7);
         }
         "#,
@@ -4158,9 +4371,9 @@ fn an_annotated_map_checks_its_inserts() {
     // real error (the B16 substitution-applied argument check).
     assert_fails(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert(2, "v");
         }
         "#,
@@ -4168,9 +4381,9 @@ fn an_annotated_map_checks_its_inserts() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert("k", 1);
             print(table.get("k").unwrap_or(-1));
         }
@@ -9797,19 +10010,24 @@ fn b206_an_ordinary_parameter_still_renders_as_written() {
 
 #[test]
 fn b249_a_trait_parameter_takes_the_impls_argument() {
-    // The find's own shape, against std's own `Source<T>`: `T` is nested inside a
-    // closure type, which is why it is a substitution and not a per-position
-    // lookup.
+    // The find's own shape, against std's own reactive trait: `T` is nested
+    // inside a closure type, which is why it is a substitution and not a
+    // per-position lookup. A142 moved `on_change` off `Source` (whose required
+    // attach is now the `T`-free `on_settle`) onto `Flow<T>`, where it is still a
+    // requirement with `T` inside its observer's closure type — so the pin names
+    // `Flow<i32>`, the trait that still carries the shape.
     let source = r#"
-        import std::reactive::Source;
+        import std::reactive::Flow;
         struct Counted { n: i32 }
-        impl Counted with Source<i32> { }
+        impl Counted with Flow<i32> { }
         fun main() {}
         "#;
-    assert_fails_with(
-        source,
-        "declare `fun on_change(self, observer: |i32| void): Subscription`",
-    );
+    // The substitution is the claim, so the pin reads the declaration around
+    // the receiver: the line renders `Flow`'s `own self` as a bare `self` (a
+    // separate find — copied verbatim it is refused for its receiver), and this
+    // pin must not be the one that fixes that spelling in place.
+    assert_fails_with(source, "missing 'on_change'; declare `fun on_change(");
+    assert_fails_with(source, ", observer: |i32| void): Subscription`");
     assert_fails_without(source, "|T| void");
 }
 
@@ -10466,6 +10684,34 @@ fn b304_a_closure_that_never_touches_its_parameter_compiles() {
         }
 
         fun main() { }
+        "#,
+    );
+}
+
+/// A bound-directed call of a SUPERTRAIT's member (`P: Pipe<T>` calling
+/// `Flow::start`) reaches the impls of the trait that declares it, and nothing
+/// else. The dispatch record names only the bound's own trait, which declares
+/// no `start`, and the candidate set fell back to EVERY member named `start`
+/// in the program — `std::http`'s `Server::start` among them — so a browser
+/// build that sealed a derivation while `std::http` was loaded was refused as
+/// reaching the `process` layer (collections-44's find, kolt's client build:
+/// `.cell()` → `Flow::start` → a collection stage → `IntoElement`'s pipe arm →
+/// `start (std::http)`). Beside it the same class for `get` through
+/// `CollSource`'s supertrait chain coloured a `CollInstance`'s closures async
+/// in any program that also spelled an async `get` (`generics.rs`'s
+/// `service_client_name_defaults_to_struct_client`).
+#[test]
+fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
+    assert_compiles_browser(
+        r#"
+        import std::http::Server;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let next = count.derive(|value| value + 1).cell();
+            print(next.get());
+        }
         "#,
     );
 }

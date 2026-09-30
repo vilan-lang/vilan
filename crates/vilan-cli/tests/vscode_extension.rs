@@ -582,6 +582,62 @@ fn e222_the_override_fires_before_the_configurations_own_set() {
     );
 }
 
+// --- E214: the two halves, pinned where each lives ---------------------------
+//
+// With the override installed, a `>` typed onto one it placed steps over it:
+// that is the map's behaviour (`closers.ts`), run as keystrokes by `npm test`
+// (`src/test/closers.test.ts`, `List<i32>` typed by hand stays `List<i32>`),
+// which `the_extensions_own_tests_pass` gates. With the setting OFF the
+// override is absent and the server's `onTypeFormatting` places the `>` again:
+// the chain below, whose server end is `vilan-lsp`'s
+// `a_client_that_closes_generics_itself_gets_no_on_type_edit` (the edit comes
+// back when `autoClosing.generics` is declared false) and
+// `the_on_type_trigger_is_the_generic_open`.
+
+/// The map the override steps over with is `closers.ts`'s, the module the
+/// keystroke tests run.
+#[test]
+fn e214_the_override_steps_over_with_the_tested_map() {
+    let source = extension_source();
+    assert!(source.contains("import { PlacedClosers } from './closers';"));
+    assert!(source.contains("const placedClosers = new PlacedClosers();"));
+    assert!(source.contains(
+        "if (!placedClosers.typeOver(document.uri.toString(), document.offsetAt(caret), following)) {"
+    ));
+    assert!(
+        source.contains("placedClosers.place(document.uri.toString(), document.offsetAt(caret));")
+    );
+    assert!(
+        source.contains(
+            "placedClosers.track(changed.document.uri.toString(), changed.contentChanges);"
+        )
+    );
+}
+
+/// `vilan.autoClosing.generics: false` leaves `onTypeFormatting` in charge:
+/// the override is removed (and its closers forgotten), the server is told
+/// the INSTALLED state — not the setting — live, and VS Code asks
+/// `onTypeFormatting` in vilan files because the extension defaults
+/// `editor.formatOnType` on there.
+#[test]
+fn e214_the_setting_off_leaves_on_type_formatting_in_charge() {
+    let source = extension_source();
+    assert!(source.contains("autoClosing: { generics: typeOverride !== undefined },"));
+    assert!(source.contains(
+        "if (!wanted && typeOverride !== undefined) {\n        typeOverride.dispose();\n        typeOverride = undefined;\n        placedClosers.clear();"
+    ));
+    assert!(
+        source.contains("event.affectsConfiguration('vilan.autoClosing') && syncTypeOverride()")
+    );
+    assert!(source.contains("settings: { vilan: readFeatureConfig() },"));
+    assert_eq!(
+        manifest_field("contributes.configurationDefaults['[vilan]']['editor.formatOnType']"),
+        "true",
+        "without formatOnType VS Code never asks the server, and the setting's off \
+         position would place no `>` at all"
+    );
+}
+
 // --- F27 R1/R6: the platform status line --------------------------------------
 
 /// The status bar says which platform the active vilan file is analyzed under
@@ -602,4 +658,155 @@ fn f27_the_status_line_names_the_platform_and_the_kind_of_fact() {
         source.contains("window.onDidChangeActiveTextEditor(() => void refreshPlatformStatus())")
     );
     assert!(source.contains("schedulePlatformRefresh();"));
+}
+
+// --- The extension's own tests (`npm test`) ----------------------------------
+//
+// The parts of the extension that DECIDE something live in files with no
+// `vscode` import (`src/versions.ts`, E229), and `src/test/*.test.ts` runs
+// them under plain node. They run here too, so the suite gates them: bundled
+// by the extension's own esbuild into this binary's scratch directory (never
+// the source tree's `out/`), then `node --test`. Like `grammar_sync`'s scope
+// pins, they need `npm ci --prefix editors/vscode`; on a working copy without
+// it the pin says so and passes, and under `CI` — where ci.yml runs that step —
+// a missing install is a failure.
+
+#[test]
+fn the_extensions_own_tests_pass() {
+    let modules = extension_dir().join("node_modules");
+    if !modules.join("esbuild/package.json").is_file() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must run `npm ci --prefix editors/vscode` before the suite"
+        );
+        eprintln!("skipped: run `npm ci --prefix editors/vscode` to run the extension's tests");
+        return;
+    }
+    let tests: Vec<PathBuf> = std::fs::read_dir(extension_dir().join("src/test"))
+        .expect("editors/vscode/src/test")
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.to_string_lossy().ends_with(".test.ts"))
+        .collect();
+    assert!(!tests.is_empty(), "the extension has tests to run");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("vscode-extension-tests");
+    let _ = std::fs::remove_dir_all(&out);
+    // esbuild's JS API rather than its `bin/`, which the install replaces with
+    // a native executable on some platforms. Paths travel as JSON, so a
+    // Windows path's backslashes arrive intact.
+    let entry_points = tests
+        .iter()
+        .map(|test| json_string(&test.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "require({}).buildSync({{ entryPoints: [{entry_points}], bundle: true, format: 'cjs', \
+         platform: 'node', outdir: {} }})",
+        json_string(&modules.join("esbuild").to_string_lossy()),
+        json_string(&out.to_string_lossy()),
+    );
+    let bundled = Command::new("node")
+        .args(["-e", &script])
+        .output()
+        .expect("run esbuild");
+    assert!(
+        bundled.status.success(),
+        "bundling the extension's tests: {}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let bundles: Vec<PathBuf> = std::fs::read_dir(&out)
+        .expect("the bundles")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    assert_eq!(bundles.len(), tests.len(), "one bundle per test file");
+    let run = Command::new("node")
+        .arg("--test")
+        .args(&bundles)
+        .output()
+        .expect("run node --test");
+    assert!(
+        run.status.success(),
+        "the extension's tests failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// `text` as a JSON (and so JavaScript) string literal.
+fn json_string(text: &str) -> String {
+    let mut literal = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            _ => literal.push(character),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+// --- E229: the version check -------------------------------------------------
+
+/// At every start the extension reads the server's `serverInfo.version` and
+/// hands it with its own to `versionGap` (whose decision `npm test` pins), and
+/// a gap is shown ONCE per window — a restart starts the same server.
+#[test]
+fn e229_the_extension_compares_its_version_with_the_servers_once() {
+    let source = extension_source();
+    assert!(
+        source.contains("await client.start();\n        checkServerVersion(context);"),
+        "the check runs right after every successful start"
+    );
+    assert!(source.contains("client.initializeResult?.serverInfo?.version"));
+    assert!(source.contains("context.extension.packageJSON.version"));
+    assert!(source.contains("versionGap(extensionVersion, serverVersion, extensionSha)"));
+    assert!(
+        source.contains("if (gap === undefined || versionNoticeShown) {")
+            && source.contains("versionNoticeShown = true;"),
+        "one notification per window, not one per restart"
+    );
+    assert!(source.contains(".showWarningMessage(gap.message, 'Copy Command', 'Open Release')"));
+}
+
+// --- E231: the commit on both halves ----------------------------------------
+
+/// The extension compares commits when the versions agree (the decision is
+/// `versionGap`'s, pinned by `npm test`); its own commit is the file every
+/// packaging writes just before `vsce package` — the dev refresh AND the
+/// release's `vsix` job, so a gallery install carries one too — from the same
+/// `git rev-parse --short=9 HEAD` the server's build stamp takes.
+#[test]
+fn e231_every_packaging_embeds_the_commit_the_extension_compares() {
+    let source = extension_source();
+    assert!(source.contains("versionGap(extensionVersion, serverVersion, extensionSha)"));
+    assert!(source.contains("path.join(context.extensionPath, BUILD_SHA_FILE)"));
+    let versions =
+        std::fs::read_to_string(extension_dir().join("src/versions.ts")).expect("versions.ts");
+    assert_eq!(
+        single_quoted_constant(&versions, "BUILD_SHA_FILE"),
+        "build-sha.txt"
+    );
+    let stamp = "git rev-parse --short=9 HEAD > build-sha.txt";
+    for script in ["scripts/install-dev.sh", ".github/workflows/release.yml"] {
+        let text = std::fs::read_to_string(repo_root().join(script)).expect(script);
+        let written = text
+            .find(stamp)
+            .unwrap_or_else(|| panic!("{script} writes the stamp"));
+        let packaged = text[written..]
+            .find("vsce package")
+            .unwrap_or_else(|| panic!("{script} packages AFTER writing the stamp"));
+        assert!(packaged > 0, "{script}");
+    }
+    let ignored =
+        std::fs::read_to_string(extension_dir().join(".vscodeignore")).expect(".vscodeignore");
+    assert!(
+        !ignored.contains("build-sha"),
+        "the stamp ships inside the vsix"
+    );
+    let build_stamp = std::fs::read_to_string(repo_root().join("crates/vilan-cli/build_stamp.rs"))
+        .expect("build_stamp.rs");
+    assert!(
+        build_stamp.contains("\"--short=9\""),
+        "the server's stamp is the same length"
+    );
 }

@@ -5,8 +5,8 @@
 // avoids is `usize-underflow.vl`, which the native differential names out.
 import std::debug::Debug;
 import std::display::{ Display, format };
+import std::hash_map::HashMap;
 import std::json::{ FromJson, Json, decode_json, encode_json };
-import std::map::Map;
 import std::operators::Div;
 
 // Generic dispatch reaches `usize`'s operator impl, and division through
@@ -62,7 +62,7 @@ fun main() {
 		Ok(let parsed) => print(i"{parsed}"),
 		Err(let reason) => print(reason),
 	}
-	mut rows: Map<usize, str> = Map::new();
+	mut rows: HashMap<usize, str> = HashMap::new();
 	rows.insert(3, "three");
 	print(rows.get(3).unwrap_or("none"));
 

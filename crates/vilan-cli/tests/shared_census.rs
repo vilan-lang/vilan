@@ -51,7 +51,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "delta.vl",
-        10,
+        24,
         "E: the delta log's ops/version/base/cursors (twice — `new` and \
          `with_limit`) plus a cursor's own sequence. Every one of them is \
          minted by the CELL that holds the log and read by the CONSUMERS that \
@@ -60,7 +60,16 @@ const CENSUS: &[(&str, usize, &str)] = &[
          (A112 S1). +1 at M86: a `ListCell`'s own list, held in a cell of its \
          own rather than inside a `SignalCell` so a write can read its length \
          in place — E for the same reason (minted by the cell, read and \
-         written through every copy of the handle).",
+         written through every copy of the handle). +12 at A142 S4, the \
+         collection pipes' INSTANCE state (O, per instance: minted by `open`, \
+         released with the consumer's handle): an element core's seven \
+         (slot ids, inputs, values, the followed elements' holds, the dirty \
+         slots, the next slot id, the consumer's subscriber), the kept mirror \
+         of `filter`, `filter_map` and the tally (one each) and the Fenwick \
+         index's tree; plus `element_holds_allocated_count`, the module-level \
+         counter the per-element allocation pin reads (R). +2 at A142 S5: \
+         `.coll()`'s and `.coll_by()`'s last list, the one each diffs the next \
+         against (O, per instance).",
     ),
     (
         "memo.vl",
@@ -87,7 +96,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive.vl",
-        37,
+        52,
         "R + O + E: turns, owners, cells, drafts, the subscriber liveness flag \
          (A110 door 1 — one per OBSERVER, minted by `subscriber_of` and \
          shared with every handle to it, since A124 S2a split `observe` into \
@@ -109,16 +118,35 @@ const CENSUS: &[(&str, usize, &str)] = &[
          whose two cells are `SignalCell::new`'s. −2 at A124 S2c: the four \
          cell-returning joins (`switch`, both `flatten`s, `and_then`) each held \
          a rolling inner subscription; the total `flatten` is a `Switch` now and \
-         the other two are the `FlattenOption`/`AndThen` nodes, one each",
+         the other two are the `FlattenOption`/`AndThen` nodes, one each +7 at A142 S1: the pipe stages keep their state in the INSTANCE a consumer starts (O, per instance, released with the consumer's handle): `Switch`, `SwitchSome` and `AndThen` each hold the flow they follow and its relay handle (2 each, where each cold node held one rolling subscription), `ThenSome` its flag and its handle (2), `Distinct` its last value (1, per instance now rather than per attach) and `DistinctBy` its last value and key (2). ±0 at A142 S2: an `Owner` is ONE cell now (its live epoch, cleanups and nursery; O) where it was two (the list and the disposed flag), its cleanup list is a cell of its own allocated at the epoch's first registration (O, the lazy owner), `owner_lists_allocated_count` is the module-level counter the lazy-owner pin reads (R), and A114's `scoped_runner` cell is gone with `scoped_runner` (an `effect`'s runs are epochs of one `Owner`). +1 at A142 S2's native follow-up: `no_cleanups`, the one never-pushed list every epoch that has registered nothing points at (R, module-level), since the native backend holds no `Option` of a closure list. +1 at A142 S4: `Owner::split_registrations`' fresh cell — an ELEMENT's owner, holding what one run of a collection operator's closure registered (O: released when the element leaves or re-runs). +6 at A142 S6 (tracked reads): a stage's `Tracker` is five cells (O, per stage instance, released with the consumer's handle) — where its runs stand (`TrackRuns`: epoch, open, dirty, and the connecting/missed pair written whole), the run in progress's reads, the last run's reads awaiting an attach, the live edges, and the subscriber a change wakes — and an `effect` keeps the value its input delivered last (O, per effect), which a tracked re-run runs with.",
     ),
     (
         "rpc.vl",
-        47,
+        56,
         "R + O + E: sessions, wiring, the mirrors' leases. FIVE fewer since \
          A112 S1: `KeyedCell`'s own log, version, base and cursors, and its \
-         cursor's sequence, are `DeltaLog`'s now (see `delta.vl`).",
+         cursor's sequence, are `DeltaLog`'s now (see `delta.vl`). +4 at A134 \
+         (Order 43): a `ReactiveClient`'s origin-table enrolment list (E: \
+         minted by the client, run by its `dispose`), each mirror's retire \
+         hooks, plain and keyed (E: filled by the table that handed the \
+         mirror out, run by the mirror's last release), and a `MirrorTable`'s \
+         entries (R: a module binding the `[service]` expansion declares). +1 \
+         at A137: a keyed mirror's join hook (E: filled once its deliverer \
+         exists, run by its own `acquire`/`rebind`). +1 at A139: its per-KEY \
+         join hook (E: the same shape, run after each per-key `Subscribe`). \
+         +2 at A140: each mirror's revive hook, plain and keyed (E: filled by \
+         the client that enlisted it, run by its `rebind`). +1 at A143: a \
+         client's wire demand (R: one per `ReactiveClient`, every mirror's \
+         `Subscribe`/`Unsubscribe` registered in it, cleared by a reconnect \
+         and by `dispose`).",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
+    (
+        "transient.vl",
+        1,
+        "E: a `Transient`'s generation claim (A142 S3) — made by `.transient()`, \
+         read by each settling task to drop a superseded reply",
+    ),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
 
@@ -232,7 +260,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 141,
+        total, 180,
         "the total number of `Shared` construction sites in std changed"
     );
 

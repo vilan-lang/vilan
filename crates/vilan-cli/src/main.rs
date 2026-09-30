@@ -31,11 +31,18 @@ use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 #[command(
     name = "vilan",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VILAN_BUILD_SHA"), ")"),
-    about
+    about,
+    arg_required_else_help = true,
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    /// Print the language's keyword table as JSON (`{"keywords": [...]}`) and
+    /// exit — the one list an editor or a highlighter outside this toolchain
+    /// reads instead of keeping its own copy (the website's playground does).
+    #[arg(long, exclusive = true)]
+    print_keywords: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -214,6 +221,10 @@ enum Command {
         /// Report whether a newer release exists without changing anything.
         #[arg(long)]
         check: bool,
+        /// Leave the VS Code extension alone (also `VILAN_NO_VSCODE=1`), as
+        /// the installers' own opt-out does.
+        #[arg(long)]
+        no_vscode: bool,
     },
     /// Work on the toolchain's own caches under `~/.vilan`.
     Cache {
@@ -293,31 +304,33 @@ fn main() -> ExitCode {
     //     Measured through this binary on the worst plant (5000 nested
     //     parentheses): peak depth 501, 34,181 bytes (33.4 KiB) per level of
     //     source nesting, 16.24 MiB unoptimized, 3.93 MiB optimized.
-    //   * the phase-1 expression walk, ~47,400 bytes (46.3 KiB) per level
-    //     (500 levels, ~22.6 MiB) — the deepest consumer by bytes per level.
-    //     OPTIMIZED it is ~2.1 KiB a level (~1 MiB at the bound).
+    //   * the phase-1 expression walk, 26,376 bytes (25.8 KiB) per level
+    //     (500 levels, ~12.8 MiB) — the deepest consumer by bytes per level.
+    //     OPTIMIZED it is ~1 KiB a level (~0.6 MiB at the bound).
     //   * the return-inference chain, ~12.8 KiB per call link (500, ~6.4 MiB).
     //
     // The parse figures are N101's re-measurement: the record had the parse
     // frame at ~71.8 KiB a level and 35.2 MiB at the bound, which did not
     // reproduce (2.2x what `VILAN_DEPTH_STATS` reads). The walk figures are
-    // N128's (2026-09-25, `VILAN_DEPTH_STATS`, the slope between a 100- and a
-    // 450-link chain, debug and release binaries): the frame had grown from
-    // N97's 42,464 bytes, and AGENTS.md's "11.3 KiB optimized" was an older
-    // frame still. `deep_nesting.rs` holds both with the method that produced
+    // Order 44's seal's (2026-09-30, `VILAN_DEPTH_STATS`, the slope between a
+    // 13- and a 403-link chain, debug and release binaries): the frame had
+    // grown to 49,120 bytes (N97 read 42,464, N128 ~47,400) and the seal moved
+    // its largest arms out of line; AGENTS.md's "11.3 KiB optimized" was an
+    // older frame still. `deep_nesting.rs` holds both with the method that produced
     // them, and a canary each.
     //
     // Each refuses with a diagnostic rather than overflowing, and the phases
     // run in SEQUENCE — the parse has unwound before analysis starts — so the
-    // worst case is the largest of them, not their sum: ~23 MiB unoptimized,
-    // and it is the WALK now rather than the parse. Real code is nowhere near
-    // it: all 211 corpus entries peak at 23 parser levels against a bound of
-    // 500, and a realistic analysis peaks under 1 MiB.
+    // worst case is the largest of them, not their sum: ~16.2 MiB unoptimized,
+    // the parse's (the walk's ~23 MiB led until Order 44's seal nearly halved
+    // its frame). Real code is nowhere near it: all 211 corpus entries peak at
+    // 23 parser levels against a bound of 500, and a realistic analysis peaks
+    // under 1 MiB.
     //
-    // 128 MiB is ~5.7x that measured worst case, and the headroom is not idle.
+    // 128 MiB is ~7.9x that measured worst case, and the headroom is not idle.
     // A macro-world compile NESTS a full pipeline inside the running analysis
     // (see `Document::analyze` in vilan-lsp), so a deep walk carrying a deep
-    // nested parse inside it composes to roughly 39 MiB; this covers that with
+    // nested parse inside it composes to roughly 29 MiB; this covers that with
     // room over. The thread DECLARES this size to the stack probe
     // (`spawn_compiler_thread`, N128), so a walk that runs away past every
     // bound is refused by name rather than aborting in the guard page. Bounding the parser is what made the number finite at all —
@@ -330,7 +343,20 @@ fn main() -> ExitCode {
 }
 
 fn run_cli() -> ExitCode {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    if cli.print_keywords {
+        print!("{}", vilan_core::keyword_table::to_json());
+        return ExitCode::SUCCESS;
+    }
+    // `arg_required_else_help` answers a bare `vilan` with the help, as the
+    // required subcommand did before `--print-keywords` made it optional; a
+    // flag with no subcommand is the only other way here.
+    let Some(command) = cli.command else {
+        use clap::CommandFactory as _;
+        let _ = Cli::command().print_help();
+        return ExitCode::from(2);
+    };
+    match command {
         Command::Build {
             file,
             stdout,
@@ -440,7 +466,7 @@ fn run_cli() -> ExitCode {
             stdout,
             stats,
         } => bindgen::bindgen(file, output, platform, only, stdout, stats),
-        Command::Upgrade { check } => upgrade::upgrade(check),
+        Command::Upgrade { check, no_vscode } => upgrade::upgrade(check, no_vscode),
         Command::Cache { command } => match command {
             CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
         },
@@ -2553,6 +2579,29 @@ struct TreeWalk {
     outside: Vec<PathBuf>,
 }
 
+/// Whether `directory` is a build/cache directory per the Cache Directory
+/// Tagging Specification (<https://bford.info/cachedir/>) — the
+/// `CACHEDIR.TAG` file cargo (among other tools) writes at a target
+/// directory's root the first time it builds into it. The walk never
+/// descends into one, by name-independent means: `CARGO_TARGET_DIR` need not
+/// be spelled `target` (`native_differential`'s shared target directory is
+/// `native-differential`, under `target/tmp/`), so a check keyed on the
+/// literal name `target` would have missed it.
+///
+/// N133: the `vilan-fmt` leg, walking `.` from the repository root, reached
+/// `target/tmp/native-differential-src-*`'s staged corpus copies and
+/// DECLINED 5,556 of their stale `resource struct` files — a construct
+/// retired before B413, so the printer had no rule left for them. The
+/// staging directories are also now removed at their test's end
+/// ([`StagedDir`] in `native_differential.rs`), but a tag-respecting walk is
+/// the general fix: any future build product left under a tagged directory
+/// stops being a formatter or watcher concern the same way.
+fn is_build_cache_dir(directory: &Path) -> bool {
+    const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    fs::read(directory.join("CACHEDIR.TAG"))
+        .is_ok_and(|contents| contents.starts_with(CACHEDIR_TAG_SIGNATURE))
+}
+
 impl TreeWalk {
     fn rooted_at(root: &Path) -> TreeWalk {
         TreeWalk {
@@ -2652,6 +2701,9 @@ impl TreeWalk {
             return;
         };
         if !self.visited.insert(identity) {
+            return;
+        }
+        if is_build_cache_dir(path) {
             return;
         }
         let Ok(entries) = fs::read_dir(path) else {
@@ -3678,11 +3730,12 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
         // platform the editor analyzes it under, and the terminal must not
         // answer differently. Otherwise the CLI's `node` default answers, and
         // there is nothing about the file's own situation to explain.
-        let declared = vilan_core::util::read_source(&entry)
-            .ok()
-            .and_then(|text| vilan_core::platform_color::declared_platform(&text));
+        let text = vilan_core::util::read_source(&entry).ok();
+        let declared = text
+            .as_deref()
+            .and_then(vilan_core::platform_color::declared_platform);
         let platform = declared.as_ref().map(|declared| declared.hosts[0]);
-        let platform_reasons = declared
+        let mut platform_reasons = declared
             .map(|declared| {
                 vec![(
                     declared.hosts[0],
@@ -3690,6 +3743,21 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
                 )]
             })
             .unwrap_or_default();
+        // F27 R3 (§8.4 item 1): a platform-fenced twin the primary platform
+        // excludes is checked under its own platform too — a further leg.
+        let primary = platform.unwrap_or_default();
+        let twin_legs = text
+            .as_deref()
+            .map(|text| vilan_core::platform_color::twin_legs(text, &[primary]))
+            .unwrap_or_default();
+        let shared_platforms: Vec<Platform> =
+            twin_legs.iter().map(|(platform, _)| *platform).collect();
+        platform_reasons.extend(twin_legs.into_iter().map(|(platform, fence)| {
+            (
+                platform,
+                vilan_core::platform_color::PlatformReason::Twin(fence).clause(),
+            )
+        }));
         Project::Single {
             unit: Unit {
                 name: String::new(),
@@ -3706,7 +3774,7 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
                 },
             },
             platform,
-            shared_platforms: Vec::new(),
+            shared_platforms,
             hooks: BuildHooks::default(),
         }
     };
@@ -7934,6 +8002,31 @@ mod tests {
             2,
             "a compiler thread spawned outside `spawn_compiler_thread` / \
              `spawn_scoped_compiler_thread` declares no stack to the probe"
+        );
+    }
+
+    // --- `vilan --print-keywords` (E225, K24) --------------------------------
+
+    /// The flag parses alone; with a subcommand it is refused rather than one
+    /// of the two silently ignored; a bare `vilan` still answers with help.
+    #[test]
+    fn print_keywords_is_a_top_level_flag_that_takes_no_subcommand() {
+        let cli = Cli::try_parse_from(["vilan", "--print-keywords"]).expect("parses");
+        assert!(cli.print_keywords);
+        assert!(cli.command.is_none());
+        let refused = Cli::try_parse_from(["vilan", "--print-keywords", "build"])
+            .err()
+            .expect("the flag and a subcommand conflict");
+        assert!(
+            refused.to_string().contains("cannot be used with"),
+            "{refused}"
+        );
+        let bare = Cli::try_parse_from(["vilan"])
+            .err()
+            .expect("a bare `vilan` is help");
+        assert_eq!(
+            bare.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
     }
 

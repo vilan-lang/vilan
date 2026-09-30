@@ -128,7 +128,7 @@ fun main() {
 			})))
 			.child(view("nav").child(each_by(handles, |handle| handle.id, |handle| {
 				print(i"by renders {handle.get().id}");
-				view("li").bind_text(handle.map(|current| current.title))
+				view("li").bind_text(handle.derive(|current| current.title))
 			})))
 	});
 
@@ -219,7 +219,7 @@ fun main() {
 	]);
 	let _root = mount_root("app", || {
 		view("ul").child(each_by(handles, |handle| handle.id, |handle| {
-			view("li").bind_text(handle.map(|current| current.title))
+			view("li").bind_text(handle.derive(|current| current.title))
 		}))
 	});
 	print(i"before={identity_of_first_row()}");
@@ -882,7 +882,7 @@ fun main() {
 	]);
 	let _root = mount_root("app", || {
 		view("ul").child(each_by(rows, |row| row.id, |row| {
-			view("li").bind_text(row.map(|current| current.text))
+			view("li").bind_text(row.derive(|current| current.text))
 		}))
 	});
 	print(i"before={tree()}");
@@ -1743,7 +1743,7 @@ fun main() {
 	let _root = mount_root("app", || {
 		view("main")
 			.child(view("header").text("head"))
-			.child(mark.map(|n: i32| view("b").text(i"m{n}")))
+			.child(mark.derive(|n: i32| view("b").text(i"m{n}")))
 			.child(view("footer").text("foot"))
 	});
 	print(i"start={tree()}");
@@ -1978,7 +1978,7 @@ fun main() {
 	let _root = mount_root("app", || {
 		view("main")
 			.child(view("header").text("head"))
-			.child(count.map(|n: i32| {
+			.child(count.derive(|n: i32| {
 				mut run: List<View> = [];
 				for index in Range::new(0, n) {
 					run.push(view("i").text(i"g{index}"));
@@ -2064,7 +2064,7 @@ fun main() {
 			<header>"head"</header>
 			{pair()}
 			<hr />
-			{count.map(|n: i32| <>
+			{count.derive(|n: i32| <>
 				<q>{i"g{n}"}</q>
 				<r>{i"h{n}"}</r>
 			</>)}
@@ -2866,7 +2866,7 @@ fun report(label: str) {
 }
 
 fun main() {
-	let _root = mount_root("app", || view("main").child(swap(route.map(shell_of), |shell: Shell| {
+	let _root = mount_root("app", || view("main").child(swap(route.derive(|value| shell_of(value)), |shell: Shell| {
 		match shell {
 			Shell::Login => view("section").text("sign in"),
 			Shell::App => view("div").child(swap(route, |path: str| page(path))),
@@ -3299,7 +3299,7 @@ fun main() {
 			.child(view("h1").text("head"))
 			.child(when_some(selected, |account| {
 				print("build");
-				view("p").bind_text(account.map(|current| current.name))
+				view("p").bind_text(account.derive(|current| current.name))
 			}))
 			.child(view("footer").text("foot"))
 	});
@@ -3346,7 +3346,7 @@ struct Holder<C: Slot> {
 }
 
 impl Holder<type C: Slot> with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		let region = Region::open(parent);
 		let _row = region.open_row((self.body)());
 	}
@@ -3471,10 +3471,10 @@ fun main() {
 	let held: SignalCell<Option<Account>> = Signal::new(Some(Account { id = 1, name = "Ada" }));
 	let absent: SignalCell<Option<Account>> = Signal::new(None);
 	print(render(view("aside").child(when_some(held, |account| {
-		view("p").bind_text(account.map(|current| current.name))
+		view("p").bind_text(account.derive(|current| current.name))
 	}))));
 	print(render(view("aside").child(when_some(absent, |account| {
-		view("p").bind_text(account.map(|current| current.name))
+		view("p").bind_text(account.derive(|current| current.name))
 	}))));
 }
 
@@ -4792,7 +4792,7 @@ let by_renders: Shared<i32> = Shared::new(0);
 
 fun rendered_by(cell: SignalCell<Row>): View {
 	by_renders.write() = by_renders.read() + 1;
-	view("li").bind_text(cell.map(|item: Row| item.text))
+	view("li").bind_text(cell.derive(|item: Row| item.text))
 }
 
 /// The CONTROL (A129): `each` and `each_by` over a plain derivation of the cell,
@@ -4809,7 +4809,7 @@ let pass_by_renders: Shared<i32> = Shared::new(0);
 
 fun rendered_pass_by(cell: SignalCell<Row>): View {
 	pass_by_renders.write() = pass_by_renders.read() + 1;
-	view("li").bind_text(cell.map(|item: Row| item.text))
+	view("li").bind_text(cell.derive(|item: Row| item.text))
 }
 
 fun joined(values: List<Row>, suffix: str): str {
@@ -4828,7 +4828,7 @@ fun joined(values: List<Row>, suffix: str): str {
 fun main() {
 	let walk: ListCell<Row> = ListCell<Row>::of([fresh(), fresh(), fresh()]);
 	let starred = map_each(walk, |item: Row| Row { id = item.id, text = item.text + "*" });
-	let passed = walk.map(|list: List<Row>| list);
+	let passed = walk.derive(|list: List<Row>| list).memo();
 	let _root = mount_root("app", || {
 		view("div")
 			.child(view("ol").child(each(walk, |item: Row| item.id, |item: Row| rendered(item))))
@@ -5010,7 +5010,7 @@ fun keyed(item: Row): i32 {
 }
 
 fun label(cell: SignalCell<Row>): View {
-	view("li").bind_text(cell.map(|item: Row| {
+	view("li").bind_text(cell.derive(|item: Row| {
 		maps.write() = maps.read() + 1;
 		item.text
 	}))
@@ -5250,7 +5250,7 @@ fun main() {
 	let _root = mount_root("app", || {
 		view("div")
 			.child(view("ul").child(each_by(by, |item: Row| item.id, |cell: SignalCell<Row>| {
-				view("li").bind_text(cell.map(|item: Row| item.text))
+				view("li").bind_text(cell.derive(|item: Row| item.text))
 			})))
 			.child(view("ol").child(each(plain, |item: Row| item.id, |item: Row| view("li").text(item.text))))
 	});
@@ -5470,7 +5470,7 @@ fun main() {
 		view("div")
 			.child(view("ol").child(each(cell, |item: Row| item.id, |item: Row| view("li").text(item.text))))
 			.child(view("ol").child(each_by(cell, |item: Row| item.id, |held: SignalCell<Row>| {
-				view("li").bind_text(held.map(|item: Row| item.text))
+				view("li").bind_text(held.derive(|item: Row| item.text))
 			})))
 	});
 	let _mounted = wholes();
@@ -5553,8 +5553,14 @@ require("./app.js");
 /// hands out a value (one); `edit` hands its body a recorder over a list of its
 /// own and takes the result back (two, per batch, however many mutations it
 /// holds); and a `Move` is still the whole-list PASS in both `each` and
-/// `each_by` (A112 S3's fallback), whose own copies of the run are the eleven —
-/// the `ListCell` and the `map_each` make none of them.
+/// `each_by` (A112 S3's fallback), whose own copies of the run are the fifteen —
+/// the `ListCell` and the `map_each` make none of them. Four of the fifteen are
+/// B457's (RULED 2026-09-29, R-e door (a)): the pass hands `reconcile` the
+/// rows' key and item runs by value, and `reconcile` calls `key_of` and `same`,
+/// closure VALUES that can reach an in-place write of those cells (a key
+/// function that writes the list re-enters the pass), so each run is copied
+/// at the call — once per `each` and once per `each_by`. Native copied them
+/// already. They were eleven before it.
 ///
 /// Non-vacuity: on the tree before M86 this reads `push wholes=3`,
 /// `insert_at wholes=2`, `remove_at wholes=2`, `set_at wholes=2`,
@@ -5570,7 +5576,7 @@ fn m86_a_list_cell_write_copies_no_whole_list() {
             "insert_at wholes=0\n",
             "remove_at wholes=0\n",
             "set_at wholes=0\n",
-            "move_range wholes=11\n",
+            "move_range wholes=15\n",
             "size=1001 wholes=0\n",
             "peek=1001 third=r wholes=0\n",
             "edit wholes=2\n",
@@ -5670,5 +5676,84 @@ fn m87_keyed_cell_locate_copies_no_whole_list() {
             "removed none wholes=0\n",
         ),
         "M87: `KeyedCell::locate` must read one element without copying the run; got:\n{stdout}"
+    );
+}
+
+// --- A142 S4: a run over a collection pipe -----------------------------------
+
+/// `each` and `each_by` CONSUME a collection pipe (A142 §6): the run is fed the
+/// ops the stages made, so a task whose followed flow flips is ONE row arriving
+/// or leaving — built at its output position, nothing else re-rendered — and a
+/// push builds one row in each run.
+const PIPE_RUNS: &str = r#"import std::io::print;
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::ui::{ View, each, each_by, mount_root, view };
+
+[derive(PartialEq)]
+struct Task {
+	id: i32,
+	title: str,
+}
+
+fun main() {
+	let done: List<SignalCell<bool>> = [Signal::new(false), Signal::new(false), Signal::new(true), Signal::new(false), Signal::new(false)];
+	let tasks: ListCell<Task> = ListCell::of([
+		Task { id = 1, title = "one" },
+		Task { id = 2, title = "two" },
+		Task { id = 3, title = "three" },
+	]);
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("ul").child(each(tasks.filter(|task| done[task.id.as_usize()].derive(|finished| !finished)), |task| task.id, |task| {
+				print(i"open renders {task.id}");
+				view("li").text(task.title)
+			})))
+			.child(view("ol").child(each_by(tasks.map(|task| task.title), |title| title, |title| {
+				print(i"title renders {title.get()}");
+				view("li").bind_text(title)
+			})))
+	});
+	print("--- task 1 done ---");
+	done[1].set(true);
+	print("--- task 2 reopened ---");
+	done[2].set(false);
+	print("--- a task arrives ---");
+	tasks.push(Task { id = 4, title = "four" });
+}
+
+main();
+"#;
+
+#[test]
+fn a142_s4_a_run_over_a_collection_pipe_builds_only_what_arrived() {
+    let harness =
+        format!("{DOM_STUB}\nrequire(\"./app.js\");\nconsole.log(flatten(documentRoot));\n");
+    let stdout = build_and_run("pipe_runs", PIPE_RUNS, &harness);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        &lines[..lines.len() - 1],
+        &[
+            "open renders 1",
+            "open renders 3",
+            "title renders one",
+            "title renders two",
+            "title renders three",
+            "--- task 1 done ---",
+            "--- task 2 reopened ---",
+            "open renders 2",
+            "--- a task arrives ---",
+            "open renders 4",
+            "title renders four",
+        ],
+        "a flip is one row, a push one row per run, and nothing else renders; got:\n{stdout}"
+    );
+    // Task 2 arrived BEFORE task 3 (its output position), and task 1 left.
+    let tree = lines.last().expect("the flattened tree");
+    let ul = &tree[..tree.find("ol#").expect("the ol")];
+    assert!(
+        !ul.contains("'one'")
+            && ul.find("'two'") < ul.find("'three'")
+            && ul.find("'three'") < ul.find("'four'"),
+        "the open run must read two, three, four in order; got:\n{tree}"
     );
 }

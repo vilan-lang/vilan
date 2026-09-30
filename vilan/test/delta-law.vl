@@ -43,6 +43,7 @@ import std::reactive::{
 	Signal,
 	SignalCell,
 	Source,
+	Subscriber,
 	Subscription,
 	batch,
 };
@@ -90,8 +91,17 @@ impl ListCell<type T> with Source<List<T>> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |List<T>| void): Subscription {
-		self.elements.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.elements.on_settle(subscriber)
+	}
+
+	/// An observer rides the elements cell's own attach, so the closure it is
+	/// registered as holds that cell and not this handle: `Source`'s default
+	/// would capture the handle, whose `elements` list holds the closure (A132's
+	/// loop).
+	[must_use]
+	fun attach_observer(self, observer: |List<T>| void, immediately: bool): Subscription {
+		self.elements.attach_observer(observer, immediately)
 	}
 }
 
@@ -106,14 +116,30 @@ impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
 	}
 
 	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
-		match self.log.since(cursor) {
-			Some(let ops) => ops,
-			None => {
-				mut lost: List<SeqOp<T>> = [];
-				lost.push(SeqOp::Reset(self.elements.get()));
-				lost
-			},
-		}
+		drain(self.log, self.elements.value, cursor)
+	}
+
+	/// What `since` reads and nothing else — not the signal an operator's
+	/// handler is registered on, which would close a loop through it (A132).
+	fun reader(self): |DeltaCursor| List<SeqOp<T>> {
+		let log = self.log;
+		let elements = self.elements.value;
+		|cursor| drain(log, elements, cursor)
+	}
+}
+
+fun drain<T>(
+	log: DeltaLog<SeqOp<T>>,
+	elements: Shared<List<T>>,
+	cursor: DeltaCursor,
+): List<SeqOp<T>> {
+	match log.since(cursor) {
+		Some(let ops) => ops,
+		None => {
+			mut lost: List<SeqOp<T>> = [];
+			lost.push(SeqOp::Reset(elements.read()));
+			lost
+		},
 	}
 }
 
@@ -213,9 +239,10 @@ fun map_each<S: DeltaSource<List<i32>, SeqOp<i32>>>(source: S): ListCell<i32> {
 		seeded.push(g(value));
 	}
 	let out: ListCell<i32> = ListCell<i32>::new(seeded);
+	let read = source.reader();
 	let _owned = source.on_change(|_list| {
 		notifications.write() = notifications.read() + 1;
-		for op in source.since(cursor) {
+		for op in read(cursor) {
 			match op {
 				SeqOp::Splice(let at, let removed, let inserted) => {
 					mut mapped: List<i32> = [];

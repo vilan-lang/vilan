@@ -43,6 +43,7 @@ use std::cell::{Cell, RefCell};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bytes::Bytes;
@@ -759,6 +760,46 @@ fn refuse(connection: &Rc<Connection>, status: u16, phrase: &str) {
     connection.stage.set(Stage::Closing);
 }
 
+// ------------------------------------------------------------ termination ---
+
+/// How many termination requests the process has had (F45). A COUNT, not a
+/// flag, because the second one means something the first does not.
+///
+/// Process-wide and atomic because the request arrives from outside the
+/// program's thread: `vilan-rt-signal` routes SIGTERM/SIGINT/SIGHUP here from
+/// the thread its signal crate runs handlers on. Everything else in this
+/// module is the program thread's own, and reads this once per poll.
+static TERMINATION_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// A request to stop the program's servers GRACEFULLY — what a termination
+/// signal means to a native server (F45; Order 43's R-i).
+///
+/// The first request is the graceful stop: at its next poll every server
+/// stops accepting, closes the connections that are only waiting, and lets a
+/// request already being answered finish (see [`Server`]'s `terminate`), so
+/// the event loop runs out of work, `main` returns, and what runs at process
+/// end runs — the leak census among it. The SECOND request ends the process
+/// at once, with exit code 1 and a sentence on stderr: a server whose open
+/// response never ends (a stream, a long poll) has no graceful end to wait
+/// for, and a second Ctrl-C is how a person says so.
+///
+/// Safe to call from any thread, which is the point: a signal handler's
+/// thread is not the program's.
+pub fn request_termination() {
+    if TERMINATION_REQUESTS.fetch_add(1, Ordering::SeqCst) > 0 {
+        eprintln!(
+            "the program was stopped by a second termination request before its open \
+             connections ended"
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Whether a termination request has arrived.
+fn termination_requested() -> bool {
+    TERMINATION_REQUESTS.load(Ordering::SeqCst) > 0
+}
+
 // ----------------------------------------------------------------- server ---
 
 /// The request handler a server is built with: `createServer`'s callback.
@@ -793,6 +834,9 @@ struct ServerBody {
     /// has ended.
     closing: Cell<bool>,
     on_closed: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Whether this server has already answered a termination request (F45) —
+    /// it answers each one once, at the first poll that sees it.
+    terminated: Cell<bool>,
 }
 
 /// `http.createServer(handler)`.
@@ -805,6 +849,7 @@ pub fn create_server(handler: Handler) -> Server {
         port: Cell::new(0),
         closing: Cell::new(false),
         on_closed: RefCell::new(None),
+        terminated: Cell::new(false),
     }))
 }
 
@@ -839,11 +884,14 @@ impl Server {
     /// mechanism `std::http`'s port-0 bind and every test harness here depends
     /// on.
     ///
-    /// `on_ready` is called SYNCHRONOUSLY once the socket is bound and
-    /// registered. Node defers it to the next tick; the difference is not
-    /// observable through `std::http`, whose `listen` callback only reads the
-    /// bound port and hands the server on, and making it a microtask would mean
-    /// the announcement raced the first request.
+    /// `on_ready` runs DEFERRED, once the code that called `listen` has
+    /// finished its turn — node emits `'listening'` from `process.nextTick`,
+    /// and the difference was observable after all: `std::http`'s `start()`
+    /// runs the app's `on_start` from this callback, so `server.start();
+    /// print("main returned")` printed its two lines in the opposite order
+    /// natively (found building F45's stop pin). It cannot race the first
+    /// request: the socket is bound here, but a connection is only ACCEPTED in
+    /// the loop's I/O poll, and the microtask queue drains before every one.
     pub fn listen(&self, port: i32, on_ready: Rc<dyn Fn()>) {
         let requested = port.clamp(0, 65535) as u16;
         let listener = match TcpListener::bind(("0.0.0.0", requested)) {
@@ -862,7 +910,7 @@ impl Server {
         self.0.port.set(bound);
         *self.0.listener.borrow_mut() = Some(listener);
         register_io(Rc::new(self.clone()));
-        on_ready();
+        crate::executor::queue_microtask(move || on_ready());
     }
 
     /// `server.address()`.
@@ -890,6 +938,28 @@ impl Server {
         self.0.closing.set(true);
         *self.0.listener.borrow_mut() = None;
         *self.0.on_closed.borrow_mut() = Some(on_closed);
+    }
+
+    /// The graceful stop a termination request asks for (F45): stop accepting,
+    /// close every connection that is only WAITING — one still reading a
+    /// request, and an upgraded socket, whose `"close"` subscribers run (an rpc
+    /// connection releases what it holds, as a hang-up would make it) — and let
+    /// a request already being answered finish. The loop drops the server once
+    /// its last connection has ended, and a program with nothing else pending
+    /// returns from `main`.
+    ///
+    /// `node:http`'s `close()` keeps an upgraded socket open until its peer
+    /// leaves; a signal-driven stop cannot wait on a peer, so this one does not.
+    /// A `close` callback a program registered through `stop()` still fires
+    /// when the last connection has gone — the two stops compose.
+    fn terminate(&self) {
+        *self.0.listener.borrow_mut() = None;
+        let connections: Vec<Rc<Connection>> = self.0.connections.borrow().clone();
+        for connection in connections {
+            if matches!(connection.stage.get(), Stage::Reading | Stage::Upgraded) {
+                connection.close();
+            }
+        }
     }
 
     /// Accepts everything waiting. `true` if anything was accepted.
@@ -1068,6 +1138,9 @@ impl Server {
 
 impl IoSource for Server {
     fn poll(&self) -> bool {
+        if termination_requested() && !self.0.terminated.replace(true) {
+            self.terminate();
+        }
         let mut progressed = self.accept_pending();
         let connections: Vec<Rc<Connection>> = self.0.connections.borrow().clone();
         for connection in &connections {
@@ -1551,5 +1624,89 @@ mod tests {
             );
         });
         assert_eq!(taken.borrow().clone(), "/ws head=");
+    }
+    /// [`fetch`] with a bounded read: a connection the server never closes
+    /// answers `"<still open>"` after five seconds instead of hanging the test.
+    fn fetch_bounded(port: u16, request: &str) -> std::thread::JoinHandle<String> {
+        let request = request.to_string();
+        std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound the read");
+            stream.write_all(request.as_bytes()).expect("send");
+            let mut response = String::new();
+            match stream.read_to_string(&mut response) {
+                Ok(_) => response,
+                Err(_) => "<still open>".to_string(),
+            }
+        })
+    }
+
+    /// F45: the graceful stop a termination request makes. A connection only
+    /// WAITING (connected, nothing sent) and an upgraded socket are closed —
+    /// the socket's `"close"` subscribers run, which is how an rpc connection
+    /// releases what it holds — while a request already being answered
+    /// finishes, and then the server is no longer live, which is what lets the
+    /// loop, and `main`, end. `terminate` is called directly: the process-wide
+    /// request counter it answers would stop every server in this test binary.
+    ///
+    /// Ordering by gaps, not by luck (N116): the requests are in the server's
+    /// hands 100 ms before the stop, and the in-flight handler answers 1,000 ms
+    /// after it — ten times the gap, and far past any poll.
+    #[test]
+    fn a_termination_closes_the_waiting_and_lets_the_answering_finish() {
+        let released = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&released);
+        let (answered, idle, upgraded, live_after) = block_on(async move {
+            let handler: Handler = Rc::new(move |_request: Request, response: Response| {
+                crate::executor::pin_future(async move {
+                    crate::executor::sleep(1000, None).await;
+                    response.end("finished\n");
+                })
+            });
+            let server = create_server(handler);
+            let on_close = Rc::clone(&observed);
+            server.on_upgrade(
+                "upgrade",
+                Rc::new(move |_request: Request, socket: Socket, _head: Bytes| {
+                    let on_close = Rc::clone(&on_close);
+                    socket.on_signal("close", Rc::new(move || on_close.set(true)));
+                }),
+            );
+            server.listen(0, Rc::new(|| {}));
+            let port = server.port() as u16;
+            let answering = fetch_bounded(port, "GET /slow HTTP/1.1\r\nHost: a\r\n\r\n");
+            let idle = fetch_bounded(port, "");
+            let upgraded = fetch_bounded(
+                port,
+                "GET /ws HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            );
+            crate::executor::sleep(100, None).await;
+            server.terminate();
+            // The loop would drop the server once it is no longer live; here the
+            // test keeps it and asks, after the in-flight answer has gone out.
+            crate::executor::sleep(1500, None).await;
+            let live_after = server.is_live();
+            (
+                answering.join().expect("the answering client"),
+                idle.join().expect("the idle client"),
+                upgraded.join().expect("the upgraded client"),
+                live_after,
+            )
+        });
+        let (status, _headers, body) = split(&answered);
+        assert_eq!(status, "HTTP/1.1 200 OK", "the in-flight request finishes");
+        assert_eq!(body, "finished\n");
+        assert_eq!(idle, "", "a waiting connection is closed with nothing sent");
+        assert_eq!(upgraded, "", "an upgraded socket is closed");
+        assert!(
+            released.get(),
+            "the upgraded socket's `close` subscribers run"
+        );
+        assert!(
+            !live_after,
+            "a stopped server with no connections is not live"
+        );
     }
 }

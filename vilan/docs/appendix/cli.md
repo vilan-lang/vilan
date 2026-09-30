@@ -15,6 +15,17 @@ For the guided on-ramp, see [Hello Vilan](../tour/hello-vilan.md); for
 `--watch`, HMR, and the manifest keys that shape the dev loop, see
 [the dev loop](../guide/dev-loop.md).
 
+One flag stands outside the commands: `vilan --print-keywords` prints the
+language's keyword table as JSON, `{"keywords": ["Self", "as", "async", …],
+"contextual": ["Self", "as", …]}`, and exits. `keywords` is every word with
+a keyword reading; `contextual` is the subset that is a keyword only in one
+position and an ordinary name everywhere else (`with`, `own`, `lazy`, `as`,
+…); the rest are reserved. It is the list for a tool that highlights or
+escapes Vilan outside this toolchain to read instead of keeping its own
+copy, which drifts: the playground's editor on this site reads it, and
+`vilan bindgen` escapes exactly the reserved words (a TypeScript member
+named `css` binds as `css_`, one named `lazy` as `lazy`).
+
 ## `vilan init [name]`
 
 Scaffolds a ready-to-run project: a manifest, sources that compile, and
@@ -91,7 +102,7 @@ its own, with the default prelude and no dependencies.
   and builds it with the host's `cargo` — **in debug**, because rustc is
   the inner loop from there on (`--release` is yours to run over the
   generated project). It is a first cut whose scope is structs, enums,
-  `Option`/`Result`, `str`, `List`, `Map`/`Set`, closures, `impl`s,
+  `Option`/`Result`, `str`, `List`, `HashMap`/`HashSet`, closures, `impl`s,
   `print` and `panic`; anything outside that — a generic function, a
   module-level binding, `async`, any host binding — is refused by name
   rather than mis-compiled. [Native binaries](../guide/native.md) has the
@@ -237,8 +248,8 @@ for them, in its own `vilan.toml`:
 internal_use = "warn"
 ```
 
-`internal_use` warns at every import and use of an `[internal("reason")]`
-item outside the module that declares it — `` `anchor` is internal: place
+`internal_use` warns at every use of an `[internal("reason")]` item outside
+the module that declares it (an `import` line alone is not a use) — `` `anchor` is internal: place
 against it, never through it ``. The label on its own only changes what the
 editor shows (the name is hidden from completion, dimmed, and its hover leads
 with the reason); a package that wants the terminal to say so too sets the
@@ -718,7 +729,7 @@ the crossing. The same fact rules out three tempting mappings:
   `[tag, …payload]` — unless it is a **backed** enum, which is the bare
   backing value and *does* cross (that is what a closed string set maps to,
   below);
-- `Map<str, T>` is a Vilan struct over a hashed native map, not a plain
+- `HashMap<str, T>` is a Vilan struct over a hashed native map, not a plain
   host object;
 - `List<T>` is a real JS array, and an array-*like* (`{[index: number]:
   T}` — numeric keys and `length`, no `Symbol.iterator`) is not one:
@@ -791,6 +802,18 @@ release, downloading for your platform and swapping the pair atomically
 (`vilan-lsp` first, so the two are never newer-cli/older-lsp). The
 licenses and third-party notices travel along. `--check` reports whether
 a newer release exists and changes nothing.
+
+The VS Code extension comes along. After the swap — and when the
+toolchain is already the newest release but the installed extension is
+not its version — `vilan upgrade` runs the installers' extension step:
+`code --install-extension vilan-lang.vilan` from the Marketplace or Open
+VSX first (an install VS Code keeps updated from then on), and the
+release's own `vilan-vscode.vsix`, verified against its checksum, when
+the gallery cannot be reached. The editor is found as the installers find
+it: `code` on your `PATH`, else a VS Code Server's own CLI. Its last line
+says which it did; an editor that refuses the extension is reported,
+never a failed upgrade. `--no-vscode` (or `VILAN_NO_VSCODE=1`) leaves the
+editor alone.
 
 `vilan upgrade` also prunes the std cache described below while it has
 `~/.vilan` open.

@@ -408,6 +408,56 @@ fn the_specs_reserved_words_are_the_lexers_keywords() {
     );
 }
 
+/// D14: the SPEC's two CONTEXTUAL-keyword lists are the lexer's table too
+/// (`lexing::CONTEXTUAL_KEYWORDS`), held both ways the way N87 holds the
+/// reserved lists. §2.2's prose list had drifted from the compiler twice —
+/// `as` and `only` were contextual for orders before it named them (D14's own
+/// finding), and B414 moved six words across the line — so the list is a
+/// fence now, and a fence is a thing a gate can read.
+///
+/// The attribute names §2.2 and §A.2 list beside the fence are
+/// `parsing::KNOWN_ATTRIBUTE_MARKERS` (the one table the parser and both
+/// editor grammars read): each must be named in both pages' prose, so a
+/// marker added to the parser is a marker the spec tells readers about.
+#[test]
+fn the_specs_contextual_keywords_are_the_lexers() {
+    let contextual: BTreeSet<String> = vilan_core::lexing::CONTEXTUAL_KEYWORDS
+        .iter()
+        .map(|(word, _)| word.to_string())
+        .collect();
+    for (relative, anchor) in [
+        ("spec/lexical.md", "are **contextual keywords**"),
+        ("spec/appendix.md", "Contextual keywords (an identifier"),
+    ] {
+        let listed = reserved_word_fence(relative, anchor);
+        let missing: Vec<&String> = contextual.difference(&listed).collect();
+        assert!(
+            missing.is_empty(),
+            "{relative}'s contextual-keyword fence is missing {missing:?} — add it, \
+             alphabetically (lexing.rs CONTEXTUAL_KEYWORDS is the table)"
+        );
+        let unknown: Vec<&String> = listed.difference(&contextual).collect();
+        assert!(
+            unknown.is_empty(),
+            "{relative}'s contextual-keyword fence lists {unknown:?}, which the lexer's \
+             CONTEXTUAL_KEYWORDS does not — a word promoted to a real keyword belongs in \
+             the reserved fence instead"
+        );
+        let page = std::fs::read_to_string(docs_root().join(relative))
+            .unwrap_or_else(|error| panic!("{relative}: {error}"));
+        let unnamed: Vec<&str> = vilan_core::parsing::KNOWN_ATTRIBUTE_MARKERS
+            .iter()
+            .copied()
+            .filter(|marker| !page.contains(&format!("`{marker}`")))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "{relative} never names the attribute marker(s) {unnamed:?} beside its \
+             contextual keywords (parsing.rs KNOWN_ATTRIBUTE_MARKERS)"
+        );
+    }
+}
+
 /// Unit pins for the fence extractor itself (the indented-fence hardening, D3).
 /// These exercise `extract_examples_from` on hand-built markdown so the fence
 /// rules are proven directly, independent of what the real docs happen to hold.

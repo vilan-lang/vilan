@@ -71,7 +71,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 
 	let remaining: SignalCell<i32> = items
-		.map(|list| {
+		.derive(|list| {
 			mut open = 0;
 			for todo in list {
 				if !todo.done {
@@ -83,7 +83,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 		.cell();
 
 	let visible: SignalCell<List<Todo>> = combine((items, filter))
-		.map(|(list, current)| {
+		.derive(|(list, current)| {
 			mut shown: List<Todo> = [];
 			for todo in list {
 				let keep = current == "all"
@@ -113,7 +113,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 			// `bind_value` is two-way: the input shows `draft` and writes it on input.
 			.child(view("input").attr("placeholder", "What needs doing?").bind_value(draft))
 			.child(view("button").styled(button).text("Add").on("click", add)))
-		.child(view("p").bind_text(remaining.map(|n| format(n) + " remaining")))
+		.child(view("p").bind_text(remaining.derive(|n| format(n) + " remaining")))
 		.child(view("div")
 			.styled(row)
 			.child(filter_button(filter, "all", "All"))
@@ -127,7 +127,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 		.child(view("p")
 			.styled(empty_note)
 			.text("Nothing here 🎉")
-			.show(visible.map(|list| list.len() == 0)))
+			.show(visible.derive(|list| list.len() == 0)))
 }
 
 // A filter button highlights itself when its value is the active filter —
@@ -141,7 +141,7 @@ fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 	let active_classes = active.class_list();
 	view("button")
 		.text(label)
-		.bind_class(filter.map(|current| if current == value {
+		.bind_class(filter.derive(|current| if current == value {
 			active_classes
 		} else {
 			base_classes

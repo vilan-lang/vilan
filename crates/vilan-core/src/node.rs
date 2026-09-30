@@ -33,6 +33,15 @@ pub struct TupleBound<'src> {
 
 pub type GenericArguments<'src> = Spanned<Vec<Spanned<Node<'src>>>>;
 
+// One `binder in source` of a tuple comprehension — the first of its bindings,
+// or one more that ZIPS with it (B183: `(a in aa, b in bb => e)`).
+#[derive(Debug)]
+pub struct ComprehensionBinding<'src> {
+    pub binder: &'src str,
+    pub binder_span: Span,
+    pub source: Spanned<Node<'src>>,
+}
+
 // How an `external` function is bound to the host (JS): a `[extern(..)]`
 // attribute selects the form. The receiver of a method/property is the
 // function's first parameter.
@@ -441,6 +450,33 @@ pub struct If<'src> {
     pub condition: Box<Spanned<Node<'src>>>,
     pub then: Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
     pub else_: Option<Spanned<NodeIfBranch<'src>>>,
+    /// How the `if` was WRITTEN (B459). Read by the formatter, which reprints
+    /// the spelling, by the editor's hover, and by the one rule the sugar adds
+    /// (R15, the guard's bindings); every other pass reads an `if`.
+    pub spelling: IfSpelling,
+}
+
+/// The two spellings of an `if` (B459). The `then`/`else` forms are SUGAR over
+/// the keyword form — `c then a else b` is `if c { a } else { b }`, and the
+/// statement forms `c then S;`, `c else S;` (the guard) and `c then S else S;`
+/// are `if c { S; }`, `if c {} else { S; }` and `if c { S; } else { S; }` — so
+/// they parse to this same node and analysis, emission and diagnostics are the
+/// `if`'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IfSpelling {
+    /// `if c { .. } else { .. }`.
+    Keyword,
+    /// The infix form. `then_word` is the `then` keyword's span (`None` for
+    /// the guard `c else S;`), `else_word` the `else`'s (`None` for `c then
+    /// S;`). `statement` is the READING: a form written at statement position
+    /// and terminated by its `;` is a statement — each branch a statement
+    /// whose value is discarded, so the branches need not unify — and any
+    /// other form is an expression, which needs both branches.
+    Then {
+        then_word: Option<Span>,
+        else_word: Option<Span>,
+        statement: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -669,12 +705,12 @@ pub enum Node<'src> {
         source: Box<Spanned<Node<'src>>>,
         template: Box<Spanned<Node<'src>>>,
     },
-    // A tuple comprehension `(x in xs = e)`: build a tuple by evaluating the body
-    // `e` for each element of the source tuple `xs`, with the element bound as `x`.
+    // A tuple comprehension `(x in xs => e)`: build a tuple by evaluating the
+    // body `e` for each element of the source tuple `xs`, with the element bound
+    // as `x`. Two or more bindings ZIP (B183): `(a in aa, b in bb => e)` walks
+    // one family's positions in step, binding each source's element there.
     TupleComprehension {
-        binder: &'src str,
-        binder_span: Span,
-        source: Box<Spanned<Node<'src>>>,
+        bindings: Vec<ComprehensionBinding<'src>>,
         body: Box<Spanned<Node<'src>>>,
     },
     // A `css { … }` block (proposal/css-block.md) — CSS-shaped sugar over the
@@ -1231,8 +1267,10 @@ impl<'src> Node<'src> {
                 visit(source);
                 visit(template);
             }
-            Node::TupleComprehension { source, body, .. } => {
-                visit(source);
+            Node::TupleComprehension { bindings, body } => {
+                for binding in bindings {
+                    visit(&binding.source);
+                }
                 visit(body);
             }
             Node::Enum(_, generic_parameters, _resource, variants, _) => {
@@ -1409,6 +1447,32 @@ pub struct Labels<'src> {
     /// with spans — empty when absent. On an `impl` everything inside requires
     /// the platform; on either, the file is analyzed under it.
     pub platform: Vec<Spanned<&'src str>>,
+    /// `[resource]` on a TRAIT (B470, RULED 2026-09-29): its trait objects
+    /// may hold a resource, so `dyn T` is itself move-only. On a struct or an
+    /// enum the attribute is the declaration's own kind flag and never lands
+    /// here.
+    pub resource: bool,
+    /// `[hint(Trait<..>)]` (E227): the trait application a struct or an enum
+    /// is SHOWN as in an inlay hint — `[hint(Source<U>)]` on
+    /// `struct Map<S, T, U>` hints a `Map<..>` as `~Source<..>`. The argument
+    /// is a TYPE, in the declaration's own generic parameters (the one
+    /// built-in attribute whose argument is). As written, every occurrence:
+    /// empty when absent, and more than one is the analyzer's refusal, not a
+    /// parse error. It changes nothing a program means.
+    pub hint: Vec<HintArgument<'src>>,
+}
+
+/// One `[hint(..)]`'s written type (E227). Shared, not owned: [`Labels`] is
+/// cloned wherever a declaration's labels are recorded (`item_labels`), and a
+/// [`Node`] is deliberately not `Clone` — the argument is one tree, read in
+/// place. Two are equal when they are the SAME written argument.
+#[derive(Debug, Clone)]
+pub struct HintArgument<'src>(pub std::sync::Arc<Spanned<Node<'src>>>);
+
+impl PartialEq for HintArgument<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 // An explicit enum backing value, `= ( (-)? NUMBER | STRING )`

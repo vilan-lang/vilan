@@ -127,12 +127,12 @@ fun app(): View {
 		.child(view("p").child(when(show_banner, || view("em").text("more & more"))))
 		.child(view("figure")
 			.child(when_some(selected, |row| {
-				view("figcaption").bind_text(row.map(|current| current.label))
+				view("figcaption").bind_text(row.derive(|current| current.label))
 			})))
 		.child(view("figure")
 			.attr("id", "unselected")
 			.child(when_some(unselected, |row| {
-				view("figcaption").bind_text(row.map(|current| current.label))
+				view("figcaption").bind_text(row.derive(|current| current.label))
 			})))
 		.child(view("input").attr("type", "text").bind_value(query))
 		.child(view("button").text("save").on("click", || query.set("x")))

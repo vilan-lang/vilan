@@ -194,18 +194,20 @@ demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is a trait, not a type: a trait names a bound, and a value needs a type"**
-A trait's name was written where a type belongs — a return type, a struct
-field, or a generic argument like `List<Display>`. Traits are **bounds**,
+A trait's name was written where a type belongs — a struct field, a
+closure parameter, a trait method's return, or a generic argument like
+`Option<Display>` in a return type. Traits are **bounds**,
 not types, so no value can have that type: the impl is fine, the
 signature is not. Three spellings do what was meant, and the message names
 each. `dyn A` is the **trait object** — a value whose concrete type is
 erased, carrying the trait's members in a table — and it is what a field,
 an element type or any other value position takes when what it holds is
 decided at runtime. A **parameter** needs nothing: `fun f(x: A)` already
-IS `fun f<T: A>(x: T)`. A **return** takes the generic the message spells
-out, `<T: A>` with `T` written in the return position; inside the trait's
-own declaration it takes `Self`, which is what a trait naming itself in a
-return position always meant. A `let` binding's own annotation is not this
+IS `fun f<T: A>(x: T)`. A free `fun` or an inherent method may **return**
+`A` itself — the ONE type its body picks, which callers see (it is not
+hidden) — while a caller-chosen return is the generic the message spells
+out, `<T: A>`, and a TRAIT method's return is `dyn A` or a concrete type;
+inside the trait's own declaration a trait naming itself takes `Self`. A `let` binding's own annotation is not this
 error at all — there a trait is a *constraint* on the inferred type; see
 the next entry. The note points at the trait, which may live in another
 module. For a CLOSED set of alternatives, an enum is still better than an
@@ -228,12 +230,14 @@ no table, and is what the language does everywhere else.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is a resource, so it cannot become a `dyn …`"**
-A `resource` has exactly one owner and a destructor that runs at a known
-point. Erasing it into a trait object would make that destructor dynamic —
-dispatched through the table like everything else — where the rest of the
-language keeps teardown static. Hold the resource in a struct field of
-your own and put *that* behind the object, or take it through a generic
-bound, where its type is still known.
+A `resource` with a `Drop` somewhere inside it has a destructor that runs
+at a known point. Erasing it into a trait object would make that destructor
+dynamic — dispatched through the table like everything else — where the
+rest of the language keeps teardown static. Hold the resource in a struct
+field of your own and put *that* behind the object, or take it through a
+generic bound, where its type is still known. (A resource with no `Drop`
+inside may become the object of a `[resource] trait`; erasing one into
+any other trait's object says so: "mark the trait `[resource]`".)
 → [Memory model](../tour/memory-model.md)
 
 **"'…' does not implement trait '…', required by the annotation on '…'"**
@@ -273,6 +277,12 @@ where it is called.
 A type has one namespace, so **receiver position is not part of the
 name**: a static `fun new()` and a method `fun new(self)` for the same
 type collide with each other too. Give one of them a different name.
+
+One pair is ranked rather than refused: a BLANKET (`impl type S: Read<type
+T> { fun peek … }`) beside a type it covers that declares the same name
+itself (`impl Cell<type T> { fun peek … }`). At a `Cell` receiver the
+type's own member answers; for every other `Read` type, and through a
+`S: Read<…>` bound, the blanket's does — in either declaration order.
 → [Names, modules, and packages](../spec/names.md)
 
 **"'…' is already implemented for '…'; remove or merge this impl"**
@@ -526,7 +536,9 @@ The number doesn't fit the type. For `i53`/`u53`/`usize` the range is
 window. Bigger integers take `BigInt` (`7n`). A negative literal at an
 unsigned type (`let n: usize = -1`) is refused with its own message, which
 names the type's range: an unsigned value is never below zero, and a
-"nothing here" sentinel is `None` in an `Option<usize>`.
+"nothing here" sentinel is `None` in an `Option<usize>`. A literal-only
+expression that folds negative (`0 - 1`) is refused the same way, naming
+the value it folds to.
 → [Values and types](../tour/values-and-types.md)
 
 **"unknown numeric suffix `…`"**
@@ -661,11 +673,14 @@ points at the move. Loan it instead (`&x` / `&mut x`, or a method call),
 or, if you really need two owners, restructure with `Option` + `take`.
 → [Resources](../tour/resources.md)
 
-**"cannot move a resource field out of a live aggregate: … no partial moves …"**
+**"cannot move a resource field out of a live aggregate: … a field moves out only as a destructure …"**
 `let x = s.db`, or passing / returning `s.db` by value, would move a
-resource out of a struct that is still alive: there are no partial moves.
-Loan the field (`&s.db`, `&mut s.db`, `s.db.method(…)`), or make the field
-an `Option<…>` and `take()` it out.
+resource out of a struct that is still alive, and here it cannot be a
+destructure: the struct is a loan (not `own`), or a `Drop` sits somewhere
+inside its type, which would be left to run on half a value. Loan the field
+(`&s.db`, `&mut s.db`, `s.db.method(…)`), take the struct by `own` (when
+nothing inside it has a `Drop`), or make the field an `Option<…>` and
+`take()` it out.
 → [Resources](../tour/resources.md)
 
 **"`…` is moved on one path through this branch but not another: …"**
@@ -732,7 +747,7 @@ instead.
 → [Resources](../tour/resources.md)
 
 **"`…` cannot hold the resource `…`…: … a native container's internals are host code …"**
-`List`, `Map`, `Set`, and the external generics (`Shared`, `Task`,
+`List`, `HashMap`, `HashSet`, and the external generics (`Shared`, `Task`,
 `Promise`, `Context`) can't hold a resource: the move checker
 can't see inside host storage. `Option` is the sanctioned resource
 container; or keep the resource in a struct field.
@@ -926,7 +941,7 @@ migration notes.
 **"field `…` of `[derive(Wire)]` type `…` is `…`, which is not Wire: …"**
 Something unserializable (a closure, a `Signal`) is inside a payload
 type. Wire types carry data only: scalars, `str`, `bool`,
-`List`/`Option`/`Result`/`Map` of Wire, other Wire types, and anything
+`List`/`Option`/`Result`/`HashMap` of Wire, other Wire types, and anything
 you write an `impl … with Wire` for.
 → [Services & RPC](../guide/services.md)
 

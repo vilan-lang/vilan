@@ -210,8 +210,10 @@ const EXPRESSION_TYPE_DEPTH_LIMIT: usize = 8;
 /// same URL as the marketplace listing's and the tap's homepage.)
 pub const BOOK_BASE: &str = "https://vilan-lang.org/docs/";
 
-/// Every keyword the lexer classifies (`token.rs`), each with a one-line
-/// meaning and a deep link into the book: `(keyword, sentence, page#anchor)`.
+/// Every keyword the lexer classifies (`token.rs`), and every CONTEXTUAL
+/// keyword (B414 — `with`, `borrows`, `own`, `dyn`, `lazy`, `jump`, which hover
+/// where the parser read them as keywords), each with a one-line meaning and a
+/// deep link into the book: `(keyword, sentence, page#anchor)`.
 /// Semantics-bearing keywords point at the specification; the rest point where
 /// the book teaches them best. The set is kept in lockstep with the lexer by
 /// [`keyword_lexeme`], whose every keyword arm has an entry here. Every
@@ -327,8 +329,13 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "else",
-        "The alternative branch of an `if`.",
+        "The alternative branch of an `if` or a `then` form; after a condition with no `then`, the guard statement `ok else ret;`.",
         "tour/control-flow.html#if--else",
+    ),
+    (
+        "then",
+        "The infix conditional, sugar over `if`: `ready then a else b` is a value, and `ready then go();` a statement.",
+        "tour/control-flow.html#then--else",
     ),
     (
         "match",
@@ -449,7 +456,10 @@ const FILE_HEAD_SNIPPET: (&str, &str, &str, &str) = (
 /// The keyword lexeme a token spells, or `None` for non-keyword tokens
 /// (identifiers, literals, operators, punctuation). Exhaustive over `Token`
 /// deliberately: a new keyword variant must be classified here, which forces
-/// the matching [`KEYWORD_DOCS`] entry it needs.
+/// the matching [`KEYWORD_DOCS`] entry it needs. A CONTEXTUAL keyword (B414,
+/// `lexing::CONTEXTUAL_KEYWORDS`) is an identifier token and answers `None`
+/// here — whether a given `with` is the keyword is a question about its
+/// position, which `parsing::contextual_keyword_readings` answers.
 pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
     Some(match token {
         Token::Async => "async",
@@ -469,23 +479,17 @@ pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
         Token::Import => "import",
         Token::In => "in",
         Token::Is => "is",
-        Token::Jump => "jump",
-        Token::Lazy => "lazy",
         Token::Let => "let",
         Token::Macro => "macro",
         Token::Match => "match",
         Token::Mod => "mod",
         Token::Mut => "mut",
         Token::Null => "null",
-        Token::Own => "own",
-        Token::Borrows => "borrows",
         Token::Ret => "ret",
-        Token::Dyn => "dyn",
         Token::Struct => "struct",
         Token::Trait => "trait",
         Token::Type => "type",
         Token::Use => "use",
-        Token::With => "with",
         Token::Ident(_)
         | Token::Ctrl(_)
         // B318 §2.3: `#` is the import reach marker — punctuation, not a
@@ -1591,7 +1595,7 @@ fn head_is_not_an_initializer(token: &Token<'_>) -> bool {
             | Token::Enum
             | Token::Trait
             | Token::Impl
-            | Token::With
+            | Token::Ident("with")
             | Token::If
             | Token::Else
             | Token::Match
@@ -2416,10 +2420,17 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 return None;
             };
             let target = match callee.checked_sub(1).map(|before| &tokens[before].0) {
-                // `x.m(…)` — the member `m` of whatever `x` resolves to.
+                // `x.m(…)` — the member `m` of whatever `x` resolves to, and
+                // its result grounded through `x`'s own type where the
+                // declaration returns a bare parameter of the impl (E228).
                 Some(Token::Ctrl('.')) => {
                     let receiver = self.live_receiver_type_id(tokens, callee - 2, depth + 1)?;
-                    self.member_id(nominal_type_id(program, receiver)?, name)?
+                    let member = self.member_id(nominal_type_id(program, receiver)?, name)?;
+                    if let Some(grounded) = self.receiver_grounded_result_type_id(member, receiver)
+                    {
+                        return Some(grounded);
+                    }
+                    member
                 }
                 // `a::b::f(…)` — a module member or a type's static.
                 Some(Token::Op("::")) => {
@@ -2521,6 +2532,41 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .iter()
             .find(|(member, _)| member == name)
             .map(|(_, id)| *id)
+    }
+
+    /// The result of calling the impl member `member` on a receiver of type
+    /// `receiver`, where the declaration returns a bare type PARAMETER of the
+    /// impl's subject: that parameter bound from the receiver's own type
+    /// arguments (E228). `Shared<T>::read(self): T` on a
+    /// `Shared<Option<i32>>` is `Option<i32>`, and the receiver says so
+    /// without any analyzed call — which is what a receiver typed since the
+    /// landing has none of. `None` for every other return (the declared-type
+    /// path answers those) and for a parameter the subject does not bind (a
+    /// method's own generic, which only a call site can ground).
+    ///
+    /// The binding walk is the analyzer's own
+    /// ([`vilan_core::impl_select::bind_subject`]), keyed by the constraint id
+    /// both the subject's `Generic` and the return's carry (B366).
+    fn receiver_grounded_result_type_id(&self, member: Id, receiver: TypeId) -> Option<TypeId> {
+        let program = self.program;
+        let target = self.function_target(member).unwrap_or(member);
+        let declared = if let Some(function) = program.functions.get(&target) {
+            function.return_type_id?
+        } else {
+            program.external_functions.get(&target)?.return_type_id
+        };
+        let Some(Type::Generic(parameter)) = program.type_id_to_type_map.get(&declared) else {
+            return None;
+        };
+        let subject = self.index.members.subject_of(member)?;
+        let mut bindings = HashMap::default();
+        vilan_core::impl_select::bind_subject(program, subject, receiver, &mut bindings);
+        bindings.get(parameter).copied().filter(|bound| {
+            !matches!(
+                program.type_id_to_type_map.get(bound),
+                Some(Type::Generic(_))
+            )
+        })
     }
 
     /// The result type of calling `target`, from its DECLARATION alone: the
@@ -2637,8 +2683,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 return Some(*return_type_id);
             }
         }
+        // An `external` declaration's return is substituted exactly as a
+        // bodied one's (E228): `Shared<T>::read(self): T` is `external`, and
+        // its bare `T` went through verbatim — a `Type::Generic` that names
+        // no members — so `cell.read().` offered nothing on every handle.
         if let Some(external) = program.external_functions.get(&callee_id) {
-            return Some(external.return_type_id);
+            return Some(self.substituted_return_type_id(call_id, external.return_type_id));
         }
         // A closure-typed callee (`let render = || …; render().`).
         let subject_type_id = self.expression_type_id(subject_id, depth + 1)?;
@@ -4007,6 +4057,12 @@ impl DocParagraphs {
 #[derive(Clone, Debug, Default)]
 struct MemberTable {
     by_type: HashMap<Id, TypeMembers>,
+    /// Each impl-DECLARED member's impl subject, in the impl's own generic
+    /// terms (`Shared<Generic(T)>` for `impl Shared<type T>`'s `read`): what
+    /// grounds a member's bare-parameter return against a live receiver's
+    /// type (E228). Trait defaults are not here — their parameters are the
+    /// trait's, not the subject's.
+    subjects: HashMap<Id, TypeId>,
 }
 
 /// One nominal type's methods, split by how they are called.
@@ -4026,10 +4082,14 @@ impl MemberTable {
     /// overrides a trait default offers the override and not both.
     fn build(program: &Program) -> MemberTable {
         let mut by_type: HashMap<Id, TypeMembers> = HashMap::default();
+        let mut subjects: HashMap<Id, TypeId> = HashMap::default();
         let mut grouped: HashMap<Id, Vec<&Implementation>> = HashMap::default();
         for implementation in &program.implementations {
             if let Some(type_id) = nominal_type_id(program, implementation.subject) {
                 grouped.entry(type_id).or_default().push(implementation);
+                for member_id in implementation.declarations.values() {
+                    subjects.insert(*member_id, implementation.subject);
+                }
             }
         }
         for (type_id, implementations) in grouped {
@@ -4081,7 +4141,12 @@ impl MemberTable {
             }
             by_type.insert(type_id, members);
         }
-        MemberTable { by_type }
+        MemberTable { by_type, subjects }
+    }
+
+    /// The impl subject that declares `member_id`, in its own generic terms.
+    fn subject_of(&self, member_id: Id) -> Option<TypeId> {
+        self.subjects.get(&member_id).copied()
     }
 
     /// `type_id`'s instance methods (`want_self`) or its statics, in the order

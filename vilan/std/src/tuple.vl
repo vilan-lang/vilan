@@ -1,0 +1,78 @@
+// `std::tuple` — a tuple you can walk, keyed by position (A122,
+// `proposal/tuple-module.md`).
+//
+// A tuple is a family indexed by position: `(i32, str)` holds an `i32` at 0 and
+// a `str` at 1, and a generic `T: (2..)` holds some element type at each of its
+// positions. `Tuple` walks such a value without knowing its arity: `keys()`
+// answers one KEY per position, `entries()` a `(key, value)` pair per position,
+// and `get(key)` reads the element a key names. A `TupleKey<T, U>` carries
+// which family it indexes (`T`) and the element type at its position (`U`), so
+// a read through it is typed — and a key for `T` indexes EVERY tuple mapped
+// from `T` too, at the mapped element type: the key from `whole.keys()` reads
+// `cells.get(key)` as a `SignalCell<U>` when `cells: (V in T: SignalCell<V>)`.
+//
+// Walk the answers with a comprehension, a `for`, or `map`:
+//
+// ```text
+// (key in whole.keys() => cells.get(key).get())      // a comprehension
+// for (key, value) in whole.entries() { .. }           // a `for` (body checked once)
+// whole.keys().map(|key| cells.get(key).get())         // `map`, the same comprehension
+// ```
+//
+// `map` is not an ordinary method: one closure has one type, and a tuple needs a
+// different function at every position, so `t.map(|x| e)` takes a closure
+// LITERAL and IS the comprehension `(x in t => e)` — its body is checked once,
+// with `x` at the element template.
+
+export *;
+
+/// A position in every tuple of the family `T`, typed at the element it names.
+///
+/// Minted only by `keys()` / `entries()`: the type is opaque (`external`), so there
+/// is no constructor to call, and a key always names a position `T` really has, at
+/// the type it really has there. (Its representation is the position, `[at]`; `get`
+/// reads it.)
+external struct TupleKey<T, U>;
+
+/// Every tuple of arity two or more, walked by position.
+///
+/// Import it (`import std::tuple::Tuple;`) and every tuple — a concrete one,
+/// a value of a tuple-bounded parameter `T: (2..)`, or a mapped tuple
+/// `(U in T: F<U>)` — has these methods.
+trait Tuple {
+	/// The arity, as a value.
+	fun len(self): usize;
+
+	/// One key per position, each at its own element type.
+	fun keys(self): (U in Self: TupleKey<Self, U>);
+
+	/// `(key, value)` per position.
+	fun entries(self): (U in Self: (TupleKey<Self, U>, U));
+
+	/// The element at `key` — in this tuple, or in any tuple mapped from the family
+	/// the key was minted for, at the mapped element type.
+	fun get<U>(self, key: TupleKey<Self, U>): U;
+
+	/// `t.map(|x| e)` is the comprehension `(x in t => e)`: `transform` must be
+	/// a closure LITERAL with one parameter, whose body is checked once, with
+	/// `x` at the element template, and the answer is the tuple of the body's
+	/// type per position. This signature is a placeholder — no signature can
+	/// type a function that takes a different type at every position — and the
+	/// compiler types the call by the comprehension's rule instead.
+	fun map<F>(self, transform: F): Self;
+}
+
+// The five members are intrinsics: each one's emission reads the concrete tuple
+// layout of the instance it is emitted in (tuples store flat, so a position's slot
+// offset is a property of the whole tuple type).
+impl type T: (2..) with Tuple {
+	external fun len(self): usize;
+
+	external fun keys(self): (U in T: TupleKey<T, U>);
+
+	external fun entries(self): (U in T: (TupleKey<T, U>, U));
+
+	external fun get<U>(self, key: TupleKey<T, U>): U;
+
+	external fun map<F>(self, transform: F): T;
+}

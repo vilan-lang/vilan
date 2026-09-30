@@ -457,11 +457,16 @@ fn b238_every_table_word_is_still_an_ordinary_identifier() {
 #[test]
 fn b238_the_census_is_non_vacuous() {
     // The same four positions with a real KEYWORD in them: every one must
-    // decline, or the census above proves nothing.
-    for word in ["match", "is", "with", "let"] {
+    // decline, or the census above proves nothing. (`with` stood here until
+    // B414 made it contextual — a name at all four positions now.) The field
+    // position asks about the literal SHORTHAND: B414 S4's member tier admits a
+    // reserved word as a declared field and as a field given with `=`, and the
+    // shorthand — which reads a binding of the field's name — is the one field
+    // spelling a keyword still cannot take.
+    for word in ["match", "is", "impl", "let"] {
         let sources = [
             format!("fun main() {{ let {word} = 1; }}"),
-            format!("struct S {{ {word}: i32 }}\nfun main() {{ let s = S {{ {word} = 1 }}; }}"),
+            format!("struct S {{ {word}: i32 }}\nfun main() {{ let s = S {{ {word} }}; }}"),
             format!("fun {word}(): i32 {{ 1 }}"),
             format!("fun take({word}: i32): i32 {{ {word} }}"),
         ];

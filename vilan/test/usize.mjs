@@ -192,11 +192,12 @@ function $D(value) {
 	$E;
 	let result = [  ];
 	for (const element of value) {
+		const $G = result;
 		const $F = from_json_value(element);
 		if ($F[0] === 1) {
 			return $F;
 		}
-		result.push($F[1]);
+		$G.push($F[1]);
 	}
 	return [ 0, result ];
 }
@@ -259,13 +260,13 @@ const positions = [ 0, 3, 2147483647 ];
 const encoded = $z(positions);
 console.log(encoded);
 const decoded = $A(encoded);
-const $G = decoded;
-let $H = null;
-if ($G[0] === 0) {
-	const back2 = $G[1];
-	$H = console.log("" + back2.length + " " + __at(back2, 2));
+const $H = decoded;
+let $I = null;
+if ($H[0] === 0) {
+	const back2 = $H[1];
+	$I = console.log("" + back2.length + " " + __at(back2, 2));
 } else {
-	const reason2 = $G[1];
-	$H = console.log(reason2);
+	const reason2 = $H[1];
+	$I = console.log(reason2);
 }
-process.exit($H);
+process.exit($I);

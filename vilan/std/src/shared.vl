@@ -41,7 +41,9 @@
 // a value, so storing one copies (spec §6.1), and so does a temporary standing
 // at a `&mut self` receiver (`cell.read().push(x)` mutates the copy and is
 // lost) — a temporary that only reads the slot, `for x in cell.read()` or
-// `cell.read().len()`, copies nothing; `write(self): &mut T
+// `cell.read().len()`, copies nothing, and a `for` whose body writes the same
+// cell in place (`cell.write().push(x)`) iterates a copy, since it no longer
+// only reads (B400); `write(self): &mut T
 // borrows self` hands back a view, and a write through it is visible through
 // every other handle to the same cell.
 
@@ -98,6 +100,31 @@ impl Shared<type T> {
 	/// — a thing reachable FROM the cell holding the cell, which under counting is
 	/// a cycle no count can collect.
 	external fun downgrade(&self): Weak<T>;
+}
+
+/// The optional cell, filled on first ask (tracker I8) — `Memo::get_or_insert`'s
+/// one-slot twin, for the value an app keeps in a `Shared<Option<T>>` and builds
+/// once: a module-level handle, a lazily opened connection.
+impl Shared<Option<type T>> {
+	/// The `T` this cell holds — or, while it holds `None`, the one `make` builds,
+	/// STORED and then answered. `make` runs at the call site and only on a miss,
+	/// so a maker that reads a context reads the caller's; what it builds is kept
+	/// in the cell past the caller, which is `Memo::get_or_insert`'s rule and its
+	/// warning's reason (a derivation built here is `.cell_global()`).
+	///
+	/// The by-hand form this replaces is a `match` over `read()` with a
+	/// `write() = Some(made)` arm — the exact place B433's unchecked assignment
+	/// through `write()` made a cache that never cached.
+	fun get_or_insert(self, make: || T): T {
+		match self.read() {
+			Some(let held) => held,
+			None => {
+				let made = make();
+				self.write() = Some(made);
+				made
+			},
+		}
+	}
 }
 
 /// A weak handle to a `Shared<T>` cell: it names the cell, and it does not keep it

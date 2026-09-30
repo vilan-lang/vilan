@@ -456,7 +456,7 @@ export fun stat(path: str): Option<Stat> {
 /// Two container rules worth meeting here rather than in a diagnostic
 /// (destruction.md R9/R10): a closure cannot capture a `File` (`with_file`
 /// below hands the body its file as a per-call parameter instead), and
-/// `List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
+/// `List`/`HashMap`/`HashSet` cannot hold one — `Option<File>` is the sanctioned
 /// container, so "a pool of open files" is not expressible in v1.
 export [resource] external struct File;
 
@@ -726,7 +726,7 @@ export fun with_file_modify<T>(path: str, body: |File| T): T {
 ///
 /// A `resource` by containment (destruction.md §3), so everything the handle tier's
 /// rules say holds here without a word added: a `Reader` moves rather than copies,
-/// a closure cannot capture one, no `List`/`Map`/`Set` can hold one, and its
+/// a closure cannot capture one, no `List`/`HashMap`/`HashSet` can hold one, and its
 /// scope-end teardown closes the `File` it owns — `drop(reader)` is the early form.
 ///
 /// Both fields are reachable as LOANS, which is the point rather than an
@@ -846,10 +846,10 @@ export impl Reader {
 
 /// A live watch on a path — the tier's resource, built on `File`'s model exactly
 /// (`Database` before it): it moves rather than copies, so a stale watcher is a
-/// compile error; a closure cannot capture one and no `List`/`Map`/`Set` can hold
-/// one (destruction.md R9/R10); and its `Drop` stops the watch at the owner's scope
-/// end. There is no public `stop()` to fall out of sync with the destructor —
-/// `drop(watcher)` is the early form.
+/// compile error; a closure cannot capture one and no `List`/`HashMap`/`HashSet`
+/// can hold one (destruction.md R9/R10); and its `Drop` stops the watch at the
+/// owner's scope end. There is no public `stop()` to fall out of sync with the
+/// destructor — `drop(watcher)` is the early form.
 ///
 /// UNLIKE `File`, ITS TEARDOWN IS GENUINELY SYNCHRONOUS. Stopping a poll is a
 /// `clearTimeout`, so `Drop` needs none of `File`'s async-close exception

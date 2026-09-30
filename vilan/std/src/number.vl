@@ -10,12 +10,8 @@ export impl u32 {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: u32): u32;
 
-	[extern("Math.min")]
-	external fun min(self, other: u32): u32;
-
-	[extern("Math.max")]
-	external fun max(self, other: u32): u32;
-
+	// `min`/`max` live at `impl u32 with Ord` (M84) — an inherent of the same name
+	// here would be invisible to `Ord::clamp`'s default body.
 	fun rem(self, m: u32): u32 {
 		self - self / m * m
 	}
@@ -38,19 +34,20 @@ export impl i32 {
 		}
 	}
 
-	/// Absolute value, exponentiation, and pairwise min/max — thin wrappers over
-	/// the host `Math` functions (the receiver is passed as the first argument).
+	/// Absolute value and exponentiation — thin wrappers over the host `Math`
+	/// functions (the receiver is passed as the first argument). `min`/`max`
+	/// are the same shape, moved to `impl i32 with Ord` (M84): the SAME method
+	/// name declared here as a plain inherent, rather than as the trait's own
+	/// override, is invisible to `Ord::clamp`'s default body (`self.min(max)
+	/// .max(min)`) — a default body reaches the trait's own `min`/`max`, not
+	/// an inherent of the same name outside the `impl … with Ord` block — so
+	/// `clamp` fell through to `Ord`'s generic, `compare`-based `min`/`max`
+	/// twice over, at every integer width, since B359.
 	[extern("Math.abs")]
 	external fun abs(self): i32;
 
 	[extern("Math.pow")]
 	external fun pow(self, exponent: i32): i32;
-
-	[extern("Math.min")]
-	external fun min(self, other: i32): i32;
-
-	[extern("Math.max")]
-	external fun max(self, other: i32): i32;
 
 	/// Truncated remainder — exact for every integer type (`/` truncates, §F2),
 	/// the stopgap spelling until the `%` operator lands (backlog H5).
@@ -239,6 +236,16 @@ export impl i32 with Ord {
 			}
 		}
 	}
+
+	// M84: overriding the trait's own `min`/`max` here — rather than leaving them
+	// as the plain inherents above — is what `Ord::clamp`'s default body reaches
+	// for, so `x.clamp(lo, hi)` costs the host's `Math.min`/`Math.max` again
+	// instead of two `compare` calls through `Ord`'s generic default.
+	[extern("Math.min")]
+	external fun min(self, b: i32): i32;
+
+	[extern("Math.max")]
+	external fun max(self, b: i32): i32;
 }
 
 export impl u32 with Eq {}
@@ -269,6 +276,13 @@ export impl u32 with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: u32): u32;
+
+	[extern("Math.max")]
+	external fun max(self, b: u32): u32;
 }
 
 export impl i8 with Eq {}
@@ -299,6 +313,13 @@ export impl i8 with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: i8): i8;
+
+	[extern("Math.max")]
+	external fun max(self, b: i8): i8;
 }
 
 export impl u8 with Eq {}
@@ -329,6 +350,13 @@ export impl u8 with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: u8): u8;
+
+	[extern("Math.max")]
+	external fun max(self, b: u8): u8;
 }
 
 export impl i16 with Eq {}
@@ -359,6 +387,13 @@ export impl i16 with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: i16): i16;
+
+	[extern("Math.max")]
+	external fun max(self, b: i16): i16;
 }
 
 export impl u16 with Eq {}
@@ -389,6 +424,13 @@ export impl u16 with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: u16): u16;
+
+	[extern("Math.max")]
+	external fun max(self, b: u16): u16;
 }
 
 export impl i53 with Eq {}
@@ -419,6 +461,13 @@ export impl i53 with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: i53): i53;
+
+	[extern("Math.max")]
+	external fun max(self, b: i53): i53;
 }
 
 export impl u53 with Eq {}
@@ -449,6 +498,13 @@ export impl u53 with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: u53): u53;
+
+	[extern("Math.max")]
+	external fun max(self, b: u53): u53;
 }
 
 export impl usize with Eq {}
@@ -479,6 +535,13 @@ export impl usize with Ord {
 			}
 		}
 	}
+
+	// M84: see `impl i32 with Ord`'s comment.
+	[extern("Math.min")]
+	external fun min(self, b: usize): usize;
+
+	[extern("Math.max")]
+	external fun max(self, b: usize): usize;
 }
 
 export impl BigInt with Eq {}
@@ -899,10 +962,9 @@ export impl f64 {
 // L4's `[deprecated("steer")]` window, which rewrites callers — the rename is
 // scheduled, not a surprise, so reach for these freely today.
 //
-// These are the TYPE's range, which is deliberately NOT the LITERAL admission
-// range: `128i8` compiles, because the signed literal check admits the
-// magnitude so that `-128i8` can be written at all (numeric-types.md §3), yet
-// `i8::max_value()` is 127. The wide pair is the symmetric ±2^53 window
+// These are the TYPE's range, and since B428 they are the LITERAL admission range
+// too: `127i8` and `-128i8` compile, `128i8` is refused (the minimum's magnitude is
+// admitted only under its `-`). The wide pair is the symmetric ±2^53 window
 // (spec/lexical.md), one past `Number.MAX_SAFE_INTEGER`. Floats get no pair —
 // docs/std/numbers.md records why.
 
@@ -925,12 +987,7 @@ export impl i8 {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: i8): i8;
 
-	[extern("Math.min")]
-	external fun min(self, other: i8): i8;
-
-	[extern("Math.max")]
-	external fun max(self, other: i8): i8;
-
+	// `min`/`max` live at `impl i8 with Ord` (M84).
 	fun rem(self, m: i8): i8 {
 		self - self / m * m
 	}
@@ -1004,12 +1061,7 @@ export impl u8 {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: u8): u8;
 
-	[extern("Math.min")]
-	external fun min(self, other: u8): u8;
-
-	[extern("Math.max")]
-	external fun max(self, other: u8): u8;
-
+	// `min`/`max` live at `impl u8 with Ord` (M84).
 	fun rem(self, m: u8): u8 {
 		self - self / m * m
 	}
@@ -1086,12 +1138,7 @@ export impl i16 {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: i16): i16;
 
-	[extern("Math.min")]
-	external fun min(self, other: i16): i16;
-
-	[extern("Math.max")]
-	external fun max(self, other: i16): i16;
-
+	// `min`/`max` live at `impl i16 with Ord` (M84).
 	fun rem(self, m: i16): i16 {
 		self - self / m * m
 	}
@@ -1165,12 +1212,7 @@ export impl u16 {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: u16): u16;
 
-	[extern("Math.min")]
-	external fun min(self, other: u16): u16;
-
-	[extern("Math.max")]
-	external fun max(self, other: u16): u16;
-
+	// `min`/`max` live at `impl u16 with Ord` (M84).
 	fun rem(self, m: u16): u16 {
 		self - self / m * m
 	}
@@ -1382,12 +1424,7 @@ export impl i53 {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: i53): i53;
 
-	[extern("Math.min")]
-	external fun min(self, other: i53): i53;
-
-	[extern("Math.max")]
-	external fun max(self, other: i53): i53;
-
+	// `min`/`max` live at `impl i53 with Ord` (M84).
 	fun rem(self, m: i53): i53 {
 		self - self / m * m
 	}
@@ -1462,12 +1499,7 @@ export impl u53 {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: u53): u53;
 
-	[extern("Math.min")]
-	external fun min(self, other: u53): u53;
-
-	[extern("Math.max")]
-	external fun max(self, other: u53): u53;
-
+	// `min`/`max` live at `impl u53 with Ord` (M84).
 	fun rem(self, m: u53): u53 {
 		self - self / m * m
 	}
@@ -1544,12 +1576,7 @@ export impl usize {
 	[extern("Math.pow")]
 	external fun pow(self, exponent: usize): usize;
 
-	[extern("Math.min")]
-	external fun min(self, other: usize): usize;
-
-	[extern("Math.max")]
-	external fun max(self, other: usize): usize;
-
+	// `min`/`max` live at `impl usize with Ord` (M84).
 	fun rem(self, m: usize): usize {
 		self - self / m * m
 	}

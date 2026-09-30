@@ -222,16 +222,24 @@ pub fn js_of<T: Js + ?Sized>(value: &T) -> Str {
 
 /// `print(message)` — `std::io`'s one universal output, bound to
 /// `console.log` on the JS backend and to this here.
+///
+/// NOT an exact match at one value: node's `console.log` special-cases
+/// negative zero to `"-0"` (a `util.inspect` behaviour), where [`js_number`]
+/// answers `"0"`, the `String(x)`/template-literal/`JSON.stringify` reading —
+/// `f64-print-negative-zero.vl` pins the divergence by name, OUTSIDE the
+/// native differential (N106).
 pub fn print<T: Js + ?Sized>(value: &T) {
     println!("{}", value.js());
 }
 
-/// ECMA-262's `Number::toString` for the cases a compiled program reaches.
+/// ECMA-262's `Number::toString` for the cases a compiled program reaches —
+/// **not** `console.log`'s rendering, which [`print`]'s doc comment carries
+/// the one departure of (negative zero).
 ///
 /// Rust's own `{}` is already the shortest round-tripping decimal, which is
 /// what JavaScript specifies too, so the body below is only the four places the
 /// two disagree — and each is a real difference a corpus program can print, not
-/// a hypothetical.
+/// a hypothetical (`f64-print-boundary.vl`, N106).
 pub fn js_number(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -242,7 +250,8 @@ pub fn js_number(value: f64) -> String {
     }
     if value == 0.0 {
         // JavaScript's `String(-0)` is `"0"`; Rust's is `"-0"`. The sign is
-        // observable through `1/x`, and nothing in scope prints that.
+        // observable through `1/x`, and through `print` specifically, whose
+        // `console.log` DOES show it — see `print`'s doc comment.
         return "0".to_string();
     }
     let magnitude = value.abs();
@@ -712,6 +721,22 @@ impl<T: ReferenceEq> ReferenceEq for Vec<T> {
     }
 }
 
+/// A cell compares by IDENTITY (its `PartialEq` is `ptr_eq` already), which is
+/// JavaScript's `===` on the object it is there. So an `Option` or a `Vec` of a
+/// cell holding closures has reference equality too: `Option<Shared<List<||
+/// void>>>`, an owner's lazily allocated cleanup list.
+impl<T> ReferenceEq for Shared<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl<T> ReferenceEq for Weak<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 /// [`ReferenceEq::reference_eq`] as a free function, so the emitter can spell it
 /// without naming the trait at the site.
 pub fn reference_eq<T: ReferenceEq + ?Sized>(left: &T, right: &T) -> bool {
@@ -751,6 +776,19 @@ impl<T: ?Sized> Dyn<T> {
     pub fn object(&self) -> &T {
         &self.object
     }
+
+    /// The erased value's POINTER, for a slot that consumes its receiver
+    /// (`own self`, B470): `ObjectFlow::start(x.into_object())`.
+    pub fn into_object(self) -> Rc<T> {
+        self.object
+    }
+}
+
+/// The value behind a consuming slot's pointer: moved out when the pointer is
+/// the only one — a `[resource]` object always is, since it is move-only — and
+/// copied out otherwise, as a borrowing slot always did (B470).
+pub fn unshare<T: Clone>(object: Rc<T>) -> T {
+    Rc::try_unwrap(object).unwrap_or_else(|shared| (*shared).clone())
 }
 
 impl<T: ?Sized> Clone for Dyn<T> {
@@ -1106,13 +1144,14 @@ impl<T: std::hash::Hash + Eq + Clone> Clone for Set<T> {
 /// Entry-wise, in insertion order.
 ///
 /// **This is not reachable from a vilan program**, and it is here because the
-/// emitter derives `PartialEq` for every aggregate it writes: `std::map` gives
-/// `Map` no `impl PartialEq`, so `a == b` on two maps does not type-check, and
-/// `[derive(PartialEq)]` on a struct with a `Map` field is rejected by the
-/// analyzer's all-fields-comparable check. What the derive would mean on the JS
-/// backend is `===` — reference equality on two `Map` objects — and a value
-/// struct has no reference to compare, which is the other half of why this stays
-/// unreachable rather than becoming the answer to a question a program can ask.
+/// emitter derives `PartialEq` for every aggregate it writes. A vilan `==` on
+/// two `HashMap`s/`HashSet`s — and a derived `PartialEq` over a struct holding
+/// one — goes through std's own `impl .. with PartialEq` (tracker I9, the Q8
+/// ruling), which is ORDER-INSENSITIVE: the same keys with equal values. This
+/// impl is order-SENSITIVE and would disagree with it, so it must stay
+/// unreachable; `native_differential`'s
+/// `i9_hash_collection_equality_is_order_insensitive_on_both_backends` holds
+/// the two backends to the std answer.
 impl<K: std::hash::Hash + Eq + Clone, V: PartialEq> PartialEq for Map<K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.live == other.live && self.iter().eq(other.iter())
@@ -1822,9 +1861,15 @@ pub fn list_insert<T>(list: &mut Vec<T>, index: usize, value: T) {
 // ---------------------------------------------------------- str intrinsics --
 
 pub fn str_len(text: &str) -> usize {
-    // JavaScript's `.length` counts UTF-16 code units, and the corpus's strings
-    // are ASCII, where the two agree. A non-ASCII program is a KNOWN divergence
-    // and the differential reports it rather than this pretending otherwise.
+    // JavaScript's `.length` counts UTF-16 code units. `char::len_utf16`
+    // answers exactly that per Unicode scalar value — 1 within the BMP, 2 for
+    // a character JS stores as a surrogate pair — so this agrees with `.length`
+    // for any valid string, not only ASCII or the BMP; `non-bmp-string-length.vl`
+    // pins a surrogate-pair character identical on both backends (N106). The
+    // one string JS can hold that this cannot is one with an UNPAIRED
+    // surrogate: Rust's `char` (and so `str`) admits no such code point, and
+    // no vilan source can spell one either, so it is not a program either
+    // backend need answer for.
     text.chars().map(char::len_utf16).sum()
 }
 

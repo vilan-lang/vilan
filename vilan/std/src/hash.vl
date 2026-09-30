@@ -1,8 +1,9 @@
-// `std::hash` — value keys for `Map` / `Set` (proposal/hashable-keys.md, I1).
+// `std::hash` — value keys for `HashMap` / `HashSet` (proposal/hashable-keys.md,
+// I1).
 //
-// `Hashable` turns a value into a `Hash` — an opaque canonical key. `Map` and `Set`
-// bound their key on it, and anyone can build their own container the same way:
-// bound on `K: Hashable`, call `key.hash()`, key a `Map<Hash, ..>`.
+// `Hashable` turns a value into a `Hash` — an opaque canonical key. `HashMap` and
+// `HashSet` bound their key on it, and anyone can build their own container the
+// same way: bound on `K: Hashable`, call `key.hash()`, key a `HashMap<Hash, ..>`.
 import pkg::compare::PartialEq;
 import pkg::option::Option;
 
@@ -123,7 +124,7 @@ export impl f64 with Hashable {
 }
 
 // A `List`/`Option` of `Hashable` is itself `Hashable` (used directly as a key,
-// e.g. `Map<List<i32>, V>`): the canonical hash of the whole aggregate.
+// e.g. `HashMap<List<i32>, V>`): the canonical hash of the whole aggregate.
 export impl Option<type T: Hashable> with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)

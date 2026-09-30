@@ -14,7 +14,7 @@ signal fields, the macro generates:
 // client side
 FooClient::connect(url: str, codec: Codec): Result<FooClient<SocketTransport>, RpcError>
 client.some_rpc(args…): Result<T, RpcError>     // per [rpc] method; implicitly awaited
-client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source; sync, unleased
+client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source (SignalCell or MemoCell); sync, unleased
 client.some_keyed(args…): KeyedSource<K, V>     // per [rpc] method returning a KeyedCell; same, keyed
 client.some_signal: RemoteSource<T>             // per [expose] field; a typed mirror (below)
 client.some_map: KeyedSource<K, V>              // per [expose(keyed)] field; a patched mirror (below)
@@ -24,6 +24,13 @@ client.transport: SocketTransport               // connection state lives here
 foo.dispatcher(): Dispatcher                    // the method table
 dispatcher.into_protocol(codec: Codec): RpcProtocol   // what Service::new takes
 ```
+
+A handle stub is **idempotent per origin**: a second call with the same
+arguments on the same client answers the mirror the first one minted (one
+call, one `Subscribe`), until that mirror's last lease closes. The table
+behind it is generated beside the client — one `MirrorTable` per handle
+method — so a stub is safe inside a cold select (`and_then`, `switch`)
+that runs on every read.
 
 `connect` accepts a relative url (`"/"`) in the browser; it dials the same
 host over WebSocket, waits for the server's announcement, and verifies the
@@ -38,17 +45,26 @@ struct RemoteSource<T> { … }
 impl RemoteSource<type T> with Source<Option<T>> {
 	fun get(self): Option<T>                              // passive: the cache, `None` before the first update
 	[must_use]
-	fun on_change(self, observer: |Option<T>| void): Subscription    // counted, lazy: no immediate call
+	fun on_settle(self, subscriber: Subscriber): Subscription       // counted: attach, then lease
 	[must_use]
-	fun sub(self, observer: |Option<T>| void): Subscription          // counted, eager: one immediate call
-	fun effect(self, observer: |Option<T>| void)                     // counted, eager, owner-scoped
+	fun attach_observer(self, observer: |Option<T>| void, immediately: bool): Subscription
+	                                                      // counted; eager = lease first, one immediate call
 }
+// Through `Flow` (every source is one): `on_change` (counted, lazy), `sub`
+// (counted, eager), `effect` (counted, eager, owner-scoped), `derive`, …
 
 impl RemoteSource<type T> {
 	fun status(self): SignalCell<Status>                      // passive: what the mirror was last told
-	fun or(self, initial: T): Map<RemoteSource<T>, Option<T>, T>   // a cold node: `initial` until the first update
+	fun or(self, initial: T): Derive<RemoteSource<T>, Option<T>, T>   // a pipe: `initial` until the first update
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
+}
+
+// A mirror is a transient source (std::transient): Status mapped arm for arm.
+impl RemoteSource<type T> with TransientSource<T, RpcError> {
+	fun state(self): MemoCell<TransientState<T, RpcError>>   // passive, like `status`
+	fun latest(self): dyn Pipe<Option<T>>                    // leases while bound; keeps the stale value
+	fun is_pending(self): dyn Pipe<bool>                     // leases while bound
 }
 
 [derive(PartialEq, Debug)]
@@ -130,16 +146,17 @@ struct KeyedSource<K, T> { … }
 impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
 	fun get(self): Option<List<T>>                            // passive: what this client subscribed to
 	[must_use]
-	fun on_change(self, observer: |Option<List<T>>| void): Subscription   // counted, lazy
+	fun on_settle(self, subscriber: Subscriber): Subscription           // counted: attach, then lease
 	[must_use]
-	fun sub(self, observer: |Option<List<T>>| void): Subscription         // counted, eager
-	fun effect(self, observer: |Option<List<T>>| void)                    // counted, eager, owner-scoped
+	fun attach_observer(self, observer: |Option<List<T>>| void, immediately: bool): Subscription
 }
+// Through `Flow`: `on_change` (counted, lazy), `sub` (counted, eager), `effect`
+// (counted, eager, owner-scoped), `derive`, …
 
 impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun status(self): SignalCell<Status>                      // passive: `Waiting` until the first patch
 	fun fault(self): Option<str>                              // passive: the first protocol fault, sticky
-	fun or(self, initial: List<T>): Map<KeyedSource<K, T>, Option<List<T>>, List<T>>   // a cold node: the whole collection
+	fun or(self, initial: List<T>): Derive<KeyedSource<K, T>, Option<List<T>>, List<T>>   // a pipe: the whole collection
 	[must_use]
 	fun sub(self, observer: |List<T>| void): Subscription     // counted, manual: the whole collection
 	fun of(self, key: K): SignalCell<Option<T>>               // counted per KEY, owner-scoped
@@ -173,19 +190,19 @@ mirror does not hold; that op is refused rather than applied.
 
 Hand-wired exposures use `ReactiveServer::expose_keyed(source, key_of)`
 (for a `Source<List<T>>`) or `expose_keyed_map(source, key_of)` (for a
-`Source<Map<K, V>>`), with `ReactiveClient::attached_keyed_source` /
+`Source<HashMap<K, V>>`), with `ReactiveClient::attached_keyed_source` /
 `keyed_source` on the other end. `key_of` is a value parameter rather than
 a `Keyed<K>` bound alone because `K` appears nowhere else in the
 signature, and vilan infers a type parameter from a call's types, not from
 its bounds.
 
 The attribute generates whichever of the two the field's collection calls for,
-and the key type comes from wherever it is written (tracker A51): a `Map<K, V>`
+and the key type comes from wherever it is written (tracker A51): a `HashMap<K, V>`
 element names it and takes the bare `[expose(keyed)]`, and every other
 collection names it in the attribute — `[expose(keyed = str)] items:
 SignalCell<List<Task>>`. Naming it in both places is redundant rather than
 wrong, but the two spellings must AGREE: an argument that disagrees with the
-`Map`'s own key is refused at the attribute (tracker A56), because the
+`HashMap`'s own key is refused at the attribute (tracker A56), because the
 expansion reads `K` from the annotation before any type resolves and cannot
 pick between them. The generated wiring is the hand-written call, frame
 for frame, and the two spellings are one contract: same `Patch` frames, same
@@ -217,7 +234,7 @@ impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 	fun get(self): List<T>
 	[must_use]
-	fun on_change(self, observer: |List<T>| void): Subscription
+	fun on_settle(self, subscriber: Subscriber): Subscription
 }
 ```
 

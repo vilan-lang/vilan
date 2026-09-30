@@ -1,0 +1,36 @@
+# A native SERVER's graceful stop on a termination signal (tracker F45; Order
+# 43's R-i, RULED: build).
+#
+# SEPARATE from `vilan-rt`, for the reason `vilan-rt-sqlite` and
+# `vilan-rt-crypto` are: `vilan-rt` takes no crates.io dependencies and forbids
+# `unsafe` (Order 37's R8), and a signal handler cannot be installed inside both
+# rules — `sigaction(2)` on unix and `SetConsoleCtrlHandler` on Windows are
+# reached only through FFI (`extern "C"` calls are `unsafe`) or through a crate
+# that wraps them; Rust's std exposes neither. So the one dependency lives here,
+# and the cargo project `vilan build --backend rust` writes names this crate
+# ONLY when the program starts an HTTP server. A program that serves nothing
+# pays nothing.
+#
+# `ctrlc`, with its `termination` feature (SIGTERM and SIGHUP beside SIGINT on
+# unix; the console's close, logoff and shutdown events on Windows): it is the
+# crate the compiler's own CLI already links for its watch session's Ctrl-C
+# hook, so the lockfile and the third-party notices already carry it and
+# everything under it. It runs the handler on a thread of its own rather than
+# inside the signal handler, which is what lets the handler be ordinary Rust.
+# This crate's own code stays `forbid(unsafe_code)`; the one `unsafe` a native
+# server build now links is `ctrlc`'s, at the OS call.
+[package]
+name = "vilan-rt-signal"
+version = "0.42.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The termination-signal half of the runtime for server programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+vilan-rt = { path = "../vilan-rt" }
+ctrlc = { version = "3.5.2", features = ["termination"] }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

@@ -65,7 +65,7 @@ use std::collections::{BTreeSet, VecDeque};
 use indexmap::IndexMap;
 
 use crate::analyzer::{Expr, ExprIfBranch, Program, SourceId};
-use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason};
 use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -159,9 +159,10 @@ pub fn check_cycles(program: &mut Program) {
 /// an ambient context (`lazy.md` §1 — a `.cell()` reads the owner), and one
 /// mistake is one diagnostic.
 pub fn check_module_level_cells(program: &mut Program) {
-    let Some(cell) = std_reactive_cell(program) else {
+    let seals = std_reactive_seals(program);
+    if seals.is_empty() {
         return;
-    };
+    }
     let mut found: Vec<(Error, SourceId)> = Vec::new();
     {
         let graph = program.call_graph();
@@ -172,9 +173,9 @@ pub fn check_module_level_cells(program: &mut Program) {
                 continue;
             }
             for call in graph.initializer_calls_of(binding) {
-                if !matches!(call.target, CallTarget::Function(callee) if callee == cell) {
+                let Some(seal) = seal_called(program, call, &seals) else {
                     continue;
-                }
+                };
                 let span = program
                     .member_name_spans
                     .get(&call.call_id)
@@ -186,11 +187,11 @@ pub fn check_module_level_cells(program: &mut Program) {
                         trace: Vec::new(),
                         span,
                         msg: format!(
-                            "`.cell()` in the initializer of the module binding `{name}` ties \
+                            "`.{seal}()` in the initializer of the module binding `{name}` ties \
                              the cell to an owner, and a module binding has none: its \
                              subscription would stay on the upstream for the life of the \
                              program. Build it under the owner that reads it (inside the view, \
-                             or an `owner_scope.run`), or write `.cell_global()`, which says \
+                             or an `owner_scope.run`), or write `.{seal}_global()`, which says \
                              that lifetime"
                         ),
                         note: None,
@@ -205,24 +206,58 @@ pub fn check_module_level_cells(program: &mut Program) {
     }
 }
 
-/// The `.cell()` blanket `std::reactive` declares, if `reactive.vl` loaded: the
-/// function named `cell` whose declaration sits in std's `reactive.vl`. A user's
-/// own `cell` (an inherent method, a free function) is a different declaration
-/// in a different file and is never matched.
-fn std_reactive_cell(program: &Program) -> Option<Id> {
-    program.functions.values().find_map(|function| {
-        if function.name != "cell" {
-            return None;
-        }
-        let source = program.source_of(function.id)?;
-        let in_std_reactive = program.std_sources.contains(&source)
-            && program
-                .sources
-                .get(source.0 as usize)
-                .and_then(|path| path.file_name())
-                .is_some_and(|file| file == "reactive.vl");
-        in_std_reactive.then_some(function.id)
-    })
+/// Which seal `call` makes, if any. `.cell()` and `.memo()` are `Pipe`'s trait
+/// DEFAULTS since A142, and a call to a default is re-dispatched per type — an
+/// indirect edge in the graph — so the member the call NAMES is read as well as
+/// its resolved target (`lifetime_steers.rs`'s `named_callee`, the same question).
+fn seal_called(
+    program: &Program,
+    call: &Call,
+    seals: &[(Id, &'static str)],
+) -> Option<&'static str> {
+    let resolved = match call.target {
+        CallTarget::Function(callee) => Some(callee),
+        _ => None,
+    };
+    let named = program
+        .function_calls
+        .get(&call.call_id)
+        .and_then(|call| program.entity_map.get(&call.subject_id))
+        .and_then(|entity| match entity {
+            Expr::Local(target) if program.functions.contains_key(target) => Some(*target),
+            _ => None,
+        });
+    seals
+        .iter()
+        .find(|(id, _)| Some(*id) == resolved || Some(*id) == named)
+        .map(|(_, name)| *name)
+}
+
+/// The owner-tied seals `std::reactive` declares, if `reactive.vl` loaded: the
+/// functions named `cell` and `memo` (A142 R20: `Pipe`'s two faces) whose
+/// declarations sit in std's `reactive.vl`, each with its name. A user's own `cell`
+/// or `memo` (an inherent method, a free function) is a different declaration in a
+/// different file and is never matched.
+fn std_reactive_seals(program: &Program) -> Vec<(Id, &'static str)> {
+    program
+        .functions
+        .values()
+        .filter_map(|function| {
+            let name = match function.name {
+                "cell" => "cell",
+                "memo" => "memo",
+                _ => return None,
+            };
+            let source = program.source_of(function.id)?;
+            let in_std_reactive = program.std_sources.contains(&source)
+                && program
+                    .sources
+                    .get(source.0 as usize)
+                    .and_then(|path| path.file_name())
+                    .is_some_and(|file| file == "reactive.vl");
+            in_std_reactive.then_some((function.id, name))
+        })
+        .collect()
 }
 
 /// Every initialization cycle in the program, as diagnostics paired with the
@@ -1008,10 +1043,12 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
                     self.value_bodies(*element, bodies, seen);
                 }
             }
-            Expr::TupleComprehension(first, second, third) => {
-                self.value_bodies(*first, bodies, seen);
-                self.value_bodies(*second, bodies, seen);
-                self.value_bodies(*third, bodies, seen);
+            Expr::TupleComprehension(bindings, body) => {
+                for (binder, source) in bindings {
+                    self.value_bodies(*binder, bodies, seen);
+                    self.value_bodies(*source, bodies, seen);
+                }
+                self.value_bodies(*body, bodies, seen);
             }
             Expr::StructInitializer(_struct_id, fields) => {
                 for value in fields.values() {

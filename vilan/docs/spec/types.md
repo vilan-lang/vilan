@@ -5,7 +5,7 @@
 The type forms (grammar §3.9) denote:
 
 - **Nominal types**: structs and enums, possibly generic
-  (`Task`, `Option<i32>`, `Map<str, List<i32>>`). Two nominal types are
+  (`Task`, `Option<i32>`, `HashMap<str, List<i32>>`). Two nominal types are
   equal iff they name the same declaration and their arguments are
   equal. There is no structural typing of nominals.
 - **Primitives**: `bool`, `str`, `i8 i16 i32 i53 u8 u16 u32 u53`,
@@ -197,11 +197,11 @@ same opt-in and for the same reason `value()` costs nothing: the enum IS
 its backing value, and that value is already a key.
 
 ```vilan,fragment
-mut widths: Map<Align, i32> = Map::new();
+mut widths: HashMap<Align, i32> = HashMap::new();
 widths.insert(Align::Start, 1);          // keyed by "flex-start"
 ```
 
-So `Map<Align, V>` and `Set<Align>` need no `[derive(Hashable)]`, and
+So `HashMap<Align, V>` and `HashSet<Align>` need no `[derive(Hashable)]`, and
 `Align::Start.hash()` is `Align::Start.value().hash()`. Writing the derive
 anyway is harmless and does nothing; a hand-written `impl Align with
 Hashable` is a duplicate-impl error, because the compiler's is already
@@ -469,7 +469,9 @@ bounds and so reaches the blanket. The bounds must entail the blanket's,
 arguments included: a blanket over `Src<str>` is not reached through
 `S: Src<i32>`. Through the bound the parameter stays opaque. An inherent
 blanket member is called as written, and the concrete type's own
-same-named inherent member is out of scope there; a trait member the
+same-named inherent member is out of scope there — while at a CONCRETE
+receiver that member outranks the blanket's, whichever was declared or
+loaded first; a trait member the
 blanket provides dispatches at monomorphization to the most specific impl
 of that trait, as every call through a bound does.
 
@@ -539,10 +541,16 @@ therefore reaches `SignalCell`'s own — its fields included — and a
 reassignment must still be a `SignalCell<i32>`.
 
 The reading is universal: any trait name in this position, for every
-trait. It applies to the binding's OWN annotation only — a trait nested
-inside one (`&Display`, `List<Display>`) is a value position like any
-other and is refused, which is what keeps a heterogeneous container
-impossible.
+trait — and it reaches a trait NESTED inside the annotation too (`let b:
+Signal<Option<Signal<i32>>> = …`, `let o: Option<Source<i32>> = …`,
+`List<Display>`, a tuple's element). Each nested mention stands for ONE
+type that implements it, grounded by the initializer: `Signal<Option<
+Signal<i32>>>` reads "some `Signal` of an `Option` of some one
+`Signal<i32>`", and the binding keeps the initializer's concrete type.
+One type per mention is what keeps a heterogeneous container impossible:
+every element of a `List<Source<i32>>` is the same source type, a list
+literal mixing two is refused with the steer to `List<dyn Source<i32>>`,
+and the object is the spelling for values of different types.
 
 An `if` needs no rule of its own. Its arms unify first (§5.11), and the
 constraint meets the one type that unification produced:
@@ -584,12 +592,37 @@ else follows from the desugaring, and nothing about it is new:
   parameters, so the annotation is refused there like any other value
   position.
 
-The reading is the binding's in one respect: it applies to the
-parameter's OWN annotation, never to a trait nested inside one
-(`List<Display>`), which stays refused. A `&` is not such a nesting — it
-is a call convention, erased before the annotation is read — so
-`&Display` is "a view of something implementing `Display`" at a parameter
-and at a binding alike.
+A trait NESTED inside a parameter's annotation is read the same way,
+one implicit generic per mention: `fun total(sources: List<Source<i32>>)`
+is `fun total<S: Source<i32>>(sources: List<S>)`, and `fun first(source:
+Source<List<Source<i32>>>)` has two, the inner bounding the outer's
+argument. Every element of such a list is the same type (`List<dyn
+Source<i32>>` holds different ones). A `&` is not a nesting — it is a
+call convention, erased before the annotation is read — so `&Display` is
+"a view of something implementing `Display`" at a parameter and at a
+binding alike.
+
+### A trait annotation on a return
+
+A free `fun`'s or an inherent method's return annotation takes a trait
+name too, and there it means the **one type the body picks**:
+
+```
+fun counter(start: i32): Source<i32> { SignalCell::new(start) }
+```
+
+The function types exactly as if its return were unannotated — the
+return is the body's own type, per instantiation of a generic function —
+and the annotation asserts that type implements `Source<i32>`, a compile
+error when it does not. Dispatch is static: a caller of `counter` holds a
+`SignalCell<i32>`. The return is **not hidden**: callers see the
+concrete type and may reach its own members (opacity, where callers see
+only the trait, is a later design). Every branch must produce that one
+type, so branches of different types are refused, with the steer to
+`dyn Source<i32>`, the trait object. A TRAIT method's return (declared
+in a trait, or implemented in an `impl … with` block) takes no trait
+name: each impl would pick its own type, which is an associated type
+vilan does not have — it returns `dyn Trait` or a concrete type.
 
 ### A trait annotation on a struct field
 
@@ -612,7 +645,9 @@ embeds one. `dyn Trait` is the value the field wants when what varies is
 the implementation; a written parameter is the answer when one instance
 should keep its concrete type. The refusal is the same on an attributed
 (`[derive(..)]`, `[service(..)]`) declaration, where `dyn Trait` is a
-spelling a generator can read.
+spelling a generator can read, and on a trait NESTED in a field's
+annotation (`List<Display>`), which the binding and parameter readings do
+not reach for the same reason.
 
 ### Associated functions
 
@@ -643,6 +678,15 @@ declaration or nothing, and the refusal names the trait's spelling.
 
 The trait's own generic parameters bind from the call, like any generic
 function's: `Signal::new(7)` binds `T = i32`.
+
+An impl's parameters bind at a `Type::func(..)` path the same way — from
+the type arguments written on the path (`Holder<A>::tag()`), from the
+arguments, or from where the result lands. A path written with the BARE
+type name inside one of that type's own impls means `Self::func(..)`: the
+enclosing instance's arguments (`Holder::tag()` inside `impl Holder<type T:
+Label>` is `Holder<T>::tag()`). Outside every impl of the type, a bounded
+parameter that none of those binds is refused (`cannot infer 'T' for this
+call`) — there is no instance to dispatch its bound through.
 
 A trait parameter's bound is in scope inside the trait's own default
 bodies, exactly as a function's or impl's is inside theirs (§5.6): a
@@ -701,7 +745,18 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
 4. After binding, every bound's satisfaction is checked; an unsatisfied
    bound is an error naming the parameter and bound.
 5. A call whose generics cannot all be grounded (no argument or
-   expectation determines them) is an error at the call.
+   expectation determines them) is an error at the call, naming the
+   generic its result is typed by and the two places a type can be
+   written: the binding the result lands in (`let v: Option<i32> =
+   nothing();`) or the call's type argument (`nothing<i32>()`). One
+   exception grounds itself: a method's own generic whose only role in
+   the result is to RE-TYPE one of the receiver's own parameters — the
+   result is the receiver's type with the generic where the receiver has
+   a parameter — takes the receiver's argument when nothing else binds
+   it. `err.or_else(|e| Ok(7))` on a `Result<i32, str>` is a `Result<i32,
+   str>`: the error type of a closure that produces no error is the
+   input's. A closure parameter written `_` is never what a call waits
+   on, and never the thing a refusal asks to annotate.
 
 A generic parameter is **rigid inside its own body**. The caller chose it,
 once, for this instantiation; nothing in the body may choose again. So a
@@ -1125,6 +1180,15 @@ let n = f("abc");                      // 3 — arity and argument types
 An ineligible `fun` has no value form at all, so it can be neither
 stored nor called this way; the error names which rule it hit.
 
+A **tuple variant** named without a call coerces the same way, where a
+closure type is expected: `Some` against `|i32| Option<i32>` is `|x|
+Some(x)`, one parameter per payload, the enum's generics taken from the
+expected type (`[1, 2].map(Some)`, `build(Shape::Rect)` for a `|i32, i32|
+Shape` parameter). Only where a closure is expected — `let f = Some;` has
+no type to take the generics from, and a payload variant named as a value
+anywhere else is refused (call it, `Some(x)`). A unit variant (`None`) is
+already a value and never coerces.
+
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
 
@@ -1141,7 +1205,36 @@ fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T>
 ```
 
 A **tuple comprehension** `(x in xs => e)` is the value-level mapping
-form.
+form. Its source is a tuple **family**: a mapped tuple, or a VALUE of a
+tuple-bounded parameter, which is the identity mapping `(U in T: U)`. The
+body is checked ONCE, with `x` at the element template over a binder `U`
+fresh to that comprehension and rigid everywhere: two walks over one family
+range over different positions at once, so their elements are different
+types (`U` and `U'`), and nothing outside a walk may bind its `U`. The
+answer is `(U in T: <body type>)`. A concrete tuple is not a source (its
+elements have types of their own and no template).
+
+Two or more bindings **zip**: `(a in aa, b in bb => e)` walks its sources'
+positions in step, each binder at its own source's element, one `U` for the
+walk. The sources must be ONE family — each a mapping of the same `T`, or a
+value of it — which is what makes their arities equal by construction; two
+families (`T` and `S`, both `(2..)`) are refused, because their arities are
+independent. `(key in whole.keys(), value in whole => …)` pairs each key
+with its element.
+
+```vilan,fragment
+fun writes<T: (2..)>(targets: (U in T: SignalCell<U>), values: T) {
+	let _done = (target in targets, value in values => target.set(value));
+}
+```
+
+A mapped type's binder carries its pack's **element bound**: over `T:
+(2..: PartialEq)`, the `U` of `(U in T: F<U>)` is `PartialEq`, because it
+ranges over exactly the elements the bound constrains — so a
+comprehension body may compare two `U`s, or call what the bound
+provides, and each element dispatches to its own implementation. The
+bound is the pack's alone: a mapped type over a second, unbounded pack
+gets nothing from it.
 
 Tuple bounds are **enforced** at every binding site, alongside trait
 bounds: the bound value must be a tuple, its arity must fall inside the
@@ -1204,8 +1297,33 @@ is nothing to concatenate it with — alone, as `inner(..items)`, which is
 how a pack is forwarded to another spread function. *`keyof` and the
 type-level spread `(..T, U)` are recorded future work.*
 
+**Walking a family: `std::tuple`.** Importing the `Tuple` trait (`import
+std::tuple::Tuple;`) gives every tuple of arity two or more — a concrete
+one, a value of `T: (2..)`, or a mapped tuple over one — four members:
+`len()`, the arity; `keys()`, one `TupleKey<T, U>` per position, each at
+its own element type; `entries()`, `(key, value)` per position; and
+`get(key)`, the element a key names. A key carries its FAMILY (`T`) and the
+element type at its position (`U`), and **a key for `T` is a key for every
+tuple mapped from `T`, at the mapped element**: `TupleKey<T, U>` indexes a
+`(V in T: F<V>)` at `F<U>`, through any number of mappings. Two unrelated
+families never share keys, and a key has no public constructor, so it always
+names a position its family has. `t.map(|x| e)` is the comprehension `(x in
+t => e)` spelled as a call: it takes a closure LITERAL (a closure value has
+one type, and a tuple needs one per position) whose parameter is the binder.
+A `for` over a family binds the template and checks its body once (§3.5).
+
+```vilan,fragment
+fun cells<T: (2..)>(whole: T): (U in T: SignalCell<U>) {
+	whole.map(|x| SignalCell::new(x))
+}
+fun reads<T: (2..)>(whole: T, cells: (U in T: SignalCell<U>)): T {
+	(key in whole.keys() => cells.get(key).get())   // `cells.get(key)`: SignalCell<U>
+}
+```
+
 **Positional access** `t.0`, `t.1` (chaining as `t.0.1`) types as that
-element and, through a `mut` binding, assigns it. Tuples store flat: a
+element and, through a `mut` binding, assigns it. A family whose arity is
+still abstract has no numbered positions; it is read at a key. Tuples store flat: a
 tuple-typed element occupies its elements' slots, so accessing one
 yields its region as a value (destructuring reads the same layout).
 Positional access and destructuring are the element-wise spellings a
@@ -1298,6 +1416,15 @@ Normative rejection cases (each is a compile error):
   `list[i].f = v`) is the same door. A compound `s.field op= v` is
   checked on what lands — the result of `op` (§5.7) — not on `v`. The
   error is reported at the value.
+- A value assigned to ANY place it does not match. Every place takes the
+  plain `mut` local's rule, checked against what the place holds: a
+  subscript (`list[i] = v`), a tuple position (`pair.0 = v`), a
+  `&mut`/`own` parameter or a `&mut` view binding, and a call answering
+  `&mut T` (`cell.write() = v` against `Shared<T>`'s `T`). References are
+  transparent, so the place's type is `T`, never `&mut T`: a bare `5`
+  written through a `Shared<Option<i32>>` is refused with `Expected
+  Option<i32>, but got i32` exactly as `mut x: Option<i32>; x = 5` is —
+  write `Some(5)`.
 
 *Implementation note (tracked gaps): a closure bound to a local and
 called directly does not infer its parameter types from the call, and
@@ -1348,10 +1475,44 @@ a field, an element of a list whose element type is a `dyn`. There is no
 implicit coercion between two concrete types, and no coercion out of an
 object: a `dyn Trait` never narrows back to the type it erased.
 
-**Resources.** A `resource` value may not be coerced into a trait object.
-Teardown through a table would make the destructor dynamic where the rest
-of the language keeps it static (memory.md R7/R10), so the coercion is
-refused and the resource is held in a struct field of its own.
+The coercion is per VALUE, at the position where the value lands. A
+literal hands each of its elements the position — `[Root { .. }]` at a
+`List<dyn Src>`, `Some(root)` at an `Option<dyn Src>`, `|| Root { .. }` at
+a `|| dyn Src`, `Boxed { value = root }` under a `Boxed<dyn Src>`
+annotation — and a generic position bound to an object is one (`push` on
+a `List<dyn Src>`). A value already BUILT with concrete elements inside
+does not become an object container as a whole: a `List<Root>` binding
+or call result passed as `List<dyn Src>` is refused, and so is a built
+`Option<Root>`, a `Boxed<Root>`, and a `|| Root` closure held in a
+binding. Rebuild it element by element under the object type (`let
+objects: List<dyn Src> = built.map(|element| element);`), or wrap a
+closure in a literal (`|| make()`). A TUPLE is the exception, because
+its elements are a fixed set: a built `(Root, Root)` landing at a
+`(dyn Src, dyn Src)` position (or at a mapped `(U in T: dyn Source<U>)`)
+is re-built by projection, each element becoming its object where it
+lands, exactly as `(t.0, t.1)` would. The reverse, nested (`List<dyn
+Src>` where `List<Root>` is wanted), is the narrowing, refused one level
+down as at the top.
+
+**Resources.** A resource with a `Drop` anywhere inside it may not be
+coerced into a trait object: teardown through a table would make the
+destructor dynamic where the rest of the language keeps it static
+(memory.md R7/R10), so the coercion is refused and the resource is held
+in a struct field of its own. A resource with NO `Drop` inside has no
+teardown to dispatch, and may become the object of a trait declared
+`[resource]` (`[resource] trait Flow<T> { … }`): such a trait says its
+objects may hold a resource, so `dyn Flow<T>` — whatever landed in it, a
+data value included — is itself a resource, moved and never copied. The
+attribute is the declaring trait's alone: a trait extending a
+`[resource]` trait has data objects unless it declares the attribute
+too. Erasing a `Drop`-free resource into the object
+of an undeclared trait is refused with the steer to declare it; `dyn` of
+an undeclared trait stays data. The rules hold at every instantiation: a
+generic parameter erased into an object (`fun erase<S: Src>(own source:
+S): dyn Src { source }`) is judged at the call that binds it to a
+resource, directly or through a caller that forwards its own parameter.
+Where an `if` or a `match` is expected to produce an object, each arm is
+erased where it lands, so arms of different types meet in the object.
 
 **What reaches an object.** The members its trait and that trait's
 supertraits declare, through the table. Beyond those, only what is written

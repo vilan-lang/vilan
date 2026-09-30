@@ -14,10 +14,10 @@ import std::build::require_build;
 import std::crypto::random_bytes;
 import std::db::Database;
 import std::document::Document;
+import std::hash_map::HashMap;
 import std::http::{ CachePolicy, Request, Response, Server };
 import std::io::print;
 import std::json::{ FromJson, Json, json_codec };
-import std::map::Map;
 import std::option::Option::{ self, None, Some };
 import std::range::Range;
 import std::reactive::{ Signal, SignalCell };
@@ -47,7 +47,7 @@ struct AuthOutcome {
 
 let db = open_store();
 
-let messages: SignalCell<Map<str, Message>> = Signal::new(Map::new());
+let messages: SignalCell<HashMap<str, Message>> = Signal::new(HashMap::new());
 
 fun open_store(): Database {
 	let database = Database::open(":memory:");
@@ -124,7 +124,7 @@ fun open_session(username: str): AuthOutcome {
 [service(KoltClient)]
 struct KoltStore {
 	user: str,
-	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+	[expose(keyed)] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl KoltStore {

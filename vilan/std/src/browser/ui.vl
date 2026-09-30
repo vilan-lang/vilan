@@ -47,27 +47,39 @@ import pkg::hash::Hashable;
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
-	DeltaFeed,
 	Disposable,
 	Draft,
+	Flow,
 	FlushPolicy,
 	Owner,
+	RowFeed,
 	RowStep,
 	SeqOp,
 	Signal,
 	SignalCell,
 	Source,
+	also_releasing,
 	comp,
 	get_owner,
 	owner_scope,
 	queue_microtask,
 	reconcile,
 	run_with_owner,
+	subscriber_of,
 	turn,
 	turn_scope,
 };
 import pkg::shared::Shared;
 import pkg::style::Style;
+
+/// A binding's subscription: `observer` now and on every change, released with
+/// the nearest boundary. `effect` without the per-run owner (A142 §4): every body
+/// a binding runs writes the DOM and registers nothing, so it pays for no owner
+/// and no nursery per change. A form that builds per value (`when`, `swap`,
+/// `each`) keeps the owners it makes itself.
+fun follow<T, F: Flow<T>>(own flow: F, observer: |T| void) {
+	get_owner().take(flow.sub(observer));
+}
 
 /// A handle to a DOM element under construction — nothing more: ownership is the
 /// enclosing boundary's job.
@@ -163,9 +175,9 @@ export impl View {
 	/// never through runtime rule construction. Registers with the nearest
 	/// enclosing boundary (an ambient `effect`), exactly like every `bind_*`:
 	/// a subscription parked in a `let _sub` outlives the view it writes to.
-	fun style_var<S: Source<str>>(self, name: str, source: S): View {
+	fun style_var<S: Flow<str>>(self, name: str, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_style_property(name, value);
 		});
 		self
@@ -174,7 +186,7 @@ export impl View {
 	/// An attribute. The value's TYPE decides its life (proposal/element-syntax.md
 	/// §5): a `str` sets once; a `SignalCell<str>` re-sets whenever it changes,
 	/// exactly `bind_attr`. Anything `AttrValue` fills the slot.
-	fun attr<V: AttrValue>(self, name: str, value: V): View {
+	fun attr<V: AttrValue>(self, name: str, own value: V): View {
 		value.apply(self, name);
 		self
 	}
@@ -209,7 +221,7 @@ export impl View {
 	/// Structure only for the static arms; the reactive ones register their one
 	/// subscription with the nearest enclosing boundary, exactly as every `bind_*`
 	/// does.
-	fun child<C: Slot>(self, content: C): View {
+	fun child<C: Slot>(self, own content: C): View {
 		content.place(self);
 		self
 	}
@@ -226,18 +238,18 @@ export impl View {
 	/// nearest enclosing boundary (an ambient `effect`). Any `Source<str>` drives
 	/// it: a `Signal`, a derived signal, a `RemoteSource` mirror, a user's own cell
 	/// (A33).
-	fun bind_text<S: Source<str>>(self, source: S): View {
+	fun bind_text<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_text(value);
 		});
 		self
 	}
 
 	/// Reactive CSS class.
-	fun bind_class<S: Source<str>>(self, source: S): View {
+	fun bind_class<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_attribute("class", value);
 		});
 		self
@@ -248,9 +260,9 @@ export impl View {
 	/// CONSTRUCTED here: every candidate style emitted its rules inside its own
 	/// `const` expression, and `class_list` is a map read, so the
 	/// construct-in-const rule holds with a signal in the middle.
-	fun bind_styled<S: Source<Style>>(self, source: S): View {
+	fun bind_styled<S: Flow<Style>>(self, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_attribute("class", value.class_list());
 		});
 		self
@@ -273,7 +285,7 @@ export impl View {
 	/// is nothing to disambiguate: a `Source<str>` is not a `Source<Option<str>>`
 	/// and vice versa, so a `SignalCell<str>` argument selects the first arm and a
 	/// `SignalCell<Option<str>>` the second.
-	fun bind_attr<V: AttrBinding>(self, name: str, source: V): View {
+	fun bind_attr<V: AttrBinding>(self, name: str, own source: V): View {
 		source.bind_attribute(self, name);
 		self
 	}
@@ -288,9 +300,9 @@ export impl View {
 	/// The set writes the empty string, which is the canonical spelling of a
 	/// present boolean attribute (`<div inert>` and `<div inert="">` serialize
 	/// alike).
-	fun toggle_attr<S: Source<bool>>(self, name: str, source: S): View {
+	fun toggle_attr<S: Flow<bool>>(self, name: str, own source: S): View {
 		let element = self.element;
-		source.effect(|present| {
+		follow(source, |present| {
 			if present {
 				element.set_attribute(name, "");
 			} else {
@@ -315,7 +327,7 @@ export impl View {
 	/// with nothing pointing back.
 	fun bind_value<S: Signal<str>>(self, signal: S): View {
 		let element = self.element;
-		signal.effect(|value| {
+		follow(signal, |value| {
 			element.set_value(value);
 		});
 		write_back_value(self.element, signal);
@@ -332,7 +344,7 @@ export impl View {
 	/// construction — this pushes.
 	fun bind_draft(self, draft: Draft<str>): View {
 		let element = self.element;
-		draft.local.effect(|value| {
+		follow(draft.local, |value| {
 			// Skip the no-op write (a push echoing through `local`): setting an
 			// input's value, even to itself, can move the caret.
 			if element.value() != value {
@@ -488,10 +500,10 @@ export impl View {
 	/// `display` itself, after `show` has bound it, loses that write on the next
 	/// toggle. Style the element through a `Style` — which is what the styling
 	/// surface is for — and the two never meet.
-	fun show<S: Source<bool>>(self, condition: S): View {
+	fun show<S: Flow<bool>>(self, own condition: S): View {
 		let element = self.element;
 		let restored = element.style_property("display");
-		condition.effect(|visible| {
+		follow(condition, |visible| {
 			element.set_hidden(!visible);
 			if visible {
 				element.set_style_property("display", restored);
@@ -697,7 +709,7 @@ export impl Region {
 	/// Places `content` as a NEW ROW at the end of the region, and returns the
 	/// handle the reconciler moves it by (A91).
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
-	fun open_row<C: Slot>(self, content: C): Row {
+	fun open_row<C: Slot>(self, own content: C): Row {
 		self.open_row_before(content, self.anchor)
 	}
 
@@ -713,7 +725,7 @@ export impl Region {
 	/// growth stays inside it, and one `insert_before` puts the finished run
 	/// where the marker says.
 	/// KEEP IN STEP with the process twin's copy (process/ui.vl).
-	fun open_row_before<C: Slot>(self, content: C, end: Text): Row {
+	fun open_row_before<C: Slot>(self, own content: C, end: Text): Row {
 		let marker = create_text_node("");
 		self.host().insert_text_before(marker, end);
 		let staging = create_document_fragment();
@@ -821,19 +833,19 @@ export impl Region {
 /// generic helper in the estate spells the bound `Slot` today. KEEP IN STEP with
 /// the process twin's copy (process/ui.vl).
 export trait Slot {
-	fun place(self, parent: View);
+	fun place(own self, parent: View);
 }
 
 /// A child element.
 export impl View with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		parent.element.append(self.element);
 	}
 }
 
 /// A static text node.
 export impl str with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		parent.element.append_text(create_text_node(self));
 	}
 }
@@ -845,27 +857,43 @@ export impl str with Slot {
 /// A BLANKET over the read trait (B158/B165): every `Source<str>` places reactively
 /// — a cell, a derived signal, a `RemoteSource`, a user's own mirror — and `str`'s
 /// own impl outranks it by the specificity order wherever both would match.
-export impl type S: Source<str> with Slot {
-	fun place(self, parent: View) {
-		let node = create_text_node("");
-		parent.element.append_text(node);
-		// A88: the boundary removes what it PLACED. This arm has no region — one
-		// text node is its whole run — so it takes that node out itself. The three
-		// STATIC arms take no such defer, deliberately: a static child's lifetime
-		// is its parent element's, and it was placed while the caller was building
-		// that parent, not by a boundary.
-		get_owner().defer(|| node.remove());
-		self.effect(|value| {
-			node.set_text(value);
-		});
+export impl type S: Flow<str> with Slot {
+	fun place(own self, parent: View) {
+		place_text_flow(self, parent);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<str> with Slot {
+	fun place(own self, parent: View) {
+		place_text_flow(self, parent);
+	}
+}
+
+fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
+	let node = create_text_node("");
+	parent.element.append_text(node);
+	// A88: the boundary removes what it PLACED. This arm has no region — one text
+	// node is its whole run — so it takes that node out itself. The three STATIC
+	// arms take no such defer, deliberately: a static child's lifetime is its
+	// parent element's, and it was placed while the caller was building that
+	// parent, not by a boundary.
+	get_owner().defer(|| node.remove());
+	follow(flow, |value| {
+		node.set_text(value);
+	});
 }
 
 /// Several child elements, in order — a STATIC run, placed once. This is the
 /// arm a fragment literal would walk through (A46): its type is `List<View>`,
 /// and a list already fills a child position.
 export impl List<View> with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		for item in self {
 			parent.element.append(item.element);
 		}
@@ -897,24 +925,40 @@ export impl List<View> with Slot {
 /// The arm opens a `Region` where it is placed and inserts every replacement before
 /// that anchor, so a reactive element child in the middle of a chain stays in the
 /// middle — which is what `{expr}` means the same thing either way requires.
-export impl type S: Source<View> with Slot {
-	fun place(self, parent: View) {
-		let region = Region::open(parent);
-		let live: Shared<Option<View>> = Shared::new(None);
-		// A88: the arm's view and its anchor leave with the boundary. The
-		// subscription already dies with it (an ambient `effect`); this is the DOM
-		// half, which matters exactly when the parent survives.
-		get_owner().defer(|| region.close());
-		self.effect(|next: View| {
-			match live.read() {
-				Some(let previous) => previous.element.remove(),
-				None => {},
-			}
-			region.insert(next);
-			region.hold([next]);
-			live.write() = Some(next);
-		});
+export impl type S: Flow<View> with Slot {
+	fun place(own self, parent: View) {
+		place_view_flow(self, parent);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<View> with Slot {
+	fun place(own self, parent: View) {
+		place_view_flow(self, parent);
+	}
+}
+
+fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
+	let region = Region::open(parent);
+	let live: Shared<Option<View>> = Shared::new(None);
+	// A88: the arm's view and its anchor leave with the boundary. The subscription
+	// already dies with it (an ambient `effect`); this is the DOM half, which
+	// matters exactly when the parent survives.
+	get_owner().defer(|| region.close());
+	follow(flow, |next: View| {
+		match live.read() {
+			Some(let previous) => previous.element.remove(),
+			None => {},
+		}
+		region.insert(next);
+		region.hold([next]);
+		live.write() = Some(next);
+	});
 }
 
 /// A reactive RUN of element children — the `List<View>` arm's reactive twin,
@@ -928,24 +972,40 @@ export impl type S: Source<View> with Slot {
 /// compare, so there is nothing to reconcile against; it is the grouping arm,
 /// with the same ownership story as the single-view arm above — and, with it,
 /// the same `Region`, so the whole run keeps the hole's position (A71).
-export impl type S: Source<List<View>> with Slot {
-	fun place(self, parent: View) {
-		let region = Region::open(parent);
-		let live: Shared<List<View>> = Shared::new([]);
-		// A88, as for the single-view arm above: the run and its anchor leave with
-		// the boundary.
-		get_owner().defer(|| region.close());
-		self.effect(|next: List<View>| {
-			for previous in live.read() {
-				previous.element.remove();
-			}
-			for item in next {
-				region.insert(item);
-			}
-			region.hold(next);
-			live.write() = next;
-		});
+export impl type S: Flow<List<View>> with Slot {
+	fun place(own self, parent: View) {
+		place_views_flow(self, parent);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<List<View>> with Slot {
+	fun place(own self, parent: View) {
+		place_views_flow(self, parent);
+	}
+}
+
+fun place_views_flow<F: Flow<List<View>>>(own flow: F, parent: View) {
+	let region = Region::open(parent);
+	let live: Shared<List<View>> = Shared::new([]);
+	// A88, as for the single-view arm above: the run and its anchor leave with the
+	// boundary.
+	get_owner().defer(|| region.close());
+	follow(flow, |next: List<View>| {
+		for previous in live.read() {
+			previous.element.remove();
+		}
+		for item in next {
+			region.insert(item);
+		}
+		region.hold(next);
+		live.write() = next;
+	});
 }
 // === The positional value forms (A85) ======================================
 //
@@ -979,7 +1039,7 @@ export impl type S: Source<List<View>> with Slot {
 // process twin's copy (process/ui.vl).
 
 /// Conditional content as a child — the `when` slot value (A85/A99).
-export struct Conditional<S: Source<bool>, C: Slot> {
+export struct Conditional<S: Flow<bool>, C: Slot> {
 	condition: S,
 	body: (|| C) context owner_scope,
 }
@@ -1002,8 +1062,11 @@ export struct Conditional<S: Source<bool>, C: Slot> {
 /// ordinary build constructs `wire = || {}` and the whole machinery stays
 /// unreferenced, which is what keeps a flagless build emitting what it always
 /// did (§4).
-export struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
-	source: S,
+export struct Swap<T: PartialEq, S: Flow<T>, C: Slot> {
+	// `None` for the route gate's form, whose `wire` already holds the source it
+	// follows (`swap_split`); a pipe is consumed once, so exactly one of the two
+	// paths holds it.
+	source: Option<S>,
 	render: (|T| C) context owner_scope,
 	gated: Option<SignalCell<T>>,
 	armed: Shared<bool>,
@@ -1011,20 +1074,20 @@ export struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
 }
 
 /// A keyed reactive run as a child — the `each` slot value (A85/A99).
-export struct Each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct Each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export struct EachValues<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachValues<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export struct EachBy<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
+export struct EachBy<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|SignalCell<T>| C) context owner_scope,
@@ -1035,8 +1098,8 @@ export struct EachBy<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
 /// the content removed. Write it in a child hole when the conditional is one child
 /// among siblings, or `parent.child(when(..))` when it belongs at the parent's
 /// current end (A99 retired the `View::when` method).
-export fun when<S: Source<bool>, C: Slot>(
-	condition: S,
+export fun when<S: Flow<bool>, C: Slot>(
+	own condition: S,
 	body: (sync || C) context owner_scope,
 ): Conditional<S, C> {
 	Conditional { condition, body }
@@ -1046,11 +1109,11 @@ export fun when<S: Source<bool>, C: Slot>(
 /// subtree is disposed and `render` builds the new one under a fresh owner. Write
 /// it in a child hole, or `parent.child(swap(..))` at the parent's current end (A99
 /// retired the `View::swap` method).
-export fun swap<T: PartialEq, S: Source<T>, C: Slot>(
-	source: S,
+export fun swap<T: PartialEq, S: Flow<T>, C: Slot>(
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 ): Swap<T, S, C> {
-	Swap { source, render, gated = None, armed = Shared::new(true), wire = || {} }
+	Swap { source = Some(source), render, gated = None, armed = Shared::new(true), wire = || {} }
 }
 
 /// `swap`, gated on the route's chunk — what the split recognizer retargets a
@@ -1099,7 +1162,7 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 	// would. Threading an ambient turn in from the build instead is what made
 	// this function a context node, which the gate cannot afford.
 	let wire = || {
-		source.effect(|value: T| turn(FlushPolicy::AtSuspension, || {
+		follow(source, |value: T| turn(FlushPolicy::AtSuspension, || {
 			// Claim this navigation's generation before anything can await, so a
 			// continuation can tell whether it is still the latest.
 			let mine = generation.read() + 1;
@@ -1128,7 +1191,7 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 			}
 		}));
 	};
-	Swap { source, render, gated = Some(gated), armed, wire }
+	Swap { source = None, render, gated = Some(gated), armed, wire }
 }
 
 /// A keyed reactive run at THIS position — one row per element, in a child hole.
@@ -1141,9 +1204,10 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 ///
 /// Over a `ListCell` or any other `DeltaSource` the run follows the source's ops
 /// rather than re-diffing the list (A112 S3; `place_each` says how). Placement asks
-/// for `S: DeltaFeed<T>`, which every `Source<List<T>>` answers.
-export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+/// for `S: RowFeed<T>`, which every `Source<List<T>>` answers, and every collection
+/// pipe (`CollPipe`, A142 §6), which the run consumes.
+export fun each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ): Each<T, K, S, C> {
@@ -1151,8 +1215,8 @@ export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Sl
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export fun each_values<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_values<T: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 ): EachValues<T, S, C> {
 	EachValues { source, render }
@@ -1162,16 +1226,16 @@ export fun each_values<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 ///
 /// Over a `ListCell` or any other `DeltaSource` the run follows the source's ops,
 /// as `each`'s does (A112 S3b; `place_each_by` says how).
-export fun each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
-	source: S,
+export fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): EachBy<T, K, S, C> {
 	EachBy { source, key, render }
 }
 
-export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		// The body lands at THIS position among the parent's children (A71),
 		// not at the end: the hole sits where the conditional content belongs,
 		// so a `when` between two static siblings toggles on between them
@@ -1184,7 +1248,8 @@ export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 			live_owner.read()?.dispose();
 			region.close();
 		});
-		self.condition.effect(|on| {
+		let body = self.body;
+		follow(self.condition, |on| {
 			if on {
 				match live_row.read() {
 					Some(let _present) => {},
@@ -1196,7 +1261,7 @@ export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 						// whatever the body's `Slot` registers (a nested region's
 						// `defer`, above all) dies with the instantiation rather
 						// than with the enclosing boundary (A91).
-						let row = run_with_owner(owner, || region.open_row((self.body)()));
+						let row = run_with_owner(owner, || region.open_row(body()));
 						region.hold_rows([row]);
 						live_row.write() = Some(row);
 						live_owner.write() = Some(owner);
@@ -1222,41 +1287,44 @@ export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 	}
 }
 
-export impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl Swap<type T: PartialEq, type S: Flow<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		// The route gate, when there is one — a no-op closure otherwise. It runs
 		// under the boundary this hole sits in, so its subscription dies with
 		// everything else `place` registers.
 		(self.wire)();
-		match self.gated {
-			Some(let gated) => place_swap(parent, gated, self.render, self.armed),
-			None => place_swap(parent, self.source, self.render, self.armed),
+		let render = self.render;
+		let armed = self.armed;
+		match self.source {
+			Some(let source) => place_swap(parent, source, render, armed),
+			None => match self.gated {
+				Some(let gated) => place_swap(parent, gated, render, armed),
+				None => {},
+			},
 		}
 	}
 }
 
-/// Placing a run asks its source for a delta feed (A112 S3), which every
-/// `Source<List<T>>` has. The bound sits HERE and not on `each`/`Each`: at the
-/// call, a source that is not a list source (an rpc mirror, `a52`'s pin) is
-/// refused with the one error that names `Source<List<Todo>>`. Written there,
-/// alone it would name `DeltaFeed<T>` with `T` unbound, and beside
-/// `Source<List<T>>` it leaves `T` unbound too — three or four errors naming an
-/// abstract `T` either way (B396).
-export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+/// Placing a run OPENS its input (`RowFeed`, A142 §6): a list source hands over
+/// its ops when it keeps a log (A112 S3) and a `Reset` per change when it does
+/// not, and a collection pipe is consumed. An input that is neither — an rpc
+/// mirror of a list, `a52`'s pin — is refused at the call naming `RowFeed<Todo>`,
+/// at its instantiation (B304).
+export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-export impl EachValues<type T: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl EachValues<type T: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
 /// `each_by` asks the same of its source, for the same reason (A112 S3b).
-export impl EachBy<type T, type K: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl EachBy<type T, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
 }
@@ -1264,9 +1332,9 @@ export impl EachBy<type T, type K: PartialEq + Hashable, type S: DeltaFeed<T>, t
 /// `swap`'s body, against a region opened at `parent`'s current end — shared by the
 /// `swap` and `swap_split` values. `armed` is the route gate's hold (see `Swap`):
 /// `true` for every ordinary swap.
-fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
+fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	render: (sync |T| C) context owner_scope,
 	armed: Shared<bool>,
 ) {
@@ -1282,7 +1350,7 @@ fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 		live_owner.read()?.dispose();
 		region.close();
 	});
-	source.effect(|value: T| {
+	follow(source, |value: T| {
 		let unchanged = match last_value.read() {
 			Some(let previous) => previous == value,
 			None => false,
@@ -1477,9 +1545,9 @@ fun row_references(
 /// fall back to on the op path, and a splice that both removes and inserts is the
 /// pass over its own SPAN (A129), so a key that leaves and arrives in one splice
 /// keeps its row.
-fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
+fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ) {
@@ -1701,78 +1769,79 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			offset += 1;
 		}
 	};
-	match source.delta_cursor() {
-		// No log, so nothing to apply: the pass is the only answer there is.
-		None => source.effect(reconcile_pass),
-		Some(let cursor) => {
-			// The cursor is the boundary's, like every subscription here: a
-			// disposed `each` stops pinning the log's history.
-			get_owner().defer(|| source.drop_delta_cursor(cursor));
-			// Attached WITHOUT the immediate call, then seeded — `map_each`'s order
-			// and for its reason: the cursor was minted at the sequence the seed is
-			// read at, so the seed is exactly the state the cursor names.
-			source.effect_on_change(|_published| {
-				for op in live_ops(source.delta_since(cursor)) {
-					match op {
-						// A splice that only removes or only inserts cannot re-meet
-						// a key, so it is applied by position. One that does both
-						// is the pass over its span (A129): a key that leaves and
-						// arrives in the same splice keeps its row.
-						SeqOp::Splice(let at, let removed, let inserted) => {
-							if removed.len() == 0 || inserted.len() == 0 {
-								splice_rows(at, removed.len(), inserted);
-							} else {
-								reconcile_span(at, removed.len(), inserted);
-							}
-						},
-						// An element changed IN PLACE. The pass's rule, one row at
-						// a time: the same key holding an equal item is a `Keep`
-						// and costs nothing; anything else is the row rebuilt.
-						SeqOp::SetAt(let at, let _was, let value) => {
-							// `.get(at)` copies the one element where binding the
-							// read would copy the run.
-							let same_key = match row_keys.read().get(at) {
-								Some(let held) => key(value) == held,
-								None => false,
-							};
-							let same_item = match row_items.read().get(at) {
-								Some(let held) => value == held,
-								None => false,
-							};
-							if !same_key || !same_item {
-								splice_rows(at, 1, [value]);
-							}
-						},
-						// The wholesale write, and the lag fallback: the run is
-						// diffed against what arrived, which is the pass.
-						SeqOp::Reset(let items) => reconcile_pass(items),
-						// A reorder is handed to the pass at the list AFTER the
-						// move — not at `source.get()`, which is the state after
-						// EVERY op this drain holds, and would leave the ops after
-						// this one applied to the wrong run. The moved rows keep
-						// their keys, so the pass keeps them (A98's scans move
-						// exactly the rows that moved).
-						SeqOp::Move(let from, let count, let to) => {
-							mut moved = row_items.read();
-							mut lifted: List<T> = [];
-							mut taken = 0;
-							for taken < count {
-								lifted.push(moved.remove(from));
-								taken += 1;
-							}
-							mut offset = 0;
-							for item in lifted {
-								moved.insert(to + offset, item);
-								offset += 1;
-							}
-							reconcile_pass(moved);
-						},
+	// The input, OPENED (A142 §6): a source with a positional log hands over its
+	// ops, one without a `Reset` per change — the whole-list pass it has always had
+	// — and a collection pipe the ops its stages made. The handle is the
+	// boundary's, like every subscription here, and disposing it releases the input
+	// (a disposed `each` stops pinning a log's history).
+	let instance = source.open_rows();
+	let drain = instance.drain;
+	// Attached WITHOUT an immediate call, then seeded — `map_each`'s order and for
+	// its reason: the input was opened at the state the seed reads, so the seed is
+	// exactly the state its first drain starts from. An EFFECT's subscriber (the
+	// run writes the DOM), minted here since `mint_subscriber` is reactive.vl's
+	// own.
+	let handle = (instance.attach)(subscriber_of(|| {
+		for op in live_ops(drain()) {
+			match op {
+				// A splice that only removes or only inserts cannot re-meet a key,
+				// so it is applied by position. One that does both is the pass over
+				// its span (A129): a key that leaves and arrives in the same splice
+				// keeps its row.
+				SeqOp::Splice(let at, let removed, let inserted) => {
+					if removed.len() == 0 || inserted.len() == 0 {
+						splice_rows(at, removed.len(), inserted);
+					} else {
+						reconcile_span(at, removed.len(), inserted);
 					}
-				}
-			});
-			reconcile_pass(source.get());
-		},
-	}
+				},
+				// An element changed IN PLACE. The pass's rule, one row at a time:
+				// the same key holding an equal item is a `Keep` and costs nothing;
+				// anything else is the row rebuilt.
+				SeqOp::SetAt(let at, let _was, let value) => {
+					// `.get(at)` copies the one element where binding the read
+					// would copy the run.
+					let same_key = match row_keys.read().get(at) {
+						Some(let held) => key(value) == held,
+						None => false,
+					};
+					let same_item = match row_items.read().get(at) {
+						Some(let held) => value == held,
+						None => false,
+					};
+					if !same_key || !same_item {
+						splice_rows(at, 1, [value]);
+					}
+				},
+				// The wholesale write, and the lag fallback: the run is diffed
+				// against what arrived, which is the pass.
+				SeqOp::Reset(let items) => reconcile_pass(items),
+				// A reorder is handed to the pass at the list AFTER the move — not
+				// at `source.get()`, which is the state after EVERY op this drain
+				// holds, and would leave the ops after this one applied to the
+				// wrong run. The moved rows keep their keys, so the pass keeps them
+				// (A98's scans move exactly the rows that moved).
+				SeqOp::Move(let from, let count, let to) => {
+					mut moved = row_items.read();
+					mut lifted: List<T> = [];
+					mut taken = 0;
+					for taken < count {
+						lifted.push(moved.remove(from));
+						taken += 1;
+					}
+					mut offset = 0;
+					for item in lifted {
+						moved.insert(to + offset, item);
+						offset += 1;
+					}
+					reconcile_pass(moved);
+				},
+			}
+		}
+	}, false));
+	also_releasing(handle, instance.release);
+	let _owned = get_owner().take(handle);
+	reconcile_pass((instance.snapshot)());
 }
 
 /// `each_by`'s body, against a region opened at `parent`'s current end.
@@ -1783,9 +1852,9 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 /// element changed in place under the same key is WRITTEN INTO that row's cell and
 /// nothing is built, exactly as the pass's `Keep` does it — but only for the row
 /// the op names, where the pass writes into every surviving row's cell.
-fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
+fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ) {
@@ -2001,77 +2070,71 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			offset += 1;
 		}
 	};
-	match source.delta_cursor() {
-		// No log, so nothing to apply: the pass is the only answer there is.
-		None => source.effect(reconcile_pass),
-		Some(let cursor) => {
-			// The cursor is the boundary's, like every subscription here.
-			get_owner().defer(|| source.drop_delta_cursor(cursor));
-			// Attached WITHOUT the immediate call, then seeded — `place_each`'s
-			// order, for its reason.
-			source.effect_on_change(|_published| {
-				for op in live_ops(source.delta_since(cursor)) {
-					match op {
-						// Positional when it only removes or only inserts; the pass
-						// over its span when it does both (A129), as in
-						// `place_each`.
-						SeqOp::Splice(let at, let removed, let inserted) => {
-							if removed.len() == 0 || inserted.len() == 0 {
-								splice_rows(at, removed.len(), inserted);
-							} else {
-								reconcile_span(at, removed.len(), inserted);
-							}
-						},
-						// An element changed IN PLACE. The pass's rule, one row at
-						// a time: the same key is a `Keep`, and a kept row takes
-						// the new item through its CELL — nothing is built. A
-						// different key is the row that was there leaving and a new
-						// one arriving, which is what the pass would plan.
-						SeqOp::SetAt(let at, let _was, let value) => {
-							// `.get(at)` copies the one element where binding the
-							// read would copy the run.
-							let same_key = match row_keys.read().get(at) {
-								Some(let held) => key(value) == held,
-								None => false,
-							};
-							if same_key {
-								match row_cells.read().get(at) {
-									Some(let cell) => {
-										row_items.write()[at] = value;
-										cell.set(value);
-									},
-									None => {},
-								}
-							} else {
-								splice_rows(at, 1, [value]);
-							}
-						},
-						// The wholesale write, and the lag fallback: the pass.
-						SeqOp::Reset(let items) => reconcile_pass(items),
-						// A reorder is handed to the pass at the list AFTER the
-						// move, for the reason `place_each` gives. The moved rows
-						// keep their keys, so the pass keeps them and their cells.
-						SeqOp::Move(let from, let count, let to) => {
-							mut moved = row_items.read();
-							mut lifted: List<T> = [];
-							mut taken = 0;
-							for taken < count {
-								lifted.push(moved.remove(from));
-								taken += 1;
-							}
-							mut offset = 0;
-							for item in lifted {
-								moved.insert(to + offset, item);
-								offset += 1;
-							}
-							reconcile_pass(moved);
-						},
+	// The input, opened as `place_each` opens its own.
+	let instance = source.open_rows();
+	let drain = instance.drain;
+	let handle = (instance.attach)(subscriber_of(|| {
+		for op in live_ops(drain()) {
+			match op {
+				// Positional when it only removes or only inserts; the pass over
+				// its span when it does both (A129), as in `place_each`.
+				SeqOp::Splice(let at, let removed, let inserted) => {
+					if removed.len() == 0 || inserted.len() == 0 {
+						splice_rows(at, removed.len(), inserted);
+					} else {
+						reconcile_span(at, removed.len(), inserted);
 					}
-				}
-			});
-			reconcile_pass(source.get());
-		},
-	}
+				},
+				// An element changed IN PLACE. The pass's rule, one row at a time:
+				// the same key is a `Keep`, and a kept row takes the new item
+				// through its CELL — nothing is built. A different key is the row
+				// that was there leaving and a new one arriving, which is what the
+				// pass would plan.
+				SeqOp::SetAt(let at, let _was, let value) => {
+					// `.get(at)` copies the one element where binding the read
+					// would copy the run.
+					let same_key = match row_keys.read().get(at) {
+						Some(let held) => key(value) == held,
+						None => false,
+					};
+					if same_key {
+						match row_cells.read().get(at) {
+							Some(let cell) => {
+								row_items.write()[at] = value;
+								cell.set(value);
+							},
+							None => {},
+						}
+					} else {
+						splice_rows(at, 1, [value]);
+					}
+				},
+				// The wholesale write, and the lag fallback: the pass.
+				SeqOp::Reset(let items) => reconcile_pass(items),
+				// A reorder is handed to the pass at the list AFTER the move, for
+				// the reason `place_each` gives. The moved rows keep their keys, so
+				// the pass keeps them and their cells.
+				SeqOp::Move(let from, let count, let to) => {
+					mut moved = row_items.read();
+					mut lifted: List<T> = [];
+					mut taken = 0;
+					for taken < count {
+						lifted.push(moved.remove(from));
+						taken += 1;
+					}
+					mut offset = 0;
+					for item in lifted {
+						moved.insert(to + offset, item);
+						offset += 1;
+					}
+					reconcile_pass(moved);
+				},
+			}
+		}
+	}, false));
+	also_releasing(handle, instance.release);
+	let _owned = get_owner().take(handle);
+	reconcile_pass((instance.snapshot)());
 }
 
 /// Something that can fill an attribute value (proposal/element-syntax.md §5). This
@@ -2081,24 +2144,40 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 /// `Source<str>` (B158/B165), so any reactive value fills an attribute. KEEP IN
 /// STEP with the process twin's copy (process/ui.vl).
 export trait AttrValue {
-	fun apply(self, parent: View, name: str);
+	fun apply(own self, parent: View, name: str);
 }
 
 /// Set once.
 export impl str with AttrValue {
-	fun apply(self, parent: View, name: str) {
+	fun apply(own self, parent: View, name: str) {
 		parent.element.set_attribute(name, self);
 	}
 }
 
 /// Set and track — exactly `bind_attr`, for every `Source<str>`.
-export impl type S: Source<str> with AttrValue {
-	fun apply(self, parent: View, name: str) {
-		let element = parent.element;
-		self.effect(|value| {
-			element.set_attribute(name, value);
-		});
+export impl type S: Flow<str> with AttrValue {
+	fun apply(own self, parent: View, name: str) {
+		apply_text_flow(self, parent, name);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<str> with AttrValue {
+	fun apply(own self, parent: View, name: str) {
+		apply_text_flow(self, parent, name);
+	}
+}
+
+fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
+	let element = parent.element;
+	follow(flow, |value| {
+		element.set_attribute(name, value);
+	});
 }
 
 /// Set once, or NOT AT ALL: a `None` writes nothing (A115). The static twin of the
@@ -2111,7 +2190,7 @@ export impl type S: Source<str> with AttrValue {
 /// distinction is the whole reason an absence needs its own value rather than a
 /// sentinel string, exactly as `AttrBinding` states it.
 export impl Option<str> with AttrValue {
-	fun apply(self, parent: View, name: str) {
+	fun apply(own self, parent: View, name: str) {
 		match self {
 			Some(let text) => parent.element.set_attribute(name, text),
 			None => {},
@@ -2123,16 +2202,32 @@ export impl Option<str> with AttrValue {
 /// coming-and-going arm, reached from element syntax. Its customer is a selector
 /// that reads PRESENCE (`[data-dragging] *`), where there is no string that turns
 /// the attribute off.
-export impl type S: Source<Option<str>> with AttrValue {
-	fun apply(self, parent: View, name: str) {
-		let element = parent.element;
-		self.effect(|value| {
-			match value {
-				Some(let text) => element.set_attribute(name, text),
-				None => element.remove_attribute(name),
-			}
-		});
+export impl type S: Flow<Option<str>> with AttrValue {
+	fun apply(own self, parent: View, name: str) {
+		apply_optional_flow(self, parent, name);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<Option<str>> with AttrValue {
+	fun apply(own self, parent: View, name: str) {
+		apply_optional_flow(self, parent, name);
+	}
+}
+
+fun apply_optional_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
+	let element = parent.element;
+	follow(flow, |value| {
+		match value {
+			Some(let text) => element.set_attribute(name, text),
+			None => element.remove_attribute(name),
+		}
+	});
 }
 
 /// What `View::bind_attr` accepts (A105) — the REACTIVE attribute vocabulary,
@@ -2151,31 +2246,63 @@ export impl type S: Source<Option<str>> with AttrValue {
 ///
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 export trait AttrBinding {
-	fun bind_attribute(self, parent: View, name: str);
+	fun bind_attribute(own self, parent: View, name: str);
 }
 
 /// Always present: every value the source holds is the attribute's value.
-export impl type S: Source<str> with AttrBinding {
-	fun bind_attribute(self, parent: View, name: str) {
-		let element = parent.element;
-		self.effect(|value| {
-			element.set_attribute(name, value);
-		});
+export impl type S: Flow<str> with AttrBinding {
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_text_attribute_flow(self, parent, name);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<str> with AttrBinding {
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_text_attribute_flow(self, parent, name);
+	}
+}
+
+fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
+	let element = parent.element;
+	follow(flow, |value| {
+		element.set_attribute(name, value);
+	});
 }
 
 /// Present exactly while the source says `Some`, and gone while it says `None` —
 /// the shape kolt hand-wrote as `bind_attr_proper` (A105).
-export impl type S: Source<Option<str>> with AttrBinding {
-	fun bind_attribute(self, parent: View, name: str) {
-		let element = parent.element;
-		self.effect(|value| {
-			match value {
-				Some(let text) => element.set_attribute(name, text),
-				None => element.remove_attribute(name),
-			}
-		});
+export impl type S: Flow<Option<str>> with AttrBinding {
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_optional_attribute_flow(self, parent, name);
 	}
+}
+
+/// The SOURCE arm of the same case (reactive-44's blanket-argument find, filed from
+/// REPORT-reactive-44): a source reaches `Flow` through the blanket, and a bounded
+/// blanket's trait argument is not checked through another blanket, so the flow
+/// arms above all match a `SignalCell` and none is the more specific. `Source` is
+/// the subtrait, so this arm outranks them for every source; the flow arm is left
+/// to the pipes, which implement `Flow` directly.
+export impl type S: Source<Option<str>> with AttrBinding {
+	fun bind_attribute(own self, parent: View, name: str) {
+		bind_optional_attribute_flow(self, parent, name);
+	}
+}
+
+fun bind_optional_attribute_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
+	let element = parent.element;
+	follow(flow, |value| {
+		match value {
+			Some(let text) => element.set_attribute(name, text),
+			None => element.remove_attribute(name),
+		}
+	});
 }
 
 /// Whether a host value is JS `null`/`undefined` — the one peek this module needs
@@ -2259,7 +2386,7 @@ export fun mount_root(id: str, body: (sync || View) context owner_scope): Owner 
 
 /// Content that exists while `source` is `Some`, with the payload bound — the
 /// `when_some` slot value (A119).
-export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
+export struct WhenSome<T, S: Flow<Option<T>>, C: Slot> {
 	source: S,
 	render: (|SignalCell<T>| C) context owner_scope,
 }
@@ -2277,15 +2404,15 @@ export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
 ///
 /// Write it in a child hole where the conditional content belongs, or hand it to
 /// `child` (`parent.child(when_some(..))`) for the parent's current end.
-export fun when_some<T, S: Source<Option<T>>, C: Slot>(
-	source: S,
+export fun when_some<T, S: Flow<Option<T>>, C: Slot>(
+	own source: S,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): WhenSome<T, S, C> {
 	WhenSome { source, render }
 }
 
-export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+export impl WhenSome<type T, type S: Flow<Option<T>>, type C: Slot> with Slot {
+	fun place(own self, parent: View) {
 		place_when_some(parent, self.source, self.render);
 	}
 }
@@ -2293,9 +2420,9 @@ export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot 
 /// `when_some`'s body, against a region opened at `parent`'s current end —
 /// `place_swap`'s machinery, with the presence deciding structure and the cell
 /// carrying the value.
-fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
+fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 	parent: View,
-	source: S,
+	own source: S,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ) {
 	// The content keeps THIS position among the parent's children (A71), so a panel
@@ -2309,7 +2436,7 @@ fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 		live_owner.read()?.dispose();
 		region.close();
 	});
-	source.effect(|value: Option<T>| {
+	follow(source, |value: Option<T>| {
 		match value {
 			Some(let payload) => {
 				match live_cell.read() {

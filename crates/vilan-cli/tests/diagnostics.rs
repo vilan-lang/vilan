@@ -1980,15 +1980,61 @@ fn internal_use_warns_at_every_use_outside_the_declaring_module() {
             "missing {expected:?} in {warnings:?}"
         );
     }
-    // `cache`: once for the import and once for the read in `main` — never for
-    // `seam`'s own read of it, which is in the module that declares it.
-    assert_eq!(
-        warnings
+    // E224 (R-j): each name warns ONCE, at its use in `main` — never at the
+    // import line, which is not a use (the rule a function's import leaf has
+    // always followed), and never for `seam`'s own read of `cache`, which is in
+    // the module that declares it.
+    for name in ["`Region`", "`anchor`", "`Auto`", "`cache`", "`seam`"] {
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.starts_with(name))
+                .count(),
+            1,
+            "{name}: {warnings:?}"
+        );
+    }
+}
+
+/// E224 (R-j): ONE rule for every labelled item — an `import` line alone does
+/// not warn; the USE warns. A deprecated or internal TYPE imported and never
+/// used is as silent as a deprecated FUNCTION imported and never called (the
+/// pre-existing behaviour, `a_std_marked_item_warns_at_its_use`).
+#[test]
+fn e224_an_import_line_alone_never_warns() {
+    let dir = labelled_package(
+        "e224_import_only",
+        "[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"warn\"\n",
+    );
+    std::fs::write(
+        dir.join("src/stale.vl"),
+        concat!(
+            "export [deprecated(\"use Fresh\")]\n",
+            "struct Stale {\n\tat: i32,\n}\n\n",
+            "export [deprecated(\"use fresh()\")]\n",
+            "fun stale(): i32 {\n\t1\n}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/main.vl"),
+        concat!(
+            "import pkg::helper::{ Region, Side, cache, seam };\n",
+            "import pkg::stale::{ Stale, stale };\n",
+            "use Side::{ Auto };\n\n",
+            "fun main() {\n\tprint(\"nothing labelled is used\");\n}\n",
+        ),
+    )
+    .unwrap();
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    let warnings = warning_lines(&output);
+    assert!(
+        !warnings
             .iter()
-            .filter(|warning| warning.starts_with("`cache`"))
-            .count(),
-        2,
-        "{warnings:?}"
+            .any(|warning| warning.contains("is internal") || warning.contains("is deprecated")),
+        "an import (or `use`) line is not a use: {warnings:?}\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -2063,11 +2109,12 @@ fn b382_a_deprecated_type_warns_at_each_use_in_another_module() {
         "a deprecation warns, it does not fail"
     );
     let warnings = warning_lines(&output);
-    // The import, the annotation and the literal's head — and nothing for the
-    // replacement beside it, or for the declaring module's own `own_use`.
+    // The annotation and the literal's head — E224 (R-j): not the import
+    // line, which is not a use — and nothing for the replacement beside it, or
+    // for the declaring module's own `own_use`.
     assert_eq!(
         warnings,
-        vec!["`KeyedThing` is deprecated; use DeltaCursor".to_string(); 3],
+        vec!["`KeyedThing` is deprecated; use DeltaCursor".to_string(); 2],
         "{warnings:?}"
     );
 }

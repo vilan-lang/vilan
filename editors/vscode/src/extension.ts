@@ -9,6 +9,7 @@ import {
     CodeAction,
     CodeActionKind,
     Disposable,
+    env as vscodeEnvironment,
     FileSystemWatcher,
     LogOutputChannel,
     ExtensionContext,
@@ -20,7 +21,10 @@ import {
     TextDocumentChangeEvent,
     TextEdit,
     TextEditor,
+    Uri,
 } from 'vscode';
+import { PlacedClosers } from './closers';
+import { BUILD_SHA_FILE, versionGap } from './versions';
 import {
     DidChangeConfigurationNotification,
     ExecuteCommandRequest,
@@ -212,7 +216,11 @@ const installDirectory = process.platform === 'win32' ? '%USERPROFILE%\\.vilan\\
 function readFeatureConfig(): object {
     const config = workspace.getConfiguration('vilan');
     return {
-        inlayHints: { enabled: config.get<boolean>('inlayHints.enabled', true) },
+        inlayHints: {
+            enabled: config.get<boolean>('inlayHints.enabled', true),
+            // E227: a `[hint]`ed type by the trait it is used as (`~Source<T>`).
+            abbreviate: config.get<boolean>('inlayHints.abbreviate', true),
+        },
         semanticTokens: { enabled: config.get<boolean>('semanticTokens.enabled', true) },
         completion: { functionCall: config.get<string>('completion.functionCall', 'full') },
         // E222: not the setting — whether the override is INSTALLED. The two
@@ -273,10 +281,10 @@ let typeOverride: Disposable | undefined;
 /// characters typed after it, so they land after its `>` rather than before.
 let typing: Promise<void> = Promise.resolve();
 
-/// The `>`s this override placed and may type over, as document offsets per URI.
-/// Kept current through every edit, and forgotten once the caret leaves their
+/// The `>`s this override placed and may type over (`closers.ts`, E214's pins):
+/// kept current through every edit, and forgotten once the caret leaves their
 /// line — VS Code's own overtype forgets an auto-closed character the same way.
-const placedClosers = new Map<string, number[]>();
+const placedClosers = new PlacedClosers();
 
 /// Install or remove the override to match `vilan.autoClosing.generics`.
 /// Returns whether the installed state changed, which is when the server must
@@ -338,15 +346,9 @@ async function typeOne(args: { text: string }): Promise<void> {
 /// A `>` typed onto one this override placed: move past it, insert nothing.
 function typeOverClosing(editor: TextEditor): boolean {
     const document = editor.document;
-    const closers = placedClosers.get(document.uri.toString());
     const caret = editor.selection.active;
-    const offset = document.offsetAt(caret);
-    const index = closers?.indexOf(offset) ?? -1;
-    if (closers === undefined || index < 0) {
-        return false;
-    }
-    closers.splice(index, 1);
-    if (document.getText(new Range(caret, caret.translate(0, 1))) !== '>') {
+    const following = document.getText(new Range(caret, caret.translate(0, 1)));
+    if (!placedClosers.typeOver(document.uri.toString(), document.offsetAt(caret), following)) {
         return false;
     }
     const past = caret.translate(0, 1);
@@ -400,10 +402,7 @@ async function closeGenericList(editor: TextEditor): Promise<void> {
         return;
     }
     editor.selection = new Selection(caret, caret);
-    const key = document.uri.toString();
-    const closers = placedClosers.get(key) ?? [];
-    closers.push(document.offsetAt(caret));
-    placedClosers.set(key, closers);
+    placedClosers.place(document.uri.toString(), document.offsetAt(caret));
 }
 
 // --- F27 R1/R6: the platform a file is analyzed under -------------------------
@@ -480,42 +479,69 @@ function schedulePlatformRefresh(): void {
 /// Keep every placed `>` at its character through edits; one an edit replaces
 /// is gone.
 function trackClosers(changed: TextDocumentChangeEvent): void {
-    const key = changed.document.uri.toString();
-    const closers = placedClosers.get(key);
-    if (closers === undefined) {
-        return;
-    }
-    for (const change of changed.contentChanges) {
-        const start = change.rangeOffset;
-        const end = start + change.rangeLength;
-        const delta = change.text.length - change.rangeLength;
-        for (let index = closers.length - 1; index >= 0; index--) {
-            if (closers[index] >= end) {
-                closers[index] += delta;
-            } else if (closers[index] >= start) {
-                closers.splice(index, 1);
-            }
-        }
-    }
-    if (closers.length === 0) {
-        placedClosers.delete(key);
-    }
+    placedClosers.track(changed.document.uri.toString(), changed.contentChanges);
 }
 
 /// Forget the placed `>`s once the caret leaves their line.
 function forgetDistantClosers(editor: TextEditor): void {
-    const key = editor.document.uri.toString();
-    const closers = placedClosers.get(key);
-    if (closers === undefined) {
+    const document = editor.document;
+    placedClosers.keepLine(
+        document.uri.toString(),
+        editor.selection.active.line,
+        (offset) => document.positionAt(offset).line,
+    );
+}
+
+// --- E229: one version on both halves ---------------------------------------
+//
+// The decision is `versions.ts`'s (no `vscode` import; `npm test` runs it);
+// this is the wiring: read the started server's `serverInfo.version`, compare
+// it with this extension's own, and on a gap show ONE notification per window
+// with the command that closes it — never again on a restart, which starts
+// the same server. Every start logs both versions to the output channel.
+
+/// Whether this window has already named a version gap.
+let versionNoticeShown = false;
+
+/// E231: the commit this extension was packaged from — `build-sha.txt` beside
+/// `package.json`, which `scripts/install-dev.sh` and release.yml's `vsix` job
+/// write from `git rev-parse --short=9 HEAD` just before `vsce package`, the
+/// stamp the server's build script takes. `undefined` for a vsix packaged
+/// without one, which is then compared by version alone.
+function packagedSha(context: ExtensionContext): string | undefined {
+    try {
+        return fs.readFileSync(path.join(context.extensionPath, BUILD_SHA_FILE), 'utf8').trim() || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function checkServerVersion(context: ExtensionContext): void {
+    if (!client) {
         return;
     }
-    const line = editor.selection.active.line;
-    const kept = closers.filter((offset) => editor.document.positionAt(offset).line === line);
-    if (kept.length === 0) {
-        placedClosers.delete(key);
-    } else {
-        placedClosers.set(key, kept);
+    const extensionVersion: string = context.extension.packageJSON.version;
+    const extensionSha = packagedSha(context);
+    const serverVersion = client.initializeResult?.serverInfo?.version;
+    outputChannel?.info(
+        `language server version ${serverVersion ?? '(none reported)'}, extension ${extensionVersion}` +
+            (extensionSha ? ` (${extensionSha})` : ''),
+    );
+    const gap = versionGap(extensionVersion, serverVersion, extensionSha);
+    if (gap === undefined || versionNoticeShown) {
+        return;
     }
+    versionNoticeShown = true;
+    outputChannel?.warn(`${gap.message}\n  ${gap.command}`);
+    void window
+        .showWarningMessage(gap.message, 'Copy Command', 'Open Release')
+        .then(async (choice) => {
+            if (choice === 'Copy Command') {
+                await vscodeEnvironment.clipboard.writeText(gap.command);
+            } else if (choice === 'Open Release') {
+                await vscodeEnvironment.openExternal(Uri.parse(gap.releaseUrl));
+            }
+        });
 }
 
 /// Resolve the language-server binary. An explicit `vilan.server.path` setting
@@ -670,6 +696,7 @@ async function startClient(context: ExtensionContext): Promise<void> {
     client = new LanguageClient('vilan', 'Vilan Language Server', serverOptions, clientOptions);
     try {
         await client.start();
+        checkServerVersion(context);
     } catch (error) {
         client = undefined;
         reportMissingServer(command);
@@ -711,7 +738,7 @@ export function activate(context: ExtensionContext): void {
         workspace.onDidChangeTextDocument(trackClosers),
         window.onDidChangeTextEditorSelection((event) => forgetDistantClosers(event.textEditor)),
         workspace.onDidCloseTextDocument((document) =>
-            placedClosers.delete(document.uri.toString()),
+            placedClosers.forget(document.uri.toString()),
         ),
     );
 

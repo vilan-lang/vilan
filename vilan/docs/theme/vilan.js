@@ -18,7 +18,7 @@
 	hljs.registerLanguage("vilan", function (hljs) {
 		const KEYWORDS = {
 			// GENERATED(keyword-groups): lexing.rs KEYWORDS split by grammar_sync.rs's KEYWORD_ROLES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-			keyword: "async await borrows const css dyn else enum export external for fun if impl import in is jump lazy let macro match mod mut own ret struct trait type use with",
+			keyword: "async await const css else enum export external for fun if impl import in is let macro match mod mut ret struct trait type use",
 			literal: "true false null void self Self",
 			// END GENERATED(keyword-groups)
 			built_in: "print panic assert",
@@ -72,7 +72,7 @@
 		const ATTRIBUTE = {
 			className: "meta",
 			// GENERATED(attribute-markers): parsing.rs KNOWN_ATTRIBUTE_MARKERS — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-			begin: "^\\s*\\[(?:derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated|internal|resource)\\b",
+			begin: "^\\s*\\[(?:derive|service|client_service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated|internal|resource|hint)\\b",
 			// END GENERATED(attribute-markers)
 			end: "\\]",
 		};
@@ -100,6 +100,50 @@
 		const IMPORT_ALIAS = {
 			className: "keyword",
 			begin: "(?<=[A-Za-z0-9_]\\s{1,8})as\\b(?=\\s{1,8}[A-Za-z_])",
+		};
+		// B414: the six contextual keywords the lexer demoted, each painted
+		// only where it reads as the keyword. `with` and `borrows` follow a
+		// TYPE (an `impl`/`trait` head, a return type) and precede a name —
+		// guarded on both sides, like `context`. `own`, `lazy`, `dyn` and
+		// `jump` are PREFIXES of a name: the keyword exactly when a name
+		// follows (never `in`/`is`/`as`, which make the word a binder or an
+		// operand). `let own = 1`, `list.with(f)`, `jump.height` stay plain.
+		const CONTEXTUAL_WITH = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_>\\)\\]]\\s{1,8})with\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_(&|])",
+		};
+		const CONTEXTUAL_BORROWS = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_>\\)\\]]\\s{1,8})borrows\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])",
+		};
+		const CONTEXTUAL_OWN = { className: "keyword", begin: "\\bown\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		const CONTEXTUAL_LAZY = { className: "keyword", begin: "\\blazy\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		const CONTEXTUAL_DYN = { className: "keyword", begin: "\\bdyn\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		const CONTEXTUAL_JUMP = { className: "keyword", begin: "\\bjump\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		// B414 S4, the member tier: every word — a reserved one included —
+		// names a member, so `event.type`, `bag.if()` and a field `type: str`
+		// are NAMES. R-k writes a member's name against its dot, which makes
+		// the member read a one-character lookbehind; a field's name is the
+		// word before a `:` or a literal's `=` (never `::`, `==` or `=>`, so
+		// `true => 1` keeps its literal). A mode with no keywords of its own
+		// takes the word before the keyword list can (highlight.js modes do
+		// not inherit keywords), and paints it plain. FIELD_NAME is listed
+		// after ELEMENT_EVENT, which wins the tie at `on:click`'s `on`.
+		const MEMBER_NAME = {
+			begin: "(?<=\\.)[a-z_][A-Za-z0-9_]*",
+			relevance: 0,
+		};
+		const FIELD_NAME = {
+			begin: "\\b[a-z_][A-Za-z0-9_]*(?=\\s*(?::(?!:)|=(?![=>])))",
+			relevance: 0,
+		};
+		// B459: `then`, the infix conditional, is CONTEXTUAL — a keyword only
+		// after a complete operand and before a branch, never where a NAME
+		// stands (`let then = 1`, `for then in xs`, `then: i32`,
+		// `promise.then(f)`): guarded on both sides, like `context`.
+		const CONTEXTUAL_THEN = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_\\)\\]\\}\"']\\s{1,8})then\\b(?=\\s{1,8}(?![=.:,;\\)\\]\\}]|i[ns]\\b|as\\b)\\S)",
 		};
 		const TYPE = {
 			className: "type",
@@ -154,11 +198,20 @@
 				INTERPOLATED,
 				PLAIN_STRING,
 				NUMBER,
+				MEMBER_NAME,
 				CONTEXT_CLAUSE,
 				SYNC_MARKER,
 				IMPORT_ALIAS,
+				CONTEXTUAL_WITH,
+				CONTEXTUAL_BORROWS,
+				CONTEXTUAL_OWN,
+				CONTEXTUAL_LAZY,
+				CONTEXTUAL_DYN,
+				CONTEXTUAL_JUMP,
+				CONTEXTUAL_THEN,
 				ELEMENT_TAG,
 				ELEMENT_EVENT,
+				FIELD_NAME,
 				FUNCTION,
 				TYPE,
 			],

@@ -125,9 +125,43 @@ fn member_name_of<'src>(program: &Program<'src>, access: Id) -> Option<&'src str
 pub fn check(program: &mut Program) {
     refuse_local_labels(program);
     refuse_impl_labels(program);
+    refuse_misplaced_hints(program);
     warn_deprecated_uses(program);
     if program.lints.internal_use == LintLevel::Warn {
         warn_internal_uses(program);
+    }
+}
+
+/// E224 (R-j): whether `span` in `source` sits on an `import`/`use` line.
+///
+/// ONE rule for every labelled item, types and functions alike: **an import
+/// line alone does not warn; the USE warns.** An import names what it binds —
+/// the loader resolves it, and the analyzer records a row for the leaf so the
+/// editor can hover and rename it — but nothing has been used yet: the fix
+/// sites are the uses, and a dead import falls out with the last one
+/// (`proposal/deprecation.md`'s "what counts as a use"). A deprecated
+/// RE-EXPORT is the one import that is itself the use — its name is
+/// transparent at every other site — and it warns at the importing leaf from
+/// the analyzer's own `check_deprecated_reexports`, not from here.
+struct ImportLines(Vec<(SourceId, Span)>);
+
+impl ImportLines {
+    fn of(program: &Program) -> ImportLines {
+        let mut spans = program.import_statement_spans.clone();
+        spans.sort_by_key(|(source, span)| (source.0, span.start));
+        ImportLines(spans)
+    }
+
+    fn contain(&self, source: SourceId, span: Span) -> bool {
+        // The last statement starting at or before `span` in `source` is the
+        // only one that can hold it: statements do not nest.
+        let at = self.0.partition_point(|(other, statement)| {
+            (other.0, statement.start) <= (source.0, span.start)
+        });
+        at > 0 && {
+            let (other, statement) = self.0[at - 1];
+            other == source && span.end <= statement.end
+        }
     }
 }
 
@@ -175,6 +209,7 @@ fn refuse_local_labels(program: &mut Program) {
 /// blocks and constructors are not the uses the steer is for.
 fn warn_deprecated_uses(program: &mut Program) {
     let lookup = program.source_lookup();
+    let import_lines = ImportLines::of(program);
     let is_user = |source: SourceId| {
         program
             .source_layers
@@ -195,7 +230,10 @@ fn warn_deprecated_uses(program: &mut Program) {
     let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
     let mut seen: HashSet<(u32, usize, usize)> = HashSet::default();
     let mut record = |span: Span, source: SourceId, target: Id| {
-        if !is_user(source) || lookup.of(target) == Some(source) {
+        if !is_user(source)
+            || lookup.of(target) == Some(source)
+            || import_lines.contain(source, span)
+        {
             return;
         }
         let Some((name, steer)) = steer_of(target) else {
@@ -205,7 +243,8 @@ fn warn_deprecated_uses(program: &mut Program) {
             sites.push((span, source, format!("`{name}` is deprecated; {steer}")));
         }
     };
-    // Type position: an annotation, a bound, an impl subject, an import leaf.
+    // Type position: an annotation, a bound, an impl subject (an import leaf
+    // records a row here too, and `record` passes it by — E224).
     for (source, span, definition, _) in &program.type_references {
         if let Some(definition) = definition {
             record(*span, *source, *definition);
@@ -276,6 +315,45 @@ fn refuse_impl_labels(program: &mut Program) {
     }
 }
 
+/// E227: `[hint(Trait<..>)]` abbreviates a TYPE in an inlay hint, so it
+/// labels a struct or an enum. The shared prefix admits it ahead of a trait,
+/// a module `let` and an `impl` block too, where there is no type of the
+/// declaration's own to abbreviate: refused, at the argument.
+fn refuse_misplaced_hints(program: &mut Program) {
+    let mut refused: Vec<(Span, SourceId, &'static str)> = program
+        .item_labels
+        .iter()
+        .filter(|(id, _)| !program.structs.contains_key(*id) && !program.enums.contains_key(*id))
+        .flat_map(|(id, labels)| {
+            let kind = if program.traits.contains_key(id) {
+                "a trait"
+            } else if program.variables.contains_key(id) {
+                "a module binding"
+            } else {
+                "an `impl` block"
+            };
+            let source = program.diagnostic_source_of(*id);
+            labels.hint.iter().map(move |hint| (hint.0.1, source, kind))
+        })
+        .collect();
+    refused.sort_by_key(|(span, source, _)| (source.0, span.start));
+    for (span, source, kind) in refused {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`[hint(..)]` names the trait a struct or an enum is shown as in an inlay \
+                     hint, and {kind} is not a type — write it on the struct or enum whose \
+                     values the hint is about"
+                ),
+            },
+            source,
+        );
+    }
+}
+
 fn warn_internal_uses(program: &mut Program) {
     for (span, source, msg) in internal_use_sites(program) {
         program.warnings.push(Error {
@@ -292,6 +370,7 @@ fn warn_internal_uses(program: &mut Program) {
 /// deterministic order (the final sort is `normalize_diagnostic_order`'s).
 fn internal_use_sites(program: &Program) -> Vec<(Span, SourceId, String)> {
     let lookup = program.source_lookup();
+    let import_lines = ImportLines::of(program);
     // The package's own code: a source under no library root (std, a
     // dependency's layers and bases).
     let is_user = |source: SourceId| {
@@ -303,6 +382,10 @@ fn internal_use_sites(program: &Program) -> Vec<(Span, SourceId, String)> {
     let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
     let mut seen: HashSet<(u32, usize, usize)> = HashSet::default();
     let mut record = |span: Span, source: SourceId, name: &str, reason: &str| {
+        // E224: an import line names what it binds; the use is what warns.
+        if import_lines.contain(source, span) {
+            return;
+        }
         if seen.insert((source.0, span.start, span.end)) {
             sites.push((span, source, format!("`{name}` is internal: {reason}")));
         }

@@ -63,8 +63,8 @@ fn main() {
         "embedded-std build: {} holds no src/lib.rs — is this a complete checkout?",
         runtime_root.display()
     );
-    // F18 slice 2 and F40: the OPTIONAL runtime crates (`vilan-rt-sqlite`,
-    // `vilan-rt-crypto`) materialize BESIDE the runtime, under the same hash and
+    // F18 slice 2, F40 and F45: the OPTIONAL runtime crates (`vilan-rt-sqlite`,
+    // `vilan-rt-crypto`, `vilan-rt-signal`) materialize BESIDE the runtime, under the same hash and
     // the same root, because the generated cargo manifest reaches each as a
     // sibling of the runtime path (the rulings keep them separate CRATES; they
     // are not separate caches). A program that reaches neither never names
@@ -153,6 +153,11 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         directory: "vilan-rt-crypto",
         manifest_static: "RT_CRYPTO_MANIFEST",
         item: "F40",
+    },
+    OptionalCrate {
+        directory: "vilan-rt-signal",
+        manifest_static: "RT_SIGNAL_MANIFEST",
+        item: "F45",
     },
 ];
 

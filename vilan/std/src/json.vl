@@ -989,12 +989,18 @@ export macro fun struct_wire_impls(target: StructItem): str {
 		.parameter("deserializer: &mut D")
 		.returns(target.subject())
 		.line("deserializer.begin_struct();");
+	// Each field's value is bound to a `__`-prefixed local — the prefix the
+	// expansions reserve for their own bindings (the `[service]` expansion's
+	// `__request` is the precedent) — never to the field's own name: a local
+	// spelled like the field is the expansion's identifier in the user's namespace,
+	// and a field called `deserializer` shadowed the parameter every later read
+	// went through (B416).
 	mut literal = init_of(target.name);
 	for field in target.fields {
 		let label = quote(field.name);
 		rebuild = rebuild.line(i"deserializer.field({label});");
-		rebuild = rebuild.line(i"let {field.name} = {field.type_.render()}::rebuild(deserializer);");
-		literal = literal.field(field.name, field.name);
+		rebuild = rebuild.line(i"let __{field.name} = {field.type_.render()}::rebuild(deserializer);");
+		literal = literal.field(field.name, i"__{field.name}");
 	}
 	rebuild = rebuild.line("deserializer.end_struct();").expr(literal.render());
 	impl_of(target.name)

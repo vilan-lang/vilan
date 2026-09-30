@@ -1,0 +1,351 @@
+/// `std::transient` — values that come and go (tracker A142 S3,
+/// `proposal/reactive-layers.md` §5).
+///
+/// A `Source` has a value. A TRANSIENT has a value only sometimes: a fetch in
+/// flight has none yet, a refresh has an old one and a newer one on its way, a
+/// failure may have a stale one, and a remote source may say there is no such
+/// thing. `TransientState` names the five, and `TransientSource` is a
+/// `Source<Option<T>>` that also reports which of them it is in.
+///
+/// Three things are transients:
+///
+/// - a flow of tasks, sealed with `.transient()`:
+///   `user_id.derive(|id| async fetch_user(id)).transient()` refreshes at every
+///   change of `user_id`, and the LATEST task wins — the superseded one is
+///   cancelled with its run (a pipe body's tasks are the run's), and a reply that
+///   arrives anyway is dropped;
+/// - one task, `TaskSource::new(task)`: pending, then ready or failed, and done;
+/// - a remote mirror (`std::rpc`'s `RemoteSource`), whose `Status` maps onto the
+///   same five states.
+///
+/// Reading one: `get()` is `Some` only while READY — a refresh reads `None`, and a
+/// binding over `get()` goes blank for it (R5). A view that should keep the old
+/// value on screen while the new one loads binds `latest()` instead (R27), which
+/// opts in to the stale value; `is_pending()` is the spinner; `state()` is the
+/// whole story, `Absent` included — which is what tells a spinner from "not found".
+
+import pkg::io::panic;
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::{
+	MemoCell,
+	Pipe,
+	SignalCell,
+	Source,
+	Subscriber,
+	Subscription,
+	as_derivation,
+	register_with_owner,
+};
+import pkg::result::Result::{ self, Err, Ok };
+import pkg::shared::Shared;
+import pkg::task::Task;
+
+/// Where a transient stands (R4, R13).
+export enum TransientState<T, E> {
+	/// Nothing yet.
+	Pending,
+	/// The value.
+	Ready(T),
+	/// A newer value is on its way; `T` is the last one.
+	Refreshing(T),
+	/// Failed with `E`; the last value, if there was one.
+	Failed(E, Option<T>),
+	/// "There is no such source", as of now: a later ask may find one.
+	Absent,
+}
+
+export impl TransientState<type T, type E> {
+	/// The value a READY state holds: what a transient's `get()` answers (R5).
+	fun ready(self): Option<T> {
+		match self {
+			TransientState::Ready(let value) => Some(value),
+			_ => None,
+		}
+	}
+
+	/// The value, stale included: `Ready(v)`, `Refreshing(v)` and
+	/// `Failed(_, Some(v))` are `Some(v)` — what `latest()` answers.
+	fun latest(self): Option<T> {
+		match self {
+			TransientState::Ready(let value) => Some(value),
+			TransientState::Refreshing(let value) => Some(value),
+			TransientState::Failed(let _error, let stale) => stale,
+			_ => None,
+		}
+	}
+
+	/// `Pending` or `Refreshing`: something is on its way.
+	fun is_pending(self): bool {
+		match self {
+			TransientState::Pending => true,
+			TransientState::Refreshing(let _value) => true,
+			_ => false,
+		}
+	}
+
+	/// The state a new ask moves this one to: the last value, if there is one, is
+	/// kept as `Refreshing(v)`; otherwise the transient is `Pending`.
+	fun refreshed(self): TransientState<T, E> {
+		match self.latest() {
+			Some(let value) => TransientState::Refreshing(value),
+			None => TransientState::Pending,
+		}
+	}
+
+	/// The state a failure moves this one to: `Failed(error, stale)`, carrying the
+	/// last value, if there was one (R13).
+	fun failed(self, error: E): TransientState<T, E> {
+		TransientState::Failed(error, self.latest())
+	}
+}
+
+/// A `Source<Option<T>>` that also says where it stands (R5, R25).
+///
+/// `get()` is `Some(v)` only in `Ready(v)`: `Refreshing` reads `None`, and so does
+/// every other state. The three accessors answer the rest.
+export trait TransientSource<T, E> with Source<Option<T>> {
+	/// The state, as the READ-ONLY face (R28): a sealed source nobody downstream
+	/// can `set`.
+	fun state(self): MemoCell<TransientState<T, E>>;
+
+	/// A FRESH pipe per call that opts in to the stale value: `Ready(v)`,
+	/// `Refreshing(v)` and `Failed(_, Some(v))` are `Some(v)` — what a view binds to
+	/// keep the old value on screen while a new one loads (R27).
+	fun latest(self): dyn Pipe<Option<T>>;
+
+	/// A FRESH pipe per call: `true` while `Pending` or `Refreshing`.
+	fun is_pending(self): dyn Pipe<bool>;
+}
+
+/// The runtime's `try`/`catch` for a body that SUSPENDS: `Ok` when it settled,
+/// `Err(message)` when it panicked or its host promise rejected (a cancelled
+/// task's abort included). `std::rpc` declares the same glue for its transports.
+[extern("__guarded_async")]
+async external fun guarded_async<T>(body: async || T): Result<T, str>;
+
+// === A flow of tasks, sealed: `.transient()` (R37) ============================
+
+/// What `.transient()` seals a flow of tasks into: the state of the LATEST task,
+/// with the value before it kept while it runs.
+///
+/// Each change upstream starts a task (the pipe's body runs once per change,
+/// inside the one instance this seal started) and moves the transient to
+/// `Refreshing(v)` — or `Pending` before any value — and the task's outcome moves
+/// it to `Ready` or `Failed`. Only the NEWEST task's outcome is applied: the task
+/// a newer one superseded is cancelled with its run (A142 §4.1), and whatever
+/// reply it produces anyway is dropped, so a slow answer to an old question never
+/// overwrites a fast answer to the new one. Releasing the seal (its owner going)
+/// drops the in-flight reply too.
+export [hint(TransientSource<T, E>)]
+struct Transient<T, E> {
+	cell: SignalCell<TransientState<T, E>>,
+	// Claimed per task; an outcome is applied only while its claim is the newest.
+	generation: Shared<i32>,
+}
+
+export impl Transient<type T, type E> {
+	/// A transient with nothing yet: pending, with no task behind it.
+	fun pending(): Transient<T, E> {
+		Transient { cell = SignalCell::new(TransientState::Pending), generation = Shared::new(0) }
+	}
+
+	/// A new task has started: claim the next generation, and move to
+	/// `Refreshing(v)` (or `Pending` before any value).
+	fun claim(self): i32 {
+		let mine = self.generation.read() + 1;
+		self.generation.write() = mine;
+		self.cell.set(self.cell.get().refreshed());
+		mine
+	}
+
+	/// Whether the task claimed as `mine` is still the newest.
+	fun current(self, mine: i32): bool {
+		self.generation.read() == mine
+	}
+
+	/// Drop every claim: whatever is in flight will not be applied. What the seal's
+	/// release runs.
+	fun retire(self) {
+		self.generation.write() = self.generation.read() + 1;
+	}
+
+	/// Apply the outcome of the task claimed as `mine`, if it is still the newest.
+	fun settle(self, mine: i32, outcome: Result<T, E>) {
+		if self.current(mine) {
+			match outcome {
+				Ok(let value) => self.cell.set(TransientState::Ready(value)),
+				Err(let error) => self.cell.set(self.cell.get().failed(error)),
+			}
+		}
+	}
+
+	/// Chain the seal's teardown onto the subscription that feeds it, and hand the
+	/// subscription to the ambient owner (A28, `.cell()`'s rule): released with the
+	/// boundary it was made in, and for the program outside every boundary.
+	fun hold(self, subscription: Subscription) {
+		let previous = subscription.release.read();
+		subscription.release.write() = Some(|| {
+			self.retire();
+			match previous {
+				Some(let earlier) => earlier(),
+				None => {},
+			}
+		});
+		let _owned = register_with_owner(subscription);
+	}
+}
+
+export impl Transient<type T, type E> with Source<Option<T>> {
+	fun get(self): Option<T> {
+		self.cell.get().ready()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+export impl Transient<type T, type E> with TransientSource<T, E> {
+	fun state(self): MemoCell<TransientState<T, E>> {
+		MemoCell { cell = self.cell }
+	}
+
+	fun latest(self): dyn Pipe<Option<T>> {
+		let pipe: dyn Pipe<Option<T>> = self.cell.derive(|state| state.latest());
+		pipe
+	}
+
+	fun is_pending(self): dyn Pipe<bool> {
+		let pipe: dyn Pipe<bool> = self.cell.derive(|state| state.is_pending());
+		pipe
+	}
+}
+
+/// `.transient()` over a flow of tasks that answer `Result<T, E>` (R36): an
+/// `Err(e)` is lifted into `Failed(e, stale)`.
+///
+/// Declared BEFORE the bare-task impl below, and the order is load-bearing: a
+/// `Task<Result<T, E>>` also matches `Task<T>`, and between two blankets that both
+/// apply, the compiler takes the first declared (tracker B477). This one is the
+/// more specific.
+///
+/// A task that PANICS has no `E` to become, so its panic is raised again — from the
+/// task that settles the seal, reported with its origin like any unobserved failure
+/// — and the transient stays where the claim left it.
+export impl type P: Pipe<Task<Result<type T, type E>>> {
+	fun transient(own self): Transient<T, E> {
+		let seal: Transient<T, E> = Transient::pending();
+		// A DERIVATION: it publishes a state, so a turn settles it before any
+		// effect reads it — the `Refreshing` a change moves it to is already there.
+		as_derivation();
+		let subscription = self.sub(|task: Task<Result<T, E>>| {
+			let mine = seal.claim();
+			let _settling = async {
+				let outcome: Result<Result<T, E>, str> = guarded_async(|| await task);
+				// A superseded task — cancelled, or merely slower — is dropped
+				// before its outcome is looked at: its abort is not a failure.
+				if seal.current(mine) {
+					match outcome {
+						Ok(let answered) => seal.settle(mine, answered),
+						Err(let message) => panic(message),
+					}
+				}
+			};
+		});
+		seal.hold(subscription);
+		seal
+	}
+}
+
+/// `.transient()` over a flow of BARE tasks (R36): a task that panics is
+/// `Failed(message, stale)`, so `E` is `str`.
+export impl type P: Pipe<Task<type T>> {
+	fun transient(own self): Transient<T, str> {
+		let seal: Transient<T, str> = Transient::pending();
+		as_derivation();
+		let subscription = self.sub(|task: Task<T>| {
+			let mine = seal.claim();
+			let _settling = async {
+				let outcome: Result<T, str> = guarded_async(|| await task);
+				seal.settle(mine, outcome);
+			};
+		});
+		seal.hold(subscription);
+		seal
+	}
+}
+
+// === One task: `TaskSource` (R24) =============================================
+
+/// ONE task as a transient: `Pending`, then `Ready` or `Failed(e, None)`, and
+/// nothing after — a task never leaves its answer. `TaskSource::new` over a task
+/// that answers `Result<T, E>` (an `Err` is `Failed`), `TaskSource::of` over a bare
+/// one (a panic is `Failed(message, None)`, R36's rule).
+export struct TaskSource<T, E> {
+	cell: SignalCell<TransientState<T, E>>,
+}
+
+export impl TaskSource<type T, type E> {
+	/// Watch `task`, which answers `Result<T, E>`.
+	fun new(task: Task<Result<T, E>>): TaskSource<T, E> {
+		let source: TaskSource<T, E> = TaskSource {
+			cell = SignalCell::new(TransientState::Pending),
+		};
+		let _settling = async {
+			let outcome: Result<Result<T, E>, str> = guarded_async(|| await task);
+			match outcome {
+				Ok(let answered) => match answered {
+					Ok(let value) => source.cell.set(TransientState::Ready(value)),
+					Err(let error) => source.cell.set(TransientState::Failed(error, None)),
+				},
+				Err(let message) => panic(message),
+			}
+		};
+		source
+	}
+}
+
+export impl TaskSource<type T, str> {
+	/// Watch a bare `task`: a panic is `Failed(message, None)`.
+	fun of(task: Task<T>): TaskSource<T, str> {
+		let source: TaskSource<T, str> = TaskSource {
+			cell = SignalCell::new(TransientState::Pending),
+		};
+		let _settling = async {
+			let outcome: Result<T, str> = guarded_async(|| await task);
+			match outcome {
+				Ok(let value) => source.cell.set(TransientState::Ready(value)),
+				Err(let message) => source.cell.set(TransientState::Failed(message, None)),
+			}
+		};
+		source
+	}
+}
+
+export impl TaskSource<type T, type E> with Source<Option<T>> {
+	fun get(self): Option<T> {
+		self.cell.get().ready()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.cell.on_settle(subscriber)
+	}
+}
+
+export impl TaskSource<type T, type E> with TransientSource<T, E> {
+	fun state(self): MemoCell<TransientState<T, E>> {
+		MemoCell { cell = self.cell }
+	}
+
+	fun latest(self): dyn Pipe<Option<T>> {
+		let pipe: dyn Pipe<Option<T>> = self.cell.derive(|state| state.latest());
+		pipe
+	}
+
+	fun is_pending(self): dyn Pipe<bool> {
+		let pipe: dyn Pipe<bool> = self.cell.derive(|state| state.is_pending());
+		pipe
+	}
+}

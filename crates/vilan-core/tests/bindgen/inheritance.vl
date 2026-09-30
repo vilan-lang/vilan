@@ -173,7 +173,7 @@ impl Orphan {
 
 	[extern(get, "own")]
 	[platform("node")]
-	external fun own_(self): str;
+	external fun own(self): str;
 
 	[extern(set, "own")]
 	[platform("node")]

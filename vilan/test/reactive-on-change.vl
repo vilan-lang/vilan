@@ -1,21 +1,30 @@
-// `Source::on_change` / `Source::effect_on_change` (backlog A43) and the A49
-// INVERSION: `on_change` is the trait's subscription REQUIREMENT and `sub` is
-// the eager form derived from it — attach lazily, then make one call with the
-// value the source already holds. Nothing is swallowed anywhere.
+// `Flow::on_change` / `Flow::effect_on_change` (backlog A43) over a root, and a
+// custom `Source` (A142 R29): a source writes its read and its no-payload attach,
+// `get` and `on_settle`, and every consumer arrives through `Flow`.
 //
 // Four claims:
 //   1. `on_change` skips the first call and fires on every change after it;
 //      `sub` beside it still fires immediately (they observe one signal).
 //   2. `effect_on_change` is the owner-registered form: it dies with the scope.
-//   3. The trait's DEFAULT `sub` serves a custom `Source` that implements only
-//      `get`/`on_change` — it attaches and then makes EXACTLY ONE call.
-//   4. `map` is a `Source` member now (reactive-traits.md Q5's widening rode
-//      in on `on_change`), so a custom source derives like a cell does.
+//   3. `Source::attach_observer`'s DEFAULT serves a custom `Source` that
+//      implements only `get`/`on_settle` — `sub` attaches and then makes EXACTLY
+//      ONE call.
+//   4. A custom source is a `Flow`, so it derives like a cell does, and the pipe
+//      is sealed where it is read as well as subscribed to.
 import std::io::print;
-import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscription, comp, owner_scope };
+import std::reactive::{
+	Disposable,
+	Signal,
+	SignalCell,
+	Source,
+	Subscriber,
+	Subscription,
+	comp,
+	owner_scope,
+};
 
-/// A `Source` of one's own: `get` and `on_change`, nothing else. `sub`,
-/// `effect`, `effect_on_change` and `map` all arrive as trait defaults.
+/// A `Source` of one's own: `get` and `on_settle`, nothing else. `sub`, `effect`,
+/// `effect_on_change` and `derive` all arrive through `Flow`.
 struct Stored<T> {
 	inner: SignalCell<T>,
 }
@@ -26,8 +35,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		self.inner.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.inner.on_settle(subscriber)
 	}
 }
 
@@ -53,31 +62,31 @@ fun main() {
 	count.set(5);
 
 	// The trait default over a custom `Source`: `Stored` writes only `get` and
-	// `on_change`, and the default `sub` is that attach PLUS one call with the
-	// current value — the eager contract, built by addition. The emitted body
-	// is the whole of it: no wrapper cell, no swallowed call, no branch riding
-	// every later notification.
-	// Re-keyed at A110 door 2: `as_derivation`/`as_derivation_for` are two
-	// more hoisted helpers, so this body's gensyms moved up two letters
-	// ($R/$S/$T -> $S/$T/$U). The CLAIM is unchanged.
-	// witness: const subscription = $T(self, observer); observer($U(self)); return subscription;
+	// `on_settle`, and `sub` is that attach PLUS one call with the current value —
+	// the eager contract, built by addition. The emitted body is the whole of it:
+	// no wrapper cell, no swallowed call, no branch riding every later
+	// notification.
+	// witness: if (immediately) { observer(
 	// witness-absent: seeded
 	let stored = Stored { inner = Signal::new(10) };
 	let eagerly = stored.sub(|value| print(i"eager {value}"));
 	stored.inner.set(11);
 	eagerly.dispose();
 
-	// And the lazy one on the same custom source: the impl's own member.
+	// And the lazy one on the same custom source.
 	let watched = stored.on_change(|value| print(i"stored {value}"));
 	stored.inner.set(12);
 	watched.dispose();
 
-	// Q5's widening: `map` is a `Source` member, so it derives off `Stored`.
-	let labelled = stored.map(|value| i"n={value}");
+	// A custom source is a `Flow`, so it derives off `Stored`; the pipe is read
+	// AND subscribed to, so it is sealed — under an owner, which releases the
+	// seal's registration on the source.
+	let (labelled, sealed) = comp(|| stored.derive(|value| i"n={value}").memo());
 	print(labelled.get());
 	let shown = labelled.sub(|value| print(i"label {value}"));
 	stored.inner.set(13);
 	shown.dispose();
+	sealed.dispose();
 }
 
 main();

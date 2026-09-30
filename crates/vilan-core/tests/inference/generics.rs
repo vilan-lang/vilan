@@ -1843,7 +1843,7 @@ fn owner_take_disposes_a_mapped_and_a_root_subscription() {
         fun main() {
             let owner = Owner::new();
             let count = Signal::new(0);
-            let doubled = count.map(|n| n * 2);
+            let doubled = count.derive(|n| n * 2);
             owner.take(doubled.sub(|n| print(i"a={n}")));   // mapped/late site
             owner.take(count.sub(|n| print(i"b={n}")));     // root/early site
             count.set(1);       // a=2, b=1
@@ -1881,25 +1881,26 @@ fn lone_set_notifies_synchronously() {
 fn batch_commits_value_immediately_but_defers_notification() {
     // Inside a `batch`, a root's value is committed at once (`s.get()` is
     // fresh), and what is DEFERRED is the notification, not the value. Re-derived
-    // at A124 S2c: a cold derivation (`map`) stores nothing, so a read inside
-    // the batch PULLS the committed root and is fresh too (`doubled=10` — the
-    // pre-flip pin read `doubled=0`, when `map` answered a cell); the stale
-    // mid-batch read is now what a CACHED derivation shows — `.cell()` is
-    // settled by the notification the batch defers (`cached=0`), and reads the
-    // settled value after the flush. One program, both halves of the claim.
+    // at A124 S2c: a cold derivation stores nothing, so a read inside the batch
+    // PULLS the committed root and is fresh too (`doubled=10` — the pre-flip pin
+    // read `doubled=0`, when `map` answered a cell); the stale mid-batch read is
+    // now what a CACHED derivation shows — `.cell()` is settled by the
+    // notification the batch defers (`cached=0`), and reads the settled value
+    // after the flush. One program, both halves of the claim. (A142: a `derive`
+    // pipe has no `get` and one consumer, so the fresh read is a one-off
+    // `.sample()` of its own pipe, and the cached half seals another.)
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source, batch };
         fun main() {
             let s = Signal::new(0);
-            let doubled = s.map(|n| n * 2);
-            let cached = doubled.cell();
+            let cached = s.derive(|n| n * 2).cell();
             batch(|| {
                 s.set(5);
-                print(i"in-batch s={s.get()} doubled={doubled.get()} cached={cached.get()}");
+                print(i"in-batch s={s.get()} doubled={s.derive(|n| n * 2).sample()} cached={cached.get()}");
             });
-            print(i"after doubled={doubled.get()} cached={cached.get()}");
+            print(i"after doubled={s.derive(|n| n * 2).sample()} cached={cached.get()}");
         }
         "#,
         "in-batch s=5 doubled=10 cached=0\nafter doubled=10 cached=10\n",
@@ -1967,8 +1968,8 @@ fn batch_cascade_settles_in_one_flush() {
         import std::reactive::{ Signal, SignalCell, batch };
         fun main() {
             let a = Signal::new(1);
-            let b = a.map(|n| n + 1);      // b = a + 1
-            let c = b.map(|n| n * 10);     // c = b * 10
+            let b = a.derive(|n| n + 1);      // b = a + 1
+            let c = b.derive(|n| n * 10);     // c = b * 10
             let _ = c.sub(|v| print(i"c={v}"));   // immediate: c=20
             batch(|| { a.set(5); });               // a=5 -> b=6 -> c=60
         }
@@ -2055,16 +2056,16 @@ fn update_generalizes_over_every_collection() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         import std::reactive::{ Signal, SignalCell };
         struct Counter { hits: i32 }
         fun main() {
-            let scores: SignalCell<Map<str, i32>> = Signal::new(Map::new());
+            let scores: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());
             scores.update(|&mut m| { m.insert("a", 1); m.insert("b", 2); });
             print(scores.get().len());
 
-            let tags: SignalCell<Set<i32>> = Signal::new(Set::new());
+            let tags: SignalCell<HashSet<i32>> = Signal::new(HashSet::new());
             tags.update(|&mut s| { s.insert(7); });
             print(tags.get().len());
 
@@ -2630,12 +2631,12 @@ fn expose_accepts_a_users_own_source_impl() {
     // the `Source` impl, so it is Wire-checked exactly as the cell's is.
     assert_compiles(
         r#"
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         struct Session {
             [expose] status: Stored<str>,
@@ -2651,13 +2652,13 @@ fn expose_rejects_a_users_source_over_a_non_wire_element() {
     // exposed did not widen what may cross the wire.
     assert_fails_with(
         r#"
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         struct Password { hash: str }
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         struct Session {
             [expose] secret: Stored<Password>,
@@ -5165,11 +5166,11 @@ fn b185_rebinding_a_map_parameter() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::reactive::Signal;
 
         fun main() {
-            mut seed: Map<str, i32> = Map::new();
+            mut seed: HashMap<str, i32> = HashMap::new();
             seed.insert("a", 1);
             let s = Signal::new(seed);
             s.set_with(|entries| {
@@ -6288,7 +6289,7 @@ fn b225_the_kolt_shape_two_fields_of_one_parameter_in_the_subjects_own_impl() {
         struct Searchable<T> { list: SignalCell<List<T>>, table: SignalCell<List<T>> }
         impl Searchable<type T> {
             fun new(list: SignalCell<List<T>>, key: sync |T| str) {
-                Searchable { table = list.map(|l| l.map(|x| key(x).to_lowercase())).cell(), list }
+                Searchable { table = list.derive(|l| l.map(|x| key(x).to_lowercase())).cell(), list }
             }
         }
         fun main() {
@@ -7282,19 +7283,19 @@ fn b244_maps_conditional_wire_impl_takes_the_same_path() {
         import std::io::print;
         import std::wire::{ Wire, Serializer, Frame };
         import std::json::json_codec;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::hash::Hashable;
 
-        fun narrate<K: Hashable + Wire, V: Wire>(rows: List<Map<K, V>>, mut serializer: Serializer) {
+        fun narrate<K: Hashable + Wire, V: Wire>(rows: List<HashMap<K, V>>, mut serializer: Serializer) {
             rows.describe(&mut serializer);
         }
 
         fun main() {
             let codec = json_codec();
             let (serializer, finish) = (codec.writer)();
-            mut row: Map<str, i32> = Map::new();
+            mut row: HashMap<str, i32> = HashMap::new();
             row.insert("a", 1);
-            let rows: List<Map<str, i32>> = [row];
+            let rows: List<HashMap<str, i32>> = [row];
             narrate(rows, serializer);
             match finish() {
                 Frame::Text(let text) => print(text),
@@ -8730,8 +8731,8 @@ fn b372_signal_new_in_a_closures_return_binds_its_parameter_from_the_argument() 
 
         fun main() {
             let n = Signal::new(1);
-            let inner = n.map(|m| Signal::new(m * 2));
-            print(inner.get().get());
+            let inner = n.derive(|m| Signal::new(m * 2));
+            print(inner.sample().get());
         }
         "#,
         "2\n",
@@ -8803,8 +8804,8 @@ fn b372_the_same_through_combine_and_a_destructured_parameter() {
         fun main() {
             let a = Signal::new(1);
             let b = Signal::new(10);
-            let summed = combine((a, b)).map(|(x, y)| Signal::new(x + y));
-            print(summed.get().get());
+            let summed = combine((a, b)).derive(|(x, y)| Signal::new(x + y));
+            print(summed.sample().get());
         }
         "#,
         "11\n",
@@ -8891,5 +8892,287 @@ fn b392_the_annotated_parameter_control() {
             "{B392_PRELUDE}fun main() {{\n\tlet h = |m: i32| wrap(m);\n\tprint(h(5).value);\n}}\n"
         ),
         "5\n",
+    );
+}
+
+// --- B403: a static call on a bounded impl generic nothing binds -------------
+//
+// The owner's ruling (2026-09-26): a BARE `Type::f()` inside `Type`'s own impl
+// MEANS `Self::f()` (std's JSON statics are the exhibit), and outside every
+// impl of `Type` a bounded impl parameter that neither the arguments nor the
+// return can bind is refused. Unbound, JS stopped with an internal error and
+// the native build emitted ONE instance for every `Holder<X>` (`A A`).
+
+const B403_HEAD: &str = concat!(
+    "import std::io::print;\n",
+    "trait Label { fun label(): str; }\n",
+    "struct A {}\n",
+    "impl A with Label { fun label(): str { \"A\" } }\n",
+    "struct B {}\n",
+    "impl B with Label { fun label(): str { \"B\" } }\n",
+    "struct Holder<T> { v: T }\n",
+);
+
+#[test]
+fn b403_a_bare_static_inside_its_own_impl_means_self() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun tag(): str { T::label() }\n",
+                "\tfun show(self): str { Holder::tag() }\n",
+                "\tfun show_self(self): str { Self::tag() }\n",
+                "\tfun show_named(self): str { Holder<T>::tag() }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder { v = A {} }.show());\n",
+                "\tprint(Holder { v = B {} }.show());\n",
+                "\tprint(Holder { v = A {} }.show_self());\n",
+                "\tprint(Holder { v = B {} }.show_named());\n",
+                "}\n",
+            )
+        ),
+        "A\nB\nA\nB\n",
+    );
+}
+
+#[test]
+fn b403_a_bare_static_outside_the_impl_that_nothing_binds_is_refused() {
+    assert_fails_once_with(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun tag(): str { T::label() }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder<A>::tag());\n",
+                "\tprint(Holder::tag());\n",
+                "}\n",
+            )
+        ),
+        "cannot infer 'T' for this call; its bound ': Label' cannot be checked",
+    );
+}
+
+#[test]
+fn b403_a_bare_static_bound_by_its_arguments_or_its_return_compiles() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B403_HEAD}{}",
+            concat!(
+                "impl Holder<type T: Label> {\n",
+                "\tfun make(v: T): Holder<T> { Holder { v } }\n",
+                "\tfun name(self): str { T::label() }\n",
+                "\tfun parse(text: str): Option<Holder<T>> { None }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(Holder::make(A {}).name());\n",
+                "\tprint(Holder::make(B {}).name());\n",
+                "\tlet parsed: Option<Holder<B>> = Holder::parse(\"x\");\n",
+                "\tprint(parsed.is_none());\n",
+                "}\n",
+            )
+        ),
+        "A\nB\ntrue\n",
+    );
+}
+
+// --- B427: a destructuring `let` of an unfilled closure parameter ------------
+
+/// `let (x, y) = pair` inside `|pair| ..` waits for the call to fill `pair`
+/// (B185's rule, at a destructure) — typed as it stood, both names bound
+/// `Unknown` and the blanket `map`'s `U` stayed open. (A142: `map` is
+/// `Flow::derive`, and the pipe is read once with `.sample()`.)
+#[test]
+fn b427_a_destructured_closure_parameter_types_the_closure_tail() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, combine };\n",
+            "fun main() {\n",
+            "\tlet a = Signal::new(1);\n",
+            "\tlet b = Signal::new(2);\n",
+            "\tlet sum = combine((a, b)).derive(|pair| { let (x, y) = pair; x + y });\n",
+            "\tprint(sum.sample());\n",
+            "\tlet p = Signal::new((3, 4));\n",
+            "\tlet q = p.derive(|pair| { let (x, y) = pair; x * y });\n",
+            "\tprint(q.sample());\n",
+            "}\n",
+        ),
+        "3\n12\n",
+    );
+}
+
+// --- B424: an unconstrained generic at a call (RULED R-h, 2026-09-28) --------
+
+/// Door (b): a combinator's own generic that only re-types one of the
+/// receiver's parameters takes the receiver's when nothing binds it —
+/// `or_else`'s `F` is the input's `E` when the closure builds only `Ok`, and a
+/// `_` parameter carries no obligation.
+#[test]
+fn b424_or_else_with_an_ok_only_closure_keeps_the_input_error_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet err: Result<i32, str> = Err(\"bad\");\n",
+            "\tlet fixed = err.or_else(|e| Ok(7));\n",
+            "\tlet same: Result<i32, str> = fixed;\n",
+            "\tprint(same.unwrap_or(0));\n",
+            "\tlet ignored: Result<i32, str> = err.or_else(|_| Ok(8));\n",
+            "\tprint(ignored.unwrap_or(0));\n",
+            "\tlet changed: Result<i32, i32> = err.or_else(|_| Err(3));\n",
+            "\tprint(changed.unwrap_or(0));\n",
+            "}\n",
+        ),
+        "7\n8\n0\n",
+    );
+}
+
+/// Door (a): anywhere else a generic nothing binds, and that the result is
+/// typed by, is refused with the steer; written on the binding or as the
+/// type argument, it compiles.
+#[test]
+fn b424_an_unbound_generic_typing_a_calls_result_is_refused() {
+    assert_fails_once_with(
+        concat!(
+            "fun nothing<U>(): Option<U> { None }\n",
+            "fun main() {\n",
+            "\tlet x = nothing();\n",
+            "}\n",
+        ),
+        "cannot infer 'U' for this call: nothing it is passed binds it, and its result is typed by it",
+    );
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun nothing<U>(): Option<U> { None }\n",
+            "fun main() {\n",
+            "\tlet y: Option<i32> = nothing();\n",
+            "\tlet z = nothing<str>();\n",
+            "\tprint(i\"{y.is_none()} {z.is_none()}\");\n",
+            "}\n",
+        ),
+        "true true\n",
+    );
+}
+
+/// A `_` closure parameter is never what a refusal asks to annotate.
+#[test]
+fn b424_an_underscore_closure_parameter_carries_no_annotation_obligation() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun apply<T, U>(value: T, transform: |T| U): U { transform(value) }\n",
+            "fun main() {\n",
+            "\tprint(apply(3, |_| \"x\"));\n",
+            "\tlet ignore = |_| {};\n",
+            "}\n",
+        ),
+        "x\n",
+    );
+}
+
+// --- B434: a closure parameter reaches a generic constructor in the tail ------
+//
+// `|v| SignalCell::new(Some(v))` typed `Some(v)` before `v` was filled, as an
+// ERASED `Option`, and the enclosing call bound its parameter to that for good
+// (`and_then`'s `U` never bound). A variant construction whose payload awaits a
+// closure parameter now waits for the fill, as B372's arguments and B427's
+// destructure do.
+
+const B434_HOLDS: &str = r#"
+struct Boxed<T> {
+    value: T,
+}
+fun wrap<T>(value: T): Boxed<T> {
+    Boxed { value = value }
+}
+trait Holds<T> {
+    fun held(self): T;
+}
+impl Boxed<type T> with Holds<T> {
+    fun held(self): T {
+        self.value
+    }
+}
+fun apply<T, U, H: Holds<Option<U>>>(input: T, select: |T| H): Option<U> {
+    select(input).held()
+}
+"#;
+
+#[test]
+fn b434_and_then_over_a_constructed_cell_binds_its_value_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::SignalCell;
+        fun main() {
+            let maybe = SignalCell::new(Some(1));
+            let chained = maybe.and_then(|v| SignalCell::new(Some(v))).memo();
+            print(chained.get().unwrap());
+            let computed = maybe.and_then(|v| SignalCell::new(Some(v + 10))).memo();
+            print(computed.get().unwrap());
+        }
+        "#,
+        "1\n11\n",
+    );
+}
+
+#[test]
+fn b434_a_generic_constructor_around_the_parameter_binds_through_a_bound() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B434_HOLDS}\nfun main() {{\n    print(apply(5, |v| wrap(Some(v))).unwrap());\n}}\n"
+        ),
+        "5\n",
+    );
+}
+
+#[test]
+fn b434_a_let_bound_closure_still_types_from_its_own_call() {
+    // The wait ends when the fixpoint stalls: a let-bound closure is filled at
+    // its own call site, which waits on this body.
+    assert_compiles_and_runs(
+        &format!(
+            "{B434_HOLDS}\nfun main() {{\n    let make = |v| wrap(Some(v));\n    print(make(3).value.unwrap());\n}}\n"
+        ),
+        "3\n",
+    );
+}
+
+#[test]
+fn b434_filter_map_over_an_into_flow_bound_takes_the_parameter_itself() {
+    // collections-44's first customer: `filter_map(|x| x)`, the closure's
+    // return a generic `F: IntoFlow<Option<U>>` read through its bound.
+    assert_compiles_and_runs(
+        r#"
+        trait IntoFlow<T> {
+            fun into_flow(self): T;
+        }
+        impl Option<type T> with IntoFlow<Option<T>> {
+            fun into_flow(self): Option<T> {
+                self
+            }
+        }
+        fun filter_map<T, U, F: IntoFlow<Option<U>>>(items: List<T>, select: |T| F): List<U> {
+            mut kept: List<U> = [];
+            for item in items {
+                match select(item).into_flow() {
+                    Some(let value) => kept.push(value),
+                    None => {},
+                }
+            }
+            kept
+        }
+        fun main() {
+            let kept = filter_map([Some(1), None, Some(3)], |x| x);
+            print(kept.len());
+            let wrapped = filter_map([1, 2], |x| Some(x * 10));
+            print(wrapped[1]);
+        }
+        "#,
+        "2\n20\n",
     );
 }

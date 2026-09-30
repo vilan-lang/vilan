@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, ten crates, plus the language's own tree:
+Rust workspace, eleven crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -69,6 +69,11 @@ Rust workspace, ten crates, plus the language's own tree:
   `vilan-rt` could reach only through a crate or `unsafe`; the digests are hand-written, the
   crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
   when the program reaches one of its bindings (optimized even in the dev profile).
+- `crates/vilan-rt-signal` — a native server's graceful stop on SIGTERM/SIGINT/SIGHUP (F45;
+  Order 43's R-i): installing a signal handler is FFI or a crate, so `ctrlc` (already the
+  CLI's) lives here and routes the signals to `vilan_rt::http::request_termination`; the
+  crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
+  when the program starts an HTTP server.
 
 ## Definition of done (the gates)
 
@@ -115,9 +120,11 @@ Rust workspace, ten crates, plus the language's own tree:
 7. **The suite runs on 8 MiB test threads, and that is a MARGIN, not a
    licence** (N97). libtest gives every `#[test]` a 2 MiB thread, and the
    analyzer's expression walk spends one frame per level of source nesting —
-   ~46.3 KiB of it unoptimized, ~2.1 KiB optimized, measured with
-   `VILAN_DEPTH_STATS=1` over chains of known depth (N128's re-measurement,
-   2026-09-25; the 11.3 KiB this said was an older optimized frame). Order 36's arms grew that
+   ~25.8 KiB of it unoptimized, ~1 KiB optimized, measured with
+   `VILAN_DEPTH_STATS=1` over chains of known depth (Order 44's seal,
+   2026-09-30, after its largest arms moved into their own `#[inline(never)]`
+   methods; N128 read ~46.3 KiB, and the 11.3 KiB this said was an older
+   optimized frame). A new arm with real locals belongs out of line too. Order 36's arms grew that
    frame while the recursion stayed put, and a nine-level module-cycle pin
    aborted the Windows shard with `0xc00000fd`; the fix was
    `.cargo/config.toml`'s `[env] RUST_MIN_STACK = "8388608"`, which cargo and

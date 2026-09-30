@@ -1,0 +1,12 @@
+import std::io::print;
+
+fun main() {
+	// N106: OUTSIDE the differential by name (`OUTSIDE_THE_DIFFERENTIAL` in
+	// `native_differential.rs`) — negative zero prints "-0" through node's
+	// `console.log` (a `util.inspect` special case), but "0" through every
+	// JS stringification `vilan_rt::js_number` implements (`String(x)`,
+	// a template literal, `JSON.stringify`) — which is what the native
+	// backend's `print` uses. The two backends legitimately disagree here;
+	// this is the printing-site documentation the divergence needs.
+	print(0f * -1f); // "-0" on JS, "0" natively
+}

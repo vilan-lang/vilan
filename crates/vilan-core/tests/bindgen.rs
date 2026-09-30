@@ -487,15 +487,16 @@ fn a_numeric_index_signature_is_never_mapped_to_list() {
 
 #[test]
 fn a_string_index_signature_is_never_mapped_to_map() {
-    // Same root cause: `std::map::Map` is a plain vilan struct wrapping a
+    // Same root cause: `std::hash_map::HashMap` is a plain vilan struct wrapping a
     // `NativeMap` keyed by `key.hash()`, not a host `{a: 1}` object.
     let output = bind("interface Lookup { [key: string]: number; }");
     assert!(
         output.contains("TODO(bindgen): string index signature"),
         "{output}"
     );
-    // The TODO prose MENTIONS `Map<str, T>` to say why it is wrong; what must
-    // not appear is `Map` in a type position.
+    // The TODO prose MENTIONS `HashMap<str, T>` to say why it is wrong; what
+    // must not appear is the map in a type position, under either name.
+    assert!(!output.contains(": HashMap<"), "{output}");
     assert!(!output.contains(": Map<"), "{output}");
 }
 
@@ -1706,5 +1707,41 @@ fn option_cannot_cross_a_host_boundary_in_either_direction() {
     assert!(
         javascript.contains("host([ 1 ])") || javascript.contains("host([1])"),
         "`None` should reach the host as the raw tagged array, got:\n{javascript}"
+    );
+}
+
+/// E225: a TypeScript member named a keyword the old hand list missed binds to
+/// an escaped name, and the bindings COMPILE — before, they emitted
+/// `fun lazy(self)` and did not parse; a free function named one was never
+/// escaped at all. `css` is reserved and escapes; B414 made `dyn` and `lazy`
+/// CONTEXTUAL, legal names, so they bind as written — and still compile,
+/// member and free function alike. `resource` (an attribute since B413) is an
+/// ordinary name too.
+#[test]
+fn e225_members_named_css_dyn_or_lazy_bind_to_escaped_names_that_compile() {
+    let source = bind(
+        "export interface Sheet {\n  css: string;\n  dyn(): void;\n  lazy: number;\n  resource: string;\n}\n\
+         export declare function lazy(): void;\n\
+         export declare function css(): void;\n",
+    );
+    assert!(source.contains("css_"), "`css_` is emitted:\n{source}");
+    for contextual in ["fun dyn(", "fun lazy("] {
+        assert!(
+            source.contains(contextual),
+            "`{contextual}` binds as written (B414):\n{source}"
+        );
+    }
+    // A FREE function named a reserved keyword too — the top-level path
+    // escaped nothing at all.
+    assert!(source.contains("external fun css_(): void;"), "{source}");
+    assert!(source.contains("external fun lazy(): void;"), "{source}");
+    assert!(
+        source.contains("fun resource("),
+        "`resource` binds as written:\n{source}"
+    );
+    let errors = compile(&format!("{source}\nfun main() {{}}\n"));
+    assert!(
+        errors.is_empty(),
+        "the bindings compile: {errors:?}\n{source}"
     );
 }

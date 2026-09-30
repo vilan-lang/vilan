@@ -26,23 +26,26 @@ thing. If that sounds strange coming from JavaScript, start with
 ## Reserved words
 
 These words are the language's own; none of them can be a binding, a
-parameter, a field or a type name. Most you will meet as you go, but two
-are worth knowing before you hit them: `own` (a parameter that takes
-ownership — see [the memory model](memory-model.md)) and `jump` (the
-prefix on `break` and `continue`), because both are short, ordinary
-English words that make good variable names in every other language.
+parameter, a field or a type name. Most you will meet as you go.
 
 ```text
-async    await    borrows  const    css      dyn      else     enum
-export   external false    for      fun      if       impl     import
-in       is       jump     lazy     let      macro    match    mod
-mut      null     own      ret      struct   trait    true     type
-use      with
+async    await    const    css      else     enum     export   external
+false    for      fun      if       impl     import   in       is
+let      macro    match    mod      mut      null     ret      struct
+trait    true     type     use
 ```
 
-A few more words — `self`, `Self`, `void`, `context`, `sync`, `as`, and
-the attribute names in `[...]` — mean something only in one position and
-are ordinary identifiers everywhere else. Spec
+A few more words mean something only in one position and are ordinary
+identifiers everywhere else: `own` (a parameter that takes ownership —
+see [the memory model](memory-model.md)), `jump` (the prefix on `break`
+and `continue`), `lazy`, `dyn`, `with`, `borrows`, `self`, `Self`, `void`,
+`context`, `sync`, `as`, and the attribute names in `[...]`. So `let own =
+owner();`, a field called `with` and a method called `jump` are all fine,
+beside the keyword readings in the same file. Even a reserved word names a
+MEMBER — a field `type`, a method `match`, read as `event.type` and called
+as `shape.match()` — because a member is reached through a receiver or a
+`::` path, never on its own; it still cannot name a binding, a parameter
+or a free function. Spec
 [§2.2](../spec/lexical.md#22-identifiers-and-keywords) lists them, and
 [§A.2](../spec/appendix.md#a2-reserved-words) is the table.
 
@@ -232,12 +235,12 @@ a spread, and vilan has no range operator for it to be confused with.
 
 ## Collections
 
-`List<T>` is built in and has literal syntax. `Map<K, V>` and `Set<T>`
+`List<T>` is built in and has literal syntax. `HashMap<K, V>` and `HashSet<T>`
 come from std:
 
 ```vilan
-import std::map::Map;
-import std::set::Set;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
 
 fun main() {
 	mut items: List<i32> = [1, 2, 3];
@@ -245,10 +248,10 @@ fun main() {
 	print(items.len());
 	print(items[0]);
 
-	mut scores: Map<str, i32> = Map::new();
+	mut scores: HashMap<str, i32> = HashMap::new();
 	scores.insert("ada", 100);
 
-	mut seen: Set<i32> = Set::new();
+	mut seen: HashSet<i32> = HashSet::new();
 	seen.insert(7);
 	print(seen.contains(7));
 }
@@ -293,7 +296,7 @@ length is known, `let [r, g, b] = rgb;` destructures one irrefutably,
 with the element count checked against the type (works in parameter
 position too).
 
-> **Going deeper.** `Map` and `Set` key **by value**. Scalar keys (`i32`,
+> **Going deeper.** `HashMap` and `HashSet` key **by value**. Scalar keys (`i32`,
 > `str`) and backed enums (`enum Align { Start = "flex-start" }` — the enum
 > *is* the string) work directly; a struct, an unbacked enum, or a `List`
 > key works once it derives `Hashable` (`[derive(Hashable)]`), so two equal

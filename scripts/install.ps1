@@ -4,9 +4,19 @@
 #   irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
 #
 # Idempotent: re-running it updates in place. It only ever touches the install
-# directory and the *user* PATH, so it needs no administrator rights.
+# directory, the *user* PATH and — when VS Code's `code` is on PATH — the user's
+# VS Code extensions, so it needs no administrator rights. The Vilan
+# extension is installed alongside the toolchain (E229): an editor extension
+# older than its language server silently lacks what the server's release
+# notes promise. From the gallery by id when the editor can reach it, else from
+# the release's verified `vilan-vscode.vsix` (E230). Opt out by setting
+# VILAN_NO_VSCODE first:
+#
+#   $env:VILAN_NO_VSCODE = '1'; irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
 
 $repo = 'vilan-lang/vilan'
+$vsix = 'vilan-vscode.vsix'
+$extensionId = 'vilan-lang.vilan'
 $baseUrl = "https://github.com/$repo/releases/latest/download"
 $binDir = if ($env:VILAN_INSTALL_DIR) {
     $env:VILAN_INSTALL_DIR
@@ -57,6 +67,21 @@ function Get-RecordedChecksum([string] $sumsPath, [string] $name) {
     return $null
 }
 
+# Verifies $name in $workdir against the release's sha256sums.txt there, or
+# stops the install by name.
+function Assert-Checksum([string] $workdir, [string] $name) {
+    $expected = Get-RecordedChecksum (Join-Path $workdir 'sha256sums.txt') $name
+    if (-not $expected) {
+        Fail "sha256sums.txt has no entry for $name"
+    }
+    # -ne on strings is case-insensitive, which is what we want:
+    # Get-FileHash writes upper-case hex, sha256sum lower-case.
+    $actual = (Get-FileHash -LiteralPath (Join-Path $workdir $name) -Algorithm SHA256).Hash
+    if ($actual -ne $expected) {
+        Fail "checksum mismatch for $name — aborting (expected $expected, got $actual)"
+    }
+}
+
 function Main {
     # Set here rather than at script scope: preference variables are
     # function-scoped, so an `iex`-run install cannot leave the user's session
@@ -86,15 +111,22 @@ function Main {
             Fail "download failed (sha256sums.txt)"
         }
 
-        $expected = Get-RecordedChecksum (Join-Path $workdir 'sha256sums.txt') $asset
-        if (-not $expected) {
-            Fail "sha256sums.txt has no entry for $asset"
+        Assert-Checksum $workdir $asset
+
+        # The editor is decided BEFORE anything is installed, so the extension
+        # is verified with the toolchain and a mismatch on either refuses both.
+        $editor = $null
+        if (-not $env:VILAN_NO_VSCODE) {
+            $editor = Get-Command code -ErrorAction SilentlyContinue | Select-Object -First 1
         }
-        # -ne on strings is case-insensitive, which is what we want:
-        # Get-FileHash writes upper-case hex, sha256sum lower-case.
-        $actual = (Get-FileHash -LiteralPath (Join-Path $workdir $asset) -Algorithm SHA256).Hash
-        if ($actual -ne $expected) {
-            Fail "checksum mismatch for $asset — aborting (expected $expected, got $actual)"
+        if ($editor) {
+            Say "downloading $vsix ..."
+            try {
+                Invoke-WebRequest -Uri "$baseUrl/$vsix" -OutFile (Join-Path $workdir $vsix) -UseBasicParsing
+            } catch {
+                Fail "download failed ($vsix) — set `$env:VILAN_NO_VSCODE = '1' to install the toolchain alone"
+            }
+            Assert-Checksum $workdir $vsix
         }
 
         New-Item -ItemType Directory -Path $binDir -Force | Out-Null
@@ -110,6 +142,29 @@ function Main {
             }
         }
         Expand-Archive -LiteralPath (Join-Path $workdir $asset) -DestinationPath $binDir -Force
+
+        # The toolchain is in place; an editor that refuses the extension is
+        # reported, never a reason to call the install failed.
+        if ($env:VILAN_NO_VSCODE) {
+            $extension = 'VS Code extension: not installed (VILAN_NO_VSCODE is set)'
+        } elseif (-not $editor) {
+            $extension = "VS Code extension: not installed (no ``code`` on PATH) — it is $vsix on https://github.com/$repo/releases"
+        } else {
+            # E230: the gallery id first — an install VS Code keeps updated
+            # from then on — and the verified release vsix when the gallery
+            # cannot be reached (`vilan upgrade` runs the same step).
+            $log = & $editor.Source --install-extension $extensionId --force 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $extension = "VS Code extension: installed $extensionId from the gallery (it updates itself from now on) — reload VS Code to use it"
+            } else {
+                $log = & $editor.Source --install-extension (Join-Path $workdir $vsix) --force 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    $extension = "VS Code extension: installed $vsix (the gallery was unreachable) — reload VS Code to use it"
+                } else {
+                    $extension = "VS Code extension: NOT installed — ``code --install-extension`` failed: $(@($log)[-1])"
+                }
+            }
+        }
     } finally {
         Remove-Item -Recurse -Force -LiteralPath $workdir -ErrorAction SilentlyContinue
     }
@@ -117,6 +172,7 @@ function Main {
     $version = & (Join-Path $binDir 'vilan.exe') --version
     Say ""
     Say "installed $version to $binDir"
+    Say $extension
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $entries = @($userPath -split ';' | Where-Object { $_ -ne '' })

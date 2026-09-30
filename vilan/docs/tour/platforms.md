@@ -99,6 +99,13 @@ resources (see [Services](../guide/services.md)).
 > hovering a function shows its inferred requirement and how it got it,
 > e.g. ``requires the `process` layer of `std` (via `save → write_file
 > (std::fs)`)``.
+>
+> When the SAME function (or the same trait `impl`) needs a different body
+> per platform, write it twice, each under its own fence —
+> `[platform("browser")]` and `[platform("@process")]` — and each build
+> compiles the twin its platform admits. The fences must not overlap, and
+> `vilan check` checks every twin under its own platform
+> ([spec §11.3](../spec/platform.md#113-fences)).
 
 ## Externs: talking to the host
 

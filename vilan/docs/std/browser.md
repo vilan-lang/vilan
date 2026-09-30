@@ -238,7 +238,7 @@ fun view(tag: str): View
 fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
-trait Slot { fun place(self, parent: View) }   // str | View | List<View>, and a Source of each
+trait Slot { fun place(own self, parent: View) }   // str | View | List<View>, and a Flow of each
 trait AttrValue { fun apply(self, parent: View, name: str) }   // str | Option<str>, and a Source of each
 ```
 
@@ -445,11 +445,13 @@ stay byte-comparable. On the process side a `Region` plants no node at all — a
 server render is one pass in source order, so appending already *is* inserting
 before the anchor.
 
-### A binding takes a `Source`, not a `Signal`
+### A binding takes a `Flow`, not a `Signal`
 
 Every binding above that only READS its argument is generic over
-[`Source<T>`](reactive.md#source), so a `Signal`, a derived signal, a
-`RemoteSource` mirror or a type of your own all drive it:
+[`Flow<T>`](reactive.md#source-flow-and-pipe) and consumes it (`own`), so a
+`Signal`, a pipe (`count.derive(..)`), a sealed memo, a `RemoteSource` mirror or
+a source of your own all drive it (the three `each` forms take a `Source`: seal a
+derived list with `.memo()`):
 
 ```vilan,fragment
 struct Stored<T> { inner: SignalCell<T> }
@@ -457,7 +459,7 @@ struct Stored<T> { inner: SignalCell<T> }
 impl Stored<type T> with Source<T> {
 	fun get(self): T { self.inner.get() }
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+	fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
 }
 ```
 
@@ -469,13 +471,14 @@ layer and the SSR twin.
 Two things deliberately still ask for the concrete type:
 
 - **`bind_value` and `bind_draft`**, because they WRITE BACK. `Source`
-  declares `get` and `on_change` and no `set`, so there is nothing to widen to
+  declares `get` and `on_settle` and no `set`, so there is nothing to widen to
   yet — the write side is its own design question.
 - **`attr` and `child`**, whose reactive arms are the `AttrValue` and
   `Slot` traits. Widening a trait ARM is a blanket impl rather than a bound
   on a parameter, and that is a separate piece of machinery — which B158/B165
   then built, so `<div href(source)>` and `<p>{source}</p>` do take any
-  `Source` today; `AttrValue`'s `Option` arms (A115) arrived the same way.
+  `Flow` today — a source or a pipe; `AttrValue`'s `Option` arms (A115) arrived
+  the same way.
 
 ## std::router
 
@@ -486,9 +489,9 @@ fun navigate_replace(path: str)       // replaceState — same, WITHOUT a new hi
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
 fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
-fun parse_query(query: str): Map<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
+fun parse_query(query: str): HashMap<str, str>   // "a=1&flag" → { "a": "1", "flag": "" }
 
-struct PathParts { segments: List<str>, query: Map<str, str>, fragment: Option<str> }
+struct PathParts { segments: List<str>, query: HashMap<str, str>, fragment: Option<str> }
 fun parse_path(path: str): PathParts  // cut, then decode — the READ direction
 
 trait Routable { fun to_path(self): str }              // route → URL

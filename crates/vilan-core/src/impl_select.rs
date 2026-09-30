@@ -259,10 +259,30 @@ pub fn subject_applies(program: &Program, subject: TypeId, target: TypeId) -> bo
     let mut bindings = HashMap::default();
     bind_subject(program, subject, target, &mut bindings);
     bindings.iter().all(|(constraint_id, bound_type)| {
-        bound_trait_ids(program, *constraint_id)
-            .iter()
-            .all(|trait_id| provides_trait(program, *bound_type, *trait_id))
+        tuple_bound_holds(program, *constraint_id, *bound_type)
+            && bound_trait_ids(program, *constraint_id)
+                .iter()
+                .all(|trait_id| provides_trait(program, *bound_type, *trait_id))
     })
+}
+
+/// A122: a binder's TUPLE bound (`impl type T: (2..)`) holds for a concrete
+/// tuple whose arity it admits, and for nothing else concrete — the blanket
+/// over tuples is not a blanket over every type.
+fn tuple_bound_holds(program: &Program, constraint_id: TypeId, bound_type: TypeId) -> bool {
+    let Some((lo, hi)) = program.tuple_bound_arities.get(&constraint_id) else {
+        return true;
+    };
+    match program.type_id_to_type_map.get(&bound_type) {
+        Some(Type::Tuple(elements)) => {
+            lo.is_none_or(|lo| elements.len() >= lo as usize)
+                && hi.is_none_or(|hi| elements.len() <= hi as usize)
+        }
+        Some(
+            Type::Struct(..) | Type::Enum(..) | Type::Array(..) | Type::Closure(..) | Type::Dyn(..),
+        ) => false,
+        _ => true,
+    }
 }
 
 /// [`subject_applies`], with each binder's PARAMETERIZED bounds read at their
@@ -311,16 +331,35 @@ fn bound_arguments_hold(
     if wanted.is_empty() {
         return true;
     }
-    let Some(provided) = provided_trait_arguments(program, concrete, trait_id) else {
+    // EVERY provider is asked, not the first (collections-44's find): a type
+    // may provide one trait at two instantiations — `impl type T with
+    // IntoFlow<T>` gives a `SignalCell<bool>` `IntoFlow<SignalCell<bool>>`, and
+    // `impl type F: Flow<type T> with IntoFlow<T>` gives it `IntoFlow<bool>` —
+    // and the bound holds when ANY of them provides what it wrote. Asking only
+    // the first applying impl turned a `R: IntoFlow<bool>` binder down for a
+    // flow, and the impl it guarded fell out of dispatch (a body-less
+    // requirement at emission).
+    let providers = provided_trait_argument_sets(program, concrete, trait_id);
+    if providers.is_empty() {
         return true;
-    };
+    }
+    providers
+        .iter()
+        .any(|(_, provided)| arguments_agree(program, wanted, provided))
+}
+
+/// Whether a provider's arguments agree with what a bound WROTE — position by
+/// position, a binder still in the bound (`Option<type U>`'s `U`) reading as
+/// agreement. An arity mismatch proves nothing and agrees, the leniency every
+/// caller here keeps.
+fn arguments_agree(program: &Program, wanted: &[TypeId], provided: &[TypeId]) -> bool {
     if provided.len() != wanted.len() {
         return true;
     }
     wanted.iter().zip(provided).all(|(wanted_id, provided_id)| {
         match (
             program.type_id_to_type_map.get(wanted_id),
-            program.type_id_to_type_map.get(&provided_id),
+            program.type_id_to_type_map.get(provided_id),
         ) {
             (Some(wanted), Some(provided)) => instantiation_agrees(program, wanted, provided),
             _ => true,
@@ -658,7 +697,7 @@ pub fn bind_subject_and_bounds(
 /// only expressible once a binder could be written inside a bound at all.
 fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap<TypeId, TypeId>) {
     // The walk recurses through a BLANKET provider's own bounds
-    // (`provided_trait_arguments`), so it carries the shared depth guard; a
+    // (`provided_trait_argument_sets`), so it carries the shared depth guard; a
     // walk that gives up binds nothing further.
     let Some(_guard) = crate::util::RecursionGuard::enter() else {
         return;
@@ -678,7 +717,9 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
             if bound_arguments.is_empty() {
                 continue;
             }
-            let Some(provided) = provided_trait_arguments(program, concrete, trait_id) else {
+            let Some(provided) =
+                provided_trait_arguments_matching(program, concrete, trait_id, &bound_arguments)
+            else {
                 continue;
             };
             if provided.len() != bound_arguments.len() {
@@ -705,6 +746,75 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
     }
 }
 
+/// F58: the PROVIDER's own binders, for a consumer that grounds types by
+/// substitution rather than by interning (the native emitter).
+///
+/// [`bind_bound_binders`] grounds a blanket's bound binder one step deep: in
+/// `impl type S: Source<type T> with Flow<T>` at `S = ListCell<str>`, the
+/// provider `impl ListCell<type E> with Source<List<E>>` answers `T =
+/// List<E>` — written in the PROVIDER's binder `E`, which a shallow walk cannot
+/// substitute without interning `List<str>`. This adds `E = str` (the
+/// provider's subject bound from the receiver) to `out`, so a type rendered
+/// under the substitution reaches `List<str>` through it.
+///
+/// Only binders `out` does not already hold are added, and a provider binder
+/// two receivers would bind differently is added for NEITHER: an unbound
+/// binder is refused by name downstream, where a wrong one would be a
+/// miscompile.
+pub fn bind_provider_binders(
+    program: &Program,
+    subject: TypeId,
+    out: &mut HashMap<TypeId, TypeId>,
+) {
+    let Some(_guard) = crate::util::RecursionGuard::enter() else {
+        return;
+    };
+    let mut binders = Vec::new();
+    collect_subject_binders(program, subject, &mut binders);
+    let mut added: HashMap<TypeId, TypeId> = HashMap::default();
+    let mut conflicted: Vec<TypeId> = Vec::new();
+    for binder in binders {
+        let Some(concrete) = out.get(&binder).copied() else {
+            continue;
+        };
+        for bound_id in bound_type_ids(program, binder) {
+            let Some(Type::Trait(trait_id, _)) = program.type_id_to_type_map.get(&bound_id) else {
+                continue;
+            };
+            // The provider `provided_trait_arguments` answers from: the first
+            // impl providing the trait that applies to the receiver.
+            let Some(provider) = program.implementations.iter().find(|implementation| {
+                implementation
+                    .provided_trait_args
+                    .iter()
+                    .any(|(provided, _)| provided == trait_id)
+                    && subject_applies(program, implementation.subject, concrete)
+            }) else {
+                continue;
+            };
+            let mut bindings = HashMap::default();
+            bind_subject(program, provider.subject, concrete, &mut bindings);
+            for (provider_binder, value) in bindings {
+                if out.contains_key(&provider_binder) {
+                    continue;
+                }
+                match added.get(&provider_binder) {
+                    Some(previous) if *previous != value => conflicted.push(provider_binder),
+                    Some(_) => {}
+                    None => {
+                        added.insert(provider_binder, value);
+                    }
+                }
+            }
+        }
+    }
+    for (provider_binder, value) in added {
+        if !conflicted.contains(&provider_binder) {
+            out.insert(provider_binder, value);
+        }
+    }
+}
+
 /// The bound type ids a binder carries — the `Src<type T>` of
 /// `type S: Src<type T>`, arguments and all. [`bound_trait_ids`] reads the same
 /// list for its ids alone.
@@ -716,17 +826,57 @@ fn bound_type_ids(program: &Program, constraint_id: TypeId) -> Vec<TypeId> {
         .unwrap_or_else(|| vec![constraint_id])
 }
 
-/// The arguments `concrete` provides for `trait_id`, through the first impl
-/// that applies to it and names the trait — the emission-side reading of the
-/// analyzer's `trait_args_for`.
-fn provided_trait_arguments(
+/// The arguments `concrete` provides for `trait_id` that AGREE with what a bound
+/// wrote (`wanted`, binders reading as holes), from the most specific provider
+/// among those that do — the emission-side reading of the analyzer's
+/// `trait_args_for`, with its pattern.
+///
+/// A type may provide one trait at several instantiations (a plain blanket and
+/// a flow blanket over `IntoFlow`, above), so "the first impl that applies" is
+/// not an answer: the bound's own arguments pick the instantiations it can
+/// mean, and when more than one survives — a bare `type U` agrees with all of
+/// them — the specificity order picks among them, as it picks a member's body
+/// (tier 3): `impl type P: Pipe<type T> with IntoElement<T>` over the plain
+/// `impl type T with IntoElement<T>` for a pipe. Unranked survivors keep
+/// declaration order, the answer before this existed.
+fn provided_trait_arguments_matching(
     program: &Program,
     concrete: TypeId,
     trait_id: Id,
+    wanted: &[TypeId],
 ) -> Option<Vec<TypeId>> {
+    let providers: Vec<(TypeId, Vec<TypeId>)> =
+        provided_trait_argument_sets(program, concrete, trait_id)
+            .into_iter()
+            .filter(|(_, provided)| arguments_agree(program, wanted, provided))
+            .collect();
+    let maxima: Vec<&(TypeId, Vec<TypeId>)> = providers
+        .iter()
+        .filter(|(subject, _)| {
+            !providers
+                .iter()
+                .any(|(other, _)| subject_outranks(program, *other, *subject))
+        })
+        .collect();
+    match maxima.as_slice() {
+        [only] => Some(only.1.clone()),
+        _ => providers.first().map(|(_, provided)| provided.clone()),
+    }
+}
+
+/// Every applying provider of `trait_id` for `concrete`, with the arguments it
+/// provides grounded from the receiver, in declaration order.
+fn provided_trait_argument_sets(
+    program: &Program,
+    concrete: TypeId,
+    trait_id: Id,
+) -> Vec<(TypeId, Vec<TypeId>)> {
+    let mut providers = Vec::new();
     for implementation in &program.implementations {
+        // B419: through the supertrait chain — a one-block subtrait impl
+        // provides the supertrait too.
         let Some((_, written)) = implementation
-            .trait_args
+            .provided_trait_args
             .iter()
             .find(|(provided, _)| *provided == trait_id)
         else {
@@ -742,14 +892,15 @@ fn provided_trait_arguments(
         // the receiver's own impls too, or `Upstream`'s argument comes back as
         // the blanket's bare `T` (B379's analyzer half, here for emission).
         bind_bound_binders(program, implementation.subject, &mut bindings);
-        return Some(
+        providers.push((
+            implementation.subject,
             written
                 .iter()
                 .map(|argument| ground_id(program, *argument, &bindings))
                 .collect(),
-        );
+        ));
     }
-    None
+    providers
 }
 
 /// [`ground`] at the id level, one step deep: a written argument that IS a

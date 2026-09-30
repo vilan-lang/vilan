@@ -139,39 +139,40 @@ function f64_value(self, value2) {
 	write_f64(self, value2);
 }
 function bool_value(self, value2) {
+	const $al = self;
 	let $ak = null;
 	if (value2) {
 		$ak = 1;
 	} else {
 		$ak = 0;
 	}
-	write_byte(self, $ak);
+	write_byte($al, $ak);
 }
 function new3(bytes) {
 	return [ __clone(bytes), 0, [ 1 ] ];
 }
 function ok(self) {
-	const $ap = self[2];
-	let $aq = null;
-	if ($ap[0] === 0) {
-		const _reason = $ap[1];
-		$aq = false;
+	const $aq = self[2];
+	let $ar = null;
+	if ($aq[0] === 0) {
+		const _reason = $aq[1];
+		$ar = false;
 	} else {
-		$aq = true;
+		$ar = true;
 	}
-	return $aq;
+	return $ar;
 }
 function report(self, reason) {
-	const $an = self[2];
-	let $ao = null;
-	if ($an[0] === 0) {
-		const _first = $an[1];
-		$ao = undefined;
+	const $ao = self[2];
+	let $ap = null;
+	if ($ao[0] === 0) {
+		const _first = $ao[1];
+		$ap = undefined;
 	} else {
 		self[2] = [ 0, reason ];
-		$ao = undefined;
+		$ap = undefined;
 	}
-	return $ao;
+	return $ap;
 }
 function expect(self, count) {
 	if (!(ok(self))) {
@@ -345,18 +346,18 @@ function binary_codec() {
 			return [ 1, finish(writer) ];
 		} ];
 	}, (frame) => {
-		const $al = frame;
-		let $am = null;
-		if ($al[0] === 1) {
-			const bytes = $al[1];
-			$am = new3(bytes);
+		const $am = frame;
+		let $an = null;
+		if ($am[0] === 1) {
+			const bytes = $am[1];
+			$an = new3(bytes);
 		} else {
-			const text = $al[1];
+			const text = $am[1];
 			let poisoned = new3(new Uint8Array(0));
 			report(poisoned, "binary codec: received a text frame");
-			$am = poisoned;
+			$an = poisoned;
 		}
-		let reader = $am;
+		let reader = $an;
 		return [ () => {
 			return begin_struct2(reader);
 		}, (name) => {
@@ -909,13 +910,13 @@ function fold_unsigned(value2, modulus) {
 }
 function saturate_unsigned(value2) {
 	const truncated = Math.trunc(value2);
-	let $ar = null;
+	let $as = null;
 	if (truncated > 0) {
-		$ar = truncated;
+		$as = truncated;
 	} else {
-		$ar = 0;
+		$as = 0;
 	}
-	return $ar;
+	return $as;
 }
 function fold_signed(value2, modulus, half) {
 	const wrapped = fold_unsigned(value2, modulus);
@@ -1040,25 +1041,25 @@ function sub2(self, b) {
 function partial_compare3(self, b) {
 	return partial_compare(self[0], b[0]);
 }
-async function sleep(ms, $aE) {
-	await (__sleep(ms, ambient_signal($aE)));
+async function sleep(ms, $aF) {
+	await (__sleep(ms, ambient_signal($aF)));
 }
-async function sleep_for(duration, $aD) {
-	await (sleep(as_i32(duration[0]), $aD));
+async function sleep_for(duration, $aE) {
+	await (sleep(as_i32(duration[0]), $aE));
 }
 function eq(self, other) {
 	return self[0] === other[0];
 }
-function ambient_signal($aF) {
-	const $aG = $aF;
-	let $aH = null;
-	if ($aG[0] === 0) {
-		const n = $aG[1];
-		$aH = [ 0, n.signal_of() ];
+function ambient_signal($aG) {
+	const $aH = $aG;
+	let $aI = null;
+	if ($aH[0] === 0) {
+		const n = $aH[1];
+		$aI = [ 0, n.signal_of() ];
 	} else {
-		$aH = [ 1 ];
+		$aI = [ 1 ];
 	}
-	return $aH;
+	return $aI;
 }
 function begin_struct5(self, fields) {
 	self[0](fields);
@@ -1139,11 +1140,11 @@ function $af(deserializer) {
 function $ad(deserializer) {
 	begin_struct6(deserializer);
 	field6(deserializer, "at");
-	const at = $ae(deserializer);
+	const __at = $ae(deserializer);
 	field6(deserializer, "label");
-	const label = $af(deserializer);
+	const __label = $af(deserializer);
 	end_struct6(deserializer);
-	return [ at, label ];
+	return [ __at, __label ];
 }
 function $ac(codec, frame) {
 	let deserializer = codec[1](frame);
@@ -1158,39 +1159,39 @@ function $ac(codec, frame) {
 	}
 	return $ah;
 }
-function $aw(self, serializer) {
+function $ax(self, serializer) {
 	begin_struct5(serializer, 1);
 	field5(serializer, "millis");
 	$aa(self[0], serializer);
 	end_struct5(serializer);
 }
-function $au(codec, value2) {
-	const $av = codec[0]();
-	const serializer = $av[0];
-	const finish2 = $av[1];
+function $av(codec, value2) {
+	const $aw = codec[0]();
+	const serializer = $aw[0];
+	const finish2 = $aw[1];
 	let sink = serializer;
-	$aw(value2, sink);
+	$ax(value2, sink);
 	return finish2();
 }
-function $ay(deserializer) {
+function $az(deserializer) {
 	begin_struct6(deserializer);
 	field6(deserializer, "millis");
-	const millis2 = $ae(deserializer);
+	const __millis = $ae(deserializer);
 	end_struct6(deserializer);
-	return [ millis2 ];
+	return [ __millis ];
 }
-function $ax(codec, frame) {
+function $ay(codec, frame) {
 	let deserializer = codec[1](frame);
-	const value2 = $ay(deserializer);
-	const $az = deserializer[17]();
-	let $aA = null;
-	if ($az[0] === 1) {
-		$aA = [ 0, value2 ];
+	const value2 = $az(deserializer);
+	const $aA = deserializer[17]();
+	let $aB = null;
+	if ($aA[0] === 1) {
+		$aB = [ 0, value2 ];
 	} else {
-		const reason = $az[1];
-		$aA = [ 1, reason ];
+		const reason = $aA[1];
+		$aB = [ 1, reason ];
 	}
-	return $aA;
+	return $aB;
 }
 (async () => {
 	const epoch = [ 0 ];
@@ -1225,30 +1226,30 @@ function $ax(codec, frame) {
 	}
 	$aj;
 	const binary_back = $ac(binary_codec(), $X(binary_codec(), stamp));
-	const $as = binary_back;
-	let $at = null;
-	if ($as[0] === 0) {
-		const value3 = $as[1];
-		$at = console.log("" + (value3[0] === stamp[0]) + " " + value3[1]);
+	const $at = binary_back;
+	let $au = null;
+	if ($at[0] === 0) {
+		const value3 = $at[1];
+		$au = console.log("" + (value3[0] === stamp[0]) + " " + value3[1]);
 	} else {
-		const reason2 = $as[1];
-		$at = console.log(reason2);
+		const reason2 = $at[1];
+		$au = console.log(reason2);
 	}
-	$at;
-	const sent = $ax(json_codec(), $au(json_codec(), later));
-	const $aB = sent;
-	let $aC = null;
-	if ($aB[0] === 0) {
-		const value4 = $aB[1];
-		$aC = console.log(eq(value4, later));
+	$au;
+	const sent = $ay(json_codec(), $av(json_codec(), later));
+	const $aC = sent;
+	let $aD = null;
+	if ($aC[0] === 0) {
+		const value4 = $aC[1];
+		$aD = console.log(eq(value4, later));
 	} else {
-		const reason3 = $aB[1];
-		$aC = console.log(reason3);
+		const reason3 = $aC[1];
+		$aD = console.log(reason3);
 	}
-	$aC;
+	$aD;
 	await (sleep_for(millis(10), [ 1 ]));
 	console.log("slept");
-})().catch(($aI) => {
-	console.error(String($aI));
+})().catch(($aJ) => {
+	console.error(String($aJ));
 	process.exit(1);
 });

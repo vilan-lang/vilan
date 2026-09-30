@@ -79,8 +79,10 @@ impl Route with Routable {
 }
 
 fun main() {
-	let route = current_path().map(parse);
 	let _root = mount_root("app", || {
+		// Built where it is consumed: the route is a pipe, and `swap` is its one
+		// consumer.
+		let route = current_path().derive(|path| parse(path));
 		view("div").child(swap(route, |current| match current {
 			Route::Home => view("h1").text("Home"),
 			Route::Workspace(let id, let _inner) => view("h1").text(i"Workspace {id}"),
@@ -179,14 +181,15 @@ you get to render it.
 
 `current_path()` is a `SignalCell<str>` of `location.pathname`. It stays
 current across `navigate` calls and the browser's back/forward buttons.
-Derive your typed route from it once:
+Derive your typed route from it where you consume it:
 
 ```vilan,fragment
-let route = current_path().map(parse);
+let route = current_path().derive(|path| parse(path));
 ```
 
-(Passing `parse` by name instead of `|p| parse(p)` is the named-function
-coercion from [the tour](../tour/functions-and-closures.md).)
+The route is a pipe, consumed once — by the `swap` below. Where several parts of
+the app read it, seal it once with `.memo()` (at the top of `main`, or
+`.memo_global()` at module level) and hand the source around.
 
 ## Pages swap on the route
 

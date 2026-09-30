@@ -908,7 +908,7 @@ struct ConditionalValue<T, S: Source<Option<T>>, C: Slot> {
 }
 
 impl ConditionalValue<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
-	fun place(self, parent: View) {
+	fun place(own self, parent: View) {
 		let region = Region::open(parent);
 		let live_row: Shared<Option<Row>> = Shared::new(None);
 		let live_owner: Shared<Option<Owner>> = Shared::new(None);
@@ -992,7 +992,7 @@ fun main() {
 			.child(view("button").on("click", || drop_pick()))
 			.child(when_some(picked, |value| {
 				get_owner().defer(|| mark("@@TAG@@:defer"));
-				view("p").bind_text(value.map(|current| i"row:{current}"))
+				view("p").bind_text(value.derive(|current| i"row:{current}"))
 			}))
 	});
 }

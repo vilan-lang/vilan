@@ -1872,6 +1872,212 @@ fn get_safe_survives_await_and_stored_closures() {
     );
 }
 
+// --- B458: `Context::clear` — `run`'s inverse -----------------------------
+//
+// For the dynamic extent of `body` the context is NOT established: a strict
+// `get` inside is the coverage refusal a `get` outside every `run` is (its
+// trace names the `clear`), `get_safe` answers `None`, a closure created
+// inside captures the cleared state, and a `run` inside re-establishes.
+
+const B458_HEAD: &str = r#"
+import std::io::print;
+import std::context::Context;
+import std::option::Option::{ Some, None };
+
+let current: Context<i32> = Context::new();
+
+fun describe(): str {
+    match current.get_safe() {
+        Some(let value) => i"some {value}",
+        None => "none",
+    }
+}
+"#;
+
+fn b458_program(main_body: &str) -> String {
+    format!("{B458_HEAD}\nfun main() {{\n{main_body}\n}}\nmain();\n")
+}
+
+#[test]
+fn b458_get_safe_inside_clear_answers_none_under_a_run() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"current.run(7, || {
+                print(describe());
+                current.clear(|| {
+                    print(describe());
+                });
+                print(describe());
+            });"#,
+        ),
+        "some 7\nnone\nsome 7\n",
+    );
+}
+
+#[test]
+fn b458_a_get_safe_read_directly_in_the_clear_body_is_none() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"current.run(7, || {
+                current.clear(|| {
+                    match current.get_safe() {
+                        Some(let value) => print(i"leaked {value}"),
+                        None => print("cleared"),
+                    }
+                });
+            });"#,
+        ),
+        "cleared\n",
+    );
+}
+
+#[test]
+fn b458_clear_yields_its_body_value() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"let answer = current.run(7, || current.clear(|| 3) + 1);
+            print(answer);"#,
+        ),
+        "4\n",
+    );
+}
+
+#[test]
+fn b458_a_run_inside_clear_re_establishes_the_context() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"current.run(1, || {
+                current.clear(|| {
+                    current.run(2, || {
+                        print(current.get());
+                        print(describe());
+                    });
+                    print(describe());
+                });
+            });"#,
+        ),
+        "2\nsome 2\nnone\n",
+    );
+}
+
+#[test]
+fn b458_a_closure_created_inside_clear_captures_the_cleared_state() {
+    // Minted inside a `run`, invoked after it: without `clear` it would
+    // answer `some 5` (the captured value); inside `clear` it has none.
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"mut stored: List<|| void> = [];
+            current.run(5, || {
+                stored.push(|| print(describe()));
+                current.clear(|| {
+                    stored.push(|| print(describe()));
+                });
+            });
+            for callback in stored {
+                callback();
+            }"#,
+        ),
+        "some 5\nnone\n",
+    );
+}
+
+#[test]
+fn b458_another_context_is_untouched_by_clear() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ Some, None };
+
+        let first: Context<i32> = Context::new();
+        let second: Context<str> = Context::new();
+
+        fun main() {
+            first.run(1, || {
+                second.run("kept", || {
+                    first.clear(|| {
+                        print(second.get());
+                        print(first.get_safe().is_none());
+                    });
+                });
+            });
+        }
+        main();
+        "#,
+        "kept\ntrue\n",
+    );
+}
+
+#[test]
+fn b458_a_strict_get_inside_clear_is_the_coverage_refusal_naming_the_clear() {
+    let source = b458_program(
+        r#"current.run(7, || {
+            current.clear(|| {
+                print(current.get());
+            });
+        });"#,
+    );
+    assert_traces(
+        &source,
+        "context `current` is read here, but this code can be reached without an enclosing `run`",
+        &[(
+            "clear",
+            0,
+            "`current.clear(..)` runs this body with the context not established",
+        )],
+    );
+}
+
+#[test]
+fn b458_a_strict_reader_called_from_clear_is_refused_through_the_call() {
+    let source = format!(
+        "{B458_HEAD}{}",
+        r#"
+fun strict_read(): i32 {
+    current.get()
+}
+
+fun main() {
+    current.run(7, || {
+        current.clear(|| {
+            print(strict_read());
+        });
+    });
+}
+main();
+"#
+    );
+    assert_traces(
+        &source,
+        "context `current` is read here, but this code can be reached without an enclosing `run`",
+        &[
+            (
+                "clear",
+                0,
+                "`current.clear(..)` runs this body with the context not established",
+            ),
+            (
+                "strict_read()",
+                1,
+                "the context requirement flows through this call",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn b458_a_closure_value_body_is_refused() {
+    assert_fails_with(
+        &b458_program(
+            r#"let body = || print(describe());
+            current.run(7, || {
+                current.clear(body);
+            });"#,
+        ),
+        "`clear` must be called on a named context with a closure literal body",
+    );
+}
+
 #[test]
 fn the_strict_fence_is_unchanged_by_get_safe() {
     // A strict `get` on an uncovered path still errors, even in a program
@@ -2944,7 +3150,8 @@ fn a_negative_index_panics() {
         fun main() {
             mut xs: List<i32> = List::new();
             xs.push(10);
-            let i = 0 - 1;
+            let zero: usize = 0;
+            let i = zero - 1;
             print(xs[i]);
         }
         main();
@@ -3039,7 +3246,8 @@ fn a_negative_list_remove_panics_rather_than_counting_from_the_end() {
             xs.push(10);
             xs.push(20);
             xs.push(30);
-            let i = 0 - 1;
+            let zero: usize = 0;
+            let i = zero - 1;
             print(xs.remove(i));
         }
         main();
@@ -3074,7 +3282,8 @@ fn a_negative_list_insert_panics_rather_than_counting_from_the_end() {
         fun main() {
             mut xs: List<i32> = List::new();
             xs.push(10);
-            let i = 0 - 1;
+            let zero: usize = 0;
+            let i = zero - 1;
             xs.insert(i, 40);
         }
         main();
@@ -3217,9 +3426,9 @@ fn const_eval_keeps_a_maps_insertion_order() {
         r#"
         import std::io::print;
         import std::display::Display;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun ordered(): str {
-            mut table: Map<str, i32> = Map::new();
+            mut table: HashMap<str, i32> = HashMap::new();
             table.insert("zeta", 1);
             table.insert("alpha", 2);
             table.insert("mu", 3);
@@ -4058,9 +4267,9 @@ fn a_generic_structs_method_checks_its_argument() {
 fn a_maps_insert_checks_its_value() {
     assert_fails_spanning(
         r#"
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut m: Map<str, i32> = Map::new();
+            mut m: HashMap<str, i32> = HashMap::new();
             m.insert("k", "not an int");
         }
         main();
@@ -6577,7 +6786,7 @@ const A_USER_SOURCE: &str = r#"
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
 
         impl Stored<type T> {
@@ -6586,15 +6795,19 @@ const A_USER_SOURCE: &str = r#"
         }
 "#;
 
-/// A49 inverted the trait: `on_change` — the attach that does NOT call its
-/// observer — is the requirement, and `sub` is the default built over it. So
-/// the impl above is the migrated shape, and the shape it replaced is now a
-/// refusal. This is the one thing an implementor has to do, and the diagnostic
-/// is the whole instruction: the member that is missing, and the signature to
-/// declare.
+/// A49 inverted the trait so that an implementor writes ONE attach and the
+/// consumers are built over it; A142 moved that requirement from `on_change` to
+/// the no-payload `on_settle`, and `on_change`/`sub` became `Flow` consumers that
+/// every `Source` answers through the blanket. So the impl above is the migrated
+/// shape, and the shapes it replaced — a `Source` that writes only a consumer
+/// (`sub` here, pre-A49's requirement; `on_change`, A49's, in the pin below) and
+/// no `on_settle` — are now a refusal. This is the one thing an
+/// implementor has to do, and the diagnostic is the whole instruction: the
+/// member that is missing, and the signature to declare. (The name keeps A49's
+/// spelling; the member it names is now `on_settle`.)
 ///
-/// Non-vacuous by construction — with the pre-A49 trait this exact program is
-/// the one every implementor in the estate was written against, and it compiled.
+/// Non-vacuous by construction — each refused program is the shape every
+/// implementor in the estate was written against under its trait, and it compiled.
 #[test]
 fn a49_a_source_that_provides_only_sub_is_refused_and_names_on_change() {
     assert_fails_with(
@@ -6606,20 +6819,21 @@ fn a49_a_source_that_provides_only_sub_is_refused_and_names_on_change() {
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+            fun sub(own self, observer: |T| void): Subscription { self.inner.sub(observer) }
         }
 
         fun main() {}
         "#,
         // B260: the head names the trait as the `with` clause wrote it, so this
         // impl's `Source<T>` is what the sentence says.
-        "does not implement trait 'Source<T>': missing 'on_change'",
+        "does not implement trait 'Source<T>': missing 'on_settle'",
     );
 }
 
 /// The refusal spells the declaration to write — for a GENERIC impl, which is
 /// the shape most of the estate's implementors are, the line is copy-pasteable
-/// and the migration is that line with `sub`'s body moved under it.
+/// and the migration is that line with the old attach's body moved under it
+/// (`self.inner.on_settle(subscriber)` for a delegating impl).
 #[test]
 fn a49_the_refusal_spells_the_declaration_to_write() {
     assert_fails_with(
@@ -6631,25 +6845,26 @@ fn a49_the_refusal_spells_the_declaration_to_write() {
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+            fun on_change(own self, observer: |T| void): Subscription { self.inner.on_change(observer) }
         }
 
         fun main() {}
         "#,
-        "declare `fun on_change(self, observer: |T| void): Subscription`",
+        "declare `fun on_settle(self, subscriber: Subscriber): Subscription`",
     );
 }
 
 /// The control that keeps the two above from being a claim about `Source`
 /// having any required member at all: `get` alone is still not enough either,
-/// and an impl that writes BOTH requirements and no eager member compiles and
+/// and an impl that writes BOTH requirements (`get` and `on_settle`) and no
+/// consumer compiles, reaches `sub`/`on_change` through `Flow`, and
 /// drives a binding — `A_USER_SOURCE` above is that impl, and every pin in this
 /// block runs on it.
 #[test]
 fn a49_an_on_change_only_source_satisfies_the_trait() {
     assert_compiles(&format!(
         r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         {A_USER_SOURCE}
         fun consume<T, S: Source<T>>(source: S) {{
             let _first: T = source.get();
@@ -6669,7 +6884,7 @@ fn a49_an_on_change_only_source_satisfies_the_trait() {
 fn a_user_source_drives_every_read_only_browser_binding() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::style::{{ Color, Style, style }};
         import std::ui::{{ View, each, mount_root, view, when }};
         {A_USER_SOURCE}
@@ -6701,7 +6916,7 @@ fn a_user_source_drives_the_process_twin_and_renders() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ View, each, render, view, when }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6738,7 +6953,7 @@ fn a_source_alone_still_cannot_drive_bind_value() {
     assert_fails_browser_with(
         &format!(
             r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6758,7 +6973,7 @@ fn bind_draft_still_demands_a_draft() {
     assert_fails_browser_with(
         &format!(
             r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6783,7 +6998,7 @@ fn a_user_source_fills_an_attribute_and_places_a_slot() {
     let program = |value: &str| {
         format!(
             r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6855,7 +7070,7 @@ fn element_syntax_still_routes_attributes_through_attr_value() {
 fn a_user_source_drives_the_browser_swap() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ View, mount_root, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6876,7 +7091,7 @@ fn a_user_source_drives_the_browser_swap() {
 fn a_user_source_drives_the_split_gate() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ View, mount_root, swap_split, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6896,7 +7111,7 @@ fn a_user_source_drives_the_split_gate() {
 fn a_user_source_drives_the_boot_preload() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ chunk_preload, View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6917,7 +7132,7 @@ fn a_user_source_drives_the_process_swap_and_renders() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         import std::ui::{{ View, render, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -7200,7 +7415,7 @@ const A_CLAMPING_SIGNAL: &str = r#"
         impl Clamped with Source<i32> {
             fun get(self): i32 { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |i32| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
 
         impl Clamped with Signal<i32> {
@@ -7218,7 +7433,7 @@ fn a32_a_clamping_setter_satisfies_a_signal_bound() {
         &format!(
             r#"
         import std::display::Display;
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         {A_CLAMPING_SIGNAL}
         fun width_control<S: Signal<i32>>(width: S) {{
             width.set(1000);
@@ -7249,7 +7464,7 @@ fn a32_an_observer_of_a_clamping_signal_never_sees_the_written_value() {
         &format!(
             r#"
         import std::display::Display;
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         {A_CLAMPING_SIGNAL}
         fun main() {{
             let clamped = Clamped::new(0, 800);
@@ -7273,7 +7488,7 @@ fn a32_the_inherited_set_with_routes_through_the_impls_own_set() {
         &format!(
             r#"
         import std::display::Display;
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         {A_CLAMPING_SIGNAL}
         fun main() {{
             let clamped = Clamped::new(795, 800);
@@ -7383,7 +7598,7 @@ fn a32_a_signal_annotation_admits_a_custom_impl() {
         &format!(
             r#"
         import std::display::Display;
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         {A_CLAMPING_SIGNAL}
         fun main() {{
             let width: Signal<i32> = Clamped::new(0, 800);
@@ -7405,7 +7620,7 @@ fn a32_a_signal_annotation_refuses_a_read_only_source() {
     assert_fails_with(
         &format!(
             r#"
-        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
         {A_USER_SOURCE}
         fun main() {{
             let typed: Signal<str> = Stored::new("");
@@ -7424,7 +7639,7 @@ fn a32_a_signal_annotation_refuses_a_read_only_source() {
 fn a32_a_custom_signal_impl_drives_bind_value() {
     assert_compiles_browser(
         r#"
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         import std::ui::{ View, mount_root, view };
 
         struct Shouted { inner: SignalCell<str> }
@@ -7436,7 +7651,7 @@ fn a32_a_custom_signal_impl_drives_bind_value() {
         impl Shouted with Source<str> {
             fun get(self): str { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |str| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
 
         impl Shouted with Signal<str> {
@@ -7458,7 +7673,7 @@ fn a32_a_custom_signal_impl_drives_bind_value() {
 fn a32_a_custom_signal_impl_drives_the_process_bind_value() {
     assert_compiles_and_runs(
         r#"
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         import std::ui::{ View, render, view };
 
         struct Upper { inner: SignalCell<str> }
@@ -7470,7 +7685,7 @@ fn a32_a_custom_signal_impl_drives_the_process_bind_value() {
         impl Upper with Source<str> {
             fun get(self): str { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |str| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
 
         impl Upper with Signal<str> {
@@ -7527,7 +7742,7 @@ fn b157_a_user_source_reaches_the_reactive_arm() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::reactive::{{ MaybeSignal, Signal, SignalCell, Source, Subscription, comp }};
+        import std::reactive::{{ MaybeSignal, Signal, SignalCell, Source, Subscriber, Subscription, comp }};
         {A_USER_SOURCE}
         fun badge<V: MaybeSignal<str>>(label: V) {{
             label.bind(|text| print(i"[{{text}}]"));
@@ -7588,7 +7803,7 @@ fn b157_a_users_own_impl_outranks_stds_blanket() {
         struct Tag { text: str }
 
         impl Tag with MaybeSignal<str> {
-            fun bind(self, react: |str| void) { react(i"<{self.text}>"); }
+            fun bind(own self, react: |str| void) { react(i"<{self.text}>"); }
         }
 
         fun badge<V: MaybeSignal<str>>(label: V) {
@@ -9063,7 +9278,14 @@ fn b275_a_bool_signal_is_not_an_attribute_value() {
             let _bad = <div data-b(flag) />;
         }
         "#,
-        "'SignalCell<bool>' does not implement trait 'AttrValue'",
+        // A142 moved the attribute arms onto `Flow` (`impl type S: Flow<str>` and
+        // `impl type S: Flow<Option<str>>`), and the solver now reports the
+        // refusal as an ambiguity between those two arms rather than as "does not
+        // implement `AttrValue`" — a known solver find (neither arm applies to a
+        // `Flow<bool>`, so the honest sentence is the old one). The claim stands:
+        // a `SignalCell<bool>` is refused as an attribute value, at `apply`
+        // through the `AttrValue` bound.
+        "'apply' cannot be dispatched on 'SignalCell<bool>' through this call's 'AttrValue' bound",
     );
 }
 
@@ -9179,7 +9401,7 @@ fn a85_a_value_form_holds_its_body_as_a_context_carrying_field() {
             Conditional { condition, body }
         }
         impl Conditional<type S: Source<bool>> with Slot {
-            fun place(self, parent: View) {
+            fun place(own self, parent: View) {
                 let region = Region::open(parent);
                 region.insert((self.body)());
             }
@@ -9381,13 +9603,13 @@ fn b324_a_clause_inside_a_map_value_is_refused() {
         r#"
         import std::io::print;
         import std::context::Context;
-        import std::map::Map;
+        import std::hash_map::HashMap;
 
         let current: Context<i32> = Context::new();
 
         fun main() {
             current.run(1, || {
-                mut bodies: Map<str, (|| void) context current> = Map::new();
+                mut bodies: HashMap<str, (|| void) context current> = HashMap::new();
                 bodies.insert("a", || print(i"saw {current.get()}"));
             });
         }
@@ -10397,7 +10619,7 @@ fn b347_each_by_types_an_unannotated_render_closure_from_its_source() {
             let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
             let _root = mount_root("app", || view("nav")
                 .child(each_by(handles, |h| h.id, |h| view("li")
-                    .bind_text(h.map(|c| c.title)))));
+                    .bind_text(h.derive(|c| c.title)))));
         }}
         "#
     ));
@@ -10656,8 +10878,8 @@ fn b352_an_explicit_type_argument_outlives_a_less_resolved_argument() {
 
         fun main() {
             let error_text = Signal<Option<str>>::new(None);
-            let _root = mount_root("app", || <div .show(error_text.map(|x| x.is_some()))>
-                {error_text.map(|x| x.unwrap_or_default())}
+            let _root = mount_root("app", || <div .show(error_text.derive(|x| x.is_some()))>
+                {error_text.derive(|x| x.unwrap_or_default())}
             </div>);
         }
         "#,
@@ -10738,15 +10960,15 @@ fn b353_a_method_call_inside_an_unannotated_closure_body_is_checked() {
 fn b353_the_remote_source_effect_shape_is_checked_too() {
     assert_fails_with(
         r#"
-        import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription, owner_scope };
+        import std::reactive::{ Owner, Signal, SignalCell, Source, Subscriber, Subscription, owner_scope };
 
         struct Stored<T> { inner: SignalCell<T> }
 
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -11496,7 +11718,7 @@ fn b378_the_a112_shape_ranks_a_delta_source_above_a_plain_source() {
             Signal,
             SignalCell,
             Source,
-            Subscription,
+            Subscriber, Subscription,
         };
 
         struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
@@ -11505,8 +11727,8 @@ fn b378_the_a112_shape_ranks_a_delta_source_above_a_plain_source() {
             fun get(self): List<i32> { self.elements.get() }
 
             [must_use]
-            fun on_change(self, observer: |List<i32>| void): Subscription {
-                self.elements.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.elements.on_settle(subscriber)
             }
         }
 
@@ -12022,7 +12244,7 @@ fn the_a112_optional_capability_takes_the_supertrait_form() {
             Signal,
             SignalCell,
             Source,
-            Subscription,
+            Subscriber, Subscription,
         };
 
         struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
@@ -12031,8 +12253,8 @@ fn the_a112_optional_capability_takes_the_supertrait_form() {
             fun get(self): List<i32> { self.elements.get() }
 
             [must_use]
-            fun on_change(self, observer: |List<i32>| void): Subscription {
-                self.elements.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.elements.on_settle(subscriber)
             }
         }
 
@@ -12370,10 +12592,11 @@ fn b395_the_control_at_matching_arguments() {
 
 /// A112 S3's ruled shape, as std will declare it: a feed trait `with
 /// Source<List<T>>` and BOTH its blankets — the "no log" one over every list
-/// source and the forwarding one over every `DeltaSource`. `Source`'s defaults
-/// (`sub`, `map`) must reach a custom `Source<i32>` (`reactive-on-change.vl`'s
+/// source and the forwarding one over every `DeltaSource`. The members every
+/// `Source` gets for free (`sub`, `derive` — `Flow`'s through the blanket, since
+/// A142) must reach a custom `Source<i32>` (`reactive-on-change.vl`'s
 /// `Stored`) and a `SignalCell<i32>`, a list-valued custom source must still
-/// map, and the feed must still answer per source kind through the
+/// derive, and the feed must still answer per source kind through the
 /// supertrait. Red before the fix at `stored.sub` ("'Stored<i32>' does not
 /// implement trait 'Source<List<T>>'").
 #[test]
@@ -12382,7 +12605,7 @@ fn b395_the_ruled_delta_feed_shape_leaves_source_defaults_on_other_arguments() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, None, Some };
-        import std::reactive::{ DeltaCursor, DeltaSource, ListCell, SeqOp, Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ DeltaCursor, DeltaSource, ListCell, SeqOp, Signal, SignalCell, Source, Subscriber, Subscription };
 
         trait Feed<T> with Source<List<T>> {
             fun cursor_of(self): Option<DeltaCursor>;
@@ -12402,8 +12625,8 @@ fn b395_the_ruled_delta_feed_shape_leaves_source_defaults_on_other_arguments() {
             fun get(self): T { self.inner.get() }
 
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -12418,16 +12641,15 @@ fn b395_the_ruled_delta_feed_shape_leaves_source_defaults_on_other_arguments() {
             let stored = Stored { inner = Signal::new(10) };
             let eagerly = stored.sub(|value| print(i"eager {value}"));
             eagerly.dispose();
-            let labelled = stored.map(|value| i"n={value}");
-            print(labelled.get());
+            print(stored.derive(|value| i"n={value}").sample());
             let number: SignalCell<i32> = Signal::new(3);
-            print(number.map(|value| value * 2).get());
+            print(number.derive(|value| value * 2).sample());
             let listed = Stored { inner = Signal::new([1, 2]) };
-            print(listed.map(|items| items.len() * 10).get());
+            print(listed.derive(|items| items.len() * 10).sample());
             let cell: ListCell<str> = ListCell<str>::of(["a"]);
             let plain: SignalCell<List<str>> = Signal::new(["a", "b"]);
             print(i"{fed(cell)} / {fed(plain)} / {fed(listed)}");
-            print(plain.map(|items| items.len()).get());
+            print(plain.derive(|items| items.len()).sample());
         }
         "#,
         "eager 10\nn=10\n6\n20\nlog over 1 / none over 2 / none over 2\n2\n",
@@ -12442,7 +12664,7 @@ fn b395_the_ruled_shape_still_refuses_a_scalar_source_as_a_feed() {
     let source = r#"
         import std::io::print;
         import std::option::Option::{ self, None, Some };
-        import std::reactive::{ DeltaCursor, Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ DeltaCursor, Signal, SignalCell, Source, Subscriber, Subscription };
 
         trait Feed<T> with Source<List<T>> {
             fun cursor_of(self): Option<DeltaCursor>;
@@ -12458,8 +12680,8 @@ fn b395_the_ruled_shape_still_refuses_a_scalar_source_as_a_feed() {
             fun get(self): T { self.inner.get() }
 
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -12467,7 +12689,7 @@ fn b395_the_ruled_shape_still_refuses_a_scalar_source_as_a_feed() {
 
         fun main() {
             let stored = Stored { inner = Signal::new(10) };
-            print(stored.map(|value| value + 1).get());
+            print(stored.derive(|value| value + 1).sample());
             print(fed(stored));
         }
         "#;
@@ -12475,7 +12697,7 @@ fn b395_the_ruled_shape_still_refuses_a_scalar_source_as_a_feed() {
     assert_eq!(
         errors.len(),
         1,
-        "the ONE refusal is the feed bound; `stored.map` must check clean: {errors:#?}"
+        "the ONE refusal is the feed bound; `stored.derive` must check clean: {errors:#?}"
     );
     assert!(
         errors[0].contains("'Stored<i32>' does not implement trait 'Feed<T>'"),
@@ -12499,7 +12721,7 @@ fn b395_an_impl_whose_bound_names_another_binder_carries_the_default() {
         import std::io::print;
         import std::compare::PartialEq;
         import std::option::Option::{ self, None, Some };
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
 
         trait Feed<T> with Source<List<T>> { fun feeds(self): bool; }
 
@@ -12521,8 +12743,8 @@ fn b395_an_impl_whose_bound_names_another_binder_carries_the_default() {
             fun get(self): Option<List<T>> { self.inner.get() }
 
             [must_use]
-            fun on_change(self, observer: |Option<List<T>>| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -12941,7 +13163,7 @@ const B396_PROGRAM: &str = concat!(
     "import std::compare::PartialEq;\n",
     "import std::io::print;\n",
     "import std::option::Option::{ self, None, Some };\n",
-    "import std::reactive::{ Signal, SignalCell, Source, Subscription };\n",
+    "import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };\n",
     "\n",
     "trait Feed<T> { fun feeds(self): bool; }\n",
     "\n",
@@ -12958,9 +13180,7 @@ const B396_PROGRAM: &str = concat!(
     "\tfun get(self): Option<List<T>> { self.inner.get() }\n",
     "\n",
     "\t[must_use]\n",
-    "\tfun on_change(self, observer: |Option<List<T>>| void): Subscription {\n",
-    "\t\tself.inner.on_change(observer)\n",
-    "\t}\n",
+    "\tfun on_settle(self, subscriber: Subscriber): Subscription {self.inner.on_settle(subscriber)}\n",
     "}\n",
     "\n",
     "fun run<T: PartialEq, K: PartialEq, BOUNDS>(source: S, key: |T| K): i32 {\n",

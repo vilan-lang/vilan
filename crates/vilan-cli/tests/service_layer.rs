@@ -25,7 +25,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::rpc_server::Service;
 import std::wire::{ Keyed, Wire };
 
@@ -45,7 +45,7 @@ impl Message with Keyed<str> {
 [service(ChatClient)]
 struct Chat {
 	[expose] topic: SignalCell<str>,
-	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+	[expose(keyed)] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl Chat {
@@ -76,7 +76,7 @@ impl Chat {
 [service(PlainChatClient)]
 struct PlainChat {
 	[expose] topic: SignalCell<str>,
-	[expose] messages: SignalCell<Map<str, Message>>,
+	[expose] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl PlainChat {
@@ -91,7 +91,7 @@ impl PlainChat {
 	}
 }
 
-let chat: Chat = Chat { topic = Signal::new("general"), messages = Signal::new(Map::new()) };
+let chat: Chat = Chat { topic = Signal::new("general"), messages = Signal::new(HashMap::new()) };
 
 fun main() {
 	Server::builder()
@@ -129,7 +129,7 @@ fun run(port: i32) {
 			// the service's map holds two.
 			print(i"held:{render(client.messages.get().unwrap_or([]))}");
 			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
-			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(HashMap::new()) };
 			print(i"hash:{client.contract_hash()}");
 			print(i"plain-hash:{plain.contract_hash()}");
 			print(i"fault:{client.messages.fault().is_some()}");
@@ -1896,8 +1896,12 @@ fn an_expose_keyed_field_mirrors_as_a_keyed_source_the_generated_client_can_subs
         stdout.contains("hash:43077e29"),
         "the keyed service's contract hash moved:\n{stdout}"
     );
+    // I9 moved this one on purpose: the whole-value channel hashes its element
+    // AS WRITTEN, and the element is spelled `HashMap<str, Message>` now
+    // (`c63e39e3` was the `Map<str, Message>` spelling's). The keyed hash above
+    // hashes the map's VALUE type and did not move.
     assert!(
-        stdout.contains("plain-hash:c63e39e3"),
+        stdout.contains("plain-hash:d093c571"),
         "the plain twin's contract hash moved:\n{stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2251,7 +2255,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::rpc_server::Service;
 import std::wire::{ Keyed, Wire };
 
@@ -2302,11 +2306,11 @@ impl ListChat {
 	}
 }
 
-// A39's shape, unchanged: the `Map` names both types and takes the bare form.
+// A39's shape, unchanged: the `HashMap` names both types and takes the bare form.
 [service(MapChatClient)]
 struct MapChat {
 	[expose] topic: SignalCell<str>,
-	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+	[expose(keyed)] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl MapChat {
@@ -2325,7 +2329,7 @@ impl MapChat {
 [service(PlainChatClient)]
 struct PlainChat {
 	[expose] topic: SignalCell<str>,
-	[expose] messages: SignalCell<Map<str, Message>>,
+	[expose] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl PlainChat {
@@ -2376,8 +2380,8 @@ fun run(port: i32) {
 			print(i"edit:{client.edit("m2", "world again").unwrap_or(false)}");
 			print(i"held:{render(client.messages.get().unwrap_or([]))}");
 			print(i"topic-held:{client.topic.get().unwrap_or("?")}");
-			let map_twin = MapChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
-			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(Map::new()) };
+			let map_twin = MapChat { topic = Signal::new(""), messages = Signal::new(HashMap::new()) };
+			let plain = PlainChat { topic = Signal::new(""), messages = Signal::new(HashMap::new()) };
 			print(i"list-hash:{client.contract_hash()}");
 			print(i"map-hash:{map_twin.contract_hash()}");
 			print(i"plain-hash:{plain.contract_hash()}");
@@ -3964,10 +3968,12 @@ fun run(port: i32) {
 			let _drain = client.stats();
 			show("re-released", client.stats().unwrap_or(empty));
 
-			// DEDUP by source identity (A92). Two handles for the same row are
-			// two mirrors and two calls, and ONE channel: the second reply
-			// carries the cell the first one already exported. The first
-			// mirror's release does not revoke it under the second.
+			// DEDUP, both halves. Since A134 two stub calls for the same ORIGIN
+			// (method + arguments) are ONE mirror and so ONE call — the client
+			// twin of A92's server dedup, which answers a second reply carrying
+			// the same cell with the channel already minted (two mirrors on one
+			// cell are pinned by `reactive_channels`' A137 pins). Two leases on
+			// the one mirror are one demand: the first release revokes nothing.
 			let twin_left: RemoteSource<Body> = client.get_message("m0");
 			let twin_right: RemoteSource<Body> = client.get_message("m0");
 			let hold_left = twin_left.sub(|_value| {});
@@ -4044,14 +4050,15 @@ fun run(port: i32) {
 ///   `seed` line is the cached value painted before the round trip; `fresh` is
 ///   what the fresh channel's first `Update` carried, which is the edit made
 ///   while nothing was watching.
-/// - **Dedup by source identity, and the counting it obliges (A92).** Two
-///   handles for the same row are two mirrors and two CALLS — `calls` 11 → 13
-///   — and ONE channel: the second reply carries a cell this connection has
-///   already exported, so `deduped` reports one capability and one forward for
-///   the pair. `half-released` is the obligation: the first mirror's
-///   `Unsubscribe` must NOT revoke the channel under the second, so the table
-///   does not move and the surviving mirror still reads its value (`twin`).
-///   `both-released` is the last hold going, and only then does the channel go.
+/// - **Dedup per origin (A134) and by source identity (A92).** Two handles for
+///   the same row are, since A134, ONE mirror and ONE call — `calls` 11 → 12,
+///   where it read 13 when every stub call minted its own — and ONE channel,
+///   so `deduped` reports one capability and one forward. `half-released` is
+///   one of the two leases on that mirror going: demand stays, nothing is
+///   revoked, and the mirror still reads its value (`twin`). `both-released`
+///   is the last lease going, and only then does the channel go. (Two MIRRORS
+///   on one channel — two origins answering one cell — and the server's hold
+///   count between them are pinned by `reactive_channels`' A137 pins.)
 /// - **The `Option` form mints on presence only, and says so in `Status`.**
 ///   One mirror type for both answers now: `find("nobody")` leases, asks, is
 ///   told `None`, mints no channel — the table does not move — and reads
@@ -4134,13 +4141,13 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("deduped:"),
-        "sources=2 live=1 calls=13",
-        "two handles on one source are two calls and ONE channel: the second \
-         reply must answer the channel the first already minted (A92):\n{stdout}"
+        "sources=2 live=1 calls=12",
+        "two handles for one origin are ONE mirror, ONE call and ONE channel \
+         (A134 on the client, A92 on the server):\n{stdout}"
     );
     assert_eq!(
         line_of("half-released:"),
-        "sources=2 live=1 calls=13",
+        "sources=2 live=1 calls=12",
         "one mirror letting go of a SHARED channel must revoke nothing — the \
          other mirror is still watching it:\n{stdout}"
     );
@@ -4151,12 +4158,12 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("both-released:"),
-        "sources=1 live=0 calls=13",
+        "sources=1 live=0 calls=12",
         "the LAST hold going is what revokes a deduped channel:\n{stdout}"
     );
     assert_eq!(
         line_of("field-released:"),
-        "sources=1 live=0 calls=13",
+        "sources=1 live=0 calls=12",
         "an `[expose]`d field channel's Unsubscribe is demand-only: its \
          capability must survive, or every remount is silently dead (A41):\n{stdout}"
     );
@@ -4179,7 +4186,7 @@ fn a_hundred_handles_cost_ten_forwards_and_a_released_one_is_revoked_and_re_mint
     );
     assert_eq!(
         line_of("after-missing:"),
-        "sources=1 live=0 calls=13",
+        "sources=1 live=0 calls=12",
         "a `None` from an Option-returning handle method must mint no channel \
          at all — the absence is the whole reply:\n{stdout}"
     );
@@ -5006,7 +5013,7 @@ fun main() {
         &dir,
         "src/main.vl",
         r#"import std::io::print;
-import std::map::Map;
+import std::hash_map::HashMap;
 
 struct Password {
 	hash: str,
@@ -5024,8 +5031,8 @@ impl Vault {
 	}
 
 	[rpc]
-	fun lookup(self, who: str): Map<str, Password> {
-		Map::new()
+	fun lookup(self, who: str): HashMap<str, Password> {
+		HashMap::new()
 	}
 }
 
@@ -5040,7 +5047,7 @@ fun main() {
         "the parameter's refusal must still fire:\n{text}"
     );
     assert!(
-        text.contains("return type of `[rpc]` method `lookup` is `Map<str, Password>`"),
+        text.contains("return type of `[rpc]` method `lookup` is `HashMap<str, Password>`"),
         "the return's refusal must still fire:\n{text}"
     );
     assert_eq!(

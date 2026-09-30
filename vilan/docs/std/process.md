@@ -579,7 +579,7 @@ data is safe either way, but only `with_file` can observe a close
 failure. The last-use `Drop` stays underneath as the safety net. Two shapes
 to know before reaching for a handle: a closure cannot capture a `File`
 (hand it in as a parameter, which is exactly what `with_file` does), and
-`List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
+`List`/`HashMap`/`HashSet` cannot hold one — `Option<File>` is the sanctioned
 container, so "a pool of open files" is not expressible today. A
 module-level `File` is not expressible either — every constructor is
 async and a module-level `let` cannot await — so a process-lifetime
@@ -721,7 +721,7 @@ a time, path-sorted, and the order among them carries no timing
 information.
 
 A `Watcher` moves rather than copies, a closure cannot capture one, and
-`List`/`Map`/`Set` cannot hold one — `File`'s rules exactly. Its
+`List`/`HashMap`/`HashSet` cannot hold one — `File`'s rules exactly. Its
 destructor stops the poll after its last use, `drop(watcher)` is the
 explicit form,
 and there is no `stop()` to forget or to call twice. That destructor is

@@ -1,9 +1,9 @@
 // The browser half of the exit's SHAPE, run under node: the generated
 // `KoltClient` connects with the session token the login answered, holds a
 // PER-KEY subscription on the keyed mirror, and calls two rpcs.
+import std::hash_map::HashMap;
 import std::io::print;
 import std::json::json_codec;
-import std::map::Map;
 import std::option::Option::{ self, None, Some };
 import std::process::{ env, exit };
 import std::reactive::{ Signal, SignalCell };
@@ -27,7 +27,7 @@ impl Message with Keyed<str> {
 [service(KoltClient)]
 struct KoltStore {
 	user: str,
-	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+	[expose(keyed)] messages: SignalCell<HashMap<str, Message>>,
 }
 
 impl KoltStore {

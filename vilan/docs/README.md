@@ -91,7 +91,7 @@ move an anchor, and a moved anchor is a broken link.
 ### std reference
 | Page | Modules |
 |---|---|
-| [collections](std/collections.md) | List, Map, Set, Range, Iterator |
+| [collections](std/collections.md) | List, HashMap, HashSet, Range, Iterator |
 | [option & result](std/option-result.md) | Option, Result and their method sets |
 | [strings](std/strings.md) | str, Display, Debug, Into |
 | [numbers](std/numbers.md) | the sized numerics, math, random |

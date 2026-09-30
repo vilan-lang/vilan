@@ -21,7 +21,7 @@ What the backend reaches today:
 
 - structs, enums, `Option` and `Result`, generics (monomorphised per type
   argument), traits, trait objects (`dyn`), overloaded operators
-- `str`, `List`, `Map`, `Set`, closures, `impl` blocks, `match`, loops,
+- `str`, `List`, `HashMap`, `HashSet`, closures, `impl` blocks, `match`, loops,
   recursion, module-level bindings, `lazy`
 - `async`, `await`, `Task` and `Nursery`, on a single-threaded executor of the
   runtime's own
@@ -44,8 +44,9 @@ What the backend reaches today:
 
 What it does **not** reach yet — each refused by name, with the construct in the
 message, rather than silently mis-compiled: the browser platform (`std::dom`,
-`std::ui`, `std::web`, `std::router`), `resource` types (deterministic
-teardown natively is its own slice), a handful of host bindings (the `fs`
+`std::ui`, `std::web`, `std::router`), a `resource` type with a `Drop` impl
+(deterministic teardown natively is its own slice; a resource with no `Drop`,
+such as a pipe node, builds as an ordinary move-only type), a handful of host bindings (the `fs`
 calls that take an options object), and
 `--watch` (a native round is a full `cargo build`; the dev loop's hot-swap
 belongs to the JS backend).
@@ -62,6 +63,16 @@ the `Uint8Array` it is on the JS backend: `let b = a` is an alias, and a
 server answers `Connection: close` on every response and sends no `Date`; node
 keeps connections alive and dates every answer. Everything a program sets — the
 status, its headers, its body — is the same on both.
+
+**A native server stops gracefully on SIGTERM.** `Server::stop()` works as it
+does on node. Beyond it, a program that starts a server answers SIGTERM, SIGINT
+and SIGHUP (Ctrl-C, and the console's close on Windows) by stopping its
+servers: it stops accepting, closes the connections that are only waiting and
+the upgraded sockets, lets a request already being answered finish — and then
+`main` returns, where node would have died of the signal. A second signal ends
+the process at once, for a server whose open response never ends. The handler
+lives in a third runtime crate, linked only by a program that serves, so a
+native server build fetches the `ctrlc` crate the first time.
 
 ## Debug by default
 

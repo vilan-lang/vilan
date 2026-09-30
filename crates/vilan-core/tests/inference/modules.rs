@@ -95,11 +95,11 @@ fn bumps_list_pop_bumps_the_receiver() {
 #[test]
 fn bumps_map_insert_and_remove_bump() {
     let source = r#"
-        import std::map::Map;
-        fun put(m: &mut Map<str, i32>) { m.insert("k", 1); }
-        fun evict(m: &mut Map<str, i32>) { m.remove("k"); }
+        import std::hash_map::HashMap;
+        fun put(m: &mut HashMap<str, i32>) { m.insert("k", 1); }
+        fun evict(m: &mut HashMap<str, i32>) { m.remove("k"); }
         fun main() {
-            mut m: Map<str, i32> = Map::new();
+            mut m: HashMap<str, i32> = HashMap::new();
             put(&mut m);
             evict(&mut m);
         }
@@ -111,11 +111,11 @@ fn bumps_map_insert_and_remove_bump() {
 #[test]
 fn bumps_set_insert_and_remove_bump() {
     let source = r#"
-        import std::set::Set;
-        fun add(s: &mut Set<i32>) { s.insert(1); }
-        fun take_out(s: &mut Set<i32>) { s.remove(1); }
+        import std::hash_set::HashSet;
+        fun add(s: &mut HashSet<i32>) { s.insert(1); }
+        fun take_out(s: &mut HashSet<i32>) { s.remove(1); }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             add(&mut s);
             take_out(&mut s);
         }
@@ -2485,7 +2485,7 @@ fn a46_a_reactive_fragment_is_the_source_list_arm() {
             let _root = mount_root("app", || {
                 <main>
                     <header>"head"</header>
-                    {mark.map(|value: i32| <><i>{i"m{value}"}</i><b>"b"</b></>)}
+                    {mark.derive(|value: i32| <><i>{i"m{value}"}</i><b>"b"</b></>)}
                     <footer>"foot"</footer>
                 </main>
             });
@@ -5723,10 +5723,10 @@ fn indexing_a_map_value_keeps_the_element_type() {
         r#"
         import std::io::print;
         import std::list::List;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         import std::option::Option::{ self, Some, None };
         fun main() {
-            mut lists: Map<str, List<i32>> = Map::new();
+            mut lists: HashMap<str, List<i32>> = HashMap::new();
             mut values: List<i32> = List::new();
             values.push(5);
             lists.insert("k", values);
@@ -5904,9 +5904,10 @@ fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
     // annotation that RESOLVED, to a trait, in value position (§12.2). A RETURN
     // since B184 — the parameter this was written on became B186's implicit
     // generic and the field became B184's hidden parameter, so the return is
-    // the nearest position that still refuses.
+    // the nearest position that still refuses. B460 made a bare RETURN the
+    // callee's one type, so the refusal is read one level in (`Option<Shape>`).
     const ALPHA: &str = "trait Shape {\n\tfun area(&self): i32;\n}\n\nfun shape(): \
-                         Shape {\n\t0\n}\n\nfun size(): i32 {\n\t0\n}\n";
+                         Option<Shape> {\n\tNone\n}\n\nfun size(): i32 {\n\t0\n}\n";
     let outcome = analyze_package(
         &[
             (
@@ -5922,7 +5923,7 @@ fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
         .iter()
         .find(|(message, _, _)| message.contains("'Shape' is a trait, not a type"))
         .expect("the bare trait in value position is refused");
-    let start = ALPHA.find("shape(): Shape").unwrap() + "shape(): ".len();
+    let start = ALPHA.find("shape(): Option<Shape>").unwrap() + "shape(): Option<".len();
     assert_eq!(
         (file.as_deref(), span.clone()),
         (Some("alpha.vl"), start..start + "Shape".len()),

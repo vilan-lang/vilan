@@ -4852,7 +4852,9 @@ fn calling_a_method_call_result_directly_parses() {
 fn swap_renders_a_dynamic_subtree_per_route_value() {
     // The canonical router shape: nested route enums, a hand-written
     // parse/href pair, `link` through the app's `Routable` impl, and a `swap`
-    // whose render closure matches the (unannotated) route value.
+    // whose render closure matches the (unannotated) route value. (A142: the
+    // derived route is a pipe, which a closure cannot capture, so it is sealed
+    // with `.memo()` — the route source the view reads.)
     assert_compiles_browser(
         r#"
         import std::ui::{ View, mount_root, swap, view };
@@ -4901,7 +4903,7 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
         }
 
         fun main() {
-            let route = current_path().map(parse);
+            let route = current_path().derive(|value| parse(value)).memo();
             let _root = mount_root("app", || view("main")
                 .child(link("Home", Route::Home))
                 .child(view("button").on("click", || navigate(href(Route::Home))))
@@ -5066,7 +5068,9 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
     // binding must check the bound against the RESOLVED `Route`, not demand
     // `U: PartialEq`. The method resolution now DEFERS while a closure
     // argument's body is untyped, so `U` binds from the closure's return on
-    // the retry instead of freezing abstract.
+    // the retry instead of freezing abstract. (A142: `map` is `derive`, whose
+    // pipe a closure cannot capture — so the unannotated binding is built
+    // inside the view closure and the pipe itself goes to `swap`.)
     assert_compiles_browser(
         r#"
         import std::ui::{ View, mount_root, swap, view };
@@ -5084,12 +5088,14 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
         }
 
         fun main() {
-            let route = current_path().map(|path| parse(path));
-            let _root = mount_root("app", || view("main")
-                .child(swap(route, |current| match current {
-                    Route::Home => view("section").text("home"),
-                    Route::Other => view("section").text("other"),
-                })));
+            let _root = mount_root("app", || {
+                let route = current_path().derive(|path| parse(path));
+                view("main")
+                    .child(swap(route, |current| match current {
+                        Route::Home => view("section").text("home"),
+                        Route::Other => view("section").text("other"),
+                    }))
+            });
         }
         "#,
     );
@@ -5376,18 +5382,26 @@ fn a_neutral_instantiation_is_admitted_despite_a_colored_impl() {
 // a token two-token lookahead cannot give — has a grammar seat. The promotion
 // took three names out of `std::style`: `Length::css(…)` became `Length::raw(…)`
 // and the `css` field of a `Length` and a `Color` became `text`. Every position
-// that used to spell the word now refuses, and the refusal NAMES both renames —
+// that used to spell the word refused, and the refusal NAMED both renames —
 // a bare "found `css`, expected an identifier" would leave the reader to guess
-// what their `.css` became. One pin per position, because each reaches the rule
+// what their `.css` became. One pin per position, because each reached the rule
 // through a different seam in the parser: a member access, a `::` path, a
 // binding, a struct field declaration and a struct-initializer field.
+//
+// B414 S4 (the member tier, R-k RULED 2026-09-29: "any word is admitted as a
+// member") moved four of the five: `css` names a MEMBER like every other
+// reserved word, so a struct may declare a `css` field again, and
+// `space(4).css` / `Length::css(..)` are the analyzer's ordinary "no such
+// member" refusals on `Length` rather than the parser's keyword rule. The
+// binding position is the one the rename note still guards — a `css` binding
+// is a name, and the word stays hard there.
 
 /// The rename the refusal has to name, in the wording every position shares.
 const CSS_RENAME_NOTE: &str = "`Length::css(…)` is now `Length::raw(…)`";
 
 #[test]
-fn a_css_member_access_refuses_naming_the_rename() {
-    assert_fails_with(
+fn a_css_member_access_is_a_member_lookup_after_the_member_tier() {
+    assert_fails_once_with(
         r#"
         import std::io::print;
         import std::style::space;
@@ -5396,23 +5410,20 @@ fn a_css_member_access_refuses_naming_the_rename() {
         }
         main();
         "#,
-        CSS_RENAME_NOTE,
+        "struct 'Length' has no field 'css'",
     );
 }
 
 #[test]
-fn a_css_path_segment_refuses_naming_the_rename() {
-    // The `::` seam recovers OVER the word rather than rolling the `::` back:
-    // rolled back, the failure surfaces at the operator as a missing `;` and
-    // the word the reader has to change is never named.
-    assert_fails_with(
+fn a_css_path_segment_is_a_member_lookup_after_the_member_tier() {
+    assert_fails_once_with(
         r#"
         import std::style::{ Length, style };
         let _x = const style().left(Length::css("1px"));
         fun main() {}
         main();
         "#,
-        CSS_RENAME_NOTE,
+        "cannot find 'css' in Length",
     );
 }
 
@@ -5432,24 +5443,25 @@ fn a_binding_named_css_refuses_naming_the_rename() {
 }
 
 #[test]
-fn a_struct_field_named_css_refuses_naming_the_rename() {
-    // A struct body whose first token is the keyword commits to nothing, so
-    // nothing inside is noted and the delimiter recovery would otherwise name
-    // the struct body instead of the word.
-    assert_fails_with(
+fn a_struct_field_named_css_is_a_member_after_the_member_tier() {
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         struct Token {
             css: str,
         }
-        fun main() {}
+        fun main() {
+            let token = Token { css = "x" };
+            print(token.css);
+        }
         main();
         "#,
-        CSS_RENAME_NOTE,
+        "x\n",
     );
 }
 
 #[test]
-fn a_struct_initializer_field_named_css_refuses_naming_the_rename() {
+fn a_struct_initializer_field_named_css_is_a_member_lookup_after_the_member_tier() {
     assert_fails_with(
         r#"
         struct Token {
@@ -5460,7 +5472,7 @@ fn a_struct_initializer_field_named_css_refuses_naming_the_rename() {
         }
         main();
         "#,
-        CSS_RENAME_NOTE,
+        "struct 'Token' has no field 'css'",
     );
 }
 
@@ -7754,4 +7766,54 @@ fn a_pseudo_class_name_cannot_claim_the_pseudo_element_marker() {
         &conditioned(r#"style().on(pseudo("%selection"), style().color(Color::gray(50)))"#),
         "a pseudo-class name cannot start with '%'",
     );
+}
+
+// --- B471: the `css` rename's did-you-mean, in the ANALYZER -------------------
+//
+// B414 S4 (syntax-44) puts `css` in the member tier, so `space(4).css`,
+// `Length::css(..)` and `style().css(..)` stop reaching the parser's rename note
+// and land on the analyzer's ordinary misses. RULED 2026-09-29: the misses name
+// the rename. These pins assert only what the rename note and the analyzer's
+// did-you-mean SHARE, so they hold on either side of the member tier; with it
+// in, they are red with `css_rename_steer` planted out.
+
+/// The half of the rename both readings spell.
+const CSS_FIELD_RENAME_NOTE: &str = "the `.css` field of a `Length` or a `Color` is now `.text`";
+
+#[test]
+fn b471_a_css_field_read_on_a_length_names_the_rename() {
+    let source = r#"
+        import std::io::print;
+        import std::style::space;
+        fun main() {
+            print(space(4).css);
+        }
+        main();
+        "#;
+    assert_fails_with(source, CSS_RENAME_NOTE);
+    assert_fails_with(source, CSS_FIELD_RENAME_NOTE);
+}
+
+#[test]
+fn b471_a_css_static_on_length_names_the_rename() {
+    let source = r#"
+        import std::style::{ Length, style };
+        let _x = const style().left(Length::css("1px"));
+        fun main() {}
+        main();
+        "#;
+    assert_fails_with(source, CSS_RENAME_NOTE);
+    assert_fails_with(source, CSS_FIELD_RENAME_NOTE);
+}
+
+#[test]
+fn b471_a_css_call_on_a_style_names_the_rename() {
+    let source = r#"
+        import std::style::style;
+        fun main() {
+            let _s = style().css("color", "red");
+        }
+        main();
+        "#;
+    assert_fails_with(source, CSS_RENAME_NOTE);
 }

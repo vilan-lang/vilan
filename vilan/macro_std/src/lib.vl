@@ -23,6 +23,10 @@ export import pkg::build;
 export import std::compare;
 export import std::debug;
 export import std::display;
+export import std::hash_map;
+export import std::hash_set;
+// `map` and `set` are the hash collections' modules before tracker I9, each a
+// deprecated alias now (`Map` IS `HashMap`); they leave with std's.
 export import std::map;
 export import std::operators;
 export import std::option;

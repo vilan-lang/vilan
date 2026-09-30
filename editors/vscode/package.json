@@ -2,7 +2,7 @@
   "name": "vilan",
   "displayName": "Vilan",
   "description": "Language support for Vilan: live diagnostics, completion with signatures, hover, inlay hints, semantic highlighting, go to definition, find references, rename, formatting, and Organize Imports.",
-  "version": "0.41.1",
+  "version": "0.42.0",
   "publisher": "vilan-lang",
   "license": "MIT OR Apache-2.0",
   "icon": "icon.png",
@@ -103,6 +103,11 @@
           "default": true,
           "description": "Show inlay type hints (the inferred type of an unannotated binding). Applies live."
         },
+        "vilan.inlayHints.abbreviate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a type that declares [hint(Trait<..>)] by the trait it is used as, marked with ~ (a pipeline node reads ': ~Source<Option<str>>', not its whole upstream). The full type stays in the hint's tooltip and in hover. Applies live."
+        },
         "vilan.semanticTokens.enabled": {
           "type": "boolean",
           "default": true,
@@ -145,7 +150,9 @@
     "vscode:prepublish": "npm run build",
     "build": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "npm run build -- --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "compile": "npm run typecheck && npm run build",
+    "test": "esbuild src/test/*.test.ts --bundle --outdir=out/test --format=cjs --platform=node && node --test \"out/test/*.test.js\""
   },
   "dependencies": {
     "vscode-languageclient": "^10.1.0"

@@ -392,7 +392,7 @@ at its last use.
 
 - **"Why can't I use it again?"** You moved it. Loan it (`&x` / `&mut x`, or
   a method call) instead of binding, passing, or returning it by value.
-- **A resource can't go in a `List`, `Map`, or `Set`**: those are native
+- **A resource can't go in a `List`, `HashMap`, or `HashSet`**: those are native
   containers whose internals are host code the move checker cannot see,
   so it cannot promise to close what you put in one. Use an `Option` (the
   sanctioned resource container), a **fixed array** (`[Guard; 2]` is a

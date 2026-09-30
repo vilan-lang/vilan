@@ -2,14 +2,15 @@ import std::io::print;
 import std::reactive::{ Owner, Signal };
 
 // `std::reactive` — explicit-dependency reactivity. A `Signal` is a writable
-// root; `map` builds a `Signal` whose dependency is structural (no
-// tracking, no `await` hazard); `sub` runs now and on every change. Writing a
-// signal propagates through the derived graph to the subscribers. `sub` is
-// `[must_use]`: `take` its `Subscription` into an `Owner` so it is disposed.
+// root; `derive` builds a pipe whose dependency is structural (no tracking, no
+// `await` hazard), and `.memo()` seals it into a source that can be read and
+// subscribed to; `sub` runs now and on every change. Writing a signal propagates
+// through the derived graph to the subscribers. `sub` is `[must_use]`: `take` its
+// `Subscription` into an `Owner` so it is disposed.
 fun main() {
 	let owner = Owner::new();
 	let count = Signal::new(0);
-	let doubled = count.map(|n| n * 2);
+	let doubled = count.derive(|n| n * 2).memo();
 
 	// `sub` fires immediately with the current value, then on each change.
 	owner.take(doubled.sub(|n| print(n))); // 0

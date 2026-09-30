@@ -7,8 +7,8 @@ Import what you use:
 
 ```vilan,fragment
 import std::reactive::{
-	Signal, SignalCell, Source, MaybeSignal, Subscription, Disposable, combine,
-	selector, Selector,
+	Signal, SignalCell, Source, Flow, Pipe, MemoCell, MaybeSignal, Subscriber, Subscription,
+	Disposable, combine, divorce, selector, Selector, derive, tracking,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -21,16 +21,25 @@ import std::reactive::{
 
 | Item | Kind | One line |
 |---|---|---|
-| `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `on_settle`/`sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change` are defaults; `map`/`switch`/`flatten`/`and_then`/`cell`/`distinct` are blankets over it) |
+| `Source<T>` | trait | anything with state that can be read (requires `get`/`on_settle`); every source is a `Flow` |
+| `Flow<T>` | `[resource]` trait | anything a pipeline starts from — every source and every pipe; carries the consumers (`on_change`/`sub`/`effect`/`effect_on_change`) and the combinators (`derive`/`switch`/`distinct_by`; `switch_some`/`and_then`/`then_some`/`flatten`/`distinct` as blankets), all `own self` |
+| `Pipe<T>` | `[resource]` trait | a move-only transformation; carries the sealing operations `memo`/`cell`/`memo_global`/`cell_global`/`sample` |
 | `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
-| `.cell()`, `.cell_global()`, `.distinct()` | blanket methods | on any `Source`: materialise into a cached cell (no comparison), owner-tied — or, `.cell_global()`, for the life of the program; pass a change on only when the value differs (`T: PartialEq`) |
-| `Map`, `Switch`, `FlattenOption`, `AndThen`, `Combine`, `Distinct` | structs | the cold pipeline nodes (A124): hold their upstream, compute when read; what `map`/`switch`/`flatten`/`and_then`/`combine` return |
+| `MemoCell<T>` | struct | a sealed derivation's read-only face — what `.memo()` returns |
+| `Constant<T>` | struct | `Source::constant(v)`: a source that never changes |
+| `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
+| `Instance<T>` | struct | a started flow — the one consumer's `pull`/`attach`/`release` (for stage authors) |
+| `TransientState`, `TransientSource`, `.transient()` | `std::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::transient](transient.md)) |
+| `track` | method (every `Source`) | read AND make the source a dependency of the body that is running — tracked reads (A142 §7) |
+| `derive` (free), `TrackedDerive<T>` | fn / `[resource]` struct | a pipe whose only dependencies are the ones its body tracks |
+| `tracking`, `TrackScope`, `Tracker` | context / structs | the tracking scope a body's run establishes; `tracking.clear(..)` is `untrack` |
 | `Resource<T>`, `ResourceState<T>` | struct/enum | a value that may still be loading — pending, settled, failed — built by `source.load(fetch)` or `Resource::pending()`, read through its fallbacks |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
 | `Subscription` | struct | an explicit subscription; `Disposable` |
-| `combine` | fn | tuple-signal over 2+ signals |
+| `combine` | fn | a pipe of the tuple of 2+ sources |
+| `divorce` | fn | the reverse: one derived pipe per position of a tuple-valued source |
 | `selector`, `Selector<T>` | fn/struct | per-key selection: one subscription, two writes per change |
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `on_cleanup` | fn | run a cleanup when the ambient owner is released |
@@ -44,14 +53,19 @@ import std::reactive::{
 | `DeltaFeed<T>` | trait | a consumer's question "do you keep ops?" — answered by every `Source<List<T>>` |
 | `ListCell<T>` | struct | a `List` cell whose writes ARE its deltas |
 | `SequenceCell<T>`, `Sequence<T>`, `Tracked<T>` | traits/struct | twelve mutators over one `splice` primitive; the `&mut` twin and its recorder |
-| `map_each` | fn | `map g` element-wise and incrementally — one call of `g` per arriving element |
+| `map_each` | fn | `g` element-wise and incrementally — one call of `g` per arriving element |
+| `CollFlow<T>`, `CollPipe<T>`, `CollSource<T>` | traits | collections per shape (A142 §6): anything a collection pipeline starts from; a move-only collection pipe (`memo`/`memo_global`/`sample`); a granular source |
+| `map`, `filter`, `filter_map`, `any`, `all`, `count`, `flatten` | methods | the collection operators — each returns a pipe, and follows the flow its closure returns (`IntoFlow`, `IntoElement`) |
+| `ListMemo<T>` | struct | a sealed collection pipe: a read-only granular source |
+| `RowFeed<T>` | trait | what `each`/`each_by` read their rows from: a list source or a collection pipe |
+| `coll`, `coll_by`, `Coll`, `CollBy`, `SameElement` | methods/structs/trait | a flow of whole lists into a collection pipe: the positional diff (prefix/suffix trim) and the keyed one (`ReconcilePlan`, emits `Move`) |
 
 ## Signal and SignalCell
 
 `Source` reads and `Signal` writes; `SignalCell` is the canonical cell that
 implements both. A component that only observes takes a `Source`, one that
-writes back takes a `Signal`, and one that needs the cell's own surface — a
-`map`, an in-place `update` — names `SignalCell`.
+writes back takes a `Signal`, and one that needs the cell's own surface — an
+in-place `update` — names `SignalCell`.
 
 ```vilan,fragment
 trait Signal<T> with Source<T> {
@@ -80,60 +94,46 @@ impl SignalCell<type T> {
 }
 impl SignalCell<type T> with Source<T> {
 	fun get(self): T
-	fun on_change(self, observer: |T| void): Subscription   // the requirement: `observe`
-	fun sub(self, observer: |T| void): Subscription         // the default, one call shallower
-	// from the trait defaults:
-	fun effect(self, observer: |T| void)    // fires now + on change; owner-registered
-	fun effect_on_change(self, observer: |T| void)  // on change only; owner-registered
+	fun on_settle(self, subscriber: Subscriber): Subscription   // push the record as given
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription  // `observe`
 }
-// A BLANKET over the read trait, not a member of the cell (A86): any source
-// whose element is itself a source joins — a `map` result, a derived cell, a
-// mirror, a plain `SignalCell`.
-impl type S: Source<type I: Source<type U>> {
-	fun flatten(self): Switch<S, I, I, U>       // follow the current inner source
+// Every source is a `Flow` (the blanket), so the cell has the consumers and the
+// combinators too — each taking `own self`, which for a cell is a copy:
+//   on_change / sub / effect / effect_on_change (an owner per run)
+//   derive / switch / distinct_by, and the bounded blankets below
+impl type F: Flow<Option<type T>> {
+	fun switch_some<U, I: Flow<U>>(own self, select: sync |T| I): SwitchSome<F, T, I, U>
+	fun and_then<U, I: Flow<Option<U>>>(own self, select: sync |T| I): AndThen<F, T, I, U>
 }
-impl type S: Source<Option<type I: Source<type U>>> {
-	fun flatten(self): FlattenOption<S, I, U>   // `None` detaches; `Some` follows
+impl type F: Flow<Option<type I: Source<type U>>> {
+	fun flatten(own self): SwitchSome<F, I, I, U>   // `None` detaches; `Some` follows
 }
-// The DYNAMIC pair (A123), written over `on_change` rather than over the join:
-// which source to follow is decided by the value this one currently holds.
-impl type S: Source<type T> {
-	fun map<U>(self, transform: sync |T| U): Map<S, T, U>     // cold: computed when read
-	fun switch<U, I: Source<U>>(self, select: sync |T| I): Switch<S, T, I, U>
+impl type F: Flow<bool> {
+	fun then_some<T, S: Source<T>>(own self, source: S): ThenSome<F, S, T>
 }
-impl type S: Source<Option<type T>> {
-	fun and_then<U, I: Source<Option<U>>>(
-		self, select: sync |T| I
-	): AndThen<S, T, I, U>
+impl type F: Flow<type T: PartialEq> {
+	fun distinct(own self): Distinct<F, T>
 }
 ```
 
-`flatten` is a **blanket over `Source`** rather than a member of
-`SignalCell<SignalCell<U>>`: the read contract is the trait, so an outer that
-is a `map` result or a mirror holds an inner signal exactly as a cell does and
-joins the same way. A default method on `Source<T>` could not say it — a
-default cannot add a bound on `T`, and this one needs `T` to be a source — so
-the bound lives in the impl subject. The `Option` form is the second blanket:
-an outer of `Option<inner source>` (a lazily-created signal) answers `None` with
-`None` and detaches from whichever inner was live, and `Some(inner)` follows
-that inner from its current value. It is `sequence` then join, not the join of
-the composite `Source`-of-`Option` — which is why a chain over optional cells
-ends in a trailing `.map(|x| x.flatten())` and why `and_then` exists.
+`flatten` is the **join** of a flow of `Option<source>`: `None` reads `None`
+and detaches from whichever inner was live, and `Some(inner)` follows that
+inner from its current value. A pipe cannot travel through a flow — its values
+are copied into every consumer — so a flow of flows is always a flow of
+*sources*. The total join of a flow of sources (A4's `flatten` over a
+`SignalCell<SignalCell<U>>`) is `.switch(|inner| inner)`, one stage.
 
-`switch` and `and_then` are the **dynamic dependencies** (A123). `map` and
-`combine` are static: the expression fixes what the result reads. `switch`
-follows whichever source its selector answers for the current value and
-re-follows on every change — Rx's `switchMap`, meaning
-`self.map(select).flatten()`. `and_then` is the same over `Source<Option<T>>`,
-the total encoding of a signal that may hold nothing: it is the Kleisli
-composition of that encoding (`Option::and_then` one level up), the outer
-`None` and the inner `None` collapse into one, and it replaces the
-`map(|x| x.map(f)).flatten().map(|x| x.flatten())` chain by hand. Both are
-written directly over `on_change` rather than as the two-node `map`-then-join:
-one derived cell, and the selector called exactly once per value of the source
-(the `map` form calls it a second time at construction and orphans the node it
-answered). Both are derivations, and both give the ambient owner the outer
-subscription and whichever inner is live — `flatten`'s story exactly.
+`switch`, `switch_some` and `and_then` are the **dynamic dependencies** (A123).
+`derive` and `combine` are static: the expression fixes what the result reads.
+`switch` follows whichever flow its selector builds for the current value and
+re-selects on every change — Rx's `switchMap`. `switch_some` is the same over
+an `Option` (`None` detaches), and `and_then` is the Kleisli composition of
+`Source<Option<T>>` (`Option::and_then` one level up): the outer `None` and the
+inner `None` collapse into one. Each is ONE stage, and its selector runs exactly
+once per change of its input, inside the one instance its consumer started; what
+a previous selection started is released at re-selection. A selector must
+BUILD the flow it answers — a closure cannot capture a pipe built outside it —
+and answering a source (a cell, a memo, a mirror) is always fine.
 
 `update` is **inherent to the cell**, deliberately: its value is in-place
 mutation with one notification, and a generic default could only
@@ -214,15 +214,14 @@ fun main() {
 	}
 }
 ```
-- `map`'s result is a live derived signal, and its internal subscription is
-  **detachable**: made inside a boundary — a mounted view, an `each` row —
-  it is registered with the ambient owner and dies when that boundary is
-  disposed. `combine` and `flatten` register theirs the same way (`flatten`
-  also releases whichever inner subscription is live at disposal).
-- Made **outside** every boundary — module level, the top of `main` — a
-  derivation has no owner to register with and lives as long as its source.
-  That is what a module-level `current_path().map(parse)` wants, and it is why
-  the derivations read the ambient owner optionally where `effect` demands one.
+- A pipe registers nothing until it is consumed. A sealed derivation's
+  subscription is **detachable**: made inside a boundary — a mounted view, an
+  `each` row — `.memo()` registers with the ambient owner and dies when that
+  boundary is disposed (a `switch` also releases whichever inner it follows).
+- Sealed **outside** every boundary — the top of `main` — a derivation has no
+  owner to register with and lives as long as its source. At module level that
+  lifetime is spelled `.memo_global()`, and it is why the seals read the ambient
+  owner optionally where `effect` demands one.
 - `effect` requires an ambient owner; calling it outside every owner is a
   compile error (context coverage). It fires once immediately.
 - `sub` fires once immediately with the current value, like `effect`, and
@@ -234,10 +233,10 @@ fun main() {
   a UI binding — the immediate call *is* the initial paint — and wrong for an
   effect that must not fire on the state the program starts in: a "you have
   unsaved changes" prompt, an analytics ping, a derivation that already seeded
-  its own first value. `map` and `combine` attach this way.
+  its own first value. `.memo()` attaches this way.
 
 ```vilan
-import std::reactive::{ Disposable, Signal, SignalCell };
+import std::reactive::{ Disposable, Signal, SignalCell , Subscriber };
 
 fun main() {
 	let title: SignalCell<str> = Signal::new("untitled");
@@ -248,50 +247,103 @@ fun main() {
 }
 ```
 
-## Source
+## Source, Flow and Pipe
 
 ```vilan,fragment
-trait Source<T> {
-	fun get(self): T                                        // required
+trait Source<T> with Flow<T> {
+	fun get(self): T                                                  // required
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription   // required; no first call
+	fun on_settle(self, subscriber: Subscriber): Subscription          // required; no payload
 	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription  // default; no payload — for node authors
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription  // default
+	fun identity(self): Option<i32>                                   // default `None`; for tracked reads
+	fun constant(value: T): Constant<T>                               // `Source::constant(v)`
+	fun track(self): T                                                // a blanket: read + track (§ below)
+}
+
+[resource]
+trait Flow<T> {
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription         // default; + one immediate call
-	fun effect_on_change(self, observer: |T| void)          // default; owner-registered
-	fun effect(self, observer: |T| void)                    // default; owner-registered, eager
-	fun scoped_effect(self, body: (sync |T| void) context owner_scope)
-	fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope)
+	fun start(own self): Instance<T>                                  // the stage author's member
+	[must_use]
+	fun on_change(own self, observer: |T| void): Subscription         // no first call
+	[must_use]
+	fun sub(own self, observer: |T| void): Subscription               // + one immediate call
+	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+	                                                                  // owner-registered; an owner per run
+	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
+	                                                                  // the same, eager; the body tracks
+	fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
+	fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, tracking, ambient_nursery)): Switch<Self, T, I, U>
+	fun distinct_by<K: PartialEq>(own self, key: sync |T| K): DistinctBy<Self, T, K>
+	…
+}
+
+[resource]
+trait Pipe<T> with Flow<T> {
+	fun memo(own self): MemoCell<T>          // seal: read-only, owner-tied
+	fun cell(own self): SignalCell<T>        // seal: writable, owner-tied
+	fun memo_global(own self): MemoCell<T>   // for the life of the program
+	fun cell_global(own self): SignalCell<T>
+	fun sample(own self): T                  // start, read once, release
 }
 ```
 
-The read-only half of a reactive value. `SignalCell<T>` implements it, and so does
-any type of yours — a storage-backed cell, a mirror over a transport, a wrapper
-that logs. Implement `get` and **`on_change`**; `sub`, `effect`,
-`effect_on_change` and `map` all come free.
+Two kinds of reactive value (A142's pipe model):
 
-**`on_change` is the primitive; `sub` is derived from it.** The requirement is
-the *lazy* attach — add an observer and do not call it — and the default `sub`
-is that attach plus one call with the current value, in that order. So an
-implementation writes the smaller thing and gets the eager contract every
-`std::ui` binding reads (`sub` fires once now, then once per change) without
-writing a line of it, and there is no path anywhere in the trait on which a
-call is made and then discarded.
+- A **`Source`** has state and can be read: `SignalCell`, a sealed `MemoCell`,
+  `Source::constant(value)`, a `RemoteSource` mirror, and any type of yours.
+- A **pipe** is a transformation — `derive`, `switch`, `switch_some`,
+  `and_then`, `then_some`, `flatten`, `distinct`, `distinct_by`, `combine` —
+  a description with no `get`. It is consumed exactly once: sealed with
+  `.memo()`, `.cell()`, the `_global` twins or `.sample()`, or handed to a
+  consumer (an `effect`, a UI binding).
 
-The arrangement used to be the other way round — `sub` required, `on_change`
-defaulted — and it could not be honest: the only lazy body reachable from an
-eager requirement is one that subscribes eagerly and *swallows* the first call,
-which costs a wrapper cell and a branch on every later notification, and makes
-a genuine first change indistinguishable from the seeding one. Deriving the
-eager form from the lazy one is pure addition (backlog A49).
+**`Flow`** is what both are: every `Source` through a blanket, and every pipe
+stage directly. The consumers and the combinators live there, and every one of
+them takes `own self` — for a source that is a copy, for a pipe the move that
+makes a second consumer a compile error (`use of 'p' after it was moved`).
+**`Pipe`** adds the sealing operations, which exist only on pipes: a cell has no
+`.memo()`, and a pipe has no `get()`.
 
-`SignalCell` implements `on_change` as `observe` — the direct attach — and
-also overrides `sub`, which is the default body with one call less
-indirection; every UI binding in a program lands there.
+**`dyn Flow<T>` holds either, once.** `Flow` and `Pipe` are declared
+`[resource]` (A142 R39), so a pipe stage erases into `dyn Flow<T>` and the
+object is move-only: consumed once, like the pipe it may hold. The attribute
+belongs to the trait that declares it, so `dyn Source<T>` stays copyable (a
+source is data) though `Source` extends `Flow`. Arms of different types meet in
+the object where one is expected, which is how a selector hands back a pipe from
+one arm and a root from the other:
 
 ```vilan
-import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription };
+import std::reactive::{ Flow, MemoCell, Signal, SignalCell, Source };
+
+fun arm(scaled: bool, count: SignalCell<i32>): dyn Flow<i32> {
+	if scaled {
+		count.derive(|value| value * 100)
+	} else {
+		count
+	}
+}
+
+fun main() {
+	let scaled = Signal::new(true);
+	let count = Signal::new(1);
+	let shown: MemoCell<i32> = scaled.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();
+	print(shown.get());   // 100
+	scaled.set(false);
+	count.set(3);
+	print(shown.get());   // 3
+}
+```
+
+(The type arguments are written: `switch` does not yet infer its `U` through the
+object's trait argument.)
+
+A source of your own implements **`get` and `on_settle`**. Everything else —
+`on_change`, `sub`, `effect`, `derive` — arrives through `Flow`:
+
+```vilan
+import std::reactive::{ Owner, Signal, SignalCell, Source, Subscriber, Subscription };
 
 /// A signal with a place to hang persistence, and no `set` on the trait.
 struct Stored<T> {
@@ -304,8 +356,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		self.inner.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.inner.on_settle(subscriber)
 	}
 }
 
@@ -327,137 +379,87 @@ fun main() {
 }
 ```
 
-**Anything that only reads takes a `Source`, not a `Signal`.** Every read-only
+`attach_observer` is the source-side answer to `on_change` (`immediately`
+false) and `sub` (true). Its default attaches a pulling subscriber through
+`on_settle`; a root overrides it to skip the indirection (`SignalCell` attaches
+directly) or to keep a contract of its own — a mirror's seeding frame arrives
+*inside* its lease over an in-process transport, so its eager form leases first
+and makes the one immediate call itself.
+
+**Anything that only reads takes a `Flow`, not a `Signal`.** Every read-only
 binding in [`std::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
-`bind_attr`, `bind_styled`, `style_var`, `each`, `when`, `show`, `swap`
-and `swap_split` — is generic over `Source<T>`, so `Stored<str>` above drives
-them exactly like a signal does, on the browser layer and on the SSR twin
-alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
-`Slot` and `AttrValue` arms element syntax dispatches through, so
-`<p>{stored}</p>` and `<a href(stored)>` work for any source. What asks for a
-`Signal` is what **writes**: `bind_value` and its SSR twin bound on
-`Signal<str>`, and `optimistic` on `Signal<T>`, so a custom implementation with
-its own `set` drives them. `Optimistic::over` takes any `Signal<T>` too — the
-cell STORES it in a field, and a field must name a real type, so the cell names
-it: `Optimistic<T, S>` carries the signal's type as a second parameter.
+`bind_attr`, `bind_styled`, `style_var`, `toggle_attr`, `when`, `when_some`,
+`show` and `swap` — is generic over `Flow<T>` and consumes it (`own`), so
+`Stored<str>` above, a cell and a pipe all drive them, on the browser layer and
+on the SSR twin alike. `each`, `each_values` and `each_by` take a `Source`: a
+derived list is sealed with `.memo()` first. The `Slot` and `AttrValue` arms
+element syntax dispatches through are `Flow` arms too, so `<p>{stored}</p>`,
+`<p>{count.derive(|n| i"{n}")}</p>` and `<a href(stored)>` all work. What asks
+for a `Signal` is what **writes**: `bind_value` and its SSR twin bound on
+`Signal<str>`, and `optimistic` on `Signal<T>`. `Optimistic::over` takes any
+`Signal<T>` too — the cell STORES it in a field, and a field must name a real
+type, so the cell names it: `Optimistic<T, S>`.
 
-### on_settle — the attach a node author writes
+A function of yours that consumes a flow takes it `own`, bounded on `Flow<T>`;
+one that reads its argument more than once asks for a `Source<T>`, and the
+caller seals.
 
-`on_change` is the subscription every application writes. `on_settle` is the one
-a **node** writes: a `Source` that holds no value of its own and computes it
-from an upstream when read — `get` pulls through the chain. It attaches a
-`Subscriber` and hands it **no value**: the subscriber is told that this source
-*may* have changed and reads `get()` if it wants to know what to.
+### on_settle — the attach every stage forwards
 
-That is what makes a chain of nodes cost nothing per hop. A node implements
-`on_settle` by **forwarding** the subscriber to its upstream untouched — no
-subscriber minted, nothing computed — so an observer reading a five-deep chain
-puts one record on the root cell, and when two arms of one observer's chain
-reach the same root (a diamond), the root holds that one record twice. Its id is
-the observer's, and a turn's queue is keyed on it, so inside a `turn` or a
-`batch` the diamond's two notifications are one call — reading a settled value,
-because every read is a pull of state that has already been written.
+`on_settle` attaches a `Subscriber` and hands it **no value**: the subscriber is
+told that this source *may* have changed and reads `get()` if it wants to know
+what to.
 
-```vilan
-import std::reactive::{
-	FlushPolicy, Signal, SignalCell, Source, Subscriber, Subscription, fresh_id,
-	turn,
-};
-import std::shared::Shared;
-
-/// A node: the upstream, doubled when read. It stores nothing.
-struct Doubled<S> {
-	up: S,
-}
-
-impl Doubled<type S: Source<i32>> with Source<i32> {
-	fun get(self): i32 {
-		self.up.get() * 2
-	}
-
-	/// The observer's ONE subscriber: its notification pulls this node.
-	[must_use]
-	fun on_change(self, observer: |i32| void): Subscription {
-		self.on_settle(Subscriber {
-			id = fresh_id(),
-			notify = || observer(self.get()),
-			live = Shared::new(true),
-			derived = false,
-		})
-	}
-
-	/// Forwarded, not wrapped.
-	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		self.up.on_settle(subscriber)
-	}
-}
-
-fun main() {
-	let count = Signal::new(1);
-	let doubled = Doubled { up = count };
-	let watch = doubled.on_change(|value| print(value));
-	turn(FlushPolicy::AtEnd, || {
-		count.set(2);
-		count.set(3);
-	});                        // 6 — once, for the settled value
-	watch.dispose();
-}
-```
+That is what makes a pipe cost nothing per hop. A consumer starts its pipe
+(`Flow::start`, which builds the pipe's one instance) and attaches ONE
+subscriber; every stateless stage forwards it to its upstream untouched — no
+subscriber minted, nothing computed — so a five-stage chain sealed into one
+`.memo()` puts one record on its root cell and evaluates the five stages fused,
+once per change. When two arms of one consumer's pipe reach the same root (a
+diamond — `combine((a, a.derive(f).memo()))`), the root holds that one record
+twice. Its id is the consumer's, and a turn's queue is keyed on it, so inside a
+`turn` or a `batch` the diamond's two notifications are one call — reading a
+settled value, because every read is a pull of state that has already been
+written.
 
 The handle `on_settle` returns has one obligation: **disposing it retires the
-subscriber** — it never fires again. Forwarding meets that for free, because the
-root cell's handle carries the subscriber's own liveness cell. A node that has
-to keep a registration of its own (one that re-selects which upstream to follow,
-the way `switch` does) registers a subscriber of its own upstream and never
-forwards the one it was handed to a registration it will dispose by itself —
-disposing that would retire the observer below it.
+subscriber** — it never fires again. Handing the subscriber to a cell's
+`on_settle` meets that for free, because the cell's handle carries the
+subscriber's own liveness cell. A stateful stage that keeps a registration of
+its own (a `switch` re-selecting what it follows) registers a relay of its own
+and never forwards the consumer's record to a registration it will dispose by
+itself — disposing that would retire the consumer.
 
-The **default** is a bridge over `on_change`: attach, discard the value, wake the
-subscriber through the turn. It is right for a root — a cell of your own, a
-mirror over a transport, `Stored` above — where `on_change` is where the value
-lives anyway, and every source gets it without writing a line. It is wrong for a
-node, which would compute a value only to throw it away, once per hop; a node
-overrides it. `SignalCell` overrides it with the direct attach.
+### Sealing: memo, cell, sample — and distinct, the stage that compares
 
-### cell and distinct — the stateful node and the comparing one
+**`.memo()`** seals a pipe into a read-only `MemoCell<T>`, backed by one cell:
+the pipe's one consumer, run once per change, with its value cached for every
+reader. Where a sealed value belongs is a question of readers: a derivation
+read by two consumers, or read with `get()`, is sealed once and shared. It is
+owner-tied — made inside an owner, it dies with the owner — a turn settles it
+before any effect reads it, and it is a source again, so a pipe can continue
+through it. **`.cell()`** is the writable twin, a `SignalCell<T>`: a local `set`
+holds until the next change upstream overwrites it.
 
-A derivation can be a *description* rather than state: a node that holds its
-upstream and computes its value when read. Two of those nodes are public on every
-`Source`:
+**`.sample()`** reads a pipe once — start it, take its value, release whatever
+its bodies built — and subscribes to nothing, so it opens no channel. Its cost
+is written at the call: `on_click(|| submit(total_of(cart).sample()))` runs the
+chain once per click.
 
-```vilan,fragment
-impl type S: Source<type T> {
-	fun cell(self): SignalCell<T>          // materialise: one cached value
-	fun cell_global(self): SignalCell<T>   // the same, for the life of the program
-}
-impl type S: Source<type T: PartialEq> {
-	fun distinct(self): Distinct<S, T>     // pass a change on only when it differs
-}
-```
-
-**`.cell()`** caches what is above it in a `SignalCell` and keeps it current. It
-is the one stateful node, and where it belongs is a question of readers: two
-consumers of a chain of nodes each evaluate the chain, and below a `.cell()` the
-chain above it runs once; a `get()` in a hot loop pulls a whole chain every time,
-and a `.cell()` makes it one read. It is a derivation like `map` — made inside an
-owner it dies with the owner, and a turn settles it before any effect reads it —
-and it is a source again, so a chain continues through it.
-
-**A module-level cell is `.cell_global()`.** A `.cell()` is owner-tied, and a
-module binding's initializer has no owner, so there its registration would stay
-on the upstream for the life of the program — a loop nothing releases, behind a
-spelling that promises a scope. The compiler refuses `.cell()` written directly
-in a module binding's initializer and steers to the two doors: build the cell
-under the owner that reads it (inside the view, or an `owner_scope.run`), or
-write `.cell_global()`, which is the same cached node with that lifetime in its
-name — it registers with no owner even inside one, and nothing releases it:
+**A module-level seal is `.memo_global()` (`.cell_global()`).** A `.memo()` is
+owner-tied, and a module binding's initializer has no owner, so there its
+registration would stay on the upstream for the life of the program — a loop
+nothing releases, behind a spelling that promises a scope. The compiler refuses
+`.memo()` and `.cell()` written directly in a module binding's initializer and
+steers to the two doors: seal under the owner that reads it (inside the view, or
+an `owner_scope.run`), or write the `_global` twin, which says that lifetime — it
+registers with no owner even inside one, and nothing releases it:
 
 ```vilan
-import std::reactive::{ Signal, SignalCell, Source };
+import std::reactive::{ MemoCell, Signal, SignalCell, Source };
 
 let path: SignalCell<str> = Signal::new("/");
-let depth: SignalCell<usize> = path.map(|value| value.len()).cell_global();
+let depth: MemoCell<usize> = path.derive(|value| value.len()).memo_global();
 
 fun main() {
 	path.set("/docs");
@@ -465,32 +467,37 @@ fun main() {
 }
 ```
 
-The refusal reads the initializer's own calls: a `.cell()` in a closure the
+The refusal reads the initializer's own calls: a `.memo()` in a closure the
 initializer creates, or inside a function it calls, is not caught — and leaks
 the same way, because a module-level closure keeps the (owner-less) context it
-was created in. Spell those `.cell_global()` too.
+was created in. Spell those `.memo_global()` too.
 
-`.cell()` **does not compare**: every change above it is a `set`, and a `set`
-always notifies. **`.distinct()`** is the node that compares — it asks
+Sealing **does not compare**: every change above a `.memo()` is a `set`, and a
+`set` always notifies. **`.distinct()`** is the stage that compares — it asks
 `T: PartialEq` and nothing else does — and passes a change on only when the
-value differs from the last one it passed on:
+value differs from the last one it passed on; **`.distinct_by(key)`** compares
+`key` of the value and passes the whole value on:
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Source };
 
 fun main() {
 	let width = Signal::new(320);
-	let wide = width.distinct();
-	let watch = wide.on_change(|value| print(i"now {value}"));
+	let watch = width.distinct().on_change(|value| print(i"now {value}"));
 	width.set(320);            // nothing: the same value
 	width.set(1024);           // now 1024
 	watch.dispose();
 }
 ```
 
-`map`, `switch`, `flatten` and `and_then` return these cold nodes, and
-`.cell()` is where you want a cache — the
-[guide](../guide/reactive.md#derived-state-map-combine-flatten) has the rule.
+The [guide](../guide/reactive.md#derived-state-derive-pipes-and-memo) has the
+rule for where a derivation lives.
+
+A pipe's type spells its whole upstream, so the editor shows a pipe stage by
+the trait it is used as — `: ~Pipe<Option<str>>` — through the
+`[hint(Pipe<U>)]` each stage declares, and a sealed `MemoCell` as the
+`~Source<T>` it is; a package author's own stage takes the same attribute
+([the editor](../appendix/editor.md)).
 
 ### Resource — a value that may still be loading
 
@@ -506,10 +513,10 @@ impl Resource<type T> {
 	fun fail(self, reason: str)
 	fun pend(self)
 	fun state(self): SignalCell<ResourceState<T>>
-	fun or(self, default: T): Map<..>              // `default` while pending or failed — RESETS on a re-pend
-	fun latest(self, default: T): Map<..>          // HOLDS the last settled value across a re-pend
-	fun optional(self): Map<..>                    // `None` while pending or failed
-	fun is_pending(self): Map<..>                  // the spinner
+	fun or(self, default: T): Derive<..>           // `default` while pending or failed — RESETS on a re-pend
+	fun latest(self, default: T): Derive<..>       // HOLDS the last settled value across a re-pend
+	fun optional(self): Derive<..>                 // `None` while pending or failed
+	fun is_pending(self): Derive<..>               // the spinner
 }
 ```
 
@@ -517,7 +524,7 @@ A fetch in flight is not a `Source` — it cannot answer `get` — so it is a
 `Resource`, a three-state machine (pending → settled → pending again when its
 source changes; failed is a third state a retry re-pends), and it becomes a
 source only through a **fallback**. That is where the `Option` of "not there
-yet" is confronted, once, instead of in every `map` below it. `source.load(fetch)`
+yet" is confronted, once, instead of in every `derive` below it. `source.load(fetch)`
 runs `fetch` for the source's current value and again at every change; the newest
 load wins. `.or` and `.latest` differ exactly on a re-pend: `.or` shows the
 default again (a spinner's product), `.latest` keeps the old value on screen
@@ -534,28 +541,40 @@ async fun fetch_name(id: i32): Result<str, str> {
 fun main() {
 	let id: SignalCell<i32> = Signal::new(1);
 	let user: Resource<str> = id.load(|n| fetch_name(n));
-	let shown = user.or("loading…").map(|name| name + "!");
-	print(shown.get());      // loading…! — the fetch has not landed
+	let shown = user.or("loading…").derive(|name| name + "!");
+	print(shown.sample());   // loading…! — the fetch has not landed
 }
 ```
 
-### scoped_effect — an owner per run
+### An owner per run — every body a pipe runs
 
 ```vilan,fragment
-fun scoped_effect(self, body: (sync |T| void) context owner_scope)
-fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope)
+fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery))
+fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, tracking, ambient_nursery)): Derive<Self, T, U>
+fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, tracking, ambient_nursery)): Switch<Self, T, I, U>
 fun on_cleanup(cleanup: || void)
+[deprecated] fun scoped_effect(own self, body: (sync |T| void) context owner_scope)   // = effect
 ```
 
-`effect`, except that **every run gets its own `Owner`**. Whatever the body
-registers — an `on_cleanup`, a nested `effect` or `map`, an `owner.take`, a
-mirror's lease — is released before the next run, and when the enclosing
-boundary goes.
+**Every run of a body a pipe runs gets its own `Owner`** (A142 R2/R14): an
+`effect`'s, a `derive`'s, a `switch`/`switch_some`/`and_then` selector's.
+Whatever the body registers — an `on_cleanup`, a nested `effect`, a `.memo()`,
+an `owner.take`, a mirror's lease — is released before the next run, and the
+last run's when the consumer is released (the enclosing boundary, for an
+`effect` or a `.memo()`; the call itself, for `.sample()`). A task the body
+starts runs in the run's nursery and is **cancelled** when the run is released,
+so a superseded fetch stops rather than landing late. A pipe has exactly one
+consumer, so every body runs once per change inside one instance, and "a run"
+always means "one run per change".
 
-A plain `effect` body that subscribes to something accumulates one subscription
-per change for as long as the boundary lives. That is usually what you want for
-a body that only reads and writes; it is never what you want for a body that
-opens something:
+The owner is allocated LAZILY: a stage keeps one owner cell for the life of its
+instance, each run is the next epoch of it, and the cleanup list is made at the
+run's first registration — a body that registers nothing costs a read and a
+write, and allocates no owner. (A run's nursery is created per run: the host's
+spawn machinery registers a task at the `async` expression, so one has to
+exist before the body runs.) The bindings in `std::ui` do not pay even that:
+their bodies write the DOM and register nothing, so they attach plainly.
 
 ```vilan
 import std::reactive::{ Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner };
@@ -566,7 +585,7 @@ fun main() {
 	let page = Owner::new();
 	run_with_owner(page, || {
 		// One subscription on `detail` at a time, not one per selection.
-		selected.scoped_effect(|id: i32| {
+		selected.effect(|id: i32| {
 			on_cleanup(|| print(i"closing {id}"));
 			detail.effect(|text: str| print(i"{id}: {text}"));
 		});
@@ -577,21 +596,101 @@ fun main() {
 ```
 
 `on_cleanup(cleanup)` is `get_owner().defer(cleanup)` under a name, and it is
-**one name whose meaning the ambient owner decides**: inside a `scoped_effect`
-the ambient owner is that run's, so the cleanup runs per run; inside any other
-boundary — a mounted view, a `swap` instantiation, an `each` row — it is the
-boundary's, so it runs once, at teardown. Like `effect`, it requires an
-enclosing owner *statically*: a cleanup with nothing in scope to run it is a
-compile error, not a silent no-op.
+**one name whose meaning the ambient owner decides**: inside a body the ambient
+owner is that run's, so the cleanup runs per run; inside any other boundary — a
+mounted view, a `swap` instantiation, an `each` row — it is the boundary's, so
+it runs once, at teardown. Like `effect`, it requires an enclosing owner
+*statically*: a cleanup with nothing in scope to run it is a compile error, not
+a silent no-op.
 
-The order inside a run is: release the previous run, install the fresh owner,
+The order inside a run is: release the previous run, install the fresh epoch,
 call the body. So a body that throws has already had its owner installed, and
 what it registered before throwing is released by the next run (or by the
-boundary).
+consumer's release). A registration that arrives after its run was released —
+an `await` that resumed late — is released on the spot.
+
+The body's owner and nursery are INJECTED (the `context` clause), which is what
+makes them the RUN's rather than the boundary's; the price is that a body is a
+closure literal or a local closure — a named function is refused at the call
+(`count.derive(|n| label(n))`, not `count.derive(label)`). `scoped_effect` and
+`scoped_effect_on_change` are `effect`'s and `effect_on_change`'s names before
+the two merged, kept one release as deprecated aliases.
 
 `swap`, `when` and `each` are **not** built on this — they keep their own
-per-instantiation owners. Reach for `scoped_effect` when you want that lifetime
-without a view.
+per-instantiation owners.
+
+### Tracked reads — `track()` and the free `derive`
+
+```vilan,fragment
+let tracking: Context<TrackScope>                                  // the scope of the running body
+impl type S: Source<type T> {
+	fun track(self): T                                             // get() + a dependency of the scope
+}
+fun derive<T>(body: (sync || T) context (owner_scope, tracking, ambient_nursery)): TrackedDerive<T>
+trait Source<T> { fun identity(self): Option<i32> … }               // `None` by default
+```
+
+The optional sugar layer (A142 §7, R6): inside a body a pipe runs, `source.track()`
+reads the source and makes it a **dependency of that body**. Nothing else
+tracks — `get()` never registers — so code that does not opt in is unchanged.
+The guide's [tracked reads](../guide/tracked-reads.md) chapter is the tour.
+
+- **Which bodies open a scope.** Every body a pipe runs: a `derive` transform
+  (`count.derive(|c| c + other.track())` follows `other` too), a `switch`/
+  `switch_some`/`and_then` selector (a tracked change re-selects), an `effect`
+  body (a tracked change re-runs it with the input's latest value), and the free
+  `derive(|| body)`, a pipe whose only dependencies are the ones it tracks —
+  a stage like any other, sealed once or consumed once. Callbacks (`on_change`,
+  `sub`, `effect_on_change`) and collection operators' per-element closures open
+  none.
+- **Strict, at compile time.** `tracking` is a context and `track()` reads it
+  with the strict `get`: a `track()` no body encloses is the coverage error, with
+  the uncovered path traced. There is no run-time lookup.
+- **Dependencies are the last run's reads.** After each run the stage compares
+  its reads with the edges it holds, in order: an edge to a source read again is
+  kept, a new read attaches one, an edge nothing read is detached. A source keeps
+  its edge across runs when it can say what state it is — `Source::identity()`,
+  answered by `SignalCell` and `MemoCell` (their cell); `None`, the default,
+  re-attaches each run and releases the old edge. A source that names its identity
+  and is read twice in one run is one edge.
+- **Glitch-free.** An edge wakes through a DERIVATION relay (the turn's first
+  phase), where the consumer's own wake from its input dedups with it: a turn
+  that changes an input and a tracked read runs the body once, on settled values.
+  An `effect`'s re-run is ordered after its input's delivery, so the same holds
+  for an effect.
+- **A scope is one run.** A closure created inside a body captures the run's
+  scope; a `track()` through it after the run returned registers nothing (a
+  run-time guard; the static form, callbacks run with the scope cleared, is a
+  planned follow-up — A142 §7.3).
+  `tracking.clear(body)` (B458) runs `body` with no scope: a closure minted
+  inside holds none, and a `track()` written inside is refused — the layer's
+  `untrack`.
+- **`on_change` primes.** A consumer that does not read at once runs a pipe's
+  bodies once when it subscribes (the value discarded, the observer not called),
+  so a tracked read is a dependency before the first change.
+
+```vilan
+import std::reactive::{ Owner, Signal, SignalCell, Source, derive, run_with_owner };
+
+fun main() {
+	let flag: SignalCell<bool> = Signal::new(true);
+	let a: SignalCell<i32> = Signal::new(1);
+	let b: SignalCell<i32> = Signal::new(100);
+	let owner = Owner::new();
+	run_with_owner(owner, || {
+		derive(|| if flag.track() { a.track() } else { b.track() })
+			.effect(|value: i32| print(i"saw {value}"));   // saw 1
+	});
+	b.set(200);        // nothing: the last run read `a`
+	flag.set(false);   // saw 200
+	a.set(2);          // nothing: the branch that read `a` was not taken
+	owner.dispose();
+}
+```
+
+`TrackScope`, `Tracker`, `Dependency` and `TrackedEdge` are the layer's own
+records (a run's scope, a stage's dependencies across runs, one read, one edge);
+an application never builds them.
 
 ## selector — per-key selection
 
@@ -620,7 +719,7 @@ fun main() {
 	let selected = selector(current);
 	let _root = mount_root("app", || {
 		view("ul").child(each(rows, |id| id, |id| {
-			view("li").text(i"row {id}").bind_class(selected.of(id).map(|on| {
+			view("li").text(i"row {id}").bind_class(selected.of(id).derive(|on| {
 				if on { "row current" } else { "row" }
 			}))
 		}))
@@ -641,21 +740,21 @@ defer every key's cleanup to whatever owner was ambient where `selector` was
 *called* — the component, never the row. A method call threads the caller's
 ambient owner the ordinary way.
 
-The key type is bounded on `Hashable` (the canonical key `Map` and `Set` use)
+The key type is bounded on `Hashable` (the canonical key `HashMap` and `HashSet` use)
 and on `PartialEq` (to seed a fresh cell against the current value). A key
 nobody has asked about has no cell and costs nothing: a change into it writes
 only the outgoing one.
 
 ## Writing a Signal
 
-Implement `Source`'s `get`/`sub` and `Signal`'s `set`/`notify`, and the type is
+Implement `Source`'s `get`/`on_settle` and `Signal`'s `set`/`notify`, and the type is
 usable anywhere a signal is wanted. The setter is where custom behaviour lives —
 a clamp, a persistence write, a debounce — and there is only one value, so
 whatever `set` stores is what every reader and every observer sees.
 
 ```vilan
 import std::display::Display;
-import std::reactive::{ Signal, SignalCell, Source, Subscription };
+import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
 
 struct Clamped { inner: SignalCell<i32>, max: i32 }
 
@@ -668,7 +767,7 @@ impl Clamped {
 impl Clamped with Source<i32> {
 	fun get(self): i32 { self.inner.get() }
 	[must_use]
-	fun on_change(self, observer: |i32| void): Subscription { self.inner.on_change(observer) }
+	fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
 }
 
 impl Clamped with Signal<i32> {
@@ -739,9 +838,11 @@ that is why `bind` may only be called under one.
 fun combine<T: (2..)>(sources: (U in T: dyn Source<U>)): Combine<T>
 ```
 
-A source of the tuple of the sources' current values, changing when any source
+A pipe of the tuple of the sources' current values, changing when any source
 changes. Variadic over tuples of mixed element types, and each element is any
-`Source` — a cell, a node, a mirror — erased to `dyn Source<U>` at the call:
+`Source` — a cell, a sealed memo, a mirror — erased to `dyn Source<U>` at the
+call. A derived input is sealed first: a pipe may become a `dyn Flow`, never a
+`dyn Source`, since a source is copied freely and a pipe is not:
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Source, combine };
@@ -749,15 +850,44 @@ import std::reactive::{ Signal, SignalCell, Source, combine };
 fun main() {
 	let flag = Signal::new(true);
 	let count = Signal::new(2);
-	let both = combine((flag, count.map(|n: i32| n * 10)));
+	let both = combine((flag, count.derive(|n: i32| n * 10).memo())).memo();
 	let (_on, current) = both.get();
 	print(current);
 }
 ```
 
 (Destructuring names the parts, which reads better than positions;
-`both.get().1` also works.) Like `map`, it is a cold node: `.cell()` it where
-the tuple is shared or read hot.
+`both.get().1` also works.) Like `derive`, it is a pipe: `.memo()` it where the
+tuple is shared or read.
+
+## divorce
+
+```vilan,fragment
+fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Derive<S, T, U>)
+```
+
+The reverse of `combine`: one derived pipe per position of a tuple-valued
+SOURCE (it reads its argument more than once, so it asks for a source and a
+combined pipe is sealed first). Each output is a `derive` reading its own
+position through a `std::tuple` key, so `divorce(combine((a, b)).memo())`
+re-derives `a`'s and `b`'s values:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source, divorce };
+
+fun main() {
+	let pair = Signal::new((1, "one"));
+	let (number, word) = divorce(pair);
+	pair.set((2, "two"));
+	print(i"{number.sample()} {word.sample()}");
+}
+```
+
+Every output subscribes to the WHOLE source, so each one fires on every change
+of it — a change to another position, and a `set` that changes nothing,
+included. A consumer that wants its output to fire only when that position
+moved gates it: `divorce(pair).0.distinct()`, which asks `PartialEq` of that
+one element. `.memo()` an output where it is shared or read.
 
 ## Subscription, Disposable
 
@@ -1043,8 +1173,8 @@ enum SeqOp<T> {
 	Move(usize, usize, usize),        // from, count, to — the same elements, elsewhere
 }
 
-enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(Map<K, V>) }
-enum SetOp<T: Hashable> { Add(T), Remove(T), Reset(Set<T>) }
+enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(HashMap<K, V>) }
+enum SetOp<T: Hashable> { Add(T), Remove(T), Reset(HashSet<T>) }
 ```
 
 Every arm carries **what left** as well as what arrived. That is a requirement,
@@ -1147,7 +1277,7 @@ impl ListCell<type T: PartialEq> { fun reconcile_to(self, items: List<T>) }
 // and: Source<List<T>>, Signal<List<T>>, SequenceCell<T>, DeltaSource<List<T>, SeqOp<T>>
 ```
 
-`ListCell<T>` is an ordinary `Source<List<T>>` — `each` takes it, `map` takes
+`ListCell<T>` is an ordinary `Source<List<T>>` — `each` takes it, `derive` takes
 it, an effect takes it — that also records what each write DID. Nothing that
 ignores the ops pays for them, and the three `each` runs do not ignore them:
 over a `ListCell` they build only the rows a write names.
@@ -1268,8 +1398,146 @@ Two rules to hold on to. The subscription is a DERIVATION and the ambient
 owner's, like every other combinator's, and the cursor goes with it — a
 disposed derivation stops pinning the source's history. And `g` must be pure IN
 THE ELEMENT: its result is kept, so a `g` that reads another signal will not
-re-run when that signal changes. That is `map`'s contract already; here nothing
+re-run when that signal changes. That is `derive`'s contract already; here nothing
 re-runs it at all, which makes the contract sharper rather than different.
+
+## Collection pipes — operators per shape
+
+```vilan,fragment
+[resource] trait CollFlow<T> {                 // anything a collection pipeline starts from
+	fun open(own self): CollInstance<T>;       // the node author's member
+}
+trait CollSource<T> with DeltaSource<List<T>, SeqOp<T>> {}   // ListCell, ListMemo
+[resource] trait CollPipe<T> with CollFlow<T> {
+	fun memo(own self): ListMemo<T>            // seal: a read-only CollSource
+	fun memo_global(own self): ListMemo<T>     // ... for the program (A130)
+	fun sample(own self): List<T>              // one read: start, take, release
+}
+impl type F: CollFlow<type T> {
+	fun map<R>(own self, transform: |T| R): CollMap<F, T, R>            // R: IntoElement<U>
+	fun filter<R>(own self, keep: |T| R): CollFilter<F, T, R>           // R: IntoFlow<bool>
+	fun filter_map<R>(own self, select: |T| R): CollFilterMap<F, T, R>  // R: IntoFlow<Option<U>>
+	fun any<R>(own self, test: |T| R): CollTally<F, T, R, bool>         // a scalar Pipe<bool>
+	fun all<R>(own self, test: |T| R): CollTally<F, T, R, bool>
+	fun count<R>(own self, test: |T| R): CollTally<F, T, R, usize>
+}
+impl type F: CollFlow<type S: Source<type U>> {
+	fun flatten(own self): CollFlatten<F, S, U>                        // follow each source
+}
+```
+
+A collection OPERATOR returns a move-only **collection pipe** (`CollPipe`),
+§3's split one level up: it is consumed once — sealed with `.memo()` into a
+`ListMemo` (a granular source, so a pipeline starts from it again), handed to
+`each`/`each_by`, or read once with `.sample()`. What travels between stages
+is not a value but the CHANGE, in the shape's one vocabulary (`SeqOp`), so an
+operator is written once per shape and every stage does work proportional to
+what changed:
+
+```vilan
+import std::reactive::{ ListCell, SequenceCell, comp };
+
+fun main() {
+	let numbers: ListCell<i32> = ListCell::of([1, 2, 3, 4]);
+	let (big, scope) = comp(|| numbers.filter(|n| n > 2).map(|n| n * 10).memo());
+	print(big.get());            // [ 30, 40 ]
+	numbers.push(7);             // the closures run for 7 alone
+	numbers.remove_at(0);        // nothing runs
+	print(big.get());            // [ 30, 40, 70 ]
+	scope.dispose();
+}
+```
+
+The operators start from a granular source — a `ListCell`, a `ListMemo` — and
+from a collection pipe. A coarse `Source<List<T>>` converts at the boundary
+(`.coll()`, `.coll_by(key)`, below).
+
+**An operator follows the flow its closure returns.** A closure may answer a
+plain value or any `Flow` — a source or a pipe (`IntoFlow`). The
+implementation is chosen per closure when the code is generated, so
+`filter(|n| n > 2)` subscribes to nothing and keeps no record per element,
+while `filter(|row| row.is_pending())` starts the pipe `is_pending` builds for
+each element and follows it: an element that flips in or out is ONE splice at
+its output position (the count of kept elements before it, from a Fenwick
+index), and `any`/`all`/`count` are counters that move by one.
+
+```vilan
+import std::reactive::{ ListCell, Signal, SignalCell, comp };
+
+fun main() {
+	let online: List<SignalCell<bool>> = [Signal::new(true), Signal::new(false)];
+	let people: ListCell<usize> = ListCell::of([0usize, 1usize]);
+	let ((here, anyone), scope) = comp(|| (
+		people.filter(|at| online[at].derive(|on| on)).memo(),
+		people.any(|at| online[at].derive(|on| on)).memo()
+	));
+	print(here.get());           // [ 0 ]
+	online[0].set(false);        // one splice out
+	print(anyone.get());         // false
+	online[1].set(true);         // one splice in; the counter moves once
+	print(here.get());           // [ 1 ]
+	scope.dispose();
+}
+```
+
+`filter`, `filter_map`, `any`, `all` and `count` follow a returned flow,
+because their output shape fixes what the flow's value means. **`map` never
+follows a returned `Source`**: a source is data and may be the element —
+`ids.map(open_mirror)` is a collection OF mirrors, and `.flatten()` is the
+explicit follow. A returned PIPE is started per element and its value carried
+(`IntoElement`), since a pipe cannot be an element. `filter_map(|x| x)` over a
+collection of `Option`-valued flows is the join; a closure answering
+`Option<Source<X>>` keeps the sources.
+
+**Every run has an owner.** A closure runs once per element that arrives and
+again per element that changes; what a run registers — an `on_cleanup`, a
+`.memo()`, a subscription — is released when the element leaves or re-runs,
+and a removed element's followed flow is detached. The owner is split off
+only when the run registered something, so a plain closure costs no owner at
+all. A task a closure starts belongs to the stage and is cancelled when the
+pipe's consumer releases it.
+
+## coll and coll_by — coarse into granular
+
+```vilan,fragment
+impl type F: Flow<List<type T>> {
+	fun coll_by<K: PartialEq + Hashable>(own self, key: sync |T| K): CollBy<F, T, K>
+}
+impl type F: Flow<List<type T: PartialEq>> {
+	fun coll(own self): Coll<F, T>
+}
+```
+
+A flow of WHOLE lists — a `SignalCell<List<T>>`, a derivation, a mirror sealed
+with `.memo()` — threw its change away upstream, so the only way back to a
+granular collection is a diff, and these two are the doors. Both return a
+collection pipe.
+
+- **`.coll_by(key)`** is the keyed diff `each_by` already runs
+  (`ReconcilePlan`), O(n) per change with hashing. A reordered element is a
+  `Move`, so it keeps its identity — and so does whatever follows it
+  downstream. A matched element whose value changed is a `SetAt` when the
+  element has `==`; without one (a collection of sources), the same key is the
+  same element.
+- **`.coll()`** is the positional fallback for `T: PartialEq`: it trims the
+  common prefix and suffix and splices what is between, so an append, an
+  insertion and a removal are each one op of one element.
+
+```vilan
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell, comp };
+
+fun main() {
+	let fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+	let (evens, scope) = comp(|| fetched.coll().filter(|n| n % 2 == 0).memo());
+	fetched.set([1, 2, 3, 4]);   // one splice of one element: 4 arrived
+	print(evens.get());          // [ 2, 4 ]
+	scope.dispose();
+}
+```
+
+The real fix is upstream — keep the source of truth granular (`ListCell`), and
+diff only at the boundaries: a fetch result, a wire snapshot.
 
 ## reconcile: keyed list diffing
 

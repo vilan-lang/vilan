@@ -443,11 +443,11 @@ function $T(deserializer) {
 function $H(deserializer) {
 	begin_struct2(deserializer);
 	field2(deserializer, "user");
-	const user = $P(deserializer);
+	const __user = $P(deserializer);
 	field2(deserializer, "admin");
-	const admin = $T(deserializer);
+	const __admin = $T(deserializer);
 	end_struct2(deserializer);
-	return [ user, admin ];
+	return [ __user, __admin ];
 }
 function $C(text) {
 	let reader = opened_reader(text);

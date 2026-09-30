@@ -889,9 +889,9 @@ fn gate_source_name(
             // A85's value form.
             if let js::Node::Local(name) = subject.as_ref()
                 && let Some((preload, source_at)) = gates.get(name)
-                && let Some(js::Node::Local(source)) = arguments.get(*source_at)
+                && let Some(source) = arguments.get(*source_at).and_then(plain_source_name)
             {
-                return Some((preload.clone(), source.clone()));
+                return Some((preload.clone(), source));
             }
             gate_source_name(subject, gates).or_else(|| {
                 arguments
@@ -915,6 +915,27 @@ fn gate_source_name(
         | js::Node::Property(inner, _) => gate_source_name(inner, gates),
         js::Node::Array(items) | js::Node::Sequence(items) => {
             items.iter().find_map(|item| gate_source_name(item, gates))
+        }
+        _ => None,
+    }
+}
+
+/// The plain name a gate's source argument reads, seen through the rule-1 copy
+/// an `own` parameter takes (`__clone(route)`): `swap` consumes its source
+/// (`own`, A142 R29), so a route passed at a use that is not its last arrives
+/// wrapped, and the preload reads the same value through the bare name. Any other
+/// shape is still "no preload".
+fn plain_source_name(argument: &js::Node) -> Option<String> {
+    match argument {
+        js::Node::Local(source) => Some(source.clone()),
+        js::Node::Call(subject, arguments)
+            if matches!(subject.as_ref(), js::Node::Local(helper) if helper == "__clone")
+                && arguments.len() == 1 =>
+        {
+            match &arguments[0] {
+                js::Node::Local(source) => Some(source.clone()),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -1925,7 +1946,7 @@ fn helper_source(name: &str) -> &'static str {
         "__map_values" => {
             "function __map_values(map) {\n\treturn [ ...map.values() ].map(__clone);\n}"
         }
-        // `for x in set`: `Set` is a struct `[table]` over a `NativeMap`, so the
+        // `for x in set`: `HashSet` is a struct `[table]` over a `NativeMap`, so the
         // elements are the backing map's stored originals, in insertion order (I1).
         "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
         // proposal/lazy.md §5 — the memo cell, and the ONE forcing helper both
@@ -4189,8 +4210,11 @@ impl<'src> Transformer<'src> {
             // A comprehension runs its body per element (`combine` subscribes each
             // source this way), so it inherits the body's side effects — and its
             // SOURCE is evaluated once whatever the body does.
-            Expr::TupleComprehension(_, source_id, body_id) => {
-                self.expr_has_side_effects(*source_id) || self.expr_has_side_effects(*body_id)
+            Expr::TupleComprehension(bindings, body_id) => {
+                bindings
+                    .iter()
+                    .any(|(_, source_id)| self.expr_has_side_effects(*source_id))
+                    || self.expr_has_side_effects(*body_id)
             }
             // The compound shapes B377 was: a block runs its statements, an
             // `if`/`match` runs the subject plus whichever continuation fires.
@@ -4617,7 +4641,129 @@ impl<'src> Transformer<'src> {
         node
     }
 
+    /// B452: walk sibling expressions — a call's arguments (the receiver
+    /// first), a list's or a tuple's elements, a struct literal's fields as
+    /// written, a binary operator's operands — so that JS evaluates them in
+    /// the order vilan does. A sibling that lowers to STATEMENTS (a block, an
+    /// `if` or `match` in value position, a `?` lift) pushes them into the
+    /// enclosing block, which runs them before the whole expression — ahead
+    /// of the siblings written before it, which is how `f(a(), { b(); c() })`
+    /// ran `b` before `a`, and `add(x, { x = 10; x })` read the new `x` twice.
+    /// So when one does, every EARLIER sibling whose value is not already
+    /// settled is first bound to a `const`, in order, and the statements
+    /// follow. A walk where no sibling needs statements emits exactly as the
+    /// plain one did.
+    fn walk_siblings_in_order<F>(
+        &mut self,
+        ids: &[Id],
+        block: &mut Vec<js::Node<'src>>,
+        mut walk_one: F,
+    ) -> Vec<(Id, js::Node<'src>)>
+    where
+        F: FnMut(&mut Self, Id, &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>>,
+    {
+        // Each entry carries whether it is already a `const` of our own, so a
+        // third sibling's statements never re-spill what a second's did.
+        let mut walked: Vec<(Id, js::Node<'src>, bool)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let mut statements = Vec::new();
+            let mark = self.pending_temporaries.len();
+            let node = walk_one(self, id, &mut statements);
+            if !statements.is_empty() {
+                for (earlier_id, earlier, spilled) in walked.iter_mut() {
+                    if *spilled || self.sibling_value_is_settled(*earlier_id, earlier) {
+                        continue;
+                    }
+                    let temp = self.ng.next_name();
+                    let value = std::mem::replace(earlier, js::Node::Local(temp.clone()));
+                    block.push(js::Node::ConstVariable(js::Variable {
+                        name: temp,
+                        value: Box::new(value),
+                    }));
+                    *spilled = true;
+                }
+                // A resource temporary this sibling lifted (C11) recorded
+                // where its `const` landed in `statements`; it lands in
+                // `block` at this offset, which is where its statement's
+                // `finally` must find it.
+                let offset = block.len();
+                for pending in &mut self.pending_temporaries[mark..] {
+                    pending.at += offset;
+                }
+                block.extend(statements);
+            }
+            if let Some(node) = node {
+                walked.push((id, node, false));
+            }
+        }
+        walked.into_iter().map(|(id, node, _)| (id, node)).collect()
+    }
+
+    /// Whether an already-lowered sibling reads the same whenever it is
+    /// evaluated (B452), so a later sibling's statements need not spill it:
+    /// a literal, a closure (creating one runs nothing), a name no statement
+    /// can reassign — an immutable `let`, a by-value parameter that is not
+    /// `mut`, a function — or the temporary a sibling's OWN lowering bound
+    /// its value to (an `if`/`match` in value position lands in its result
+    /// temp, a `?` in its subject temp's payload slot; a block answers for
+    /// its tail). Anything else — a call, a read of a `mut` binding or a
+    /// place inside one — might differ, so it is spilled.
+    fn sibling_value_is_settled(&self, id: Id, node: &js::Node<'src>) -> bool {
+        if matches!(
+            node,
+            js::Node::Number(..)
+                | js::Node::String(_)
+                | js::Node::Bool(_)
+                | js::Node::Null
+                | js::Node::Void
+                | js::Node::Closure(_)
+        ) {
+            return true;
+        }
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) if matches!(node, js::Node::Local(_)) => {
+                if let Some(variable) = self.program.variables.get(binding) {
+                    !variable.mutable
+                } else if let Some(parameter) = self.program.parameters.get(binding) {
+                    !parameter.mutable && parameter.convention != Convention::RefMut
+                } else {
+                    true
+                }
+            }
+            Some(Expr::If(_) | Expr::Match(..)) => matches!(node, js::Node::Local(_)),
+            Some(Expr::TryAssert(_)) => match node {
+                js::Node::Local(_) => true,
+                js::Node::PropertyIndex(subject, index) => {
+                    matches!(**subject, js::Node::Local(_))
+                        && matches!(**index, js::Node::Number(..))
+                }
+                _ => false,
+            },
+            Some(Expr::Block((_, tail))) => self.sibling_value_is_settled(*tail, node),
+            _ => false,
+        }
+    }
+
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
+        // B462: a tuple variant standing for a closure is its eta-expansion,
+        // `(a, b) => variant(a, b)`, built at the site.
+        if let Some(&(enum_id, variant_index, arity, _)) = self.program.variant_coercions.get(&id) {
+            let names: Vec<String> = (0..arity).map(|_| self.ng.next_name()).collect();
+            let data = names
+                .iter()
+                .map(|name| js::Node::Local(name.clone()))
+                .collect();
+            let value = self.variant_value(enum_id, variant_index, data);
+            return Some(js::Node::Closure(js::Closure {
+                parameters: names
+                    .into_iter()
+                    .map(|name| js::Parameter { name })
+                    .collect(),
+                body: vec![js::Node::Return(Box::new(value))],
+                is_async: false,
+                origin: None,
+            }));
+        }
         let node = self.walk_entity_seams(id, block)?;
         // B340 Q1: a `Callable` value in a closure-typed position. A struct is
         // a plain JS array — it cannot be applied — so the coercion IS the
@@ -4652,6 +4798,48 @@ impl<'src> Transformer<'src> {
             }
             let vtable = self.emit_vtable(subject_type_id, trait_id, &trait_arguments);
             return Some(js::Node::Array(vec![node, js::Node::Local(vtable)]));
+        }
+        // B430: a built tuple at a tuple-of-objects position is re-built by
+        // projection, each object element paired with its table —
+        // `((t) => [[t[0], vtable], t[1]])(value)`. An arrow applied in place
+        // rather than a hoisted `const`, so the value is evaluated exactly once
+        // and exactly where it was written, among its sibling arguments.
+        if let Some(elements) = self.program.dyn_tuple_coercions.get(&id).cloned() {
+            let tuple = self.ng.next_name();
+            let projected: Vec<js::Node<'src>> = elements
+                .iter()
+                .enumerate()
+                .map(|(index, element)| {
+                    let read = js::Node::PropertyIndex(
+                        Box::new(js::Node::Local(tuple.clone())),
+                        Box::new(js::Node::Number(index.to_string(), None)),
+                    );
+                    match element {
+                        Some((subject_type_id, trait_id, trait_arguments))
+                            if !matches!(
+                                self.program
+                                    .type_id_to_type_map
+                                    .get(&self.resolve_type_id(*subject_type_id)),
+                                Some(Type::Dyn(..))
+                            ) =>
+                        {
+                            let vtable =
+                                self.emit_vtable(*subject_type_id, *trait_id, trait_arguments);
+                            js::Node::Array(vec![read, js::Node::Local(vtable)])
+                        }
+                        _ => read,
+                    }
+                })
+                .collect();
+            return Some(js::Node::Call(
+                Box::new(js::Node::Closure(js::Closure {
+                    parameters: vec![js::Parameter { name: tuple }],
+                    body: vec![js::Node::Return(Box::new(js::Node::Array(projected)))],
+                    is_async: false,
+                    origin: None,
+                })),
+                vec![node],
+            ));
         }
         Some(node)
     }
@@ -4763,7 +4951,7 @@ impl<'src> Transformer<'src> {
             // A macro-name marker: never a value (the analyzer rejects value
             // uses); reached only as an inert statement — emit nothing.
             Expr::Macro => js::Node::Void,
-            Expr::TupleComprehension(binder_id, source_id, body_id) => {
+            Expr::TupleComprehension(bindings, body_id) => {
                 // A flat tuple is a JS array, so the comprehension lowers to a
                 // runtime `source.map((x) => body)` — arity-independent, no
                 // monomorphization needed. The binder is the closure parameter.
@@ -4774,7 +4962,11 @@ impl<'src> Transformer<'src> {
                 // tuple-valued body result must SPLICE into the result rather
                 // than nest in it. That instance is emitted unrolled — see
                 // `unrolled_comprehension`.
-                let (binder_id, source_id, body_id) = (*binder_id, *source_id, *body_id);
+                if bindings.len() > 1 {
+                    let (bindings, body_id) = (bindings.clone(), *body_id);
+                    return Some(self.zipped_comprehension(id, &bindings, body_id, block));
+                }
+                let ((binder_id, source_id), body_id) = (bindings[0], *body_id);
                 if let Some(unrolled) =
                     self.unrolled_comprehension(id, binder_id, source_id, body_id, block)
                 {
@@ -4980,24 +5172,30 @@ impl<'src> Transformer<'src> {
             }
             Expr::Call(id) => {
                 let function_call = self.program.function_calls.get(id).unwrap().clone();
-                let args = function_call
-                    .argument_ids
-                    .iter()
-                    .filter_map(|arg| {
-                        // lazy.md §1: an argument standing in a `lazy` position
-                        // is not evaluated here at all — it is packaged, or it
-                        // forwards a cell it already holds. Both answers are
-                        // built whole, so neither passes through `maybe_clone`:
-                        // a memo cell is an identity, and copying one would give
-                        // the callee a second memo of the same thunk.
-                        if let Some(cell) = self.lazy_argument(*arg) {
-                            return Some(cell);
-                        }
-                        // An argument to an `own` parameter is copied (marked in
-                        // `clone_sites`), like a binding copy.
-                        self.walk_entity(*arg, block)
-                            .map(|node| self.maybe_clone(*arg, node))
-                    })
+                // B452: in source order, an argument that needs statements
+                // spilling the ones before it.
+                let args = self
+                    .walk_siblings_in_order(
+                        &function_call.argument_ids,
+                        block,
+                        |this, arg, block| {
+                            // lazy.md §1: an argument standing in a `lazy` position
+                            // is not evaluated here at all — it is packaged, or it
+                            // forwards a cell it already holds. Both answers are
+                            // built whole, so neither passes through `maybe_clone`:
+                            // a memo cell is an identity, and copying one would give
+                            // the callee a second memo of the same thunk.
+                            if let Some(cell) = this.lazy_argument(arg) {
+                                return Some(cell);
+                            }
+                            // An argument to an `own` parameter is copied (marked in
+                            // `clone_sites`), like a binding copy.
+                            this.walk_entity(arg, block)
+                                .map(|node| this.maybe_clone(arg, node))
+                        },
+                    )
+                    .into_iter()
+                    .map(|(_, node)| node)
                     .collect::<Vec<_>>();
 
                 // `T::member()` inside a monomorphized body: dispatch directly
@@ -5691,8 +5889,7 @@ impl<'src> Transformer<'src> {
                     }
                 }
             }
-            Expr::Binary(op, lhs, rhs) => {
-                let lhs = self.walk_entity(*lhs, block).unwrap_or(js::Node::Void);
+            Expr::Binary(op, lhs_id, rhs_id) => {
                 // B224: `&&` and `||` are the only operators whose right
                 // operand may not run at all, and the emitter had no statement
                 // slot for a condition — so a right operand that lowers to
@@ -5712,10 +5909,11 @@ impl<'src> Transformer<'src> {
                 // and `concat_render_dispatch` never hold one), and they are
                 // neither bitwise nor division.
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let lhs = self.walk_entity(*lhs_id, block).unwrap_or(js::Node::Void);
                     let mark = self.pending_temporaries.len();
                     let mut scratch = Vec::new();
                     let t_rhs = self
-                        .walk_entity(*rhs, &mut scratch)
+                        .walk_entity(*rhs_id, &mut scratch)
                         .unwrap_or(js::Node::Void);
                     // The overwhelmingly common case — a right operand that
                     // needed no statement — emits exactly as it always did,
@@ -5725,7 +5923,16 @@ impl<'src> Transformer<'src> {
                     }
                     return Some(self.emit_short_circuit(*op, lhs, t_rhs, scratch, mark, block));
                 }
-                let mut rhs = self.walk_entity(*rhs, block).unwrap_or(js::Node::Void);
+                // B452: the left operand runs first, so a right operand that
+                // needs statements spills it ahead of them.
+                let mut operands = self
+                    .walk_siblings_in_order(&[*lhs_id, *rhs_id], block, |this, id, block| {
+                        Some(this.walk_entity(id, block).unwrap_or(js::Node::Void))
+                    })
+                    .into_iter()
+                    .map(|(_, node)| node);
+                let lhs = operands.next().unwrap_or(js::Node::Void);
+                let mut rhs = operands.next().unwrap_or(js::Node::Void);
                 // B176: `"v=" + value` where `value: T` is bounded to a trait
                 // that provides `to_string`. The analyzer ADMITS this — the
                 // bound is exactly the string form the concatenation asks for
@@ -6431,7 +6638,14 @@ impl<'src> Transformer<'src> {
                 let t_iterable = self
                     .walk_entity(*iterable_id, block)
                     .unwrap_or(js::Node::Void);
-                // `Set` is a vilan struct over a `NativeMap`; iterate the backing
+                // B400: a `Shared::read()` iterable whose loop can write the
+                // cell iterates a copy (the analyzer's decision).
+                let t_iterable = self.maybe_clone(*iterable_id, t_iterable);
+                if let Some(view_id) = self.program.tuple_walk_views.get(iterable_id).copied() {
+                    self.tuple_for_each(view_id, t_iterable, *item_id, body, block);
+                    return Some(js::Node::Void);
+                }
+                // `HashSet` is a vilan struct over a `NativeMap`; iterate the backing
                 // map's stored originals (`set[0].values()`), in insertion order.
                 //
                 // The type comes from the analyzer's own record for this loop
@@ -7003,12 +7217,13 @@ impl<'src> Transformer<'src> {
             Expr::List(ids) => {
                 // An element read from a place is a construction slot: it copies
                 // (B54), unless the analyzer elided it.
-                let items = ids
-                    .iter()
-                    .filter_map(|id| {
-                        self.walk_entity(*id, block)
-                            .map(|node| self.maybe_clone(*id, node))
+                let items = self
+                    .walk_siblings_in_order(ids, block, |this, id, block| {
+                        this.walk_entity(id, block)
+                            .map(|node| this.maybe_clone(id, node))
                     })
+                    .into_iter()
+                    .map(|(_, node)| node)
                     .collect();
                 js::Node::Array(items)
             }
@@ -7046,18 +7261,22 @@ impl<'src> Transformer<'src> {
                 // §T.2), so it needs no type lookup and cannot lose the splice to a
                 // missing one, which the type-driven test does for an element whose
                 // expression caches no type of its own (a call, an `if`).
-                let items = ids
-                    .iter()
-                    .filter_map(|id| {
-                        let walked = self.walk_entity(*id, block)?;
-                        let value = self.maybe_clone(*id, walked);
+                // The splice is applied AFTER the ordered walk, so a spilled
+                // element is the value and never the `...` around it (B452).
+                let items = self
+                    .walk_siblings_in_order(ids, block, |this, id, block| {
+                        let walked = this.walk_entity(id, block)?;
+                        Some(this.maybe_clone(id, walked))
+                    })
+                    .into_iter()
+                    .map(|(id, value)| {
                         let splices =
-                            self.program.spread_elements.contains(id) || self.is_tuple_typed(*id);
-                        Some(if splices {
+                            self.program.spread_elements.contains(&id) || self.is_tuple_typed(id);
+                        if splices {
                             js::Node::Spread(Box::new(value))
                         } else {
                             value
-                        })
+                        }
                     })
                     .collect();
                 js::Node::Array(items)
@@ -7065,12 +7284,21 @@ impl<'src> Transformer<'src> {
             Expr::StructInitializer(_struct_id, assignments) => {
                 // let struct_ = self.program.structs.get(struct_id).unwrap();
                 // let mut properties_ng = NameGenerator::simple(debug_names);
-                let mut properties = assignments
-                    .iter()
-                    .filter_map(|(i, id)| {
-                        // let field = struct_.fields.get(*i).unwrap();
-                        let value = self.walk_entity(*id, block);
-                        value.map(|x| (i, self.maybe_clone(*id, x)))
+                // Walked in the order the literal WROTE its fields (B452: an
+                // initializer that needs statements spills the ones before
+                // it), then laid out in declaration order.
+                let field_ids: Vec<Id> = assignments.values().copied().collect();
+                let walked = self.walk_siblings_in_order(&field_ids, block, |this, id, block| {
+                    this.walk_entity(id, block)
+                        .map(|node| this.maybe_clone(id, node))
+                });
+                let mut properties = walked
+                    .into_iter()
+                    .filter_map(|(id, node)| {
+                        assignments
+                            .iter()
+                            .find(|(_, field_id)| **field_id == id)
+                            .map(|(index, _)| (index, node))
                     })
                     .collect::<Vec<_>>();
                 properties.sort_by(|a, b| a.0.cmp(b.0));
@@ -7857,7 +8085,12 @@ impl<'src> Transformer<'src> {
         body_id: Id,
         block: &mut Vec<js::Node<'src>>,
     ) -> Option<js::Node<'src>> {
-        let source_type_id = self.expr_type_id(source_id)?;
+        // A122: the walk's own view — its fresh binder over the family — which
+        // is also what a `T: (2..)` VALUE source is read as (`(U in T: U)`).
+        let source_type_id = match self.program.tuple_walk_views.get(&comprehension_id) {
+            Some(view_id) => *view_id,
+            None => self.expr_type_id(source_id)?,
+        };
         let Some(Type::Mapped(binder, source_tuple, template)) = self
             .program
             .type_id_to_type_map
@@ -7910,9 +8143,15 @@ impl<'src> Transformer<'src> {
                 layout.push((element, source_width, result_is_tuple));
             }
         }
-        if layout
-            .iter()
-            .all(|(_, width, result_is_tuple)| *width == 1 && !*result_is_tuple)
+        // B399: a binder that inherits an ELEMENT bound (`T: (2..:
+        // PartialEq)`) lets the body dispatch through it — `==`, `to_string()`
+        // — and a dispatch is chosen per element type. One shared `.map` body
+        // has no element type to choose by, so a bounded binder always unrolls.
+        let binder_is_bounded = self.program.generic_bounds.contains_key(&binder);
+        if !binder_is_bounded
+            && layout
+                .iter()
+                .all(|(_, width, result_is_tuple)| *width == 1 && !*result_is_tuple)
         {
             return None;
         }
@@ -7976,6 +8215,272 @@ impl<'src> Transformer<'src> {
             });
         }
         Some(js::Node::Array(items))
+    }
+
+    /// A122 §4.4 — a `for` over a tuple FAMILY, whose body the analyzer checked
+    /// once at the view's binder `U`. Emitted by the same rule as a
+    /// comprehension (`unrolled_comprehension`): where every element is one
+    /// non-tuple slot and `U` carries no bound to dispatch through, the flat
+    /// array IS the element sequence and a native `for...of` walks it; anything
+    /// else walks the POSITIONS, and each position's branch binds its element
+    /// (a slot, or a `.slice`) and emits the body with `U` bound to that
+    /// element's type. The branches sit in one `for...of`, so `break` and
+    /// `continue` keep their meaning.
+    fn tuple_for_each(
+        &mut self,
+        view_id: TypeId,
+        iterable: js::Node<'src>,
+        item_id: Option<Id>,
+        body: &(Vec<Id>, Id),
+        block: &mut Vec<js::Node<'src>>,
+    ) {
+        let binding = item_id
+            .map(|item_id| self.ng.name_for(item_id))
+            .unwrap_or_else(|| "_".to_string());
+        let Some(Type::Mapped(binder, _, _)) =
+            self.program.type_id_to_type_map.get(&view_id).cloned()
+        else {
+            let t_body = self.walk_loop_body_nodes(&body.0, body.1);
+            block.push(js::Node::ForOf(binding, Box::new(iterable), t_body));
+            return;
+        };
+        let elements = self.tuple_family_elements(view_id);
+        let positions = self.tuple_positions(view_id);
+        let bounded = self.program.generic_bounds.contains_key(&binder);
+        let (Some(elements), Some(positions)) = (elements, positions) else {
+            let t_body = self.walk_loop_body_nodes(&body.0, body.1);
+            block.push(js::Node::ForOf(binding, Box::new(iterable), t_body));
+            return;
+        };
+        let one_slot_each = positions
+            .iter()
+            .enumerate()
+            .all(|(at, (offset, _, is_tuple))| !*is_tuple && *offset == at);
+        if one_slot_each && !bounded {
+            let t_body = self.walk_loop_body_nodes(&body.0, body.1);
+            block.push(js::Node::ForOf(binding, Box::new(iterable), t_body));
+            return;
+        }
+        let tuple = match iterable {
+            js::Node::Local(name) => js::Node::Local(name),
+            other => {
+                let name = self.ng.next_name();
+                block.push(js::Node::ConstVariable(js::Variable {
+                    name: name.clone(),
+                    value: Box::new(other),
+                }));
+                js::Node::Local(name)
+            }
+        };
+        let position_name = self.ng.next_name();
+        let mut chain: Option<js::IfBranch<'src>> = None;
+        let branches: Vec<(usize, (usize, usize, bool), Vec<(TypeId, TypeId)>)> = positions
+            .into_iter()
+            .zip(elements)
+            .enumerate()
+            .map(|(at, (position, (_, bindings)))| (at, position, bindings))
+            .collect();
+        let count = branches.len();
+        for (at, (offset, width, is_tuple), bindings) in branches.into_iter().rev() {
+            let element = match is_tuple {
+                false => js::Node::PropertyIndex(
+                    Box::new(tuple.clone()),
+                    Box::new(js::Node::Number(offset.to_string(), None)),
+                ),
+                true => js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(tuple.clone()),
+                        "slice".to_string(),
+                    )),
+                    vec![
+                        js::Node::Number(offset.to_string(), None),
+                        js::Node::Number((offset + width).to_string(), None),
+                    ],
+                ),
+            };
+            // `U` bound to this position's element (the view's own binding is
+            // the last its family walk recorded), under whatever the family's
+            // own mappings bound on the way.
+            let mut inner = self.current_substitution.clone();
+            inner.extend(bindings);
+            let outer = std::mem::replace(&mut self.current_substitution, inner);
+            let mut branch = vec![js::Node::ConstVariable(js::Variable {
+                name: binding.clone(),
+                value: Box::new(element),
+            })];
+            branch.extend(self.walk_loop_body_nodes(&body.0, body.1));
+            self.current_substitution = outer;
+            let test = js::Node::Binary(
+                BinaryOp::Eq,
+                Box::new(js::Node::Local(position_name.clone())),
+                Box::new(js::Node::Number(at.to_string(), None)),
+            );
+            chain = Some(js::IfBranch::If(
+                Box::new(test),
+                branch,
+                chain.map(Box::new),
+            ));
+        }
+        let loop_body = chain
+            .map(|chain| vec![js::Node::If(chain)])
+            .unwrap_or_default();
+        block.push(js::Node::ForOf(
+            position_name,
+            Box::new(js::Node::Array(
+                (0..count)
+                    .map(|at| js::Node::Number(at.to_string(), None))
+                    .collect(),
+            )),
+            loop_body,
+        ));
+    }
+
+    /// B183 — a ZIPPED comprehension `(a in aa, b in bb => body)`, whose sources
+    /// are one family (the analyzer checked it), emitted UNROLLED: each source
+    /// evaluated once, and per position the body run as `((a, b) =>
+    /// body)(aa_i, bb_i)` with the walk's `U` bound to that position's element,
+    /// each source's element read at ITS OWN flat offset (the sources are
+    /// different mappings of one family, so their layouts differ), and a
+    /// tuple-valued result spliced. A family still abstract here (no instance
+    /// binds it) walks the first source's array by index, reading the others at
+    /// the same index — exact when every element is one slot.
+    fn zipped_comprehension(
+        &mut self,
+        comprehension_id: Id,
+        bindings: &[(Id, Id)],
+        body_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let mut sources = Vec::with_capacity(bindings.len());
+        for (_, source_id) in bindings {
+            let source = self
+                .walk_entity(*source_id, block)
+                .unwrap_or(js::Node::Void);
+            let source = match source {
+                js::Node::Local(name) => js::Node::Local(name),
+                other => {
+                    let name = self.ng.next_name();
+                    block.push(js::Node::ConstVariable(js::Variable {
+                        name: name.clone(),
+                        value: Box::new(other),
+                    }));
+                    js::Node::Local(name)
+                }
+            };
+            sources.push(source);
+        }
+        let parameters: Vec<js::Parameter> = bindings
+            .iter()
+            .map(|(binder_id, _)| js::Parameter {
+                name: self.ng.name_for(*binder_id),
+            })
+            .collect();
+        let views = self
+            .program
+            .tuple_zip_views
+            .get(&comprehension_id)
+            .cloned()
+            .unwrap_or_default();
+        let result_template = self.expr_type_id(comprehension_id).and_then(|type_id| {
+            match self.program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Mapped(_, _, template)) => Some(*template),
+                _ => None,
+            }
+        });
+        let layouts: Option<Vec<(Vec<(usize, usize, bool)>, Vec<Vec<(TypeId, TypeId)>>)>> = views
+            .iter()
+            .map(|view| {
+                let positions = self.tuple_positions(*view)?;
+                let elements = self.tuple_family_elements(*view)?;
+                Some((
+                    positions,
+                    elements.into_iter().map(|(_, bindings)| bindings).collect(),
+                ))
+            })
+            .collect();
+        let Some(layouts) = layouts.filter(|layouts| layouts.len() == bindings.len()) else {
+            // The abstract fallback: index the other sources in step.
+            let index_name = "$zip".to_string();
+            let mut body = Vec::new();
+            for (parameter, source) in parameters.iter().zip(&sources).skip(1) {
+                body.push(js::Node::ConstVariable(js::Variable {
+                    name: parameter.name.clone(),
+                    value: Box::new(js::Node::PropertyIndex(
+                        Box::new(source.clone()),
+                        Box::new(js::Node::Local(index_name.clone())),
+                    )),
+                }));
+            }
+            if let Some(value) = self.walk_entity(body_id, &mut body) {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+            return js::Node::Call(
+                Box::new(js::Node::Property(
+                    Box::new(sources[0].clone()),
+                    "map".to_string(),
+                )),
+                vec![js::Node::Closure(js::Closure {
+                    parameters: vec![parameters[0].clone(), js::Parameter { name: index_name }],
+                    body,
+                    is_async: false,
+                    origin: None,
+                })],
+            );
+        };
+        let count = layouts[0].0.len();
+        let mut items = Vec::with_capacity(count);
+        for at in 0..count {
+            let mut arguments = Vec::with_capacity(sources.len());
+            let mut inner = self.current_substitution.clone();
+            for ((positions, bindings), source) in layouts.iter().zip(&sources) {
+                let (offset, width, is_tuple) = positions[at];
+                arguments.push(match is_tuple {
+                    false => js::Node::PropertyIndex(
+                        Box::new(source.clone()),
+                        Box::new(js::Node::Number(offset.to_string(), None)),
+                    ),
+                    true => js::Node::Call(
+                        Box::new(js::Node::Property(
+                            Box::new(source.clone()),
+                            "slice".to_string(),
+                        )),
+                        vec![
+                            js::Node::Number(offset.to_string(), None),
+                            js::Node::Number((offset + width).to_string(), None),
+                        ],
+                    ),
+                });
+                inner.extend(bindings[at].iter().copied());
+            }
+            let outer = std::mem::replace(&mut self.current_substitution, inner);
+            let result_is_tuple = result_template.is_some_and(|template| {
+                matches!(
+                    self.program
+                        .type_id_to_type_map
+                        .get(&self.resolve_type_id(template)),
+                    Some(Type::Tuple(_))
+                )
+            });
+            let mut body = Vec::new();
+            if let Some(value) = self.walk_entity(body_id, &mut body) {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+            self.current_substitution = outer;
+            let call = js::Node::Call(
+                Box::new(js::Node::Closure(js::Closure {
+                    parameters: parameters.clone(),
+                    body,
+                    is_async: false,
+                    origin: None,
+                })),
+                arguments,
+            );
+            items.push(match result_is_tuple {
+                true => js::Node::Spread(Box::new(call)),
+                false => call,
+            });
+        }
+        js::Node::Array(items)
     }
 
     /// Binds a comprehension's element binder to one element's type on top of
@@ -8460,6 +8965,19 @@ impl<'src> Transformer<'src> {
                 Box::new(args.next().unwrap_or(js::Node::Void)),
                 Box::new(args.next().unwrap_or(js::Node::Void)),
             ),
+            Intrinsic::TupleMap => {
+                let receiver = args.next().unwrap_or(js::Node::Void);
+                let transform = args.next().unwrap_or(js::Node::Void);
+                self.emit_tuple_map(receiver, transform, call_expr_id)
+            }
+            Intrinsic::TupleLen
+            | Intrinsic::TupleKeys
+            | Intrinsic::TupleEntries
+            | Intrinsic::TupleGet => {
+                let receiver = args.next().unwrap_or(js::Node::Void);
+                let key = args.next();
+                self.emit_tuple_intrinsic(intrinsic, receiver, key, call_expr_id)
+            }
             // `Array.from(document.querySelectorAll(selector))` — the NodeList as a
             // real array, so `List` operations (`map`/`push`/…) behave.
             Intrinsic::QuerySelectorAll => {
@@ -8472,6 +8990,374 @@ impl<'src> Transformer<'src> {
                     vec![query],
                 )
             }
+        }
+    }
+
+    /// A122 — `std::tuple`'s four intrinsics, lowered against the receiver's
+    /// CONCRETE layout in this instance (`tuple_positions`): the arity for
+    /// `len`, a `TupleKey` (`[at]`, the struct's one field) per position for
+    /// `keys`, a spliced `(key, value)` per position for `entries`, and for
+    /// `get` a read at the position's own flat offset — a slot, or a `.slice`
+    /// for an element that is itself a tuple.
+    ///
+    /// A receiver whose layout this instance does not know (its family still
+    /// abstract — no instantiation reaches such a call today) reads every
+    /// position as one slot, which is exactly right whenever no element is a
+    /// tuple.
+    fn emit_tuple_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        receiver: js::Node<'src>,
+        key: Option<js::Node<'src>>,
+        call_expr_id: Option<Id>,
+    ) -> js::Node<'src> {
+        let positions = call_expr_id
+            .and_then(|call_expr_id| self.call_receiver_type_id(call_expr_id))
+            .and_then(|type_id| self.tuple_positions(type_id));
+        let number = |value: usize| js::Node::Number(value.to_string(), None);
+        let key_at =
+            |key: js::Node<'src>| js::Node::PropertyIndex(Box::new(key), Box::new(number(0)));
+        // Evaluates the receiver once, wherever the answer reads it more than
+        // once or not at all: an arrow over it, called with it.
+        let over_receiver = |receiver: js::Node<'src>, body: js::Node<'src>| match receiver {
+            js::Node::Local(_) => body,
+            receiver => js::Node::Call(
+                Box::new(js::Node::Closure(js::Closure {
+                    parameters: vec![js::Parameter {
+                        name: "$tuple".to_string(),
+                    }],
+                    body: vec![js::Node::Return(Box::new(body))],
+                    is_async: false,
+                    origin: None,
+                })),
+                vec![receiver],
+            ),
+        };
+        let subject = |receiver: &js::Node<'src>| match receiver {
+            js::Node::Local(name) => js::Node::Local(name.clone()),
+            _ => js::Node::Local("$tuple".to_string()),
+        };
+        // One position's element, read out of the flat receiver.
+        let element =
+            |tuple: js::Node<'src>, (offset, width, is_tuple): (usize, usize, bool)| match is_tuple
+            {
+                false => js::Node::PropertyIndex(Box::new(tuple), Box::new(number(offset))),
+                true => js::Node::Call(
+                    Box::new(js::Node::Property(Box::new(tuple), "slice".to_string())),
+                    vec![number(offset), number(offset + width)],
+                ),
+            };
+        match intrinsic {
+            Intrinsic::TupleLen => match positions {
+                Some(positions) => match receiver {
+                    js::Node::Local(_) => number(positions.len()),
+                    receiver => js::Node::Sequence(vec![receiver, number(positions.len())]),
+                },
+                None => js::Node::Property(Box::new(receiver), "length".to_string()),
+            },
+            Intrinsic::TupleKeys => match positions {
+                Some(positions) => {
+                    let keys = js::Node::Array(
+                        (0..positions.len())
+                            .map(|at| js::Node::Array(vec![number(at)]))
+                            .collect(),
+                    );
+                    match receiver {
+                        js::Node::Local(_) => keys,
+                        receiver => js::Node::Sequence(vec![receiver, keys]),
+                    }
+                }
+                None => js::Node::Call(
+                    Box::new(js::Node::Property(Box::new(receiver), "map".to_string())),
+                    vec![js::Node::Closure(js::Closure {
+                        parameters: vec![
+                            js::Parameter {
+                                name: "_".to_string(),
+                            },
+                            js::Parameter {
+                                name: "$at".to_string(),
+                            },
+                        ],
+                        body: vec![js::Node::Return(Box::new(js::Node::Array(vec![
+                            js::Node::Local("$at".to_string()),
+                        ])))],
+                        is_async: false,
+                        origin: None,
+                    })],
+                ),
+            },
+            Intrinsic::TupleEntries => {
+                let positions = positions.unwrap_or_default();
+                let tuple = subject(&receiver);
+                let mut items = Vec::with_capacity(positions.len() * 2);
+                for (at, position) in positions.into_iter().enumerate() {
+                    items.push(js::Node::Array(vec![number(at)]));
+                    let (offset, width, is_tuple) = position;
+                    match is_tuple {
+                        false => items.push(element(tuple.clone(), position)),
+                        // The pair `(key, value)` is itself flat: a tuple value
+                        // contributes its slots, not a nested array.
+                        true => items.extend((offset..offset + width).map(|slot| {
+                            js::Node::PropertyIndex(Box::new(tuple.clone()), Box::new(number(slot)))
+                        })),
+                    }
+                }
+                over_receiver(receiver, js::Node::Array(items))
+            }
+            Intrinsic::TupleGet => {
+                let key = key_at(key.unwrap_or(js::Node::Void));
+                match positions {
+                    Some(positions)
+                        if positions
+                            .iter()
+                            .enumerate()
+                            .any(|(at, (offset, _, is_tuple))| *is_tuple || *offset != at) =>
+                    {
+                        // `((tuple, at) => { if (at === 0) return ..; .. })(r, key[0])`
+                        let tuple = js::Node::Local("$tuple".to_string());
+                        let at = js::Node::Local("$at".to_string());
+                        let last = positions.len().saturating_sub(1);
+                        let mut body = Vec::with_capacity(positions.len());
+                        for (index, position) in positions.into_iter().enumerate() {
+                            let read = js::Node::Return(Box::new(element(tuple.clone(), position)));
+                            if index == last {
+                                body.push(read);
+                            } else {
+                                body.push(js::Node::If(js::IfBranch::If(
+                                    Box::new(js::Node::Binary(
+                                        BinaryOp::Eq,
+                                        Box::new(at.clone()),
+                                        Box::new(number(index)),
+                                    )),
+                                    vec![read],
+                                    None,
+                                )));
+                            }
+                        }
+                        js::Node::Call(
+                            Box::new(js::Node::Closure(js::Closure {
+                                parameters: vec![
+                                    js::Parameter {
+                                        name: "$tuple".to_string(),
+                                    },
+                                    js::Parameter {
+                                        name: "$at".to_string(),
+                                    },
+                                ],
+                                body,
+                                is_async: false,
+                                origin: None,
+                            })),
+                            vec![receiver, key],
+                        )
+                    }
+                    // Every position one slot at its own index: the read IS the
+                    // subscript.
+                    _ => js::Node::PropertyIndex(Box::new(receiver), Box::new(key)),
+                }
+            }
+            _ => unreachable!("emit_tuple_intrinsic takes only the four tuple intrinsics"),
+        }
+    }
+
+    /// A122 §3 — `t.map(|x| e)`, the comprehension `(x in t => e)` spelled as
+    /// a call, emitted by the comprehension's own rule
+    /// (`unrolled_comprehension`): where every source element and every
+    /// result is one non-tuple slot and the binder dispatches through no
+    /// bound, the flat array's own `.map` over the closure is exact; anything
+    /// else is unrolled — the receiver read once, the closure emitted once per
+    /// position with `U` bound to that position's element, each result
+    /// spliced when it is a tuple.
+    fn emit_tuple_map(
+        &mut self,
+        receiver: js::Node<'src>,
+        transform: js::Node<'src>,
+        call_expr_id: Option<Id>,
+    ) -> js::Node<'src> {
+        let native = |receiver: js::Node<'src>, transform: js::Node<'src>| {
+            js::Node::Call(
+                Box::new(js::Node::Property(Box::new(receiver), "map".to_string())),
+                vec![transform],
+            )
+        };
+        let Some(call_expr_id) = call_expr_id else {
+            return native(receiver, transform);
+        };
+        let view = self.program.tuple_walk_views.get(&call_expr_id).copied();
+        let result = self.program.tuple_map_results.get(&call_expr_id).copied();
+        let closure_id = match self.program.entity_map.get(&call_expr_id) {
+            Some(Expr::Call(call_id)) => self
+                .program
+                .function_calls
+                .get(call_id)
+                .and_then(|call| call.argument_ids.get(1).copied()),
+            _ => None,
+        };
+        let (Some(view), Some(result), Some(closure_id)) = (view, result, closure_id) else {
+            return native(receiver, transform);
+        };
+        let (Some(Type::Mapped(binder, _, _)), Some(Type::Mapped(_, _, result_template))) = (
+            self.program.type_id_to_type_map.get(&view).cloned(),
+            self.program.type_id_to_type_map.get(&result).cloned(),
+        ) else {
+            return native(receiver, transform);
+        };
+        let (Some(elements), Some(positions)) =
+            (self.tuple_family_elements(view), self.tuple_positions(view))
+        else {
+            return native(receiver, transform);
+        };
+        let results_are_tuples: Vec<bool> = elements
+            .iter()
+            .map(|(_, bindings)| {
+                let mut inner = self.current_substitution.clone();
+                inner.extend(bindings.iter().copied());
+                let outer = std::mem::replace(&mut self.current_substitution, inner);
+                let is_tuple = matches!(
+                    self.program
+                        .type_id_to_type_map
+                        .get(&self.resolve_type_id(result_template)),
+                    Some(Type::Tuple(_))
+                );
+                self.current_substitution = outer;
+                is_tuple
+            })
+            .collect();
+        let bounded = self.program.generic_bounds.contains_key(&binder);
+        let one_slot_each = positions
+            .iter()
+            .enumerate()
+            .all(|(at, (offset, _, is_tuple))| !*is_tuple && *offset == at);
+        if one_slot_each && !bounded && !results_are_tuples.contains(&true) {
+            return native(receiver, transform);
+        }
+        let tuple = js::Node::Local("$tuple".to_string());
+        let mut items = Vec::with_capacity(positions.len());
+        for (((offset, width, is_tuple), (_, bindings)), result_is_tuple) in
+            positions.into_iter().zip(elements).zip(results_are_tuples)
+        {
+            let element = match is_tuple {
+                false => js::Node::PropertyIndex(
+                    Box::new(tuple.clone()),
+                    Box::new(js::Node::Number(offset.to_string(), None)),
+                ),
+                true => js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(tuple.clone()),
+                        "slice".to_string(),
+                    )),
+                    vec![
+                        js::Node::Number(offset.to_string(), None),
+                        js::Node::Number((offset + width).to_string(), None),
+                    ],
+                ),
+            };
+            let mut inner = self.current_substitution.clone();
+            inner.extend(bindings);
+            let outer = std::mem::replace(&mut self.current_substitution, inner);
+            let mut throwaway = Vec::new();
+            let closure = self
+                .walk_entity(closure_id, &mut throwaway)
+                .unwrap_or(js::Node::Void);
+            self.current_substitution = outer;
+            let call = js::Node::Call(Box::new(closure), vec![element]);
+            items.push(match result_is_tuple {
+                true => js::Node::Spread(Box::new(call)),
+                false => call,
+            });
+        }
+        js::Node::Call(
+            Box::new(js::Node::Closure(js::Closure {
+                parameters: vec![js::Parameter {
+                    name: "$tuple".to_string(),
+                }],
+                body: vec![js::Node::Return(Box::new(js::Node::Array(items)))],
+                is_async: false,
+                origin: None,
+            })),
+            vec![receiver],
+        )
+    }
+
+    /// The type the receiver of a method-call intrinsic has in this instance —
+    /// the call's first argument's recorded type (a method call's `self`).
+    fn call_receiver_type_id(&self, call_expr_id: Id) -> Option<TypeId> {
+        if let Some(receiver_type_id) = self.program.tuple_call_receivers.get(&call_expr_id) {
+            return Some(*receiver_type_id);
+        }
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return None;
+        };
+        let receiver_id = *self
+            .program
+            .function_calls
+            .get(call_id)?
+            .argument_ids
+            .first()?;
+        self.expr_type_id(receiver_id)
+    }
+
+    /// A122 — each position of a tuple FAMILY value, as `(flat offset, flat
+    /// width, whether the element is itself a tuple)`, under the substitution
+    /// in force: a concrete tuple's elements directly, and a mapped tuple's
+    /// `F[U := X]` per element `X` of its (recursively concrete) family. `None`
+    /// when the family is still abstract here.
+    fn tuple_positions(&mut self, type_id: TypeId) -> Option<Vec<(usize, usize, bool)>> {
+        let elements = self.tuple_family_elements(type_id)?;
+        let mut offset = 0;
+        let mut positions = Vec::with_capacity(elements.len());
+        for (element, bindings) in elements {
+            let mut inner = self.current_substitution.clone();
+            inner.extend(bindings);
+            let outer = std::mem::replace(&mut self.current_substitution, inner);
+            let width = self.flat_width(element);
+            let is_tuple = matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(element)),
+                Some(Type::Tuple(_))
+            );
+            self.current_substitution = outer;
+            positions.push((offset, width, is_tuple));
+            offset += width;
+        }
+        Some(positions)
+    }
+
+    /// The elements of a tuple family value in this instance, each with the
+    /// binder bindings that type it: a concrete tuple's elements bind nothing;
+    /// a mapped tuple `(U in T: F<U>)`'s element is its template `F` with `U`
+    /// bound to `T`'s element (and whatever that element itself needed).
+    fn tuple_family_elements(
+        &self,
+        type_id: TypeId,
+    ) -> Option<Vec<(TypeId, Vec<(TypeId, TypeId)>)>> {
+        let _guard = crate::util::RecursionGuard::enter()?;
+        match self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(type_id))?
+        {
+            Type::Tuple(elements) => Some(
+                elements
+                    .iter()
+                    .map(|element| (*element, Vec::new()))
+                    .collect(),
+            ),
+            Type::Mapped(binder, family, template) => {
+                let (binder, template) = (*binder, *template);
+                let family = self.tuple_family_elements(*family)?;
+                Some(
+                    family
+                        .into_iter()
+                        .map(|(element, mut bindings)| {
+                            bindings.push((binder, element));
+                            (template, bindings)
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
         }
     }
 
@@ -10705,7 +11591,7 @@ impl<'src> Transformer<'src> {
     /// Emission now recomputes those offsets from the analyzer's recorded path
     /// under the instance's substitution (`tuple_index_slot`), so both halves
     /// read the SAME layout: the instantiated one, which is also the layout the
-    /// concrete caller builds and reads. Boxing a `(K, V)` inside `Map::insert`
+    /// concrete caller builds and reads. Boxing a `(K, V)` inside `HashMap::insert`
     /// and reslicing it flat at `entries()` was the miscompile.
     fn is_tuple_typed(&self, expr_id: Id) -> bool {
         if matches!(self.program.entity_map.get(&expr_id), Some(Expr::Tuple(_))) {
@@ -10729,7 +11615,7 @@ impl<'src> Transformer<'src> {
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
-    /// Whether a `for x in ...` loop's iterable is the built-in `Set` — a vilan
+    /// Whether a `for x in ...` loop's iterable is the built-in `HashSet` — a vilan
     /// struct wrapping a `NativeMap` (I1). Its elements are the backing map's
     /// stored originals, so such a loop iterates `set[0].values()`.
     ///
@@ -10737,7 +11623,7 @@ impl<'src> Transformer<'src> {
     /// the type it inferred there (`for_each_iterable_types`), which is the only
     /// total answer. Re-deriving it here from the iterable's own expr id was
     /// what B85 was — silent for every form that stores no type of its own, so
-    /// `for x in self` inside `Set`'s own impl, `for x in make_set()` and `for
+    /// `for x in self` inside `HashSet`'s own impl, `for x in make_set()` and `for
     /// x in *view` all walked the struct's one-element field array instead.
     fn for_each_iterates_a_set(&self, for_each_id: Id) -> bool {
         self.program
@@ -10750,7 +11636,7 @@ impl<'src> Transformer<'src> {
                     .program
                     .structs
                     .get(id)
-                    .is_some_and(|struct_| struct_.name == "Set"),
+                    .is_some_and(|struct_| struct_.name == "HashSet"),
                 _ => false,
             })
     }

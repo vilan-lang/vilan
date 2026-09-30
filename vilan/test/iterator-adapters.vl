@@ -3,12 +3,12 @@
 // defaults returning named concrete structs, and each stage monomorphizes to a
 // direct call — no dispatch table, no vtable. `Naturals` is unbounded, so the
 // short-circuiting stages are what make this program terminate at all.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
 import std::io::print;
 import std::iterator::Iterator;
-import std::map::Map;
 import std::option::Option::{ self, None, Some };
 import std::range::Range;
-import std::set::Set;
 
 struct Naturals {
 	at: i32,

@@ -47,8 +47,8 @@ trait Default {
 ```
 
 Zero for numbers, `""` for `str`, `false` for `bool`, `None` for
-`Option<T>`, and the empty container for `List<T>`, `Map<K, V>` and
-`Set<T>`. `[derive(Default)]` composes fields' defaults — so a struct
+`Option<T>`, and the empty container for `List<T>`, `HashMap<K, V>` and
+`HashSet<T>`. `[derive(Default)]` composes fields' defaults — so a struct
 holding a container derives one. Used as a bound by helpers like
 `unwrap_or_default` and `List.sum`.
 

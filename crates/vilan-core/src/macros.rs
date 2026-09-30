@@ -3287,6 +3287,7 @@ fn handle_spelling(returned: &Node) -> Option<&'static str> {
     };
     match (*name, arguments.0.len()) {
         ("SignalCell", 1) => Some("SignalCell"),
+        ("MemoCell", 1) => Some("MemoCell"),
         ("KeyedCell", 2) => Some("KeyedCell"),
         _ => None,
     }

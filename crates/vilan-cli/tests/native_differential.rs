@@ -159,6 +159,23 @@ const DEFAULT_SUITE: &[&str] = &[
     // F36: `i"{one.get()}"` — a generic call's result, interpolated, judged at
     // the type the call binds its parameter to.
     "reactive-selector.vl",
+    // N106: `vilan_rt::js_number`'s four documented departures from Rust's
+    // own `{}` — 1e21's exponential switch, the 1e-6 linear floor, and the
+    // two infinities — pinned identical on a corpus program rather than left
+    // unrecorded (negative zero is the one departure that is NOT identical;
+    // it is `f64-print-negative-zero.vl`, outside this differential by name).
+    "f64-print-boundary.vl",
+    // N106: `str::len` counts UTF-16 code units to match JavaScript's
+    // `.length`; a character outside the BMP is a surrogate pair on JS and
+    // `char::len_utf16` counts it the same way natively — verified here
+    // rather than left as an unverified claim in `vilan_rt::str_len`'s doc
+    // comment.
+    "non-bmp-string-length.vl",
+    // B414 S4: every reserved word names a member — fields, methods, a trait
+    // default, a `::` static, a lifted link and a `[derive(Json)]` round trip
+    // over a `"type"` key — and the Rust emitter's own keywords (`type`,
+    // `match`, `if`, `in`, `for`, `ret`) must survive as member names natively.
+    "keyword-members.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -171,10 +188,18 @@ const DEFAULT_SUITE: &[&str] = &[
 /// corpus keeps its JS golden, and
 /// [`an_underflowing_usize_is_outside_the_differential_by_name`] pins the
 /// native half.
-const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[(
-    "usize-underflow.vl",
-    "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
-)];
+const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[
+    (
+        "usize-underflow.vl",
+        "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
+    ),
+    (
+        "f64-print-negative-zero.vl",
+        "negative zero prints \"-0\" through node's `console.log` (a `util.inspect` \
+         special case) but \"0\" through every JS stringification `vilan_rt::js_number` \
+         implements instead (`String(x)`, a template literal, `JSON.stringify`) — N106",
+    ),
+];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
 ///
@@ -282,7 +307,36 @@ pub fn platform_free_programs() -> Vec<String> {
 /// still leads the name, so two concurrent runs of this binary cannot meet
 /// either. The shared cargo target directory stays shared on purpose; cargo
 /// locks it itself.
-fn stage() -> PathBuf {
+///
+/// Nothing removed the directory at the test's end, so a run that started
+/// clean left every staged corpus copy behind: 2,788 of them after one day of
+/// Order 42's runs, and CI's `vilan-fmt` leg — walking `./target` locally —
+/// tripped on 5,556 stale `resource struct` copies from before B413 (N133).
+/// `StagedDir` removes its directory on drop, at the end of the test function
+/// that called `stage()`, whether the test passed, failed, or panicked.
+struct StagedDir(PathBuf);
+
+impl std::ops::Deref for StagedDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for StagedDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn stage() -> StagedDir {
     static STAGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let call = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staged = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -291,7 +345,7 @@ fn stage() -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&staged);
     copy_tree(&corpus_dir(), &staged);
-    staged
+    StagedDir(staged)
 }
 
 /// Copies the corpus tree, DIRECTORIES INCLUDED.
@@ -449,6 +503,52 @@ fn an_underflowing_usize_is_outside_the_differential_by_name() {
          stdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&native.stdout)
     );
+}
+
+/// N106: the other [`OUTSIDE_THE_DIFFERENTIAL`] program — negative zero is
+/// the one `vilan_rt::js_number` departure from `console.log` that is NOT
+/// identical: node's `console.log` special-cases it to `"-0"` (`util.inspect`),
+/// while every JS *stringification* (`String(x)`, a template literal,
+/// `JSON.stringify`) answers `"0"`, which is what `js_number` — and so the
+/// native backend's `print` — implements. Both backends do what the book
+/// says; the sweep leaves the program out so it is not called broken.
+#[test]
+fn negative_zero_prints_differently_on_each_backend_by_name() {
+    for (program, _) in OUTSIDE_THE_DIFFERENTIAL {
+        assert!(
+            corpus_dir().join(program).is_file(),
+            "{program} is named outside the differential but is not a corpus program"
+        );
+        assert!(
+            !platform_free_programs().contains(&program.to_string()),
+            "{program} is named outside the differential but the sweep still enumerates it"
+        );
+        assert!(
+            !DEFAULT_SUITE.contains(program),
+            "{program} is outside the differential and cannot be in its default suite"
+        );
+    }
+    let staged = stage();
+    let javascript = vilan(&staged)
+        .args(["run", "f64-print-negative-zero.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert!(
+        javascript.status.success(),
+        "the JS leg runs clean: {}",
+        String::from_utf8_lossy(&javascript.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "-0\n");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "f64-print-negative-zero.vl"])
+        .output()
+        .expect("run the native backend");
+    assert!(
+        native.status.success(),
+        "the native leg runs clean: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "0\n");
 }
 
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
@@ -698,8 +798,8 @@ fn a_canonical_hash_keys_the_same_values_on_both_backends() {
 
 const HASH_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::map::Map;\n",
-    "import std::set::Set;\n",
+    "import std::hash_map::HashMap;\n",
+    "import std::hash_set::HashSet;\n",
     "\n",
     "[derive(Hashable, PartialEq)]\n",
     "struct Point { x: i32, y: i32 }\n",
@@ -707,12 +807,12 @@ const HASH_PROBE: &str = concat!(
     "fun main() {\n",
     // A string key and an integer key that render the same: two JS primitives,
     // two keys.
-    "\tmut mixed: Map<str, i32> = Map::new();\n",
+    "\tmut mixed: HashMap<str, i32> = HashMap::new();\n",
     "\tmixed.insert(\"1\", 10);\n",
     "\tmixed.insert(\"one\", 11);\n",
     "\tprint(mixed.len());\n",
     "\tprint(mixed.get(\"1\"));\n",
-    "\tmut numbers: Map<i32, str> = Map::new();\n",
+    "\tmut numbers: HashMap<i32, str> = HashMap::new();\n",
     "\tnumbers.insert(1, \"one\");\n",
     "\tnumbers.insert(2, \"two\");\n",
     "\tnumbers.insert(1, \"uno\");\n",
@@ -721,12 +821,12 @@ const HASH_PROBE: &str = concat!(
     // A re-insert keeps the ORIGINAL position, as a JS `Map` does.
     "\tfor key in numbers.keys() { print(key); }\n",
     // `bool` and `f64` keys — the other two primitive arms.
-    "\tmut flags: Map<bool, i32> = Map::new();\n",
+    "\tmut flags: HashMap<bool, i32> = HashMap::new();\n",
     "\tflags.insert(true, 1);\n",
     "\tflags.insert(false, 0);\n",
     "\tprint(flags.get(true));\n",
     "\tprint(flags.contains_key(false));\n",
-    "\tmut reals: Map<f64, str> = Map::new();\n",
+    "\tmut reals: HashMap<f64, str> = HashMap::new();\n",
     "\treals.insert(1.5, \"half\");\n",
     "\treals.insert(0.0, \"zero\");\n",
     "\tprint(reals.get(1.5));\n",
@@ -734,19 +834,19 @@ const HASH_PROBE: &str = concat!(
     // An AGGREGATE key: `[derive(Hashable)]` canonicalises through
     // `JSON.stringify`, so two equal points are one key and a different one is
     // its own.
-    "\tmut points: Map<Point, str> = Map::new();\n",
+    "\tmut points: HashMap<Point, str> = HashMap::new();\n",
     "\tpoints.insert(Point { x = 1, y = 2 }, \"a\");\n",
     "\tpoints.insert(Point { x = 1, y = 2 }, \"b\");\n",
     "\tpoints.insert(Point { x = 2, y = 1 }, \"c\");\n",
     "\tprint(points.len());\n",
     "\tprint(points.get(Point { x = 1, y = 2 }));\n",
     // A `List` key — `impl List<T: Hashable> with Hashable`.
-    "\tmut lists: Map<List<i32>, str> = Map::new();\n",
+    "\tmut lists: HashMap<List<i32>, str> = HashMap::new();\n",
     "\tlists.insert([1, 2], \"twelve\");\n",
     "\tprint(lists.get([1, 2]));\n",
     "\tprint(lists.get([2, 1]));\n",
     // A `Set`, which keys the same way.
-    "\tmut words: Set<str> = Set::new();\n",
+    "\tmut words: HashSet<str> = HashSet::new();\n",
     "\twords.insert(\"a\");\n",
     "\twords.insert(\"a\");\n",
     "\twords.insert(\"b\");\n",
@@ -755,6 +855,99 @@ const HASH_PROBE: &str = concat!(
     "\tprint(words.contains(\"z\"));\n",
     "}\n",
 );
+
+/// I9 / Q8: `HashMap` and `HashSet` equality is ORDER-INSENSITIVE on both
+/// backends — the same keys with equal values (the same members), whatever the
+/// insertion order. The native runtime's own `PartialEq for Map` is
+/// order-SENSITIVE and must stay unreachable: `==` goes through std's
+/// `impl .. with PartialEq`, and so does a derived `PartialEq` over a struct
+/// holding a map, and a map of maps compares its values through the same impl.
+/// Each line pairs an order-only difference (equal) with a value, a size or a
+/// member difference (unequal).
+#[test]
+fn i9_hash_collection_equality_is_order_insensitive_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_hash_eq.vl"), HASH_EQUALITY_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_hash_eq.vl"),
+        Verdict::Identical,
+        "map and set equality must ignore insertion order on both backends"
+    );
+}
+
+const HASH_EQUALITY_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::hash_map::HashMap;\n",
+    "import std::hash_set::HashSet;\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Holder {\n",
+    "\tscores: HashMap<str, i32>,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a: HashMap<str, i32> = HashMap::new();\n",
+    "\ta.insert(\"x\", 1);\n",
+    "\ta.insert(\"y\", 2);\n",
+    "\tmut b: HashMap<str, i32> = HashMap::new();\n",
+    "\tb.insert(\"y\", 2);\n",
+    "\tb.insert(\"x\", 1);\n",
+    "\tprint(a == b);\n",
+    "\tb.insert(\"y\", 3);\n",
+    "\tprint(a == b);\n",
+    "\tprint(a != b);\n",
+    "\tmut c: HashMap<str, i32> = HashMap::new();\n",
+    "\tc.insert(\"x\", 1);\n",
+    "\tprint(a == c);\n",
+    "\tc.insert(\"z\", 2);\n",
+    "\tprint(a == c);\n",
+    "\tprint(Holder { scores = a } == Holder { scores = [(\"y\", 2), (\"x\", 1)].to_map() });\n",
+    "\tprint(Holder { scores = a } == Holder { scores = c });\n",
+    "\tlet s: HashSet<i32> = [1, 2, 3].to_set();\n",
+    "\tprint(s == [3, 2, 1].to_set());\n",
+    "\tprint(s == [3, 2].to_set());\n",
+    "\tprint(s == [3, 2, 4].to_set());\n",
+    "\tmut nested: HashMap<str, HashMap<str, i32>> = HashMap::new();\n",
+    "\tnested.insert(\"a\", a);\n",
+    "\tmut other: HashMap<str, HashMap<str, i32>> = HashMap::new();\n",
+    "\tother.insert(\"a\", [(\"y\", 2), (\"x\", 1)].to_map());\n",
+    "\tprint(nested == other);\n",
+    "}\n",
+);
+
+/// A142 S4 and S5: the collection pipes on both backends — the operators' and
+/// the boundary conversions' seeded random walks against an oracle recomputed
+/// after every step (the same walks as `inference/collections.rs`'s), and the
+/// following shapes: `map` over a
+/// returned pipe and a returned source, `flatten`, `filter_map(|m| m)` and
+/// `any(|m| m.is_pending())` over `Option`-valued sources, and the element
+/// runs' owners released on leave, re-run and disposal.
+#[test]
+fn a142_collection_pipes_build_the_same_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_collection_walk.vl",
+            include_str!("native/collection_walk.vl"),
+        ),
+        (
+            "native_probe_collection_follow.vl",
+            include_str!("native/collection_follow.vl"),
+        ),
+        (
+            "native_probe_conversion_walk.vl",
+            include_str!("native/conversion_walk.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: a collection pipe must build and answer the same on both backends"
+        );
+    }
+}
 
 /// F23: a context-threaded hidden parameter is typed from the flavour the
 /// CONTEXT PASS recorded, and one program carries both readings.
@@ -900,6 +1093,1018 @@ const DESTRUCTURE_PROBE: &str = concat!(
     "\t\tlet (index, name) = row;\n",
     "\t\tprint(i\"{index}={name}\");\n",
     "\t}\n",
+    "}\n",
+);
+
+/// F41: a field named `self`, `super` or `crate` builds natively.
+///
+/// Vilan's `self` and `super` are contextual, so they are legal field names
+/// and the JS backend always ran them; the emitter spelled them `r#self` /
+/// `r#super`, and rustc refuses a PATH keyword raw. They are mangled instead
+/// (`self` → `self_`), and a field ALREADY spelled `self_` sits beside
+/// them in the probe so the mangling is shown injective: one more `_` for
+/// every name in the family, never a collision. Every site the name reaches is
+/// here — the declaration, a literal, a read, a write, a compound write, a
+/// method body through `self.self`, the derived `PartialEq` and `Json`, the
+/// printed struct, and a closure-holding struct's hand-written `PartialEq`.
+#[test]
+fn a_field_named_by_a_path_keyword_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_path_keywords.vl"),
+        PATH_KEYWORD_FIELD_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_path_keywords.vl"),
+        Verdict::Identical,
+        "a field named `self`/`super`/`crate` must build and print identically on both backends"
+    );
+}
+
+const PATH_KEYWORD_FIELD_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "[derive(Json, PartialEq)]\n",
+    "struct Node {\n",
+    "\tself: i32,\n",
+    "\tsuper: str,\n",
+    "\tself_: i32,\n",
+    "\tcrate: bool,\n",
+    "}\n",
+    "\n",
+    "struct Hook {\n",
+    "\tself: || i32,\n",
+    "\tsuper: i32,\n",
+    "}\n",
+    "\n",
+    "impl Node {\n",
+    "\tfun total(self): i32 {\n",
+    "\t\tself.self + self.self_\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut node = Node { self = 1, super = \"up\", self_ = 10, crate = true };\n",
+    "\tnode.self = node.self + 1;\n",
+    "\tnode.self_ += node.self;\n",
+    "\tprint(i\"{node.self} {node.super} {node.self_} {node.crate} {node.total()}\");\n",
+    "\tprint(node);\n",
+    "\tprint(node.to_json());\n",
+    "\tlet hook = Hook { self = || 7, super = 8 };\n",
+    "\tlet call = hook.self;\n",
+    "\tprint(call() + hook.super);\n",
+    "\tlet copy = Node { self = 5, super = \"s\", self_ = 6, crate = false };\n",
+    "\tprint(copy == node);\n",
+    "\tprint(copy.self == 5 && copy.super == \"s\");\n",
+    "}\n",
+);
+
+/// F42: `KeyedCell` builds natively — every writer, the op log read back as
+/// the wire's `Delta`s, the `Source` view, the keyed lookup and the wholesale
+/// `set`.
+///
+/// It was refused whole, for `Map`'s unbound `V`, at `KeyedCell::new`'s
+/// `positions = Shared::new(Map::new())`. The field's type names both of
+/// `Map`'s arguments, and a generic call closes its open bindings from the
+/// position it fills — but `Shared::new` is an INTRINSIC, and its argument
+/// was rendered under the expectation for the intrinsic's RESULT: `Map<K, V>`
+/// matched against `Shared<Map<Hash, usize>>` closed nothing. Each argument
+/// of an intrinsic now takes the expectation its intrinsic gives it — the
+/// `Shared`'s element for `Shared::new`'s value, nothing for a receiver or
+/// an operand, which the result says nothing about.
+#[test]
+fn a_keyed_cell_builds_and_journals_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_keyed_cell.vl"), KEYED_CELL_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_keyed_cell.vl"),
+        Verdict::Identical,
+        "`KeyedCell` must build natively and journal the same deltas as node"
+    );
+}
+
+const KEYED_CELL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::Source;\n",
+    "import std::rpc::KeyedCell;\n",
+    "import std::wire::{ Delta, Keyed };\n",
+    "\n",
+    "struct Row {\n",
+    "\tid: i32,\n",
+    "\tlabel: str,\n",
+    "}\n",
+    "\n",
+    "impl Row with Keyed<i32> {\n",
+    "\tfun key(self): i32 {\n",
+    "\t\tself.id\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun describe(delta: Delta<i32, Row>): str {\n",
+    "\tmatch delta {\n",
+    "\t\tDelta::Reset(let rows) => i\"reset {rows.len()}\",\n",
+    "\t\tDelta::Insert(let key, let row, let at) => i\"insert {key} {row.label} at {at}\",\n",
+    "\t\tDelta::Update(let key, let row) => i\"update {key} {row.label}\",\n",
+    "\t\tDelta::Remove(let key) => i\"remove {key}\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun labels(rows: List<Row>): str {\n",
+    "\tmut joined = \"\";\n",
+    "\tfor row in rows {\n",
+    "\t\tjoined = joined + row.label + \";\";\n",
+    "\t}\n",
+    "\tjoined\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet cell: KeyedCell<i32, Row> = KeyedCell<i32, Row>::new([Row { id = 1, label = \"one\" }]);\n",
+    "\tlet cursor = cell.cursor();\n",
+    "\tcell.insert(Row { id = 2, label = \"two\" });\n",
+    "\tcell.insert(Row { id = 3, label = \"three\" });\n",
+    "\tcell.update(2, |&mut row| {\n",
+    "\t\trow.label = \"TWO\";\n",
+    "\t});\n",
+    "\tcell.remove(1);\n",
+    "\tcell.insert(Row { id = 3, label = \"THREE\" });\n",
+    "\tfor delta in cell.since(cursor) {\n",
+    "\t\tprint(describe(delta));\n",
+    "\t}\n",
+    "\tprint(labels(cell.get()));\n",
+    "\tmatch cell.locate(3) {\n",
+    "\t\tSome(let found) => print(i\"3 at {found.0}: {found.1.label}\"),\n",
+    "\t\tNone => print(\"3 missing\"),\n",
+    "\t}\n",
+    "\tcell.set([Row { id = 9, label = \"nine\" }]);\n",
+    "\tprint(labels(cell.get()));\n",
+    "\tfor delta in cell.since(cursor) {\n",
+    "\t\tprint(describe(delta));\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// F44: a closure stored where nothing names its type is the counted
+/// `dyn Fn` its vilan type renders as — including one pushed into the list it
+/// READS.
+///
+/// `Shared::new([])` gives Rust's inference nothing, so the first closure
+/// pushed decided the element type: its own anonymous one. A second closure
+/// was then "a different closure", and a closure that reads the list it is
+/// pushed into was "a cyclic type of infinite size" — the closure's type held
+/// the list that held the closure. Every closure literal is now built AS
+/// `Rc<dyn Fn(..) -> _>`, so the element type is the one the vilan type
+/// names. The three shapes: a self-reading closure beside a second one in a
+/// `Shared<List<..>>`, two closures grown into an empty `List`, and an
+/// `Option` holding a closure that reads the cell holding the option.
+#[test]
+fn a_closure_stored_in_what_it_reads_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_stored_closure.vl"),
+        STORED_CLOSURE_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_stored_closure.vl"),
+        Verdict::Identical,
+        "a closure stored in a collection it reads must build and answer the same on both backends"
+    );
+}
+
+const STORED_CLOSURE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun main() {\n",
+    "\t// A closure pushed into the very list it reads, then a second closure.\n",
+    "\tlet cell: Shared<List<|| usize>> = Shared::new([]);\n",
+    "\tlet same = cell;\n",
+    "\tcell.write().push(|| same.read().len());\n",
+    "\tcell.write().push(|| 40);\n",
+    "\tmut total: usize = 0;\n",
+    "\tfor call in cell.read() {\n",
+    "\t\ttotal += call();\n",
+    "\t}\n",
+    "\tprint(total);\n",
+    "\n",
+    "\t// A plain list of two different closures, built empty and grown.\n",
+    "\tmut steps: List<|i32| i32> = [];\n",
+    "\tsteps.push(|n| n + 1);\n",
+    "\tsteps.push(|n| n * 10);\n",
+    "\tmut value = 1;\n",
+    "\tfor step in steps {\n",
+    "\t\tvalue = step(value);\n",
+    "\t}\n",
+    "\tprint(value);\n",
+    "\n",
+    "\t// An `Option` holding a closure that reads the cell holding the option.\n",
+    "\tlet hook: Shared<Option<|| str>> = Shared::new(None);\n",
+    "\tlet seen = hook;\n",
+    "\thook.write() = Some(|| if seen.read().is_some() { \"set\" } else { \"unset\" });\n",
+    "\tmatch hook.read() {\n",
+    "\t\tSome(let call) => print(call()),\n",
+    "\t\tNone => print(\"none\"),\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// F46: an argument that hands the RECEIVER's binding on by value copies it,
+/// because the receiver's loan outlives every argument.
+///
+/// `source.on_settle(pulling(source, observer))` — `std::reactive`'s
+/// `subscribe_pulling`, which reactive-42 wrote as two statements to dodge
+/// this. The last-use pass walked the receiver first, so the argument's read
+/// was the binding's last use and MOVED it while `&source` was live (rustc
+/// E0505; E0382 behind F35's hoist for a `&mut` receiver). A loaned bare
+/// place is now walked after the call's other arguments, so the argument
+/// copies. Four shapes, each the binding's last use: a `&self` method, a
+/// `&mut self` method (F35's hoist), a trait default, and the std shape
+/// through a generic bound.
+#[test]
+fn an_argument_handing_on_the_borrowed_receiver_copies_it_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_loaned_receiver.vl"),
+        LOANED_RECEIVER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_loaned_receiver.vl"),
+        Verdict::Identical,
+        "an argument moving the borrowed receiver must build and print identically"
+    );
+}
+
+const LOANED_RECEIVER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Counter {\n",
+    "\thits: List<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Counter {\n",
+    "\tfun absorb(self, other: Counter): i32 {\n",
+    "\t\tself.hits.len().as_i32() + other.hits.len().as_i32()\n",
+    "\t}\n",
+    "\n",
+    "\tfun grow(&mut self, other: Counter): i32 {\n",
+    "\t\tself.hits.push(other.hits.len().as_i32());\n",
+    "\t\tself.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun twice(counter: Counter): Counter {\n",
+    "\tmut hits = counter.hits;\n",
+    "\thits.push(0);\n",
+    "\tCounter { hits }\n",
+    "}\n",
+    "\n",
+    "trait Source {\n",
+    "\tfun size(self): i32;\n",
+    "\tfun settle(self, witness: Counter): i32 {\n",
+    "\t\tself.size() * 100 + witness.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl Counter with Source {\n",
+    "\tfun size(self): i32 {\n",
+    "\t\tself.hits.len().as_i32()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun witness<S: Source>(source: S): Counter {\n",
+    "\tCounter { hits = [source.size(), source.size()] }\n",
+    "}\n",
+    "\n",
+    "// `std::reactive`'s `subscribe_pulling` shape: through a BOUND, the receiver\n",
+    "// is borrowed while the argument hands the same parameter on by value.\n",
+    "fun generic<S: Source>(source: S): i32 {\n",
+    "\tsource.settle(witness(source))\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet counter = Counter { hits = [1, 2] };\n",
+    "\t// The argument MOVES the receiver's binding at its last use, while the\n",
+    "\t// receiver is borrowed for the call.\n",
+    "\tprint(counter.absorb(twice(counter)));\n",
+    "\tmut growing = Counter { hits = [3] };\n",
+    "\tprint(growing.grow(twice(growing)));\n",
+    "\tlet source = Counter { hits = [4, 5, 6] };\n",
+    "\tprint(source.settle(twice(source)));\n",
+    "\tlet again = Counter { hits = [7] };\n",
+    "\tprint(generic(again));\n",
+    "}\n",
+);
+
+/// F47 (UNSOUND until now): a `mut` PARAMETER a closure captures is one
+/// binding the two frames share, and natively it was a COPY — `late(0)`
+/// printed `0` where node prints `5`, and a closure that WROTE one was
+/// refused by rustc as `FnMut`. A captured `mut` parameter is boxed like a
+/// captured `mut` let and re-bound into its cell on entry. The shapes: a
+/// read after the write, a closure writing it, a `List` pushed through a
+/// capture, `mut self` written through a capture, and a closure's own `mut`
+/// parameter captured by a closure inside it.
+#[test]
+fn a_captured_mut_parameter_is_shared_with_its_closure_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_mut_parameter.vl"),
+        MUT_PARAMETER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_mut_parameter.vl"),
+        Verdict::Identical,
+        "a closure's capture of a `mut` parameter must be the parameter itself on both backends"
+    );
+}
+
+const MUT_PARAMETER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "// A `mut` parameter a closure captures is one binding two frames share.\n",
+    "fun late(mut n: i32): i32 {\n",
+    "\tlet show = || n;\n",
+    "\tn = 5;\n",
+    "\tshow()\n",
+    "}\n",
+    "\n",
+    "fun bump(mut n: i32): i32 {\n",
+    "\tlet inc = || {\n",
+    "\t\tn = n + 1;\n",
+    "\t};\n",
+    "\tinc();\n",
+    "\tinc();\n",
+    "\tn\n",
+    "}\n",
+    "\n",
+    "fun collect(mut seen: List<i32>): usize {\n",
+    "\tlet add = |value: i32| seen.push(value);\n",
+    "\tadd(1);\n",
+    "\tadd(2);\n",
+    "\tseen.len()\n",
+    "}\n",
+    "\n",
+    "struct Tally {\n",
+    "\tcount: i32,\n",
+    "}\n",
+    "\n",
+    "impl Tally {\n",
+    "\tfun spend(mut self): i32 {\n",
+    "\t\tlet take = || {\n",
+    "\t\t\tself.count = self.count - 1;\n",
+    "\t\t};\n",
+    "\t\ttake();\n",
+    "\t\tself.count\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(late(0));\n",
+    "\tprint(bump(0));\n",
+    "\tprint(collect([9]));\n",
+    "\tprint(Tally { count = 3 }.spend());\n",
+    "\t// A closure's own `mut` parameter, captured by a closure inside it.\n",
+    "\tlet outer = |mut total: i32| {\n",
+    "\t\tlet add = |amount: i32| {\n",
+    "\t\t\ttotal = total + amount;\n",
+    "\t\t};\n",
+    "\t\tadd(10);\n",
+    "\t\tadd(20);\n",
+    "\t\ttotal\n",
+    "\t};\n",
+    "\tprint(outer(1));\n",
+    "}\n",
+);
+
+/// B435: a value erased where it lands in a `dyn` position that a generic
+/// parameter or a literal hands it — `push` on a `List<dyn Src>` (the list's
+/// own and a field's), an index assignment, `Some(value)` at an
+/// `Option<dyn Src>`, and a generic struct literal under a `Boxed<dyn Src>`
+/// annotation. Each printed a `TypeError` on JS before (the bare value
+/// reached code reading a `(value, table)` pair) and was refused by rustc;
+/// the two backends agree now.
+#[test]
+fn a_value_erased_at_a_bound_or_literal_dyn_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b435.vl"), B435_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b435.vl"),
+        Verdict::Identical,
+        "a value erased at a bound or literal `dyn` position must mean the same thing on both backends"
+    );
+}
+
+const B435_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Boxed<T> {\n",
+    "\tvalue: T,\n",
+    "}\n",
+    "\n",
+    "struct Bag {\n",
+    "\titems: List<dyn Src>,\n",
+    "}\n",
+    "\n",
+    "fun total(objects: List<dyn Src>): i32 {\n",
+    "\tmut sum = 0;\n",
+    "\tfor object in objects {\n",
+    "\t\tsum = sum + object.get();\n",
+    "\t}\n",
+    "\tsum\n",
+    "}\n",
+    "\n",
+    "fun read(object: Option<dyn Src>): i32 {\n",
+    "\tmatch object {\n",
+    "\t\tSome(let found) => found.get(),\n",
+    "\t\tNone => 0,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet root = Root { n = 4 };\n",
+    "\tprint(read(Some(root)));\n",
+    "\tprint(read(Some(Root { n = 5 })));\n",
+    "\tlet boxed: Boxed<dyn Src> = Boxed { value = Root { n = 7 } };\n",
+    "\tprint(boxed.value.get());\n",
+    "\tmut pushed: List<dyn Src> = [];\n",
+    "\tpushed.push(Root { n = 8 });\n",
+    "\tpushed.push(root);\n",
+    "\tprint(total(pushed));\n",
+    "\tmut bag = Bag { items = [] };\n",
+    "\tbag.items.push(Root { n = 9 });\n",
+    "\tprint(bag.items[0].get());\n",
+    "\tmut slots: List<dyn Src> = [Root { n = 0 }];\n",
+    "\tslots[0] = Root { n = 11 };\n",
+    "\tprint(slots[0].get());\n",
+    "}\n",
+);
+
+/// B418: a place or a `Shared` read reaching a binding through an `if` or
+/// `match` arm is a copy on both backends. JS aliased it (the cell's later
+/// write showed through the binding, and a `push` on the binding grew the
+/// source) where the native build copied.
+#[test]
+fn a_place_chosen_by_a_branch_is_copied_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b418.vl"), B418_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b418.vl"),
+        Verdict::Identical,
+        "a place chosen by a branch must be copied the same way on both backends"
+    );
+}
+
+const B418_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet s: Shared<List<i32>> = Shared::new([1, 2, 3]);\n",
+    "\tlet flag = true;\n",
+    "\tlet b = if flag { s.read() } else { [] };\n",
+    "\ts.write().push(4);\n",
+    "\tprint(b.len());\n",
+    "\tlet c = match flag {\n",
+    "\t\ttrue => s.read(),\n",
+    "\t\tfalse => [],\n",
+    "\t};\n",
+    "\ts.write().push(5);\n",
+    "\tprint(c.len());\n",
+    "\tlet a: List<i32> = [1, 2];\n",
+    "\tmut d = if flag { a } else { [] };\n",
+    "\td.push(3);\n",
+    "\tprint(a.len());\n",
+    "\tprint(d.len());\n",
+    "\tmut e: List<i32> = [];\n",
+    "\te = if flag { a } else { [] };\n",
+    "\te.push(9);\n",
+    "\tprint(a.len());\n",
+    "}\n",
+);
+
+/// B452: a sibling that lowers to statements — a block, an `if` or `match`
+/// in value position — runs AFTER the siblings written before it, on JS as it
+/// always did natively: call arguments, list and tuple elements, struct
+/// fields in written order, binary operands, a method receiver, a `mut`
+/// binding read before a block that writes it.
+#[test]
+fn a_sibling_that_lowers_to_statements_keeps_its_order_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b452.vl"), B452_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b452.vl"),
+        Verdict::Identical,
+        "sibling evaluation order must agree on both backends"
+    );
+}
+
+const B452_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Pair {\n",
+    "\ta: i32,\n",
+    "\tb: i32,\n",
+    "}\n",
+    "\n",
+    "struct Acc {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Acc {\n",
+    "\tfun plus(self, k: i32): i32 {\n",
+    "\t\tself.n + k\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun say(label: str, value: i32): i32 {\n",
+    "\tprint(label);\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun add(a: i32, b: i32): i32 {\n",
+    "\ta + b\n",
+    "}\n",
+    "\n",
+    "fun make(label: str): Acc {\n",
+    "\tprint(label);\n",
+    "\tAcc { n = 100 }\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(add(say(\"a\", 1), { print(\"b-block\"); say(\"b\", 2) }));\n",
+    "\tlet list = [say(\"x\", 1), { print(\"y-block\"); say(\"y\", 2) }];\n",
+    "\tprint(list.len());\n",
+    "\tlet p = Pair { b = say(\"b\", 2), a = { print(\"a-block\"); say(\"a\", 1) } };\n",
+    "\tprint(p.a * 10 + p.b);\n",
+    "\tlet c = true;\n",
+    "\tprint(add(say(\"i\", 1), if c { print(\"j-if\"); say(\"j\", 2) } else { 0 }));\n",
+    "\tprint(add(say(\"m\", 1), match Some(2) { Some(let v) => { print(\"n-match\"); say(\"n\", v) }, None => 0 }));\n",
+    "\tmut x = 1;\n",
+    "\tprint(add(x, { x = 10; x }));\n",
+    "\tprint(say(\"l\", 1) + { print(\"r-block\"); say(\"r\", 2) });\n",
+    "\tlet t = (say(\"p\", 1), { print(\"q-block\"); say(\"q\", 2) });\n",
+    "\tprint(t.0 + t.1);\n",
+    "\tprint(make(\"recv\").plus({ print(\"arg-block\"); 1 }));\n",
+    "}\n",
+);
+
+/// B403: a bare `Holder::tag()` inside `impl Holder<type T: Label>` means
+/// `Self::tag()`, so each `Holder<X>` reaches its own `X::label()`. The
+/// native build emitted ONE instance for the unbound call and printed `A A`
+/// for a `Holder<B>`; JS stopped with an internal error.
+#[test]
+fn a_bare_static_inside_its_own_impl_dispatches_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b403.vl"), B403_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b403.vl"),
+        Verdict::Identical,
+        "a bare static inside its own impl must dispatch per instance on both backends"
+    );
+}
+
+const B403_PROBE: &str = concat!(
+    "trait Label { fun label(): str; }\n",
+    "struct A {}\n",
+    "impl A with Label { fun label(): str { \"A\" } }\n",
+    "struct B {}\n",
+    "impl B with Label { fun label(): str { \"B\" } }\n",
+    "struct Holder<T> { v: T }\n",
+    "impl Holder<type T: Label> {\n",
+    "\tfun tag(): str { T::label() }\n",
+    "\tfun show(self): str { Holder::tag() }\n",
+    "\tfun show_self(self): str { Self::tag() }\n",
+    "\tfun show_named(self): str { Holder<T>::tag() }\n",
+    "}\n",
+    "fun main() {\n",
+    "\tprint(Holder { v = A {} }.show_self());\n",
+    "\tprint(Holder { v = B {} }.show_named());\n",
+    "\tprint(Holder { v = A {} }.show());\n",
+    "\tprint(Holder { v = B {} }.show());\n",
+    "}\n",
+);
+
+/// B419: a blanket over a SUPERTRAIT applies to a type whose one impl block
+/// names the subtrait (B243's one-block form) — both backends find `pair`.
+#[test]
+fn a_blanket_over_a_supertrait_reaches_a_one_block_subtrait_impl_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b419.vl"), B419_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b419.vl"),
+        Verdict::Identical,
+        "a blanket over a supertrait must reach a one-block subtrait impl on both backends"
+    );
+}
+
+const B419_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Src<T> {\n",
+    "\tfun get(self): T;\n",
+    "}\n",
+    "\n",
+    "trait Sig<T> with Src<T> {\n",
+    "\tfun label(self): str;\n",
+    "}\n",
+    "\n",
+    "struct Cell<T> {\n",
+    "\tv: T,\n",
+    "}\n",
+    "\n",
+    "impl Cell<type T> with Sig<T> {\n",
+    "\tfun get(self): T {\n",
+    "\t\tself.v\n",
+    "\t}\n",
+    "\tfun label(self): str {\n",
+    "\t\t\"cell\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "impl type S: Src<type T> {\n",
+    "\tfun pair(self): (T, T) {\n",
+    "\t\t(self.get(), self.get())\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet c = Cell { v = 3 };\n",
+    "\tlet (a, b) = c.pair();\n",
+    "\tprint(a + b);\n",
+    "}\n",
+);
+
+/// B423: a literal `if` arm or `match` leg takes its sibling's numeric type
+/// (`u53` here) on both backends — the analyzer refused it before, and the
+/// native build needs the literal typed to emit `0u64`.
+#[test]
+fn a_literal_arm_typed_by_its_sibling_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b423.vl"), B423_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b423.vl"),
+        Verdict::Identical,
+        "a literal arm typed by its sibling must mean the same thing on both backends"
+    );
+}
+
+const B423_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun want(value: u53): u53 {\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n: u53 = 5;\n",
+    "\tlet m = if n > 2 { n } else { 0 };\n",
+    "\tlet k = if n > 2 { 0 } else { n };\n",
+    "\tlet j = match n > 2 {\n",
+    "\t\ttrue => n,\n",
+    "\t\tfalse => 0,\n",
+    "\t};\n",
+    "\tprint(i\"{want(m)} {want(k)} {want(j)}\");\n",
+    "}\n",
+);
+
+/// B457: a `Shared::read()` live across a CALL that writes the cell reads the
+/// same on both backends — a notify loop whose subscriber adds a subscriber,
+/// and a read handed by value to a callee that writes the cell.
+#[test]
+fn a_read_across_a_writing_call_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b457.vl"), B457_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b457.vl"),
+        Verdict::Identical,
+        "a read across a writing call must read the same on both backends"
+    );
+}
+
+const B457_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun direct(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+    "\tcell.write().push(9);\n",
+    "\tseen.len()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet log: Shared<List<str>> = Shared::new([]);\n",
+    "\tlet subs: Shared<List<|| void>> = Shared::new([]);\n",
+    "\tsubs.write().push(|| {\n",
+    "\t\tlog.write().push(\"first\");\n",
+    "\t\tsubs.write().push(|| log.write().push(\"late\"));\n",
+    "\t});\n",
+    "\tsubs.write().push(|| log.write().push(\"second\"));\n",
+    "\tfor sub in subs.read() {\n",
+    "\t\tsub();\n",
+    "\t}\n",
+    "\tprint(log.read().len());\n",
+    "\tlet cell = Shared::new([1, 2]);\n",
+    "\tprint(direct(cell, cell.read()));\n",
+    "}\n",
+);
+
+/// B462: a tuple variant where a closure is expected is its constructor on
+/// both backends — `Some` into `map`, a user variant with two payloads into a
+/// two-parameter closure, the generics taken from the expected type.
+#[test]
+fn a_variant_standing_for_a_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b462.vl"), B462_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b462.vl"),
+        Verdict::Identical,
+        "a variant coerced to a closure must build the same value on both backends"
+    );
+}
+
+const B462_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Shape {\n",
+    "\tRect(i32, i32),\n",
+    "\tDot,\n",
+    "}\n",
+    "\n",
+    "fun build(make: |i32, i32| Shape): Shape {\n",
+    "\tmake(2, 3)\n",
+    "}\n",
+    "\n",
+    "fun area(shape: Shape): i32 {\n",
+    "\tmatch shape {\n",
+    "\t\tShape::Rect(let w, let h) => w * h,\n",
+    "\t\tShape::Dot => 0,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs = [1, 2].map(Some);\n",
+    "\tprint(xs.len());\n",
+    "\tprint(xs[1].unwrap());\n",
+    "\tlet f: |i32| Option<i32> = Some;\n",
+    "\tprint(f(3).unwrap());\n",
+    "\tprint(area(build(Shape::Rect)));\n",
+    "}\n",
+);
+
+/// B458: `Context::clear` lowers to a plain call of its body with the value
+/// absent — a `get_safe` inside answers `None`, a closure minted inside keeps
+/// the cleared state, a `run` inside re-establishes — the same on both
+/// backends.
+#[test]
+fn a_cleared_context_reads_as_absent_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b458.vl"), B458_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b458.vl"),
+        Verdict::Identical,
+        "`clear` must read as absent the same way on both backends"
+    );
+}
+
+const B458_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun describe(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"some {value}\",\n",
+    "\t\tNone => \"none\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run(7, || {\n",
+    "\t\tprint(describe());\n",
+    "\t\tcurrent.clear(|| {\n",
+    "\t\t\tprint(describe());\n",
+    "\t\t\tcurrent.run(2, || print(current.get()));\n",
+    "\t\t});\n",
+    "\t\tprint(describe());\n",
+    "\t});\n",
+    "\tlet answer = current.run(5, || current.clear(|| 3) + 1);\n",
+    "\tprint(answer);\n",
+    "}\n",
+);
+
+/// A142 S6: tracked reads — the `tracking` context threaded through every body
+/// a pipe runs, the free `derive`'s stage, edges reconnected after each run,
+/// an effect's tracked re-run, a selector's re-selection, a tracked diamond in
+/// a turn, and `clear` as untrack — the same on both backends.
+#[test]
+fn tracked_reads_follow_the_same_dependencies_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_tracking.vl"), TRACKING_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_tracking.vl"),
+        Verdict::Identical,
+        "tracked reads must follow the same dependencies on both backends"
+    );
+}
+
+const TRACKING_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{\n",
+    "\tFlushPolicy, Owner, Signal, SignalCell, Source, derive, run_with_owner, tracking, turn,\n",
+    "};\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag: SignalCell<bool> = Signal::new(true);\n",
+    "\tlet a: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet b: SignalCell<i32> = Signal::new(100);\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tderive(|| if flag.track() { a.track() } else { b.track() })\n",
+    "\t\t\t.effect(|value: i32| print(i\"branch {value}\"));\n",
+    "\t\ta.effect(|value: i32| {\n",
+    "\t\t\tlet other = b.track();\n",
+    "\t\t\tprint(i\"effect {value} {other}\");\n",
+    "\t\t});\n",
+    "\t});\n",
+    "\ta.set(2);\n",
+    "\tb.set(200);\n",
+    "\tflag.set(false);\n",
+    "\ta.set(3);\n",
+    "\tlet stage = a.derive(|x: i32| x + b.track()).memo();\n",
+    "\tb.set(300);\n",
+    "\tprint(i\"stage {stage.get()}\");\n",
+    "\tlet picked = flag.switch(|on: bool| {\n",
+    "\t\tlet base = b.track();\n",
+    "\t\ta.derive(|x: i32| if on { x } else { x + base })\n",
+    "\t}).memo();\n",
+    "\tb.set(1000);\n",
+    "\tprint(i\"picked {picked.get()}\");\n",
+    "\tlet tens = a.derive(|x: i32| x * 10).memo();\n",
+    "\tlet hundreds = a.derive(|x: i32| x * 100).memo();\n",
+    "\tlet sums = Owner::new();\n",
+    "\trun_with_owner(sums, || {\n",
+    "\t\tderive(|| tens.track() + hundreds.track()).effect(|sum: i32| print(i\"sum {sum}\"));\n",
+    "\t});\n",
+    "\tturn(FlushPolicy::AtEnd, || a.set(4));\n",
+    "\tlet untracked = derive(|| a.track() + tracking.clear(|| b.get())).memo();\n",
+    "\tb.set(5);\n",
+    "\tprint(i\"untracked {untracked.get()}\");\n",
+    "\ta.set(6);\n",
+    "\tprint(i\"untracked {untracked.get()}\");\n",
+    "\tsums.dispose();\n",
+    "\towner.dispose();\n",
+    "}\n",
+);
+
+/// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
+/// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
+/// native half — building the erased pair for a resource without cloning — is
+/// native-44's, so until it lands the native build must REFUSE BY NAME and
+/// never hand rustc something wrong. When it lands this pin expects identity.
+#[test]
+fn a_resource_erased_into_a_resource_traits_object_is_identical_or_refused_by_name() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b470.vl"), B470_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_b470.vl") {
+        Verdict::Identical | Verdict::Refused(_) => {}
+        Verdict::Broken(detail) => panic!("the native build was accepted and wrong: {detail}"),
+    }
+}
+
+const B470_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "[resource]\n",
+    "trait Run {\n",
+    "\tfun run(own self): i32;\n",
+    "}\n",
+    "\n",
+    "[resource]\n",
+    "struct Node {\n",
+    "\tv: i32,\n",
+    "}\n",
+    "\n",
+    "impl Node with Run {\n",
+    "\tfun run(own self): i32 {\n",
+    "\t\tself.v + 1\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Plain {\n",
+    "\tv: i32,\n",
+    "}\n",
+    "\n",
+    "impl Plain with Run {\n",
+    "\tfun run(own self): i32 {\n",
+    "\t\tself.v * 10\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun pick(on: bool): dyn Run {\n",
+    "\tif on {\n",
+    "\t\tNode { v = 1 }\n",
+    "\t} else {\n",
+    "\t\tPlain { v = 2 }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(pick(true).run());\n",
+    "\tprint(pick(false).run());\n",
+    "}\n",
+);
+
+/// B430: the native build does not yet re-build a tuple erased element-wise
+/// (the JS emitter does, by projection) — it REFUSES by name rather than
+/// handing rustc a bare struct where a `Dyn` is wanted.
+#[test]
+fn a_tuple_erased_elementwise_is_refused_by_name_natively() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b430.vl"), B430_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_b430.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a tuple value erased element-wise"),
+            "refused for another reason: {reason}"
+        ),
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
+const B430_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "fun pair(p: (dyn Src, dyn Src)): i32 {\n",
+    "\tp.0.get() + p.1.get()\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet t = (Root { n = 1 }, Root { n = 2 });\n",
+    "\tprint(pair(t));\n",
+    "}\n",
+);
+
+/// B424 door (b): `or_else`'s free `F` takes the input's error type, so the
+/// native build has a type to emit — it refused by name before ("a value of
+/// an unbound generic type parameter (parameter 1 of `or_else`)").
+#[test]
+fn or_else_with_an_ok_only_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b424.vl"), B424_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b424.vl"),
+        Verdict::Identical,
+        "`or_else` with an Ok-only closure must mean the same thing on both backends"
+    );
+}
+
+const B424_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "fun main() {\n",
+    "\tlet err: Result<i32, str> = Err(\"bad\");\n",
+    "\tlet fixed = err.or_else(|e| Ok(7));\n",
+    "\tprint(fixed.unwrap_or(0));\n",
+    "\tlet fixed2 = err.or_else(|_| Ok(8));\n",
+    "\tprint(fixed2.unwrap_or(0));\n",
     "}\n",
 );
 
@@ -1613,7 +2818,7 @@ fn a_closure_type_over_a_view_takes_its_argument_by_reference() {
 
 const VIEW_CLOSURE_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::map::Map;\n",
+    "import std::hash_map::HashMap;\n",
     "import std::reactive::{ Signal, SignalCell };\n",
     "\n",
     "struct Counter {\n",
@@ -1640,7 +2845,7 @@ const VIEW_CLOSURE_PROBE: &str = concat!(
     "\t\titems.push(4);\n",
     "\t\titems.push(5);\n",
     "\t});\n",
-    "\tlet names: SignalCell<Map<str, i32>> = Signal::new(Map::new());\n",
+    "\tlet names: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());\n",
     "\tnames.update(|&mut entries| {\n",
     "\t\tentries.insert(\"a\", 1);\n",
     "\t});\n",
@@ -1788,7 +2993,7 @@ fn a_generic_call_left_open_is_closed_by_its_position() {
 
 const OPEN_BINDING_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::map::Map;\n",
+    "import std::hash_map::HashMap;\n",
     "import std::reactive::{ Signal, SignalCell };\n",
     "\n",
     "enum Delta<K, T> {\n",
@@ -1809,7 +3014,7 @@ const OPEN_BINDING_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet cell: SignalCell<List<i32>> = SignalCell::new([]);\n",
-    "\tlet named: SignalCell<Map<str, i32>> = Signal::new(Map::new());\n",
+    "\tlet named: SignalCell<HashMap<str, i32>> = Signal::new(HashMap::new());\n",
     "\tmut ops: List<Delta<str, i32>> = [];\n",
     "\tops.push(Delta::Reset([1, 2]));\n",
     "\tops.push(Delta::Remove(\"k\"));\n",
@@ -1885,7 +3090,9 @@ const KOLT_LOWERING_PROBE: &str = concat!(
 /// rebuilds the bad half. Both refused at the Order 40 seal (`parameter 1 of
 /// map`; `a ? lift`); `reactive.vl`, `reactive-on-change.vl`,
 /// `reactive-flatten.vl` and `iterator-adapters.vl` flip with them, and two of
-/// those are in [`DEFAULT_SUITE`].
+/// those are in [`DEFAULT_SUITE`]. A142 S1 renamed `map` to `derive` and made
+/// the total join `switch(|inner| inner)`; the probes seal what they read with
+/// `.memo()`, since a pipe has no `get`.
 #[test]
 fn the_reactive_combinators_map_and_flatten_build_the_same_on_both_backends() {
     let staged = stage();
@@ -1923,9 +3130,9 @@ const CELL_CHAIN_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet count = SignalCell::new(1);\n",
-    "\tlet scaled = count.map(|n| n * 10).cell();\n",
-    "\tlet labelled = scaled.map(|n| i\"#{n}\").cell();\n",
-    "\tlet parity = count.map(|n| n % 2).distinct();\n",
+    "\tlet scaled = count.derive(|n| n * 10).memo();\n",
+    "\tlet labelled = scaled.derive(|n| i\"#{n}\").memo();\n",
+    "\tlet parity = count.derive(|n| n % 2).distinct().memo();\n",
     "\tmut changes = 0;\n",
     "\tlet _watch = parity.sub(|value| {\n",
     "\t\tchanges += 1;\n",
@@ -1946,9 +3153,9 @@ const MAP_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet count = SignalCell::new(1);\n",
-    "\tlet scaled = count.map(|n| n * 10);\n",
-    "\tlet labelled = scaled.map(|n| i\"#{n}\");\n",
-    "\tlet halves = count.map(|n| n.as_f64() / 2.0);\n",
+    "\tlet scaled = count.derive(|n| n * 10).memo();\n",
+    "\tlet labelled = scaled.derive(|n| i\"#{n}\").memo();\n",
+    "\tlet halves = count.derive(|n| n.as_f64() / 2.0).memo();\n",
     "\tcount.set(4);\n",
     "\tlet now: i32 = scaled.get();\n",
     "\tlet label: str = labelled.get();\n",
@@ -1968,7 +3175,7 @@ const FLATTEN_PROBE: &str = concat!(
     "\tlet first = SignalCell::new(1);\n",
     "\tlet second = SignalCell::new(2);\n",
     "\tlet chosen = SignalCell::new(first);\n",
-    "\tlet joined = chosen.flatten();\n",
+    "\tlet joined = chosen.switch(|inner: SignalCell<i32>| inner).memo();\n",
     "\tfirst.set(10);\n",
     "\tchosen.set(second);\n",
     "\tsecond.set(20);\n",
@@ -2556,6 +3763,275 @@ impl Drop for ServerUnderTest {
     }
 }
 
+/// F45: `Server::stop()` ends a native server program as it ends a node one —
+/// the listener closes, `on_stop` fires, the loop runs out of work, and the
+/// process exits 0 — and `on_start` runs AFTER the turn that called
+/// `start()`, as node's `'listening'` does (it ran inside `start()`
+/// natively, so `print("main returned")` came second; found building this).
+#[test]
+fn a_stopped_server_ends_the_program_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_stop.vl"), STOP_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_stop.vl"),
+        Verdict::Identical,
+        "a server that stops itself must end the program, printing the same lines in the same \
+         order on both backends"
+    );
+}
+
+const STOP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder().body(\"hello\\n\").build(),\n",
+    "\t\ton_start = |started| {\n",
+    "\t\t\tprint(\"started\");\n",
+    "\t\t\tstarted.stop();\n",
+    "\t\t},\n",
+    "\t\ton_stop = |stopped| print(\"stopped\"),\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "\tprint(\"main returned\");\n",
+    "}\n",
+);
+
+/// A native server built from `program` and spawned with `environment`: the
+/// child and the port it announced.
+#[cfg(unix)]
+struct SignalledServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+#[cfg(unix)]
+impl SignalledServer {
+    fn spawn(staged: &Path, program: &str, environment: &[(&str, &str)]) -> SignalledServer {
+        let built = vilan(staged)
+            .args(["build", "--backend", "rust", program])
+            .output()
+            .expect("build the server natively");
+        assert!(
+            built.status.success(),
+            "the native leg did not build:\n{}{}",
+            String::from_utf8_lossy(&built.stdout),
+            String::from_utf8_lossy(&built.stderr)
+        );
+        // The graceful stop is linked only by a program that serves.
+        let manifest = std::fs::read_to_string(
+            staged
+                .join("dist")
+                .join("native")
+                .join(program.trim_end_matches(".vl"))
+                .join("Cargo.toml"),
+        )
+        .expect("read the generated manifest");
+        assert!(
+            manifest.contains("vilan-rt-signal"),
+            "a program that starts a server links the signal crate:\n{manifest}"
+        );
+        let binary = String::from_utf8_lossy(&built.stdout)
+            .lines()
+            .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+            .expect("`vilan build` says where the binary is");
+        let mut command = Command::new(staged.join(&binary));
+        command
+            .current_dir(staged)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("spawn the server");
+        let stdout = child.stdout.take().expect("the server's stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let port = loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .expect("read the server's stdout");
+            assert!(
+                read > 0,
+                "the server's stdout ended before it announced a port"
+            );
+            if let Some(number) = line.trim().strip_prefix("vilan-test-port=") {
+                break number.parse().expect("the announced port is a number");
+            }
+        };
+        SignalledServer { child, port }
+    }
+
+    fn signal(&self, name: &str) {
+        let sent = Command::new("kill")
+            .args([name, &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(sent.success(), "kill {name} must succeed");
+    }
+
+    /// Waits for the process to end — a LIVENESS bound, not a claim about how
+    /// fast it stops — and answers its exit status and its stderr.
+    fn finish(mut self) -> (std::process::ExitStatus, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll the server") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server did not end after the signal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        (status, stderr)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalledServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// F45 (Order 43's R-i, RULED: build): a native server STOPS on SIGTERM and
+/// reaches its process end, so the leak census reads a server's cells at exit.
+///
+/// The kolt shape answers a login, takes a SIGTERM, and exits 0 — where node,
+/// with no handler, dies of the signal — printing the census line the runtime
+/// prints only after the program's thread has ended. A `#[cfg(unix)]` pin: the
+/// signal is sent with `kill`, and Windows has no console equivalent a test
+/// could send.
+#[cfg(unix)]
+#[test]
+fn a_native_server_stops_on_sigterm_and_reaches_its_process_end() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_kolt_exit.vl"), KOLT_SHAPE_PROBE)
+        .expect("write the probe program");
+    let server = SignalledServer::spawn(
+        &staged,
+        "native_probe_kolt_exit.vl",
+        &[("VILAN_NATIVE_LEAK_CENSUS", "1")],
+    );
+    let login =
+        ServedRequest::exchange(server.port, "POST", "/api/login", "[\"ada\",\"lovelace1\"]");
+    assert_eq!(login.body, "{\"ok\":true,\"message\":\"welcome ada\"}");
+    server.signal("-TERM");
+    let (status, stderr) = server.finish();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a SIGTERM'd native server drains and exits 0 (stderr: {stderr})"
+    );
+    let census = stderr
+        .lines()
+        .find(|line| line.starts_with("vilan-native: cells minted="))
+        .unwrap_or_else(|| panic!("the program reached no process end:\n{stderr}"));
+    assert_eq!(
+        census, KOLT_SHAPE_EXIT_CENSUS,
+        "the kolt shape's exit census moved; a live cell is a cycle — read it before moving \
+         this line"
+    );
+}
+
+/// What the kolt shape's counted cells are at process end after one login and
+/// a SIGTERM — F45's exit row, C14's gate reading a server for the first time.
+#[cfg(unix)]
+const KOLT_SHAPE_EXIT_CENSUS: &str = "vilan-native: cells minted=1 live=0";
+
+/// F45: the SECOND termination signal ends the process at once — the answer
+/// for a server whose open response never ends. The first stops the listener
+/// (a new connection is refused, which is how the harness knows it landed —
+/// no sleep stands in for it) while the open stream keeps the program alive;
+/// the second exits 1 with the runtime's sentence.
+#[cfg(unix)]
+#[test]
+fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_open_stream.vl"),
+        OPEN_STREAM_PROBE,
+    )
+    .expect("write the probe program");
+    let mut server = SignalledServer::spawn(&staged, "native_probe_open_stream.vl", &[]);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port))
+        .expect("connect to the announced port");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .expect("send the request");
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone the stream"));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).expect("read the stream") > 0,
+            "the stream ended before its first chunk"
+        );
+        if line.contains("first") {
+            break;
+        }
+    }
+    server.signal("-TERM");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::net::TcpStream::connect(("127.0.0.1", server.port)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first SIGTERM never closed the listener"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        server.child.try_wait().expect("poll the server").is_none(),
+        "the open stream keeps the program alive after the first signal"
+    );
+    server.signal("-TERM");
+    let (status, stderr) = server.finish();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the second signal exits 1 (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("stopped by a second termination request"),
+        "the runtime says why it stopped: {stderr}"
+    );
+    drop(stream);
+}
+
+#[cfg(unix)]
+const OPEN_STREAM_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder()\n",
+    "\t\t\t.streaming(|stream| stream.send(\"first\\n\"))\n",
+    "\t\t\t.build(),\n",
+    "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
+    "\t\ton_stop = |stopped| {},\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "}\n",
+);
+
 /// F25: a program that FAILS answers the same exit code on both backends, and
 /// the native binary does not print Rust's panic banner.
 ///
@@ -3091,7 +4567,7 @@ const INTERPOLATE_PROBE: &str = concat!(
     "fun main() {\n",
     "\tlet count = SignalCell::new(1);\n",
     "\tshow(\"count\", count);\n",
-    "\tlet doubled = count.map(|n| n * 2);\n",
+    "\tlet doubled = count.derive(|n| n * 2).memo();\n",
     "\tcount.set(5);\n",
     "\tshow(\"doubled\", doubled);\n",
     "\tlet name = SignalCell::new(\"ada\");\n",
@@ -3170,24 +4646,25 @@ const ENCODE_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F36's boundary, named: `blanket-impl.vl` got past the interpolation and met
-/// a call that threads FEWER context arguments than its callee's instance
-/// declares (`badge("static")` from `main`, whose instance takes the ambient
-/// `Owner` because one impl of the trait member it dispatches through reaches
-/// it; JavaScript passes `undefined`). rustc refused that as E0061 — a BROKEN
-/// verdict — so it is refused by name instead, which is what the whole-set
-/// sweep's zero-broken gate needs. The context pass is the analyzer's, and the
-/// fix that makes the call emittable is there.
+/// F36's boundary, CLOSED by B425: `blanket-impl.vl` met a call that threaded
+/// FEWER context arguments than its callee's instance declared
+/// (`badge("static")` from `main`). The instance declared the ambient `Owner`
+/// because the context pass read `label.bind(..)` — a dispatch through `V:
+/// MaybeSignal<str>`, the program's OWN trait — as reaching every member
+/// NAMED `bind`, std's `MaybeSignal::bind` (whose reactive impl registers an
+/// effect) among them, while coverage, which narrows, found no need. A
+/// generic-member site's candidates are now the bound's traits' members only,
+/// so nothing is declared that no caller supplies: the program is identical
+/// on both backends (it was refused by name here, and before that rustc's
+/// E0061).
 #[test]
 fn a_call_missing_a_context_argument_is_refused_by_name() {
     let staged = stage();
-    match compare(&staged, "blanket-impl.vl") {
-        Verdict::Refused(reason) => assert!(
-            reason.contains("a call to `badge` that threads fewer context arguments"),
-            "{reason}"
-        ),
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "blanket-impl.vl"),
+        Verdict::Identical,
+        "`blanket-impl.vl` must mean the same thing on both backends"
+    );
 }
 
 /// **F38**: `and_then<U>`'s `U` — a callee's OWN generic parameter that no
@@ -3245,17 +4722,20 @@ const AND_THEN_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F38's boundary: `result-combinators.vl` now stops at `or_else<F>` over an
-/// `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose `F` NOTHING in the
-/// program constrains — the analyzer records `any` and JavaScript never needs
-/// a type. Natively a type has to be chosen, which is a ruling, not a
-/// lowering, so it stays refused by name at the new wall.
+/// F38's boundary, moved by B424: `result-combinators.vl` stopped at
+/// `or_else<F>` over an `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose
+/// `F` nothing in the program constrained. The ruling (R-h, door (b)) gives
+/// that `F` the input's error type, and `err.or(Ok(3))`'s likewise, so both
+/// emit now. The program stops one wall further on: `ok.and(Ok(5))`'s
+/// ARGUMENT, a constructor whose own error parameter the analyzer leaves
+/// open although its landing position (`Result<U, E>` at the receiver's
+/// `E`) fixes it — refused by name, not broken.
 #[test]
 fn an_unconstrained_generic_parameter_is_refused_by_name() {
     let staged = stage();
     match compare(&staged, "result-combinators.vl") {
         Verdict::Refused(reason) => {
-            assert!(reason.contains("parameter 1 of `or_else`"), "{reason}")
+            assert!(reason.contains("parameter 2 of enum `Result`"), "{reason}")
         }
         other => panic!("expected a refusal by name, got {other:?}"),
     }
@@ -3530,9 +5010,11 @@ fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
 /// not a number to regenerate past. Regenerate with
 /// `VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1` only after reading the difference.
 ///
-/// The F18/F40 exit — kolt's server and its shape — is NOT a row: a server is
-/// stopped by a signal, and `vilan_rt::http` has no graceful stop to reach
-/// process end through (recorded in the lane's report).
+/// The F18/F40 exit — kolt's server and its shape — is not a row of THIS
+/// table, whose rows run to their own end: a server runs until it is told to
+/// stop. Since F45 it can be told — SIGTERM stops it gracefully and the
+/// census reads it at process end — and the kolt shape's exit line is held by
+/// [`a_native_server_stops_on_sigterm_and_reaches_its_process_end`].
 #[test]
 fn the_native_leak_census_matches_its_table() {
     let staged = stage();
@@ -4290,7 +5772,7 @@ const COMBINE_TUPLE_ELEMENT_PROBE: &str = concat!(
     "fun main() {\n",
     "\tlet point = SignalCell::new((1, 2));\n",
     "\tlet label = SignalCell::new(\"c\");\n",
-    "\tlet both = combine((point, label));\n",
+    "\tlet both = combine((point, label)).memo();\n",
     "\tlet ((x, y), l) = both.get();\n",
     "\tprint(i\"{x} {y} {l}\");\n",
     "\tpoint.set((3, 4));\n",
@@ -4890,3 +6372,661 @@ fn the_enumeration_finds_a_corpus_and_excludes_the_platform_programs() {
     );
     assert!(programs.iter().any(|program| program == "bool.vl"));
 }
+
+/// F56: a `[resource]` type with NO `Drop` impl needs no teardown — move-only
+/// is the analyzer's, and it reads the same on both backends — so the native
+/// build emits it as an ordinary type. A142's pipe nodes are exactly that
+/// (Drop-less `[resource]` structs holding closures), and before F56 every
+/// program deriving a signal was refused at its first node.
+///
+/// The cases are Appendix A's prototype (`native/pipe_prototype.vl`): a fused
+/// chain sealed once, a counting `switch` selector, a root and a pipe handed to
+/// an `own` parameter, two chains sealed in sequence, and a pipe chosen by a
+/// branch beside a Drop-less resource ENUM carrying one.
+#[test]
+fn a_resource_without_drop_builds_the_same_on_both_backends() {
+    let staged = stage();
+    let library = include_str!("native/pipe_prototype.vl");
+    for (name, main) in [
+        ("fused", PIPE_FUSED_MAIN),
+        ("switch", PIPE_SWITCH_MAIN),
+        ("own_parameter", PIPE_OWN_PARAMETER_MAIN),
+        ("sealed_twice", PIPE_SEALED_TWICE_MAIN),
+        ("branch", PIPE_BRANCH_MAIN),
+    ] {
+        let program = format!("native_probe_pipe_{name}.vl");
+        std::fs::write(staged.join(&program), format!("{library}\n{main}"))
+            .expect("write the probe program");
+        assert_eq!(
+            compare(&staged, &program),
+            Verdict::Identical,
+            "{program}: a Drop-less resource must build and print the same on both backends"
+        );
+    }
+}
+
+/// F56: a Drop-less resource handed on is MOVED natively, never copied. The
+/// source binding is dead (the analyzer's move checker says so on both
+/// backends), so a copy would be harmless for a type with no teardown — and
+/// wasted, and a second owner of what the language says has one. Two move
+/// sites, each of which copied before:
+///
+/// - a generic field read at a resource instantiation: the outer `Map`'s
+///   `start` hands `self.up` — itself a `Map` — to the inner `start`. The
+///   analyzer's decision is per instantiation (`UnlessResource`), and this
+///   backend read only that a decision EXISTED;
+/// - a destructuring `match` over an owned resource parameter, which copied
+///   its subject as it does a data place's.
+#[test]
+fn a_resource_is_moved_not_copied_at_its_move_sites_natively() {
+    let staged = stage();
+    let library = include_str!("native/pipe_prototype.vl");
+    let emit = |program: &str, main: &str| -> String {
+        std::fs::write(staged.join(program), format!("{library}\n{main}"))
+            .expect("write the probe program");
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("build the probe");
+        assert!(
+            emitted.status.success(),
+            "{program} was refused:\n{}",
+            String::from_utf8_lossy(&emitted.stderr)
+        );
+        String::from_utf8_lossy(&emitted.stdout).into_owned()
+    };
+    // The function whose signature names a parameter of a Rust type minted
+    // from `prefix`, as (its parameter's name, its body).
+    let owners_of = |source: &str, prefix: &str, name_prefix: &str| -> Vec<(String, String)> {
+        source
+            .split("\nfn ")
+            .skip(1)
+            .filter_map(|function| {
+                let signature = function.lines().next()?;
+                let marker = format!(": {prefix}");
+                let at = signature.find(&marker)?;
+                let name = signature[..at].rsplit(['(', ' ']).next()?.to_string();
+                name.starts_with(name_prefix)
+                    .then(|| (name, function.to_string()))
+            })
+            .collect()
+    };
+
+    // The fused chain: `Map<Map<Cell, ..>, ..>`. The Rust struct whose `up`
+    // is itself a `Map` is the outer node.
+    let fused = emit("native_probe_pipe_moves_fused.vl", PIPE_FUSED_MAIN);
+    let outer = fused
+        .split("\nstruct ")
+        .skip(1)
+        .find(|declaration| {
+            declaration
+                .lines()
+                .nth(1)
+                .is_some_and(|field| field.contains("up: Map_"))
+        })
+        .and_then(|declaration| declaration.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no `Map` over a `Map` in the emitted source:\n{fused}"))
+        .to_string();
+    let starts = owners_of(&fused, &outer, "this");
+    assert!(
+        !starts.is_empty(),
+        "no function takes the outer node `{outer}` by value:\n{fused}"
+    );
+    for (_, body) in &starts {
+        assert!(
+            !body.contains("(this.up).clone()"),
+            "the outer node's `up` (a resource) is copied where it is moved:\n{body}"
+        );
+    }
+
+    // A destructuring `match` over an owned resource parameter.
+    let branch = emit("native_probe_pipe_moves_branch.vl", PIPE_BRANCH_MAIN);
+    let runs = owners_of(&branch, "Stage_", "s_");
+    assert!(
+        !runs.is_empty(),
+        "no function takes a `Stage` by value:\n{branch}"
+    );
+    for (name, body) in &runs {
+        assert!(
+            body.contains(&format!("match {name} {{")),
+            "the owned resource `{name}` is copied into its `match`:\n{body}"
+        );
+    }
+}
+
+/// F56's other half: a resource WITH a `Drop` impl is still refused by name —
+/// its teardown is F1's later slice — as a struct and as an enum.
+#[test]
+fn a_resource_with_drop_is_still_refused_by_name_natively() {
+    let staged = stage();
+    for (program, source, named) in [
+        (
+            "native_probe_drop_struct.vl",
+            DROP_STRUCT_PROBE,
+            "the `resource` type `Guard`",
+        ),
+        (
+            "native_probe_drop_enum.vl",
+            DROP_ENUM_PROBE,
+            "the `resource` enum `Slot`",
+        ),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        match compare(&staged, program) {
+            Verdict::Refused(reason) => assert!(
+                reason.contains(named),
+                "{program} refused for another reason: {reason}"
+            ),
+            other => panic!("{program}: expected a refusal by name, got {other:?}"),
+        }
+    }
+}
+
+const PIPE_FUSED_MAIN: &str = concat!(
+    "fun main() {\n",
+    "\tlet runs = Shared::new(0);\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tlet m = c\n",
+    "\t\t.derive(|x| {\n",
+    "\t\t\truns.write() = runs.read() + 1;\n",
+    "\t\t\tx * 2\n",
+    "\t\t})\n",
+    "\t\t.derive(|x| x + 1)\n",
+    "\t\t.memo();\n",
+    "\tprint(i\"m={m.get()} runs={runs.read()}\");\n",
+    "\tc.set(5);\n",
+    "\tprint(i\"m={m.get()} {m.get()} {m.get()} runs={runs.read()}\");\n",
+    "}\n",
+);
+
+const PIPE_SWITCH_MAIN: &str = concat!(
+    "fun main() {\n",
+    "\tlet made = Shared::new(0);\n",
+    "\tlet flag = Cell::new(true);\n",
+    "\tlet count = Cell::new(1);\n",
+    "\tlet m = flag\n",
+    "\t\t.switch(|on| {\n",
+    "\t\t\tmade.write() = made.read() + 1;\n",
+    "\t\t\tcount.derive(|x| if on { x * 100 } else { 0 - x })\n",
+    "\t\t})\n",
+    "\t\t.memo();\n",
+    "\tprint(i\"m={m.get()} made={made.read()}\");\n",
+    "\tcount.set(2);\n",
+    "\tprint(i\"m={m.get()} {m.get()} made={made.read()}\");\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(i\"m={m.get()} made={made.read()}\");\n",
+    "}\n",
+);
+
+const PIPE_OWN_PARAMETER_MAIN: &str = concat!(
+    "fun show(label: str, own x: Up<i32>) {\n",
+    "\tx.start(|v| print(i\"{label}: {v}\"));\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tshow(\"root\", c);\n",
+    "\tshow(\"root again\", c);\n",
+    "\tshow(\"pipe\", c.derive(|x| x * 10));\n",
+    "\tc.set(2);\n",
+    "}\n",
+);
+
+const PIPE_SEALED_TWICE_MAIN: &str = concat!(
+    "fun main() {\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tlet m = c.derive(|x| x * 2).derive(|x| x + 1).memo();\n",
+    "\tc.set(5);\n",
+    "\tprint(i\"{m.get()}\");\n",
+    "\tlet p = c.derive(|x| x * 3);\n",
+    "\tlet q = p.derive(|x| x + 1);\n",
+    "\tlet n = q.memo();\n",
+    "\tprint(i\"{n.get()}\");\n",
+    "}\n",
+);
+
+const PIPE_BRANCH_MAIN: &str = concat!(
+    "[resource]\n",
+    "enum Stage {\n",
+    "\tDoubled(Map<Cell<i32>, i32, i32>),\n",
+    "\tPlain(Cell<i32>),\n",
+    "}\n",
+    "fun stage(on: bool, c: Cell<i32>): Stage {\n",
+    "\tif on {\n",
+    "\t\tStage::Doubled(c.derive(|x| x * 2))\n",
+    "\t} else {\n",
+    "\t\tStage::Plain(c)\n",
+    "\t}\n",
+    "}\n",
+    "fun run(label: str, own s: Stage) {\n",
+    "\tmatch s {\n",
+    "\t\tStage::Doubled(let p) => p.start(|v| print(i\"{label} doubled {v}\")),\n",
+    "\t\tStage::Plain(let c) => c.start(|v| print(i\"{label} plain {v}\")),\n",
+    "\t}\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet c = Cell::new(1);\n",
+    "\tlet p = if c.get() > 0 { c.derive(|x| x + 1) } else { c.derive(|x| x - 1) };\n",
+    "\tlet m = p.memo();\n",
+    "\trun(\"a\", stage(true, c));\n",
+    "\trun(\"b\", stage(false, c));\n",
+    "\tc.set(7);\n",
+    "\tprint(i\"m={m.get()}\");\n",
+    "}\n",
+);
+
+const DROP_STRUCT_PROBE: &str = concat!(
+    "import std::drop::Drop;\n",
+    "[resource]\n",
+    "struct Guard {\n",
+    "\tname: str,\n",
+    "}\n",
+    "impl Guard with Drop {\n",
+    "\tfun drop(&mut self) {\n",
+    "\t\tprint(i\"closing {self.name}\");\n",
+    "\t}\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet g = Guard { name = \"a\" };\n",
+    "\tprint(g.name);\n",
+    "}\n",
+);
+
+const DROP_ENUM_PROBE: &str = concat!(
+    "import std::drop::Drop;\n",
+    "[resource]\n",
+    "enum Slot {\n",
+    "\tFull(str),\n",
+    "\tEmpty,\n",
+    "}\n",
+    "impl Slot with Drop {\n",
+    "\tfun drop(&mut self) {\n",
+    "\t\tprint(\"closing\");\n",
+    "\t}\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet s = Slot::Full(\"a\");\n",
+    "\tmatch s {\n",
+    "\t\tSlot::Full(let name) => print(name),\n",
+    "\t\tSlot::Empty => print(\"empty\"),\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// F53: a closure whose BODY is erased to `dyn` — `roots.map(|r| r)` into a
+/// `List<dyn Src>`, the very spelling B435's steer gives — wraps its tail
+/// natively as the JS emitter pairs it. The expression-bodied closure's tail
+/// was rendered without the erasure every other value position applies, and
+/// rustc refused the closure (`expected Dyn<..>, found Root`). Beside it: a
+/// block-bodied twin, a closure-typed binding and parameter answering `dyn`,
+/// whose CALL is then a receiver (it had no recorded type, so the slot call
+/// through it was refused by name), and the `Some(r)` shape that always worked.
+#[test]
+fn a_closure_body_erased_to_an_object_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_f53.vl"), F53_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f53.vl"),
+        Verdict::Identical,
+        "a closure body erased to `dyn` must build and print the same on both backends"
+    );
+}
+
+const F53_PROBE: &str = concat!(
+    "trait Src {\n",
+    "\tfun get(self): i32;\n",
+    "}\n",
+    "struct Root {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "impl Root with Src {\n",
+    "\tfun get(self): i32 {\n",
+    "\t\tself.n\n",
+    "\t}\n",
+    "}\n",
+    "fun apply(f: |Root| dyn Src, r: Root): i32 {\n",
+    "\tf(r).get()\n",
+    "}\n",
+    "fun main() {\n",
+    "\tlet roots: List<Root> = [Root { n = 1 }, Root { n = 2 }];\n",
+    "\tlet ys: List<dyn Src> = roots.map(|r| r);\n",
+    "\tprint(ys[1].get());\n",
+    "\tlet zs: List<dyn Src> = roots.map(|r| {\n",
+    "\t\tlet doubled = Root { n = r.n * 2 };\n",
+    "\t\tdoubled\n",
+    "\t});\n",
+    "\tprint(zs[1].get());\n",
+    "\tlet erase: |Root| dyn Src = |r| r;\n",
+    "\tprint(erase(Root { n = 5 }).get());\n",
+    "\tprint(apply(|r| r, Root { n = 7 }));\n",
+    "\tlet r = Root { n = 3 };\n",
+    "\tlet o: Option<dyn Src> = Some(r);\n",
+    "\tmatch o {\n",
+    "\t\tSome(let s) => print(s.get()),\n",
+    "\t\tNone => print(0),\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// A142 parity (reactive-44's `Switch` node): a FIELD read off a `Shared`'s
+/// read — `(followed.read().pull)()`, a node calling its current inner
+/// instance's closure — builds natively. The read is an intrinsic call with no
+/// recorded type of its own, so the field read had no struct to name its field
+/// from and was refused by name; its type is the cell's element.
+#[test]
+fn a_field_read_off_a_shared_read_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_shared_field.vl"),
+        SHARED_FIELD_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_shared_field.vl"),
+        Verdict::Identical,
+        "a field read off a `Shared` read must build and print the same on both backends"
+    );
+}
+
+const SHARED_FIELD_PROBE: &str = concat!(
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Inst<T> {\n",
+    "\tpull: || T,\n",
+    "\tlabel: str,\n",
+    "}\n",
+    "\n",
+    "fun follow<T>(v: T): || T {\n",
+    "\tlet followed: Shared<Inst<T>> = Shared::new(Inst<T> { pull = || v, label = \"f\" });\n",
+    "\t|| (followed.read().pull)()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet s: Shared<Inst<i32>> = Shared::new(Inst<i32> { pull = || 1, label = \"s\" });\n",
+    "\tprint((s.read().pull)());\n",
+    "\tprint(s.read().label);\n",
+    "\tprint(follow(\"x\")());\n",
+    "}\n",
+);
+
+/// F58: `on_change` through the blanket `Flow` impl, reached under a generic
+/// bound `S: Source<List<X>>` whose value is a `ListCell<X>`. The blanket's
+/// binder `T` grounds from the provider `impl ListCell<type E> with
+/// Source<List<E>>` as `List<E>` — written in the PROVIDER's binder, which
+/// the substitution never bound, so the instance was refused by name ("an
+/// unbound generic type parameter (parameter 1 of struct `ListCell`)"). The
+/// provider's own binder now binds from the receiver. Two shapes: a toy
+/// source and std's own `ListCell` observed through a generic.
+#[test]
+fn a_blanket_reached_through_a_list_source_bound_builds_the_same_on_both_backends() {
+    let staged = stage();
+    for (program, source) in [
+        ("native_probe_f58_toy.vl", F58_TOY_PROBE),
+        ("native_probe_f58_list_cell.vl", F58_LIST_CELL_PROBE),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: a blanket reached through a `Source<List<X>>` bound must build and \
+             print the same on both backends"
+        );
+    }
+}
+
+const F58_TOY_PROBE: &str = concat!(
+    "trait Src<T> {\n",
+    "\tfun get(self): T;\n",
+    "}\n",
+    "struct LC<T> {\n",
+    "\titems: List<T>,\n",
+    "}\n",
+    "impl LC<type T> with Src<List<T>> {\n",
+    "\tfun get(self): List<T> {\n",
+    "\t\tself.items\n",
+    "\t}\n",
+    "}\n",
+    "trait Fl<T> {\n",
+    "\tfun now(own self): T;\n",
+    "}\n",
+    "impl type S: Src<type T> with Fl<T> {\n",
+    "\tfun now(own self): T {\n",
+    "\t\tself.get()\n",
+    "\t}\n",
+    "}\n",
+    "fun watch<S: Src<List<str>>>(source: S) {\n",
+    "\tprint(source.now().len());\n",
+    "}\n",
+    "fun main() {\n",
+    "\twatch(LC<str> { items = [\"a\", \"b\"] });\n",
+    "}\n",
+);
+
+const F58_LIST_CELL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::delta::ListCell;\n",
+    "import std::reactive::{ Disposable, Source };\n",
+    "\n",
+    "fun watch<S: Source<List<str>>>(source: S) {\n",
+    "\tlet watching = source.on_change(|list| print(i\"changed {list.len()}\"));\n",
+    "\tsource.get();\n",
+    "\twatching.dispose();\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet source: ListCell<str> = ListCell::new();\n",
+    "\twatch(source);\n",
+    "\tlet kept = source.on_change(|list| print(i\"kept {list.len()}\"));\n",
+    "\tsource.push(\"b\");\n",
+    "\tkept.dispose();\n",
+    "}\n",
+    "main();\n",
+);
+
+/// F59: a field read on a call whose return type is INFERRED — `fun make(..)
+/// { Square { .. } }` has no written return, and neither has B460's checked
+/// return — builds natively. The call's type was read off the written
+/// signature alone, so `make(2).side` had no struct to name its field from.
+#[test]
+fn a_field_read_on_an_inferred_return_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_f59.vl"), F59_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f59.vl"),
+        Verdict::Identical,
+        "a field read on an inferred return must build and print the same on both backends"
+    );
+}
+
+const F59_PROBE: &str = concat!(
+    "struct Square {\n",
+    "\tside: i32,\n",
+    "\tname: str,\n",
+    "}\n",
+    "fun make_square(side: i32) {\n",
+    "\tSquare { side = side, name = \"sq\" }\n",
+    "}\n",
+    "fun relabel(side: i32) {\n",
+    "\tlet made = make_square(side);\n",
+    "\tSquare { side = made.side * 2, name = i\"{made.name}!\" }\n",
+    "}\n",
+    "fun main() {\n",
+    "\tprint(make_square(2).side);\n",
+    "\tprint(relabel(3).side);\n",
+    "\tprint(relabel(3).name);\n",
+    "}\n",
+);
+
+/// A142 parity: an `Option` of a CELL holding closures — an owner's lazily
+/// allocated cleanup list, `Option<Shared<List<|| void>>>` — has reference
+/// equality natively (a cell compares by identity, as the JS object does), so
+/// the struct holding it builds. It was refused by name, and reactive-44
+/// wrote S2's `OwnerCell` around the refusal.
+#[test]
+fn an_option_of_a_cell_of_closures_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_option_cell.vl"),
+        OPTION_CELL_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_option_cell.vl"),
+        Verdict::Identical,
+        "an `Option` of a cell of closures must build and print the same on both backends"
+    );
+}
+
+const OPTION_CELL_PROBE: &str = concat!(
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Cell {\n",
+    "\tcleanups: Option<Shared<List<|| void>>>,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet c: Shared<Cell> = Shared::new(Cell { cleanups = None });\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => list.write().push(|| print(\"x\")),\n",
+    "\t\tNone => {\n",
+    "\t\t\tc.write() = Cell { cleanups = Some(Shared::new([|| print(\"first\")])) };\n",
+    "\t\t},\n",
+    "\t}\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => list.write().push(|| print(\"second\")),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => {\n",
+    "\t\t\tfor f in list.read() {\n",
+    "\t\t\t\tf();\n",
+    "\t\t\t}\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// B470's native half: a `[resource]` trait's object is MOVED into its
+/// consuming members. `Flow` is declared `[resource]` (A142 R39), so a
+/// `dyn Flow<i32>` is move-only and its pointer unique; a slot whose member
+/// takes `own self` takes the pointer (`self: Rc<Self>`) and moves the value
+/// out of it (`vilan_rt::unshare`), where it copied the pipe out from behind a
+/// borrow. Two programs: the mixed-arm selector (`dyn_objects`'
+/// `a142_a_mixed_arm_selector_…`), whose arms are a `Derive` pipe and a root,
+/// and a `dyn Flow` handed to an `own` parameter and consumed once.
+#[test]
+fn a_resource_trait_object_is_moved_into_its_consuming_members_natively() {
+    let staged = stage();
+    for (program, source) in [
+        ("native_probe_b470_selector.vl", B470_SELECTOR_PROBE),
+        ("native_probe_b470_once.vl", B470_ONCE_PROBE),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: a `dyn Flow` must build and print the same on both backends"
+        );
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("build the probe");
+        let source = String::from_utf8_lossy(&emitted.stdout);
+        // The table's consuming slots move the value out of the pointer.
+        let slots: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains("fn start(") || line.contains("fn on_change("))
+            .filter(|line| line.trim_start().starts_with("fn "))
+            .collect();
+        assert!(
+            !slots.is_empty()
+                && slots
+                    .iter()
+                    .all(|line| line.contains("self: std::rc::Rc<Self>")),
+            "{program}: a consuming slot must take the object's pointer:\n{}",
+            slots.join("\n")
+        );
+        assert!(
+            source.contains("vilan_rt::unshare(self)") && !source.contains("(self.clone(),"),
+            "{program}: the object's value must be moved out, not copied:\n{source}"
+        );
+    }
+    // The object handed to an `own` parameter is consumed by its one call:
+    // the parameter's pointer is given over, not bumped and copied.
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_b470_once.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    let watch = source
+        .split("\nfn ")
+        .find(|function| function.starts_with("watch_"))
+        .unwrap_or_else(|| panic!("no `watch` in the emitted source:\n{source}"));
+    assert!(
+        watch.contains(").into_object()") && !watch.contains(".clone().into_object()"),
+        "the `own` object must be handed over whole:\n{watch}"
+    );
+}
+
+const B470_SELECTOR_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Flow, MemoCell, Signal, SignalCell, Source };\n",
+    "\n",
+    "fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value * 100)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag = Signal::new(true);\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet picked: MemoCell<i32> = flag.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();\n",
+    "\tprint(i\"{picked.get()}\");\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(i\"{picked.get()}\");\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
+
+const B470_ONCE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Disposable, Flow, Signal, SignalCell, Source, Subscription };\n",
+    "\n",
+    "fun pick(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value + 1)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun watch(label: str, own flow: dyn Flow<i32>): Subscription {\n",
+    "\tflow.on_change(|value| print(i\"{label} {value}\"))\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet piped = pick(true, count);\n",
+    "\tlet a = watch(\"piped\", piped);\n",
+    "\tlet b = watch(\"root\", pick(false, count));\n",
+    "\tcount.set(5);\n",
+    "\ta.dispose();\n",
+    "\tb.dispose();\n",
+    "\tcount.set(9);\n",
+    "\tprint(\"done\");\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);

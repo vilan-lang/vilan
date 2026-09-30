@@ -120,8 +120,9 @@ also carries `vilan-vscode.vsix`, the VS Code extension: highlighting,
 diagnostics, hover with docs on everything (keywords included),
 go-to-definition, rename, call-shaped completion with signatures, inlay
 hints, semantic tokens, Organize Imports, and a formatter. All of it
-keeps working while the file has errors. Install it via "Extensions:
-Install from VSIX".
+keeps working while the file has errors. The installers install it for you
+when VS Code's `code` command is on your PATH (opt out with
+`VILAN_NO_VSCODE=1`); otherwise use "Extensions: Install from VSIX".
 
 Or build the project from source (Rust required) with:
 

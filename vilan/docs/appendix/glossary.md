@@ -15,7 +15,7 @@ re-sending it. Echoes are ignored, clean fields update, dirty fields win.
 <a id="backed-enum"></a>**backed enum**: an enum whose payload-free variants carry an explicit
 string or integer — `enum Align { Start = "flex-start" }`. The variant
 *is* that value at run time (no tag, no wrapper), which is why `value()`
-costs nothing, `parse` is offered, and it keys a `Map` with no derive. Its
+costs nothing, `parse` is offered, and it keys a `HashMap` with no derive. Its
 runtime domain is the host's, so an exhaustive `match` traps on a value
 outside the set. [Data and traits](../tour/data-and-traits.md),
 [spec §5.2](../spec/types.md).

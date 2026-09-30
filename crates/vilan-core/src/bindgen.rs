@@ -28,7 +28,7 @@
 //! - `enum` lowers to `[tag, …payload]`. A TS discriminated union is a tagged
 //!   *object* (`{kind: "circle", r: 2}`); matching one as an enum reads
 //!   `value[0]`, misses every arm, and crashes.
-//! - `std::map::Map<K, V>` is a plain struct wrapping a `NativeMap` keyed by
+//! - `std::hash_map::HashMap<K, V>` is a plain struct wrapping a `NativeMap` keyed by
 //!   `key.hash()` — nothing like a host `{a: 1}` object.
 //! - `List<T>` is a native JS *array*. An array-LIKE object (`{[index: number]:
 //!   T}` — NodeList-shaped: numeric keys and `length`, no `Symbol.iterator`)
@@ -233,18 +233,31 @@ pub fn generate(source: &str, options: &Options) -> Generated {
 
 // --- Names -------------------------------------------------------------------
 
-/// Vilan's reserved words plus the built-in type names a generated binding must
-/// not shadow. A TS member landing on one of these is suffixed with `_`.
-const RESERVED: &[&str] = &[
-    "any", "async", "await", "bool", "borrows", "const", "else", "enum", "export", "external",
-    "f32", "f64", "false", "for", "fun", "i16", "i32", "i53", "i8", "if", "impl", "import", "in",
-    "is", "jump", "let", "macro", "match", "mod", "mut", "null", "own", "resource", "ret", "self",
-    "str", "struct", "trait", "true", "type", "u16", "u32", "u53", "u8", "use", "usize", "void",
-    "with", "BigInt", "List", "Map", "Option", "Set",
+/// The names a generated binding must not take that are NOT keywords: `self`
+/// (an identifier the grammar gives one meaning) and the built-in type names a
+/// binding must not shadow. The keywords themselves are the lexer's table,
+/// read through [`crate::keyword_table::is_keyword`] — this list used to copy
+/// them, and the copy drifted (E225: no `css`, `dyn` or `lazy`, a stale
+/// `resource`), so a TS member named `lazy` generated a binding that did not
+/// parse. `bindgen_reserves_no_keyword_by_hand` holds that no keyword creeps
+/// back in here.
+const RESERVED_NAMES: &[&str] = &[
+    "self", "any", "bool", "f32", "f64", "i8", "i16", "i32", "i53", "str", "u8", "u16", "u32",
+    "u53", "usize", "void", "BigInt", "List", "HashMap", "HashSet", "Option",
+    // `Map`/`Set` are the hash collections' names before tracker I9, still
+    // published one release as `std::map`/`std::set`'s deprecated aliases.
+    "Map", "Set",
 ];
 
+/// Whether a generated name must be escaped: a keyword, or a name
+/// [`RESERVED_NAMES`] keeps for the language.
+fn is_reserved(name: &str) -> bool {
+    crate::keyword_table::is_keyword(name) || RESERVED_NAMES.contains(&name)
+}
+
+/// A TS name landing on a reserved one, suffixed with `_`.
 fn escape_reserved(name: &str) -> String {
-    if RESERVED.contains(&name) {
+    if is_reserved(name) {
         return format!("{name}_");
     }
     name.to_string()
@@ -1305,9 +1318,11 @@ impl<'options> Emitter<'options> {
             .map(|parameter| parameter.name.clone())
             .collect();
         let binding = format!("[extern(\"{}\")]", signature.name);
+        // Escaped like every other generated name (E225): a free function
+        // named `lazy` or `match` was emitted verbatim and did not parse.
         let text = self.emit_function(
             "",
-            &to_snake_case(&signature.name),
+            &escape_reserved(&to_snake_case(&signature.name)),
             signature,
             &binding,
             None,
@@ -1404,7 +1419,7 @@ impl<'options> Emitter<'options> {
                 // is a native JS array, and an array-LIKE object is not one.
                 // `for`-in over `{0: "a", length: 1}` throws `TypeError: … is
                 // not iterable`, and `map`/`filter`/`fold`/`reverse` all ride
-                // `for`-in. `Map<str, T>` is worse still: it is a plain vilan
+                // `for`-in. `HashMap<str, T>` is worse still: it is a plain vilan
                 // struct wrapping a `NativeMap` keyed by `key.hash()`, so a
                 // host `{a: 1}` read through it crashes on `.has`.
                 let (kind, note) = match index.key {
@@ -1417,7 +1432,7 @@ impl<'options> Emitter<'options> {
                     ),
                     IndexKey::String => (
                         "string index signature",
-                        "vilan has no open keyed-object type at a host boundary: `Map<str, T>` \
+                        "vilan has no open keyed-object type at a host boundary: `HashMap<str, T>` \
                          is a vilan struct over a `NativeMap` keyed by `key.hash()`, not a plain \
                          host object. Bind the keys you need as `[extern(get, \"key\")]` \
                          accessors",
@@ -1962,7 +1977,7 @@ impl<'options> Emitter<'options> {
                 self.coverage.note_todo("Record type");
                 return Mapped::todo(
                     "any",
-                    "`Record<K, V>` is an open keyed host object; vilan's `Map` is a struct over \
+                    "`Record<K, V>` is an open keyed host object; vilan's `HashMap` is a struct over \
                      a `NativeMap` keyed by `key.hash()`, not a host object. Bind the keys you \
                      need as `[extern(get, \"key\")]` accessors",
                 );
@@ -2795,5 +2810,44 @@ fn substitute_member(member: &Member, substitution: &HashMap<String, TsType>) ->
             construct,
             raw: raw.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod reserved_tests {
+    use super::*;
+
+    /// E225: every RESERVED keyword is escaped — derived, so a keyword added
+    /// to the lexer is escaped with no second edit — and the word the old copy
+    /// missed is named. B414: a CONTEXTUAL keyword is a legal name, so it
+    /// binds as itself (`dyn` and `lazy`, which the old copy also missed,
+    /// became contextual in the same order).
+    #[test]
+    fn every_keyword_is_escaped() {
+        for word in crate::keyword_table::reserved() {
+            assert_eq!(escape_reserved(word), format!("{word}_"), "{word}");
+        }
+        assert_eq!(escape_reserved("css"), "css_");
+        for word in ["dyn", "lazy", "with", "own", "borrows", "jump"] {
+            assert_eq!(escape_reserved(word), word, "{word} is a legal name (B414)");
+        }
+        // B413 made `resource` an attribute: an ordinary name again.
+        assert_eq!(escape_reserved("resource"), "resource");
+        // And the non-keyword reservations still hold.
+        for name in RESERVED_NAMES {
+            assert_eq!(escape_reserved(name), format!("{name}_"));
+        }
+    }
+
+    /// The hand list is only what the lexer cannot say: no keyword is copied
+    /// into it, so there is nothing in it to drift.
+    #[test]
+    fn bindgen_reserves_no_keyword_by_hand() {
+        for name in RESERVED_NAMES {
+            assert!(
+                !crate::keyword_table::is_keyword(name),
+                "`{name}` is a keyword — the lexer's table already reserves it"
+            );
+        }
     }
 }

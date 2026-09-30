@@ -1,0 +1,13 @@
+import std::io::print;
+
+fun main() {
+	// N106: `vilan_rt::js_number` documents JavaScript's departures from
+	// Rust's own `{}` at these four boundaries; this corpus program pins the
+	// JS emitter's own behaviour there against them, rather than leaving it
+	// unrecorded.
+	print(1000000000000000000000f); // 1e21 — JS' exponential switch AT 1e21
+	print(0.0000001f); // 1e-7 — below JS' 1e-6 linear floor
+	print(1f / 0f); // Infinity
+	print(-1f / 0f); // -Infinity
+	print(0f / 0f); // NaN
+}

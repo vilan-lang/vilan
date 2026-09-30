@@ -39,8 +39,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		self.inner.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.inner.on_settle(subscriber)
 	}
 }
 
@@ -127,7 +127,7 @@ fn build_and_run(tag: &str, app: &str) -> String {
 /// and again after the values move.
 fn app_source() -> String {
     format!(
-        r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        r#"import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
 import std::ui::{{ View, each, mount_root, view, when }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
@@ -249,7 +249,7 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
 #[test]
 fn a_user_source_drives_swap_and_keeps_driving_it() {
     let app = format!(
-        r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        r#"import std::reactive::{{ Signal, SignalCell, Source, Subscriber, Subscription }};
 import std::ui::{{ View, mount_root, swap, view }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.

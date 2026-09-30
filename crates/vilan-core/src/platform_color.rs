@@ -1183,6 +1183,10 @@ pub enum PlatformReason {
     /// `[platform(..)]` its items carry. The declaration outranks inference and
     /// the `default-entry` colour; the clause names what was written.
     Declared(String),
+    /// A further leg a file's platform-fenced TWIN adds (F27 R3, §8.4 item 1):
+    /// the twin is compiled only under a platform its fence admits, so the
+    /// file is checked under that platform too. Names the twin's fence.
+    Twin(String),
 }
 
 impl PlatformReason {
@@ -1199,6 +1203,7 @@ impl PlatformReason {
             }
             PlatformReason::Flag => "`--platform` was passed".into(),
             PlatformReason::Declared(declaration) => format!("it declares {declaration}"),
+            PlatformReason::Twin(fence) => format!("it declares a {fence} twin"),
         }
     }
 
@@ -1212,6 +1217,7 @@ impl PlatformReason {
             PlatformReason::DefaultEntry(_) => "default-entry",
             PlatformReason::Flag => "--platform",
             PlatformReason::Declared(_) => "declared",
+            PlatformReason::Twin(_) => "twin",
         }
     }
 }
@@ -1326,13 +1332,16 @@ pub fn file_platform_choices(
     // F27 R1: what the file DECLARES outranks the colour below — read off the
     // file as it is on disk. The language server asks
     // [`file_platform_choices_for`] with its live buffer instead.
-    let declared = crate::util::read_source(file)
-        .ok()
-        .and_then(|text| declared_platform(&text));
-    apply_declared(
+    let text = crate::util::read_source(file).ok();
+    let declared = text.as_deref().and_then(declared_platform);
+    let choices = apply_declared(
         colored_platform_choices(pkg_root, manifest, file),
         declared.as_ref(),
-    )
+    );
+    match text {
+        Some(text) => with_twin_legs(choices, &text),
+        None => choices,
+    }
 }
 
 /// [`file_platform_choices`] over the file's text as the caller holds it — the
@@ -1343,10 +1352,33 @@ pub fn file_platform_choices_for(
     file: &Path,
     text: &str,
 ) -> Vec<PlatformChoice> {
-    apply_declared(
-        colored_platform_choices(pkg_root, manifest, file),
-        declared_platform(text).as_ref(),
+    with_twin_legs(
+        apply_declared(
+            colored_platform_choices(pkg_root, manifest, file),
+            declared_platform(text).as_ref(),
+        ),
+        text,
     )
+}
+
+/// `choices` with the legs the file's platform-fenced twins add (F27 R3,
+/// §8.4 item 1): a twin is compiled only under a platform its fence admits,
+/// so a file whose colour admits none of a twin's hosts is checked under the
+/// twin's platform as well — the editor and `vilan check` alike, since both
+/// read their legs here. A file with no colour at all keeps none: the caller's
+/// own default answers for it, and adds the twins' legs itself.
+fn with_twin_legs(mut choices: Vec<PlatformChoice>, text: &str) -> Vec<PlatformChoice> {
+    if choices.is_empty() {
+        return choices;
+    }
+    let covered: Vec<Platform> = choices.iter().map(|choice| choice.platform).collect();
+    for (platform, fence) in twin_legs(text, &covered) {
+        choices.push(PlatformChoice {
+            platform,
+            reason: PlatformReason::Twin(fence),
+        });
+    }
+    choices
 }
 
 /// The colour a file takes from its package alone — E113's reachability and
@@ -1608,6 +1640,456 @@ pub fn apply_declared(
     }]
 }
 
+// ── Platform-fenced TWIN items (F27 R3) ──────────────────────────────────────
+
+/// What one analysis LEG makes of a file's platform-fenced twins (F27 R3,
+/// `platform-coloring.md` §8.3, RULED 2026-09-25).
+///
+/// Two items of one IDENTITY — two module-level functions of one name, or two
+/// `impl`s of one trait for one subject — are TWINS when both carry a
+/// `[platform(..)]` fence and the fences share no host. A leg collects only the
+/// twin its platform admits (R3.2): the others are not walked, registered or
+/// emitted, which is how std's layer twins already avoid B98 — at file
+/// granularity there, at item granularity here. Everything else is untouched:
+/// an unfenced item is collected in every leg exactly as before, and a single
+/// fenced item is R1's.
+#[derive(Debug, Default)]
+pub struct TwinSelection {
+    /// The spans of the items this leg does NOT collect (each a list element
+    /// of a module body, the outermost node — an `export` wrapper included).
+    pub fenced_out: Vec<Span>,
+    /// Twin FUNCTIONS no member of which admits this leg (R3.5, "a missing
+    /// twin is an ordinary miss"): the name, and the fences its twins declare —
+    /// for the steer on the miss.
+    pub missing: Vec<(String, String)>,
+    /// R3.1's refusals (an overlap, or an unfenced item beside a fenced one)
+    /// and R3.4's (twin functions whose signatures differ). Leg-independent:
+    /// every leg reports the same ones.
+    pub diagnostics: Vec<Error>,
+}
+
+/// The twin items of one module body.
+struct TwinMember<'a> {
+    /// The item's outermost span (what [`TwinSelection::fenced_out`] names).
+    span: Span,
+    /// Where a refusal about it is anchored: its name, or its `impl` head.
+    anchor: Span,
+    /// The fence as written, empty for an unfenced item.
+    fence: Vec<&'a str>,
+    /// The hosts the fence admits; every known host for an unfenced item.
+    hosts: Vec<Platform>,
+    /// A function's written signature, whitespace dropped (R3.4); `None` for
+    /// an impl, whose trait fixes it.
+    signature: Option<String>,
+}
+
+/// The hosts a fence admits, in [`known_hosts`] order.
+fn fence_hosts(written: &[&str]) -> Vec<Platform> {
+    known_hosts()
+        .into_iter()
+        .filter(|host| {
+            written.iter().any(|text| {
+                crate::target::PlatformPattern::parse(text)
+                    .is_some_and(|patterns| patterns.iter().any(|p| host.matches(*p).is_some()))
+            })
+        })
+        .collect()
+}
+
+/// `` `[platform("browser")]` `` — a fence as a message quotes it.
+fn fence_spelling(written: &[&str]) -> String {
+    let patterns = written
+        .iter()
+        .map(|text| format!("\"{text}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("`[platform({patterns})]`")
+}
+
+/// The text of `span` with every whitespace character dropped — how two
+/// written signatures or two `impl` heads are compared.
+fn squeezed(source: &str, span: Span) -> String {
+    source
+        .get(span.into_range())
+        .unwrap_or("")
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// [`TwinSelection`] for the module `items` (a file's top level; nested `mod`
+/// bodies are read too) in a leg analyzed under `platform`. Syntactic: it runs
+/// before the analyzer collects anything, which is the point — a fenced-out
+/// twin must never register.
+///
+/// A file that leads with `[platform(..)] mod self;` (B415) holds its twins to
+/// it: a twin that admits none of the platforms its file declares can never be
+/// compiled, and says so.
+pub fn select_twins(
+    items: &crate::node::NodeList,
+    source: &str,
+    platform: Platform,
+) -> TwinSelection {
+    let mut selection = TwinSelection::default();
+    let module_declared: Option<Vec<&str>> = match items.first() {
+        Some((crate::node::Node::ModulePlatform(patterns), _)) if !patterns.is_empty() => {
+            Some(patterns.iter().map(|(text, _)| *text).collect())
+        }
+        _ => None,
+    };
+    select_twins_in(
+        items,
+        source,
+        platform,
+        module_declared.as_deref(),
+        &mut selection,
+    );
+    selection
+}
+
+fn select_twins_in(
+    items: &crate::node::NodeList,
+    source: &str,
+    platform: Platform,
+    module_declared: Option<&[&str]>,
+    selection: &mut TwinSelection,
+) {
+    use crate::node::Node;
+    // The overwhelming case first: a body with no fenced item has no twins,
+    // and pays one scan — only its inline `mod`s are read further.
+    fn fenced(node: &Node<'_>) -> bool {
+        match node {
+            Node::Export(_, inner, _) => fenced(&inner.0),
+            Node::Func(function) => !function.platform_fence.is_empty(),
+            Node::Impl(_, traits, _, Some(labels)) => {
+                !traits.is_empty() && !labels.platform.is_empty()
+            }
+            _ => false,
+        }
+    }
+    if !items.iter().any(|(item, _)| fenced(item)) {
+        for (item, _) in items {
+            let mut node = item;
+            while let Node::Export(_, inner, _) = node {
+                node = &inner.0;
+            }
+            if let Node::Module(_, body) = node {
+                select_twins_in(&body.0, source, platform, module_declared, selection);
+            }
+        }
+        return;
+    }
+    // Identity -> members, in source order. A function is keyed by its name,
+    // a trait impl by its written head (subject and traits); an inherent impl
+    // and every other item have no twin identity in the first build (§8.7 Q1:
+    // twin nominals and inherent impls wait on F27 R5).
+    let mut groups: Vec<(String, &'static str, Vec<TwinMember>)> = Vec::new();
+    for (item, item_span) in items {
+        let mut node = item;
+        while let Node::Export(_, inner, _) = node {
+            node = &inner.0;
+        }
+        let member = match node {
+            Node::Module(_, body) => {
+                select_twins_in(&body.0, source, platform, module_declared, selection);
+                continue;
+            }
+            Node::Func(function) if function.body.is_some() || function.external => {
+                let fence: Vec<&str> = function
+                    .platform_fence
+                    .iter()
+                    .map(|(text, _)| *text)
+                    .collect();
+                let mut signature = String::new();
+                if let Some(generics) = &function.generic_parameters {
+                    signature.push_str(&squeezed(source, generics.1));
+                }
+                signature.push_str(&squeezed(source, function.parameters.1));
+                if let Some(returns) = &function.return_type {
+                    signature.push(':');
+                    signature.push_str(&squeezed(source, returns.1));
+                }
+                Some((
+                    format!("fun {}", function.name.0),
+                    "function",
+                    TwinMember {
+                        span: *item_span,
+                        anchor: function.name.1,
+                        hosts: if fence.is_empty() {
+                            known_hosts().to_vec()
+                        } else {
+                            fence_hosts(&fence)
+                        },
+                        fence,
+                        signature: Some(signature),
+                    },
+                ))
+            }
+            Node::Impl(subject, traits, _, labels) if !traits.is_empty() => {
+                let fence: Vec<&str> = labels
+                    .as_ref()
+                    .map(|labels| labels.platform.iter().map(|(text, _)| *text).collect())
+                    .unwrap_or_default();
+                let mut key = format!("impl {}", squeezed(source, subject.1));
+                for trait_ in traits {
+                    key.push_str(" with ");
+                    key.push_str(&squeezed(source, trait_.1));
+                }
+                let head_end = traits.last().map_or(subject.1.end, |trait_| trait_.1.end);
+                Some((
+                    key,
+                    "impl",
+                    TwinMember {
+                        span: *item_span,
+                        anchor: Span::from(subject.1.start..head_end),
+                        hosts: if fence.is_empty() {
+                            known_hosts().to_vec()
+                        } else {
+                            fence_hosts(&fence)
+                        },
+                        fence,
+                        signature: None,
+                    },
+                ))
+            }
+            _ => None,
+        };
+        let Some((key, kind, member)) = member else {
+            continue;
+        };
+        match groups.iter_mut().find(|(existing, _, _)| *existing == key) {
+            Some((_, _, members)) => members.push(member),
+            None => groups.push((key, kind, vec![member])),
+        }
+    }
+    for (key, kind, members) in groups {
+        // Only a group with a FENCED member is R3's: two unfenced functions of
+        // one name are B57's, two unfenced impls B98's, as before.
+        if members.len() < 2 || members.iter().all(|member| member.fence.is_empty()) {
+            continue;
+        }
+        let name = key.split_once(' ').map_or(key.as_str(), |(_, name)| name);
+        let label = match kind {
+            "function" => format!("`{name}`"),
+            _ => format!("`{key}`"),
+        };
+        // R3.1: every pair disjoint, every member fenced. A member that
+        // overlaps an EARLIER one is refused where it is written and not
+        // collected in any leg, so the duplicate checks (B57/B98) do not
+        // report it a second time.
+        let mut admitted: Vec<&TwinMember> = Vec::new();
+        for member in &members {
+            let overlap = admitted.iter().find_map(|earlier| {
+                earlier
+                    .hosts
+                    .iter()
+                    .find(|host| {
+                        member
+                            .hosts
+                            .iter()
+                            .any(|other| other.runtime_name() == host.runtime_name())
+                    })
+                    .map(|host| (*earlier, *host))
+            });
+            let Some((earlier, host)) = overlap else {
+                admitted.push(member);
+                continue;
+            };
+            let note = Some(crate::error::Note {
+                span: earlier.anchor,
+                msg: format!(
+                    "the other twin, fenced {}",
+                    if earlier.fence.is_empty() {
+                        "nowhere".to_string()
+                    } else {
+                        fence_spelling(&earlier.fence)
+                    }
+                ),
+                source: None,
+            });
+            let host = host.runtime_name();
+            if member.fence.is_empty() || earlier.fence.is_empty() {
+                selection.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note,
+                    span: member.anchor,
+                    msg: format!(
+                        "{label} is declared both with and without a `[platform(..)]` fence: twins \
+                         are chosen by the platform each fence admits, so there is no default with \
+                         a platform override — fence the unfenced one too, with the platforms the \
+                         other does not admit (both admit `{host}` now)"
+                    ),
+                });
+            } else {
+                selection.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note,
+                    span: member.anchor,
+                    msg: format!(
+                        "both twins of {label} admit `{host}`, so a build for `{host}` would have \
+                         two: platform-fenced twins are coherent only when their fences share no \
+                         platform"
+                    ),
+                });
+            }
+            selection.fenced_out.push(member.span);
+        }
+        if admitted.len() < 2 {
+            continue;
+        }
+        // R3.4: twin functions agree on their written signature.
+        if let Some(first) = admitted
+            .first()
+            .and_then(|first| first.signature.as_ref().map(|s| (first, s)))
+        {
+            for member in admitted.iter().skip(1) {
+                if member
+                    .signature
+                    .as_ref()
+                    .is_some_and(|signature| signature != first.1)
+                {
+                    selection.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: Some(crate::error::Note {
+                            span: first.0.anchor,
+                            msg: format!("the {} twin's signature", fence_spelling(&first.0.fence)),
+                            source: None,
+                        }),
+                        span: member.anchor,
+                        msg: format!(
+                            "the {} and {} twins of {label} must agree on their signature — \
+                             parameters, return type and generics — or code that calls it would \
+                             check under one platform and not the other",
+                            fence_spelling(&first.0.fence),
+                            fence_spelling(&member.fence)
+                        ),
+                    });
+                }
+            }
+        }
+        // B415 × R3: a twin its file's own declaration excludes can never be
+        // compiled.
+        if let Some(declared) = module_declared {
+            let file_hosts = fence_hosts(declared);
+            for member in &admitted {
+                if !member.hosts.iter().any(|host| {
+                    file_hosts
+                        .iter()
+                        .any(|file| file.runtime_name() == host.runtime_name())
+                }) {
+                    selection.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: member.anchor,
+                        msg: format!(
+                            "this twin of {label} is fenced {} inside a file that declares {} — \
+                             no build compiles it; move the twins to a file that declares no platform",
+                            fence_spelling(&member.fence),
+                            fence_spelling(declared)
+                        ),
+                    });
+                }
+            }
+        }
+        // R3.2: this leg collects the one twin its platform admits (at most
+        // one — they are disjoint), and none when no twin admits it (R3.5).
+        let chosen = admitted.iter().position(|member| {
+            member
+                .hosts
+                .iter()
+                .any(|host| host.runtime_name() == platform.runtime_name())
+        });
+        for (index, member) in admitted.iter().enumerate() {
+            if Some(index) != chosen {
+                selection.fenced_out.push(member.span);
+            }
+        }
+        if chosen.is_none() && kind == "function" {
+            let fences = admitted
+                .iter()
+                .map(|member| fence_spelling(&member.fence))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            selection.missing.push((name.to_string(), fences));
+        }
+    }
+}
+
+/// The platforms a file's twins add to the legs that check it (F27 R3,
+/// §8.4 item 1): one per twin fence whose hosts `covered` admits none of —
+/// the fence's first host, with the fence as written for the reason clause.
+/// Empty for a file with no twins, which is every file but a handful.
+pub fn twin_legs(source: &str, covered: &[Platform]) -> Vec<(Platform, String)> {
+    let (tree, _) = crate::parsing::parse(source);
+    let Some((items, _)) = tree else {
+        return Vec::new();
+    };
+    let mut legs: Vec<(Platform, String)> = Vec::new();
+    let mut fences: Vec<Vec<&str>> = Vec::new();
+    collect_twin_fences(&items, source, &mut fences);
+    for fence in fences {
+        let hosts = fence_hosts(&fence);
+        let already = hosts.iter().any(|host| {
+            covered
+                .iter()
+                .chain(legs.iter().map(|(platform, _)| platform))
+                .any(|other| other.runtime_name() == host.runtime_name())
+        });
+        if !already && let Some(first) = hosts.first() {
+            legs.push((*first, fence_spelling(&fence)));
+        }
+    }
+    legs
+}
+
+/// Every fence written on a member of a twin group (two or more items of one
+/// identity, at least two of them fenced).
+fn collect_twin_fences<'a>(
+    items: &'a crate::node::NodeList<'a>,
+    source: &str,
+    into: &mut Vec<Vec<&'a str>>,
+) {
+    use crate::node::Node;
+    let mut keyed: Vec<(String, Vec<&'a str>)> = Vec::new();
+    for (item, _) in items {
+        let mut node = item;
+        while let Node::Export(_, inner, _) = node {
+            node = &inner.0;
+        }
+        match node {
+            Node::Module(_, body) => collect_twin_fences(&body.0, source, into),
+            Node::Func(function) if !function.platform_fence.is_empty() => keyed.push((
+                format!("fun {}", function.name.0),
+                function
+                    .platform_fence
+                    .iter()
+                    .map(|(text, _)| *text)
+                    .collect(),
+            )),
+            Node::Impl(subject, traits, _, Some(labels))
+                if !traits.is_empty() && !labels.platform.is_empty() =>
+            {
+                let mut key = format!("impl {}", squeezed(source, subject.1));
+                for trait_ in traits {
+                    key.push_str(" with ");
+                    key.push_str(&squeezed(source, trait_.1));
+                }
+                keyed.push((key, labels.platform.iter().map(|(text, _)| *text).collect()));
+            }
+            _ => {}
+        }
+    }
+    for (index, (key, fence)) in keyed.iter().enumerate() {
+        let twinned = keyed
+            .iter()
+            .enumerate()
+            .any(|(other, (other_key, _))| other != index && other_key == key);
+        if twinned && !into.contains(fence) {
+            into.push(fence.clone());
+        }
+    }
+}
+
 /// The program's entry: a function named `main` defined in user code. Also
 /// used by async inference's initializer check — "which initializers run"
 /// must mean the same thing to admission, emission, and awaiting.
@@ -1733,5 +2215,95 @@ mod declared_tests {
         // And a file that declares nothing keeps its colour exactly.
         let colour = vec![choice(node(), PlatformReason::PackageTarget)];
         assert_eq!(apply_declared(colour.clone(), None), colour);
+    }
+
+    /// F27 R3's selector on its own: which twins a leg skips, and what it says.
+    fn selection(source: &str, platform: Platform) -> TwinSelection {
+        let (tree, errors) = crate::parsing::parse(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        select_twins(&tree.expect("a tree").0, source, platform)
+    }
+
+    #[test]
+    fn a_leg_skips_exactly_the_twins_its_platform_excludes() {
+        let source = concat!(
+            "[platform(\"browser\")]\nfun f(): i32 { 1 }\n",
+            "export [platform(\"@process\")]\nfun f(): i32 { 2 }\n",
+            "[platform(\"browser\")]\nimpl T with Show { fun show(self): str { \"b\" } }\n",
+            "[platform(\"@process\")]\nimpl T with Show { fun show(self): str { \"p\" } }\n",
+            "fun main() {}\n",
+        );
+        let text_of = |selection: &TwinSelection| -> Vec<String> {
+            selection
+                .fenced_out
+                .iter()
+                .map(|span| {
+                    source[span.into_range()]
+                        .lines()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+        let browser = selection(source, Platform::Browser);
+        assert!(browser.diagnostics.is_empty(), "{:?}", browser.diagnostics);
+        assert_eq!(
+            text_of(&browser),
+            vec![
+                "fun f(): i32 { 2 }",
+                "impl T with Show { fun show(self): str { \"p\" } }"
+            ]
+        );
+        let process = selection(source, node());
+        assert_eq!(
+            text_of(&process),
+            vec![
+                "fun f(): i32 { 1 }",
+                "impl T with Show { fun show(self): str { \"b\" } }"
+            ]
+        );
+        // A file with no twins — nearly every file — skips nothing.
+        let plain = selection("[platform(\"browser\")]\nfun f() {}\nfun g() {}\n", node());
+        assert!(plain.fenced_out.is_empty() && plain.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn twins_nested_in_an_inline_module_are_selected_too() {
+        let source = "mod inner {\n[platform(\"browser\")]\nfun f() {}\n[platform(\"node\")]\nfun f() {}\n}\n";
+        assert_eq!(selection(source, Platform::Browser).fenced_out.len(), 1);
+        // `deno` is admitted by neither: both are skipped, and the miss is named.
+        let deno = selection(source, Platform::parse("deno").expect("deno"));
+        assert_eq!(deno.fenced_out.len(), 2);
+        assert_eq!(deno.missing.len(), 1);
+        assert_eq!(deno.missing[0].0, "f");
+    }
+
+    #[test]
+    fn a_twin_adds_the_leg_its_colour_does_not_cover() {
+        let source = concat!(
+            "[platform(\"browser\")]\nfun f(): i32 { 1 }\n",
+            "[platform(\"@process\")]\nfun f(): i32 { 2 }\n",
+        );
+        let legs = twin_legs(source, &[node()]);
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].0, Platform::Browser);
+        assert_eq!(legs[0].1, "`[platform(\"browser\")]`");
+        assert!(twin_legs(source, &[node(), Platform::Browser]).is_empty());
+        // One fenced item is no twin, and adds no leg.
+        assert!(twin_legs("[platform(\"browser\")]\nfun f() {}\n", &[node()]).is_empty());
+        let choices = with_twin_legs(
+            vec![choice(
+                node(),
+                PlatformReason::DefaultEntry("server".into()),
+            )],
+            source,
+        );
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[1].reason.kind(), "twin");
+        assert_eq!(
+            choices[1].reason.clause(),
+            "it declares a `[platform(\"browser\")]` twin"
+        );
     }
 }

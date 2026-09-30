@@ -71,6 +71,8 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
     };
     // Absent only against an older `context.vl` without `get_safe`.
     let get_safe_fn = program.context_get_safe_fn_id;
+    // B458: likewise `clear`.
+    let clear_fn = program.context_clear_fn_id;
 
     let graph = CallGraph::build(program);
     let mut warnings: Vec<(Error, SourceId)> = Vec::new();
@@ -79,6 +81,7 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
         &graph,
         get_fn,
         get_safe_fn,
+        clear_fn,
         run_fn,
         new_fn,
         &mut warnings,
@@ -208,6 +211,17 @@ struct RunSite {
     closure_id: Option<Id>,
 }
 
+/// B458: a `clear(body)` call — `run`'s inverse. The body is a closure
+/// LITERAL that runs with the context NOT established: it is an uncovered
+/// root (a strict read under it fences, a safe read is `None`), and the
+/// call lowers to `body()`.
+struct ClearSite {
+    call_id: Id,
+    context: Id,
+    closure_entity: Id,
+    closure_id: Id,
+}
+
 /// How a threaded call site obtains one context's argument: the caller's
 /// own parameter (bare or already-`Option`), that parameter `Some`-wrapped
 /// (the covered→safe boundary), or a literal `None` (an entry point with no
@@ -257,6 +271,8 @@ struct Plan {
     none_variant: Option<Id>,
     /// `run` calls to lower to `body(value)`.
     runs: Vec<RunSite>,
+    /// B458: `clear` calls to lower to `body()`, as `(call, body entity)`.
+    clears: Vec<(Id, Id)>,
     /// `Context::new()` calls to lower to an opaque value.
     news: Vec<Id>,
     /// Spawn registration (async-polymorphism.md Part B): each `async` spawn
@@ -271,6 +287,7 @@ impl Plan {
     fn is_empty(&self) -> bool {
         self.gets.is_empty()
             && self.runs.is_empty()
+            && self.clears.is_empty()
             && self.news.is_empty()
             && self.spawns.is_empty()
     }
@@ -558,7 +575,7 @@ fn struct_binds_parameter_to_a_field(program: &Program, struct_id: Id, position:
 }
 
 /// B324: the first `context` clause written INSIDE `type_id` at a position no
-/// landing rule reaches — `List<(|| i32) context c>`, `Map<str, (|| i32)
+/// landing rule reaches — `List<(|| i32) context c>`, `HashMap<str, (|| i32)
 /// context c>`, `Option<..>`, a tuple element, an array element.
 ///
 /// B309 gave the clause four WRITING positions (a parameter, a `let`
@@ -621,7 +638,7 @@ fn unfollowable_clause(
 /// cannot follow it (B324). One row.
 fn unfollowable_refusal(program: &Program, position: &str, clause: &[Id]) -> String {
     format!(
-        "a closure written at this {position} would be born under `{}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array",
+        "a closure written at this {position} would be born under `{}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `HashMap`, an `Option`, a tuple or an array",
         clause_spelling(program, clause),
     )
 }
@@ -773,6 +790,7 @@ fn analyze(
     graph: &CallGraph,
     get_fn: Id,
     get_safe_fn: Option<Id>,
+    clear_fn: Option<Id>,
     run_fn: Id,
     new_fn: Id,
     warnings: &mut Vec<(Error, SourceId)>,
@@ -802,6 +820,7 @@ fn analyze(
     // --- Collect get/run/new sites. ---
     let mut gets: Vec<GetSite> = Vec::new();
     let mut runs: Vec<RunSite> = Vec::new();
+    let mut clears: Vec<ClearSite> = Vec::new();
     let mut news: Vec<Id> = Vec::new();
     let mut contexts: HashSet<Id> = HashSet::default();
 
@@ -883,6 +902,40 @@ fn analyze(
                 closure_entity,
                 closure_id,
             });
+        } else if Some(target) == clear_fn {
+            // B458: `receiver.clear(body)` — arguments [receiver, body]. The
+            // body must be a closure LITERAL: it is the root that runs
+            // without the value, and a closure value would carry whatever it
+            // captured where it was made.
+            let arguments = &function_call.argument_ids;
+            let context = arguments
+                .first()
+                .copied()
+                .and_then(|receiver| local_target(program, receiver));
+            let closure_entity = arguments.get(1).copied();
+            let closure_id =
+                closure_entity.and_then(|entity| match program.entity_map.get(&entity) {
+                    Some(Expr::Closure(closure_id)) => Some(*closure_id),
+                    _ => None,
+                });
+            let (Some(context), Some(closure_entity), Some(closure_id)) =
+                (context, closure_entity, closure_id)
+            else {
+                errors.push(anchored(
+                    program,
+                    call_id,
+                    "`clear` must be called on a named context with a closure literal body"
+                        .to_string(),
+                ));
+                continue;
+            };
+            contexts.insert(context);
+            clears.push(ClearSite {
+                call_id,
+                context,
+                closure_entity,
+                closure_id,
+            });
         }
     }
 
@@ -956,6 +1009,13 @@ fn analyze(
         }
     }
 
+    // B458: the body closure of every `clear`, mapped to the context it
+    // clears and the `clear` call — an uncovered root for that context.
+    let clear_closures: HashMap<Id, (Id, Id)> = clears
+        .iter()
+        .map(|site| (site.closure_id, (site.context, site.call_id)))
+        .collect();
+
     let mut plan = Plan {
         contexts: {
             let mut sorted: Vec<Id> = contexts.iter().copied().collect();
@@ -964,6 +1024,10 @@ fn analyze(
         },
         news,
         runs,
+        clears: clears
+            .iter()
+            .map(|site| (site.call_id, site.closure_entity))
+            .collect(),
         ..Default::default()
     };
 
@@ -1019,8 +1083,18 @@ fn analyze(
             let Some(name) = dispatch_member_name(call.call_id) else {
                 continue;
             };
+            // B425: a GENERIC-MEMBER site (`label.bind(..)` through `V:
+            // MaybeSignal<str>`) reaches only the traits its parameter is
+            // bounded by — a same-NAMED member of an unrelated trait (std's own
+            // `MaybeSignal::bind`, whose reactive impl needs the ambient owner)
+            // is no candidate of it. Name-keyed, that impl made the caller
+            // DECLARE the strict owner parameter while coverage, which narrows,
+            // found no need — so a top-level call threaded nothing into it
+            // (`blanket-impl.vl`'s `badge("static")`: JS passed `undefined`,
+            // rustc refused the arity).
             let candidates =
                 crate::dispatch_refine::known_receiver_candidates(program, call.call_id)
+                    .or_else(|| crate::dispatch_refine::bound_candidates(program, call.call_id))
                     .unwrap_or_else(|| dispatch_candidates(call.call_id, name));
             for &candidate in &candidates {
                 dispatch_callers
@@ -1770,7 +1844,7 @@ fn analyze(
     let unresolved_run_contexts: HashSet<Id> = program
         .unresolved_method_calls
         .iter()
-        .filter(|(_, _, member_name)| *member_name == "run")
+        .filter(|(_, _, member_name)| *member_name == "run" || *member_name == "clear")
         .filter_map(|(_, subject_id, _)| local_target(program, *subject_id))
         .filter(|context| contexts.contains(context))
         .collect();
@@ -1814,6 +1888,14 @@ fn analyze(
                 }
             }
         }
+        // B458: a `clear` body for THIS context — the root that runs with
+        // the value absent, and the `clear` call that makes it one.
+        let cleared_here = |id: Id| -> Option<Id> {
+            clear_closures
+                .get(&id)
+                .filter(|(cleared, _)| *cleared == context)
+                .map(|(_, call)| *call)
+        };
         // A closure that RECEIVES the value as its own parameter — a `run`
         // body for this context, or a deferred (injected) literal — does not
         // capture from its creator, so needs must not leak to its parent.
@@ -1822,6 +1904,9 @@ fn analyze(
                 || deferred
                     .get(&context)
                     .is_some_and(|closures| closures.contains(&id))
+                // B458: and a `clear` body for this context — it runs WITHOUT
+                // the value, so its need is its own, never its creator's.
+                || cleared_here(id).is_some()
                 // E189: and a closure handed to a call that never resolved.
                 // The parameter it was written for is exactly what could not
                 // be found, so whether it would have carried a clause is the
@@ -2024,6 +2109,10 @@ fn analyze(
                                 .flatten()
                                 .all(|caller| bound.contains(caller))
                     }
+                } else if cleared_here(id).is_some() {
+                    // B458: a `clear` body runs with the value absent — an
+                    // uncovered root whatever its creator holds.
+                    false
                 } else if unresolved_argument_closures.contains(&id) {
                     // E189: the call this closure was written for resolved to
                     // nothing, so it has no defining scope on record and the
@@ -2137,6 +2226,14 @@ fn analyze(
                         entries.push(call_id);
                     }
                 }
+                // B458: a `clear` body's uncovered-ness came from the `clear`
+                // itself, never from its defining scope.
+                if let Some(clear_call) = cleared_here(node) {
+                    if !library_spanned(clear_call) {
+                        entries.push(clear_call);
+                    }
+                    continue;
+                }
                 // The capture hop: an unbound closure's uncovered-ness came
                 // through its defining scope.
                 if let Some(parent) = graph.closure_parent_of(node)
@@ -2169,6 +2266,9 @@ fn analyze(
             /// site MAY select the needy candidate, so its label must not
             /// overclaim.
             dispatch: bool,
+            /// B458: the `clear` whose body the path runs in — where the
+            /// value stops, labelled as such.
+            clear: bool,
             depth: usize,
         }
         let uncovered_hops_from = |start: Id| -> Vec<Hop> {
@@ -2187,6 +2287,7 @@ fn analyze(
                         hops.push(Hop {
                             call: call_id,
                             dispatch: false,
+                            clear: false,
                             depth,
                         });
                     }
@@ -2200,6 +2301,7 @@ fn analyze(
                         hops.push(Hop {
                             call: call_id,
                             dispatch: true,
+                            clear: false,
                             depth,
                         });
                     }
@@ -2210,9 +2312,23 @@ fn analyze(
                         hops.push(Hop {
                             call: call_id,
                             dispatch: false,
+                            clear: false,
                             depth,
                         });
                     }
+                }
+                // B458: the path stops at a `clear` — its body is uncovered
+                // because of the `clear`, not because of where it was written.
+                if let Some(clear_call) = cleared_here(node) {
+                    if !library_spanned(clear_call) {
+                        hops.push(Hop {
+                            call: clear_call,
+                            dispatch: false,
+                            clear: true,
+                            depth,
+                        });
+                    }
+                    continue;
                 }
                 if let Some(parent) = graph.closure_parent_of(node)
                     && !bound.contains(&parent)
@@ -2248,7 +2364,12 @@ fn analyze(
                 .map(|hop| TraceHop {
                     note: Note {
                         span: call_anchor_span(program, hop.call),
-                        msg: if hop.dispatch {
+                        msg: if hop.clear {
+                            format!(
+                                "`{}.clear(..)` runs this body with the context not established",
+                                context_name(program, context)
+                            )
+                        } else if hop.dispatch {
                             "the context requirement may flow through this call (dispatch may select a reader)"
                                 .to_string()
                         } else {
@@ -2469,6 +2590,12 @@ fn analyze(
             if entry_main == Some(id) {
                 continue;
             }
+            // B458: a `clear` body holds no value — it is None-rooted, and so
+            // is every closure whose provider walk lands on it first.
+            if cleared_here(id).is_some() {
+                none_rooted.insert(id);
+                continue;
+            }
             if is_function(id) || run_closure_ids.contains(&id) {
                 param_nodes.insert(id);
                 provider_of.insert(id, id);
@@ -2480,7 +2607,9 @@ fn analyze(
                 let mut provider = graph.closure_parent_of(id);
                 loop {
                     match provider {
-                        Some(parent) if entry_main == Some(parent) => {
+                        Some(parent)
+                            if entry_main == Some(parent) || cleared_here(parent).is_some() =>
+                        {
                             none_rooted.insert(id);
                             break;
                         }
@@ -2955,6 +3084,22 @@ fn apply(program: &mut Program, plan: Plan) {
         // plain parameter) as if it were a generic function.
         program.method_call_substitution.remove(&site.call_id);
         program.generic_dispatch.remove(&site.call_id);
+    }
+
+    // B458: `clear(body)` becomes `body()` — the body carries no hidden
+    // parameter for the context it clears (it is None-rooted), so it is
+    // called with nothing.
+    for &(call_id, closure_entity) in &plan.clears {
+        if let Some(call) = program.function_calls.get_mut(&call_id) {
+            let erased_subject = call.subject_id;
+            call.subject_id = closure_entity;
+            call.argument_ids = Vec::new();
+            program
+                .context_erased_subjects
+                .insert(call_id, erased_subject);
+        }
+        program.method_call_substitution.remove(&call_id);
+        program.generic_dispatch.remove(&call_id);
     }
 
     // `Context::new()` lowers to an opaque value; its binding is now unused.

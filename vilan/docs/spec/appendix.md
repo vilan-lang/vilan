@@ -26,18 +26,25 @@ top-tier-only forms: `const expr` and struct initializers (§3.8).
 ## A.2 Reserved words
 
 ```text
-async     await     borrows  const   css    dyn     else  enum
-export    external  for      fun     if     impl    import in
-is        jump      lazy     let     macro  match   mod   mut
-null      own       ret      struct  trait  type    use   with
-true      false
+async     await     const    css     else    enum    export
+external  for       fun      if      impl    import  in
+is        let       macro    match   mod     mut     null
+ret       struct    trait    type    use     true    false
 ```
 
-Contextual (identifier everywhere else): `context`, `sync`, `void`,
-`self`, `Self`, `as`, `only`, `break`/`continue` (after `jump`), and the
-attribute names `derive` `service` `extern` `must_use` `rpc` `trait_only`
-`doc` `expose` `platform` `deprecated` `internal` `resource` (`resource`
-was a keyword until B413 made it the `[resource]` attribute).
+Contextual keywords (an identifier everywhere but their one position;
+B414 made `with`, `borrows`, `own`, `dyn`, `lazy` and `jump` contextual, and
+B459 added `then`):
+
+```text
+as        borrows   context   dyn       jump      lazy      only
+own       self      Self      sync      then      void      with
+```
+
+Also matched by text in one position: `break`/`continue` (after `jump`), and the
+attribute names `derive` `service` `client_service` `extern` `must_use` `rpc` `trait_only`
+`doc` `expose` `platform` `deprecated` `internal` `resource` `hint`
+(`resource` was a keyword until B413 made it the `[resource]` attribute).
 
 ## A.3 Literal suffixes
 

@@ -1149,13 +1149,18 @@ fn the_release_commit_stages_every_workspace_members_manifest() {
 /// fixture shims. They are symlinked into the fixture's own `bin/` so the
 /// scrubbed PATH is still a working environment — which is what makes the
 /// ABSENCE of a sha256 tool from it deliberate rather than incidental.
-const INSTALLER_TOOLS: [&str; 6] = ["uname", "mktemp", "grep", "rm", "mkdir", "chmod"];
+const INSTALLER_TOOLS: [&str; 7] = ["uname", "mktemp", "grep", "rm", "mkdir", "chmod", "tail"];
 
 /// The fixture's `curl`: no network. It writes whatever the installer asked
-/// for at the path the installer named — the tarball as a few bytes of
-/// stand-in text, and `sha256sums.txt` either with that stand-in's true
-/// digest or with a placeholder that cannot match it, per
-/// `$VILAN_FIXTURE_SUMS`.
+/// for at the path the installer named — the tarball and the VS Code
+/// extension as a few bytes of stand-in text each, and `sha256sums.txt` with
+/// a line for both, each either the stand-in's true digest or a placeholder
+/// that cannot match it, per `$VILAN_FIXTURE_SUMS`: `real` (both true),
+/// `bogus` (both placeholders), `bogus-vsix` (only the extension's).
+///
+/// The sums arrive BEFORE the extension is downloaded, so its digest is taken
+/// over a stand-in written beside them — the same bytes the later download
+/// writes.
 const CURL_SHIM: &str = r#"#!/bin/sh
 set -eu
 out=""
@@ -1168,24 +1173,67 @@ while [ $# -gt 0 ]; do
     esac
 done
 dir="${out%/*}"
+digest() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1"
+    else
+        shasum -a 256 "$1"
+    fi
+}
+placeholder() {
+    printf '%s  %s\n' \
+        0000000000000000000000000000000000000000000000000000000000000000 "$1"
+}
 case "$url" in
     *sha256sums.txt)
         asset=""
         for candidate in "$dir"/vilan-*.tar.gz; do asset="${candidate##*/}"; done
-        if [ "$VILAN_FIXTURE_SUMS" = real ]; then
-            if command -v sha256sum > /dev/null 2>&1; then
-                (cd "$dir" && sha256sum "$asset") > "$out"
-            else
-                (cd "$dir" && shasum -a 256 "$asset") > "$out"
-            fi
+        mkdir "$dir/stand-ins"
+        printf 'a stand-in for the extension\n' > "$dir/stand-ins/vilan-vscode.vsix"
+        if [ "$VILAN_FIXTURE_SUMS" = bogus ]; then
+            placeholder "$asset" > "$out"
         else
-            printf '%s  %s\n' \
-                0000000000000000000000000000000000000000000000000000000000000000 \
-                "$asset" > "$out"
+            (cd "$dir" && digest "$asset") > "$out"
+        fi
+        if [ "$VILAN_FIXTURE_SUMS" = real ]; then
+            (cd "$dir/stand-ins" && digest vilan-vscode.vsix) >> "$out"
+        else
+            placeholder vilan-vscode.vsix >> "$out"
         fi
         ;;
+    *.vsix) printf 'a stand-in for the extension\n' > "$out" ;;
     *) printf 'a stand-in for the release tarball\n' > "$out" ;;
 esac
+"#;
+
+/// The fixture's VS Code CLI (`code` on PATH, or a VS Code Server's
+/// `code-server`): records its arguments and the bytes of the extension it was
+/// handed in `$HOME/editor.log`, then exits with `$VILAN_FIXTURE_EDITOR_EXIT`
+/// — or, for an install by gallery id (no `.vsix` argument), with
+/// `$VILAN_FIXTURE_GALLERY_EXIT` when that is set: an unreachable gallery
+/// (E230).
+const EDITOR_SHIM: &str = r#"#!/bin/sh
+printf '%s\n' "${0##*/} $*" >> "$HOME/editor.log"
+from_file=""
+for argument in "$@"; do
+    case "$argument" in
+        # builtins only: the fixture PATH holds no `cat`.
+        *.vsix)
+            from_file=1
+            while IFS= read -r line; do printf '%s\n' "$line"; done < "$argument" >> "$HOME/editor.log"
+            ;;
+    esac
+done
+if [ -z "$from_file" ] && [ -n "${VILAN_FIXTURE_GALLERY_EXIT:-}" ]; then
+    if [ "$VILAN_FIXTURE_GALLERY_EXIT" != 0 ]; then
+        echo "Failed Installing Extensions: the gallery is unreachable" >&2
+    fi
+    exit "$VILAN_FIXTURE_GALLERY_EXIT"
+fi
+if [ "${VILAN_FIXTURE_EDITOR_EXIT:-0}" != 0 ]; then
+    echo "the editor refused the extension" >&2
+fi
+exit "${VILAN_FIXTURE_EDITOR_EXIT:-0}"
 "#;
 
 /// The fixture's `tar`: unpacks nothing, plants the two executables the
@@ -1263,24 +1311,34 @@ impl Installer {
     /// `sha256sums.txt`: the download's true digest, or a placeholder that
     /// cannot match it.
     fn run(&self, correct_sums: bool) -> (bool, String) {
+        self.run_with(if correct_sums { "real" } else { "bogus" }, &[], &[])
+    }
+
+    /// `run` with the fixture's sums mode by name (see `CURL_SHIM`), the
+    /// installer's own arguments, and extra environment.
+    fn run_with(
+        &self,
+        sums: &str,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> (bool, String) {
         // `/bin/sh` by absolute path: the child's PATH is the fixture's, and
         // the point of this fixture is that nothing else on the machine is
         // reachable from inside the script.
         let output = Command::new("/bin/sh")
             .arg("scripts/install.sh")
+            .args(arguments)
             .current_dir(&self.root)
             .env_clear()
             .env("PATH", &self.bin)
-            .env("HOME", self.root.join("home"))
+            .env("HOME", self.home())
             .env("TMPDIR", &self.root)
             .env(
                 "VILAN_INSTALL_DIR",
                 self.installed().parent().expect("bin/"),
             )
-            .env(
-                "VILAN_FIXTURE_SUMS",
-                if correct_sums { "real" } else { "bogus" },
-            )
+            .env("VILAN_FIXTURE_SUMS", sums)
+            .envs(environment.iter().copied())
             .output()
             .expect("run scripts/install.sh");
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1291,6 +1349,30 @@ impl Installer {
     /// Where a completed install would leave the compiler.
     fn installed(&self) -> PathBuf {
         self.root.join("install").join("vilan")
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    /// Puts `code` on the fixture's PATH.
+    fn with_code_on_path(self) -> Installer {
+        write_shim(&self.bin.join("code"), EDITOR_SHIM);
+        self
+    }
+
+    /// Plants a VS Code Server under the fixture's home, the way Remote-SSH /
+    /// Tunnels / WSL leave one: `~/.vscode-server/bin/<commit>/bin/code-server`.
+    fn with_vscode_server(self) -> Installer {
+        let cli = self.home().join(".vscode-server/bin/0123abcd/bin");
+        fs::create_dir_all(&cli).expect("create the server's bin/");
+        write_shim(&cli.join("code-server"), EDITOR_SHIM);
+        self
+    }
+
+    /// What the fixture's VS Code CLI was asked to do, or `""` if it never ran.
+    fn editor_log(&self) -> String {
+        fs::read_to_string(self.home().join("editor.log")).unwrap_or_default()
     }
 }
 
@@ -1373,4 +1455,202 @@ fn the_installer_refuses_when_no_sha256_tool_can_verify_the_download() {
         !installer.installed().exists(),
         "an unverified archive was installed:\n{report}"
     );
+}
+
+// --- E229: the installer delivers the VS Code extension --------------------
+//
+// The release has shipped `vilan-vscode.vsix` since the extension existed and
+// no installer ever installed it, so an editor could run an extension a whole
+// order older than its language server without anything noticing (the owner's
+// ran 0.40.0 against a 0.41.1 toolchain — no `vilan.autoClosing.generics`, the
+// doubled `>` of E214 live a full order after its fix). The installer now
+// installs it wherever a VS Code CLI is found, verified against the same
+// `sha256sums.txt` as the toolchain, behind an opt-out.
+
+/// `code` on PATH: the extension is downloaded and verified with the
+/// toolchain, and then installed from the GALLERY by id (E230) — an
+/// unversioned gallery install is one VS Code keeps updated, where a vsix
+/// install is pinned — forced over whatever is there, and the summary says so.
+#[test]
+fn e229_the_installer_installs_the_extension_when_code_is_on_path() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    let installer = Installer::new("e229-code", Some(&tool)).with_code_on_path();
+    let (ok, report) = installer.run_with("real", &[], &[]);
+    assert!(ok, "the install failed:\n{report}");
+    assert!(
+        installer.installed().exists(),
+        "the toolchain was not installed:\n{report}"
+    );
+    assert_eq!(
+        installer.editor_log(),
+        "code --install-extension vilan-lang.vilan --force\n",
+        "`code` must be asked for the gallery id, forced over an older one"
+    );
+    assert!(
+        report.contains("VS Code extension: installed vilan-lang.vilan from the gallery")
+            && report.contains("reload VS Code"),
+        "the summary must say the extension was installed and what to do next:\n{report}"
+    );
+}
+
+/// E230: the gallery unreachable, the release's own vsix — the file the
+/// installer downloaded and VERIFIED before anything was installed.
+#[test]
+fn e230_an_unreachable_gallery_falls_back_to_the_verified_vsix() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    let installer = Installer::new("e230-offline", Some(&tool)).with_code_on_path();
+    let (ok, report) = installer.run_with("real", &[], &[("VILAN_FIXTURE_GALLERY_EXIT", "1")]);
+    assert!(ok, "the install failed:\n{report}");
+    let log = installer.editor_log();
+    let calls: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        calls[0], "code --install-extension vilan-lang.vilan --force",
+        "{log}"
+    );
+    assert!(
+        calls[1].starts_with("code --install-extension ")
+            && calls[1].ends_with("vilan-vscode.vsix --force"),
+        "{log}"
+    );
+    assert!(
+        log.contains("a stand-in for the extension"),
+        "`code` must be handed the DOWNLOADED file, not a path to nothing:\n{log}"
+    );
+    assert!(
+        report.contains(
+            "VS Code extension: installed vilan-vscode.vsix (the gallery was unreachable)"
+        ),
+        "{report}"
+    );
+}
+
+/// The opt-out, both spellings: `--no-vscode` (`sh -s -- --no-vscode` through
+/// the pipe) and `VILAN_NO_VSCODE=1`. Neither downloads the extension nor
+/// touches the editor, and the summary says why.
+#[test]
+fn e229_the_extension_install_is_opted_out_by_flag_or_environment() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    for (name, arguments, environment) in [
+        ("e229-flag", &["--no-vscode"][..], &[][..]),
+        ("e229-env", &[][..], &[("VILAN_NO_VSCODE", "1")][..]),
+    ] {
+        let installer = Installer::new(name, Some(&tool)).with_code_on_path();
+        // `bogus-vsix`: had the extension been downloaded and verified, the
+        // run would have been refused — the opt-out skips the download itself.
+        let (ok, report) = installer.run_with("bogus-vsix", arguments, environment);
+        assert!(ok, "{name}: the opted-out install failed:\n{report}");
+        assert!(
+            installer.installed().exists(),
+            "{name}: no toolchain:\n{report}"
+        );
+        assert_eq!(installer.editor_log(), "", "{name}: the editor was touched");
+        assert!(
+            report.contains("VS Code extension: not installed (--no-vscode / VILAN_NO_VSCODE)"),
+            "{name}: the summary must name the opt-out:\n{report}"
+        );
+        assert!(
+            !report.contains("downloading vilan-vscode.vsix"),
+            "{name}:\n{report}"
+        );
+    }
+}
+
+/// No VS Code on the machine: the toolchain installs as before, nothing is
+/// downloaded for an editor that is not there, and the summary says where the
+/// extension is for an editor installed later.
+#[test]
+fn e229_without_a_vscode_cli_the_summary_says_where_the_extension_is() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    let installer = Installer::new("e229-none", Some(&tool));
+    let (ok, report) = installer.run_with("bogus-vsix", &[], &[]);
+    assert!(ok, "the install failed:\n{report}");
+    assert!(
+        report.contains("VS Code extension: not installed (no `code` on PATH)")
+            && report.contains("vilan-vscode.vsix on https://github.com/vilan-lang/vilan/releases"),
+        "the summary must say why and where:\n{report}"
+    );
+}
+
+/// No `code` on PATH but a VS Code Server in the home directory (Remote-SSH,
+/// Tunnels, a WSL shell without the Windows launcher): the server's own CLI
+/// installs the extension where the remote editor loads it from.
+#[test]
+fn e229_a_vscode_server_cli_installs_the_extension_when_code_is_absent() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    let installer = Installer::new("e229-server", Some(&tool)).with_vscode_server();
+    let (ok, report) = installer.run_with("real", &[], &[]);
+    assert!(ok, "the install failed:\n{report}");
+    let log = installer.editor_log();
+    assert!(
+        log.starts_with("code-server --install-extension ") && log.contains("--force"),
+        "the server's CLI must be asked to install the vsix:\n{log}"
+    );
+    assert!(
+        report.contains("VS Code extension: installed vilan-lang.vilan from the gallery"),
+        "{report}"
+    );
+}
+
+/// The extension is verified like the toolchain, and BEFORE anything is
+/// installed: a digest that does not match refuses the whole install, by name.
+#[test]
+fn e229_an_extension_that_does_not_verify_refuses_the_whole_install() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    let installer = Installer::new("e229-mismatch", Some(&tool)).with_code_on_path();
+    let (ok, report) = installer.run_with("bogus-vsix", &[], &[]);
+    assert!(!ok, "an unverifiable extension installed anyway:\n{report}");
+    assert!(
+        report.contains("checksum mismatch for vilan-vscode.vsix"),
+        "{report}"
+    );
+    assert!(
+        !installer.installed().exists(),
+        "a refused install must leave nothing behind — the toolchain included:\n{report}"
+    );
+    assert_eq!(
+        installer.editor_log(),
+        "",
+        "the editor was handed an unverified file"
+    );
+}
+
+/// The editor refusing the extension is REPORTED, never a failed install: the
+/// toolchain is already in place, and the summary quotes the editor's reason.
+#[test]
+fn e229_an_editor_that_refuses_the_extension_does_not_fail_the_install() {
+    let Some(tool) = sha256_tool() else {
+        return;
+    };
+    let installer = Installer::new("e229-refused", Some(&tool)).with_code_on_path();
+    let (ok, report) = installer.run_with("real", &[], &[("VILAN_FIXTURE_EDITOR_EXIT", "1")]);
+    assert!(ok, "the editor's refusal failed the install:\n{report}");
+    assert!(installer.installed().exists());
+    assert!(
+        report.contains("VS Code extension: NOT installed")
+            && report.contains("the editor refused the extension"),
+        "the summary must say the extension is missing, and why:\n{report}"
+    );
+}
+
+/// An option the installer does not know is refused rather than ignored — a
+/// misspelled `--no-vscode` must not install the extension anyway.
+#[test]
+fn e229_an_unknown_installer_option_is_refused() {
+    let installer = Installer::new("e229-unknown", sha256_tool().as_deref());
+    let (ok, report) = installer.run_with("real", &["--no-vs-code"], &[]);
+    assert!(!ok, "a misspelled option was ignored:\n{report}");
+    assert!(report.contains("unknown option: --no-vs-code"), "{report}");
+    assert!(!installer.installed().exists());
 }

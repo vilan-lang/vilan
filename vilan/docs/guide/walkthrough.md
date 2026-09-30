@@ -239,7 +239,7 @@ the whole wiring diagram:
 ```vilan,fragment
 async fun main() {
 	let token = Signal::new(storage::get("notes-token"));
-	let route = current_path().map(parse);
+	let route = current_path().derive(|path| parse(path)).cell();
 
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {
@@ -327,7 +327,7 @@ entry.effect(|current: Option<Note>| {
 
 view("div")
 	.child(view("input").styled(field).attr("placeholder", "Title…").bind_draft(title))
-	.child(view("span").styled(muted).bind_text(title.state.map(state_text)))
+	.child(view("span").styled(muted).bind_text(title.state.derive(|state| state_text(state))))
 	…
 ```
 

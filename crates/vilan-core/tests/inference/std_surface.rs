@@ -357,6 +357,292 @@ fn the_std_surface_batch_needs_no_import() {
     );
 }
 
+// --- I9: `HashMap`/`HashSet`, and the old names as deprecated aliases ---------
+//
+// The hash collections are `std::hash_map::HashMap` and `std::hash_set::HashSet`.
+// `std::map::Map` and `std::set::Set` stay one release as `[deprecated]`
+// re-exports of the SAME types: a program that still spells them compiles,
+// warns at the name with the steer, and its values pass for the new type's in
+// both directions (a second spelling of one item, not a second type).
+
+#[test]
+fn i9_std_map_map_is_a_deprecated_alias_that_warns_with_the_steer() {
+    assert_warns_spanning(
+        r#"
+        import std::map::Map;
+
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("a", 1);
+        }
+        "#,
+        "Map",
+        "`Map` is deprecated; use std::hash_map::HashMap",
+    );
+}
+
+#[test]
+fn i9_std_set_set_is_a_deprecated_alias_that_warns_with_the_steer() {
+    assert_warns_spanning(
+        r#"
+        import std::set::Set;
+
+        fun main() {
+            mut seen: Set<i32> = Set::new();
+            seen.insert(1);
+        }
+        "#,
+        "Set",
+        "`Set` is deprecated; use std::hash_set::HashSet",
+    );
+}
+
+#[test]
+fn i9_the_new_names_do_not_warn() {
+    let warnings = warnings(
+        r#"
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        fun main() {
+            mut scores: HashMap<str, i32> = HashMap::new();
+            scores.insert("a", 1);
+            mut seen: HashSet<i32> = HashSet::new();
+            seen.insert(1);
+        }
+        "#,
+    );
+    assert!(warnings.is_empty(), "{warnings:#?}");
+}
+
+/// The iteration contract the new names keep: INSERTION order (papers-44's
+/// probe found both backends agree on it). An overwrite keeps its key's place,
+/// a remove and re-insert goes to the end, and a set's duplicate insert keeps
+/// its value's place.
+#[test]
+fn i9_hash_map_and_hash_set_iterate_in_insertion_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        fun main() {
+            mut m: HashMap<str, i32> = HashMap::new();
+            m.insert("a", 1);
+            m.insert("b", 2);
+            m.insert("c", 3);
+            m.insert("a", 10);
+            m.remove("b");
+            m.insert("b", 20);
+            m.insert("d", 4);
+            print(m.keys());
+            print(m.values());
+            mut s: HashSet<i32> = HashSet::new();
+            s.insert(3);
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            s.remove(1);
+            s.insert(1);
+            print(s.values());
+        }
+        "#,
+        "[ 'a', 'c', 'b', 'd' ]\n[ 10, 3, 20, 4 ]\n[ 3, 2, 1 ]\n",
+    );
+}
+
+/// Q8 (ruled with I9): `==` on the hash collections is ORDER-INSENSITIVE — the
+/// same keys with equal values, the same members. Each order-only difference
+/// is equal, each value/size/member difference is not, a derived `PartialEq`
+/// over a struct holding a map compares through it, and a map of maps compares
+/// its values with it. `native_differential` holds the Rust backend to the same
+/// answers.
+#[test]
+fn i9_hash_collection_equality_ignores_insertion_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+
+        [derive(PartialEq)]
+        struct Holder {
+            scores: HashMap<str, i32>,
+        }
+
+        fun main() {
+            mut a: HashMap<str, i32> = HashMap::new();
+            a.insert("x", 1);
+            a.insert("y", 2);
+            mut b: HashMap<str, i32> = HashMap::new();
+            b.insert("y", 2);
+            b.insert("x", 1);
+            print(a == b);
+            b.insert("y", 3);
+            print(a == b);
+            print(a != b);
+            mut c: HashMap<str, i32> = HashMap::new();
+            c.insert("x", 1);
+            print(a == c);
+            c.insert("z", 2);
+            print(a == c);
+            print(Holder { scores = a } == Holder { scores = [("y", 2), ("x", 1)].to_map() });
+            print(Holder { scores = a } == Holder { scores = c });
+            let s: HashSet<i32> = [1, 2, 3].to_set();
+            print(s == [3, 2, 1].to_set());
+            print(s == [3, 2].to_set());
+            print(s == [3, 2, 4].to_set());
+            mut nested: HashMap<str, HashMap<str, i32>> = HashMap::new();
+            nested.insert("a", a);
+            mut other: HashMap<str, HashMap<str, i32>> = HashMap::new();
+            other.insert("a", [("y", 2), ("x", 1)].to_map());
+            print(nested == other);
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\nfalse\nfalse\ntrue\n",
+    );
+}
+
+/// A map whose VALUE type has no `PartialEq` has no `==`: the impl is bounded
+/// `V: PartialEq`, so the refusal is the ordinary one, at the operator.
+#[test]
+fn i9_a_map_of_incomparable_values_has_no_equality() {
+    assert_fails_with(
+        r#"
+        import std::hash_map::HashMap;
+
+        struct Opaque { n: i32 }
+
+        fun main() {
+            let a: HashMap<str, Opaque> = HashMap::new();
+            let b: HashMap<str, Opaque> = HashMap::new();
+            let same = a == b;
+        }
+        "#,
+        "PartialEq",
+    );
+}
+
+/// The alias IS the type: an old-spelled value goes where the new type is
+/// declared and back, the old import still reaches the `List` terminators
+/// (`to_map`/`to_set`, extension impls declared in the new modules), and a
+/// `for` over an old-spelled set still takes the set's native lowering (it is
+/// keyed on the declaring struct, which the alias shares).
+#[test]
+fn i9_the_old_names_are_the_same_types_as_the_new() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
+        import std::map::Map;
+        import std::set::Set;
+
+        fun size_new(table: HashMap<str, i32>): usize { table.len() }
+        fun size_old(table: Map<str, i32>): usize { table.len() }
+        fun make_old(): Set<i32> { [3, 1, 3].to_set() }
+
+        fun main() {
+            let old: Map<str, i32> = [("a", 1), ("b", 2)].to_map();
+            let new: HashMap<str, i32> = old;
+            print(size_new(old));
+            print(size_old(new));
+            let seen: HashSet<i32> = make_old();
+            for value in make_old() {
+                print(value);
+            }
+            print(seen.contains(1));
+        }
+        "#,
+        "2\n2\n3\n1\ntrue\n",
+    );
+}
+
+// --- I8's maps half: `HashMap::get_or_insert(key, make)` --------------------
+
+/// A miss makes once and stores; a hit makes nothing; the value read back is
+/// the one stored. The maker counts its runs through a `Shared`, so "made
+/// nothing" is observed rather than inferred from the answer.
+#[test]
+fn i8_hash_map_get_or_insert_makes_once_on_a_miss_and_never_on_a_hit() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+        import std::shared::Shared;
+
+        fun main() {
+            let runs = Shared::new(0);
+            mut widths: HashMap<str, i32> = HashMap::new();
+            print(widths.get_or_insert("a", || { runs.write() = runs.read() + 1; 5 }));
+            print(widths.get_or_insert("a", || { runs.write() = runs.read() + 1; 9 }));
+            print(widths.get("a").unwrap_or(0));
+            print(widths.get_or_insert("b", || { runs.write() = runs.read() + 1; 7 }));
+            print(widths.len());
+            print(runs.read());
+        }
+        "#,
+        "5\n5\n5\n7\n2\n2\n",
+    );
+}
+
+/// The key a miss stores is the caller's key, by value: a derived-`Hashable`
+/// struct key is found again by an EQUAL, distinct value, and `keys()` answers
+/// the stored key itself.
+#[test]
+fn i8_hash_map_get_or_insert_stores_the_key_it_was_given() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::hash_map::HashMap;
+
+        [derive(Hashable, PartialEq)]
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            mut names: HashMap<Point, str> = HashMap::new();
+            print(names.get_or_insert(Point { x = 1, y = 2 }, || "first"));
+            print(names.get_or_insert(Point { x = 1, y = 2 }, || "second"));
+            for key in names.keys() {
+                print(key.x + key.y);
+            }
+        }
+        "#,
+        "first\nfirst\n3\n",
+    );
+}
+
+/// `Memo::get_or_insert` stays three steps (read, make, write) rather than a
+/// call to `HashMap::get_or_insert` through `write()`, because a maker may ask
+/// the same memo again: the memoized recursion. Pinned so a "thin wrapper"
+/// refactor that runs the maker under a live `write()` view has to answer it.
+#[test]
+fn i8_a_memo_maker_may_ask_the_same_memo_again() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::memo::Memo;
+
+        let fibs: Memo<i32, i32> = Memo::new();
+
+        fun fib(n: i32): i32 {
+            if n < 2 {
+                n
+            } else {
+                fibs.get_or_insert(n, || fib(n - 1) + fib(n - 2))
+            }
+        }
+
+        fun main() {
+            print(fib(30));
+            print(fibs.len());
+        }
+        "#,
+        "832040\n29\n",
+    );
+}
+
 // --- I4's open tail: Map/Set parity (proposal/std-surface.md §1.2/§3) --------
 //
 // The unranked "Map/Set parity" row v1 left unshipped: `entries`/
@@ -373,9 +659,9 @@ fn map_entries_pairs_keys_and_values_in_insertion_order() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("alice", 1);
             scores.insert("bob", 2);
             scores.insert("alice", 99);   // overwrite -- position does not move
@@ -399,9 +685,9 @@ fn map_entries_on_an_empty_map_is_empty() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut empty: Map<str, i32> = Map::new();
+            mut empty: HashMap<str, i32> = HashMap::new();
             print(empty.entries().len());   // 0
             print(empty.entries().is_empty()); // true
         }
@@ -415,9 +701,9 @@ fn map_contains_value_compares_by_value_not_by_key() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("x", 5);
             scores.insert("y", 5);   // a duplicate value under a different key
             print(scores.contains_value(5));    // true
@@ -434,9 +720,9 @@ fn map_contains_value_on_an_empty_map_is_false() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut empty: Map<str, i32> = Map::new();
+            mut empty: HashMap<str, i32> = HashMap::new();
             print(empty.contains_value(0));
         }
         "#,
@@ -449,13 +735,13 @@ fn set_union_combines_and_dedupes_the_overlap() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(2);
             b.insert(3);
             b.insert(4);
@@ -475,12 +761,12 @@ fn set_union_with_an_empty_set_is_identity_either_direction() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
-            mut empty: Set<i32> = Set::new();
+            mut empty: HashSet<i32> = HashSet::new();
             print(a.union(empty).len());       // 2
             print(empty.union(a).len());       // 2
             print(empty.union(empty).len());   // 0 -- both sides empty
@@ -495,13 +781,13 @@ fn set_intersection_keeps_only_the_shared_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(2);
             b.insert(3);
             b.insert(4);
@@ -510,7 +796,7 @@ fn set_intersection_keeps_only_the_shared_elements() {
             print(shared.contains(2));      // true
             print(shared.contains(1));      // false
 
-            mut disjoint: Set<i32> = Set::new();
+            mut disjoint: HashSet<i32> = HashSet::new();
             disjoint.insert(100);
             print(a.intersection(disjoint).len());   // 0 -- no overlap
         }
@@ -524,13 +810,13 @@ fn set_difference_keeps_elements_absent_from_the_other_side() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(2);
             b.insert(3);
             let remainder = a.difference(b);
@@ -539,7 +825,7 @@ fn set_difference_keeps_elements_absent_from_the_other_side() {
             print(remainder.contains(2));    // false
 
             print(a.difference(a).len());    // 0 -- a set minus itself is empty
-            mut empty: Set<i32> = Set::new();
+            mut empty: HashSet<i32> = HashSet::new();
             print(a.difference(empty).len()); // 3 -- nothing removed
         }
         "#,
@@ -556,10 +842,10 @@ fn the_map_set_parity_batch_needs_only_its_own_type_import() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("a", 1);
             mut total = 0;
             for entry in scores.entries() {
@@ -568,9 +854,9 @@ fn the_map_set_parity_batch_needs_only_its_own_type_import() {
             print(total);
             print(scores.contains_value(1));
 
-            mut xs: Set<i32> = Set::new();
+            mut xs: HashSet<i32> = HashSet::new();
             xs.insert(1);
-            mut ys: Set<i32> = Set::new();
+            mut ys: HashSet<i32> = HashSet::new();
             ys.insert(2);
             print(xs.union(ys).len());
             print(xs.intersection(ys).len());
@@ -601,9 +887,9 @@ fn a_set_loop_over_self_inside_its_own_generic_impl_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
+        impl HashSet<type T: Hashable> {
             fun probe(self): i32 {
                 mut n = 0;
                 for x in self {
@@ -613,7 +899,7 @@ fn a_set_loop_over_self_inside_its_own_generic_impl_walks_the_elements() {
             }
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -632,9 +918,9 @@ fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
+        impl HashSet<type T: Hashable> {
             fun total(self): i32 {
                 mut sum = 0;
                 for x in self {
@@ -643,7 +929,7 @@ fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
                 sum
             }
         }
-        impl Set<i32> {
+        impl HashSet<i32> {
             fun sum(self): i32 {
                 mut sum = 0;
                 for x in self {
@@ -653,7 +939,7 @@ fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
             }
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(10);
             s.insert(20);
             s.insert(30);
@@ -676,11 +962,11 @@ fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
-            fun merged(self, other: Set<T>): Set<T> {
-                mut result: Set<T> = Set::new();
+        impl HashSet<type T: Hashable> {
+            fun merged(self, other: HashSet<T>): HashSet<T> {
+                mut result: HashSet<T> = HashSet::new();
                 for value in self {
                     result.insert(value);
                 }
@@ -691,11 +977,11 @@ fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
             }
         }
         fun main() {
-            mut a: Set<i32> = Set::new();
+            mut a: HashSet<i32> = HashSet::new();
             a.insert(1);
             a.insert(2);
             a.insert(3);
-            mut b: Set<i32> = Set::new();
+            mut b: HashSet<i32> = HashSet::new();
             b.insert(3);
             b.insert(4);
             print(a.merged(b).len());   // 4, not 1
@@ -710,9 +996,9 @@ fn a_set_loop_over_a_mut_self_receiver_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        impl Set<type T: Hashable> {
+        impl HashSet<type T: Hashable> {
             fun probe(&mut self): i32 {
                 mut n = 0;
                 for x in self {
@@ -722,7 +1008,7 @@ fn a_set_loop_over_a_mut_self_receiver_walks_the_elements() {
             }
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             print(s.probe());
@@ -740,16 +1026,16 @@ fn a_set_loop_over_a_plain_parameter_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         import std::hash::Hashable;
-        fun count_concrete(s: Set<i32>): i32 {
+        fun count_concrete(s: HashSet<i32>): i32 {
             mut n = 0;
             for x in s {
                 n = n + 1;
             }
             n
         }
-        fun count_generic<T: Hashable>(s: Set<T>): i32 {
+        fun count_generic<T: Hashable>(s: HashSet<T>): i32 {
             mut n = 0;
             for x in s {
                 n = n + 1;
@@ -757,7 +1043,7 @@ fn a_set_loop_over_a_plain_parameter_walks_the_elements() {
             n
         }
         fun main() {
-            mut s: Set<i32> = Set::new();
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -777,12 +1063,12 @@ fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
+        import std::hash_set::HashSet;
         struct Holder {
-            inner: Set<i32>,
+            inner: HashSet<i32>,
         }
-        fun make(): Set<i32> {
-            mut s: Set<i32> = Set::new();
+        fun make(): HashSet<i32> {
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -795,7 +1081,7 @@ fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
             }
             n
         }
-        fun from_view(s: &Set<i32>): i32 {
+        fun from_view(s: &HashSet<i32>): i32 {
             mut n = 0;
             for x in *s {
                 n = n + 1;
@@ -830,9 +1116,9 @@ fn a_set_loop_survives_nesting_and_a_closure_parameter() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::set::Set;
-        fun make(): Set<i32> {
-            mut s: Set<i32> = Set::new();
+        import std::hash_set::HashSet;
+        fun make(): HashSet<i32> {
+            mut s: HashSet<i32> = HashSet::new();
             s.insert(1);
             s.insert(2);
             s.insert(3);
@@ -845,8 +1131,8 @@ fn a_set_loop_survives_nesting_and_a_closure_parameter() {
                     n = n + 1;
                 }
             }
-            print(n);   // 6 -- the loop binding is a `Set`, not an element
-            let count = |s: Set<i32>| {
+            print(n);   // 6 -- the loop binding is a `HashSet`, not an element
+            let count = |s: HashSet<i32>| {
                 mut c = 0;
                 for x in s {
                     c = c + 1;
@@ -916,9 +1202,9 @@ fn a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         fun main() {
-            mut scores: Map<str, i32> = Map::new();
+            mut scores: HashMap<str, i32> = HashMap::new();
             scores.insert("a", 1);
             scores.insert("b", 2);
             mut n = 0;
@@ -4117,15 +4403,15 @@ fn b186_a_bare_trait_parameter_is_the_generic_the_steer_asked_for() {
 #[test]
 fn b72_the_bare_trait_steer_names_the_position_that_works() {
     // The actionable half — without it the message diagnoses without directing.
-    // Read at a RETURN, and the steer names all three spellings: the parameter
-    // (B186), `dyn A` for a field or any other value position (A124 R3), and
-    // the written generic, which is what a RETURN actually needs.
+    // Read at a NESTED return (B460 made the bare return a reading), and the
+    // steer names all three spellings: the parameter (B186), `dyn A` for a
+    // field or any other value position (A124 R3), and the written generic.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun main() { }
         "#,
         "Write `fun f(x: A)` for a parameter, `dyn A` for a field or any other position \
@@ -4161,7 +4447,7 @@ fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun subject(): A { Bag { n = 1 } }
+        fun subject(): Option<A> { Some(Bag { n = 1 }) }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4206,7 +4492,7 @@ fn b72_the_refusal_does_not_wait_for_an_argument() {
         struct Bag { n: i32 }
         struct Other { m: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(): A { Other { m = 1 } }
+        fun show(): Option<A> { Some(Other { m = 1 }) }
         fun main() { let s = show(); }
         "#,
         "'A' is a trait, not a type",
@@ -4224,7 +4510,7 @@ fn b72_an_unused_bare_trait_declaration_is_still_refused() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4350,18 +4636,20 @@ fn b186_a_bare_trait_method_parameter_is_the_generic_too() {
 }
 
 #[test]
-fn b72_a_bare_trait_return_is_refused() {
-    // The position std itself used, and the reason §11 sequenced the `Self`
-    // rewrites before the tightening.
-    assert_fails_with(
+fn b72_a_bare_trait_return_is_the_callees_one_type() {
+    // The position std itself used, refused since B72 (B253 kept it refused).
+    // B460 (RULED 2026-09-29, door (i)) reverses that for a free fun: the
+    // callee picks ONE concrete type — the body's — and the caller sees it.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun make(): A { Bag { n = 1 } }
-        fun main() { let v = make(); }
+        fun main() { let v = make(); print(v.name()); }
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4416,15 +4704,27 @@ fn b72_a_bare_trait_generic_argument_is_refused() {
     // §2.3: `List<A>` type-checked, and then narrowed to `List<Bag>` at the
     // first element because the `(Struct|Enum, Trait)` arm returns the concrete
     // side — so a genuinely heterogeneous list built by `push` compiled and ran.
-    // Refused at the argument, by the same rule and at the same arm.
-    assert_fails_with(
+    // B461 (2026-09-29) reads the nested trait as an EXISTENTIAL: ONE type that
+    // implements `A`, grounded by what the list holds — so a homogeneous list
+    // compiles, and the heterogeneous one §2.3 was about is refused at the
+    // second type (the steer names `dyn A`).
+    assert_compiles(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun main() { mut xs: List<A> = []; xs.push(Bag { n = 1 }); }
         "#,
-        "'A' is a trait, not a type",
+    );
+    assert_fails(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Box2 { n: i32 }
+        impl Box2 with A { fun name(self): str { "box" } }
+        fun main() { mut xs: List<A> = []; xs.push(Bag { n = 1 }); xs.push(Box2 { n = 2 }); }
+        "#,
     );
 }
 
@@ -4491,9 +4791,9 @@ fn b4_the_internal_error_route_through_a_return_is_a_clean_refusal() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let s = use_it(make()); }
+        fun main() { let s = use_it(make().unwrap()); }
         "#,
         "'A' is a trait, not a type",
     );
@@ -4526,9 +4826,9 @@ fn b4_no_route_to_the_internal_error_survives() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun make(): A { Bag { n = 1 } }
+        fun make(): Option<A> { Some(Bag { n = 1 }) }
         fun use_it<T: A>(v: T): str { v.name() }
-        fun main() { let s = use_it(make()); }
+        fun main() { let s = use_it(make().unwrap()); }
         "#,
     ] {
         let diagnostics = compile(source).expect_err("expected a compile error");
@@ -5842,14 +6142,14 @@ fn a_memo_makes_a_value_once_per_key_and_forgets_one_on_request() {
         }
 
         fun main() {
-            print(i"first:{widths.get_or("alpha", || width_of("alpha"))}");
-            print(i"again:{widths.get_or("alpha", || width_of("alpha"))}");
-            print(i"other:{widths.get_or("be", || width_of("be"))}");
+            print(i"first:{widths.get_or_insert("alpha", || width_of("alpha"))}");
+            print(i"again:{widths.get_or_insert("alpha", || width_of("alpha"))}");
+            print(i"other:{widths.get_or_insert("be", || width_of("be"))}");
             print(i"makes:{makes.read()} len:{widths.len()}");
             print(i"held:{widths.get("alpha").is_some()}");
             widths.forget("alpha");
             print(i"held_after_forget:{widths.get("alpha").is_some()} len:{widths.len()}");
-            print(i"remade:{widths.get_or("alpha", || width_of("alpha"))} makes:{makes.read()}");
+            print(i"remade:{widths.get_or_insert("alpha", || width_of("alpha"))} makes:{makes.read()}");
             widths.clear();
             print(i"cleared:{widths.len()}");
         }
@@ -6018,21 +6318,21 @@ fn i4_the_containers_have_a_default_and_it_is_the_empty_one() {
         r#"
         import std::io::print;
         import std::default::Default;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         fun make<T: Default>(): T {
             T::default()
         }
         fun main() {
             let list: List<i32> = make();
-            mut map: Map<str, i32> = make();
-            mut set: Set<i32> = make();
+            mut map: HashMap<str, i32> = make();
+            mut set: HashSet<i32> = make();
             print(i"{list.len()} {map.len()} {set.len()}");
             map.insert("a", 1);
             set.insert(3);
             print(i"{map.len()} {set.len()}");
-            let fresh_map: Map<str, i32> = make();
-            let fresh_set: Set<i32> = make();
+            let fresh_map: HashMap<str, i32> = make();
+            let fresh_set: HashSet<i32> = make();
             print(i"{fresh_map.len()} {fresh_set.len()}");
         }
         "#,
@@ -6073,13 +6373,13 @@ fn i4_a_derived_default_admits_a_struct_holding_containers() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::map::Map;
-        import std::set::Set;
+        import std::hash_map::HashMap;
+        import std::hash_set::HashSet;
         [derive(Default)]
         struct Prefs {
             names: List<str>,
-            seen: Set<i32>,
-            widths: Map<str, i32>,
+            seen: HashSet<i32>,
+            widths: HashMap<str, i32>,
             label: str,
             collapsed: bool,
             width: i32,
@@ -6104,13 +6404,13 @@ fn i4_the_container_defaults_do_not_widen_what_a_map_key_may_be() {
         r#"
         import std::io::print;
         import std::default::Default;
-        import std::map::Map;
+        import std::hash_map::HashMap;
         struct Key { id: i32 }
         fun make<T: Default>(): T {
             T::default()
         }
         fun main() {
-            let map: Map<Key, i32> = make();
+            let map: HashMap<Key, i32> = make();
             print(map.len());
         }
         "#,
@@ -6870,4 +7170,88 @@ fn a126_u53_displays_through_a_bound() {
 #[test]
 fn a126_f32_displays_through_a_bound() {
     assert_displays_through_a_bound("f32", "1.5f32", "1.5");
+}
+
+/// I7: `Memo::get_or` is `get_or_insert` now, and the old name stays one
+/// release as a `[deprecated]` alias (E224's rule for functions) — it still
+/// answers, and it warns at the name with the steer.
+#[test]
+fn i7_memo_get_or_is_a_deprecated_alias_of_get_or_insert() {
+    assert_warns_spanning(
+        r#"
+        import std::memo::Memo;
+
+        let widths: Memo<str, usize> = Memo::new();
+
+        fun main() {
+            let held = widths.get_or("alpha", || 5usize);
+        }
+        "#,
+        "get_or",
+        "`get_or` is deprecated; use get_or_insert(key, make)",
+    );
+}
+
+/// I8: `Shared<Option<T>>::get_or_insert(make)` — a miss makes once and
+/// stores, a hit makes nothing, and what the cell holds afterwards is what was
+/// answered.
+#[test]
+fn i8_an_optional_cell_is_filled_once_by_get_or_insert() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let makes: Shared<i32> = Shared::new(0);
+        let slot: Shared<Option<str>> = Shared::new(None);
+
+        fun make(): str {
+            makes.write() += 1;
+            i"made-{makes.read()}"
+        }
+
+        fun main() {
+            print(i"miss:{slot.get_or_insert(|| make())}");
+            print(i"hit:{slot.get_or_insert(|| make())}");
+            print(i"held:{slot.read().unwrap_or("-")} makes:{makes.read()}");
+            slot.write() = Some("preset");
+            print(i"preset:{slot.get_or_insert(|| make())} makes:{makes.read()}");
+        }
+        main();
+        "#,
+        "miss:made-1\nhit:made-1\nheld:made-1 makes:1\npreset:preset makes:1\n",
+    );
+}
+
+// --- B416: `[derive(Wire)]`'s locals are hygienic ------------------------------
+//
+// The rebuild bound each field to a local spelled like the FIELD, so a field
+// named `deserializer` (or any name the expansion itself uses) shadowed the
+// parameter every later read went through: five errors inside code the author
+// never wrote. The locals take the `__` prefix the expansions reserve.
+
+#[test]
+fn b416_a_field_named_like_the_expansions_own_bindings_round_trips() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::wire::Wire;\n",
+            "import std::binary::{ encode_binary, decode_binary };\n",
+            "[derive(Wire)]\n",
+            "struct Tricky {\n",
+            "\tdeserializer: i32,\n",
+            "\tserializer: str,\n",
+            "\trebuilt: i32,\n",
+            "\tvalue: List<i32>,\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet t = Tricky { deserializer = 1, serializer = \"s\", rebuilt = 2, value = [3, 4] };\n",
+            "\tmatch decode_binary<Tricky>(encode_binary(t)) {\n",
+            "\t\tOk(let back) => print(i\"{back.deserializer} {back.serializer} {back.rebuilt} {back.value.len()}\"),\n",
+            "\t\tErr(let error) => print(error),\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "1 s 2 2\n",
+    );
 }
