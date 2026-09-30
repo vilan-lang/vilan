@@ -207,7 +207,9 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         // coverage or `run`-shape error); re-judging its body here as a
         // host-await misuse cascades a false secondary — anchored in std —
         // on top of that primary (E68).
-        if Some(*target) == program.context_run_fn_id {
+        if Some(*target) == program.context_run_fn_id
+            || Some(*target) == program.context_clear_fn_id
+        {
             continue;
         }
         let Some(external) = program.external_functions.get(target) else {
@@ -1789,7 +1791,7 @@ fn extern_violations_at(
     // The `Context::run` intrinsic is not a host boundary — see the direct
     // host-boundary check in `infer` (E68): a surviving `run` call means
     // `thread_contexts` already refused and reported it.
-    if Some(callee) == program.context_run_fn_id {
+    if Some(callee) == program.context_run_fn_id || Some(callee) == program.context_clear_fn_id {
         return;
     }
     let Some(external) = program.external_functions.get(&callee) else {

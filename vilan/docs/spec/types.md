@@ -469,7 +469,9 @@ bounds and so reaches the blanket. The bounds must entail the blanket's,
 arguments included: a blanket over `Src<str>` is not reached through
 `S: Src<i32>`. Through the bound the parameter stays opaque. An inherent
 blanket member is called as written, and the concrete type's own
-same-named inherent member is out of scope there; a trait member the
+same-named inherent member is out of scope there — while at a CONCRETE
+receiver that member outranks the blanket's, whichever was declared or
+loaded first; a trait member the
 blanket provides dispatches at monomorphization to the most specific impl
 of that trait, as every call through a bound does.
 
@@ -539,10 +541,16 @@ therefore reaches `SignalCell`'s own — its fields included — and a
 reassignment must still be a `SignalCell<i32>`.
 
 The reading is universal: any trait name in this position, for every
-trait. It applies to the binding's OWN annotation only — a trait nested
-inside one (`&Display`, `List<Display>`) is a value position like any
-other and is refused, which is what keeps a heterogeneous container
-impossible.
+trait — and it reaches a trait NESTED inside the annotation too (`let b:
+Signal<Option<Signal<i32>>> = …`, `let o: Option<Source<i32>> = …`,
+`List<Display>`, a tuple's element). Each nested mention stands for ONE
+type that implements it, grounded by the initializer: `Signal<Option<
+Signal<i32>>>` reads "some `Signal` of an `Option` of some one
+`Signal<i32>`", and the binding keeps the initializer's concrete type.
+One type per mention is what keeps a heterogeneous container impossible:
+every element of a `List<Source<i32>>` is the same source type, a list
+literal mixing two is refused with the steer to `List<dyn Source<i32>>`,
+and the object is the spelling for values of different types.
 
 An `if` needs no rule of its own. Its arms unify first (§5.11), and the
 constraint meets the one type that unification produced:
@@ -584,12 +592,37 @@ else follows from the desugaring, and nothing about it is new:
   parameters, so the annotation is refused there like any other value
   position.
 
-The reading is the binding's in one respect: it applies to the
-parameter's OWN annotation, never to a trait nested inside one
-(`List<Display>`), which stays refused. A `&` is not such a nesting — it
-is a call convention, erased before the annotation is read — so
-`&Display` is "a view of something implementing `Display`" at a parameter
-and at a binding alike.
+A trait NESTED inside a parameter's annotation is read the same way,
+one implicit generic per mention: `fun total(sources: List<Source<i32>>)`
+is `fun total<S: Source<i32>>(sources: List<S>)`, and `fun first(source:
+Source<List<Source<i32>>>)` has two, the inner bounding the outer's
+argument. Every element of such a list is the same type (`List<dyn
+Source<i32>>` holds different ones). A `&` is not a nesting — it is a
+call convention, erased before the annotation is read — so `&Display` is
+"a view of something implementing `Display`" at a parameter and at a
+binding alike.
+
+### A trait annotation on a return
+
+A free `fun`'s or an inherent method's return annotation takes a trait
+name too, and there it means the **one type the body picks**:
+
+```
+fun counter(start: i32): Source<i32> { SignalCell::new(start) }
+```
+
+The function types exactly as if its return were unannotated — the
+return is the body's own type, per instantiation of a generic function —
+and the annotation asserts that type implements `Source<i32>`, a compile
+error when it does not. Dispatch is static: a caller of `counter` holds a
+`SignalCell<i32>`. The return is **not hidden**: callers see the
+concrete type and may reach its own members (opacity, where callers see
+only the trait, is a later design). Every branch must produce that one
+type, so branches of different types are refused, with the steer to
+`dyn Source<i32>`, the trait object. A TRAIT method's return (declared
+in a trait, or implemented in an `impl … with` block) takes no trait
+name: each impl would pick its own type, which is an associated type
+vilan does not have — it returns `dyn Trait` or a concrete type.
 
 ### A trait annotation on a struct field
 
@@ -612,7 +645,9 @@ embeds one. `dyn Trait` is the value the field wants when what varies is
 the implementation; a written parameter is the answer when one instance
 should keep its concrete type. The refusal is the same on an attributed
 (`[derive(..)]`, `[service(..)]`) declaration, where `dyn Trait` is a
-spelling a generator can read.
+spelling a generator can read, and on a trait NESTED in a field's
+annotation (`List<Display>`), which the binding and parameter readings do
+not reach for the same reason.
 
 ### Associated functions
 
@@ -1145,6 +1180,15 @@ let n = f("abc");                      // 3 — arity and argument types
 An ineligible `fun` has no value form at all, so it can be neither
 stored nor called this way; the error names which rule it hit.
 
+A **tuple variant** named without a call coerces the same way, where a
+closure type is expected: `Some` against `|i32| Option<i32>` is `|x|
+Some(x)`, one parameter per payload, the enum's generics taken from the
+expected type (`[1, 2].map(Some)`, `build(Shape::Rect)` for a `|i32, i32|
+Shape` parameter). Only where a closure is expected — `let f = Some;` has
+no type to take the generics from, and a payload variant named as a value
+anywhere else is refused (call it, `Some(x)`). A unit variant (`None`) is
+already a value and never coerces.
+
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
 
@@ -1450,14 +1494,25 @@ lands, exactly as `(t.0, t.1)` would. The reverse, nested (`List<dyn
 Src>` where `List<Root>` is wanted), is the narrowing, refused one level
 down as at the top.
 
-**Resources.** A `resource` value may not be coerced into a trait object.
-Teardown through a table would make the destructor dynamic where the rest
-of the language keeps it static (memory.md R7/R10), so the coercion is
-refused and the resource is held in a struct field of its own. The rule
-holds at every instantiation: a generic parameter erased into an object
-(`fun erase<S: Src>(own source: S): dyn Src { source }`) is refused at
-the call that binds it to a resource, directly or through a caller that
-forwards its own parameter.
+**Resources.** A resource with a `Drop` anywhere inside it may not be
+coerced into a trait object: teardown through a table would make the
+destructor dynamic where the rest of the language keeps it static
+(memory.md R7/R10), so the coercion is refused and the resource is held
+in a struct field of its own. A resource with NO `Drop` inside has no
+teardown to dispatch, and may become the object of a trait declared
+`[resource]` (`[resource] trait Flow<T> { … }`): such a trait says its
+objects may hold a resource, so `dyn Flow<T>` — whatever landed in it, a
+data value included — is itself a resource, moved and never copied. The
+attribute is the declaring trait's alone: a trait extending a
+`[resource]` trait has data objects unless it declares the attribute
+too. Erasing a `Drop`-free resource into the object
+of an undeclared trait is refused with the steer to declare it; `dyn` of
+an undeclared trait stays data. The rules hold at every instantiation: a
+generic parameter erased into an object (`fun erase<S: Src>(own source:
+S): dyn Src { source }`) is judged at the call that binds it to a
+resource, directly or through a caller that forwards its own parameter.
+Where an `if` or a `match` is expected to produce an object, each arm is
+erased where it lands, so arms of different types meet in the object.
 
 **What reaches an object.** The members its trait and that trait's
 supertraits declare, through the table. Beyond those, only what is written

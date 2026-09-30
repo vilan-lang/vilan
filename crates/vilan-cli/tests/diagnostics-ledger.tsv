@@ -238,7 +238,7 @@ row	flagship	key
 203	flagship	an async closure cannot adapt a trait/generic-dispatched call
 204	flagship	found {found} expected {expected} in {context}; {hint}
 205	flagship	unclosed `{delimiter}` in {production}: expected a matching `{close}`
-206	-	`[resource]` marks a type as a resource: it may label only a `struct` or an `enum` declaration
+206	-	`[resource]` marks a type as a resource: it may label only a `struct`, an `enum` or a `trait` declaration
 207	-	found '{character}' expected a token
 208	-	if this was postfix `!` before a comparison, the space is required: `a! == b`
 209	flagship	{members} form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order
@@ -292,7 +292,7 @@ row	flagship	key
 258	flagship	{label} of `[derive(Json)]` type `{type_name}` is the resource `{rendered}`: a resource is not plain data and cannot be serialized (serializing it would copy it out of its owner); serialize a plain-data projection (an id, a key) instead
 259	flagship	'{trait_name}' is already implemented for '{subject_label}'{elsewhere}; remove or merge this impl
 260	flagship	'{member_name}' is already defined for '{subject_label}'{elsewhere}; remove or rename this one
-261	flagship	cannot move a resource field out of a live aggregate: a resource has one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make the field an `Option` and use `take`
+261	flagship	cannot move a resource field out of a live aggregate: a resource has one owner, and a field moves out only as a destructure — of an aggregate this function owns (`own`), with no `Drop` anywhere inside it; loan it with `&` / `&mut`, or make the field an `Option` and use `take`
 262	flagship	`{name}` is moved on one path through this branch but not another: a resource's end-of-scope ownership must be static; move it on every path, or restructure with `Option` + `take`
 263	flagship	`{name}` is declared outside this loop and moved inside it: the move would repeat on the next iteration; move a value declared inside the loop, or loan `{name}` with `&` / `&mut`
 264	-	cannot move the resource `{name}` out of this function: it is declared `{declared}`, a loan, and a loan changes no ownership; declare it `{owned}` to take ownership, or restructure with `Option` + `take`
@@ -613,3 +613,10 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 588	-	both twins of {label} admit `{host}`, so a build for `{host}` would have two: platform-fenced twins are coherent only when their fences share no platform
 589	-	the {fence} and {fence} twins of {label} must agree on their signature — parameters, return type and generics — or code that calls it would check under one platform and not the other
 590	-	this twin of {label} is fenced {fence} inside a file that declares {fence} — no build compiles it; move the twins to a file that declares no platform
+591	-	the trait default `{name}` is not move-clean when a resource inherits it: {summary}, and a trait default cannot destroy a resource `Self` (its teardown is planned once, before any implementing type is known); move it out on every path, or declare `{name}` in this impl
+592	-	`{rendered}` is a resource, so it can become a `{object_label}` only when `{trait_name}` is declared `[resource]`: mark the trait `[resource]` — its trait objects may hold a resource, and are moved, never copied
+593	-	`clear` must be called on a named context with a closure literal body
+594	-	'{type_label}' does not match the annotation on '{name}', '{annotation_label}': each trait written inside the annotation must be met by ONE type that implements it (values of different types need a trait object there, `dyn …`)
+595	-	`{name}` carries a payload, so it is not a value on its own: call it (`{name}({list})`), or pass it where a closure is expected, where it stands for `|{list}| {name}({list})`
+596	-	'{trait_name}' is a trait, not a type: a TRAIT method cannot return a bare trait yet — each impl would pick its own type, an associated type vilan does not have. Return `dyn {trait_name}` from `{member}` (the object), or a concrete type; a free `fun` or an inherent method may return `{trait_name}` itself
+597	-	'{produced_label}' does not implement trait '{trait_label}', which `{name}` returns: a trait written as a return type is the ONE type the body produces, and it must implement the trait (callers see that type — the return is not hidden)

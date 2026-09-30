@@ -368,15 +368,15 @@ function $X(self, $Y) {
 	let $aa = null;
 	if ($Z[0] === 0) {
 		const turn = $Z[1];
-		$aa = enqueue(turn, self[1].v);
+		$aa = enqueue(turn, __clone(self[1].v));
 	} else {
 		const $ab = $z(draining_turns.v);
 		let $ac = null;
 		if ($ab[0] === 0) {
 			const draining = $ab[1];
-			$ac = enqueue(draining, self[1].v);
+			$ac = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}

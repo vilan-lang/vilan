@@ -216,15 +216,15 @@ function $l(self, $m) {
 	let $o = null;
 	if ($n[0] === 0) {
 		const turn = $n[1];
-		$o = enqueue(turn, self[1].v);
+		$o = enqueue(turn, __clone(self[1].v));
 	} else {
 		const $u = $r(draining_turns.v);
 		let $v = null;
 		if ($u[0] === 0) {
 			const draining = $u[1];
-			$v = enqueue(draining, self[1].v);
+			$v = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}

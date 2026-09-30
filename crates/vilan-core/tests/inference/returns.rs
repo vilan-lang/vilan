@@ -5570,3 +5570,190 @@ fn b369_the_kolt_shape_a_context_carrying_closure_parameter_and_a_slot_impl() {
         "#,
     );
 }
+
+// --- B452: a sibling that lowers to statements keeps its place in the order ---
+//
+// A block, an `if`/`match` in value position, or a `?` lowers to STATEMENTS
+// pushed ahead of the whole expression — so a call argument, a list or tuple
+// element, a struct field or a binary operand written that way ran BEFORE the
+// siblings written ahead of it: `f(say("a"), { print("b"); .. })` printed `b`
+// first. The native backend always kept the order; each shape is pinned here
+// (JS) and in `native_differential`'s B452 probe (both backends agree).
+
+const B452_SAY: &str = r#"
+fun say(label: str, value: i32): i32 {
+    print(label);
+    value
+}
+fun add(a: i32, b: i32): i32 {
+    a + b
+}
+"#;
+
+fn b452_program(main_body: &str) -> String {
+    format!("{B452_SAY}\nfun main() {{\n{main_body}\n}}\n")
+}
+
+#[test]
+fn b452_a_block_argument_runs_after_the_arguments_before_it() {
+    assert_compiles_and_runs(
+        &b452_program(r#"print(add(say("a", 1), { print("b-block"); say("b", 2) }));"#),
+        "a\nb-block\nb\n3\n",
+    );
+}
+
+#[test]
+fn b452_a_block_list_element_runs_after_the_elements_before_it() {
+    assert_compiles_and_runs(
+        &b452_program(
+            r#"let list = [say("x", 1), { print("y-block"); say("y", 2) }];
+            print(list.len());"#,
+        ),
+        "x\ny-block\ny\n2\n",
+    );
+}
+
+#[test]
+fn b452_struct_fields_run_in_the_order_the_literal_writes_them() {
+    // Written `b` then `a`, declared `a` then `b`: the literal's order is the
+    // evaluation order, and the block after `b` runs after it.
+    assert_compiles_and_runs(
+        r#"
+        struct Pair { a: i32, b: i32 }
+        fun say(label: str, value: i32): i32 {
+            print(label);
+            value
+        }
+        fun main() {
+            let p = Pair { b = say("b", 2), a = { print("a-block"); say("a", 1) } };
+            print(p.a * 10 + p.b);
+        }
+        "#,
+        "b\na-block\na\n12\n",
+    );
+}
+
+#[test]
+fn b452_an_if_argument_runs_after_the_arguments_before_it() {
+    assert_compiles_and_runs(
+        &b452_program(
+            r#"let c = true;
+            print(add(say("a", 1), if c { print("b-if"); say("b", 2) } else { 0 }));"#,
+        ),
+        "a\nb-if\nb\n3\n",
+    );
+}
+
+#[test]
+fn b452_a_match_argument_runs_after_the_arguments_before_it() {
+    assert_compiles_and_runs(
+        &b452_program(
+            r#"print(add(say("m", 1), match Some(2) {
+                Some(let v) => {
+                    print("n-match");
+                    say("n", v)
+                },
+                None => 0,
+            }));"#,
+        ),
+        "m\nn-match\nn\n3\n",
+    );
+}
+
+#[test]
+fn b452_a_mut_binding_read_before_a_block_that_writes_it_keeps_its_old_value() {
+    // `x` is read first, so it is 1 — the block's write lands after the read.
+    assert_compiles_and_runs(
+        &b452_program(
+            r#"mut x = 1;
+            print(add(x, { x = 10; x }));"#,
+        ),
+        "11\n",
+    );
+}
+
+#[test]
+fn b452_a_block_right_operand_runs_after_the_left_operand() {
+    assert_compiles_and_runs(
+        &b452_program(r#"print(say("l", 1) + { print("r-block"); say("r", 2) });"#),
+        "l\nr-block\nr\n3\n",
+    );
+}
+
+#[test]
+fn b452_a_block_tuple_element_runs_after_the_elements_before_it() {
+    assert_compiles_and_runs(
+        &b452_program(
+            r#"let t = (say("p", 1), { print("q-block"); say("q", 2) });
+            print(t.0 + t.1);"#,
+        ),
+        "p\nq-block\nq\n3\n",
+    );
+}
+
+#[test]
+fn b452_a_method_receiver_runs_before_a_block_argument() {
+    assert_compiles_and_runs(
+        r#"
+        struct Acc { n: i32 }
+        impl Acc {
+            fun plus(self, k: i32): i32 { self.n + k }
+        }
+        fun make(label: str): Acc {
+            print(label);
+            Acc { n = 100 }
+        }
+        fun main() {
+            print(make("recv").plus({ print("arg-block"); 1 }));
+        }
+        "#,
+        "recv\narg-block\n101\n",
+    );
+}
+
+#[test]
+fn b452_nested_siblings_keep_their_order_at_every_level() {
+    assert_compiles_and_runs(
+        r#"
+        fun say(label: str, value: i32): i32 {
+            print(label);
+            value
+        }
+        fun first(list: List<i32>): i32 { list[0] }
+        fun main() {
+            let nested = [
+                say("o1", 1),
+                first([say("i1", 1), { print("i2-block"); say("i2", 2) }]),
+                { print("o3-block"); say("o3", 3) },
+            ];
+            print(nested.len());
+        }
+        "#,
+        "o1\ni1\ni2-block\ni2\no3-block\no3\n3\n",
+    );
+}
+
+#[test]
+fn b452_a_resource_temporary_in_an_earlier_argument_still_drops_after_its_statement() {
+    // The temporary's `finally` must still close over the whole statement when
+    // a later argument's statements are spliced in after it (C11).
+    assert_compiles_and_runs(
+        r#"
+        import std::drop::Drop;
+        [resource] struct R { n: i32 }
+        impl R with Drop {
+            fun drop(&mut self) { print(i"drop {self.n}"); }
+        }
+        fun make(n: i32): R {
+            print(i"make {n}");
+            R { n = n }
+        }
+        fun peek(r: &R, k: i32): i32 { r.n + k }
+        fun main() {
+            print(peek(&make(5), { print("blk"); 3 }) + peek(&make(7), { print("blk2"); 4 }));
+            print("end");
+        }
+        "#,
+        "make 5\nblk\nmake 7\nblk2\n19\ndrop 7\ndrop 5\nend\n",
+    );
+}

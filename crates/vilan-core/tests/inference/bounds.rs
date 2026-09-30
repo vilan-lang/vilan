@@ -1872,6 +1872,212 @@ fn get_safe_survives_await_and_stored_closures() {
     );
 }
 
+// --- B458: `Context::clear` — `run`'s inverse -----------------------------
+//
+// For the dynamic extent of `body` the context is NOT established: a strict
+// `get` inside is the coverage refusal a `get` outside every `run` is (its
+// trace names the `clear`), `get_safe` answers `None`, a closure created
+// inside captures the cleared state, and a `run` inside re-establishes.
+
+const B458_HEAD: &str = r#"
+import std::io::print;
+import std::context::Context;
+import std::option::Option::{ Some, None };
+
+let current: Context<i32> = Context::new();
+
+fun describe(): str {
+    match current.get_safe() {
+        Some(let value) => i"some {value}",
+        None => "none",
+    }
+}
+"#;
+
+fn b458_program(main_body: &str) -> String {
+    format!("{B458_HEAD}\nfun main() {{\n{main_body}\n}}\nmain();\n")
+}
+
+#[test]
+fn b458_get_safe_inside_clear_answers_none_under_a_run() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"current.run(7, || {
+                print(describe());
+                current.clear(|| {
+                    print(describe());
+                });
+                print(describe());
+            });"#,
+        ),
+        "some 7\nnone\nsome 7\n",
+    );
+}
+
+#[test]
+fn b458_a_get_safe_read_directly_in_the_clear_body_is_none() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"current.run(7, || {
+                current.clear(|| {
+                    match current.get_safe() {
+                        Some(let value) => print(i"leaked {value}"),
+                        None => print("cleared"),
+                    }
+                });
+            });"#,
+        ),
+        "cleared\n",
+    );
+}
+
+#[test]
+fn b458_clear_yields_its_body_value() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"let answer = current.run(7, || current.clear(|| 3) + 1);
+            print(answer);"#,
+        ),
+        "4\n",
+    );
+}
+
+#[test]
+fn b458_a_run_inside_clear_re_establishes_the_context() {
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"current.run(1, || {
+                current.clear(|| {
+                    current.run(2, || {
+                        print(current.get());
+                        print(describe());
+                    });
+                    print(describe());
+                });
+            });"#,
+        ),
+        "2\nsome 2\nnone\n",
+    );
+}
+
+#[test]
+fn b458_a_closure_created_inside_clear_captures_the_cleared_state() {
+    // Minted inside a `run`, invoked after it: without `clear` it would
+    // answer `some 5` (the captured value); inside `clear` it has none.
+    assert_compiles_and_runs(
+        &b458_program(
+            r#"mut stored: List<|| void> = [];
+            current.run(5, || {
+                stored.push(|| print(describe()));
+                current.clear(|| {
+                    stored.push(|| print(describe()));
+                });
+            });
+            for callback in stored {
+                callback();
+            }"#,
+        ),
+        "some 5\nnone\n",
+    );
+}
+
+#[test]
+fn b458_another_context_is_untouched_by_clear() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::context::Context;
+        import std::option::Option::{ Some, None };
+
+        let first: Context<i32> = Context::new();
+        let second: Context<str> = Context::new();
+
+        fun main() {
+            first.run(1, || {
+                second.run("kept", || {
+                    first.clear(|| {
+                        print(second.get());
+                        print(first.get_safe().is_none());
+                    });
+                });
+            });
+        }
+        main();
+        "#,
+        "kept\ntrue\n",
+    );
+}
+
+#[test]
+fn b458_a_strict_get_inside_clear_is_the_coverage_refusal_naming_the_clear() {
+    let source = b458_program(
+        r#"current.run(7, || {
+            current.clear(|| {
+                print(current.get());
+            });
+        });"#,
+    );
+    assert_traces(
+        &source,
+        "context `current` is read here, but this code can be reached without an enclosing `run`",
+        &[(
+            "clear",
+            0,
+            "`current.clear(..)` runs this body with the context not established",
+        )],
+    );
+}
+
+#[test]
+fn b458_a_strict_reader_called_from_clear_is_refused_through_the_call() {
+    let source = format!(
+        "{B458_HEAD}{}",
+        r#"
+fun strict_read(): i32 {
+    current.get()
+}
+
+fun main() {
+    current.run(7, || {
+        current.clear(|| {
+            print(strict_read());
+        });
+    });
+}
+main();
+"#
+    );
+    assert_traces(
+        &source,
+        "context `current` is read here, but this code can be reached without an enclosing `run`",
+        &[
+            (
+                "clear",
+                0,
+                "`current.clear(..)` runs this body with the context not established",
+            ),
+            (
+                "strict_read()",
+                1,
+                "the context requirement flows through this call",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn b458_a_closure_value_body_is_refused() {
+    assert_fails_with(
+        &b458_program(
+            r#"let body = || print(describe());
+            current.run(7, || {
+                current.clear(body);
+            });"#,
+        ),
+        "`clear` must be called on a named context with a closure literal body",
+    );
+}
+
 #[test]
 fn the_strict_fence_is_unchanged_by_get_safe() {
     // A strict `get` on an uncovered path still errors, even in a program

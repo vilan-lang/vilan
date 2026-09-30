@@ -5904,9 +5904,10 @@ fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
     // annotation that RESOLVED, to a trait, in value position (§12.2). A RETURN
     // since B184 — the parameter this was written on became B186's implicit
     // generic and the field became B184's hidden parameter, so the return is
-    // the nearest position that still refuses.
+    // the nearest position that still refuses. B460 made a bare RETURN the
+    // callee's one type, so the refusal is read one level in (`Option<Shape>`).
     const ALPHA: &str = "trait Shape {\n\tfun area(&self): i32;\n}\n\nfun shape(): \
-                         Shape {\n\t0\n}\n\nfun size(): i32 {\n\t0\n}\n";
+                         Option<Shape> {\n\tNone\n}\n\nfun size(): i32 {\n\t0\n}\n";
     let outcome = analyze_package(
         &[
             (
@@ -5922,7 +5923,7 @@ fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
         .iter()
         .find(|(message, _, _)| message.contains("'Shape' is a trait, not a type"))
         .expect("the bare trait in value position is refused");
-    let start = ALPHA.find("shape(): Shape").unwrap() + "shape(): ".len();
+    let start = ALPHA.find("shape(): Option<Shape>").unwrap() + "shape(): Option<".len();
     assert_eq!(
         (file.as_deref(), span.clone()),
         (Some("alpha.vl"), start..start + "Shape".len()),

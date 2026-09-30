@@ -415,26 +415,28 @@ fn a_bounded_generic_satisfies_a_trait_annotation() {
 // --- B161: NARROWED, not repealed — every other position still refuses ---
 
 #[test]
-fn a_trait_nested_in_a_binding_annotation_is_still_refused() {
-    // §12.2's silently heterogeneous `List<Trait>`: the constraint reading is
-    // the binding's OWN annotation, not any trait spelled anywhere under it.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun main() {{
-                let pack: List<Greet> = [Dog {{ name = "a" }}];
-                print(pack.length());
-            }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
+fn a_trait_nested_in_a_binding_annotation_is_one_type() {
+    // §12.2's silently heterogeneous `List<Trait>` was why this was refused.
+    // B461 reads the nested trait as ONE type implementing it, grounded by the
+    // initializer — a homogeneous pack compiles; a mixed one is refused with
+    // the steer to the object (`b461_*`).
+    assert_compiles(&format!(
+        r#"{GREET}
+        fun main() {{
+            let pack: List<Greet> = [Dog {{ name = "a" }}];
+            print(pack.len());
+        }}
+        main();
+        "#
+    ));
 }
 
 #[test]
-fn a_trait_in_return_position_is_still_refused() {
-    assert_fails_with(
+fn a_trait_in_return_position_is_the_callees_one_type() {
+    // B460 (RULED 2026-09-29, door (i)) reverses B253: the callee picks ONE
+    // type, and the caller sees it — the return is NOT hidden, so the concrete
+    // type's own field reads through (opacity is a later slice).
+    assert_compiles_and_runs(
         &format!(
             r#"{GREET}
             fun get(): Greet {{ Dog {{ name = "rex" }} }}
@@ -442,7 +444,7 @@ fn a_trait_in_return_position_is_still_refused() {
             main();
             "#
         ),
-        "'Greet' is a trait, not a type",
+        "rex\n",
     );
 }
 
@@ -1157,8 +1159,8 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
     assert_fails_with(
         &format!(
             r#"{GREET}
-            fun get(): Greet {{ Dog {{ name = "rex" }} }}
-            fun main() {{ print(get().name); }}
+            fun get(): Option<Greet> {{ Some(Dog {{ name = "rex" }}) }}
+            fun main() {{ print(get().unwrap().name); }}
             main();
             "#
         ),
@@ -1168,21 +1170,9 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
     // withdrew the hidden parameter at that position — so a field is a refusal
     // again, steered to `dyn Greet` rather than to the sugar
     // (`b184_a_trait_at_a_struct_field_is_refused_and_steers_to_dyn`). The
-    // parameter leg left with B186 and stays gone. What this pins is the
-    // return, the nested spelling, and the CLOSURE parameter — the position
-    // that has no generic list to append to.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun main() {{
-                let pack: List<Greet> = [Dog {{ name = "a" }}];
-                print(pack.length());
-            }}
-            main();
-            "#
-        ),
-        steer,
-    );
+    // parameter leg left with B186 and stays gone, and the nested `let` leg
+    // left with B461. What this pins is the return and the CLOSURE parameter
+    // — the position that has no generic list to append to.
     assert_fails_with(
         &format!(
             r#"{GREET}
@@ -1198,20 +1188,17 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
 }
 
 #[test]
-fn b186_a_nested_trait_spelling_on_a_parameter_is_still_refused() {
-    // The sugar is the parameter's OWN annotation, not any trait spelled
-    // under it — `List<Greet>` mints an inner type id the sugar never sees,
-    // exactly as B161's nested case does.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun describe(pack: List<Greet>): i32 {{ pack.length() }}
-            fun main() {{ print(describe([Dog {{ name = "a" }}])); }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
+fn b186_a_nested_trait_spelling_on_a_parameter_mints_its_own_generic() {
+    // B461: the sugar reaches a trait spelled UNDER the parameter's annotation
+    // too — `List<Greet>` reads `<G: Greet> … List<G>`, one generic per
+    // mention.
+    assert_compiles(&format!(
+        r#"{GREET}
+        fun describe(pack: List<Greet>): usize {{ pack.len() }}
+        fun main() {{ print(describe([Dog {{ name = "a" }}])); }}
+        main();
+        "#
+    ));
 }
 
 #[test]
@@ -2295,13 +2282,17 @@ fn b252_a_refused_return_annotation_does_not_cascade_through_its_uses() {
     // refusal restated in the vocabulary of a type the author never wrote.
     let source = format!(
         r#"{GREET}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().greet());
+            print(Shelter {{ n = 1 }}.pick().greet());
         }}
         main();
         "#
     );
+    // B460 made a free fun's bare-trait return a reading; a TRAIT method's is
+    // the return that is still refused, and it is what this family reads now.
     assert_fails_once_with(&source, "'Greet' is a trait, not a type");
     assert_fails_without(&source, "on unknown");
     let diagnostics = failure_diagnostics(&source);
@@ -2319,9 +2310,11 @@ fn b252_a_field_read_through_a_refused_return_stands_down_as_well() {
     // answers for both halves at once.
     let source = format!(
         r#"{GREET}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().name);
+            print(Shelter {{ n = 1 }}.pick().name);
         }}
         main();
         "#
@@ -2347,9 +2340,11 @@ fn b252_an_unrelated_unknown_still_reports_beside_a_refused_return() {
         r#"{GREET}
         struct Holder<T> {{ v: T }}
         struct Other {{ held: Holder }}
-        fun pick(): Greet {{ Dog {{ name = "rex" }} }}
+        trait Picker {{ fun pick(self): Greet {{ Dog {{ name = "rex" }} }} }}
+        struct Shelter {{ n: i32 }}
+        impl Shelter with Picker {{}}
         fun main() {{
-            print(pick().greet());
+            print(Shelter {{ n = 1 }}.pick().greet());
             let other = Other {{ held = 1 }};
             print(other.held.length());
         }}
@@ -4699,27 +4694,101 @@ fn a86_two_blankets_bounded_the_same_way_still_collide() {
 }
 
 #[test]
-fn a86_a_blanket_and_a_constructor_headed_impl_still_collide() {
+fn a86_a_blanket_and_a_constructor_headed_impl_are_ranked() {
     // The other control: the bounds clause reaches BARE binders only. A
-    // blanket against a concrete subject is the overlap B73 named, and it is
-    // still refused.
-    assert_fails_with(
+    // blanket beside a concrete subject it claims was B73's overlap and was
+    // refused — but only in THIS declaration order (the blanket first); the
+    // other order compiled and the call took whichever block came first.
+    // B456 (RULED 2026-09-29, door (b)) ranks the pair in both orders: the
+    // concrete subject's member outranks the blanket's at a concrete
+    // receiver, and the blanket answers every other `Read`.
+    assert_compiles_and_runs(
         r#"
         trait Read<T> { fun get(self): T; }
         struct Cell<T> { value: T }
         impl Cell<type T> with Read<T> {
             fun get(self): T { self.value }
         }
+        struct Boxed<T> { value: T }
+        impl Boxed<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
 
         impl type S: Read<type T> {
-            fun peek(self): T { self.get() }
+            fun peek(self): T { print("blanket"); self.get() }
         }
         impl Cell<type T> {
-            fun peek(self): T { self.value }
+            fun peek(self): T { print("concrete"); self.value }
         }
 
-        fun main() { }
+        fun main() {
+            print(Cell { value = 1 }.peek());
+            print(Boxed { value = 2 }.peek());
+        }
         "#,
+        "concrete\n1\nblanket\n2\n",
+    );
+}
+
+/// B456 (RULED 2026-09-29, door (b)): a blanket and a concrete subject it
+/// claims share a name in EITHER declaration order, with one answer: the
+/// concrete member at a concrete receiver, the blanket's for every other type
+/// and through a bound. The same program is run in both orders.
+const B456_HEAD: &str = r#"
+trait Read<T> { fun get(self): T; }
+struct Cell<T> { value: T }
+impl Cell<type T> with Read<T> {
+    fun get(self): T { self.value }
+}
+struct Boxed<T> { value: T }
+impl Boxed<type T> with Read<T> {
+    fun get(self): T { self.value }
+}
+"#;
+const B456_CONCRETE: &str = r#"
+impl Cell<type T> {
+    fun peek(self): str { "concrete" }
+}
+"#;
+const B456_BLANKET: &str = r#"
+impl type S: Read<type T> {
+    fun peek(self): str { "blanket" }
+}
+"#;
+const B456_MAIN: &str = r#"
+fun through<S: Read<i32>>(source: S): str { source.peek() }
+fun main() {
+    print(Cell { value = 1 }.peek());
+    print(Boxed { value = 2 }.peek());
+    print(through(Cell { value = 3 }));
+}
+"#;
+
+#[test]
+fn b456_the_concrete_block_declared_first_is_ranked() {
+    assert_compiles_and_runs(
+        &format!("{B456_HEAD}{B456_CONCRETE}{B456_BLANKET}{B456_MAIN}"),
+        "concrete\nblanket\nblanket\n",
+    );
+}
+
+#[test]
+fn b456_the_blanket_declared_first_is_ranked_the_same() {
+    // Refused as "already defined" before the ruling.
+    assert_compiles_and_runs(
+        &format!("{B456_HEAD}{B456_BLANKET}{B456_CONCRETE}{B456_MAIN}"),
+        "concrete\nblanket\nblanket\n",
+    );
+}
+
+#[test]
+fn b456_two_concrete_blocks_still_collide() {
+    // The ranking is for a blanket beside a constructor-headed subject; two
+    // constructor-headed blocks declaring one name are still a duplicate.
+    assert_fails_with(
+        &format!(
+            "{B456_HEAD}{B456_CONCRETE}\nimpl Cell<i32> {{\n    fun peek(self): str {{ \"again\" }}\n}}\nfun main() {{}}\n"
+        ),
         "'peek' is already defined for",
     );
 }
@@ -7722,4 +7791,298 @@ fn b417_a_method_named_self_is_refused_where_it_is_declared() {
         "#,
         "cannot access field",
     );
+}
+
+// --- B461: a bare trait NESTED in an annotation --------------------------------
+//
+// Each nested mention reads as its position reads a top-level one: at a
+// parameter an implicit generic of the function (B186), at a `let` an
+// existential the initializer grounds (B161). ONE type per mention — a mixed
+// list is `List<dyn Trait>`, and the refusal says so. A field keeps A124 R3's
+// refusal (a trait at a field is the object).
+
+#[test]
+fn b461_the_owners_let_with_a_nested_signal_compiles_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        fun main() {
+            let b: Signal<Option<Signal<i32>>> = SignalCell::new(Some(SignalCell::new(4)));
+            print(b.get().unwrap().get());
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b461_a_let_with_a_concrete_outer_and_a_nested_trait_grounds_from_its_initializer() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let o: Option<Source<i32>> = Some(SignalCell::new(5));
+            print(o.unwrap().get());
+            let pair: (Source<i32>, str) = (SignalCell::new(6), "x");
+            print(pair.0.get());
+        }
+        "#,
+        "5\n6\n",
+    );
+}
+
+#[test]
+fn b461_nested_traits_at_a_parameter_each_mint_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun total(sources: List<Source<i32>>): i32 {
+            mut sum = 0;
+            for source in sources {
+                sum = sum + source.get();
+            }
+            sum
+        }
+        fun first(source: Source<List<Source<i32>>>): i32 {
+            source.get()[0].get()
+        }
+        fun both(left: List<Source<i32>>, right: List<Source<i32>>): i32 {
+            total(left) + total(right)
+        }
+        fun main() {
+            print(total([SignalCell::new(1), SignalCell::new(2)]));
+            print(first(SignalCell::new([SignalCell::new(9)])));
+            print(both([SignalCell::new(1)], [SignalCell::new(2).map(|x| x * 10)]));
+        }
+        "#,
+        "3\n9\n21\n",
+    );
+}
+
+#[test]
+fn b461_a_mixed_literal_at_a_let_steers_to_the_object() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let mixed: List<Source<i32>> = [SignalCell::new(1), SignalCell::new(2).map(|x| x)];
+            print(mixed.len());
+        }
+        "#,
+        "The elements' type was written `Source<i32>`, a trait: written inside a type it stands \
+         for ONE type that implements it, so every element must be that type; for elements of \
+         different types write `dyn Source<i32>` there",
+    );
+}
+
+#[test]
+fn b461_a_mixed_literal_at_a_parameter_steers_to_the_object() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun count(sources: List<Source<i32>>): usize { sources.len() }
+        fun main() {
+            print(count([SignalCell::new(1), SignalCell::new(2).map(|x| x)]));
+        }
+        "#,
+        "for elements of different types write `dyn Source<i32>` there",
+    );
+}
+
+#[test]
+fn b461_a_let_whose_value_does_not_meet_the_nested_trait_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::Source;
+        fun main() {
+            let o: Option<Source<i32>> = Some(5);
+        }
+        "#,
+        "'Option<i32>' does not match the annotation on 'o'",
+    );
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        fun main() {
+            let b: Signal<Option<Signal<i32>>> = SignalCell::new(Some(5));
+        }
+        "#,
+        "'SignalCell<Option<i32>>' does not implement trait",
+    );
+}
+
+// --- B460: a bare trait in return position (RULED 2026-09-29, R-a door (i)) ---
+//
+// On a free `fun` or an inherent method the callee picks ONE concrete type — the
+// body's — checked to implement the trait and statically dispatched; the call
+// types as that concrete type per instantiation (B161's "checked wide, kept
+// narrow" applied to returns: NOT hidden, opacity is a later slice). Branches
+// that disagree are steered to `dyn`; a trait method's return stays refused.
+
+const B460_SHAPES: &str = r#"
+import std::reactive::{ Source, SignalCell };
+trait Shape {
+    fun area(self): i32;
+}
+struct Square { side: i32 }
+impl Square with Shape {
+    fun area(self): i32 { self.side * self.side }
+}
+struct Circle { r: i32 }
+impl Circle with Shape {
+    fun area(self): i32 { 3 * self.r * self.r }
+}
+"#;
+
+fn b460_program(rest: &str) -> String {
+    format!("{B460_SHAPES}\n{rest}")
+}
+
+#[test]
+fn b460_a_free_fun_returns_the_one_type_its_body_picks() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun make(side: i32): Shape { Square { side = side } }
+            fun counter(start: i32): Source<i32> { SignalCell::new(start) }
+            fun main() {
+                print(make(3).area());
+                print(counter(4).get());
+                // Not hidden: the caller sees `Square`.
+                print(make(2).side);
+            }
+            "#,
+        ),
+        "9\n4\n2\n",
+    );
+}
+
+#[test]
+fn b460_a_generic_fun_and_an_inherent_method_pick_per_instantiation() {
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun wrap<T>(value: T): Source<T> { SignalCell::new(value) }
+            struct Model { base: i32 }
+            impl Model {
+                fun doubled(self): Source<i32> { SignalCell::new(self.base * 2) }
+            }
+            fun main() {
+                print(wrap("x").get());
+                print(wrap(7).get());
+                print(Model { base = 5 }.doubled().get());
+            }
+            "#,
+        ),
+        "x\n7\n10\n",
+    );
+}
+
+#[test]
+fn b460_branches_of_two_types_steer_to_the_object() {
+    assert_fails_with(
+        &b460_program(
+            r#"
+            fun pick(square: bool): Shape {
+                if square { Square { side = 1 } } else { Circle { r = 1 } }
+            }
+            fun main() {}
+            "#,
+        ),
+        "`pick` returns `Shape`, a trait: that is ONE type the body picks, so every branch must \
+         produce it; for branches of different types return `dyn Shape`",
+    );
+    // ...and the object is the spelling that works.
+    assert_compiles_and_runs(
+        &b460_program(
+            r#"
+            fun pick(square: bool): dyn Shape {
+                if square { Square { side = 2 } } else { Circle { r = 1 } }
+            }
+            fun main() {
+                print(pick(true).area() + pick(false).area());
+            }
+            "#,
+        ),
+        "7\n",
+    );
+}
+
+#[test]
+fn b460_a_body_that_does_not_implement_the_trait_is_refused() {
+    assert_fails_with(
+        &b460_program("fun wrong(): Shape { 5 }\nfun main() {}\n"),
+        "'i32' does not implement trait 'Shape', which `wrong` returns: a trait written as a \
+         return type is the ONE type the body produces",
+    );
+}
+
+#[test]
+fn b460_a_trait_methods_bare_trait_return_stays_refused() {
+    let steer = "a TRAIT method cannot return a bare trait yet";
+    assert_fails_with(
+        &b460_program("trait Maker {\n    fun make(self): Shape;\n}\nfun main() {}\n"),
+        steer,
+    );
+    assert_fails_with(
+        &b460_program(
+            "trait Maker {\n    fun make(self): Square;\n}\nstruct Factory { n: i32 }\n\
+             impl Factory with Maker {\n    fun make(self): Shape { Square { side = 1 } }\n}\n\
+             fun main() {}\n",
+        ),
+        steer,
+    );
+}
+
+// --- A142 §3.3: a read on a pipe steers to sealing (Order 44, item 12) ------
+//
+// A PLACEHOLDER fixture: the pipe layer is reactive-44's, so the traits are
+// local here and read BY NAME (`Pipe`, `Source`) — the steer's wording and the
+// std names are pinned against reactive-44's after the rebase.
+
+const PIPE_STEER_FIXTURE: &str = "
+trait Source<T> {
+    fun get(self): T;
+}
+trait Pipe<T> {
+    fun memo(own self): i32 { 0 }
+}
+[resource]
+struct Doubled { n: i32 }
+impl Doubled with Pipe<i32> {}
+struct Plain { n: i32 }
+";
+
+#[test]
+fn a_read_on_a_pipe_steers_to_sealing_or_sampling() {
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Doubled {{ n = 1 }};\n    print(p.get());\n}}\n"
+    );
+    assert_fails_with(
+        &source,
+        "Doubled has no method 'get'; a pipe has no `get`: seal it with `.memo()`, or read it \
+         once with `.sample()`",
+    );
+}
+
+#[test]
+fn a_missing_member_on_a_non_pipe_keeps_its_ordinary_message() {
+    // The control: the steer is for a PIPE's read — a type that is no pipe,
+    // asked for the same member, keeps the plain message.
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Plain {{ n = 1 }};\n    print(p.get());\n}}\n"
+    );
+    assert_fails_with(&source, "Plain has no method 'get'");
+    assert_fails_without(&source, "a pipe has no");
+}
+
+#[test]
+fn a_pipe_asked_for_a_member_no_source_declares_keeps_its_ordinary_message() {
+    // The steer names a READ: a member the source trait does not declare is
+    // an ordinary miss on a pipe too.
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Doubled {{ n = 1 }};\n    print(p.frob());\n}}\n"
+    );
+    assert_fails_with(&source, "Doubled has no method 'frob'");
+    assert_fails_without(&source, "a pipe has no");
 }

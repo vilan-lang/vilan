@@ -250,11 +250,16 @@ fun main() {
 /// which is the last point at which the destructor is still known. Without it,
 /// "a `dyn` is never a resource" would be §2.2's destructor suppression
 /// wearing a keyword.
+///
+/// B470 (RULED 2026-09-29) narrows it to a resource with a `Drop` inside; a
+/// `Drop`-free one is steered to a `[resource] trait` (pinned below).
 #[test]
 fn a_resource_cannot_be_erased() {
     assert_fails_with(
-        "trait Shown { fun get(self): i32; }
+        "import std::drop::Drop;
+trait Shown { fun get(self): i32; }
 [resource] struct Handle { v: i32 }
+impl Handle with Drop { fun drop(&mut self) {} }
 impl Handle with Shown { fun get(self): i32 { self.v } }
 fun main() { let h = Handle { v = 1 }; let x: dyn Shown = h; print(i\"{x.get()}\"); }
 ",
@@ -1299,10 +1304,14 @@ fn b430_a_tuple_value_erases_elementwise_at_a_mapped_position() {
 // the resource's teardown. Refused at the call that binds it, directly or
 // through a caller forwarding its own parameter.
 
+// B470: `Handle` carries a `Drop`, so its erasure keeps Q5's refusal; the
+// `Drop`-free twins are pinned below.
 const B431_HEAD: &str = concat!(
     "import std::io::print;\n",
+    "import std::drop::Drop;\n",
     "trait Src { fun get(self): i32; }\n",
     "[resource] struct Handle { n: i32 }\n",
+    "impl Handle with Drop { fun drop(&mut self) {} }\n",
     "impl Handle with Src { fun get(self): i32 { self.n } }\n",
     "struct Plain { n: i32 }\n",
     "impl Plain with Src { fun get(self): i32 { self.n } }\n",
@@ -1375,4 +1384,242 @@ fn b435_a_written_type_argument_on_a_method_erases_the_closures_result() {
         ),
         "3\n2\n",
     );
+}
+
+// --- B470: a `Drop`-free resource into the object of a `[resource] trait` ----
+//
+// RULED 2026-09-29: move-only-ness of a trait object is DECLARED. `dyn T` is
+// a resource exactly when `T` (or a trait it extends) is `[resource]`; a
+// resource with no `Drop` anywhere inside may be erased only into such a
+// trait's object (else the steer to declare it); a resource with a `Drop`
+// inside stays refused with the message it always had.
+
+const B470_HEAD: &str = r#"
+import std::drop::Drop;
+
+[resource]
+trait Run {
+    fun run(own self): i32;
+}
+
+[resource]
+struct Node { v: i32 }
+
+impl Node with Run {
+    fun run(own self): i32 { self.v + 1 }
+}
+
+struct Plain { v: i32 }
+
+impl Plain with Run {
+    fun run(own self): i32 { self.v * 10 }
+}
+"#;
+
+fn b470_program(rest: &str) -> String {
+    format!("{B470_HEAD}\n{rest}")
+}
+
+#[test]
+fn b470_a_drop_free_resource_becomes_a_resource_traits_object_and_moves() {
+    assert_compiles_and_runs(
+        &b470_program(
+            r#"
+            fun pick(on: bool): dyn Run {
+                if on {
+                    Node { v = 1 }
+                } else {
+                    Plain { v = 2 }
+                }
+            }
+            fun main() {
+                print(pick(true).run());
+                print(pick(false).run());
+            }
+            "#,
+        ),
+        "2\n20\n",
+    );
+}
+
+#[test]
+fn b470_a_resource_traits_object_is_move_only() {
+    // Whatever landed in it — here a DATA value — the object is moved.
+    assert_fails_with(
+        &b470_program(
+            r#"
+            fun main() {
+                let object: dyn Run = Plain { v = 2 };
+                let first = object;
+                let second = object;
+            }
+            "#,
+        ),
+        "use of `object` after it was moved: a resource has a single owner",
+    );
+}
+
+#[test]
+fn b470_a_resource_with_a_drop_inside_is_still_refused() {
+    assert_fails_with(
+        &b470_program(
+            r#"
+            [resource]
+            struct Held { n: i32 }
+            impl Held with Drop {
+                fun drop(&mut self) {}
+            }
+            impl Held with Run {
+                fun run(own self): i32 { 0 }
+            }
+            fun main() {
+                let object: dyn Run = Held { n = 1 };
+            }
+            "#,
+        ),
+        "`Held` is a resource, so it cannot become a `dyn Run`: a trait object's teardown would \
+         have to be dispatched through its table",
+    );
+}
+
+#[test]
+fn b470_a_drop_free_resource_into_an_undeclared_traits_object_is_steered() {
+    assert_fails_with(
+        r#"
+        trait Plainly {
+            fun value(self): i32;
+        }
+        [resource]
+        struct Node { v: i32 }
+        impl Node with Plainly {
+            fun value(self): i32 { self.v }
+        }
+        fun main() {
+            let object: dyn Plainly = Node { v = 1 };
+        }
+        "#,
+        "`Node` is a resource, so it can become a `dyn Plainly` only when `Plainly` is declared \
+         `[resource]`: mark the trait `[resource]`",
+    );
+}
+
+#[test]
+fn b470_the_attribute_is_the_declaring_traits_alone() {
+    // Not inherited (the integrator's correction, 2026-09-29): a subtrait of
+    // a `[resource]` trait has data objects unless it declares the attribute
+    // itself — its `dyn` copies freely, and cannot receive a resource.
+    let subtrait = r#"
+        trait Labelled with Run {
+            fun label(self): str;
+        }
+        impl Plain with Labelled {
+            fun label(self): str { "plain" }
+        }
+    "#;
+    assert_compiles_and_runs(
+        &b470_program(&format!(
+            "{subtrait}\nfun main() {{\n    let object: dyn Labelled = Plain {{ v = 2 }};\n    \
+             let first = object;\n    let second = object;\n    print(first.label() + second.label());\n}}\n"
+        )),
+        "plainplain\n",
+    );
+    assert_fails_with(
+        &b470_program(&format!(
+            "{subtrait}\nimpl Node with Labelled {{\n    fun label(self): str {{ \"node\" }}\n}}\n\
+             fun main() {{\n    let object: dyn Labelled = Node {{ v = 1 }};\n}}\n"
+        )),
+        "`Node` is a resource, so it can become a `dyn Labelled` only when `Labelled` is declared \
+         `[resource]`",
+    );
+    // The declared supertrait's object stays move-only.
+    assert_fails_with(
+        &b470_program(
+            "fun main() {\n    let object: dyn Run = Plain { v = 2 };\n    let first = object;\n    \
+             let second = object;\n}\n",
+        ),
+        "use of `object` after it was moved",
+    );
+}
+
+#[test]
+fn b470_an_undeclared_traits_object_stays_data() {
+    // The control: `dyn` of a trait nobody declared `[resource]` copies freely.
+    assert_compiles_and_runs(
+        r#"
+        trait Show {
+            fun show(self): str;
+        }
+        struct Plain { v: i32 }
+        impl Plain with Show {
+            fun show(self): str { i"{self.v}" }
+        }
+        fun main() {
+            let object: dyn Show = Plain { v = 2 };
+            let first = object;
+            let second = object;
+            print(first.show() + second.show());
+        }
+        "#,
+        "22\n",
+    );
+}
+
+#[test]
+fn b470_a_pipe_selector_with_arms_of_two_types_returns_the_object() {
+    // A142's mixed-arm selector, cut down: a `[resource]` node and a data root
+    // behind one `[resource] trait` object, started once each.
+    assert_compiles_and_runs(
+        r#"
+        [resource]
+        trait Flow {
+            fun start(own self, react: |i32| void);
+        }
+        struct Root { v: i32 }
+        impl Root with Flow {
+            fun start(own self, react: |i32| void) { react(self.v); }
+        }
+        [resource]
+        struct Doubled { up: Root }
+        impl Doubled with Flow {
+            fun start(own self, react: |i32| void) {
+                self.up.start(|v| react(v * 2));
+            }
+        }
+        fun select(doubled: bool, root: Root): dyn Flow {
+            if doubled {
+                Doubled { up = root }
+            } else {
+                root
+            }
+        }
+        fun main() {
+            let root = Root { v = 3 };
+            select(true, root).start(|v| print(i"piped {v}"));
+            select(false, root).start(|v| print(i"root {v}"));
+        }
+        "#,
+        "piped 6\nroot 3\n",
+    );
+}
+
+#[test]
+fn b470_an_erased_parameter_at_a_drop_free_resource_is_steered_or_allowed() {
+    // B431's per-instantiation path under B470: a `Drop`-free resource bound
+    // to an erased parameter is steered to `[resource]` when the trait is not
+    // declared one, and allowed (and moved) when it is.
+    let head = |declared: &str| {
+        format!(
+            "{declared}trait Src {{ fun get(self): i32; }}\n\
+             [resource] struct Node {{ n: i32 }}\n\
+             impl Node with Src {{ fun get(self): i32 {{ self.n }} }}\n\
+             fun erase<S: Src>(own source: S): dyn Src {{ source }}\n\
+             fun main() {{\n\tprint(erase(Node {{ n = 2 }}).get());\n}}\n"
+        )
+    };
+    assert_fails_once_with(
+        &head(""),
+        "`Node` is a resource, so it can become a `dyn Src` only when `Src` is declared \
+         `[resource]`",
+    );
+    assert_compiles_and_runs(&head("[resource]\n"), "2\n");
 }

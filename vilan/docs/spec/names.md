@@ -270,7 +270,13 @@ file's own import statements admit (§4.3): a plain `import a::b;` admits
 every block declared in `a`'s file and in every file on the path to it,
 `import a::b only;` admits none, and
 `import a::{ (impl T) }` admits exactly the blocks whose subject unifies
-with `T`.
+with `T`. A block's members are what it declares AND the trait defaults it
+inherits, so a default-only `impl Box with One {}` is a block `(impl Box)`
+admits, and `(impl Box)::describe` takes the default it inherits. Method
+lookup reads the file's namespace: two blocks offering one name, one of
+them declined by the file, are not ambiguous — the admitted block answers —
+and a call only a declined block answers is refused, naming the import
+that declined it.
 
 Two impls declaring the same name for one subject — two statics, two
 methods, or one of each — are refused, and *where* depends on how far

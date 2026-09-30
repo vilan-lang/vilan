@@ -29,15 +29,21 @@ let flavor: Context<i32> = Context::new();
 - `flavor.get()` (the **strict** read): yields the established `T`.
 - `flavor.get_safe()` (the **safe** read): yields `Option<T>`,
   `Some(value)` under an enclosing `run`, `None` otherwise.
+- `flavor.clear(body)` (clear): `run`'s inverse — for the dynamic extent
+  of `body` the context is **not** established. A strict `get()` inside
+  is the coverage error a `get()` outside every `run` is (the refusal
+  names the `clear`); `get_safe()` yields `None`; a closure created
+  inside captures the cleared state; a `run` inside re-establishes it
+  (the nearest wins). `clear` yields `body`'s value.
 
-`Context::new`, `run`, `get`, and `get_safe` are intrinsics: the
+`Context::new`, `run`, `get`, `get_safe` and `clear` are intrinsics: the
 threading pass rewrites their call sites away. They must be applied
 directly to the context's **name** (a receiver that is not a named
 context is rejected). A context is not otherwise useful as a value:
 moving one through a parameter or a field severs the link between its
 `run`s and its reads; the reads can then never be covered. `run`'s
 body argument must be a closure literal (or an injected closure value,
-§8.5).
+§8.5); `clear`'s must be a closure literal.
 
 `Context<T>`'s value type is inferred from its first `run`, exactly as
 a `List<T>`'s element type is inferred from `push`.
@@ -168,6 +174,29 @@ across suspensions or across deferred invocation, because the closure's
 channel was fixed when it was made. (Contrast dynamic-binding systems
 where the *call site's* environment decides; in Vilan only `run`'s
 extent and creation sites decide.)
+
+A callback that must NOT carry the value — one minted inside a tracking
+scope and invoked after it closed — is made inside `clear`, which fixes
+its channel as absent:
+
+```vilan
+import std::context::Context;
+import std::option::Option::{ Some, None };
+
+let flavor: Context<i32> = Context::new();
+
+fun describe(): str {
+	match flavor.get_safe() {
+		Some(let value) => i"flavor {value}",
+		None => "no flavor",
+	}
+}
+
+fun main() {
+	let callback = flavor.run(3, || flavor.clear(|| || describe()));
+	print(callback());   // no flavor — minted with the value cleared
+}
+```
 
 ## 8.5 Injected closures: the `context` clause
 

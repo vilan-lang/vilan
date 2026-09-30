@@ -3689,6 +3689,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::MultilineString(_) => {
                 return Err(unsupported("a triple-quoted string", span));
             }
+            // B462: a tuple variant standing for a closure is its
+            // eta-expansion, one per instantiation (the closure type the
+            // analyzer recorded at the site).
+            Expr::Local(_) if self.program.variant_coercions.contains_key(&id) => {
+                self.variant_closure(id, span)?
+            }
             // J6: a `None` or a variant the context pass synthesized as an
             // argument names the VARIANT, not a place — `Expr::Local` of the
             // variant's own declaration id.
@@ -4637,6 +4643,37 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// one with a `lazy` parameter or a context-threaded hidden one (the
     /// signature carries a cell or an extra argument the closure type does
     /// not).
+    /// B462: `Some` where a closure is expected — `Rc::new(move |p0: A| Some(p0))`,
+    /// its types the instantiation's.
+    fn variant_closure(&mut self, id: Id, span: Span) -> Result<String, Error> {
+        let Some(&(enum_id, index, _, closure_type)) = self.program.variant_coercions.get(&id)
+        else {
+            return Err(unsupported("an unresolved variant coercion", span));
+        };
+        let Some(Type::Closure(parameters, returned, _)) =
+            self.program.type_id_to_type_map.get(&closure_type).cloned()
+        else {
+            return Err(unsupported("a variant coerced to a non-closure type", span));
+        };
+        let arguments = match self.program.type_id_to_type_map.get(&returned) {
+            Some(Type::Enum(_, arguments)) => arguments.clone(),
+            _ => Vec::new(),
+        };
+        let mut typed = Vec::new();
+        let mut names = Vec::new();
+        for (position, parameter) in parameters.iter().enumerate() {
+            let name = format!("variant_arg_{position}");
+            typed.push(format!("{name}: {}", self.rust_type(*parameter, span)?));
+            names.push(name);
+        }
+        let path = self.variant_path(enum_id, index, &arguments, span)?;
+        Ok(format!(
+            "std::rc::Rc::new(move |{}| {path}({}))",
+            typed.join(", "),
+            names.join(", ")
+        ))
+    }
+
     fn function_value(&mut self, function_id: Id, span: Span) -> Result<String, Error> {
         let Some(function) = self.program.functions.get(&function_id).cloned() else {
             return Err(unsupported("an unresolved function", span));

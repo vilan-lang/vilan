@@ -1173,6 +1173,14 @@ struct MoveScan<'a> {
     /// `loaned_captures`: whether a leaf crosses is a property of its own
     /// signature, not of the scan root.
     value_crossings: &'a HashSet<Id>,
+    /// B469 (RULED 2026-09-29, door (a)): the resource FIELD places whose
+    /// consuming read is admitted, each mapped to the root binding it moves
+    /// out of — a root the function OWNS (`own` parameter, owned local) whose
+    /// type has no `Drop` anywhere inside it. Such a move reads as a
+    /// destructure: the root is spent there, so a later use of it or of any
+    /// of its fields is the ordinary use-after-move. Every other consuming
+    /// field read stays R5's partial move.
+    partial_move_roots: &'a HashMap<Id, Id>,
 }
 
 /// One arm's outcome, for R7's cross-arm comparison and the continuation merge.
@@ -1261,6 +1269,10 @@ enum MoveState {
 struct MoveFlow {
     moved: HashMap<Id, MoveState>,
     decl_loop_depth: HashMap<Id, u32>,
+    /// B469: a binding spent by moving ONE of its fields out, mapped to that
+    /// field place — only so a later use can name the field. A label, not a
+    /// state: `moved` alone decides.
+    moved_fields: HashMap<Id, Id>,
 }
 
 impl MoveFlow {
@@ -1268,6 +1280,7 @@ impl MoveFlow {
         MoveFlow {
             moved: HashMap::default(),
             decl_loop_depth: HashMap::default(),
+            moved_fields: HashMap::default(),
         }
     }
 }
@@ -1281,8 +1294,11 @@ enum ResourceMoveViolation {
         use_id: Id,
         binding: Id,
         move_span: Span,
+        /// B469: the field whose move spent `binding`, when it was a field.
+        moved_field: Option<Id>,
     },
-    /// R5: moving a resource field out of a live aggregate (no partial moves).
+    /// R5: moving a resource field out of a live aggregate that is not a B469
+    /// destructure (a loan, or a `Drop` somewhere inside).
     PartialMove {
         at: Id,
     },
@@ -1356,6 +1372,28 @@ impl ResourceMoveViolation {
     }
 }
 
+/// B461: where a bare trait NESTED in an annotation stands — the reading
+/// each position gives it (a mint for a parameter, an existential for a
+/// `let`). A field is not one: A124 R3 made a trait at a field the object.
+#[derive(Clone, Copy, Debug)]
+enum NestedAnnotationOwner {
+    /// Inside a parameter's annotation: an implicit generic of the function
+    /// (B186's reading, one per mention).
+    Parameter(Id, Id),
+    /// Inside a `let` binding's annotation: an existential the initializer
+    /// grounds (B161's constraint reading, one level down).
+    Binding,
+}
+
+/// Why B470 refuses a resource erasure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceErasureRefusal {
+    /// A `Drop` sits somewhere inside: today's refusal.
+    Drop,
+    /// `Drop`-free, but the object's trait is not declared `[resource]`.
+    UndeclaredTrait,
+}
+
 /// One generic instantiation to re-check under R11 (destruction.md §4): a
 /// callee whose generic parameters `resources` are bound to resource types at
 /// this instantiation, so its body must be move-clean with those parameters
@@ -1365,9 +1403,27 @@ impl ResourceMoveViolation {
 struct R11Instance {
     callee: Id,
     /// The callee's constraint ids bound to a resource here, sorted (the dedup
-    /// key alongside `callee`).
+    /// key alongside `callee`). For a trait default (B463) the one entry is the
+    /// declaring trait's `Self` — `Type::Trait(trait, [])`, the type a default
+    /// body's `self` has — which `classify_resource` answers from this set.
     resources: Vec<TypeId>,
     call_id: Id,
+    /// Where this instantiation was found, which decides how it speaks.
+    site: R11Site,
+}
+
+/// How an [`R11Instance`] was reached (B463).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum R11Site {
+    /// A call instantiates the callee at a resource: `call_id` is the call,
+    /// and the diagnostic is spanned there with a note into the body.
+    Call,
+    /// An `impl` whose subject is a resource INHERITS a trait default: the
+    /// default's body runs with `Self` a resource for every value of that
+    /// subject, called or not, exactly as a body written in the impl would.
+    /// `call_id` is the impl's id; a move violation is reported in the body
+    /// with the concrete impl's own message and a note at the impl.
+    Admission,
 }
 
 /// B389 — what [`Analyzer::literal_numeric_shape`] saw: whether any literal
@@ -1977,6 +2033,9 @@ pub struct Implementation<'src> {
     /// the key the visibility bit is read by (B318 S4). Minted by the walk that
     /// registers the block, so it is the same id `Expr::Impl(id)` carries.
     pub impl_id: Id,
+    /// The block's head, `impl Subject with A + B` without its body — where a
+    /// diagnostic about the block as a whole points (B463).
+    pub header_span: Span,
     /// The SCOPE the block was written in — a module's body scope at a file's
     /// top level, which is what `curated_modules` and `export_all_modules` are
     /// keyed on. Carried rather than looked up because the visibility question
@@ -2225,6 +2284,10 @@ pub struct Trait<'src> {
     /// `with` clause. A type implementing this trait must also satisfy these,
     /// and their members are inherited for method resolution.
     pub supertraits: Vec<TypeId>,
+    /// `[resource] trait` (B470, RULED 2026-09-29): this trait's objects may
+    /// hold a resource, so `dyn` of it is itself a resource (move-only). Not
+    /// inherited by subtraits.
+    pub resource: bool,
 }
 
 /// What a trait member's signature is being rendered FOR: the trait that
@@ -3269,6 +3332,37 @@ pub struct Analyzer<'src> {
     /// NEVER marked a clone (R1: resources move, they do not copy). Empty when no
     /// resource is declared (std/corpus), so clone-site behavior is unchanged there.
     resource_value_places: HashSet<Id>,
+    /// B463: one canonical `Type::Trait(trait, [])` id per trait, minted on
+    /// first ask — the `Self` marker R11 puts in an instance's resource set
+    /// for a trait default. Types are not interned (`type_id_for_type`), so
+    /// the dedup key needs one id per trait; `classify_resource` compares
+    /// the marker structurally, since a default body's `self` carries its own.
+    trait_self_markers: HashMap<Id, TypeId>,
+    /// B469: chunk 3's admitted field moves (place -> owned root), published
+    /// for the whole-program drop plan beside `resource_value_places`.
+    partial_move_roots: HashMap<Id, Id>,
+    /// B470: every resource erased into a `dyn` at a coercion site, as
+    /// `(site, the value's type, the object type)`, for the post-build
+    /// question of whether it may be.
+    resource_erasures: Vec<(Id, TypeId, TypeId)>,
+    /// B462: every reference to a tuple variant that stands for a closure,
+    /// as `(enum, variant, arity, the closure type)` — the emitter
+    /// eta-expands it there.
+    variant_coercions: HashMap<Id, (Id, usize, usize, TypeId)>,
+    /// B461: the type slots written NESTED inside a parameter's, a field's or
+    /// a binding's annotation (a generic argument, a tuple element, an array
+    /// element), with the position they stand in.
+    nested_annotation_owners: HashMap<TypeId, NestedAnnotationOwner>,
+    /// B461: the existential holes a nested bare trait in a `let` annotation
+    /// resolves to — `Type::Generic` over the bound, owned by no declaration.
+    existential_annotation_holes: HashSet<TypeId>,
+    /// B461: a binding whose (non-trait) annotation holds an existential, as
+    /// `(binding, the annotation, its span)`: the annotation is a constraint
+    /// on the type the initializer grounds, checked after the build.
+    binding_existential_constraints: Vec<(Id, TypeId, Span)>,
+    /// B461: the initializer of each such binding, with the annotation — for
+    /// the mixed-literal steer, which the literal cannot otherwise see.
+    existential_initializers: HashMap<Id, TypeId>,
     /// Drop planning (destruction.md §5/§7): resource-typed local bindings still
     /// owned at their declaring scope's fall-through end — dropped there in
     /// reverse declaration order. Ownership at a program point is single-valued
@@ -3869,6 +3963,29 @@ pub struct Analyzer<'src> {
     /// that writes neither `only` nor a selector, which is every file in the
     /// estate today.
     import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B401: the admission the analyzer's OWN method lookup reads during the
+    /// fixpoint — [`LookupAdmission`], built from `import_impl_restrictions`
+    /// before each fixpoint runs. `None` when no file restricts anything and
+    /// no module hides an `impl`: the estate's path, which filters nothing.
+    lookup_admission: Option<LookupAdmission>,
+    /// B401: the file the constraint being resolved sits in, and its anchor —
+    /// set per constraint in `resolve_constraints`, the one seam every
+    /// constraint passes through. `None` outside the fixpoint, where a lookup
+    /// filters nothing (today's reading).
+    lookup_importer: Option<SourceId>,
+    lookup_anchor: Option<Id>,
+    /// B401: the calls that resolved to an inherited trait DEFAULT through a
+    /// block the calling file did not admit — no admitted block offered the
+    /// name, so the lookup kept today's answer and the post-build admission
+    /// pass refuses it by name: `(member, implementation index, member name)`
+    /// by call anchor. A declared member needs no record; the pass finds its
+    /// block by its declarations.
+    declined_default_calls: HashMap<Id, (Id, usize, String)>,
+    /// The loaded files' paths by `SourceId`, handed in by the driver before
+    /// each resolve: [`Analyzer::build_lookup_admission`] reads a module's
+    /// ANCESTOR files off them (`ancestor_module_sources`), as the post-build
+    /// pass reads `Program::canonical_sources`.
+    source_paths: Vec<PathBuf>,
     /// B318 S4: the cross-module inherent collisions the declaration-site rule
     /// banks for the IMPORT pass ([`MemberCollision`]). Empty for every program
     /// in which no two files declare one inherent name for one subject — the
@@ -4225,6 +4342,21 @@ pub struct Analyzer<'src> {
     /// Whether the walk is inside a trait or `impl` item list, so a `context`
     /// clause on the declaration can be refused there (B242 defers members).
     walking_member_body: bool,
+    /// B460: whether the walk is inside an `impl … with Trait` block — its
+    /// members implement a trait, so a bare-trait return there is a TRAIT
+    /// method's (refused until a paper), not an inherent method's.
+    walking_trait_impl_body: bool,
+    /// B460: each function's return annotation slot, with whether the
+    /// function is a trait method (declared in a trait, or in an `impl …
+    /// with` block) — the drain decides a bare trait there.
+    return_annotation_owners: HashMap<TypeId, (Id, bool)>,
+    /// B460 (RULED 2026-09-29, R-a door (i)): the functions whose return is a
+    /// bare trait — the callee picks ONE concrete type, the body's — with the
+    /// trait, its written arguments and the annotation's span.
+    opaque_returns: HashMap<Id, (Id, Vec<TypeId>, Span)>,
+    /// B460: the tail expressions of those functions (through blocks), for
+    /// the steer to `dyn` when their branches disagree.
+    opaque_return_tails: HashMap<Id, Id>,
     // Parameters and `let` bindings whose declared closure type carries the
     // `async` marker (J2): calls through them are implicitly awaited.
     async_values: HashSet<Id>,
@@ -5868,6 +6000,71 @@ impl ImplAdmission {
     }
 }
 
+/// B401 — the impl admission the analyzer's OWN method lookup reads, built
+/// before the fixpoint ([`Analyzer::build_lookup_admission`]) from the same
+/// rows [`build_impl_admission`] resolves after it.
+///
+/// Before it, the lookup was program-wide and only a post-build pass corrected
+/// the call: which was enough for a lookup with ONE candidate, and wrong for
+/// the two others. A lookup with two candidates, one of which the file
+/// declined, was refused as ambiguous whatever the file admitted — and a call
+/// that reached an inherited DEFAULT through a declined block compiled, since
+/// the post-build pass found blocks by their declarations and a default is
+/// declared by its trait. The lookup now NARROWS by this map (it never empties:
+/// with no admitted candidate the answer stands, and the post-build pass
+/// refuses it by name).
+///
+/// Keyed by BLOCK rather than by member id, so a whole-block selector admits
+/// the defaults the block inherits as well as what it declares (B455): a
+/// default-only `impl Box with One {}` is a block `(impl Box)` names.
+#[derive(Debug, Clone, Default)]
+struct LookupAdmission {
+    /// The importing files whose own statements restrict anything at all.
+    restricting: HashSet<SourceId>,
+    /// (importing file, declaring file) -> the blocks the importer's
+    /// selectors admitted out of that file, each with the member names its
+    /// `::` tail took (`None`: the whole block). An entry's absence is
+    /// "unrestricted"; an EMPTY entry is `only`.
+    admitted: HashMap<(SourceId, SourceId), HashMap<Id, Option<Vec<String>>>>,
+    /// The blocks a curated module does not export, as
+    /// [`ImplAdmission::hidden`].
+    hidden: HashSet<Id>,
+    /// (importing file, block) — a `#(impl T)` reach into a hidden block.
+    reached: HashSet<(SourceId, Id)>,
+}
+
+impl LookupAdmission {
+    /// Whether `importer` admits `member_name` from `implementation`: the
+    /// block is the file's own, or it is visible (exported, or reached) and
+    /// the file's statements did not decline it.
+    fn admits(
+        &self,
+        importer: SourceId,
+        implementation: &Implementation,
+        member_name: &str,
+    ) -> bool {
+        if implementation.source == importer {
+            return true;
+        }
+        if self.hidden.contains(&implementation.impl_id)
+            && !self.reached.contains(&(importer, implementation.impl_id))
+        {
+            return false;
+        }
+        if !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, implementation.source)) {
+            None => true,
+            Some(blocks) => match blocks.get(&implementation.impl_id) {
+                None => false,
+                Some(None) => true,
+                Some(Some(names)) => names.iter().any(|name| name == member_name),
+            },
+        }
+    }
+}
+
 /// B318 S3 — one `import` statement's claim on the implementations its walk
 /// carries, banked by the import walk and resolved after `build()` by
 /// [`check_impl_selector_admission`].
@@ -6053,6 +6250,14 @@ impl<'src> Analyzer<'src> {
             generic_type_applications: Vec::new(),
             reported_container_structures: HashSet::default(),
             resource_value_places: HashSet::default(),
+            trait_self_markers: HashMap::default(),
+            partial_move_roots: HashMap::default(),
+            resource_erasures: Vec::new(),
+            variant_coercions: HashMap::default(),
+            nested_annotation_owners: HashMap::default(),
+            existential_annotation_holes: HashSet::default(),
+            binding_existential_constraints: Vec::new(),
+            existential_initializers: HashMap::default(),
             dropped_bindings: HashSet::default(),
             drop_extents: HashMap::default(),
             declared_binding_extents: HashMap::default(),
@@ -6155,6 +6360,11 @@ impl<'src> Analyzer<'src> {
             implementation_by_declaration: HashMap::default(),
             impl_namespaces: Vec::new(),
             import_impl_restrictions: Vec::new(),
+            lookup_admission: None,
+            lookup_importer: None,
+            lookup_anchor: None,
+            declined_default_calls: HashMap::default(),
+            source_paths: Vec::new(),
             cross_module_collisions: Vec::new(),
             blanket_residues: Vec::new(),
             scoped_reach_checks: Vec::new(),
@@ -6227,6 +6437,10 @@ impl<'src> Analyzer<'src> {
             function_context_clause_spans: HashMap::default(),
             function_signature_end_spans: HashMap::default(),
             walking_member_body: false,
+            walking_trait_impl_body: false,
+            return_annotation_owners: HashMap::default(),
+            opaque_returns: HashMap::default(),
+            opaque_return_tails: HashMap::default(),
             async_values: HashSet::default(),
             sync_values: HashSet::default(),
             async_fields: HashSet::default(),
@@ -7623,6 +7837,48 @@ impl<'src> Analyzer<'src> {
     /// arms that will not unify have already failed with the ordinary mismatch,
     /// and the skip below keeps this check from filing a second, misleading
     /// report on top of it.
+    /// B461: a binding annotated with a type that holds an existential
+    /// (`let x: Option<Source<i32>> = ..`) — the initializer grounded the
+    /// binding's type; the annotation must admit it, each hole met by a type
+    /// that implements the hole's trait.
+    fn check_binding_existential_constraints(&mut self) {
+        for (variable_id, annotation, span) in
+            std::mem::take(&mut self.binding_existential_constraints)
+        {
+            let Some(variable) = self.variables.get(&variable_id) else {
+                continue;
+            };
+            let name = variable.name;
+            let value_type = variable.type_id.get_type(self);
+            if matches!(
+                value_type,
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
+            ) {
+                continue;
+            }
+            if self.annotation_admits(annotation, &value_type, 0) {
+                continue;
+            }
+            let type_label = self.pretty_print_type(&value_type, &HashMap::default());
+            let annotation_label =
+                self.pretty_print_type(&annotation.get_type(self), &HashMap::default());
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "'{type_label}' does not match the annotation on '{name}', \
+                         '{annotation_label}': each trait written inside the annotation must be \
+                         met by ONE type that implements it (values of different types need a \
+                         trait object there, `dyn …`)"
+                    ),
+                },
+                variable_id,
+            );
+        }
+    }
+
     fn check_binding_trait_constraints(&mut self) {
         for constraint in std::mem::take(&mut self.binding_trait_constraints) {
             let Some(variable) = self.variables.get(&constraint.variable_id) else {
@@ -7638,12 +7894,25 @@ impl<'src> Analyzer<'src> {
             ) {
                 continue;
             }
-            if self.satisfies_trait_bound(
-                &value_type,
-                constraint.trait_id,
-                &constraint.arguments,
-                0,
-            ) {
+            let satisfied = if constraint
+                .arguments
+                .iter()
+                .any(|argument| self.type_id_holds_existential(*argument))
+            {
+                self.value_satisfies_with_holes(
+                    &value_type,
+                    constraint.trait_id,
+                    &constraint.arguments,
+                )
+            } else {
+                self.satisfies_trait_bound(
+                    &value_type,
+                    constraint.trait_id,
+                    &constraint.arguments,
+                    0,
+                )
+            };
+            if satisfied {
                 continue;
             }
             let Some(trait_label) =
@@ -9312,6 +9581,17 @@ impl<'src> Analyzer<'src> {
         earlier_subject: TypeId,
     ) -> Option<SubjectCollision> {
         let earlier_type = earlier_subject.get_type(self);
+        // B456 (RULED 2026-09-29, door (b)): a BLANKET (`impl type S: Read<..>`)
+        // and a constructor-headed subject it claims (`impl Cell<type T>`) are
+        // not one name declared twice — they are RANKED, in either declaration
+        // order: at a concrete receiver the concrete subject's member outranks
+        // the blanket's (`rank_member_candidates`' tier 1), and through a bound
+        // the blanket answers. This rule used to refuse the pair only when the
+        // blanket came FIRST (the comparison below is asked concrete-against-
+        // blanket), so which body a call took was declaration and load order.
+        if matches!(subject_type, Type::Generic(_)) != matches!(earlier_type, Type::Generic(_)) {
+            return None;
+        }
         if !self.compare_type(subject_type, &earlier_type, &HashMap::default()) {
             return None;
         }
@@ -10469,7 +10749,13 @@ impl<'src> Analyzer<'src> {
                 // A124 R3). Answering `false` here without that refusal would be
                 // §2.2's destructor suppression in a new carrier, which is why
                 // the two are written as one rule and pinned together.
-                Type::Dyn(..) => Members::Answer(false, true),
+                //
+                // B470 narrows the enforcement: a `Drop`-free resource may be
+                // erased into the object of a trait DECLARED `[resource]`, and
+                // that object is then move-only — so a `dyn` of such a trait is
+                // a resource, whatever landed in it, and every other `dyn`
+                // (a subtrait's included) stays data.
+                Type::Dyn(trait_id, _) => Members::Answer(self.trait_is_resource(*trait_id), true),
                 // Everything else is a non-value or a scalar: never a resource by
                 // containment.
                 Type::Any
@@ -10480,8 +10766,24 @@ impl<'src> Analyzer<'src> {
                 | Type::Closure(..)
                 | Type::Function(_)
                 | Type::Module(_)
-                | Type::Trait(_, _)
                 | Type::Mapped(_, _, _) => Members::Answer(false, true),
+                // A trait default body's `Self` (B463): a resource iff THIS
+                // instantiation says so, exactly as a `Generic` above — R11
+                // puts the argument-free `Type::Trait(trait, [])` in the set
+                // when a resource subject inherits the default. The base query
+                // passes an empty set, so a bare trait is never a resource
+                // there.
+                Type::Trait(trait_id, arguments) => Members::Answer(
+                    arguments.is_empty()
+                        && resource_constraints.iter().any(|marker| {
+                            matches!(
+                                self.borrow_type_by_type_id(*marker),
+                                Type::Trait(marked, marked_arguments)
+                                    if marked == trait_id && marked_arguments.is_empty()
+                            )
+                        }),
+                    true,
+                ),
             }
         };
         match plan {
@@ -12246,6 +12548,16 @@ impl<'src> Analyzer<'src> {
         let is_refinements =
             self.collect_is_refinements(&HashSet::default(), &mut HashMap::default());
         let value_crossings = self.compute_return_value_crossings();
+        // B469: which field moves read as destructures. The concrete scan
+        // knows no instantiation, so a generic inside an aggregate's type may
+        // hold a `Drop` and keeps the refusal.
+        let partial_move_roots = self.collect_partial_move_roots(
+            &resource_value_places,
+            &module_level_bindings,
+            &loaned_captures,
+            &HashMap::default(),
+        );
+        self.partial_move_roots = partial_move_roots.clone();
 
         let scan = MoveScan {
             resource_bindings: &resource_bindings,
@@ -12254,6 +12566,7 @@ impl<'src> Analyzer<'src> {
             loaned_captures: &loaned_captures,
             is_refinements: &is_refinements,
             value_crossings: &value_crossings,
+            partial_move_roots: &partial_move_roots,
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.emit_resource_move_violations(violations);
@@ -12945,6 +13258,7 @@ impl<'src> Analyzer<'src> {
             owned_bindings,
             place_overwrites,
             explicitly_dropped,
+            partial_moves: self.partial_move_roots.clone(),
         };
         // A program with no `resource` declaration anywhere plans nothing and
         // keeps its bytes. The three sets above are NOT enough to decide that
@@ -13473,6 +13787,10 @@ impl<'src> Analyzer<'src> {
             // the root binding (a consuming field read is R5's rejected partial
             // move, already diagnosed; treat it as a loan for planning).
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
+                if consuming && let Some(root) = resources.partial_moves.get(&expr_id) {
+                    owned.remove(root);
+                    return;
+                }
                 self.plan_expr(subject, false, resources, owned, plan);
             }
             Expr::Index(subject, index) => {
@@ -14468,10 +14786,24 @@ impl<'src> Analyzer<'src> {
                 }
             }
             // R5: a resource field/element access. Consuming it moves a resource
-            // out of a live aggregate — rejected (no partial moves in v1). Either
+            // out of a live aggregate — rejected unless B469 admits it. Either
             // way, reading it loans the subject (a live-owner check on the root).
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
                 if consuming && scan.resource_value_places.contains(&expr_id) {
+                    // B469: out of an owned, `Drop`-free aggregate the move is
+                    // a destructure — it spends the ROOT, here, by the same
+                    // touch a whole move of it makes (so every R1/R7/R8 rule
+                    // judges it as one).
+                    if let Some(&root) = scan.partial_move_roots.get(&expr_id) {
+                        let was_live = !flow.moved.contains_key(&root);
+                        self.scan_move_touch(
+                            root, expr_id, true, scan, flow, loop_depth, violations,
+                        );
+                        if was_live && flow.moved.contains_key(&root) {
+                            flow.moved_fields.insert(root, expr_id);
+                        }
+                        return;
+                    }
                     violations.push(ResourceMoveViolation::PartialMove { at: expr_id });
                 }
                 self.scan_move(subject, false, false, scan, flow, loop_depth, violations);
@@ -14498,6 +14830,7 @@ impl<'src> Analyzer<'src> {
                 }
                 if scan.resource_bindings.contains(&variable_id) {
                     flow.moved.remove(&variable_id);
+                    flow.moved_fields.remove(&variable_id);
                     flow.decl_loop_depth.insert(variable_id, loop_depth);
                 }
             }
@@ -14527,6 +14860,7 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                         flow.moved.remove(binding);
+                        flow.moved_fields.remove(binding);
                         flow.decl_loop_depth.entry(*binding).or_insert(loop_depth);
                     }
                     _ => {
@@ -14799,6 +15133,7 @@ impl<'src> Analyzer<'src> {
                     use_id,
                     binding,
                     move_span: *move_span,
+                    moved_field: flow.moved_fields.get(&binding).copied(),
                 });
             }
             return;
@@ -14813,6 +15148,7 @@ impl<'src> Analyzer<'src> {
             }
             let span = **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN);
             flow.moved.insert(binding, MoveState::Moved(span));
+            flow.moved_fields.remove(&binding);
         }
     }
 
@@ -15924,152 +16260,247 @@ impl<'src> Analyzer<'src> {
             // The whole-program scan crosses every file, so each diagnostic is
             // placed in the one its own span indexes into (B112).
             let anchor = violation.anchor();
-            let error = match violation {
-                ResourceMoveViolation::UseAfterMove {
-                    use_id,
-                    binding,
-                    move_span,
-                } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
+            let error = self.resource_move_violation_error(violation);
+            self.push_anchored(error, anchor);
+        }
+    }
+
+    /// B463: the violations of a trait default's body under a resource `Self`,
+    /// found at an impl that inherits it (`R11Site::Admission`). The body is
+    /// the impl's as much as a member written inside the impl would be, so it
+    /// speaks in exactly that member's words, at the same place in the body —
+    /// the concrete refusal, not R11's instantiation framing. What the body
+    /// alone cannot say — why `self` is a resource here — is a note at the
+    /// impl, unless the violation already carries its own note (use after
+    /// move points at the move, which is the half the author acts on).
+    fn emit_inherited_default_violations(
+        &mut self,
+        instance: &R11Instance,
+        violations: Vec<ResourceMoveViolation>,
+    ) {
+        for violation in violations {
+            let anchor = violation.anchor();
+            let mut error = self.resource_move_violation_error(violation);
+            if error.note.is_none() {
+                error.note = Some(self.inherited_default_admission_note(instance, anchor));
+            }
+            self.push_anchored(error, anchor);
+        }
+    }
+
+    /// The note an admission-site diagnostic carries (B463): the impl that
+    /// inherits the default, and why its `Self` is a resource.
+    fn inherited_default_admission_note(
+        &mut self,
+        instance: &R11Instance,
+        body_anchor: Id,
+    ) -> crate::error::Note {
+        let member = self
+            .functions
+            .get(&instance.callee)
+            .map(|function| function.name)
+            .unwrap_or("this default");
+        let admitting = self
+            .implementations
+            .iter()
+            .find(|implementation| implementation.impl_id == instance.call_id)
+            .map(|implementation| (implementation.subject, implementation.header_span));
+        let subject_label = admitting
+            .map(|(subject, _)| self.declaration_type_label(subject))
+            .unwrap_or_else(|| "this type".to_string());
+        let body_source = self.source_of_id(body_anchor).unwrap_or(SourceId(0));
+        crate::error::Note {
+            span: admitting.map_or(EMPTY_SPAN, |(_, header)| header),
+            msg: format!(
+                "`{subject_label}` inherits the default `{member}` here, and `{subject_label}` \
+                 is a resource, so the default's `self` is one too; declare `{member}` in this \
+                 impl, or fix the default"
+            ),
+            source: self.note_source_against(instance.call_id, body_source),
+        }
+    }
+
+    /// One affine-rule violation, in the concrete scan's words (destruction.md
+    /// §4/§11). Shared by chunk 3 and by a trait default checked at the impl
+    /// that inherits it (B463), which must read the same.
+    fn resource_move_violation_error(&self, violation: ResourceMoveViolation) -> Error {
+        match violation {
+            ResourceMoveViolation::UseAfterMove {
+                use_id,
+                binding,
+                move_span,
+                moved_field,
+            } => {
+                let name = self.binding_name(binding);
+                // B469: spent by a FIELD move — the use and the note both name
+                // the field, since that is the move the author wrote.
+                let field = moved_field.and_then(|place| self.field_chain_spelling(place));
+                let (msg, note) = match field {
+                    Some(field) => (
+                        format!(
+                            "use of `{name}` after `{field}` was moved out of it: moving a \
+                             field out spends the whole aggregate"
+                        ),
+                        format!(
+                            "`{field}` was moved out of `{name}` here: once a field has moved \
+                             out, neither `{name}` nor its other fields can be used; take \
+                             what you need from `{name}` before this, or loan the field with \
+                             `&{field}`"
+                        ),
+                    ),
+                    None => (
+                        format!(
                             "use of `{name}` after it was moved: a resource has a single owner"
                         ),
-                        note: Some(crate::error::Note::here(
-                            move_span,
-                            format!(
-                                "`{name}` was moved here: a resource has one owner; loan it with \
-                                 `&{name}` / `&mut {name}`, or restructure with `Option` + `take`"
-                            ),
-                        )),
-                    }
+                        format!(
+                            "`{name}` was moved here: a resource has one owner; loan it with \
+                             `&{name}` / `&mut {name}`, or restructure with `Option` + `take`"
+                        ),
+                    ),
+                };
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
+                    msg,
+                    note: Some(crate::error::Note::here(move_span, note)),
                 }
-                ResourceMoveViolation::PartialMove { at } => Error { trace: Vec::new(),
+            }
+            ResourceMoveViolation::PartialMove { at } => Error {
+                trace: Vec::new(),
+                span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                msg: "cannot move a resource field out of a live aggregate: a resource has \
+                      one owner, and a field moves out only as a destructure — of an aggregate \
+                      this function owns (`own`), with no `Drop` anywhere inside it; loan it \
+                      with `&` / `&mut`, or make the field an `Option` and use `take`"
+                    .to_string(),
+                note: None,
+            },
+            ResourceMoveViolation::ConditionalMove { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
                     span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                    msg: "cannot move a resource field out of a live aggregate: a resource has \
-                          one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make \
-                          the field an `Option` and use `take`"
-                        .to_string(),
+                    msg: format!(
+                        "`{name}` is moved on one path through this branch but not another: a \
+                         resource's end-of-scope ownership must be static; move it on every path, \
+                         or restructure with `Option` + `take`"
+                    ),
                     note: None,
-                },
-                ResourceMoveViolation::ConditionalMove { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is moved on one path through this branch but not another: a \
-                             resource's end-of-scope ownership must be static; move it on every path, \
-                             or restructure with `Option` + `take`"
-                        ),
-                        note: None,
-                    }
                 }
-                ResourceMoveViolation::LoopMove { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is declared outside this loop and moved inside it: the move \
-                             would repeat on the next iteration; move a value declared inside the \
-                             loop, or loan `{name}` with `&` / `&mut`"
-                        ),
-                        note: None,
-                    }
+            }
+            ResourceMoveViolation::LoopMove { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is declared outside this loop and moved inside it: the move \
+                         would repeat on the next iteration; move a value declared inside the \
+                         loop, or loan `{name}` with `&` / `&mut`"
+                    ),
+                    note: None,
                 }
-                ResourceMoveViolation::LoanConsumed { at, binding } => {
-                    let name = self.binding_name(binding);
-                    let convention = self
-                        .parameters
-                        .get(&binding)
-                        .map(|parameter| parameter.convention)
-                        .unwrap_or(Convention::Bare);
-                    let declared = if name == "self" {
-                        Self::receiver_form(convention).to_string()
-                    } else {
-                        match convention {
-                            Convention::Ref => format!("&{name}"),
-                            Convention::RefMut => format!("&mut {name}"),
-                            Convention::Bare | Convention::Own => name.to_string(),
-                        }
-                    };
-                    let owned = format!("own {name}");
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "cannot move the resource `{name}` out of this function: it is declared \
-                             `{declared}`, a loan, and a loan changes no ownership; declare it \
-                             `{owned}` to take ownership, or restructure with `Option` + `take`"
-                        ),
-                        note: None,
+            }
+            ResourceMoveViolation::LoanConsumed { at, binding } => {
+                let name = self.binding_name(binding);
+                let convention = self
+                    .parameters
+                    .get(&binding)
+                    .map(|parameter| parameter.convention)
+                    .unwrap_or(Convention::Bare);
+                let declared = if name == "self" {
+                    Self::receiver_form(convention).to_string()
+                } else {
+                    match convention {
+                        Convention::Ref => format!("&{name}"),
+                        Convention::RefMut => format!("&mut {name}"),
+                        Convention::Bare | Convention::Own => name.to_string(),
                     }
+                };
+                let owned = format!("own {name}");
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "cannot move the resource `{name}` out of this function: it is declared \
+                         `{declared}`, a loan, and a loan changes no ownership; declare it \
+                         `{owned}` to take ownership, or restructure with `Option` + `take`"
+                    ),
+                    note: None,
                 }
-                // B65. Deliberately NOT the `LoanConsumed` text: there is no
-                // convention to redeclare on a capture, so `own x` is not the fix
-                // here — consuming the SUBJECT is. The advice is spellable on
-                // both counts (B4): `match o` by value is R6's consuming form,
-                // and `take` is the sanctioned partial move. It does not offer a
-                // copy: vilan has no user-facing copy spelling, and R1 forbids
-                // copying a resource anyway.
-                ResourceMoveViolation::LoanedCaptureConsumed { at, binding, subject } => {
-                    let name = self.binding_name(binding);
-                    let subject = match self.pattern_subject_name(subject) {
-                        Some(subject_name) => format!("`{subject_name}`"),
-                        None => "the subject".to_string(),
-                    };
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "cannot move the resource `{name}` out of this pattern: it captures \
-                             from {subject}, which is matched by loan — `is` and `match &` inspect \
-                             without consuming, so {subject} still owns the payload and still \
-                             drops at its scope end; match {subject} by value to move the payload \
-                             into the capture, or restructure with `Option` + `take`"
-                        ),
-                        note: None,
-                    }
+            }
+            // B65. Deliberately NOT the `LoanConsumed` text: there is no
+            // convention to redeclare on a capture, so `own x` is not the fix
+            // here — consuming the SUBJECT is. The advice is spellable on
+            // both counts (B4): `match o` by value is R6's consuming form,
+            // and `take` is the sanctioned partial move. It does not offer a
+            // copy: vilan has no user-facing copy spelling, and R1 forbids
+            // copying a resource anyway.
+            ResourceMoveViolation::LoanedCaptureConsumed {
+                at,
+                binding,
+                subject,
+            } => {
+                let name = self.binding_name(binding);
+                let subject = match self.pattern_subject_name(subject) {
+                    Some(subject_name) => format!("`{subject_name}`"),
+                    None => "the subject".to_string(),
+                };
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "cannot move the resource `{name}` out of this pattern: it captures \
+                         from {subject}, which is matched by loan — `is` and `match &` inspect \
+                         without consuming, so {subject} still owns the payload and still \
+                         drops at its scope end; match {subject} by value to move the payload \
+                         into the capture, or restructure with `Option` + `take`"
+                    ),
+                    note: None,
                 }
-                ResourceMoveViolation::Capture {
-                    reference_id,
-                    binding,
-                } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "a closure cannot capture the resource `{name}`; pass a loan into the \
-                             call, give ownership to the struct that owns this closure's lifetime, \
-                             or hoist the resource to module level (process lifetime)"
-                        ),
-                        note: None,
-                    }
+            }
+            ResourceMoveViolation::Capture {
+                reference_id,
+                binding,
+            } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "a closure cannot capture the resource `{name}`; pass a loan into the \
+                         call, give ownership to the struct that owns this closure's lifetime, \
+                         or hoist the resource to module level (process lifetime)"
+                    ),
+                    note: None,
                 }
-                ResourceMoveViolation::ModuleLevelMove { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is a module-level resource: it has process lifetime and \
-                             cannot be moved; loan it with `&{name}` / `&mut {name}` or a method \
-                             call (`drop({name})` moves it, so it is rejected too)"
-                        ),
-                        note: None,
-                    }
+            }
+            ResourceMoveViolation::ModuleLevelMove { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is a module-level resource: it has process lifetime and \
+                         cannot be moved; loan it with `&{name}` / `&mut {name}` or a method \
+                         call (`drop({name})` moves it, so it is rejected too)"
+                    ),
+                    note: None,
                 }
-                ResourceMoveViolation::ModuleLevelOverwrite { at, binding } => {
-                    let name = self.binding_name(binding);
-                    Error { trace: Vec::new(),
-                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "`{name}` is a module-level resource: it has process lifetime and \
-                             cannot be overwritten (the old value's drop has nowhere to run); \
-                             its initializer is the one write, and everything after is a loan"
-                        ),
-                        note: None,
-                    }
+            }
+            ResourceMoveViolation::ModuleLevelOverwrite { at, binding } => {
+                let name = self.binding_name(binding);
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is a module-level resource: it has process lifetime and \
+                         cannot be overwritten (the old value's drop has nowhere to run); \
+                         its initializer is the one write, and everything after is a loan"
+                    ),
+                    note: None,
                 }
-            };
-            self.push_anchored(error, anchor);
+            }
         }
     }
 
@@ -16109,6 +16540,10 @@ impl<'src> Analyzer<'src> {
         // inside a generic whose parameter is bound to that generic's own `T`
         // seeds nothing until the generic is itself known to be instantiated at a
         // resource, which propagation below discovers.)
+        // B463: the defaults a resource subject inherits come first, so a
+        // default both admitted and called reports once, at the body, in the
+        // concrete impl's words.
+        self.seed_inherited_default_admissions(&mut worklist, &mut enqueued);
         let empty: HashSet<TypeId> = HashSet::default();
         let mut seed_memo: HashMap<TypeId, bool> = HashMap::default();
         let all_calls: Vec<Id> = self.function_calls.keys().copied().collect();
@@ -16139,11 +16574,21 @@ impl<'src> Analyzer<'src> {
             // this one, so the refinement is recomputed under the delta set.
             let is_refinements = self.collect_is_refinements(&resources, &mut memo);
             let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
+            // B469: a field move out of an owned aggregate is a destructure when
+            // the aggregate has no `Drop` anywhere inside at THIS instantiation
+            // — so the question is asked with what the instantiation binds.
+            let known_instantiation = self.r11_instantiation_types(&instance);
+            let no_module_level: HashSet<Id> = HashSet::default();
+            let partial_move_roots = self.collect_partial_move_roots(
+                &resource_value_places,
+                &no_module_level,
+                &loaned_captures,
+                &known_instantiation,
+            );
             let violations = {
                 // A generic body's bindings are all in-body (parameters / locals);
                 // module-level resources never enter its delta set, so the loan-only
                 // corollary is inert here.
-                let no_module_level: HashSet<Id> = HashSet::default();
                 let scan = MoveScan {
                     resource_bindings: &resource_bindings,
                     resource_value_places: &resource_value_places,
@@ -16151,16 +16596,23 @@ impl<'src> Analyzer<'src> {
                     loaned_captures: &loaned_captures,
                     is_refinements: &is_refinements,
                     value_crossings: &value_crossings,
+                    partial_move_roots: &partial_move_roots,
                 };
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
             let body_is_move_clean = violations.is_empty();
             let reported_before = self.diagnostics.len();
-            self.emit_r11_violations(instance.callee, instance.call_id, violations);
+            match instance.site {
+                R11Site::Call => {
+                    self.emit_r11_violations(instance.callee, instance.call_id, violations)
+                }
+                R11Site::Admission => self.emit_inherited_default_violations(&instance, violations),
+            }
             self.check_own_generic_exactly_once(
                 &instance,
                 &resource_bindings,
                 &resource_value_places,
+                &partial_move_roots,
                 body_is_move_clean,
             );
             self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
@@ -16232,6 +16684,7 @@ impl<'src> Analyzer<'src> {
         instance: &R11Instance,
         resource_bindings: &HashSet<Id>,
         resource_value_places: &HashSet<Id>,
+        partial_move_roots: &HashMap<Id, Id>,
         body_is_move_clean: bool,
     ) {
         if Some(instance.callee) == self.drop_fn_id {
@@ -16283,6 +16736,7 @@ impl<'src> Analyzer<'src> {
             // separately rejected under a resource instantiation, so no
             // delta-resource binding reaches the guarded pair anyway.)
             explicitly_dropped: HashSet::default(),
+            partial_moves: partial_move_roots.clone(),
         };
         self.plan_scope(
             &[],
@@ -16389,7 +16843,7 @@ impl<'src> Analyzer<'src> {
                 ),
             ),
         };
-        let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let site = self.r11_site_span(instance);
         // The primary is the INSTANTIATION site, so it belongs to the file that
         // wrote it — an imported module, not the entry (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
@@ -16398,15 +16852,29 @@ impl<'src> Analyzer<'src> {
             msg: detail,
             source: self.note_source_against(note_anchor, call_source),
         };
+        // B463: a default an impl inherits is planned once, for every type
+        // that inherits it (codegen specializes the body, but its drops are
+        // the unspecialized plan's), so it is in a generic body's position —
+        // but its escape hatch is the impl's own declaration, not a concrete
+        // parameter type.
+        let msg = match instance.site {
+            R11Site::Call => format!(
+                "`{name}` is not move-clean when instantiated with a resource: {summary}, \
+                 and a generic body cannot destroy a `T`; move it out on every path, or \
+                 take a concrete type"
+            ),
+            R11Site::Admission => format!(
+                "the trait default `{name}` is not move-clean when a resource inherits it: \
+                 {summary}, and a trait default cannot destroy a resource `Self` (its teardown \
+                 is planned once, before any implementing type is known); move it out on every \
+                 path, or declare `{name}` in this impl"
+            ),
+        };
         self.push_anchored(
             Error {
                 trace: Vec::new(),
                 span: site,
-                msg: format!(
-                    "`{name}` is not move-clean when instantiated with a resource: {summary}, \
-                     and a generic body cannot destroy a `T`; move it out on every path, or \
-                     take a concrete type"
-                ),
+                msg,
                 note: Some(note),
             },
             instance.call_id,
@@ -16471,7 +16939,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
-        let call_span = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let call_span = self.r11_site_span(instance);
         // The primary is the INSTANTIATION, so it belongs to the caller's file —
         // which is not the entry when the instantiating code was imported (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
@@ -16775,7 +17243,7 @@ impl<'src> Analyzer<'src> {
             Some(rendered) => format!("the resource `{rendered}`"),
             None => "a resource type".to_string(),
         };
-        let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let site = self.r11_site_span(instance);
         // The primary is the INSTANTIATION site: the caller's file (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
         let note = crate::error::Note {
@@ -16842,7 +17310,7 @@ impl<'src> Analyzer<'src> {
             .get(&instance.callee)
             .map(|function| function.name)
             .unwrap_or("this generic");
-        let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let site = self.r11_site_span(instance);
         // The primary is the INSTANTIATION site: the caller's file (B112).
         let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
         let note = crate::error::Note {
@@ -17013,6 +17481,15 @@ impl<'src> Analyzer<'src> {
     /// are not descended into (impl-plan §2 R12); the per-instantiation re-check
     /// of the concrete impl a resource selects is chunk 3's when that impl's own
     /// `self` is the concrete resource.
+    ///
+    /// B463: an INHERITED trait default called on a concrete receiver is not
+    /// residue — the analyzer resolved it to one body, the default's — so a
+    /// receiver that is a resource here instantiates that body with its `Self`
+    /// a resource. An impl whose subject is a resource outright was already
+    /// seeded at its admission (`seed_inherited_default_admissions`), and the
+    /// shared dedup key makes this the per-instantiation remainder: a generic
+    /// subject (`impl Holder<type X> with Wrap`) whose resource-ness this call's
+    /// arguments decide.
     fn r11_discover(
         &mut self,
         call_id: Id,
@@ -17021,6 +17498,19 @@ impl<'src> Analyzer<'src> {
         worklist: &mut VecDeque<R11Instance>,
         enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
     ) {
+        if let Some((callee, receiver, self_marker)) = self.r11_inherited_default_call(call_id) {
+            if self.type_is_resource_with(receiver, current_resources, memo)
+                && enqueued.insert((callee, vec![self_marker]))
+            {
+                worklist.push_back(R11Instance {
+                    callee,
+                    resources: vec![self_marker],
+                    call_id,
+                    site: R11Site::Call,
+                });
+            }
+            return;
+        }
         let Some(callee) = self.r11_direct_callee(call_id) else {
             return;
         };
@@ -17042,7 +17532,372 @@ impl<'src> Analyzer<'src> {
                 callee,
                 resources,
                 call_id,
+                site: R11Site::Call,
             });
+        }
+    }
+
+    /// B469: what an R11 instantiation binds, as far as it is known: the
+    /// concrete type each resource parameter (or trait-default `Self` marker)
+    /// stands for here. An admission binds `Self` to the impl's subject; an
+    /// inherited default's call to its receiver; an ordinary call to its
+    /// recorded arguments (in the CALLER's terms, so a caller's own parameter
+    /// stays unknown). Only the `Drop` question reads it.
+    fn r11_instantiation_types(&self, instance: &R11Instance) -> HashMap<TypeId, TypeId> {
+        let mut known: HashMap<TypeId, TypeId> = HashMap::default();
+        let self_marker = instance.resources.iter().copied().find(|resource| {
+            matches!(self.borrow_type_by_type_id(*resource), Type::Trait(_, arguments) if arguments.is_empty())
+        });
+        match (instance.site, self_marker) {
+            (R11Site::Admission, Some(marker)) => {
+                if let Some(implementation) = self
+                    .implementations
+                    .iter()
+                    .find(|implementation| implementation.impl_id == instance.call_id)
+                {
+                    known.insert(marker, implementation.subject);
+                }
+            }
+            (R11Site::Call, Some(marker)) => {
+                if let Some(GenericDispatch::OnType(Some(receiver), _)) =
+                    self.generic_dispatch.get(&instance.call_id)
+                {
+                    known.insert(marker, *receiver);
+                }
+            }
+            _ => {
+                for (constraint, bound) in
+                    self.r11_call_type_bindings(instance.call_id, instance.callee)
+                {
+                    if instance.resources.contains(&constraint) {
+                        known.insert(constraint, bound);
+                    }
+                }
+            }
+        }
+        known
+    }
+
+    /// B469 (RULED 2026-09-29, door (a)): the resource field places whose
+    /// consuming read is a destructure rather than R5's partial move, each
+    /// mapped to its root binding. Admitted when the place is a pure chain of
+    /// fields / tuple positions over a binding the function OWNS — an `own`
+    /// parameter, or a local that is neither a view, a module-level binding
+    /// nor a capture of a loaned subject — and the root's type has no `Drop`
+    /// anywhere inside it (F56's test), so moving one member out leaves
+    /// nothing whose teardown could run. An element of a list or an array
+    /// (`Index`) is never admitted: that is a container, not an aggregate.
+    fn collect_partial_move_roots(
+        &mut self,
+        resource_value_places: &HashSet<Id>,
+        module_level_bindings: &HashSet<Id>,
+        loaned_captures: &HashMap<Id, Id>,
+        known: &HashMap<TypeId, TypeId>,
+    ) -> HashMap<Id, Id> {
+        let mut roots: HashMap<Id, Id> = HashMap::default();
+        let candidates: Vec<(Id, Id)> = resource_value_places
+            .iter()
+            .filter_map(|place| Some((*place, self.field_chain_root(*place)?)))
+            .collect();
+        if candidates.is_empty() {
+            return roots;
+        }
+        let drop_nominals = self.drop_implementing_nominals();
+        let mut verdicts: HashMap<Id, bool> = HashMap::default();
+        for (place, root) in candidates {
+            let admitted = match verdicts.get(&root) {
+                Some(verdict) => *verdict,
+                None => {
+                    let owned = !module_level_bindings.contains(&root)
+                        && !loaned_captures.contains_key(&root)
+                        && !self.binding_or_param_is_view(root)
+                        && match self.parameters.get(&root) {
+                            Some(parameter) => parameter.convention == Convention::Own,
+                            None => self.variables.contains_key(&root),
+                        };
+                    let verdict = owned
+                        && self.dropped_binding_type_id(root).is_some_and(|type_id| {
+                            !self.type_contains_drop(
+                                type_id,
+                                known,
+                                &drop_nominals,
+                                &mut HashSet::default(),
+                            )
+                        });
+                    verdicts.insert(root, verdict);
+                    verdict
+                }
+            };
+            if admitted {
+                roots.insert(place, root);
+            }
+        }
+        roots
+    }
+
+    /// The binding a place names through fields and tuple positions only
+    /// (`self.up`, `pair.0.inner`), or `None` for any other shape.
+    fn field_chain_root(&self, place: Id) -> Option<Id> {
+        match self.expr_id_to_expr_map.get(&place)? {
+            Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
+                match self.expr_id_to_expr_map.get(subject)? {
+                    Expr::Local(binding) => Some(*binding),
+                    Expr::Field(..) | Expr::TupleIndex(..) => self.field_chain_root(*subject),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `p.a`, `self.inner.up`, `pair.0` — a field chain spelled as written
+    /// (B469's use-after-move names the field it moved).
+    fn field_chain_spelling(&self, place: Id) -> Option<String> {
+        match self.expr_id_to_expr_map.get(&place)? {
+            Expr::Local(binding) => Some(self.binding_name(*binding).to_string()),
+            Expr::Field(subject, struct_id, index) => {
+                let field = self.structs.get(struct_id)?.fields.get(*index)?.name;
+                Some(format!("{}.{field}", self.field_chain_spelling(*subject)?))
+            }
+            Expr::TupleIndex(subject, index, _) => {
+                Some(format!("{}.{index}", self.field_chain_spelling(*subject)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The nominal types that implement `Drop` (B469's and B470's question).
+    fn drop_implementing_nominals(&self) -> HashSet<Id> {
+        let Some(drop_trait_id) = self.drop_trait_id else {
+            return HashSet::default();
+        };
+        self.implementations
+            .iter()
+            .filter(|implementation| implementation.trait_ids.contains(&drop_trait_id))
+            .filter_map(|implementation| self.nominal_id(implementation.subject))
+            .collect()
+    }
+
+    /// Whether a value of this type could run a `Drop` somewhere inside it
+    /// (F56's test, B469/B470). A nominal with a `Drop` impl answers yes; an
+    /// aggregate answers for its (substituted) members. A generic parameter —
+    /// or a trait default's `Self` — answers through what `known` binds it to,
+    /// and yes when nothing does: an unknown type may be one that drops.
+    fn type_contains_drop(
+        &mut self,
+        type_id: TypeId,
+        known: &HashMap<TypeId, TypeId>,
+        drop_nominals: &HashSet<Id>,
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visiting.insert(type_id) {
+            return false;
+        }
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return true;
+        };
+        let (members, context): (Vec<TypeId>, SubstitutionContext) = match self
+            .borrow_type_by_type_id(type_id)
+        {
+            Type::Struct(id, arguments) => {
+                if drop_nominals.contains(id) {
+                    return true;
+                }
+                let Some(struct_) = self.structs.get(id) else {
+                    return false;
+                };
+                (
+                    struct_.fields.iter().map(|field| field.type_id).collect(),
+                    Self::instantiation_context(
+                        &struct_.generic_parameter_constraint_ids,
+                        arguments,
+                    ),
+                )
+            }
+            Type::Enum(id, arguments) => {
+                if drop_nominals.contains(id) {
+                    return true;
+                }
+                let Some(enum_) = self.enums.get(id) else {
+                    return false;
+                };
+                (
+                    enum_
+                        .variants
+                        .iter()
+                        .flat_map(|variant| variant.data_type_ids.iter().copied())
+                        .collect(),
+                    Self::instantiation_context(&enum_.generic_parameter_constraint_ids, arguments),
+                )
+            }
+            Type::Tuple(elements) => (elements.clone(), SubstitutionContext::default()),
+            Type::Array(element, _) => (vec![*element], SubstitutionContext::default()),
+            Type::Generic(constraint) => {
+                let constraint = *constraint;
+                return match known.get(&constraint).copied() {
+                    Some(bound) => self.type_contains_drop(bound, known, drop_nominals, visiting),
+                    None => true,
+                };
+            }
+            Type::Trait(trait_id, arguments) if arguments.is_empty() => {
+                let marker = self.trait_self_markers.get(trait_id).copied();
+                return match marker.and_then(|marker| known.get(&marker).copied()) {
+                    Some(bound) => self.type_contains_drop(bound, known, drop_nominals, visiting),
+                    None => true,
+                };
+            }
+            _ => return false,
+        };
+        for member in members {
+            let member = self.substitute_member(member, &context);
+            if self.type_contains_drop(member, known, drop_nominals, visiting) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Where an R11 instantiation's own diagnostic is spanned: the call, or —
+    /// for a default an impl inherits (B463) — that impl's head, not the whole
+    /// block.
+    fn r11_site_span(&self, instance: &R11Instance) -> Span {
+        match instance.site {
+            R11Site::Call => **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN),
+            R11Site::Admission => self
+                .implementations
+                .iter()
+                .find(|implementation| implementation.impl_id == instance.call_id)
+                .map_or(EMPTY_SPAN, |implementation| implementation.header_span),
+        }
+    }
+
+    /// B463: the trait default a call reaches as an INHERITED member on a
+    /// concrete receiver (`GenericDispatch::OnType(Some(receiver))`, which
+    /// method lookup records for `FoundInheritedDefault` and the Gap E
+    /// fallback alike), with the receiver's type and the declaring trait's
+    /// `Self` marker. `None` for every other call, including a `self`-typed
+    /// call inside a default body (`OnType(None)`): which body that reaches
+    /// is decided per specialization, so it stays residue.
+    fn r11_inherited_default_call(&mut self, call_id: Id) -> Option<(Id, TypeId, TypeId)> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(GenericDispatch::OnType(Some(receiver), _)) = self.generic_dispatch.get(&call_id)
+        else {
+            return None;
+        };
+        let receiver = *receiver;
+        let Some(Expr::Local(member)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let member = *member;
+        if !self
+            .functions
+            .get(&member)
+            .is_some_and(|function| function.has_body)
+        {
+            return None;
+        }
+        let trait_id = self.declaring_trait_of_member(member)?;
+        Some((member, receiver, self.trait_self_marker(trait_id)))
+    }
+
+    /// The trait whose body DECLARES `member` (a default or a requirement).
+    fn declaring_trait_of_member(&self, member: Id) -> Option<Id> {
+        self.traits
+            .values()
+            .find(|trait_| trait_.declared_members.iter().any(|(_, id)| *id == member))
+            .map(|trait_| trait_.id)
+    }
+
+    /// The type a trait default body's `Self` (and `self`) has — the trait
+    /// itself, argument-free (`register_self_type` at the trait's body
+    /// scope). R11 names it in an instance's resource set to say "`Self` is a
+    /// resource here" (B463).
+    fn trait_self_marker(&mut self, trait_id: Id) -> TypeId {
+        if let Some(marker) = self.trait_self_markers.get(&trait_id) {
+            return *marker;
+        }
+        let marker = Type::Trait(trait_id, Vec::new()).get_type_id(self);
+        self.trait_self_markers.insert(trait_id, marker);
+        marker
+    }
+
+    /// B463: seed R11 with every trait default an `impl` whose subject is a
+    /// resource INHERITS. Resource-ness is per instantiation (destruction.md
+    /// §6.8), and for such a subject every instantiation is one, so the
+    /// default's body runs with a resource `Self` whether or not anything calls
+    /// it — the same footing as a body written in that impl, which chunk 3
+    /// checks at its declaration. A default the subject's own impls declare
+    /// (an override, in the trait's block or any other on that subject) is not
+    /// what runs, and is skipped. Seeded in implementation order, so the first
+    /// admitting impl is the one a diagnostic names; the dedup key is shared
+    /// with call discovery, which then adds nothing for the same default.
+    fn seed_inherited_default_admissions(
+        &mut self,
+        worklist: &mut VecDeque<R11Instance>,
+        enqueued: &mut HashSet<(Id, Vec<TypeId>)>,
+    ) {
+        let implementations: Vec<(TypeId, Id, Vec<Id>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| !implementation.trait_ids.is_empty())
+            .map(|implementation| {
+                (
+                    implementation.subject,
+                    implementation.impl_id,
+                    implementation.trait_ids.clone(),
+                )
+            })
+            .collect();
+        for (subject, impl_id, trait_ids) in implementations {
+            if !self.type_is_resource(subject) {
+                continue;
+            }
+            let declared_on_subject: HashSet<&'src str> = self
+                .implementations
+                .iter()
+                .filter(|implementation| implementation.subject == subject)
+                .flat_map(|implementation| implementation.declarations.keys().copied())
+                .collect();
+            let mut chain: Vec<Id> = Vec::new();
+            for trait_id in trait_ids {
+                for (reached, _) in self.trait_with_supertraits_at(trait_id, &[]) {
+                    if !chain.contains(&reached) {
+                        chain.push(reached);
+                    }
+                }
+            }
+            for trait_id in chain {
+                let defaults: Vec<Id> = self
+                    .traits
+                    .get(&trait_id)
+                    .map(|trait_| {
+                        trait_
+                            .declarations
+                            .iter()
+                            .filter(|(name, _)| !declared_on_subject.contains(*name))
+                            .map(|(_, member)| *member)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let self_marker = self.trait_self_marker(trait_id);
+                for member in defaults {
+                    let Some(function) = self.functions.get(&member) else {
+                        continue;
+                    };
+                    if !function.has_body {
+                        continue;
+                    }
+                    if enqueued.insert((member, vec![self_marker])) {
+                        worklist.push_back(R11Instance {
+                            callee: member,
+                            resources: vec![self_marker],
+                            call_id: impl_id,
+                            site: R11Site::Admission,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -17340,8 +18195,9 @@ impl<'src> Analyzer<'src> {
                 ResourceMoveViolation::PartialMove { .. } => (
                     "a resource-typed field is moved out of a live aggregate",
                     format!(
-                        "in `{name}`, a resource field is moved out of a live aggregate here: v1 \
-                         has no partial moves"
+                        "in `{name}`, a resource field is moved out of a live aggregate here, and \
+                         at this instantiation it is no destructure (the aggregate is a loan, or \
+                         may hold a `Drop`)"
                     ),
                 ),
                 ResourceMoveViolation::ConditionalMove { binding, .. } => {
@@ -18388,7 +19244,7 @@ impl<'src> Analyzer<'src> {
         // The written arguments are read here, where the declaring impl is in
         // hand; padding and instantiation happen below, once the immutable
         // borrow of `implementations_by_member` is released.
-        let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = declaring
+        let mut found: Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> = declaring
             .iter()
             .map(|index| &self.implementations[*index])
             .filter(|implementation| {
@@ -18418,14 +19274,29 @@ impl<'src> Analyzer<'src> {
                     })
                     .unwrap_or_default();
                 Some((
-                    member_id,
-                    implementation.subject,
-                    home_trait,
-                    written_arguments,
+                    (
+                        member_id,
+                        implementation.subject,
+                        home_trait,
+                        written_arguments,
+                    ),
+                    self.lookup_admits(implementation, member_name),
                 ))
             })
             .collect();
-        found.extend(self.inheriting_impls_of_declared_homes(subject_type, member_name, &found));
+        let declared: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = found
+            .iter()
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        found.extend(self.inheriting_impls_of_declared_homes(subject_type, member_name, &declared));
+        // B401: the calling file's admission NARROWS the field and never
+        // empties it — with nothing admitted the answer stands, and the
+        // post-build pass refuses it naming the import that declined it.
+        if found.iter().any(|(_, admitted)| *admitted) {
+            found.retain(|(_, admitted)| *admitted);
+        }
+        let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> =
+            found.into_iter().map(|(candidate, _)| candidate).collect();
         found.sort_by_key(|(member_id, ..)| self.declaration_order(*member_id));
         found.dedup_by_key(|(member_id, ..)| *member_id);
         let candidates: Vec<ImplMemberCandidate> = found
@@ -18499,7 +19370,7 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &str,
         declared: &[(Id, TypeId, Option<Id>, Vec<TypeId>)],
-    ) -> Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> {
+    ) -> Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> {
         let homes: Vec<Id> = declared
             .iter()
             .filter_map(|(_, _, home_trait, _)| *home_trait)
@@ -18533,10 +19404,13 @@ impl<'src> Analyzer<'src> {
                     .map(|(_, arguments)| arguments.clone())
                     .unwrap_or_default();
                 Some((
-                    member_id,
-                    implementation.subject,
-                    Some(trait_id),
-                    written_arguments,
+                    (
+                        member_id,
+                        implementation.subject,
+                        Some(trait_id),
+                        written_arguments,
+                    ),
+                    self.lookup_admits(implementation, member_name),
                 ))
             })
             .collect()
@@ -18845,11 +19719,25 @@ impl<'src> Analyzer<'src> {
         // definition-site error (`check_duplicate_inherent_members`); resolution
         // still takes the first in the deterministic order, so that one error
         // does not cascade into a second at every call site.
-        if let Some(inherent) = candidates
+        //
+        // B456 (RULED 2026-09-29, door (b)): the one pair that rule ADMITS — a
+        // blanket beside a constructor-headed subject it claims — is ranked,
+        // not ordered: the constructor-headed subject's member outranks the
+        // blanket's, whichever was declared or loaded first.
+        let inherent = |candidate: &&ImplMemberCandidate| candidate.home_trait.is_none();
+        let blanket = |candidate: &ImplMemberCandidate| {
+            matches!(
+                self.borrow_type_by_type_id(candidate.impl_subject),
+                Type::Generic(_)
+            )
+        };
+        if let Some(winner) = candidates
             .iter()
-            .find(|candidate| candidate.home_trait.is_none())
+            .filter(inherent)
+            .find(|candidate| !blanket(candidate))
+            .or_else(|| candidates.iter().find(inherent))
         {
-            return ImplMemberResolution::Found(inherent.member_id, inherent.impl_subject);
+            return ImplMemberResolution::Found(winner.member_id, winner.impl_subject);
         }
         // Tier 2: trait-provided. A home is `(trait, the arguments THIS receiver
         // instantiates)` — B73's R1. Keying on the trait id alone made std's
@@ -21577,13 +22465,21 @@ impl<'src> Analyzer<'src> {
         member_name: &str,
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
         let mut reached: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
-        for implementation in self.implementations.iter().filter(|implementation| {
-            self.impl_subject_admits(
-                subject_type,
-                implementation.subject.borrow_type(self),
-                &HashMap::default(),
-            )
-        }) {
+        // B401: parallel to `reached` — the providing block's index, and
+        // whether the calling file admits the member from it.
+        let mut providers: Vec<(usize, bool)> = Vec::new();
+        for (index, implementation) in
+            self.implementations
+                .iter()
+                .enumerate()
+                .filter(|(_, implementation)| {
+                    self.impl_subject_admits(
+                        subject_type,
+                        implementation.subject.borrow_type(self),
+                        &HashMap::default(),
+                    )
+                })
+        {
             for trait_id in &implementation.trait_ids {
                 let Some(member_id) = self.method_member_in_trait(*trait_id, member_name) else {
                     continue;
@@ -21610,24 +22506,45 @@ impl<'src> Analyzer<'src> {
                     *trait_id,
                     trait_arguments,
                 ));
+                providers.push((index, self.lookup_admits(implementation, member_name)));
             }
+        }
+        // B401: the calling file's admission narrows first, and never empties
+        // (`impl_member_candidates`' rule): two defaults of one name, one of
+        // them through a block the file declined, are ONE candidate.
+        let mut reached: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> =
+            reached.into_iter().zip(providers).collect();
+        if reached.iter().any(|(_, (_, admitted))| *admitted) {
+            reached.retain(|(_, (_, admitted))| *admitted);
         }
         let mut applying = Vec::with_capacity(reached.len());
         for candidate in &reached {
-            if self.impl_bounds_hold(candidate.1, subject_type) {
+            if self.impl_bounds_hold(candidate.0.1, subject_type) {
                 applying.push(candidate.clone());
             }
         }
-        let mut candidates: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
+        let mut candidates: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> = Vec::new();
         for candidate in match applying.is_empty() {
             true => reached,
             false => applying,
         } {
-            if !candidates.iter().any(|(id, ..)| *id == candidate.0) {
+            if !candidates.iter().any(|((id, ..), _)| *id == candidate.0.0) {
                 candidates.push(candidate);
             }
         }
+        // B401: one candidate, and the file declined the block it comes
+        // through — the answer stands (a lookup never empties), and the
+        // post-build pass refuses the call by name.
+        if let [((member_id, ..), (index, false))] = candidates.as_slice()
+            && let Some(anchor) = self.lookup_anchor
+        {
+            self.declined_default_calls
+                .insert(anchor, (*member_id, *index, member_name.to_string()));
+        }
         candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect()
     }
 
     /// Whether a trait member has a source-provided body (a default method), so
@@ -27609,9 +28526,15 @@ impl<'src> Analyzer<'src> {
                 // CALL in the body is not seen here — B267's call-conservative
                 // reading would copy std's every notify loop (a subscriber is a
                 // call); that is the copy-policy question, left to its ruling.
+                //
+                // B457 (RULED 2026-09-29, R-e door (a)): a write reached THROUGH
+                // A CALL in the body counts too — `for sub in subs.read() {
+                // sub() }` where a subscriber unsubscribes — asked of the
+                // callee's write summary (`call_reaches_an_in_place_write`).
                 Expr::ForEach(iterable_id, _, _) => {
                     if let Some(cell) = self.shared_cells.reads.get(iterable_id).copied()
-                        && self.spans_an_in_place_write(*expr_id, cell)
+                        && (self.spans_an_in_place_write(*expr_id, cell)
+                            || self.spans_a_call_reaching_a_write(*expr_id, cell))
                     {
                         consider(self, *iterable_id, None);
                     }
@@ -27677,7 +28600,29 @@ impl<'src> Analyzer<'src> {
                         let is_shared_read_receiver = parameter.convention == Convention::RefMut
                             && parameter.name == "self"
                             && self.is_shared_read(*argument_id);
-                        if parameter.convention == Convention::Own || is_shared_read_receiver {
+                        // B457 (R-e door (a)): a `Shared::read()` handed BY VALUE
+                        // to a callee that can reach an in-place write of that
+                        // cell would read its own write through the argument
+                        // on JS (the read aliases the cell's storage) and not
+                        // natively (which copies): the argument is a copy.
+                        let read_the_callee_writes = parameter.convention == Convention::Bare
+                            && parameter.name != "self"
+                            && self
+                                .shared_cells
+                                .reads
+                                .get(argument_id)
+                                .copied()
+                                .is_some_and(|cell| {
+                                    self.function_reaches_an_in_place_write(
+                                        callee_id,
+                                        cell,
+                                        &mut HashMap::default(),
+                                    )
+                                });
+                        if parameter.convention == Convention::Own
+                            || is_shared_read_receiver
+                            || read_the_callee_writes
+                        {
                             consider(self, *argument_id, None);
                         }
                     }
@@ -28708,6 +29653,153 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// B457 (RULED 2026-09-29, R-e door (a)): whether a CALL inside
+    /// `expr_id`'s source span can reach an in-place write of `cell` — the
+    /// call-through half of B400's loop test. Spans, for the same reason.
+    fn spans_a_call_reaching_a_write(&self, expr_id: Id, cell: CellSlot) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        let (start, end) = (span.start, span.end);
+        let calls: Vec<Id> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter(|(other_id, other)| {
+                matches!(other, Expr::Call(_))
+                    && **other_id != expr_id
+                    && self.source_of_id(**other_id) == Some(source)
+                    && self.span_map.get(other_id).is_some_and(|other_span| {
+                        other_span.start >= start && other_span.end <= end
+                    })
+            })
+            .map(|(other_id, _)| *other_id)
+            .collect();
+        let mut summaries: HashMap<Id, bool> = HashMap::default();
+        calls
+            .into_iter()
+            .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, &mut summaries))
+    }
+
+    /// B457: whether one call can reach an in-place write of `cell` — the
+    /// callee's WRITE SUMMARY. A function with a body answers for its own span
+    /// and every call in it (memoized per function, and a function already
+    /// being asked answers no, so recursion terminates; its own writes are
+    /// counted where it is first asked). An external writes no vilan cell
+    /// (`Shared::write` IS the write, counted by the span test), and a variant
+    /// builds a value. A dispatched member answers for every body of its name.
+    /// A call through a closure VALUE (a subscriber) is unknown statically,
+    /// and answers whether ANY write mutates the cell in place.
+    fn call_reaches_an_in_place_write(
+        &self,
+        call_id: Id,
+        cell: CellSlot,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        if self.shared_cells.reads.contains_key(&call_id)
+            || self.shared_cells.writes.contains_key(&call_id)
+        {
+            return false;
+        }
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return false;
+        };
+        // A DISPATCHED member reaches whatever any body of that name does —
+        // every impl's declaration and every trait's default (the candidate
+        // set dispatch picks from; `hash` writes no subscriber list).
+        let dispatched_name = [call_id, function_call.subject_id]
+            .iter()
+            .find_map(|id| match self.generic_dispatch.get(id) {
+                Some(GenericDispatch::OnConstraint(_, name) | GenericDispatch::OnType(_, name)) => {
+                    Some(*name)
+                }
+                None => None,
+            });
+        if let Some(name) = dispatched_name {
+            let candidates: Vec<Id> = self
+                .implementations
+                .iter()
+                .filter_map(|implementation| implementation.declarations.get(name).copied())
+                .chain(
+                    self.traits
+                        .values()
+                        .filter_map(|trait_| trait_.declarations.get(name).copied()),
+                )
+                .filter(|member| {
+                    self.functions
+                        .get(member)
+                        .is_some_and(|function| function.has_body)
+                })
+                .collect();
+            return candidates
+                .into_iter()
+                .any(|member| self.function_reaches_an_in_place_write(member, cell, summaries));
+        }
+        match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+            Some(Expr::Local(callee)) => {
+                if self.external_functions.contains_key(callee)
+                    || matches!(
+                        self.expr_id_to_expr_map.get(callee),
+                        Some(Expr::EnumVariant(..))
+                    )
+                {
+                    return false;
+                }
+                if self
+                    .functions
+                    .get(callee)
+                    .is_some_and(|function| function.has_body)
+                {
+                    return self.function_reaches_an_in_place_write(*callee, cell, summaries);
+                }
+                self.shared_cells.mutated.contains(&cell)
+            }
+            _ => self.shared_cells.mutated.contains(&cell),
+        }
+    }
+
+    /// B457: a function's write summary for `cell` — an in-place write inside
+    /// its span, or a call inside it that reaches one.
+    fn function_reaches_an_in_place_write(
+        &self,
+        function_id: Id,
+        cell: CellSlot,
+        summaries: &mut HashMap<Id, bool>,
+    ) -> bool {
+        if let Some(answer) = summaries.get(&function_id) {
+            return *answer;
+        }
+        // In progress: no until proven otherwise (a recursive call adds no
+        // write the function's own span does not already hold).
+        summaries.insert(function_id, false);
+        let answer = self.spans_an_in_place_write(function_id, cell) || {
+            let (Some(source), Some(span)) = (
+                self.source_of_id(function_id),
+                self.span_map.get(&function_id),
+            ) else {
+                return true;
+            };
+            let (start, end) = (span.start, span.end);
+            let calls: Vec<Id> = self
+                .expr_id_to_expr_map
+                .iter()
+                .filter(|(other_id, other)| {
+                    matches!(other, Expr::Call(_))
+                        && self.source_of_id(**other_id) == Some(source)
+                        && self.span_map.get(other_id).is_some_and(|other_span| {
+                            other_span.start >= start && other_span.end <= end
+                        })
+                })
+                .map(|(other_id, _)| *other_id)
+                .collect();
+            calls
+                .into_iter()
+                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, summaries))
+        };
+        summaries.insert(function_id, answer);
+        answer
+    }
+
     /// Every straight-line STATEMENT SEQUENCE in the program — the intervals
     /// [`Self::rebind_orphans_the_read`] may reason about program order over.
     fn statement_sequences(&self) -> Vec<&Vec<Id>> {
@@ -29535,6 +30627,581 @@ impl<'src> Analyzer<'src> {
                 .push(constraint_id);
         }
         constraint_id
+    }
+
+    /// B461's mixed-literal steer: the list literal `literal` lands where its
+    /// element position was written as a bare trait — a parameter's implicit
+    /// generic or a `let` annotation's existential —
+    /// so its elements must all be ONE type, and values of two types need the
+    /// trait object there.
+    fn bare_trait_element_steer(
+        &self,
+        literal: Id,
+        expected_element: Option<&Type>,
+    ) -> Option<String> {
+        let constraint = match expected_element {
+            Some(Type::Generic(constraint)) => *constraint,
+            _ => {
+                let annotation = self.existential_initializers.get(&literal)?;
+                match self.type_id_to_type_map.get(annotation)? {
+                    Type::Struct(_, arguments) => {
+                        match self.type_id_to_type_map.get(arguments.first()?)? {
+                            Type::Generic(constraint) => *constraint,
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        if !self.existential_annotation_holes.contains(&constraint)
+            && !self.implicit_generic_scopes.contains_key(&constraint)
+        {
+            return None;
+        }
+        let Some(Type::Trait(trait_id, arguments)) = self.type_id_to_type_map.get(&constraint)
+        else {
+            return None;
+        };
+        let name = self.traits.get(trait_id)?.name;
+        let bound = self.trait_label_with_arguments(name, arguments);
+        Some(format!(
+            " The elements' type was written `{bound}`, a trait: written inside a type it stands \
+             for ONE type that implements it, so every element must be that type; for elements \
+             of different types write `dyn {bound}` there"
+        ))
+    }
+
+    /// B401: whether the file of the constraint being resolved admits
+    /// `member_name` from `implementation`. `true` outside the fixpoint and
+    /// whenever nothing restricts — the estate's reading.
+    fn lookup_admits(&self, implementation: &Implementation, member_name: &str) -> bool {
+        match (&self.lookup_admission, self.lookup_importer) {
+            (Some(admission), Some(importer)) => {
+                admission.admits(importer, implementation, member_name)
+            }
+            _ => true,
+        }
+    }
+
+    /// The file a constraint's lookups are admitted under: the anchor's own,
+    /// or — for generated code — the file whose attribute generated it (B391's
+    /// rule, `Program::note_source_of`).
+    fn admitting_source_of(&self, anchor: Id) -> Option<SourceId> {
+        match self.source_of_id(anchor)? {
+            DERIVED_SOURCE => self
+                .derived_origins
+                .iter()
+                .find(|(range, _, _)| range.contains(&anchor.0))
+                .map(|(_, _, source)| *source),
+            source => Some(source),
+        }
+    }
+
+    /// B318 S4's export gate, as a set: the blocks a curated module declares
+    /// and does not export. Shared by the lookup's admission (B401) and the
+    /// commit, which hands it to [`build_impl_admission`].
+    fn hidden_impl_blocks(&self) -> HashSet<Id> {
+        self.implementations
+            .iter()
+            .filter(|implementation| {
+                self.curated_modules.contains(&implementation.module_scope)
+                    && !self
+                        .export_all_modules
+                        .contains(&implementation.module_scope)
+                    && !self.exported_entities.contains_key(&implementation.impl_id)
+            })
+            .map(|implementation| implementation.impl_id)
+            .collect()
+    }
+
+    /// Whether a selector reaches a block: the block's subject and the
+    /// selector's type unify in EITHER direction — [`selector_admits`]'s
+    /// reading, over the analyzer's own comparison.
+    fn selector_reaches(&self, impl_subject: TypeId, selector: TypeId) -> bool {
+        let impl_type = impl_subject.get_type(self);
+        let selector_type = selector.get_type(self);
+        self.impl_subject_admits(&selector_type, &impl_type, &HashMap::default())
+            || self.impl_subject_admits(&impl_type, &selector_type, &HashMap::default())
+    }
+
+    /// B401 — the admission map the method lookups read DURING the fixpoint
+    /// ([`LookupAdmission`]), from the rows the import walk banked. The same
+    /// statements, the same files per statement (`statement_sources`, shared
+    /// with the post-build pass) and the same selector test in both
+    /// directions as [`build_impl_admission`] — which still runs after the
+    /// build and owns every diagnostic; this builds only the filter.
+    ///
+    /// Rebuilt per resolve (the pre-entry world's, then the build's), since
+    /// the entry's own statements arrive between them.
+    fn build_lookup_admission(&mut self) {
+        let restricting: HashSet<SourceId> = self
+            .import_impl_restrictions
+            .iter()
+            .filter(|row| row.only.is_some() || !row.selectors.is_empty())
+            .map(|row| row.source)
+            .collect();
+        let hidden = self.hidden_impl_blocks();
+        if restricting.is_empty() && hidden.is_empty() {
+            self.lookup_admission = None;
+            return;
+        }
+        // The statement walk below reads these only for a RESTRICTING file's
+        // statements; a program whose only departure from the estate is a
+        // hidden block (a curated module) skips the index and the paths.
+        let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
+        let mut canonical_sources: Vec<PathBuf> = Vec::new();
+        if !restricting.is_empty() {
+            for (source, span, definition, _) in &self.type_references {
+                if let Some(definition) = definition {
+                    references.entry((*source, *span)).or_insert(*definition);
+                }
+            }
+            canonical_sources = self
+                .source_paths
+                .iter()
+                .map(crate::util::canonical_path)
+                .collect();
+        }
+        let mut source_of_path: HashMap<&Path, SourceId> = HashMap::default();
+        for (position, path) in canonical_sources.iter().enumerate() {
+            source_of_path
+                .entry(path.as_path())
+                .or_insert(SourceId(position as u32));
+        }
+        let mut admitted: HashMap<(SourceId, SourceId), HashMap<Id, Option<Vec<String>>>> =
+            HashMap::default();
+        let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
+        let mut reached: HashSet<(SourceId, Id)> = HashSet::default();
+        for row in &self.import_impl_restrictions {
+            if !hidden.is_empty() {
+                for selector in row.selectors.iter().filter(|selector| selector.reached) {
+                    for implementation in &self.implementations {
+                        if hidden.contains(&implementation.impl_id)
+                            && self.selector_reaches(implementation.subject, selector.subject)
+                        {
+                            reached.insert((row.source, implementation.impl_id));
+                        }
+                    }
+                }
+            }
+            if !restricting.contains(&row.source) {
+                continue;
+            }
+            let sources = statement_sources(
+                |id| self.source_of_id(id),
+                &canonical_sources,
+                &references,
+                &source_of_path,
+                row,
+            );
+            if row.only.is_none() && row.selectors.is_empty() {
+                for module in sources {
+                    unrestricted.insert((row.source, module));
+                }
+                continue;
+            }
+            let mut blocks: HashMap<Id, Option<Vec<String>>> = HashMap::default();
+            for selector in &row.selectors {
+                for implementation in &self.implementations {
+                    if !sources.contains(&implementation.source)
+                        || !self.selector_reaches(implementation.subject, selector.subject)
+                    {
+                        continue;
+                    }
+                    let taken: Option<Vec<String>> = (!selector.members.is_empty()).then(|| {
+                        selector
+                            .members
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect()
+                    });
+                    merge_admitted_block(&mut blocks, implementation.impl_id, taken);
+                }
+            }
+            for module in &sources {
+                let entry = admitted.entry((row.source, *module)).or_default();
+                for (block, taken) in &blocks {
+                    merge_admitted_block(entry, *block, taken.clone());
+                }
+            }
+        }
+        for key in unrestricted {
+            admitted.remove(&key);
+        }
+        self.lookup_admission = Some(LookupAdmission {
+            restricting,
+            admitted,
+            hidden,
+            reached,
+        });
+    }
+
+    /// B471 (RULED 2026-09-29): the did-you-mean a retired `css` member earns
+    /// on std's style values. `css` became the `css { … }` block's keyword in
+    /// v0.38 and the values renamed their `css` members out of its way; since
+    /// B414 S4 the word names a MEMBER again, so an old spelling no longer
+    /// reaches the parser's rename note and lands on the analyzer's ordinary
+    /// miss — which names the rename instead. Keyed on std's own `Length`,
+    /// `Color`, `Style` and `Declarations`: a user type's `css` miss is an
+    /// ordinary one.
+    fn css_rename_steer(&self, subject_type: &Type, member_name: &str) -> Option<String> {
+        if member_name != "css" {
+            return None;
+        }
+        let Type::Struct(struct_id, _) = subject_type else {
+            return None;
+        };
+        let name = self.structs.get(struct_id)?.name;
+        if !matches!(name, "Length" | "Color" | "Style" | "Declarations")
+            || !self
+                .source_of_id(*struct_id)
+                .is_some_and(|source| self.std_sources.contains(&source))
+        {
+            return None;
+        }
+        let meant = match name {
+            "Length" | "Color" => "`.text` (the field) or `Length::raw(…)`",
+            _ => "`.raw(…)`",
+        };
+        Some(format!(
+            "; did you mean {meant}? `css` became the `css {{ … }}` block's keyword, and the \
+             style values' `css` members were renamed out of its way: `Length::css(…)` is now \
+             `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.text`"
+        ))
+    }
+
+    /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for
+    /// a member only the SOURCE trait declares (`get`, and the other reads).
+    /// A pipe is a description consumed once; reading it means sealing it, or
+    /// sampling it once. The trait names are read by name — `PIPE_TRAIT` and
+    /// `SOURCE_TRAIT`, pinned against std's once the pipe layer lands.
+    fn pipe_read_steer(&mut self, subject_type: &Type, member_name: &str) -> Option<String> {
+        const PIPE_TRAIT: &str = "Pipe";
+        const SOURCE_TRAIT: &str = "Source";
+        let pipe_traits: Vec<Id> = self
+            .traits
+            .values()
+            .filter(|trait_| trait_.name == PIPE_TRAIT)
+            .map(|trait_| trait_.id)
+            .collect();
+        if pipe_traits.is_empty() {
+            return None;
+        }
+        let a_source_reads_it = self.traits.values().any(|trait_| {
+            trait_.name == SOURCE_TRAIT && trait_.declarations.contains_key(member_name)
+        });
+        if !a_source_reads_it {
+            return None;
+        }
+        pipe_traits
+            .into_iter()
+            .any(|pipe| self.type_implements_trait(subject_type, pipe))
+            .then(|| {
+                format!(
+                    "; a pipe has no `{member_name}`: seal it with `.memo()`, or read it once \
+                     with `.sample()`"
+                )
+            })
+    }
+
+    /// B460's steer at a tail whose arms disagree: the function returns a
+    /// trait, which is ONE type the body picks — branches of two types are
+    /// the object's job.
+    fn opaque_return_arm_steer(&self, expression_id: Id) -> String {
+        let Some(function_id) = self.opaque_return_tails.get(&expression_id) else {
+            return String::new();
+        };
+        let Some((trait_id, arguments, _)) = self.opaque_returns.get(function_id) else {
+            return String::new();
+        };
+        let name = self
+            .functions
+            .get(function_id)
+            .map(|function| function.name)
+            .unwrap_or("this function");
+        let trait_name = self
+            .traits
+            .get(trait_id)
+            .map(|trait_| trait_.name)
+            .unwrap_or("the trait");
+        let bound = self.trait_label_with_arguments(trait_name, arguments);
+        format!(
+            " `{name}` returns `{bound}`, a trait: that is ONE type the body picks, so every \
+             branch must produce it; for branches of different types return `dyn {bound}`"
+        )
+    }
+
+    /// B460 (RULED 2026-09-29, R-a door (i)): each function returning a bare
+    /// trait — the type its body produced must implement it. That type is
+    /// what callers see (the return is NOT hidden; opacity is a later slice).
+    fn check_opaque_returns(&mut self) {
+        let mut functions: Vec<(Id, Id, Vec<TypeId>, Span)> = self
+            .opaque_returns
+            .iter()
+            .map(|(function_id, (trait_id, arguments, span))| {
+                (*function_id, *trait_id, arguments.clone(), *span)
+            })
+            .collect();
+        functions.sort_by_key(|(function_id, ..)| function_id.0);
+        for (function_id, trait_id, arguments, span) in functions {
+            let produced = self.inferred_return_type_of(function_id);
+            if matches!(
+                produced,
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Never | Type::Trait(..)
+            ) {
+                continue;
+            }
+            if self.satisfies_trait_bound(&produced, trait_id, &arguments, 0) {
+                continue;
+            }
+            let name = self
+                .functions
+                .get(&function_id)
+                .map(|function| function.name)
+                .unwrap_or("this function");
+            let Some(trait_label) = self.bound_trait_label(trait_id, &arguments) else {
+                continue;
+            };
+            let produced_label = self.pretty_print_type(&produced, &HashMap::default());
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "'{produced_label}' does not implement trait '{trait_label}', which \
+                         `{name}` returns: a trait written as a return type is the ONE type the \
+                         body produces, and it must implement the trait (callers see that type — \
+                         the return is not hidden)"
+                    ),
+                },
+                function_id,
+            );
+        }
+    }
+
+    /// B461: the drained arm turns a binding annotation that holds an
+    /// existential into a constraint (the binding grounds from its
+    /// initializer). A tuple or an array annotation is written at the walk and
+    /// never drained, so the same reading is given here, once the drain has
+    /// resolved the elements.
+    fn ground_existential_structural_annotations(&mut self) {
+        if self.existential_annotation_holes.is_empty() {
+            return;
+        }
+        let mut annotations: Vec<(TypeId, Id)> = self
+            .binding_annotation_type_ids
+            .iter()
+            .map(|(type_id, variable_id)| (*type_id, *variable_id))
+            .filter(|(type_id, _)| {
+                matches!(
+                    self.type_id_to_type_map.get(type_id),
+                    Some(Type::Tuple(_) | Type::Array(..))
+                )
+            })
+            .collect();
+        annotations.sort_by_key(|(type_id, _)| type_id.0);
+        for (type_id, variable_id) in annotations {
+            let annotation_type = type_id.get_type(self);
+            if !self.type_holds_existential(&annotation_type) {
+                continue;
+            }
+            let annotation = annotation_type.clone().get_type_id(self);
+            let span = self
+                .variables
+                .get(&variable_id)
+                .map(|variable| variable.name_span)
+                .unwrap_or(EMPTY_SPAN);
+            self.binding_existential_constraints
+                .push((variable_id, annotation, span));
+            if let Some(initial) = self
+                .variables
+                .get(&variable_id)
+                .and_then(|variable| variable.initial)
+            {
+                self.existential_initializers.insert(initial, annotation);
+            }
+            self.write_type_slot(type_id, Type::Unknown);
+        }
+    }
+
+    /// B461: an EXISTENTIAL hole for a bare trait nested in a `let`
+    /// annotation — a `Generic` over the bound that no declaration owns. It
+    /// never becomes a value's type: the binding grounds from its
+    /// initializer, and the hole is only asked "does the grounded type fit".
+    fn mint_existential_hole(&mut self, trait_id: Id, arguments: Vec<TypeId>) -> TypeId {
+        let constraint_id = self.type_id_for_type(Type::Trait(trait_id, arguments));
+        if let Some(trait_) = self.traits.get(&trait_id) {
+            self.generic_constraint_names
+                .insert(constraint_id, trait_.name);
+        }
+        self.existential_annotation_holes.insert(constraint_id);
+        constraint_id
+    }
+
+    /// B461: record every slot NESTED in the annotation whose top slot is
+    /// `top` — generic arguments (through the unqualified-name queue, which is
+    /// where they wait for the drain), tuple and array elements — as standing
+    /// in `owner`'s position. A closure type's parts are not nested positions:
+    /// a trait there keeps the value-position refusal.
+    fn register_nested_annotation(&mut self, top: TypeId, owner: NestedAnnotationOwner) {
+        let mut stack: Vec<TypeId> = self.annotation_child_type_ids(top);
+        let mut seen: HashSet<TypeId> = HashSet::default();
+        while let Some(child) = stack.pop() {
+            if !seen.insert(child) {
+                continue;
+            }
+            self.nested_annotation_owners.insert(child, owner);
+            stack.extend(self.annotation_child_type_ids(child));
+        }
+    }
+
+    /// The slots an annotation's slot `type_id` was written with.
+    fn annotation_child_type_ids(&self, type_id: TypeId) -> Vec<TypeId> {
+        if let Some((.., arguments, _)) = self
+            .prepped_type_locals
+            .iter()
+            .rev()
+            .find(|(slot, ..)| *slot == type_id)
+        {
+            return arguments.clone();
+        }
+        match self.type_id_to_type_map.get(&type_id) {
+            Some(Type::Tuple(elements)) => elements.clone(),
+            Some(Type::Array(element, _)) => vec![*element],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether a type mentions a B461 existential hole anywhere.
+    fn type_holds_existential(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Generic(constraint) => self.existential_annotation_holes.contains(constraint),
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                arguments
+                    .iter()
+                    .any(|argument| self.type_id_holds_existential(*argument))
+            }
+            Type::Tuple(elements) => elements
+                .iter()
+                .any(|element| self.type_id_holds_existential(*element)),
+            Type::Array(element, _) => self.type_id_holds_existential(*element),
+            _ => false,
+        }
+    }
+
+    fn type_id_holds_existential(&self, type_id: TypeId) -> bool {
+        self.type_id_to_type_map
+            .get(&type_id)
+            .is_some_and(|type_| self.type_holds_existential(type_))
+    }
+
+    /// B461: whether an annotation with existential holes admits a grounded
+    /// value type — structurally, each hole met by a type implementing the
+    /// hole's trait (at its arguments, holes and all).
+    fn annotation_admits(&mut self, annotation: TypeId, value: &Type, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let annotation_type = annotation.get_type(self);
+        match (&annotation_type, value) {
+            (Type::Generic(constraint), _)
+                if self.existential_annotation_holes.contains(constraint) =>
+            {
+                match constraint.get_type(self) {
+                    Type::Trait(trait_id, arguments) => {
+                        self.value_satisfies_with_holes(value, trait_id, &arguments)
+                    }
+                    _ => true,
+                }
+            }
+            (Type::Struct(left, left_arguments), Type::Struct(right, right_arguments))
+            | (Type::Enum(left, left_arguments), Type::Enum(right, right_arguments))
+                if left == right && left_arguments.len() == right_arguments.len() =>
+            {
+                let pairs: Vec<(TypeId, TypeId)> = left_arguments
+                    .iter()
+                    .copied()
+                    .zip(right_arguments.iter().copied())
+                    .collect();
+                pairs.into_iter().all(|(wanted, got)| {
+                    let got = got.get_type(self);
+                    self.annotation_admits(wanted, &got, depth + 1)
+                })
+            }
+            (Type::Tuple(wanted), Type::Tuple(got)) if wanted.len() == got.len() => {
+                let pairs: Vec<(TypeId, TypeId)> =
+                    wanted.iter().copied().zip(got.iter().copied()).collect();
+                pairs.into_iter().all(|(wanted, got)| {
+                    let got = got.get_type(self);
+                    self.annotation_admits(wanted, &got, depth + 1)
+                })
+            }
+            (Type::Array(wanted, wanted_length), Type::Array(got, got_length))
+                if wanted_length == got_length =>
+            {
+                let got = got.get_type(self);
+                self.annotation_admits(*wanted, &got, depth + 1)
+            }
+            _ if self.type_holds_existential(&annotation_type) => false,
+            _ => self.compare_type(value, &annotation_type, &HashMap::default()),
+        }
+    }
+
+    /// B461: `value` implements `trait_id` at `arguments`, where the arguments
+    /// may hold existential holes: the trait is implemented, and some impl
+    /// providing it provides arguments the holes admit.
+    fn value_satisfies_with_holes(
+        &mut self,
+        value: &Type,
+        trait_id: Id,
+        arguments: &[TypeId],
+    ) -> bool {
+        if !arguments
+            .iter()
+            .any(|argument| self.type_id_holds_existential(*argument))
+        {
+            return self.satisfies_trait_bound(value, trait_id, arguments, 0);
+        }
+        if !self.type_implements_trait(value, trait_id) {
+            return false;
+        }
+        let providers: Vec<(TypeId, Vec<TypeId>)> = self
+            .implementations
+            .iter()
+            .filter_map(|implementation| {
+                let (_, provided) = implementation
+                    .provided_trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)?;
+                self.impl_subject_admits(
+                    value,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+                .then(|| (implementation.subject, provided.clone()))
+            })
+            .collect();
+        for (provider_subject, written) in providers {
+            let provided =
+                self.instantiated_home_arguments(value, trait_id, &written, provider_subject);
+            if provided.len() != arguments.len() {
+                continue;
+            }
+            let pairs: Vec<(TypeId, TypeId)> = arguments
+                .iter()
+                .copied()
+                .zip(provided.iter().copied())
+                .collect();
+            if pairs.into_iter().all(|(wanted, got)| {
+                let got = got.get_type(self);
+                self.annotation_admits(wanted, &got, 1)
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     /// B261: the FACE an implicit binder wears in an operator or dispatch
@@ -32139,6 +33806,16 @@ impl<'src> Analyzer<'src> {
                 }
                 let return_type_id = return_type_node
                     .map(|return_type| self.walk_type_node(return_type, body_scope_id));
+                // B460: the drain decides whether a bare trait here is an
+                // opaque return (a free fun, an inherent method) or a trait
+                // method's (refused).
+                if let Some(return_type_id) = return_type_id
+                    && !function.external
+                {
+                    let trait_member = self.walking_trait_body || self.walking_trait_impl_body;
+                    self.return_annotation_owners
+                        .insert(return_type_id, (id, trait_member));
+                }
                 if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
                     self.record_type_context_clause(return_type_id, names, body_scope_id, None);
                 }
@@ -32723,6 +34400,7 @@ impl<'src> Analyzer<'src> {
                         // because the name has not resolved yet — whether the
                         // annotation names a trait is the drain's to discover.
                         self.binding_annotation_type_ids.insert(type_id, id);
+                        self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
                         type_id
                     }
                     None => Type::Unknown.get_type_id(self),
@@ -32951,6 +34629,12 @@ impl<'src> Analyzer<'src> {
                             // parameter are the drain's.
                             self.field_annotation_type_ids
                                 .insert(type_id, (id, body_scope_id));
+                            // B461 deliberately registers no NESTED field
+                            // positions: A124 R3 withdrew the top-level field
+                            // reading (a trait at a field is the object, `dyn
+                            // A`), and a nested field mention keeps the same
+                            // refusal and steer rather than reviving B184's
+                            // hidden parameter one level down.
                             type_id
                         }
                         None => Type::Unknown.get_type_id(self),
@@ -33185,6 +34869,12 @@ impl<'src> Analyzer<'src> {
                 None
             }
             Node::Impl(subject, traits, body, labels) => {
+                // B463: the head — `impl R with Wrap`, without the body — for a
+                // note that points at the block rather than covering it.
+                let header_span = Span {
+                    start: node.1.start,
+                    end: traits.last().map_or(subject.1.end, |trait_| trait_.1.end),
+                };
                 // F27 R1: an impl's `[platform(..)]` rides the item labels.
                 if let Some(labels) = labels {
                     self.item_labels.insert(id, (**labels).clone());
@@ -33258,7 +34948,10 @@ impl<'src> Analyzer<'src> {
                 let subject = subject_type_id;
                 let was_walking_member_body = self.walking_member_body;
                 self.walking_member_body = true;
+                let was_walking_trait_impl_body = self.walking_trait_impl_body;
+                self.walking_trait_impl_body = !traits.is_empty();
                 self.walk_expr_nodes(&body.0, body_scope_id);
+                self.walking_trait_impl_body = was_walking_trait_impl_body;
                 self.current_impl_subject_name = outer_impl_subject;
                 self.walking_member_body = was_walking_member_body;
                 let declared_members = self.collect_declared_members(body_scope_id);
@@ -33336,6 +35029,7 @@ impl<'src> Analyzer<'src> {
                 self.implementations.push(Implementation {
                     subject,
                     impl_id: id,
+                    header_span,
                     module_scope: scope_id,
                     source: self.current_source_id,
                     declarations,
@@ -33410,6 +35104,7 @@ impl<'src> Analyzer<'src> {
                         declarations,
                         declared_members,
                         supertraits,
+                        resource: labels.as_ref().is_some_and(|labels| labels.resource),
                     },
                 );
                 Some(Expr::Trait(id))
@@ -33777,6 +35472,10 @@ impl<'src> Analyzer<'src> {
                 if let Some(owner_id) = implicit_generic_owner {
                     self.parameter_annotation_type_ids
                         .insert(type_id, (owner_id, type_scope_id));
+                    self.register_nested_annotation(
+                        type_id,
+                        NestedAnnotationOwner::Parameter(owner_id, type_scope_id),
+                    );
                 }
                 type_id
             }
@@ -36480,8 +38179,182 @@ impl<'src> Analyzer<'src> {
             waiting_on.push(expr_id);
         }
         self.note_callable_coercion(expr_id, constraint, &inferred);
+        self.note_variant_coercion(expr_id, &inferred);
         self.note_dyn_coercion(expr_id, constraint, &inferred, substitution_context);
         inferred
+    }
+
+    /// B462: an expression naming a tuple variant that inferred as a CLOSURE
+    /// is the coercion site — the emitter builds the eta-expansion there. Only
+    /// the reference (`Local`) is recorded; the variant entity itself is
+    /// shared by every mention.
+    fn note_variant_coercion(&mut self, expr_id: Id, inferred: &Type) {
+        let Type::Closure(parameters, _, _) = inferred else {
+            return;
+        };
+        let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return;
+        };
+        let Some(&Expr::EnumVariant(enum_id, variant_index)) = self.expr_id_to_expr_map.get(target)
+        else {
+            return;
+        };
+        let arity = parameters.len();
+        let closure_type = inferred.clone().get_type_id(self);
+        self.variant_coercions
+            .insert(expr_id, (enum_id, variant_index, arity, closure_type));
+    }
+
+    /// B462: the closure type a tuple variant stands for at an expected
+    /// closure type — one parameter per payload, the enum's generics bound
+    /// from the expected parameters and return. `None` when the arity differs
+    /// (the ordinary mismatch then speaks).
+    fn variant_as_closure(
+        &mut self,
+        enum_id: Id,
+        variant_index: usize,
+        expected_parameters: &[TypeId],
+        expected_return: TypeId,
+        substitution_context: &SubstitutionContext,
+    ) -> Option<Type> {
+        let (payload, generics) = {
+            let enum_ = self.enums.get(&enum_id)?;
+            (
+                enum_.variants.get(variant_index)?.data_type_ids.clone(),
+                enum_.generic_parameter_constraint_ids.clone(),
+            )
+        };
+        if payload.len() != expected_parameters.len() {
+            return None;
+        }
+        let mut bound: SubstitutionContext = HashMap::default();
+        for (declared, expected) in payload.iter().zip(expected_parameters) {
+            let declared = declared.get_type(self);
+            let expected = self.substitute_type(&expected.get_type(self), substitution_context);
+            if let Some((_, bindings)) =
+                self.reconcile_type(&declared, &expected, &HashMap::default())
+            {
+                for (generic, value) in bindings {
+                    if generics.contains(&generic) {
+                        bound.entry(generic).or_insert(value);
+                    }
+                }
+            }
+        }
+        let expected_return =
+            self.substitute_type(&expected_return.get_type(self), substitution_context);
+        if let Type::Enum(returned_enum, arguments) = &expected_return
+            && *returned_enum == enum_id
+            && arguments.len() == generics.len()
+        {
+            for (generic, argument) in generics.iter().zip(arguments) {
+                if !matches!(
+                    self.borrow_type_by_type_id(*argument),
+                    Type::Unknown | Type::Generic(_)
+                ) {
+                    bound.entry(*generic).or_insert(*argument);
+                }
+            }
+        }
+        let arguments: Vec<TypeId> = generics
+            .iter()
+            .map(|generic| {
+                bound
+                    .get(generic)
+                    .copied()
+                    .unwrap_or_else(|| Type::Unknown.get_type_id(self))
+            })
+            .collect();
+        let parameters: Vec<TypeId> = payload
+            .iter()
+            .map(|declared| {
+                let declared = declared.get_type(self);
+                self.substitute_type(&declared, &bound).get_type_id(self)
+            })
+            .collect();
+        let returned = Type::Enum(enum_id, arguments).get_type_id(self);
+        Some(Type::Closure(parameters, returned, Vec::new()))
+    }
+
+    /// B462's other half: a TUPLE variant named as a value where no closure is
+    /// expected (`let f = Some;`, `let o: Option<i32> = Some;`) has no payload
+    /// to build — it compiled to the bare tag, a value no pattern can read
+    /// back. Refused where it is written, with both spellings that mean
+    /// something.
+    fn refuse_bare_payload_variants(&mut self) {
+        let call_subjects: HashSet<Id> = self
+            .function_calls
+            .values()
+            .map(|call| call.subject_id)
+            .chain(
+                self.arity_invalid_calls
+                    .iter()
+                    .map(|(_, subject_id)| *subject_id),
+            )
+            .chain(
+                self.written_call_arguments
+                    .iter()
+                    .map(|(_, subject_id, _)| *subject_id),
+            )
+            .collect();
+        let mut sites: Vec<(Id, Id)> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(expr_id, expr)| match expr {
+                Expr::Local(target) => Some((*expr_id, *target)),
+                _ => None,
+            })
+            .filter(|(expr_id, target)| {
+                !call_subjects.contains(expr_id)
+                    && !self.variant_coercions.contains_key(expr_id)
+                    && matches!(
+                        self.expr_id_to_expr_map.get(target),
+                        Some(Expr::EnumVariant(enum_id, index))
+                            if self.enums.get(enum_id).and_then(|enum_| enum_.variants.get(*index))
+                                .is_some_and(|variant| !variant.data_type_ids.is_empty())
+                    )
+            })
+            .collect();
+        sites.sort_by_key(|(expr_id, _)| expr_id.0);
+        for (expr_id, target) in sites {
+            if self.frozen_entity(expr_id) {
+                continue;
+            }
+            let Some(&Expr::EnumVariant(enum_id, index)) = self.expr_id_to_expr_map.get(&target)
+            else {
+                continue;
+            };
+            let Some(variant) = self
+                .enums
+                .get(&enum_id)
+                .and_then(|enum_| enum_.variants.get(index))
+            else {
+                continue;
+            };
+            let name = variant.name;
+            let placeholders: Vec<String> = (0..variant.data_type_ids.len())
+                .map(|position| {
+                    ["x", "y", "z", "w"]
+                        .get(position)
+                        .map_or_else(|| format!("p{position}"), |name| name.to_string())
+                })
+                .collect();
+            let list = placeholders.join(", ");
+            let span = **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{name}` carries a payload, so it is not a value on its own: call it \
+                         (`{name}({list})`), or pass it where a closure is expected, where it \
+                         stands for `|{list}| {name}({list})`"
+                    ),
+                },
+                expr_id,
+            );
+        }
     }
 
     /// A124 R3: record an expression at which a concrete value is erased into a
@@ -36587,26 +38460,17 @@ impl<'src> Analyzer<'src> {
         // choice rather than a gap. Without it, `compute_resource`'s "a `dyn` is
         // never a resource" would be §2.2's destructor suppression wearing a
         // keyword.
+        //
+        // B470 (RULED 2026-09-29): a resource with NO `Drop` anywhere inside it
+        // may be erased into the object of a `[resource] trait` — there is no
+        // teardown to dispatch, and the object is itself move-only. Whether a
+        // `Drop` sits inside is asked after the build
+        // (`refuse_resource_erasures`), when every `impl … with Drop` is on
+        // record; the site is banked here and the pair still built.
         if self.type_is_resource(subject_type_id) {
-            if !self.dyn_refusals_reported.insert(expr_id) {
-                return;
-            }
-            let rendered = self.pretty_print_type(inferred, &HashMap::default());
-            let object = self.pretty_print_type(constraint, &HashMap::default());
-            if let Some(span) = self.span_map.get(&expr_id).map(|span| **span) {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span,
-                    msg: format!(
-                        "`{rendered}` is a resource, so it cannot become a `{object}`: a trait \
-                         object's teardown would have to be dispatched through its table, and \
-                         vilan keeps teardown static (memory.md R7/R10). Holding the resource in \
-                         a struct field of your own is the sanctioned alternative"
-                    ),
-                });
-            }
-            return;
+            let object_type_id = constraint.clone().get_type_id(self);
+            self.resource_erasures
+                .push((expr_id, subject_type_id, object_type_id));
         }
         // B431: a PARAMETER erased here is bound per instance, and Q5 above
         // sees only the parameter. The instantiations are asked after the
@@ -37442,10 +39306,17 @@ impl<'src> Analyzer<'src> {
                                 let expected =
                                     self.pretty_print_type(&element_type, &HashMap::default());
                                 let got = self.pretty_print_type(&item_type, &HashMap::default());
+                                // B461: where the literal lands in a position a
+                                // bare trait was written at (`List<Source<i32>>`),
+                                // the trait stands for ONE type — the steer is
+                                // the object.
+                                let steer = self
+                                    .bare_trait_element_steer(expr_id, expected_element.as_ref())
+                                    .unwrap_or_default();
                                 self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                     span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
-                                        "Expected {expected} (this literal's element type), but got {got} instead."
+                                        "Expected {expected} (this literal's element type), but got {got} instead.{steer}"
                                     ),
                                 });
                             }
@@ -37646,6 +39517,24 @@ impl<'src> Analyzer<'src> {
                     .get(&enum_id)
                     .map(|enum_| enum_.generic_parameter_constraint_ids.len())
                     .unwrap_or(0);
+                // B462: a TUPLE variant named without a call, where a closure
+                // is expected, IS that closure — `|A, B| E<..>`, its generics
+                // taken from the expected type (`Some` against `|i32| U` is
+                // `|i32| Option<i32>`). Anywhere else a payload variant as a
+                // value is refused after the build (`refuse_bare_payload_variants`).
+                if !payload_less
+                    && let Type::Closure(expected_parameters, expected_return, _) =
+                        constraint.as_ref()
+                    && let Some(coerced) = self.variant_as_closure(
+                        enum_id,
+                        *variant_index,
+                        expected_parameters,
+                        *expected_return,
+                        substitution_context,
+                    )
+                {
+                    return coerced;
+                }
                 match (payload_less && parameters > 0, constraint.as_ref()) {
                     (false, _) => Type::Enum(enum_id, Vec::new()),
                     (true, Type::Enum(wanted_id, wanted_arguments))
@@ -37750,6 +39639,23 @@ impl<'src> Analyzer<'src> {
                                 substitution_context,
                                 exprs_seen,
                             );
+                            // B434: a payload that is still waiting on a closure
+                            // parameter's fill (`|v| SignalCell::new(Some(v))`)
+                            // decided nothing YET — typing the construction now
+                            // published an ERASED `Option` that the enclosing
+                            // generic call bound its parameter to for good
+                            // (`and_then`'s `I` became `SignalCell<Option>` and
+                            // its `U` never bound). It waits for the fill, as
+                            // B372's call arguments and B427's destructure do,
+                            // until the fixpoint stalls.
+                            if inferred.is_none()
+                                && !self.fixpoint_stalled
+                                && argument_ids.iter().any(|argument| {
+                                    self.value_awaits_a_closure_parameter(*argument)
+                                })
+                            {
+                                return Type::Unresolved;
+                            }
                             Type::Enum(enum_id, inferred.unwrap_or(arguments))
                         } else {
                             Type::Enum(enum_id, arguments)
@@ -38297,7 +40203,7 @@ impl<'src> Analyzer<'src> {
                             if matches!(inferred, Type::Unresolved) {
                                 return Type::Unresolved;
                             }
-                            inferred
+                            self.arm_erased_to_expected_object(inferred, &constraint)
                         };
                         result = match self.reconcile_type(
                             &result,
@@ -42177,9 +44083,17 @@ impl<'src> Analyzer<'src> {
                 .expr_id_to_scope_id_map
                 .get(&constraint.anchor())
                 .copied();
+            // B401: the file whose admission this constraint's method lookups
+            // read — asked only when some file restricts anything.
+            if self.lookup_admission.is_some() {
+                self.lookup_anchor = Some(constraint.anchor());
+                self.lookup_importer = self.admitting_source_of(constraint.anchor());
+            }
             let diagnostics_before = self.diagnostics.len();
             let resolution = self.try_resolve(&constraint);
             self.rigid_binder_scope = None;
+            self.lookup_importer = None;
+            self.lookup_anchor = None;
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
             self.attribute_diagnostics_to_anchor(diagnostics_before, constraint.anchor());
@@ -44867,9 +46781,19 @@ impl<'src> Analyzer<'src> {
                 // If an UNLOADED std module implements it for this type, the fix
                 // is an import, not a definition (std-surface.md §5 — the
                 // `42.to_string()` complaint that opened I4).
-                let import_steer = self
-                    .unimported_trait_method_steer(&subject_type, member_name)
-                    .unwrap_or_default();
+                // A142 §3.3: a READ on a pipe — the member a `Source` has and a
+                // pipe deliberately does not — is sealed or sampled, and the
+                // import the steer below would offer is the wrong fix.
+                let pipe_read_steer = self
+                    .pipe_read_steer(&subject_type, member_name)
+                    // B471: a style value's retired `css` member names its rename.
+                    .or_else(|| self.css_rename_steer(&subject_type, member_name));
+                let import_steer = match pipe_read_steer {
+                    Some(steer) => steer,
+                    None => self
+                        .unimported_trait_method_steer(&subject_type, member_name)
+                        .unwrap_or_default(),
+                };
                 // A99: one of the six retired `View` methods, whose fix is the
                 // free slot value and not a definition or an import.
                 let retired_slot_steer = self
@@ -48517,7 +50441,7 @@ impl<'src> Analyzer<'src> {
                 if matches!(inferred, Type::Unresolved) {
                     return None;
                 }
-                inferred
+                self.arm_erased_to_expected_object(inferred, &arm_constraint)
             };
             unified = Some(match unified {
                 None => body_type,
@@ -48532,12 +50456,13 @@ impl<'src> Analyzer<'src> {
                                 .get(body_id)
                                 .map(|span| **span)
                                 .unwrap_or(fallback_span);
+                            let steer = self.opaque_return_arm_steer(expression_id);
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
                                 note: None,
                                 span: arm_span,
                                 msg: format!(
-                                    "{construct} have mismatched types: expected {expected}, but got {got} instead."
+                                    "{construct} have mismatched types: expected {expected}, but got {got} instead.{steer}"
                                 ),
                             });
                             current
@@ -48548,6 +50473,127 @@ impl<'src> Analyzer<'src> {
         }
         // No arms at all is `void`, the same value an armless construct has.
         Some(unified.unwrap_or(Type::Void))
+    }
+
+    /// An arm of an `if`/`match` whose expected type is a trait OBJECT is
+    /// erased where it lands — each arm's tail builds its own pair
+    /// (`note_dyn_coercion`) — so for the merge it IS the object. Without
+    /// this, `fun pick(on: bool): dyn Run { if on { A {..} } else { B {..} } }`
+    /// was refused as mismatched arms, although each arm erases on its own
+    /// (A142's selectors, B470's mixed-arm shape). An arm that does not
+    /// implement the trait keeps its own type and meets the mismatch.
+    fn arm_erased_to_expected_object(&mut self, arm: Type, expected: &Type) -> Type {
+        let Type::Dyn(trait_id, _) = expected else {
+            return arm;
+        };
+        match &arm {
+            Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+                if self.type_implements_trait(&arm, *trait_id) =>
+            {
+                expected.clone()
+            }
+            _ => arm,
+        }
+    }
+
+    /// B470 (RULED 2026-09-29): the coercion sites' resource erasures. A
+    /// resource with a `Drop` anywhere inside keeps today's refusal — its
+    /// teardown would have to be dispatched through the table. A `Drop`-free
+    /// one may become the object of a trait declared `[resource]`, and is
+    /// steered there when its trait is not.
+    fn refuse_resource_erasures(&mut self) {
+        let erasures = std::mem::take(&mut self.resource_erasures);
+        for (site, subject, object) in erasures {
+            let Some(refusal) = self.resource_erasure_refusal(subject, object) else {
+                continue;
+            };
+            if !self.dyn_refusals_reported.insert(site) {
+                continue;
+            }
+            let msg = match refusal {
+                ResourceErasureRefusal::UndeclaredTrait => {
+                    self.undeclared_resource_trait_refusal(subject, object)
+                }
+                ResourceErasureRefusal::Drop => {
+                    let rendered =
+                        self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+                    let object =
+                        self.pretty_print_type(&object.get_type(self), &HashMap::default());
+                    format!(
+                        "`{rendered}` is a resource, so it cannot become a `{object}`: a trait \
+                         object's teardown would have to be dispatched through its table, and \
+                         vilan keeps teardown static (memory.md R7/R10). Holding the resource in \
+                         a struct field of your own is the sanctioned alternative"
+                    )
+                }
+            };
+            let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg,
+                },
+                site,
+            );
+        }
+    }
+
+    /// Why a resource of type `subject` may not become the object `object`
+    /// (B470), or `None` when it may: nothing inside it has a `Drop` and the
+    /// object's trait is declared `[resource]`.
+    fn resource_erasure_refusal(
+        &mut self,
+        subject: TypeId,
+        object: TypeId,
+    ) -> Option<ResourceErasureRefusal> {
+        let drop_nominals = self.drop_implementing_nominals();
+        if self.type_contains_drop(
+            subject,
+            &HashMap::default(),
+            &drop_nominals,
+            &mut HashSet::default(),
+        ) {
+            return Some(ResourceErasureRefusal::Drop);
+        }
+        match object.get_type(self) {
+            Type::Dyn(trait_id, _) if self.trait_is_resource(trait_id) => None,
+            _ => Some(ResourceErasureRefusal::UndeclaredTrait),
+        }
+    }
+
+    /// B470's steer: the resource could be erased, but the object's trait
+    /// does not say its objects may hold one.
+    fn undeclared_resource_trait_refusal(&self, subject: TypeId, object: TypeId) -> String {
+        let rendered = self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+        let object_type = object.get_type(self);
+        let object_label = self.pretty_print_type(&object_type, &HashMap::default());
+        let trait_name = match object_type {
+            Type::Dyn(trait_id, _) => self
+                .traits
+                .get(&trait_id)
+                .map(|trait_| trait_.name)
+                .unwrap_or("the trait"),
+            _ => "the trait",
+        };
+        format!(
+            "`{rendered}` is a resource, so it can become a `{object_label}` only when \
+             `{trait_name}` is declared `[resource]`: mark the trait `[resource]` — its trait \
+             objects may hold a resource, and are moved, never copied"
+        )
+    }
+
+    /// B470: whether `dyn` of this trait may hold a resource — THIS trait is
+    /// declared `[resource]`. The attribute is not inherited: a subtrait's
+    /// objects are data unless it declares the attribute itself (A142's
+    /// `Source<T> with Flow<T>` keeps `dyn Source<T>` copyable while `Flow`
+    /// is `[resource]`), and a resource erased into an undeclared subtrait's
+    /// object is steered like any other.
+    fn trait_is_resource(&self, trait_id: Id) -> bool {
+        self.traits
+            .get(&trait_id)
+            .is_some_and(|trait_| trait_.resource)
     }
 
     /// B431 — trait-objects.md §8.3's Q5 at monomorphisation. B412 erases the
@@ -48595,7 +50641,30 @@ impl<'src> Analyzer<'src> {
                         frontier.push((next, depth + 1));
                         continue;
                     }
-                    if !self.type_is_resource(bound) || !reported.insert((call_id, site)) {
+                    if !self.type_is_resource(bound) {
+                        continue;
+                    }
+                    // B470: a `Drop`-free resource erased into a `[resource]`
+                    // trait's object is allowed; into any other trait's it is
+                    // the steer to declare the trait one.
+                    let Some(refusal) = self.resource_erasure_refusal(bound, object) else {
+                        continue;
+                    };
+                    if !reported.insert((call_id, site)) {
+                        continue;
+                    }
+                    if refusal == ResourceErasureRefusal::UndeclaredTrait {
+                        let message = self.undeclared_resource_trait_refusal(bound, object);
+                        let span = **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN);
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            call_id,
+                        );
                         continue;
                     }
                     let rendered = self.pretty_print_type(&bound_type, &HashMap::default());
@@ -50092,7 +52161,17 @@ impl<'src> Analyzer<'src> {
                                 Some(member_name),
                             ),
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!("struct '{}' has no field '{}'", struct_name, member_name),
+                            msg: format!(
+                                "struct '{}' has no field '{}'{}",
+                                struct_name,
+                                member_name,
+                                // B471: a style value's retired `.css` field.
+                                self.css_rename_steer(
+                                    &Type::Struct(struct_id, Vec::new()),
+                                    member_name
+                                )
+                                .unwrap_or_default()
+                            ),
                         });
                         self.expr_id_to_expr_map.insert(id, Expr::Error);
                         Resolution::Failed
@@ -51446,6 +53525,91 @@ impl<'src> Analyzer<'src> {
                                 owner_id,
                                 owner_scope_id,
                             ));
+                        } else if let Some((function_id, false)) =
+                            self.return_annotation_owners.get(&type_id).copied()
+                        {
+                            // B460 (RULED 2026-09-29, R-a door (i)): a bare
+                            // trait returned by a free fun or an inherent
+                            // method is ONE type the callee picks — the
+                            // body's. The function types as if unannotated
+                            // (its return inferred from its body, per
+                            // instantiation), and the body's type is checked
+                            // against the trait after the build. The type is
+                            // NOT hidden from callers; opacity is a later slice.
+                            self.opaque_returns
+                                .insert(function_id, (*trait_id, arguments.clone(), span));
+                            if let Some(function) = self.functions.get_mut(&function_id) {
+                                function.return_type_id = None;
+                            }
+                            let tail = self
+                                .functions
+                                .get(&function_id)
+                                .map(|function| function.body.1);
+                            let mut stack: Vec<Id> = tail.into_iter().collect();
+                            while let Some(tail_id) = stack.pop() {
+                                self.opaque_return_tails.insert(tail_id, function_id);
+                                if let Some(Expr::Block((_, inner))) =
+                                    self.expr_id_to_expr_map.get(&tail_id)
+                                {
+                                    stack.push(*inner);
+                                }
+                            }
+                        } else if let Some((function_id, true)) =
+                            self.return_annotation_owners.get(&type_id).copied()
+                        {
+                            // B460: a TRAIT method's return stays refused —
+                            // the type an impl picks would be the impl's, an
+                            // associated opaque type per impl, which is a
+                            // separate slice after a paper.
+                            let trait_name = self
+                                .traits
+                                .get(trait_id)
+                                .map(|trait_| trait_.name)
+                                .unwrap_or("this trait");
+                            let member = self
+                                .functions
+                                .get(&function_id)
+                                .map(|function| function.name)
+                                .unwrap_or("this method");
+                            self.push_at_written_type(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: format!(
+                                        "'{trait_name}' is a trait, not a type: a TRAIT method \
+                                         cannot return a bare trait yet — each impl would pick its \
+                                         own type, an associated type vilan does not have. Return \
+                                         `dyn {trait_name}` from `{member}` (the object), or a \
+                                         concrete type; a free `fun` or an inherent method may \
+                                         return `{trait_name}` itself"
+                                    ),
+                                },
+                                source_id,
+                                type_id,
+                            );
+                            self.refused_annotation_slots
+                                .insert(type_id, (source_id, span));
+                        } else if let Some(owner) =
+                            self.nested_annotation_owners.get(&type_id).copied()
+                        {
+                            // B461: a bare trait NESTED in an annotation reads
+                            // as its position reads a top-level one — ONE type
+                            // per mention, so every element of a
+                            // `List<Source<i32>>` is the same source type (a
+                            // mixed list is `List<dyn Source<i32>>`).
+                            implicit_generic_id = Some(match owner {
+                                NestedAnnotationOwner::Parameter(owner_id, owner_scope_id) => self
+                                    .mint_implicit_generic(
+                                        *trait_id,
+                                        arguments.clone(),
+                                        owner_id,
+                                        owner_scope_id,
+                                    ),
+                                NestedAnnotationOwner::Binding => {
+                                    self.mint_existential_hole(*trait_id, arguments.clone())
+                                }
+                            });
                         } else {
                             // B184: whether a FIELD is one of the positions
                             // this steer may name depends on the declaration —
@@ -51513,6 +53677,36 @@ impl<'src> Analyzer<'src> {
                     // to the mint above. Both are the same desugaring one level
                     // apart, and both are written here so the one arm that owns
                     // an annotation's slot keeps owning it.
+                    // B461: a binding whose annotation holds an existential
+                    // (a nested bare trait) cannot BE its type — the hole has
+                    // no concrete type of its own — so, as B161's bare trait
+                    // does, it grounds from its initializer and the annotation
+                    // is checked against what it grounded to, after the build.
+                    let existential_binding = bare_trait_id.is_none()
+                        && hidden_field_type.is_none()
+                        && hidden_mention_type.is_none()
+                        && !refused_arity
+                        && self
+                            .binding_annotation_type_ids
+                            .get(&type_id)
+                            .copied()
+                            .filter(|_| self.type_holds_existential(&subject_type))
+                            .inspect(|variable_id| {
+                                let annotation = subject_type.clone().get_type_id(self);
+                                self.binding_existential_constraints.push((
+                                    *variable_id,
+                                    annotation,
+                                    span,
+                                ));
+                                if let Some(initial) = self
+                                    .variables
+                                    .get(variable_id)
+                                    .and_then(|variable| variable.initial)
+                                {
+                                    self.existential_initializers.insert(initial, annotation);
+                                }
+                            })
+                            .is_some();
                     self.write_type_slot(
                         type_id,
                         match (hidden_field_type, hidden_mention_type) {
@@ -51522,6 +53716,7 @@ impl<'src> Analyzer<'src> {
                                 (Some(_), Some(constraint_id)) => Type::Generic(constraint_id),
                                 (Some(_), None) => Type::Unknown,
                                 (None, _) if refused_arity => Type::Unknown,
+                                (None, _) if existential_binding => Type::Unknown,
                                 (None, _) => subject_type,
                             },
                         },
@@ -51720,6 +53915,10 @@ impl<'src> Analyzer<'src> {
         // A124 R3: every `dyn Trait<..>` slot, written once the trait path it
         // wraps has resolved — which is what both drains above have just done.
         self.resolve_dyn_annotations();
+        // B461: a binding annotation whose TOP slot the drain never visits — a
+        // tuple or an array, written at the walk — may hold an existential in
+        // an element; it takes B161's reading the same way the drained ones do.
+        self.ground_existential_structural_annotations();
 
         // Record each `impl … with Trait`'s resolved trait ids (and its `with`
         // reference) BEFORE static access resolves, so the `[trait_only]`
@@ -52182,8 +54381,13 @@ impl<'src> Analyzer<'src> {
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
-                                    "cannot find '{}' in {}{}",
-                                    member_name, subject_str, trait_only_note
+                                    "cannot find '{}' in {}{}{}",
+                                    member_name,
+                                    subject_str,
+                                    trait_only_note,
+                                    // B471: `Length::css(…)`, renamed `raw`.
+                                    self.css_rename_steer(&subject_type, member_name)
+                                        .unwrap_or_default()
                                 ),
                             });
                         }
@@ -52847,6 +55051,10 @@ impl<'src> Analyzer<'src> {
         // part of that type for every substitution and reconcile the solver
         // performs.
         self.resolve_context_clauses();
+        // B401: the admission the lookups below read — after the import drain
+        // (which recorded each statement's path segments) and the type drain
+        // (which typed each selector's subject), before the first lookup.
+        self.build_lookup_admission();
 
         if split_on {
             split.push(("contexts", split_mark.elapsed()));
@@ -55002,7 +57210,18 @@ impl<'src> Analyzer<'src> {
                 }
                 continue;
             }
-            if value.map(|value| value <= bound).unwrap_or(false) {
+            // B428 (RULED 2026-09-29, R-i: the looseness is withdrawn): a
+            // signed type's positive literal tops at 2^(n-1) - 1. The BOUND is
+            // the magnitude, which the minimum needs under its `-` (`-128i8`,
+            // now read with its negation since B407); without one, `128i8`
+            // exceeded `i8::max_value()` and compiled. `i53`'s window is the
+            // symmetric ±2^53, so its bound is its maximum too.
+            let limit = if signed && negation.is_none() && name != "i53" {
+                bound - 1
+            } else {
+                bound
+            };
+            if value.map(|value| value <= limit).unwrap_or(false) {
                 continue;
             }
             let range = if matches!(name, "i53" | "u53" | "usize") {
@@ -55039,6 +57258,11 @@ impl<'src> Analyzer<'src> {
         // non-literal operand (`z - 1` over `z: usize`) is not a constant and
         // is left to the runtime bounds rule (I5 ruling 2).
         self.refuse_negative_unsigned_constants();
+        // B470: the coercion sites' resource erasures, now that every `Drop`
+        // impl is on record.
+        self.refuse_resource_erasures();
+        // B462: a tuple variant named as a value nowhere a closure is expected.
+        self.refuse_bare_payload_variants();
         // B431: Q5 (a `dyn` holds no resource) at every INSTANTIATION of an
         // erased parameter, which the coercion site cannot see.
         self.refuse_resource_parameter_erasures();
@@ -56560,6 +58784,11 @@ struct ResourceOwnership {
     /// release the resource; the emitted pair is made idempotent instead (the
     /// sink empties the slot, the `finally` destroys only a full one).
     explicitly_dropped: HashSet<Id>,
+    /// B469: admitted field moves, place -> root (see `MoveScan`'s field of the
+    /// same name). A consuming read of one spends the root for planning too:
+    /// the aggregate has no `Drop` anywhere inside, so nothing is left to
+    /// destroy once its field has moved on.
+    partial_moves: HashMap<Id, Id>,
 }
 
 /// What `compute_capture_clone_sites` settles about a program's pattern
@@ -56745,6 +58974,11 @@ pub struct Program<'src> {
     /// files wrote, DRAINED by [`build_impl_admission`] after the program is
     /// built. Empty for a program that writes neither.
     pub import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B401: the calls that resolved to an inherited trait default through a
+    /// block their file did not admit (`Analyzer::declined_default_calls`),
+    /// read by [`check_call_site_admission`] — a default's block is not found
+    /// by its declarations.
+    pub declined_default_calls: HashMap<Id, (Id, usize, String)>,
     /// B318 S4: the cross-module inherent collisions, banked at the declaration
     /// and refused at the IMPORT of whichever file admits both
     /// ([`refuse_imported_member_collisions`]).
@@ -56931,6 +59165,9 @@ pub struct Program<'src> {
     pub context_run_fn_id: Option<Id>,
     pub context_get_fn_id: Option<Id>,
     pub context_get_safe_fn_id: Option<Id>,
+    /// B458: `Context::clear`, `run`'s inverse — its body runs with the
+    /// context NOT established.
+    pub context_clear_fn_id: Option<Id>,
     // The `std::task` nursery machinery (if `task.vl` loaded): the
     // `ambient_nursery` context binding and the `nursery` function. The
     // context threading pass treats every spawn (`Expr::Async`) as a SAFE
@@ -57269,6 +59506,9 @@ pub struct Program<'src> {
     /// in the program — the vtable's slot set (§6.2's reachability).
     pub dyn_dispatched_members: HashSet<(Id, &'src str)>,
     pub callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// B462: references to a tuple variant standing for a closure, as
+    /// `(enum, variant, arity, the closure type)` — eta-expanded at the site.
+    pub variant_coercions: HashMap<Id, (Id, usize, usize, TypeId)>,
     /// A124 R3: the recorded `dyn` coercion sites — expression id to the type
     /// being erased. The emitter builds one `(value, vtable)` pair per entry.
     pub dyn_coercions: HashMap<Id, (TypeId, Id, Vec<TypeId>)>,
@@ -65009,6 +67249,7 @@ fn analyze_inner<'src>(
         entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
     let phase_base_start = crate::PhaseClock::now();
     if !entry_is_module && !entry_is_open_module {
+        analyzer.source_paths = sources.clone();
         analyzer.resolve_world();
     }
     let phase_base = phase_base_start.elapsed();
@@ -65165,6 +67406,10 @@ fn analyze_over_world<'src>(
     // key, so a stored world's value is another call's.
     analyzer.platform = platform;
     analyzer.platform_reason = workspace.platform_reason.clone();
+    // B401: the admission the build's lookups read climbs a module's ANCESTOR
+    // files by path — this call's paths, since a cached world's entry is
+    // another call's (`sources[0]` is re-pointed on the hit path).
+    analyzer.source_paths = sources.clone();
     analyzer.prelude_repair = workspace.prelude_repair;
     if !crate::macros::in_macro_world() {
         SERVED_FROM_BASE_CACHE.with(|served| served.set(from_base_cache));
@@ -65506,6 +67751,8 @@ fn analyze_over_world<'src>(
         // B161's binding-position twin of the bound check above, in the same place
         // and for the same reason: every binding's type has settled by here.
         analyzer.check_binding_trait_constraints();
+        analyzer.check_binding_existential_constraints();
+        analyzer.check_opaque_returns();
         analyzer.check_binding_hidden_nominal_constraints();
         // B251's twin of the bound check above, at the third binding channel:
         // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).
@@ -65668,6 +67915,7 @@ fn analyze_over_world<'src>(
     let mut context_run_fn_id: Option<Id> = None;
     let mut context_get_fn_id: Option<Id> = None;
     let mut context_get_safe_fn_id: Option<Id> = None;
+    let mut context_clear_fn_id: Option<Id> = None;
     if let Some(context_struct_id) = context_struct_id {
         for implementation in &analyzer.implementations {
             let subject_is_context = matches!(
@@ -65695,6 +67943,11 @@ fn analyze_over_world<'src>(
                     .get("get_safe")
                     .copied()
                     .or(context_get_safe_fn_id);
+                context_clear_fn_id = implementation
+                    .declarations
+                    .get("clear")
+                    .copied()
+                    .or(context_clear_fn_id);
             }
         }
     }
@@ -66537,22 +68790,7 @@ fn analyze_over_world<'src>(
     // the whole estate: a module with NO marker offers everything, exactly as
     // it did before B318 (`visibility.md` §14), so a package that has not
     // curated loses nothing.
-    let hidden_impls_pending: HashSet<Id> = analyzer
-        .implementations
-        .iter()
-        .filter(|implementation| {
-            analyzer
-                .curated_modules
-                .contains(&implementation.module_scope)
-                && !analyzer
-                    .export_all_modules
-                    .contains(&implementation.module_scope)
-                && !analyzer
-                    .exported_entities
-                    .contains_key(&implementation.impl_id)
-        })
-        .map(|implementation| implementation.impl_id)
-        .collect();
+    let hidden_impls_pending: HashSet<Id> = analyzer.hidden_impl_blocks();
 
     // B318 (E178): the visibility answers the walk already has, for vilan-ide's
     // completion filters. `export *;` marks the MODULE rather than each of its
@@ -66629,6 +68867,7 @@ fn analyze_over_world<'src>(
         global_scope_id,
         implementations: analyzer.implementations,
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
+        declined_default_calls: std::mem::take(&mut analyzer.declined_default_calls),
         cross_module_collisions: std::mem::take(&mut analyzer.cross_module_collisions),
         blanket_residues: std::mem::take(&mut analyzer.blanket_residues),
         scoped_reach_checks: std::mem::take(&mut analyzer.scoped_reach_checks),
@@ -66666,6 +68905,7 @@ fn analyze_over_world<'src>(
         context_run_fn_id,
         context_get_fn_id,
         context_get_safe_fn_id,
+        context_clear_fn_id,
         nursery_ambient_id,
         nursery_fn_id,
         owned_nursery_enter_fn_id,
@@ -66730,6 +68970,7 @@ fn analyze_over_world<'src>(
         tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
+        variant_coercions: std::mem::take(&mut analyzer.variant_coercions),
         dyn_coercions: std::mem::take(&mut analyzer.dyn_coercions),
         dyn_tuple_coercions: std::mem::take(&mut analyzer.dyn_tuple_coercions),
         dyn_method_calls: std::mem::take(&mut analyzer.dyn_method_calls),
@@ -67043,7 +69284,13 @@ pub fn build_impl_admission(program: &mut Program) {
         if !restricting.contains(&row.source) && collisions.is_empty() {
             continue;
         }
-        let sources = statement_sources(program, &references, &source_of_path, row);
+        let sources = statement_sources(
+            |id| program.source_of(id),
+            &program.canonical_sources,
+            &references,
+            &source_of_path,
+            row,
+        );
         if !collisions.is_empty() {
             // M77: only a COLLIDING block's file can be asked for, so only
             // those are kept — and a statement that carried none of them
@@ -67087,6 +69334,17 @@ pub fn build_impl_admission(program: &mut Program) {
                         || selector.members.iter().any(|(taken, _)| taken == name)
                     {
                         members.push(*member_id);
+                    }
+                }
+                // B455: the defaults the block INHERITS are members it
+                // provides too, so a default-only `impl Box with One {}` is a
+                // block `(impl Box)` names, and `(impl Box)::describe` takes
+                // the default it inherits.
+                for (name, member_id) in inherited_default_members(program, implementation) {
+                    if selector.members.is_empty()
+                        || selector.members.iter().any(|(taken, _)| *taken == name)
+                    {
+                        members.push(member_id);
                     }
                 }
             }
@@ -67549,11 +69807,13 @@ fn module_stem(program: &Program, source: SourceId) -> String {
 /// B318 S3/S4 — the refusal a CALL earns when the method it resolved to comes
 /// from an `impl` the calling file did not admit.
 ///
-/// The analyzer's own method lookup ([`Analyzer::impl_member_candidates`]) runs
-/// during the walk, where the admission map does not exist yet: the question a
-/// selector asks is `impl_select::subject_applies`, which reads a FINISHED
-/// program. So the lookup stays program-wide and the call is corrected here —
-/// which is also where the message can name the selector that would fix it.
+/// The analyzer's own method lookup ([`Analyzer::impl_member_candidates`],
+/// and the inherited-default scan) NARROWS by the file's admission since B401
+/// ([`LookupAdmission`]) — but never empties: when no admitted block offers the
+/// name, the lookup keeps its answer and the call is refused here, which is
+/// where the message can name the selector that would fix it. A declared
+/// member's block is found by its declarations; an inherited default's is the
+/// one the lookup recorded (`Program::declined_default_calls`).
 /// The per-importer namespace proper ([`ImplAdmission`], read by
 /// `dispatch_refine` and by emission's `impl_select`) is the same map asked by
 /// the consumers that DO run after the build.
@@ -67562,6 +69822,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         return;
     }
     let residues = std::mem::take(&mut program.blanket_residues);
+    let declined = std::mem::take(&mut program.declined_default_calls);
     let ImplAdmission {
         restricting,
         admitted: restricted,
@@ -67595,8 +69856,18 @@ pub fn check_call_site_admission(program: &mut Program) {
         let Some(Expr::Local(member_id)) = program.entity_map.get(&function_call.subject_id) else {
             continue;
         };
-        let Some(index) = declaring.get(member_id).copied() else {
-            continue;
+        // B401: an inherited DEFAULT is declared by its trait, not by the
+        // block that provides it — so its block is the one the lookup recorded
+        // when the file had declined it, and a call it did not record was
+        // admitted.
+        let (index, inherited_name) = match declaring.get(member_id).copied() {
+            Some(index) => (index, None),
+            None => match declined.get(call_id) {
+                Some((declined_member, index, name)) if declined_member == member_id => {
+                    (*index, Some(name.as_str()))
+                }
+                _ => continue,
+            },
         };
         let implementation = &program.implementations[index];
         // B330's refusal, decided HERE because only the site knows the
@@ -67685,6 +69956,7 @@ pub fn check_call_site_admission(program: &mut Program) {
             .iter()
             .find(|(_, id)| *id == member_id)
             .map(|(name, _)| *name)
+            .or(inherited_name)
             .unwrap_or("the member");
         let module = module_stem(program, implementation.source);
         // The EXPORT gate first (B318 S4, RULED 2026-09-13): a block its module
@@ -67761,7 +70033,8 @@ pub fn check_call_site_admission(program: &mut Program) {
 /// on the way, and probe P7's whole point is that an intermediate module's
 /// `impl` arrives with it. `only` declines the lot.
 fn statement_sources(
-    program: &Program,
+    source_of: impl Fn(Id) -> Option<SourceId>,
+    canonical_sources: &[PathBuf],
     references: &HashMap<(SourceId, Span), Id>,
     source_of_path: &HashMap<&Path, SourceId>,
     restriction: &ImportImplRestriction,
@@ -67771,15 +70044,18 @@ fn statement_sources(
         let Some(definition) = references.get(&(restriction.source, *span)).copied() else {
             continue;
         };
-        let Some(home) = program.source_of(definition) else {
+        let Some(home) = source_of(definition) else {
             continue;
         };
         if home != restriction.source && !sources.contains(&home) {
             sources.push(home);
         }
-        for ancestor in
-            ancestor_module_sources(program, source_of_path, home, restriction.path_spans.len())
-        {
+        for ancestor in ancestor_module_sources(
+            canonical_sources,
+            source_of_path,
+            home,
+            restriction.path_spans.len(),
+        ) {
             if ancestor != restriction.source && !sources.contains(&ancestor) {
                 sources.push(ancestor);
             }
@@ -67807,13 +70083,13 @@ fn statement_sources(
 /// would eventually reach a package's entry file, which no import of a module
 /// under it loads.
 fn ancestor_module_sources(
-    program: &Program,
+    canonical_sources: &[PathBuf],
     source_of_path: &HashMap<&Path, SourceId>,
     source: SourceId,
     bound: usize,
 ) -> Vec<SourceId> {
     let mut found = Vec::new();
-    let Some(start) = program.canonical_sources.get(source.0 as usize) else {
+    let Some(start) = canonical_sources.get(source.0 as usize) else {
         return found;
     };
     let mut current = start.clone();
@@ -67848,6 +70124,67 @@ fn ancestor_module_sources(
         current = hit;
     }
     found
+}
+
+/// B455: the trait DEFAULTS a block inherits — each member with a body that a
+/// trait the block provides (the clause's traits and their supertraits,
+/// `provided_trait_args`) declares and the block itself does not.
+fn inherited_default_members(
+    program: &Program,
+    implementation: &Implementation,
+) -> Vec<(String, Id)> {
+    let mut found: Vec<(String, Id)> = Vec::new();
+    let traits = implementation.trait_ids.iter().chain(
+        implementation
+            .provided_trait_args
+            .iter()
+            .map(|(trait_id, _)| trait_id),
+    );
+    for trait_id in traits {
+        let Some(trait_) = program.traits.get(trait_id) else {
+            continue;
+        };
+        for (name, member_id) in &trait_.declarations {
+            if implementation.declarations.contains_key(name)
+                || found.iter().any(|(seen, _)| seen == name)
+            {
+                continue;
+            }
+            let has_body = matches!(
+                program.entity_map.get(member_id),
+                Some(Expr::Function(function_id))
+                    if program.functions.get(function_id).is_some_and(|function| function.has_body)
+            );
+            if has_body {
+                found.push(((*name).to_string(), *member_id));
+            }
+        }
+    }
+    found
+}
+
+/// Folds one selector's claim on a block into what the statement admitted
+/// from it: a whole-block claim (`None`) absorbs any tail, and two tails
+/// union.
+fn merge_admitted_block(
+    blocks: &mut HashMap<Id, Option<Vec<String>>>,
+    block: Id,
+    taken: Option<Vec<String>>,
+) {
+    match (blocks.get_mut(&block), taken) {
+        (None, taken) => {
+            blocks.insert(block, taken);
+        }
+        (Some(whole @ Some(_)), None) => *whole = None,
+        (Some(Some(names)), Some(more)) => {
+            for name in more {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        (Some(None), _) => {}
+    }
 }
 
 /// Whether a selector admits an implementation: the implementation's subject
@@ -68666,6 +71003,7 @@ pub fn check_unlowered_externals(program: &mut Program) {
         program.context_run_fn_id,
         program.context_get_fn_id,
         program.context_get_safe_fn_id,
+        program.context_clear_fn_id,
         program.nursery_fn_id,
         program.owned_nursery_enter_fn_id,
     ];

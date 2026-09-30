@@ -543,15 +543,15 @@ function $P(self, $Q) {
 	let $S = null;
 	if ($R[0] === 0) {
 		const turn2 = $R[1];
-		$S = enqueue(turn2, self[1].v);
+		$S = enqueue(turn2, __clone(self[1].v));
 	} else {
 		const $Y = $V(draining_turns.v);
 		let $Z = null;
 		if ($Y[0] === 0) {
 			const draining = $Y[1];
-			$Z = enqueue(draining, self[1].v);
+			$Z = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}

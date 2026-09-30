@@ -537,10 +537,16 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   only — R7 reads the arms against each other, so producing a different
   binding from each arm is a conditional move, not two independent returns.
 - **R5: fields.** A struct literal moves resources in. A resource field is
-  read only by loan (`self.db.exec(..)`, `&mut self.db`); moving it out of a
-  live aggregate is rejected; v1 has no partial moves. The sanctioned
-  partial move is `Option` (below). Writing *over* a resource field is
-  permitted, and is R2's overwrite: the outgoing value is destroyed first.
+  read by loan (`self.db.exec(..)`, `&mut self.db`). Moving a field *out*
+  is a **destructure** when the aggregate is one this function OWNS (an
+  `own` parameter or an owned local) and its type has no `Drop` anywhere
+  inside it: the move spends the whole aggregate, so any later use of it,
+  or of one of its other fields, is a use after move (`let tag = p.tag;
+  sink(p.a);` is the order that works). Out of a loan, or out of an
+  aggregate with a `Drop` inside, moving a field is rejected — there the
+  sanctioned partial move is `Option` (below). Writing *over* a resource
+  field is permitted, and is R2's overwrite: the outgoing value is
+  destroyed first.
 - **R6: match consumes.** Matching a resource *by value* consumes the
   subject; pattern captures move the payloads into the arm, and each capture
   **owns** what it took — it is destroyed at its last use inside the arm that
@@ -632,6 +638,16 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   at the instantiation site. The consequence worth stating: a combinator that
   hands a payload to a closure and then discards it — the closure only *loans*
   it — cannot be resource-clean, whatever its receiver convention.
+
+  A **trait default** is in the same position for its `Self`: its body is
+  written once for every implementing type, so an impl whose subject is a
+  resource inherits a body whose `self` is one. It is checked under that
+  instantiation at the impl that inherits it, called or not, and a move
+  violation there is refused with the words a body written in the impl would
+  get ("declare it `own self`"), noting the impl; an `own self` default must
+  move `self` out on every path. When the subject is a resource only for some
+  arguments (`impl Box<type X> with Wrap` at `Box<Guard>`), the call that
+  makes it one is the instantiation site, as for any generic.
 
   Read the same sentence at R2's seam and it reaches **writes**, not only
   scope ends. Overwriting a `T`-typed place destroys the outgoing value, and a

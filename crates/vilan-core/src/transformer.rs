@@ -4620,7 +4620,129 @@ impl<'src> Transformer<'src> {
         node
     }
 
+    /// B452: walk sibling expressions — a call's arguments (the receiver
+    /// first), a list's or a tuple's elements, a struct literal's fields as
+    /// written, a binary operator's operands — so that JS evaluates them in
+    /// the order vilan does. A sibling that lowers to STATEMENTS (a block, an
+    /// `if` or `match` in value position, a `?` lift) pushes them into the
+    /// enclosing block, which runs them before the whole expression — ahead
+    /// of the siblings written before it, which is how `f(a(), { b(); c() })`
+    /// ran `b` before `a`, and `add(x, { x = 10; x })` read the new `x` twice.
+    /// So when one does, every EARLIER sibling whose value is not already
+    /// settled is first bound to a `const`, in order, and the statements
+    /// follow. A walk where no sibling needs statements emits exactly as the
+    /// plain one did.
+    fn walk_siblings_in_order<F>(
+        &mut self,
+        ids: &[Id],
+        block: &mut Vec<js::Node<'src>>,
+        mut walk_one: F,
+    ) -> Vec<(Id, js::Node<'src>)>
+    where
+        F: FnMut(&mut Self, Id, &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>>,
+    {
+        // Each entry carries whether it is already a `const` of our own, so a
+        // third sibling's statements never re-spill what a second's did.
+        let mut walked: Vec<(Id, js::Node<'src>, bool)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let mut statements = Vec::new();
+            let mark = self.pending_temporaries.len();
+            let node = walk_one(self, id, &mut statements);
+            if !statements.is_empty() {
+                for (earlier_id, earlier, spilled) in walked.iter_mut() {
+                    if *spilled || self.sibling_value_is_settled(*earlier_id, earlier) {
+                        continue;
+                    }
+                    let temp = self.ng.next_name();
+                    let value = std::mem::replace(earlier, js::Node::Local(temp.clone()));
+                    block.push(js::Node::ConstVariable(js::Variable {
+                        name: temp,
+                        value: Box::new(value),
+                    }));
+                    *spilled = true;
+                }
+                // A resource temporary this sibling lifted (C11) recorded
+                // where its `const` landed in `statements`; it lands in
+                // `block` at this offset, which is where its statement's
+                // `finally` must find it.
+                let offset = block.len();
+                for pending in &mut self.pending_temporaries[mark..] {
+                    pending.at += offset;
+                }
+                block.extend(statements);
+            }
+            if let Some(node) = node {
+                walked.push((id, node, false));
+            }
+        }
+        walked.into_iter().map(|(id, node, _)| (id, node)).collect()
+    }
+
+    /// Whether an already-lowered sibling reads the same whenever it is
+    /// evaluated (B452), so a later sibling's statements need not spill it:
+    /// a literal, a closure (creating one runs nothing), a name no statement
+    /// can reassign — an immutable `let`, a by-value parameter that is not
+    /// `mut`, a function — or the temporary a sibling's OWN lowering bound
+    /// its value to (an `if`/`match` in value position lands in its result
+    /// temp, a `?` in its subject temp's payload slot; a block answers for
+    /// its tail). Anything else — a call, a read of a `mut` binding or a
+    /// place inside one — might differ, so it is spilled.
+    fn sibling_value_is_settled(&self, id: Id, node: &js::Node<'src>) -> bool {
+        if matches!(
+            node,
+            js::Node::Number(..)
+                | js::Node::String(_)
+                | js::Node::Bool(_)
+                | js::Node::Null
+                | js::Node::Void
+                | js::Node::Closure(_)
+        ) {
+            return true;
+        }
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) if matches!(node, js::Node::Local(_)) => {
+                if let Some(variable) = self.program.variables.get(binding) {
+                    !variable.mutable
+                } else if let Some(parameter) = self.program.parameters.get(binding) {
+                    !parameter.mutable && parameter.convention != Convention::RefMut
+                } else {
+                    true
+                }
+            }
+            Some(Expr::If(_) | Expr::Match(..)) => matches!(node, js::Node::Local(_)),
+            Some(Expr::TryAssert(_)) => match node {
+                js::Node::Local(_) => true,
+                js::Node::PropertyIndex(subject, index) => {
+                    matches!(**subject, js::Node::Local(_))
+                        && matches!(**index, js::Node::Number(..))
+                }
+                _ => false,
+            },
+            Some(Expr::Block((_, tail))) => self.sibling_value_is_settled(*tail, node),
+            _ => false,
+        }
+    }
+
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
+        // B462: a tuple variant standing for a closure is its eta-expansion,
+        // `(a, b) => variant(a, b)`, built at the site.
+        if let Some(&(enum_id, variant_index, arity, _)) = self.program.variant_coercions.get(&id) {
+            let names: Vec<String> = (0..arity).map(|_| self.ng.next_name()).collect();
+            let data = names
+                .iter()
+                .map(|name| js::Node::Local(name.clone()))
+                .collect();
+            let value = self.variant_value(enum_id, variant_index, data);
+            return Some(js::Node::Closure(js::Closure {
+                parameters: names
+                    .into_iter()
+                    .map(|name| js::Parameter { name })
+                    .collect(),
+                body: vec![js::Node::Return(Box::new(value))],
+                is_async: false,
+                origin: None,
+            }));
+        }
         let node = self.walk_entity_seams(id, block)?;
         // B340 Q1: a `Callable` value in a closure-typed position. A struct is
         // a plain JS array — it cannot be applied — so the coercion IS the
@@ -5029,24 +5151,30 @@ impl<'src> Transformer<'src> {
             }
             Expr::Call(id) => {
                 let function_call = self.program.function_calls.get(id).unwrap().clone();
-                let args = function_call
-                    .argument_ids
-                    .iter()
-                    .filter_map(|arg| {
-                        // lazy.md §1: an argument standing in a `lazy` position
-                        // is not evaluated here at all — it is packaged, or it
-                        // forwards a cell it already holds. Both answers are
-                        // built whole, so neither passes through `maybe_clone`:
-                        // a memo cell is an identity, and copying one would give
-                        // the callee a second memo of the same thunk.
-                        if let Some(cell) = self.lazy_argument(*arg) {
-                            return Some(cell);
-                        }
-                        // An argument to an `own` parameter is copied (marked in
-                        // `clone_sites`), like a binding copy.
-                        self.walk_entity(*arg, block)
-                            .map(|node| self.maybe_clone(*arg, node))
-                    })
+                // B452: in source order, an argument that needs statements
+                // spilling the ones before it.
+                let args = self
+                    .walk_siblings_in_order(
+                        &function_call.argument_ids,
+                        block,
+                        |this, arg, block| {
+                            // lazy.md §1: an argument standing in a `lazy` position
+                            // is not evaluated here at all — it is packaged, or it
+                            // forwards a cell it already holds. Both answers are
+                            // built whole, so neither passes through `maybe_clone`:
+                            // a memo cell is an identity, and copying one would give
+                            // the callee a second memo of the same thunk.
+                            if let Some(cell) = this.lazy_argument(arg) {
+                                return Some(cell);
+                            }
+                            // An argument to an `own` parameter is copied (marked in
+                            // `clone_sites`), like a binding copy.
+                            this.walk_entity(arg, block)
+                                .map(|node| this.maybe_clone(arg, node))
+                        },
+                    )
+                    .into_iter()
+                    .map(|(_, node)| node)
                     .collect::<Vec<_>>();
 
                 // `T::member()` inside a monomorphized body: dispatch directly
@@ -5740,8 +5868,7 @@ impl<'src> Transformer<'src> {
                     }
                 }
             }
-            Expr::Binary(op, lhs, rhs) => {
-                let lhs = self.walk_entity(*lhs, block).unwrap_or(js::Node::Void);
+            Expr::Binary(op, lhs_id, rhs_id) => {
                 // B224: `&&` and `||` are the only operators whose right
                 // operand may not run at all, and the emitter had no statement
                 // slot for a condition — so a right operand that lowers to
@@ -5761,10 +5888,11 @@ impl<'src> Transformer<'src> {
                 // and `concat_render_dispatch` never hold one), and they are
                 // neither bitwise nor division.
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let lhs = self.walk_entity(*lhs_id, block).unwrap_or(js::Node::Void);
                     let mark = self.pending_temporaries.len();
                     let mut scratch = Vec::new();
                     let t_rhs = self
-                        .walk_entity(*rhs, &mut scratch)
+                        .walk_entity(*rhs_id, &mut scratch)
                         .unwrap_or(js::Node::Void);
                     // The overwhelmingly common case — a right operand that
                     // needed no statement — emits exactly as it always did,
@@ -5774,7 +5902,16 @@ impl<'src> Transformer<'src> {
                     }
                     return Some(self.emit_short_circuit(*op, lhs, t_rhs, scratch, mark, block));
                 }
-                let mut rhs = self.walk_entity(*rhs, block).unwrap_or(js::Node::Void);
+                // B452: the left operand runs first, so a right operand that
+                // needs statements spills it ahead of them.
+                let mut operands = self
+                    .walk_siblings_in_order(&[*lhs_id, *rhs_id], block, |this, id, block| {
+                        Some(this.walk_entity(id, block).unwrap_or(js::Node::Void))
+                    })
+                    .into_iter()
+                    .map(|(_, node)| node);
+                let lhs = operands.next().unwrap_or(js::Node::Void);
+                let mut rhs = operands.next().unwrap_or(js::Node::Void);
                 // B176: `"v=" + value` where `value: T` is bounded to a trait
                 // that provides `to_string`. The analyzer ADMITS this — the
                 // bound is exactly the string form the concatenation asks for
@@ -7059,12 +7196,13 @@ impl<'src> Transformer<'src> {
             Expr::List(ids) => {
                 // An element read from a place is a construction slot: it copies
                 // (B54), unless the analyzer elided it.
-                let items = ids
-                    .iter()
-                    .filter_map(|id| {
-                        self.walk_entity(*id, block)
-                            .map(|node| self.maybe_clone(*id, node))
+                let items = self
+                    .walk_siblings_in_order(ids, block, |this, id, block| {
+                        this.walk_entity(id, block)
+                            .map(|node| this.maybe_clone(id, node))
                     })
+                    .into_iter()
+                    .map(|(_, node)| node)
                     .collect();
                 js::Node::Array(items)
             }
@@ -7102,18 +7240,22 @@ impl<'src> Transformer<'src> {
                 // §T.2), so it needs no type lookup and cannot lose the splice to a
                 // missing one, which the type-driven test does for an element whose
                 // expression caches no type of its own (a call, an `if`).
-                let items = ids
-                    .iter()
-                    .filter_map(|id| {
-                        let walked = self.walk_entity(*id, block)?;
-                        let value = self.maybe_clone(*id, walked);
+                // The splice is applied AFTER the ordered walk, so a spilled
+                // element is the value and never the `...` around it (B452).
+                let items = self
+                    .walk_siblings_in_order(ids, block, |this, id, block| {
+                        let walked = this.walk_entity(id, block)?;
+                        Some(this.maybe_clone(id, walked))
+                    })
+                    .into_iter()
+                    .map(|(id, value)| {
                         let splices =
-                            self.program.spread_elements.contains(id) || self.is_tuple_typed(*id);
-                        Some(if splices {
+                            self.program.spread_elements.contains(&id) || self.is_tuple_typed(id);
+                        if splices {
                             js::Node::Spread(Box::new(value))
                         } else {
                             value
-                        })
+                        }
                     })
                     .collect();
                 js::Node::Array(items)
@@ -7121,12 +7263,21 @@ impl<'src> Transformer<'src> {
             Expr::StructInitializer(_struct_id, assignments) => {
                 // let struct_ = self.program.structs.get(struct_id).unwrap();
                 // let mut properties_ng = NameGenerator::simple(debug_names);
-                let mut properties = assignments
-                    .iter()
-                    .filter_map(|(i, id)| {
-                        // let field = struct_.fields.get(*i).unwrap();
-                        let value = self.walk_entity(*id, block);
-                        value.map(|x| (i, self.maybe_clone(*id, x)))
+                // Walked in the order the literal WROTE its fields (B452: an
+                // initializer that needs statements spills the ones before
+                // it), then laid out in declaration order.
+                let field_ids: Vec<Id> = assignments.values().copied().collect();
+                let walked = self.walk_siblings_in_order(&field_ids, block, |this, id, block| {
+                    this.walk_entity(id, block)
+                        .map(|node| this.maybe_clone(id, node))
+                });
+                let mut properties = walked
+                    .into_iter()
+                    .filter_map(|(id, node)| {
+                        assignments
+                            .iter()
+                            .find(|(_, field_id)| **field_id == id)
+                            .map(|(index, _)| (index, node))
                     })
                     .collect::<Vec<_>>();
                 properties.sort_by(|a, b| a.0.cmp(b.0));

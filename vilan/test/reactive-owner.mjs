@@ -305,15 +305,15 @@ function $G(self, $H) {
 	let $J = null;
 	if ($I[0] === 0) {
 		const turn = $I[1];
-		$J = enqueue(turn, self[1].v);
+		$J = enqueue(turn, __clone(self[1].v));
 	} else {
 		const $M = $u(draining_turns.v);
 		let $N = null;
 		if ($M[0] === 0) {
 			const draining = $M[1];
-			$N = enqueue(draining, self[1].v);
+			$N = enqueue(draining, __clone(self[1].v));
 		} else {
-			for (const subscriber of self[1].v) {
+			for (const subscriber of __clone(self[1].v)) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}

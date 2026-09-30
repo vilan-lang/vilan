@@ -5553,8 +5553,14 @@ require("./app.js");
 /// hands out a value (one); `edit` hands its body a recorder over a list of its
 /// own and takes the result back (two, per batch, however many mutations it
 /// holds); and a `Move` is still the whole-list PASS in both `each` and
-/// `each_by` (A112 S3's fallback), whose own copies of the run are the eleven —
-/// the `ListCell` and the `map_each` make none of them.
+/// `each_by` (A112 S3's fallback), whose own copies of the run are the fifteen —
+/// the `ListCell` and the `map_each` make none of them. Four of the fifteen are
+/// B457's (RULED 2026-09-29, R-e door (a)): the pass hands `reconcile` the
+/// rows' key and item runs by value, and `reconcile` calls `key_of` and `same`,
+/// closure VALUES that can reach an in-place write of those cells (a key
+/// function that writes the list re-enters the pass), so each run is copied
+/// at the call — once per `each` and once per `each_by`. Native copied them
+/// already. They were eleven before it.
 ///
 /// Non-vacuity: on the tree before M86 this reads `push wholes=3`,
 /// `insert_at wholes=2`, `remove_at wholes=2`, `set_at wholes=2`,
@@ -5570,7 +5576,7 @@ fn m86_a_list_cell_write_copies_no_whole_list() {
             "insert_at wholes=0\n",
             "remove_at wholes=0\n",
             "set_at wholes=0\n",
-            "move_range wholes=11\n",
+            "move_range wholes=15\n",
             "size=1001 wholes=0\n",
             "peek=1001 third=r wholes=0\n",
             "edit wholes=2\n",

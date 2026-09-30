@@ -1503,6 +1503,73 @@ const B418_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B452: a sibling that lowers to statements — a block, an `if` or `match`
+/// in value position — runs AFTER the siblings written before it, on JS as it
+/// always did natively: call arguments, list and tuple elements, struct
+/// fields in written order, binary operands, a method receiver, a `mut`
+/// binding read before a block that writes it.
+#[test]
+fn a_sibling_that_lowers_to_statements_keeps_its_order_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b452.vl"), B452_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b452.vl"),
+        Verdict::Identical,
+        "sibling evaluation order must agree on both backends"
+    );
+}
+
+const B452_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Pair {\n",
+    "\ta: i32,\n",
+    "\tb: i32,\n",
+    "}\n",
+    "\n",
+    "struct Acc {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Acc {\n",
+    "\tfun plus(self, k: i32): i32 {\n",
+    "\t\tself.n + k\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun say(label: str, value: i32): i32 {\n",
+    "\tprint(label);\n",
+    "\tvalue\n",
+    "}\n",
+    "\n",
+    "fun add(a: i32, b: i32): i32 {\n",
+    "\ta + b\n",
+    "}\n",
+    "\n",
+    "fun make(label: str): Acc {\n",
+    "\tprint(label);\n",
+    "\tAcc { n = 100 }\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(add(say(\"a\", 1), { print(\"b-block\"); say(\"b\", 2) }));\n",
+    "\tlet list = [say(\"x\", 1), { print(\"y-block\"); say(\"y\", 2) }];\n",
+    "\tprint(list.len());\n",
+    "\tlet p = Pair { b = say(\"b\", 2), a = { print(\"a-block\"); say(\"a\", 1) } };\n",
+    "\tprint(p.a * 10 + p.b);\n",
+    "\tlet c = true;\n",
+    "\tprint(add(say(\"i\", 1), if c { print(\"j-if\"); say(\"j\", 2) } else { 0 }));\n",
+    "\tprint(add(say(\"m\", 1), match Some(2) { Some(let v) => { print(\"n-match\"); say(\"n\", v) }, None => 0 }));\n",
+    "\tmut x = 1;\n",
+    "\tprint(add(x, { x = 10; x }));\n",
+    "\tprint(say(\"l\", 1) + { print(\"r-block\"); say(\"r\", 2) });\n",
+    "\tlet t = (say(\"p\", 1), { print(\"q-block\"); say(\"q\", 2) });\n",
+    "\tprint(t.0 + t.1);\n",
+    "\tprint(make(\"recv\").plus({ print(\"arg-block\"); 1 }));\n",
+    "}\n",
+);
+
 /// B403: a bare `Holder::tag()` inside `impl Holder<type T: Label>` means
 /// `Self::tag()`, so each `Holder<X>` reaches its own `X::label()`. The
 /// native build emitted ONE instance for the unbound call and printed `A A`
@@ -1622,6 +1689,194 @@ const B423_PROBE: &str = concat!(
     "\t\tfalse => 0,\n",
     "\t};\n",
     "\tprint(i\"{want(m)} {want(k)} {want(j)}\");\n",
+    "}\n",
+);
+
+/// B457: a `Shared::read()` live across a CALL that writes the cell reads the
+/// same on both backends — a notify loop whose subscriber adds a subscriber,
+/// and a read handed by value to a callee that writes the cell.
+#[test]
+fn a_read_across_a_writing_call_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b457.vl"), B457_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b457.vl"),
+        Verdict::Identical,
+        "a read across a writing call must read the same on both backends"
+    );
+}
+
+const B457_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "fun direct(cell: Shared<List<i32>>, seen: List<i32>): usize {\n",
+    "\tcell.write().push(9);\n",
+    "\tseen.len()\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet log: Shared<List<str>> = Shared::new([]);\n",
+    "\tlet subs: Shared<List<|| void>> = Shared::new([]);\n",
+    "\tsubs.write().push(|| {\n",
+    "\t\tlog.write().push(\"first\");\n",
+    "\t\tsubs.write().push(|| log.write().push(\"late\"));\n",
+    "\t});\n",
+    "\tsubs.write().push(|| log.write().push(\"second\"));\n",
+    "\tfor sub in subs.read() {\n",
+    "\t\tsub();\n",
+    "\t}\n",
+    "\tprint(log.read().len());\n",
+    "\tlet cell = Shared::new([1, 2]);\n",
+    "\tprint(direct(cell, cell.read()));\n",
+    "}\n",
+);
+
+/// B462: a tuple variant where a closure is expected is its constructor on
+/// both backends — `Some` into `map`, a user variant with two payloads into a
+/// two-parameter closure, the generics taken from the expected type.
+#[test]
+fn a_variant_standing_for_a_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b462.vl"), B462_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b462.vl"),
+        Verdict::Identical,
+        "a variant coerced to a closure must build the same value on both backends"
+    );
+}
+
+const B462_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Shape {\n",
+    "\tRect(i32, i32),\n",
+    "\tDot,\n",
+    "}\n",
+    "\n",
+    "fun build(make: |i32, i32| Shape): Shape {\n",
+    "\tmake(2, 3)\n",
+    "}\n",
+    "\n",
+    "fun area(shape: Shape): i32 {\n",
+    "\tmatch shape {\n",
+    "\t\tShape::Rect(let w, let h) => w * h,\n",
+    "\t\tShape::Dot => 0,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs = [1, 2].map(Some);\n",
+    "\tprint(xs.len());\n",
+    "\tprint(xs[1].unwrap());\n",
+    "\tlet f: |i32| Option<i32> = Some;\n",
+    "\tprint(f(3).unwrap());\n",
+    "\tprint(area(build(Shape::Rect)));\n",
+    "}\n",
+);
+
+/// B458: `Context::clear` lowers to a plain call of its body with the value
+/// absent — a `get_safe` inside answers `None`, a closure minted inside keeps
+/// the cleared state, a `run` inside re-establishes — the same on both
+/// backends.
+#[test]
+fn a_cleared_context_reads_as_absent_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b458.vl"), B458_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b458.vl"),
+        Verdict::Identical,
+        "`clear` must read as absent the same way on both backends"
+    );
+}
+
+const B458_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun describe(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"some {value}\",\n",
+    "\t\tNone => \"none\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run(7, || {\n",
+    "\t\tprint(describe());\n",
+    "\t\tcurrent.clear(|| {\n",
+    "\t\t\tprint(describe());\n",
+    "\t\t\tcurrent.run(2, || print(current.get()));\n",
+    "\t\t});\n",
+    "\t\tprint(describe());\n",
+    "\t});\n",
+    "\tlet answer = current.run(5, || current.clear(|| 3) + 1);\n",
+    "\tprint(answer);\n",
+    "}\n",
+);
+
+/// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
+/// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
+/// native half — building the erased pair for a resource without cloning — is
+/// native-44's, so until it lands the native build must REFUSE BY NAME and
+/// never hand rustc something wrong. When it lands this pin expects identity.
+#[test]
+fn a_resource_erased_into_a_resource_traits_object_is_identical_or_refused_by_name() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b470.vl"), B470_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_b470.vl") {
+        Verdict::Identical | Verdict::Refused(_) => {}
+        Verdict::Broken(detail) => panic!("the native build was accepted and wrong: {detail}"),
+    }
+}
+
+const B470_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "[resource]\n",
+    "trait Run {\n",
+    "\tfun run(own self): i32;\n",
+    "}\n",
+    "\n",
+    "[resource]\n",
+    "struct Node {\n",
+    "\tv: i32,\n",
+    "}\n",
+    "\n",
+    "impl Node with Run {\n",
+    "\tfun run(own self): i32 {\n",
+    "\t\tself.v + 1\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Plain {\n",
+    "\tv: i32,\n",
+    "}\n",
+    "\n",
+    "impl Plain with Run {\n",
+    "\tfun run(own self): i32 {\n",
+    "\t\tself.v * 10\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun pick(on: bool): dyn Run {\n",
+    "\tif on {\n",
+    "\t\tNode { v = 1 }\n",
+    "\t} else {\n",
+    "\t\tPlain { v = 2 }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(pick(true).run());\n",
+    "\tprint(pick(false).run());\n",
     "}\n",
 );
 

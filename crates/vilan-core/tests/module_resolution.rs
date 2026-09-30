@@ -70,6 +70,55 @@ fn analyze_package_raw(files: &[(&str, &str)], entry: &str, platform: Platform) 
     errors
 }
 
+/// B456: writes `files` into a fresh package, compiles `entry` through the
+/// whole pipeline and runs the result with `node`, returning its stdout — for
+/// the pins whose claim is WHICH body a cross-module call reached.
+fn run_package(files: &[(&str, &str)], entry: &str) -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_run_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "{:?}",
+        errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+    );
+    let js = vilan_core::transform(
+        &program.expect("a program"),
+        &vilan_core::BuildOptions::default(),
+    )
+    .expect("the program emits");
+    let script = dir.join("out.mjs");
+    std::fs::write(&script, js).unwrap();
+    let output = std::process::Command::new("node")
+        .arg(&script)
+        .output()
+        .expect("run node");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// As [`analyze_package_raw`], but just the diagnostic messages.
 fn analyze_package(files: &[(&str, &str)], entry: &str, platform: Platform) -> Vec<String> {
     analyze_package_raw(files, entry, platform)
@@ -6598,14 +6647,11 @@ fn analyze_inherited_default_package(p1_import: &str) -> InheritedDefaultProgram
 ///
 /// Red with the parameter planted out of the shared lookup (`resolve_inherited_default`
 /// passing `None` to `applying_trait_ids`): the declined file answers `One`'s
-/// default. NOT red with `None` planted at the JavaScript emitter's call site,
-/// and the pin cannot be made to: the entry that calls `box.describe()` under
-/// the declining import compiles today (the analyzer's default lookup does not
-/// read admission), and when the file-scoped lookup declines, the emitter falls
-/// back to the analyzer's own resolution — the same default — so the emitted
-/// program differs only in the name it gives the function. The two-trait form
-/// the tracker asked for is refused before emission: with `p2` loaded at all,
-/// `box.describe()` is "ambiguous on 'Box'" whatever `c.vl`'s imports admit.
+/// default. NOT red with `None` planted at the JavaScript emitter's call site:
+/// since B401 the analyzer's own lookup reads the file's admission too, so a
+/// call under the declining import is refused before emission, and a call
+/// with one block admitted already resolves to that block's default — the
+/// `b401_*` pins below hold the analyzer's half.
 #[test]
 fn n124_the_shared_inherited_default_lookup_answers_under_the_asking_files_imports() {
     let declined = analyze_inherited_default_package("import pkg::p1 only;\nimport pkg::p2 only;");
@@ -6975,6 +7021,69 @@ fn b318_a_files_own_block_colliding_with_an_imported_one_is_refused_at_the_impor
             && message.contains("`import shape::{ (impl Bag)::new };`")),
         "expected the import-site refusal naming `shape`: {diagnostics:?}"
     );
+}
+
+/// B456 (RULED 2026-09-29, door (b)): the concrete block and the blanket in
+/// two modules are RANKED, not refused, and the answer does not depend on
+/// which module loads first (`alpha` before `omega`) or which the file
+/// imports first — the concrete member at a concrete receiver, the blanket's
+/// for another `Read` type.
+fn b456_files(concrete: &str, blanket: &str, app: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "read.vl".to_string(),
+            "export trait Read<T> {\n\tfun get(self): T;\n}\n\n\
+             export struct Cell<T> {\n\tvalue: T,\n}\n\n\
+             export impl Cell<type T> with Read<T> {\n\tfun get(self): T {\n\t\tself.value\n\t}\n}\n\n\
+             export struct Boxed<T> {\n\tvalue: T,\n}\n\n\
+             export impl Boxed<type T> with Read<T> {\n\tfun get(self): T {\n\t\tself.value\n\t}\n}\n"
+                .to_string(),
+        ),
+        (
+            format!("{concrete}.vl"),
+            "import pkg::read::Cell;\n\n\
+             export impl Cell<type T> {\n\tfun peek(self): str {\n\t\t\"concrete\"\n\t}\n}\n"
+                .to_string(),
+        ),
+        (
+            format!("{blanket}.vl"),
+            "import pkg::read::Read;\n\n\
+             export impl type S: Read<type T> {\n\tfun peek(self): str {\n\t\t\"blanket\"\n\t}\n}\n"
+                .to_string(),
+        ),
+        ("app.vl".to_string(), app.to_string()),
+    ]
+}
+
+#[test]
+fn b456_the_cross_module_pair_is_ranked_in_every_order() {
+    for (concrete, blanket) in [("alpha", "omega"), ("omega", "alpha")] {
+        for concrete_first in [true, false] {
+            let (first, second) = match concrete_first {
+                true => (concrete, blanket),
+                false => (blanket, concrete),
+            };
+            let app = format!(
+                "import pkg::read::{{ Cell, Boxed }};\nimport pkg::{first};\nimport pkg::{second};\n\n\
+                 fun main() {{\n\tprint(Cell {{ value = 1 }}.peek());\n\tprint(Boxed {{ value = 2 }}.peek());\n}}\n"
+            );
+            let owned = b456_files(concrete, blanket, &app);
+            let files: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(name, body)| (name.as_str(), body.as_str()))
+                .collect();
+            let diagnostics = analyze_package(&files, "app.vl", Platform::default());
+            assert!(
+                diagnostics.is_empty(),
+                "concrete `{concrete}`, blanket `{blanket}`, `{first}` imported first: {diagnostics:?}"
+            );
+            let output = run_package(&files, "app.vl");
+            assert_eq!(
+                output, "concrete\nblanket\n",
+                "concrete `{concrete}`, blanket `{blanket}`, `{first}` imported first"
+            );
+        }
+    }
 }
 
 /// The `export impl` exhibit: a CURATED module (it exports its struct) whose
@@ -7988,4 +8097,113 @@ fn b354_a_derived_body_is_still_refused_when_its_own_file_cannot_reach_the_impl(
             && refused.contains("module `thing` does not admit it"),
         "the refusal should name the member, the providing module and the deriving one: {refused}"
     );
+}
+
+// --- B401: the analyzer's own method lookup reads the file's admission -------
+//
+// N124's package with a CALL: `c.vl` calls `box.describe()`, each trait's
+// default reached through its own module's block. Before, the analyzer's
+// lookup was program-wide: `import pkg::p1 only;` compiled the call through
+// `p1`'s declined block, and with `p2` loaded in any form the call was
+// "ambiguous on 'Box'" whatever the file admitted.
+
+/// The files, with `c.vl`'s imports and `p2.vl`'s block written per case.
+fn b401_files(imports: &str, p2_block: &str) -> Vec<(String, String)> {
+    vec![
+        ("b.vl".to_string(), "export struct Box { n: i32 }\n".to_string()),
+        (
+            "t.vl".to_string(),
+            "export trait One {\n\tfun describe(self): str { \"one\" }\n}\n\nexport trait Two {\n\tfun describe(self): str { \"two\" }\n}\n".to_string(),
+        ),
+        (
+            "p1.vl".to_string(),
+            "import pkg::b::Box;\nimport pkg::t::One;\n\nexport impl Box with One {}\n".to_string(),
+        ),
+        (
+            "p2.vl".to_string(),
+            format!("import pkg::b::Box;\nimport pkg::t::Two;\n\n{p2_block}\n"),
+        ),
+        (
+            "c.vl".to_string(),
+            format!(
+                "import pkg::b::Box;\n{imports}\n\nfun main() {{\n\tprint(Box {{ n = 1 }}.describe());\n}}\n"
+            ),
+        ),
+    ]
+}
+
+fn b401_borrowed(owned: &[(String, String)]) -> Vec<(&str, &str)> {
+    owned
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect()
+}
+
+#[test]
+fn b401_a_default_reached_through_a_declined_block_is_refused() {
+    let owned = b401_files("import pkg::p1 only;", "export impl Box with Two {}");
+    let diagnostics = analyze_package(&b401_borrowed(&owned), "c.vl", Platform::default());
+    assert!(
+        diagnostics.iter().any(|message| message.contains(
+            "'describe' is provided by an `impl` in module `p1`, and this file imports that \
+             module `only`, which admits none: drop the `only`, or name the block in a selector"
+        )),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b401_the_admitted_default_answers_where_the_other_block_is_declined() {
+    for (imports, expected) in [
+        ("import pkg::p1;\nimport pkg::p2 only;", "one"),
+        ("import pkg::p1 only;\nimport pkg::p2;", "two"),
+        ("import pkg::p2 only;\nimport pkg::p1;", "one"),
+    ] {
+        let owned = b401_files(imports, "export impl Box with Two {}");
+        assert_eq!(
+            run_package(&b401_borrowed(&owned), "c.vl").trim(),
+            expected,
+            "{imports}"
+        );
+    }
+}
+
+#[test]
+fn b401_a_block_its_module_does_not_export_does_not_compete() {
+    // `p2` curates its exports and leaves its block out: the block reaches
+    // its own file and no other, so it is no candidate for `c.vl`.
+    let owned = b401_files(
+        "import pkg::p1;\nimport pkg::p2;",
+        "impl Box with Two {}\n\nexport fun marker(): i32 { 0 }",
+    );
+    assert_eq!(run_package(&b401_borrowed(&owned), "c.vl").trim(), "one");
+}
+
+#[test]
+fn b401_a_declared_member_is_narrowed_the_same_way() {
+    // The DECLARED twin: each block writes its own `describe` for a required
+    // trait member. The ambiguity used to ignore admission for these too.
+    let mut owned = b401_files("import pkg::p1;\nimport pkg::p2 only;", "");
+    owned[1].1 = "export trait One {\n\tfun describe(self): str;\n}\n\nexport trait Two {\n\tfun describe(self): str;\n}\n".to_string();
+    owned[2].1 = "import pkg::b::Box;\nimport pkg::t::One;\n\nexport impl Box with One {\n\tfun describe(self): str { \"one\" }\n}\n".to_string();
+    owned[3].1 = "import pkg::b::Box;\nimport pkg::t::Two;\n\nexport impl Box with Two {\n\tfun describe(self): str { \"two\" }\n}\n".to_string();
+    assert_eq!(run_package(&b401_borrowed(&owned), "c.vl").trim(), "one");
+}
+
+#[test]
+fn b455_a_selector_names_a_block_that_only_inherits() {
+    // B455: `(impl Box)` reaches `p1`'s default-only block — it admits what
+    // the block inherits, and is no "admits nothing" miss — and a tail may
+    // name the inherited default.
+    for imports in [
+        "import pkg::p1::{ (impl Box) };\nimport pkg::p2 only;",
+        "import pkg::p1::{ (impl Box)::describe };\nimport pkg::p2 only;",
+    ] {
+        let owned = b401_files(imports, "export impl Box with Two {}");
+        assert_eq!(
+            run_package(&b401_borrowed(&owned), "c.vl").trim(),
+            "one",
+            "{imports}"
+        );
+    }
 }
