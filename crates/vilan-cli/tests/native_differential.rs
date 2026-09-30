@@ -6693,3 +6693,53 @@ const F59_PROBE: &str = concat!(
     "\tprint(relabel(3).name);\n",
     "}\n",
 );
+
+/// A142 parity: an `Option` of a CELL holding closures — an owner's lazily
+/// allocated cleanup list, `Option<Shared<List<|| void>>>` — has reference
+/// equality natively (a cell compares by identity, as the JS object does), so
+/// the struct holding it builds. It was refused by name, and reactive-44
+/// wrote S2's `OwnerCell` around the refusal.
+#[test]
+fn an_option_of_a_cell_of_closures_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_option_cell.vl"),
+        OPTION_CELL_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_option_cell.vl"),
+        Verdict::Identical,
+        "an `Option` of a cell of closures must build and print the same on both backends"
+    );
+}
+
+const OPTION_CELL_PROBE: &str = concat!(
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Cell {\n",
+    "\tcleanups: Option<Shared<List<|| void>>>,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet c: Shared<Cell> = Shared::new(Cell { cleanups = None });\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => list.write().push(|| print(\"x\")),\n",
+    "\t\tNone => {\n",
+    "\t\t\tc.write() = Cell { cleanups = Some(Shared::new([|| print(\"first\")])) };\n",
+    "\t\t},\n",
+    "\t}\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => list.write().push(|| print(\"second\")),\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "\tmatch c.read().cleanups {\n",
+    "\t\tSome(let list) => {\n",
+    "\t\t\tfor f in list.read() {\n",
+    "\t\t\t\tf();\n",
+    "\t\t\t}\n",
+    "\t\t},\n",
+    "\t\tNone => {},\n",
+    "\t}\n",
+    "}\n",
+);

@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: feature -->
+**A struct holding an `Option` of a cell of closures — `Option<Shared<List<|| void>>>`, an owner's lazily allocated cleanup list — builds natively.** A cell compares by identity (JavaScript's `===` on the object), so an `Option` or a `List` of one has reference equality too; the native backend refused the struct by name, and A142 S2's `OwnerCell` was written around the refusal.
+
+<!-- family: feature -->
 **A field read on a call whose return type is inferred builds natively: `make_square(2).side`, where `make_square` writes no return type — and B460's checked returns, which take the same path.** The call's type was read off the written signature alone, so the field read had no struct to find its field in and was refused by name. It now reads the return as the callee's emitted signature does (written, or the analyzer's inference). Tracker F59.
 
 <!-- family: feature -->

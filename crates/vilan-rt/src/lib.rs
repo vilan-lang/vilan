@@ -721,6 +721,22 @@ impl<T: ReferenceEq> ReferenceEq for Vec<T> {
     }
 }
 
+/// A cell compares by IDENTITY (its `PartialEq` is `ptr_eq` already), which is
+/// JavaScript's `===` on the object it is there. So an `Option` or a `Vec` of a
+/// cell holding closures has reference equality too: `Option<Shared<List<||
+/// void>>>`, an owner's lazily allocated cleanup list.
+impl<T> ReferenceEq for Shared<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl<T> ReferenceEq for Weak<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 /// [`ReferenceEq::reference_eq`] as a free function, so the emitter can spell it
 /// without naming the trait at the site.
 pub fn reference_eq<T: ReferenceEq + ?Sized>(left: &T, right: &T) -> bool {

@@ -2933,7 +2933,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn reference_equality_reaches(rendered: &str) -> bool {
-        if rendered.starts_with("std::rc::Rc<") {
+        // A counted closure compares by pointer, and so does a CELL, whatever
+        // it holds (`vilan_rt::ReferenceEq` for `Shared`/`Weak`).
+        if rendered.starts_with("std::rc::Rc<") || compares_by_cell_identity(rendered) {
             return true;
         }
         for wrapper in ["Option<", "Vec<"] {
