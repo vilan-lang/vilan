@@ -38983,6 +38983,23 @@ impl<'src> Analyzer<'src> {
                                 substitution_context,
                                 exprs_seen,
                             );
+                            // B434: a payload that is still waiting on a closure
+                            // parameter's fill (`|v| SignalCell::new(Some(v))`)
+                            // decided nothing YET — typing the construction now
+                            // published an ERASED `Option` that the enclosing
+                            // generic call bound its parameter to for good
+                            // (`and_then`'s `I` became `SignalCell<Option>` and
+                            // its `U` never bound). It waits for the fill, as
+                            // B372's call arguments and B427's destructure do,
+                            // until the fixpoint stalls.
+                            if inferred.is_none()
+                                && !self.fixpoint_stalled
+                                && argument_ids.iter().any(|argument| {
+                                    self.value_awaits_a_closure_parameter(*argument)
+                                })
+                            {
+                                return Type::Unresolved;
+                            }
                             Type::Enum(enum_id, inferred.unwrap_or(arguments))
                         } else {
                             Type::Enum(enum_id, arguments)

@@ -9072,3 +9072,105 @@ fn b424_an_underscore_closure_parameter_carries_no_annotation_obligation() {
         "x\n",
     );
 }
+
+// --- B434: a closure parameter reaches a generic constructor in the tail ------
+//
+// `|v| SignalCell::new(Some(v))` typed `Some(v)` before `v` was filled, as an
+// ERASED `Option`, and the enclosing call bound its parameter to that for good
+// (`and_then`'s `U` never bound). A variant construction whose payload awaits a
+// closure parameter now waits for the fill, as B372's arguments and B427's
+// destructure do.
+
+const B434_HOLDS: &str = r#"
+struct Boxed<T> {
+    value: T,
+}
+fun wrap<T>(value: T): Boxed<T> {
+    Boxed { value = value }
+}
+trait Holds<T> {
+    fun held(self): T;
+}
+impl Boxed<type T> with Holds<T> {
+    fun held(self): T {
+        self.value
+    }
+}
+fun apply<T, U, H: Holds<Option<U>>>(input: T, select: |T| H): Option<U> {
+    select(input).held()
+}
+"#;
+
+#[test]
+fn b434_and_then_over_a_constructed_cell_binds_its_value_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::SignalCell;
+        fun main() {
+            let maybe = SignalCell::new(Some(1));
+            let chained = maybe.and_then(|v| SignalCell::new(Some(v)));
+            print(chained.get().unwrap());
+            let computed = maybe.and_then(|v| SignalCell::new(Some(v + 10)));
+            print(computed.get().unwrap());
+        }
+        "#,
+        "1\n11\n",
+    );
+}
+
+#[test]
+fn b434_a_generic_constructor_around_the_parameter_binds_through_a_bound() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B434_HOLDS}\nfun main() {{\n    print(apply(5, |v| wrap(Some(v))).unwrap());\n}}\n"
+        ),
+        "5\n",
+    );
+}
+
+#[test]
+fn b434_a_let_bound_closure_still_types_from_its_own_call() {
+    // The wait ends when the fixpoint stalls: a let-bound closure is filled at
+    // its own call site, which waits on this body.
+    assert_compiles_and_runs(
+        &format!(
+            "{B434_HOLDS}\nfun main() {{\n    let make = |v| wrap(Some(v));\n    print(make(3).value.unwrap());\n}}\n"
+        ),
+        "3\n",
+    );
+}
+
+#[test]
+fn b434_filter_map_over_an_into_flow_bound_takes_the_parameter_itself() {
+    // collections-44's first customer: `filter_map(|x| x)`, the closure's
+    // return a generic `F: IntoFlow<Option<U>>` read through its bound.
+    assert_compiles_and_runs(
+        r#"
+        trait IntoFlow<T> {
+            fun into_flow(self): T;
+        }
+        impl Option<type T> with IntoFlow<Option<T>> {
+            fun into_flow(self): Option<T> {
+                self
+            }
+        }
+        fun filter_map<T, U, F: IntoFlow<Option<U>>>(items: List<T>, select: |T| F): List<U> {
+            mut kept: List<U> = [];
+            for item in items {
+                match select(item).into_flow() {
+                    Some(let value) => kept.push(value),
+                    None => {},
+                }
+            }
+            kept
+        }
+        fun main() {
+            let kept = filter_map([Some(1), None, Some(3)], |x| x);
+            print(kept.len());
+            let wrapped = filter_map([1, 2], |x| Some(x * 10));
+            print(wrapped[1]);
+        }
+        "#,
+        "2\n20\n",
+    );
+}
