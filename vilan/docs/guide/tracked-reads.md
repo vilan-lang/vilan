@@ -166,7 +166,9 @@ fun main() {
 open no scope of their own. A `track()` in a callback written outside every body
 is refused at compile time. One written inside a body captured that body's run,
 and when the callback fires later it registers nothing — the run it belonged to
-is over. Either way a callback never becomes a hidden dependency of anything.
+is over. Either way a callback never becomes a hidden dependency of anything. (The second case is guarded when the callback runs; making it a compile-time
+refusal too — a callback parameter that runs its callback with the scope cleared —
+is a planned follow-up.)
 
 `on_change` over a pipe that tracks still hears its first change: a consumer
 that does not read at once *primes* the pipe — it runs the pipe's bodies once,

@@ -653,7 +653,9 @@ The guide's [tracked reads](../guide/tracked-reads.md) chapter is the tour.
   An `effect`'s re-run is ordered after its input's delivery, so the same holds
   for an effect.
 - **A scope is one run.** A closure created inside a body captures the run's
-  scope; a `track()` through it after the run returned registers nothing.
+  scope; a `track()` through it after the run returned registers nothing (a
+  run-time guard; the static form, callbacks run with the scope cleared, is a
+  planned follow-up — A142 §7.3).
   `tracking.clear(body)` (B458) runs `body` with no scope: a closure minted
   inside holds none, and a `track()` written inside is refused — the layer's
   `untrack`.
