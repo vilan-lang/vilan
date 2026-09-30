@@ -3963,6 +3963,29 @@ pub struct Analyzer<'src> {
     /// that writes neither `only` nor a selector, which is every file in the
     /// estate today.
     import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B401: the admission the analyzer's OWN method lookup reads during the
+    /// fixpoint — [`LookupAdmission`], built from `import_impl_restrictions`
+    /// before each fixpoint runs. `None` when no file restricts anything and
+    /// no module hides an `impl`: the estate's path, which filters nothing.
+    lookup_admission: Option<LookupAdmission>,
+    /// B401: the file the constraint being resolved sits in, and its anchor —
+    /// set per constraint in `resolve_constraints`, the one seam every
+    /// constraint passes through. `None` outside the fixpoint, where a lookup
+    /// filters nothing (today's reading).
+    lookup_importer: Option<SourceId>,
+    lookup_anchor: Option<Id>,
+    /// B401: the calls that resolved to an inherited trait DEFAULT through a
+    /// block the calling file did not admit — no admitted block offered the
+    /// name, so the lookup kept today's answer and the post-build admission
+    /// pass refuses it by name: `(member, implementation index, member name)`
+    /// by call anchor. A declared member needs no record; the pass finds its
+    /// block by its declarations.
+    declined_default_calls: HashMap<Id, (Id, usize, String)>,
+    /// The loaded files' paths by `SourceId`, handed in by the driver before
+    /// each resolve: [`Analyzer::build_lookup_admission`] reads a module's
+    /// ANCESTOR files off them (`ancestor_module_sources`), as the post-build
+    /// pass reads `Program::canonical_sources`.
+    source_paths: Vec<PathBuf>,
     /// B318 S4: the cross-module inherent collisions the declaration-site rule
     /// banks for the IMPORT pass ([`MemberCollision`]). Empty for every program
     /// in which no two files declare one inherent name for one subject — the
@@ -5977,6 +6000,71 @@ impl ImplAdmission {
     }
 }
 
+/// B401 — the impl admission the analyzer's OWN method lookup reads, built
+/// before the fixpoint ([`Analyzer::build_lookup_admission`]) from the same
+/// rows [`build_impl_admission`] resolves after it.
+///
+/// Before it, the lookup was program-wide and only a post-build pass corrected
+/// the call: which was enough for a lookup with ONE candidate, and wrong for
+/// the two others. A lookup with two candidates, one of which the file
+/// declined, was refused as ambiguous whatever the file admitted — and a call
+/// that reached an inherited DEFAULT through a declined block compiled, since
+/// the post-build pass found blocks by their declarations and a default is
+/// declared by its trait. The lookup now NARROWS by this map (it never empties:
+/// with no admitted candidate the answer stands, and the post-build pass
+/// refuses it by name).
+///
+/// Keyed by BLOCK rather than by member id, so a whole-block selector admits
+/// the defaults the block inherits as well as what it declares (B455): a
+/// default-only `impl Box with One {}` is a block `(impl Box)` names.
+#[derive(Debug, Clone, Default)]
+struct LookupAdmission {
+    /// The importing files whose own statements restrict anything at all.
+    restricting: HashSet<SourceId>,
+    /// (importing file, declaring file) -> the blocks the importer's
+    /// selectors admitted out of that file, each with the member names its
+    /// `::` tail took (`None`: the whole block). An entry's absence is
+    /// "unrestricted"; an EMPTY entry is `only`.
+    admitted: HashMap<(SourceId, SourceId), HashMap<Id, Option<Vec<String>>>>,
+    /// The blocks a curated module does not export, as
+    /// [`ImplAdmission::hidden`].
+    hidden: HashSet<Id>,
+    /// (importing file, block) — a `#(impl T)` reach into a hidden block.
+    reached: HashSet<(SourceId, Id)>,
+}
+
+impl LookupAdmission {
+    /// Whether `importer` admits `member_name` from `implementation`: the
+    /// block is the file's own, or it is visible (exported, or reached) and
+    /// the file's statements did not decline it.
+    fn admits(
+        &self,
+        importer: SourceId,
+        implementation: &Implementation,
+        member_name: &str,
+    ) -> bool {
+        if implementation.source == importer {
+            return true;
+        }
+        if self.hidden.contains(&implementation.impl_id)
+            && !self.reached.contains(&(importer, implementation.impl_id))
+        {
+            return false;
+        }
+        if !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, implementation.source)) {
+            None => true,
+            Some(blocks) => match blocks.get(&implementation.impl_id) {
+                None => false,
+                Some(None) => true,
+                Some(Some(names)) => names.iter().any(|name| name == member_name),
+            },
+        }
+    }
+}
+
 /// B318 S3 — one `import` statement's claim on the implementations its walk
 /// carries, banked by the import walk and resolved after `build()` by
 /// [`check_impl_selector_admission`].
@@ -6272,6 +6360,11 @@ impl<'src> Analyzer<'src> {
             implementation_by_declaration: HashMap::default(),
             impl_namespaces: Vec::new(),
             import_impl_restrictions: Vec::new(),
+            lookup_admission: None,
+            lookup_importer: None,
+            lookup_anchor: None,
+            declined_default_calls: HashMap::default(),
+            source_paths: Vec::new(),
             cross_module_collisions: Vec::new(),
             blanket_residues: Vec::new(),
             scoped_reach_checks: Vec::new(),
@@ -19151,7 +19244,7 @@ impl<'src> Analyzer<'src> {
         // The written arguments are read here, where the declaring impl is in
         // hand; padding and instantiation happen below, once the immutable
         // borrow of `implementations_by_member` is released.
-        let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = declaring
+        let mut found: Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> = declaring
             .iter()
             .map(|index| &self.implementations[*index])
             .filter(|implementation| {
@@ -19181,14 +19274,29 @@ impl<'src> Analyzer<'src> {
                     })
                     .unwrap_or_default();
                 Some((
-                    member_id,
-                    implementation.subject,
-                    home_trait,
-                    written_arguments,
+                    (
+                        member_id,
+                        implementation.subject,
+                        home_trait,
+                        written_arguments,
+                    ),
+                    self.lookup_admits(implementation, member_name),
                 ))
             })
             .collect();
-        found.extend(self.inheriting_impls_of_declared_homes(subject_type, member_name, &found));
+        let declared: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = found
+            .iter()
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        found.extend(self.inheriting_impls_of_declared_homes(subject_type, member_name, &declared));
+        // B401: the calling file's admission NARROWS the field and never
+        // empties it — with nothing admitted the answer stands, and the
+        // post-build pass refuses it naming the import that declined it.
+        if found.iter().any(|(_, admitted)| *admitted) {
+            found.retain(|(_, admitted)| *admitted);
+        }
+        let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> =
+            found.into_iter().map(|(candidate, _)| candidate).collect();
         found.sort_by_key(|(member_id, ..)| self.declaration_order(*member_id));
         found.dedup_by_key(|(member_id, ..)| *member_id);
         let candidates: Vec<ImplMemberCandidate> = found
@@ -19262,7 +19370,7 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &str,
         declared: &[(Id, TypeId, Option<Id>, Vec<TypeId>)],
-    ) -> Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> {
+    ) -> Vec<((Id, TypeId, Option<Id>, Vec<TypeId>), bool)> {
         let homes: Vec<Id> = declared
             .iter()
             .filter_map(|(_, _, home_trait, _)| *home_trait)
@@ -19296,10 +19404,13 @@ impl<'src> Analyzer<'src> {
                     .map(|(_, arguments)| arguments.clone())
                     .unwrap_or_default();
                 Some((
-                    member_id,
-                    implementation.subject,
-                    Some(trait_id),
-                    written_arguments,
+                    (
+                        member_id,
+                        implementation.subject,
+                        Some(trait_id),
+                        written_arguments,
+                    ),
+                    self.lookup_admits(implementation, member_name),
                 ))
             })
             .collect()
@@ -22354,13 +22465,21 @@ impl<'src> Analyzer<'src> {
         member_name: &str,
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
         let mut reached: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
-        for implementation in self.implementations.iter().filter(|implementation| {
-            self.impl_subject_admits(
-                subject_type,
-                implementation.subject.borrow_type(self),
-                &HashMap::default(),
-            )
-        }) {
+        // B401: parallel to `reached` — the providing block's index, and
+        // whether the calling file admits the member from it.
+        let mut providers: Vec<(usize, bool)> = Vec::new();
+        for (index, implementation) in
+            self.implementations
+                .iter()
+                .enumerate()
+                .filter(|(_, implementation)| {
+                    self.impl_subject_admits(
+                        subject_type,
+                        implementation.subject.borrow_type(self),
+                        &HashMap::default(),
+                    )
+                })
+        {
             for trait_id in &implementation.trait_ids {
                 let Some(member_id) = self.method_member_in_trait(*trait_id, member_name) else {
                     continue;
@@ -22387,24 +22506,45 @@ impl<'src> Analyzer<'src> {
                     *trait_id,
                     trait_arguments,
                 ));
+                providers.push((index, self.lookup_admits(implementation, member_name)));
             }
+        }
+        // B401: the calling file's admission narrows first, and never empties
+        // (`impl_member_candidates`' rule): two defaults of one name, one of
+        // them through a block the file declined, are ONE candidate.
+        let mut reached: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> =
+            reached.into_iter().zip(providers).collect();
+        if reached.iter().any(|(_, (_, admitted))| *admitted) {
+            reached.retain(|(_, (_, admitted))| *admitted);
         }
         let mut applying = Vec::with_capacity(reached.len());
         for candidate in &reached {
-            if self.impl_bounds_hold(candidate.1, subject_type) {
+            if self.impl_bounds_hold(candidate.0.1, subject_type) {
                 applying.push(candidate.clone());
             }
         }
-        let mut candidates: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
+        let mut candidates: Vec<((Id, TypeId, Id, Vec<TypeId>), (usize, bool))> = Vec::new();
         for candidate in match applying.is_empty() {
             true => reached,
             false => applying,
         } {
-            if !candidates.iter().any(|(id, ..)| *id == candidate.0) {
+            if !candidates.iter().any(|((id, ..), _)| *id == candidate.0.0) {
                 candidates.push(candidate);
             }
         }
+        // B401: one candidate, and the file declined the block it comes
+        // through — the answer stands (a lookup never empties), and the
+        // post-build pass refuses the call by name.
+        if let [((member_id, ..), (index, false))] = candidates.as_slice()
+            && let Some(anchor) = self.lookup_anchor
+        {
+            self.declined_default_calls
+                .insert(anchor, (*member_id, *index, member_name.to_string()));
+        }
         candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect()
     }
 
     /// Whether a trait member has a source-provided body (a default method), so
@@ -30530,6 +30670,171 @@ impl<'src> Analyzer<'src> {
              for ONE type that implements it, so every element must be that type; for elements \
              of different types write `dyn {bound}` there"
         ))
+    }
+
+    /// B401: whether the file of the constraint being resolved admits
+    /// `member_name` from `implementation`. `true` outside the fixpoint and
+    /// whenever nothing restricts — the estate's reading.
+    fn lookup_admits(&self, implementation: &Implementation, member_name: &str) -> bool {
+        match (&self.lookup_admission, self.lookup_importer) {
+            (Some(admission), Some(importer)) => {
+                admission.admits(importer, implementation, member_name)
+            }
+            _ => true,
+        }
+    }
+
+    /// The file a constraint's lookups are admitted under: the anchor's own,
+    /// or — for generated code — the file whose attribute generated it (B391's
+    /// rule, `Program::note_source_of`).
+    fn admitting_source_of(&self, anchor: Id) -> Option<SourceId> {
+        match self.source_of_id(anchor)? {
+            DERIVED_SOURCE => self
+                .derived_origins
+                .iter()
+                .find(|(range, _, _)| range.contains(&anchor.0))
+                .map(|(_, _, source)| *source),
+            source => Some(source),
+        }
+    }
+
+    /// B318 S4's export gate, as a set: the blocks a curated module declares
+    /// and does not export. Shared by the lookup's admission (B401) and the
+    /// commit, which hands it to [`build_impl_admission`].
+    fn hidden_impl_blocks(&self) -> HashSet<Id> {
+        self.implementations
+            .iter()
+            .filter(|implementation| {
+                self.curated_modules.contains(&implementation.module_scope)
+                    && !self
+                        .export_all_modules
+                        .contains(&implementation.module_scope)
+                    && !self.exported_entities.contains_key(&implementation.impl_id)
+            })
+            .map(|implementation| implementation.impl_id)
+            .collect()
+    }
+
+    /// Whether a selector reaches a block: the block's subject and the
+    /// selector's type unify in EITHER direction — [`selector_admits`]'s
+    /// reading, over the analyzer's own comparison.
+    fn selector_reaches(&self, impl_subject: TypeId, selector: TypeId) -> bool {
+        let impl_type = impl_subject.get_type(self);
+        let selector_type = selector.get_type(self);
+        self.impl_subject_admits(&selector_type, &impl_type, &HashMap::default())
+            || self.impl_subject_admits(&impl_type, &selector_type, &HashMap::default())
+    }
+
+    /// B401 — the admission map the method lookups read DURING the fixpoint
+    /// ([`LookupAdmission`]), from the rows the import walk banked. The same
+    /// statements, the same files per statement (`statement_sources`, shared
+    /// with the post-build pass) and the same selector test in both
+    /// directions as [`build_impl_admission`] — which still runs after the
+    /// build and owns every diagnostic; this builds only the filter.
+    ///
+    /// Rebuilt per resolve (the pre-entry world's, then the build's), since
+    /// the entry's own statements arrive between them.
+    fn build_lookup_admission(&mut self) {
+        let restricting: HashSet<SourceId> = self
+            .import_impl_restrictions
+            .iter()
+            .filter(|row| row.only.is_some() || !row.selectors.is_empty())
+            .map(|row| row.source)
+            .collect();
+        let hidden = self.hidden_impl_blocks();
+        if restricting.is_empty() && hidden.is_empty() {
+            self.lookup_admission = None;
+            return;
+        }
+        // The statement walk below reads these only for a RESTRICTING file's
+        // statements; a program whose only departure from the estate is a
+        // hidden block (a curated module) skips the index and the paths.
+        let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
+        let mut canonical_sources: Vec<PathBuf> = Vec::new();
+        if !restricting.is_empty() {
+            for (source, span, definition, _) in &self.type_references {
+                if let Some(definition) = definition {
+                    references.entry((*source, *span)).or_insert(*definition);
+                }
+            }
+            canonical_sources = self
+                .source_paths
+                .iter()
+                .map(crate::util::canonical_path)
+                .collect();
+        }
+        let mut source_of_path: HashMap<&Path, SourceId> = HashMap::default();
+        for (position, path) in canonical_sources.iter().enumerate() {
+            source_of_path
+                .entry(path.as_path())
+                .or_insert(SourceId(position as u32));
+        }
+        let mut admitted: HashMap<(SourceId, SourceId), HashMap<Id, Option<Vec<String>>>> =
+            HashMap::default();
+        let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
+        let mut reached: HashSet<(SourceId, Id)> = HashSet::default();
+        for row in &self.import_impl_restrictions {
+            if !hidden.is_empty() {
+                for selector in row.selectors.iter().filter(|selector| selector.reached) {
+                    for implementation in &self.implementations {
+                        if hidden.contains(&implementation.impl_id)
+                            && self.selector_reaches(implementation.subject, selector.subject)
+                        {
+                            reached.insert((row.source, implementation.impl_id));
+                        }
+                    }
+                }
+            }
+            if !restricting.contains(&row.source) {
+                continue;
+            }
+            let sources = statement_sources(
+                |id| self.source_of_id(id),
+                &canonical_sources,
+                &references,
+                &source_of_path,
+                row,
+            );
+            if row.only.is_none() && row.selectors.is_empty() {
+                for module in sources {
+                    unrestricted.insert((row.source, module));
+                }
+                continue;
+            }
+            let mut blocks: HashMap<Id, Option<Vec<String>>> = HashMap::default();
+            for selector in &row.selectors {
+                for implementation in &self.implementations {
+                    if !sources.contains(&implementation.source)
+                        || !self.selector_reaches(implementation.subject, selector.subject)
+                    {
+                        continue;
+                    }
+                    let taken: Option<Vec<String>> = (!selector.members.is_empty()).then(|| {
+                        selector
+                            .members
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect()
+                    });
+                    merge_admitted_block(&mut blocks, implementation.impl_id, taken);
+                }
+            }
+            for module in &sources {
+                let entry = admitted.entry((row.source, *module)).or_default();
+                for (block, taken) in &blocks {
+                    merge_admitted_block(entry, *block, taken.clone());
+                }
+            }
+        }
+        for key in unrestricted {
+            admitted.remove(&key);
+        }
+        self.lookup_admission = Some(LookupAdmission {
+            restricting,
+            admitted,
+            hidden,
+            reached,
+        });
     }
 
     /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for
@@ -43744,9 +44049,17 @@ impl<'src> Analyzer<'src> {
                 .expr_id_to_scope_id_map
                 .get(&constraint.anchor())
                 .copied();
+            // B401: the file whose admission this constraint's method lookups
+            // read — asked only when some file restricts anything.
+            if self.lookup_admission.is_some() {
+                self.lookup_anchor = Some(constraint.anchor());
+                self.lookup_importer = self.admitting_source_of(constraint.anchor());
+            }
             let diagnostics_before = self.diagnostics.len();
             let resolution = self.try_resolve(&constraint);
             self.rigid_binder_scope = None;
+            self.lookup_importer = None;
+            self.lookup_anchor = None;
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
             self.attribute_diagnostics_to_anchor(diagnostics_before, constraint.anchor());
@@ -54686,6 +54999,10 @@ impl<'src> Analyzer<'src> {
         // part of that type for every substitution and reconcile the solver
         // performs.
         self.resolve_context_clauses();
+        // B401: the admission the lookups below read — after the import drain
+        // (which recorded each statement's path segments) and the type drain
+        // (which typed each selector's subject), before the first lookup.
+        self.build_lookup_admission();
 
         if split_on {
             split.push(("contexts", split_mark.elapsed()));
@@ -58605,6 +58922,11 @@ pub struct Program<'src> {
     /// files wrote, DRAINED by [`build_impl_admission`] after the program is
     /// built. Empty for a program that writes neither.
     pub import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B401: the calls that resolved to an inherited trait default through a
+    /// block their file did not admit (`Analyzer::declined_default_calls`),
+    /// read by [`check_call_site_admission`] — a default's block is not found
+    /// by its declarations.
+    pub declined_default_calls: HashMap<Id, (Id, usize, String)>,
     /// B318 S4: the cross-module inherent collisions, banked at the declaration
     /// and refused at the IMPORT of whichever file admits both
     /// ([`refuse_imported_member_collisions`]).
@@ -66875,6 +67197,7 @@ fn analyze_inner<'src>(
         entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
     let phase_base_start = crate::PhaseClock::now();
     if !entry_is_module && !entry_is_open_module {
+        analyzer.source_paths = sources.clone();
         analyzer.resolve_world();
     }
     let phase_base = phase_base_start.elapsed();
@@ -67031,6 +67354,10 @@ fn analyze_over_world<'src>(
     // key, so a stored world's value is another call's.
     analyzer.platform = platform;
     analyzer.platform_reason = workspace.platform_reason.clone();
+    // B401: the admission the build's lookups read climbs a module's ANCESTOR
+    // files by path — this call's paths, since a cached world's entry is
+    // another call's (`sources[0]` is re-pointed on the hit path).
+    analyzer.source_paths = sources.clone();
     analyzer.prelude_repair = workspace.prelude_repair;
     if !crate::macros::in_macro_world() {
         SERVED_FROM_BASE_CACHE.with(|served| served.set(from_base_cache));
@@ -68411,22 +68738,7 @@ fn analyze_over_world<'src>(
     // the whole estate: a module with NO marker offers everything, exactly as
     // it did before B318 (`visibility.md` §14), so a package that has not
     // curated loses nothing.
-    let hidden_impls_pending: HashSet<Id> = analyzer
-        .implementations
-        .iter()
-        .filter(|implementation| {
-            analyzer
-                .curated_modules
-                .contains(&implementation.module_scope)
-                && !analyzer
-                    .export_all_modules
-                    .contains(&implementation.module_scope)
-                && !analyzer
-                    .exported_entities
-                    .contains_key(&implementation.impl_id)
-        })
-        .map(|implementation| implementation.impl_id)
-        .collect();
+    let hidden_impls_pending: HashSet<Id> = analyzer.hidden_impl_blocks();
 
     // B318 (E178): the visibility answers the walk already has, for vilan-ide's
     // completion filters. `export *;` marks the MODULE rather than each of its
@@ -68503,6 +68815,7 @@ fn analyze_over_world<'src>(
         global_scope_id,
         implementations: analyzer.implementations,
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
+        declined_default_calls: std::mem::take(&mut analyzer.declined_default_calls),
         cross_module_collisions: std::mem::take(&mut analyzer.cross_module_collisions),
         blanket_residues: std::mem::take(&mut analyzer.blanket_residues),
         scoped_reach_checks: std::mem::take(&mut analyzer.scoped_reach_checks),
@@ -68919,7 +69232,13 @@ pub fn build_impl_admission(program: &mut Program) {
         if !restricting.contains(&row.source) && collisions.is_empty() {
             continue;
         }
-        let sources = statement_sources(program, &references, &source_of_path, row);
+        let sources = statement_sources(
+            |id| program.source_of(id),
+            &program.canonical_sources,
+            &references,
+            &source_of_path,
+            row,
+        );
         if !collisions.is_empty() {
             // M77: only a COLLIDING block's file can be asked for, so only
             // those are kept — and a statement that carried none of them
@@ -68963,6 +69282,17 @@ pub fn build_impl_admission(program: &mut Program) {
                         || selector.members.iter().any(|(taken, _)| taken == name)
                     {
                         members.push(*member_id);
+                    }
+                }
+                // B455: the defaults the block INHERITS are members it
+                // provides too, so a default-only `impl Box with One {}` is a
+                // block `(impl Box)` names, and `(impl Box)::describe` takes
+                // the default it inherits.
+                for (name, member_id) in inherited_default_members(program, implementation) {
+                    if selector.members.is_empty()
+                        || selector.members.iter().any(|(taken, _)| *taken == name)
+                    {
+                        members.push(member_id);
                     }
                 }
             }
@@ -69425,11 +69755,13 @@ fn module_stem(program: &Program, source: SourceId) -> String {
 /// B318 S3/S4 — the refusal a CALL earns when the method it resolved to comes
 /// from an `impl` the calling file did not admit.
 ///
-/// The analyzer's own method lookup ([`Analyzer::impl_member_candidates`]) runs
-/// during the walk, where the admission map does not exist yet: the question a
-/// selector asks is `impl_select::subject_applies`, which reads a FINISHED
-/// program. So the lookup stays program-wide and the call is corrected here —
-/// which is also where the message can name the selector that would fix it.
+/// The analyzer's own method lookup ([`Analyzer::impl_member_candidates`],
+/// and the inherited-default scan) NARROWS by the file's admission since B401
+/// ([`LookupAdmission`]) — but never empties: when no admitted block offers the
+/// name, the lookup keeps its answer and the call is refused here, which is
+/// where the message can name the selector that would fix it. A declared
+/// member's block is found by its declarations; an inherited default's is the
+/// one the lookup recorded (`Program::declined_default_calls`).
 /// The per-importer namespace proper ([`ImplAdmission`], read by
 /// `dispatch_refine` and by emission's `impl_select`) is the same map asked by
 /// the consumers that DO run after the build.
@@ -69438,6 +69770,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         return;
     }
     let residues = std::mem::take(&mut program.blanket_residues);
+    let declined = std::mem::take(&mut program.declined_default_calls);
     let ImplAdmission {
         restricting,
         admitted: restricted,
@@ -69471,8 +69804,18 @@ pub fn check_call_site_admission(program: &mut Program) {
         let Some(Expr::Local(member_id)) = program.entity_map.get(&function_call.subject_id) else {
             continue;
         };
-        let Some(index) = declaring.get(member_id).copied() else {
-            continue;
+        // B401: an inherited DEFAULT is declared by its trait, not by the
+        // block that provides it — so its block is the one the lookup recorded
+        // when the file had declined it, and a call it did not record was
+        // admitted.
+        let (index, inherited_name) = match declaring.get(member_id).copied() {
+            Some(index) => (index, None),
+            None => match declined.get(call_id) {
+                Some((declined_member, index, name)) if declined_member == member_id => {
+                    (*index, Some(name.as_str()))
+                }
+                _ => continue,
+            },
         };
         let implementation = &program.implementations[index];
         // B330's refusal, decided HERE because only the site knows the
@@ -69561,6 +69904,7 @@ pub fn check_call_site_admission(program: &mut Program) {
             .iter()
             .find(|(_, id)| *id == member_id)
             .map(|(name, _)| *name)
+            .or(inherited_name)
             .unwrap_or("the member");
         let module = module_stem(program, implementation.source);
         // The EXPORT gate first (B318 S4, RULED 2026-09-13): a block its module
@@ -69637,7 +69981,8 @@ pub fn check_call_site_admission(program: &mut Program) {
 /// on the way, and probe P7's whole point is that an intermediate module's
 /// `impl` arrives with it. `only` declines the lot.
 fn statement_sources(
-    program: &Program,
+    source_of: impl Fn(Id) -> Option<SourceId>,
+    canonical_sources: &[PathBuf],
     references: &HashMap<(SourceId, Span), Id>,
     source_of_path: &HashMap<&Path, SourceId>,
     restriction: &ImportImplRestriction,
@@ -69647,15 +69992,18 @@ fn statement_sources(
         let Some(definition) = references.get(&(restriction.source, *span)).copied() else {
             continue;
         };
-        let Some(home) = program.source_of(definition) else {
+        let Some(home) = source_of(definition) else {
             continue;
         };
         if home != restriction.source && !sources.contains(&home) {
             sources.push(home);
         }
-        for ancestor in
-            ancestor_module_sources(program, source_of_path, home, restriction.path_spans.len())
-        {
+        for ancestor in ancestor_module_sources(
+            canonical_sources,
+            source_of_path,
+            home,
+            restriction.path_spans.len(),
+        ) {
             if ancestor != restriction.source && !sources.contains(&ancestor) {
                 sources.push(ancestor);
             }
@@ -69683,13 +70031,13 @@ fn statement_sources(
 /// would eventually reach a package's entry file, which no import of a module
 /// under it loads.
 fn ancestor_module_sources(
-    program: &Program,
+    canonical_sources: &[PathBuf],
     source_of_path: &HashMap<&Path, SourceId>,
     source: SourceId,
     bound: usize,
 ) -> Vec<SourceId> {
     let mut found = Vec::new();
-    let Some(start) = program.canonical_sources.get(source.0 as usize) else {
+    let Some(start) = canonical_sources.get(source.0 as usize) else {
         return found;
     };
     let mut current = start.clone();
@@ -69724,6 +70072,67 @@ fn ancestor_module_sources(
         current = hit;
     }
     found
+}
+
+/// B455: the trait DEFAULTS a block inherits — each member with a body that a
+/// trait the block provides (the clause's traits and their supertraits,
+/// `provided_trait_args`) declares and the block itself does not.
+fn inherited_default_members(
+    program: &Program,
+    implementation: &Implementation,
+) -> Vec<(String, Id)> {
+    let mut found: Vec<(String, Id)> = Vec::new();
+    let traits = implementation.trait_ids.iter().chain(
+        implementation
+            .provided_trait_args
+            .iter()
+            .map(|(trait_id, _)| trait_id),
+    );
+    for trait_id in traits {
+        let Some(trait_) = program.traits.get(trait_id) else {
+            continue;
+        };
+        for (name, member_id) in &trait_.declarations {
+            if implementation.declarations.contains_key(name)
+                || found.iter().any(|(seen, _)| seen == name)
+            {
+                continue;
+            }
+            let has_body = matches!(
+                program.entity_map.get(member_id),
+                Some(Expr::Function(function_id))
+                    if program.functions.get(function_id).is_some_and(|function| function.has_body)
+            );
+            if has_body {
+                found.push(((*name).to_string(), *member_id));
+            }
+        }
+    }
+    found
+}
+
+/// Folds one selector's claim on a block into what the statement admitted
+/// from it: a whole-block claim (`None`) absorbs any tail, and two tails
+/// union.
+fn merge_admitted_block(
+    blocks: &mut HashMap<Id, Option<Vec<String>>>,
+    block: Id,
+    taken: Option<Vec<String>>,
+) {
+    match (blocks.get_mut(&block), taken) {
+        (None, taken) => {
+            blocks.insert(block, taken);
+        }
+        (Some(whole @ Some(_)), None) => *whole = None,
+        (Some(Some(names)), Some(more)) => {
+            for name in more {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        (Some(None), _) => {}
+    }
 }
 
 /// Whether a selector admits an implementation: the implementation's subject
