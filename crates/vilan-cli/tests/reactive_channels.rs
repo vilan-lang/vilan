@@ -4341,7 +4341,7 @@ fun main() {
 	let channel = server.expose(count);
 	let client = ReactiveClient::new(client_end, json_codec());
 	let mirror: RemoteSource<i32> = client.attached_source(channel);
-	let _watch = mirror.map(|value| value.unwrap_or(0)).sub(|value| print(i"sees {value}"));
+	let _watch = mirror.derive(|value| value.unwrap_or(0)).sub(|value| print(i"sees {value}"));
 	sleep_for(Duration::millis(0));
 	print("done");
 }
@@ -4608,7 +4608,7 @@ impl Store {
 	// (any connection's) is answered with the same cell.
 	[rpc]
 	fun doubled(self): SignalCell<i32> {
-		self.cache.get_or_insert(0, || self.source.map(|x| x * 2).cell())
+		self.cache.get_or_insert(0, || self.source.derive(|x| x * 2).cell())
 	}
 }
 
@@ -4711,7 +4711,7 @@ struct Store {
 impl Store {
 	[rpc]
 	fun tripled(self): SignalCell<i32> {
-		self.slot.get_or_insert(|| self.source.map(|x| x * 3).cell())
+		self.slot.get_or_insert(|| self.source.derive(|x| x * 3).cell())
 	}
 }
 

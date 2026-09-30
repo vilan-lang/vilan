@@ -320,7 +320,7 @@ fn handler_store_warnings(
     }
     let writes = std_externals(program, "shared.vl", &["write"]);
     let makers = std_functions(program, "shared.vl", &["get_or_insert"]);
-    let derivations = std_functions(program, "reactive.vl", &["cell"]);
+    let derivations = std_functions(program, "reactive.vl", &["cell", "memo"]);
     let graph = program.call_graph();
     // The handlers, and every call their bodies make directly.
     let mut handlers: Vec<Id> = Vec::new();
@@ -429,16 +429,20 @@ fn handler_store_warnings(
     stored
         .into_iter()
         .map(|cell| {
+            let label = named_callee(program, cell)
+                .map(|callee| callee_label(program, callee))
+                .unwrap_or_else(|| "`.cell()`".to_string());
             program.anchored(
                 Error {
                     trace: Vec::new(),
                     span: call_span(program, cell),
-                    msg: "`.cell()` stored on a structure that outlives the call, in an `[rpc]` \
-                          handler: the cell is owned by the handler's owner — the CONNECTION's \
-                          under `Service::factory` — so a store every connection shares keeps \
-                          handing it out dead once that connection closes. A derivation cached \
-                          across calls is `.cell_global()`"
-                        .to_string(),
+                    msg: format!(
+                        "{label} stored on a structure that outlives the call, in an `[rpc]` \
+                         handler: the seal is owned by the handler's owner — the CONNECTION's \
+                         under `Service::factory` — so a store every connection shares keeps \
+                         handing it out dead once that connection closes. A derivation cached \
+                         across calls is `.memo_global()` or `.cell_global()`"
+                    ),
                     note: None,
                 },
                 cell,

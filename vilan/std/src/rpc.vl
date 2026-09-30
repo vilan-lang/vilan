@@ -308,7 +308,7 @@ export impl DuplexEnd {
 /// - A mirror attaches its observer before it takes its lease (`on_change`'s
 ///   order), so the seed is a change on both transports, and a mirror read right
 ///   after its first lease holds the value in process and `None` over a socket.
-/// - A node over a mirror (`mirror.map(f).sub(..)`) that pulls the mirror as it
+/// - A node over a mirror (`mirror.derive(f).sub(..)`) that pulls the mirror as it
 ///   subscribes can see the seed TWICE in process: once through the pull, which
 ///   already reads the value the inline seed wrote, and once as the seed's own
 ///   notification. Over a socket it sees it once. The value is the same; only the
