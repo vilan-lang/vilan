@@ -8033,3 +8033,56 @@ fn b460_a_trait_methods_bare_trait_return_stays_refused() {
         steer,
     );
 }
+
+// --- A142 §3.3: a read on a pipe steers to sealing (Order 44, item 12) ------
+//
+// A PLACEHOLDER fixture: the pipe layer is reactive-44's, so the traits are
+// local here and read BY NAME (`Pipe`, `Source`) — the steer's wording and the
+// std names are pinned against reactive-44's after the rebase.
+
+const PIPE_STEER_FIXTURE: &str = "
+trait Source<T> {
+    fun get(self): T;
+}
+trait Pipe<T> {
+    fun memo(own self): i32 { 0 }
+}
+[resource]
+struct Doubled { n: i32 }
+impl Doubled with Pipe<i32> {}
+struct Plain { n: i32 }
+";
+
+#[test]
+fn a_read_on_a_pipe_steers_to_sealing_or_sampling() {
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Doubled {{ n = 1 }};\n    print(p.get());\n}}\n"
+    );
+    assert_fails_with(
+        &source,
+        "Doubled has no method 'get'; a pipe has no `get`: seal it with `.memo()`, or read it \
+         once with `.sample()`",
+    );
+}
+
+#[test]
+fn a_missing_member_on_a_non_pipe_keeps_its_ordinary_message() {
+    // The control: the steer is for a PIPE's read — a type that is no pipe,
+    // asked for the same member, keeps the plain message.
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Plain {{ n = 1 }};\n    print(p.get());\n}}\n"
+    );
+    assert_fails_with(&source, "Plain has no method 'get'");
+    assert_fails_without(&source, "a pipe has no");
+}
+
+#[test]
+fn a_pipe_asked_for_a_member_no_source_declares_keeps_its_ordinary_message() {
+    // The steer names a READ: a member the source trait does not declare is
+    // an ordinary miss on a pipe too.
+    let source = format!(
+        "{PIPE_STEER_FIXTURE}\nfun main() {{\n    let p = Doubled {{ n = 1 }};\n    print(p.frob());\n}}\n"
+    );
+    assert_fails_with(&source, "Doubled has no method 'frob'");
+    assert_fails_without(&source, "a pipe has no");
+}

@@ -30532,6 +30532,40 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for
+    /// a member only the SOURCE trait declares (`get`, and the other reads).
+    /// A pipe is a description consumed once; reading it means sealing it, or
+    /// sampling it once. The trait names are read by name — `PIPE_TRAIT` and
+    /// `SOURCE_TRAIT`, pinned against std's once the pipe layer lands.
+    fn pipe_read_steer(&mut self, subject_type: &Type, member_name: &str) -> Option<String> {
+        const PIPE_TRAIT: &str = "Pipe";
+        const SOURCE_TRAIT: &str = "Source";
+        let pipe_traits: Vec<Id> = self
+            .traits
+            .values()
+            .filter(|trait_| trait_.name == PIPE_TRAIT)
+            .map(|trait_| trait_.id)
+            .collect();
+        if pipe_traits.is_empty() {
+            return None;
+        }
+        let a_source_reads_it = self.traits.values().any(|trait_| {
+            trait_.name == SOURCE_TRAIT && trait_.declarations.contains_key(member_name)
+        });
+        if !a_source_reads_it {
+            return None;
+        }
+        pipe_traits
+            .into_iter()
+            .any(|pipe| self.type_implements_trait(subject_type, pipe))
+            .then(|| {
+                format!(
+                    "; a pipe has no `{member_name}`: seal it with `.memo()`, or read it once \
+                     with `.sample()`"
+                )
+            })
+    }
+
     /// B460's steer at a tail whose arms disagree: the function returns a
     /// trait, which is ONE type the body picks — branches of two types are
     /// the object's job.
@@ -46400,9 +46434,16 @@ impl<'src> Analyzer<'src> {
                 // If an UNLOADED std module implements it for this type, the fix
                 // is an import, not a definition (std-surface.md §5 — the
                 // `42.to_string()` complaint that opened I4).
-                let import_steer = self
-                    .unimported_trait_method_steer(&subject_type, member_name)
-                    .unwrap_or_default();
+                // A142 §3.3: a READ on a pipe — the member a `Source` has and a
+                // pipe deliberately does not — is sealed or sampled, and the
+                // import the steer below would offer is the wrong fix.
+                let pipe_read_steer = self.pipe_read_steer(&subject_type, member_name);
+                let import_steer = match pipe_read_steer {
+                    Some(steer) => steer,
+                    None => self
+                        .unimported_trait_method_steer(&subject_type, member_name)
+                        .unwrap_or_default(),
+                };
                 // A99: one of the six retired `View` methods, whose fix is the
                 // free slot value and not a definition or an import.
                 let retired_slot_steer = self
