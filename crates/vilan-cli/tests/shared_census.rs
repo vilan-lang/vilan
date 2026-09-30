@@ -132,6 +132,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
          and by `dispose`).",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
+    (
+        "transient.vl",
+        1,
+        "E: a `Transient`'s generation claim (A142 S3) — made by `.transient()`, \
+         read by each settling task to drop a superseded reply",
+    ),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
 
@@ -245,7 +251,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 158,
+        total, 159,
         "the total number of `Shared` construction sites in std changed"
     );
 

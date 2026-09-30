@@ -472,6 +472,14 @@ whatever it last held, and the **next** 0→1 lease asks again. So a row
 that re-renders after a failure retries by itself, and a view that shows
 a spinner or a retry button reads `status()` to decide which.
 
+A mirror is also a [transient source](../std/transient.md): `state()`
+answers the same facts as a `TransientState` — `Waiting` is `Pending`,
+`Ready` is `Ready(v)`, `Absent` is `Absent`, and `Failed(e)` is
+`Failed(e, stale)`, carrying what the mirror last held. `latest()` and
+`is_pending()` are pipes that lease the mirror while a view binds them:
+bind `latest()` to keep the last value on screen while a re-mint is on
+its way.
+
 **One handle per origin.** A stub call is keyed by its *origin* — the
 method and its arguments, as the wire would carry them — and the
 client hands back the mirror it already minted for that origin: two

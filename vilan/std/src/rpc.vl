@@ -40,7 +40,9 @@ import pkg::reactive::{
 	Derive,
 	Disposable,
 	FlushPolicy,
+	MemoCell,
 	Owner,
+	Pipe,
 	SeqOp,
 	SignalCell,
 	Source,
@@ -51,6 +53,7 @@ import pkg::reactive::{
 	at_settle,
 	batch,
 	cell_identity,
+	combine,
 	defer_to_owner,
 	fresh_id,
 	get_owner,
@@ -63,6 +66,7 @@ import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::Shared;
 import pkg::task::Task;
 import pkg::time::{ Duration, sleep_for };
+import pkg::transient::{ TransientSource, TransientState };
 import pkg::wire::{ Codec, Delta, Deserializer, Frame, Keyed, Serializer, Wire };
 
 // === Transport: request/response ============================================
@@ -4422,6 +4426,52 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 	}
 }
 
+/// A mirror IS a transient (A142 S3, `proposal/reactive-layers.md` §5): what it
+/// knows about its channel is a `TransientState`, with `Status` mapped arm for arm
+/// — `Waiting` is `Pending`, `Ready` is `Ready(v)`, `Absent` is `Absent`, and
+/// `Failed(e)` is `Failed(e, stale)`, the stale value being whatever the mirror
+/// last held (a mirror has always kept it; the state now carries it).
+///
+/// `state()` REPORTS, like `status()`: it leases nothing, so an unwatched mirror's
+/// state is `Pending` for as long as nothing watches it. `latest()` and
+/// `is_pending()` are pipes a view BINDS in place of the mirror, so each LEASES the
+/// mirror while its consumer holds it — `latest()` is how a list keeps its old rows
+/// on screen while a re-mint is on its way (R27) — and each follows what the last
+/// mint said as well as the value.
+///
+/// The mirror's own `get()` is unchanged: it reads what the mirror holds, the stale
+/// value included after a failed re-mint.
+export impl RemoteSource<type T> with TransientSource<T, RpcError> {
+	fun state(self): MemoCell<TransientState<T, RpcError>> {
+		let derived = SignalCell::new(self.transient_state());
+		let _cached = register_with_owner(self.cache.on_change(|_value| {
+			derived.set(self.transient_state());
+		}));
+		let _minted = register_with_owner(self.mint.on_change(|_told| {
+			derived.set(self.transient_state());
+		}));
+		MemoCell { cell = derived }
+	}
+
+	fun latest(self): dyn Pipe<Option<T>> {
+		let leased: dyn Source<Option<T>> = self;
+		let told: dyn Source<Option<Status>> = self.mint;
+		let pipe: dyn Pipe<Option<T>> = combine((leased, told)).derive(|_both| self
+			.transient_state()
+			.latest());
+		pipe
+	}
+
+	fun is_pending(self): dyn Pipe<bool> {
+		let leased: dyn Source<Option<T>> = self;
+		let told: dyn Source<Option<Status>> = self.mint;
+		let pipe: dyn Pipe<bool> = combine((leased, told)).derive(|_both| self
+			.transient_state()
+			.is_pending());
+		pipe
+	}
+}
+
 export impl RemoteSource<type T> {
 	/// `initial` until the first frame, the mirrored value after — a cold `map`
 	/// node over the mirror (A124 S2c). It stores nothing and leases nothing:
@@ -4482,6 +4532,20 @@ export impl RemoteSource<type T> {
 				Some(let _present) => Status::Ready,
 				None => Status::Waiting,
 			},
+		}
+	}
+
+	/// `known()` as a `TransientState` (A142 S3): the mirror's status, carrying its
+	/// value — and, when the last mint failed, the stale value it still holds.
+	fun transient_state(self): TransientState<T, RpcError> {
+		match self.known() {
+			Status::Waiting => TransientState::Pending,
+			Status::Ready => match self.cache.get() {
+				Some(let value) => TransientState::Ready(value),
+				None => TransientState::Pending,
+			},
+			Status::Absent => TransientState::Absent,
+			Status::Failed(let error) => TransientState::Failed(error, self.cache.get()),
 		}
 	}
 

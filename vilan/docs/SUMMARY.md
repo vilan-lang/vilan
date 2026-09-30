@@ -44,6 +44,7 @@
 - [Markdown](std/markdown.md)
 - [Networking](std/net.md)
 - [Reactive](std/reactive.md)
+- [Transient sources](std/transient.md)
 - [Style](std/style.md)
 - [RPC](std/rpc.md)
 - [Browser modules](std/browser.md)

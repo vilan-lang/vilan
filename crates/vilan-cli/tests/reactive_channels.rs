@@ -4358,6 +4358,291 @@ fn a133_an_in_process_seed_is_inline_and_a_node_over_the_mirror_sees_it_twice() 
     );
 }
 
+// --- A142 S3: transient sources -------------------------------------------
+
+/// A142 S3 IN PROCESS (`reactive-layers.md` §5, R4/R5/R13/R24/R27/R36/R37). One
+/// program, six claims:
+///
+/// 1. `.transient()` over a flow of tasks: `Pending`, then `Ready`; a change moves
+///    it to `Refreshing(v)`, where `get()` reads `None` and `latest()` keeps `v`
+///    (R5, R27), and `is_pending()` is true. The LATEST task wins, by
+///    cancellation: 2's slow task is started in the pipe's run and cancelled the
+///    moment 3 is asked (it never finishes: `finished=2`).
+/// 2. A failed refresh keeps the stale value: `Failed(e, Some(30))`, `get()` None,
+///    `latest()` 30.
+/// 3. OUT-OF-ORDER replies: tasks made outside the pipe belong to no run and are
+///    never cancelled; the slow one answers LAST and is dropped (`Ready(60)`,
+///    with 5 the last to finish).
+/// 4. R36's bare-task arm: a panicking `Task<T>` is `Failed(message, stale)`,
+///    `E = str`.
+/// 5. `TaskSource` (R24): one task, `Pending` then `Ready`, or `Failed(e, None)`.
+/// 6. A seal released with its owner applies no reply that lands after.
+///
+/// No stderr: a superseded task's abort is awaited by the seal, not reported.
+const A142_S3_TRANSIENT: &str = r#"import std::io::{ panic, print };
+import std::map::Map;
+import std::reactive::{ Flow, Owner, Pipe, Signal, SignalCell, Source, owner_scope };
+import std::result::Result::{ self, Ok, Err };
+import std::shared::Shared;
+import std::task::Task;
+import std::time::sleep;
+import std::transient::{ TaskSource, Transient, TransientSource, TransientState };
+
+fun show<E>(state: TransientState<i32, E>, error: |E| str): str {
+	match state {
+		TransientState::Pending => "Pending",
+		TransientState::Ready(let v) => i"Ready({v})",
+		TransientState::Refreshing(let v) => i"Refreshing({v})",
+		TransientState::Failed(let e, let stale) => match stale {
+			Some(let v) => i"Failed({error(e)}, {v})",
+			None => i"Failed({error(e)}, -)",
+		},
+		TransientState::Absent => "Absent",
+	}
+}
+
+fun text(state: TransientState<i32, str>): str {
+	show(state, |e| e)
+}
+
+fun opt(value: Option<i32>): str {
+	match value {
+		Some(let v) => i"{v}",
+		None => "-",
+	}
+}
+
+/// Poll until `ready` holds — the program's own sequencing, never a bare sleep.
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(5);
+		tries += 1;
+	}
+}
+
+let finished: Shared<List<i32>> = Shared::new([]);
+
+// Started INSIDE the pipe's body, so each is the run's and is cancelled with it.
+async fun answer(x: i32, delay: i32): Result<i32, str> {
+	sleep(delay);
+	finished.write().push(x);
+	if x == 4 {
+		Err("four refused")
+	} else {
+		Ok(x * 10)
+	}
+}
+
+// A bare task: its failure is a panic, and its message is the error (R36).
+async fun bare(x: i32): i32 {
+	sleep(5);
+	if x == 2 {
+		panic("two panicked");
+	}
+	x * 100
+}
+
+fun main() {
+	let owner = Owner::new();
+	let _run = async {
+		// 1. Latest wins, by cancellation: 2 is slow and 3 is fast; 2's task is
+		//    cancelled with its run the moment 3 is asked, and never finishes.
+		let input: SignalCell<i32> = Signal::new(1);
+		let seal: Transient<i32, str> = owner_scope.run(owner, || input.derive(|x| async answer(x, if x == 2 { 80 } else { 5 })).transient());
+		let latest = owner_scope.run(owner, || seal.latest().memo());
+		let pending = owner_scope.run(owner, || seal.is_pending().memo());
+		print(i"start: {text(seal.state().get())} get={opt(seal.get())} latest={opt(latest.get())} pending={pending.get()}");
+		until(|| seal.get().is_some());
+		print(i"settled: {text(seal.state().get())} get={opt(seal.get())} latest={opt(latest.get())} pending={pending.get()}");
+		input.set(2);
+		// latest() across Refreshing: the old value stays, get() reads None.
+		print(i"asked 2: {text(seal.state().get())} get={opt(seal.get())} latest={opt(latest.get())} pending={pending.get()}");
+		input.set(3);
+		until(|| seal.get() == Some(30));
+		sleep(120);
+		print(i"asked 3: {text(seal.state().get())} finished={finished.read().len()}");
+		// 2. A failed refresh keeps the stale value.
+		input.set(4);
+		until(|| !pending.get());
+		print(i"failed: {text(seal.state().get())} get={opt(seal.get())} latest={opt(latest.get())} pending={pending.get()}");
+
+		// 3. Latest wins, by DROPPING: tasks made outside the pipe are nobody's
+		//    run's, so nothing cancels them; the slow one's reply comes last and
+		//    is dropped.
+		let replies: Shared<Map<i32, Task<Result<i32, str>>>> = Shared::new(Map::new());
+		replies.write().insert(5, async answer(5, 60));
+		replies.write().insert(6, async answer(6, 5));
+		let picked: SignalCell<i32> = Signal::new(5);
+		let dropped: Transient<i32, str> = owner_scope.run(owner, || picked.derive(|x| replies.read().get(x).unwrap()).transient());
+		picked.set(6);
+		until(|| finished.read().len() == 5);
+		print(i"out of order: {text(dropped.state().get())} finished-last={finished.read().get(4usize).unwrap_or(0)}");
+
+		// 4. Bare tasks: E is str, the panic's message.
+		let which: SignalCell<i32> = Signal::new(1);
+		let plain: Transient<i32, str> = owner_scope.run(owner, || which.derive(|x| async bare(x)).transient());
+		until(|| plain.get().is_some());
+		which.set(2);
+		until(|| !plain.state().get().is_pending());
+		print(i"bare: {text(plain.state().get())}");
+
+		// 5. One task.
+		let one: TaskSource<i32, str> = TaskSource::new(async answer(7, 5));
+		let one_bare: TaskSource<i32, str> = TaskSource::of(async bare(2));
+		print(i"one: {text(one.state().get())} {text(one_bare.state().get())}");
+		until(|| one.get().is_some() && !one_bare.state().get().is_pending());
+		print(i"one: {text(one.state().get())} {text(one_bare.state().get())}");
+
+		// 6. Released with its owner: the reply in flight is not applied.
+		let gone = Owner::new();
+		let later: SignalCell<i32> = Signal::new(8);
+		let retired: Transient<i32, str> = owner_scope.run(gone, || later.derive(|x| replies.read().get(5).unwrap()).transient());
+		gone.dispose();
+		sleep(20);
+		print(i"released: {text(retired.state().get())}");
+		owner.dispose();
+		print("done");
+	};
+}
+"#;
+
+#[test]
+fn a142_s3_a_flow_of_tasks_is_a_transient_where_the_latest_task_wins() {
+    let stdout = run_program("a142_s3_transient", A142_S3_TRANSIENT);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start: Pending get=- latest=- pending=true",
+            "settled: Ready(10) get=10 latest=10 pending=false",
+            "asked 2: Refreshing(10) get=- latest=10 pending=true",
+            "asked 3: Ready(30) finished=2",
+            "failed: Failed(four refused, 30) get=- latest=30 pending=false",
+            "out of order: Ready(60) finished-last=5",
+            "bare: Failed(two panicked, 100)",
+            "one: Pending Pending",
+            "one: Ready(70) Failed(two panicked, -)",
+            "released: Pending",
+            "done",
+        ],
+        "a flow of tasks sealed with .transient(); got:\n{stdout}"
+    );
+}
+
+/// A142 S3 OVER A SOCKET: a `RemoteSource` is a `TransientSource<T, RpcError>`
+/// (§5's `Status` map). An `Option` handle the server answers `None` for is
+/// `Absent`, one it answers is `Ready(v)` — and before anything watches either,
+/// both are `Pending`, because `state()` reports and leases nothing. `latest()`
+/// and `is_pending()` LEASE the mirror while bound, so binding them is enough to
+/// mint; `latest()` follows a change.
+const A142_S3_REMOTE_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::process::exit;
+import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, Owner, owner_scope };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::{ RemoteSource, RpcError };
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+import std::transient::{ TransientSource, TransientState };
+
+[service(BoardClient)]
+struct Board {
+	notes: Shared<Map<i32, SignalCell<str>>>,
+}
+
+impl Board {
+	[rpc]
+	fun write(self, id: i32, text: str): i32 {
+		match self.notes.read().get(id) {
+			Some(let cell) => cell.set(text),
+			None => {},
+		}
+		0
+	}
+
+	[rpc]
+	fun note(self, id: i32): Option<SignalCell<str>> {
+		self.notes.read().get(id)
+	}
+}
+
+let board: Board = Board { notes = Shared::new(Map::new()) };
+
+fun main() {
+	board.notes.write().insert(1, Signal::new("one"));
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+fun show(state: TransientState<str, RpcError>): str {
+	match state {
+		TransientState::Pending => "Pending",
+		TransientState::Ready(let v) => i"Ready({v})",
+		TransientState::Refreshing(let v) => i"Refreshing({v})",
+		TransientState::Failed(let _e, let stale) => i"Failed({stale.unwrap_or("-")})",
+		TransientState::Absent => "Absent",
+	}
+}
+
+async fun run(port: i32) {
+	match BoardClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let owner = Owner::new();
+			let present: RemoteSource<str> = client.note(1);
+			let missing: RemoteSource<str> = client.note(9);
+			let present_state = owner_scope.run(owner, || present.state());
+			let missing_state = owner_scope.run(owner, || missing.state());
+			print(i"unwatched: present={show(present_state.get())} missing={show(missing_state.get())}");
+			// Binding latest() leases the mirror.
+			let present_latest = owner_scope.run(owner, || present.latest().memo());
+			let missing_pending = owner_scope.run(owner, || missing.is_pending().memo());
+			let missing_latest = owner_scope.run(owner, || missing.latest().memo());
+			until(|| present_latest.get().is_some() && !missing_pending.get());
+			print(i"watched: present={show(present_state.get())} latest={present_latest.get().unwrap_or("-")} missing={show(missing_state.get())} missing-pending={missing_pending.get()} missing-latest={missing_latest.get().unwrap_or("-")}");
+			print(i"write:{client.write(1, "uno").unwrap_or(0 - 1)}");
+			until(|| present_latest.get() == Some("uno"));
+			print(i"after: present={show(present_state.get())} latest={present_latest.get().unwrap_or("-")} get={present.get().unwrap_or("-")}");
+			owner.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a142_s3_a_mirror_is_a_transient_absent_versus_pending_over_a_socket() {
+    let stdout = run_program("a142_s3_remote_socket", A142_S3_REMOTE_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "unwatched: present=Pending missing=Pending",
+            "watched: present=Ready(one) latest=one missing=Absent missing-pending=false missing-latest=-",
+            "write:0",
+            "after: present=Ready(uno) latest=uno get=uno",
+        ],
+        "over a socket, a mirror's transient state; got:\n{stdout}"
+    );
+}
+
 // --- A135: a handler runs under its CONNECTION's owner ----------------------
 
 /// A135 IN PROCESS: kolt's shape — a handle method whose body is
