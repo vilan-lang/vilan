@@ -20,6 +20,7 @@
 # The guides
 
 - [Reactive state](guide/reactive.md)
+- [Tracked reads](guide/tracked-reads.md)
 - [Building UI](guide/ui.md)
 - [Styling](guide/styling.md)
 - [Routing](guide/routing.md)

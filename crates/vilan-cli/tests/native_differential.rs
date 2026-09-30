@@ -1919,6 +1919,71 @@ const B458_PROBE: &str = concat!(
     "}\n",
 );
 
+/// A142 S6: tracked reads — the `tracking` context threaded through every body
+/// a pipe runs, the free `derive`'s stage, edges reconnected after each run,
+/// an effect's tracked re-run, a selector's re-selection, a tracked diamond in
+/// a turn, and `clear` as untrack — the same on both backends.
+#[test]
+fn tracked_reads_follow_the_same_dependencies_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_tracking.vl"), TRACKING_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_tracking.vl"),
+        Verdict::Identical,
+        "tracked reads must follow the same dependencies on both backends"
+    );
+}
+
+const TRACKING_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{\n",
+    "\tFlushPolicy, Owner, Signal, SignalCell, Source, derive, run_with_owner, tracking, turn,\n",
+    "};\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag: SignalCell<bool> = Signal::new(true);\n",
+    "\tlet a: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet b: SignalCell<i32> = Signal::new(100);\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tderive(|| if flag.track() { a.track() } else { b.track() })\n",
+    "\t\t\t.effect(|value: i32| print(i\"branch {value}\"));\n",
+    "\t\ta.effect(|value: i32| {\n",
+    "\t\t\tlet other = b.track();\n",
+    "\t\t\tprint(i\"effect {value} {other}\");\n",
+    "\t\t});\n",
+    "\t});\n",
+    "\ta.set(2);\n",
+    "\tb.set(200);\n",
+    "\tflag.set(false);\n",
+    "\ta.set(3);\n",
+    "\tlet stage = a.derive(|x: i32| x + b.track()).memo();\n",
+    "\tb.set(300);\n",
+    "\tprint(i\"stage {stage.get()}\");\n",
+    "\tlet picked = flag.switch(|on: bool| {\n",
+    "\t\tlet base = b.track();\n",
+    "\t\ta.derive(|x: i32| if on { x } else { x + base })\n",
+    "\t}).memo();\n",
+    "\tb.set(1000);\n",
+    "\tprint(i\"picked {picked.get()}\");\n",
+    "\tlet tens = a.derive(|x: i32| x * 10).memo();\n",
+    "\tlet hundreds = a.derive(|x: i32| x * 100).memo();\n",
+    "\tlet sums = Owner::new();\n",
+    "\trun_with_owner(sums, || {\n",
+    "\t\tderive(|| tens.track() + hundreds.track()).effect(|sum: i32| print(i\"sum {sum}\"));\n",
+    "\t});\n",
+    "\tturn(FlushPolicy::AtEnd, || a.set(4));\n",
+    "\tlet untracked = derive(|| a.track() + tracking.clear(|| b.get())).memo();\n",
+    "\tb.set(5);\n",
+    "\tprint(i\"untracked {untracked.get()}\");\n",
+    "\ta.set(6);\n",
+    "\tprint(i\"untracked {untracked.get()}\");\n",
+    "\tsums.dispose();\n",
+    "\towner.dispose();\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is
