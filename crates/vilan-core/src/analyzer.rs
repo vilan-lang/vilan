@@ -32612,21 +32612,22 @@ impl<'src> Analyzer<'src> {
     /// The walk's depth bound (B138): the walk recurses once per level of
     /// syntactic nesting carrying the largest frame in the analyzer — the
     /// union of [`Self::walk_expr_node_inner`]'s ~90 arms, measured by
-    /// `VILAN_DEPTH_STATS` (and by gdb, to the byte) at 42,464 B (41.5 KiB)
-    /// per level unoptimized, ~4,650 B (4.5 KiB) optimized — so nesting
+    /// `VILAN_DEPTH_STATS` (and by gdb, to the byte) at 26,376 B (25.8 KiB)
+    /// per level unoptimized, ~1,050 B optimized — so nesting
     /// depth, not node count, is what outgrows a stack (the v0.36.0
     /// incident, commit 0fb5e5f0: a modest server program's walk closed a CI
     /// worker's ~2 MiB margin). Every realistic fixture peaks at 20 levels
     /// (both walkthrough entries, the std twin-parity and release-emission
     /// corpora); 500 is 25x that, and caps the bounded worst case near
-    /// 20.3 MiB unoptimized — deeper nesting gets a clean diagnostic instead
+    /// 12.8 MiB unoptimized — deeper nesting gets a clean diagnostic instead
     /// of a stack overflow.
     ///
-    /// The per-level figure is N97's re-measurement, and
+    /// The per-level figure is Order 44's seal's re-measurement, and
     /// `tests/deep_nesting.rs` is where it is held: the record read ~36 KiB
     /// per level and ~18 MiB at the bound until Order 36's lazy, const,
-    /// callable and visibility arms landed IN this frame, and three comments
-    /// went on quoting the old numbers (N111).
+    /// callable and visibility arms landed IN this frame, three comments
+    /// went on quoting the old numbers (N111), and the frame had reached
+    /// 49,120 B when the seal moved its largest arms out of line.
     const WALK_DEPTH_LIMIT: usize = 500;
 
     fn walk_expr_node(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
@@ -32728,6 +32729,13 @@ impl<'src> Analyzer<'src> {
         id
     }
 
+    /// One level of the phase-1 walk. Its locals are ONE stack frame taken on
+    /// every call, so every level of nesting pays for every arm's locals,
+    /// whichever arm runs (`tests/deep_nesting.rs` measures it). A large arm,
+    /// or a new one that brings much with it, goes in its own
+    /// `#[inline(never)]` method, as the declaration and closure arms do
+    /// (`walk_func_entity` and its siblings below): those locals then exist
+    /// only while that arm runs.
     fn walk_expr_node_inner(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
         // F27 R3.2: a platform-fenced twin whose fence excludes this leg is
         // not collected — no entity of its own, no scope entry, no impl
@@ -33265,56 +33273,7 @@ impl<'src> Analyzer<'src> {
             // A macro definition: HERMETIC — the body is never walked in the
             // program world (it compiles in the per-file macro world instead,
             // macro-engine.md §3). Expansion consumed it before this walk.
-            Node::MacroFun(function) => {
-                if !self.module_scope_ids.contains(&scope_id) {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: node.1,
-                        msg: "a `macro fun` must be a top-level item".to_string(),
-                    });
-                }
-                // Bind the macro's NAME so imports/`use`/re-exports resolve it
-                // (the expansion layer resolves scope separately, from syntax).
-                // Items WIN name collisions — macros are a separate namespace
-                // (§4), and a derive macro deliberately shares its trait's
-                // name in the trait's own module: the item import must keep
-                // meaning the trait. `or_insert` here + plain inserts in the
-                // item arms give items precedence in either declaration order.
-                let marker = self.new_entity_id();
-                self.expr_id_to_expr_map.insert(marker, Expr::Macro);
-                self.span_map.insert(marker, &function.name.1);
-                self.expr_id_to_scope_id_map.insert(marker, scope_id);
-                let mut signature = format!("macro fun {}(", function.name.0);
-                for (index, parameter) in function.parameters.0.iter().enumerate() {
-                    if index > 0 {
-                        signature.push_str(", ");
-                    }
-                    match &parameter.pattern {
-                        Pattern::Binding(name, _, _) => signature.push_str(name),
-                        _ => signature.push('_'),
-                    }
-                    if let Some(type_) = parameter.declared_type.as_deref() {
-                        signature.push_str(": ");
-                        signature.push_str(&render_type(&type_.0));
-                    }
-                }
-                signature.push(')');
-                if let Some(return_type) = function.return_type.as_deref() {
-                    signature.push_str(": ");
-                    signature.push_str(&render_type(&return_type.0));
-                }
-                self.macro_signatures.insert(marker, signature);
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.macro_name_to_id.insert(function.name.0, marker);
-                // Also visible as an ITEM name when nothing shadows it, so
-                // `import pkg::x::my_macro` resolves; items win collisions.
-                scope
-                    .name_to_id_map
-                    .entry(function.name.0)
-                    .or_insert(marker);
-                Some(Expr::Void)
-            }
+            Node::MacroFun(..) => self.walk_macro_fun_entity(node, scope_id),
             // A macro attribute: expansion already ran (pre-walk) and appended
             // the generated items; the annotated item itself walks normally.
             Node::MacroAttribute(name, name_span, _, inner) => {
@@ -33759,357 +33718,7 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::If(branch))
             }
-            Node::Func(function) => {
-                let name = function.name.0;
-                // B417: `Self` names the type an `impl` or `trait` is about, so
-                // a member spelled that way could never be reached — `x.Self()`
-                // parses `Self` as the type — and declaring it shadowed the
-                // type's own `Self` in the body scope (`self.x` lost its type).
-                // Refused at the declaration, and left undeclared so the body
-                // still reads the real `Self`.
-                if name == "Self" {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: function.name.1,
-                        msg: "a function cannot be named `Self`: `Self` names the type an `impl` \
-                              or `trait` is about, so `value.Self()` reads as that type and \
-                              never reaches this member. Give it another name"
-                            .to_string(),
-                    });
-                } else {
-                    self.declare_scope_item(scope_id, name, id);
-                }
-                self.reference_count.entry(id).or_insert(0);
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                // E148: where a `context` clause would be inserted on this
-                // function — the parser's own record, carried through so the
-                // editor's fix has a span on a function that declares none.
-                if let Some(signature_end) = function.signature_end {
-                    self.function_signature_end_spans.insert(id, signature_end);
-                }
-                // B242: the DECLARATION's `context` clause. Resolution is
-                // deferred past the import fixpoint exactly as a parameter
-                // clause's is (a clause may name an imported context), and the
-                // names resolve as VALUES in the declaring scope — not the body
-                // scope, whose parameters could shadow one.
-                if let Some((names, clause_span)) = &function.contexts {
-                    if self.walking_member_body {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: *clause_span,
-                            msg: "a `context` clause on a trait or `impl` method is not \
-                                  supported yet: a dispatched call selects its callee at \
-                                  the call site, so the requirement cannot be checked \
-                                  against one declaration. Declare it on a free `fun` and \
-                                  call that from the method"
-                                .to_string(),
-                        });
-                    } else {
-                        self.prepped_function_context_clauses.push((
-                            id,
-                            names.iter().map(|(name, span)| (*name, *span)).collect(),
-                            scope_id,
-                            self.current_source_id,
-                        ));
-                        self.function_context_clause_spans.insert(id, *clause_span);
-                    }
-                }
-                // A tuple parameter (`fun f((a, b): T)`) desugars to a synthetic
-                // positional parameter plus a destructure run before the body.
-                let mut parameter_destructures = Vec::new();
-                let parameters = function
-                    .parameters
-                    .0
-                    .iter()
-                    .map(|parameter| {
-                        self.walk_parameter(
-                            parameter,
-                            id,
-                            body_scope_id,
-                            body_scope_id,
-                            Some(id),
-                            &mut parameter_destructures,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let generic_parameter_constraint_ids = self.register_generic_parameters(
-                    id,
-                    function.generic_parameters.as_ref(),
-                    body_scope_id,
-                );
-                // The return type is resolved in the body scope so it can refer
-                // to the function's own generic parameters (e.g. `(): T`).
-                // An `async || T` return type peels its marker first (J2): the
-                // function returns an async closure, so calls THROUGH the
-                // returned value await.
-                let mut return_type_node = function.return_type.as_deref();
-                // B309: a RETURN may carry a `context` clause — the returned
-                // closure is injected, and its caller supplies the context at
-                // each call through it. The parser binds a clause after a
-                // non-closure return type to the FUNCTION (B242's declared
-                // clause); one after a closure return type reaches here and is
-                // the type's.
-                let mut return_clause: Option<&Vec<(&'src str, Span)>> = None;
-                if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
-                    return_type_node.map(|node| (&node.0, node.1))
-                {
-                    if !clause_target_is_a_closure(&inner.0) {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: clause_span,
-                            msg: "a `context` clause is only supported on a closure type"
-                                .to_string(),
-                        });
-                    }
-                    return_clause = Some(names);
-                    return_type_node = Some(inner);
-                }
-                match return_type_node.map(|node| &node.0) {
-                    Some(Node::AsyncType(inner)) => {
-                        self.async_returning.insert(id);
-                        return_type_node = Some(inner);
-                    }
-                    Some(Node::Tuple(elements)) if elements.len() == 1 => {
-                        if let Node::AsyncType(inner) = &elements[0].0 {
-                            self.async_returning.insert(id);
-                            return_type_node = Some(inner);
-                        }
-                    }
-                    _ => {}
-                }
-                let return_type_id = return_type_node
-                    .map(|return_type| self.walk_type_node(return_type, body_scope_id));
-                // B460: the drain decides whether a bare trait here is an
-                // opaque return (a free fun, an inherent method) or a trait
-                // method's (refused).
-                if let Some(return_type_id) = return_type_id
-                    && !function.external
-                {
-                    let trait_member = self.walking_trait_body || self.walking_trait_impl_body;
-                    self.return_annotation_owners
-                        .insert(return_type_id, (id, trait_member));
-                }
-                if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
-                    self.record_type_context_clause(return_type_id, names, body_scope_id, None);
-                }
-                if function.external {
-                    // An `external` function is an intrinsic: no Vilan body, a
-                    // declared (or void) return type, registered as an external
-                    // function with a callable type so calls infer their return.
-                    if function.body.is_some() {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: function.name.1,
-                            msg: "an `external` function cannot have a body".to_string(),
-                        });
-                    }
-                    let return_type_id =
-                        return_type_id.unwrap_or_else(|| Type::Void.get_type_id(self));
-                    let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
-                    self.external_functions.insert(
-                        id,
-                        ExternalFunction {
-                            id,
-                            name,
-                            name_span: function.name.1,
-                            generic_parameter_constraint_ids,
-                            parameters,
-                            return_type_id,
-                            extern_binding: function.extern_binding.clone(),
-                            retains: function.extern_retains,
-                            borrows,
-                            returns_mut_view: matches!(
-                                return_type_node.map(|spanned| &spanned.0),
-                                Some(Node::Reference(true, _))
-                            ),
-                            // Seeded after `build()`: the native-container table, or
-                            // the all-`&mut` default (`infer_bumps`). Empty until then.
-                            bumps: BTreeSet::new(),
-                            call_count: 0,
-                            is_async: function.is_async,
-                            deprecated: function.deprecated,
-                            internal: function.internal,
-                        },
-                    );
-                    let function_type_id = self.new_type_id();
-                    self.write_type_slot(function_type_id, Type::Function(id));
-                    self.expr_id_to_type_id_map.insert(id, function_type_id);
-                    Some(Expr::ExternalFunction(id))
-                } else {
-                    // The body's `ret`s check against this function's declared
-                    // return type; without one they COLLECT, and the function's
-                    // return type is inferred from them together with its tail
-                    // (proposal/ret-checking.md rules 2 and 3).
-                    self.return_type_stack.push(match return_type_id {
-                        Some(declared) => ReturnFrame::Function(id, declared),
-                        None => ReturnFrame::Inferred { rets: Vec::new() },
-                    });
-                    let (ids, expr_id, body_statement_ids) = match &function.body {
-                        Some(body) => {
-                            // Parameter destructures run first, before the body.
-                            let mut ids = parameter_destructures;
-                            let statement_ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
-                            // The block's OWN statements, captured before they
-                            // are merged with the destructure ids —
-                            // `resolve_return_type` reads them to ask whether
-                            // the body leaves before the tail (B221) and to
-                            // tell "this body ends without producing a value"
-                            // from "the `;` discards this body's last value"
-                            // (S3, editing-dx.md §3.7).
-                            let body_statement_ids = statement_ids.clone();
-                            ids.extend(statement_ids);
-                            let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
-                            (ids, expr_id, body_statement_ids)
-                        }
-                        None => {
-                            // A signature without a body is only legitimate as a
-                            // trait method requirement; anywhere else it must be
-                            // declared `external`.
-                            if !self.walking_trait_body {
-                                self.diagnostics.push(Error {
-                                    trace: Vec::new(),
-                                    note: None,
-                                    span: function.name.1,
-                                    msg: format!(
-                                        "function '{}' must have a body or be declared `external`",
-                                        name
-                                    ),
-                                });
-                            }
-                            let void_id = self.new_entity_id();
-                            self.expr_id_to_expr_map.insert(void_id, Expr::Void);
-                            self.expr_id_to_scope_id_map.insert(void_id, body_scope_id);
-                            self.span_map.insert(void_id, &EMPTY_SPAN);
-                            (Vec::new(), void_id, Vec::new())
-                        }
-                    };
-                    let rets = match self.return_type_stack.pop() {
-                        Some(ReturnFrame::Inferred { rets }) => rets,
-                        _ => Vec::new(),
-                    };
-                    // B134: `return_sites` is the one join of a function's
-                    // return positions — the tail and each value-carrying
-                    // `ret` — for EVERY bodied function, annotated or not.
-                    // B116 built it for declared-return functions; B126 typed
-                    // an unannotated function's `ret`s, so the seam readers
-                    // (`infer_borrows`, the crossing scan, `check_view_escape`,
-                    // the return clone sites) must see those positions too, or
-                    // the two spellings of one return disagree: an unannotated
-                    // `ret &self.x` was refused by the raw escape arm while
-                    // its tail twin copied, and an unannotated TAIL handing
-                    // back a loaned place was never a clone seam at all —
-                    // live storage left the frame. A declared-return bare
-                    // `ret`'s synthesized void still enters (it IS the checked
-                    // value); an unannotated bare `ret` synthesizes none and
-                    // has no leaves to contribute.
-                    if function.body.is_some() {
-                        self.return_sites.push((id, expr_id));
-                        for (_, ret_value_id) in &rets {
-                            if let Some(ret_value_id) = ret_value_id {
-                                self.return_sites.push((id, *ret_value_id));
-                            }
-                        }
-                    }
-                    // Infer the body's tail against the declared return type (the
-                    // way a `let v: R = ..` annotation drives its value), so a
-                    // return-position generic call binds its type parameters from
-                    // `R`. Only for a real body with a declared return type.
-                    if function.body.is_some()
-                        && let Some(return_type_id) = return_type_id
-                    {
-                        self.expected_types.insert(expr_id, return_type_id);
-                        self.seed_tail_expectations(expr_id, return_type_id);
-                        // The synthesized void tail after a last statement that
-                        // LEAVES is unreachable, and checking it draws a second
-                        // diagnostic that adds no information (P28's duplicate,
-                        // editing-dx.md §17.2) or — for an exhaustive
-                        // `if`/`match` of `ret`s — a false one (B124, §17.7).
-                        // The constraint is pushed unconditionally and
-                        // `check_return_position` asks `block_diverges` instead:
-                        // at walk time a `match` is not yet in
-                        // `expr_id_to_expr_map` (`resolve_match` inserts it), so
-                        // only the resolve-time question can see every way out.
-                        self.constraints.push(Constraint::ReturnType {
-                            body_id: expr_id,
-                            return_type_id,
-                            statement_ids: body_statement_ids.clone(),
-                        });
-                    }
-                    // Rule 3: an undeclared return is inferred from the body's
-                    // return positions, which must agree. One constraint per
-                    // bodied function, `ret`s or not — its pass is what leaves
-                    // the record the read-only coercion path reads.
-                    if function.body.is_some() && return_type_id.is_none() {
-                        self.constraints
-                            .push(Constraint::FunctionReturns { function_id: id });
-                    }
-                    // An `[rpc]` method's declared signature must be Wire —
-                    // recorded now, with the type ids its annotations walked
-                    // to, and checked once every impl is in the table. Ahead of
-                    // the insert below because that is what moves `parameters`.
-                    if function.rpc {
-                        self.collect_rpc_signature(function, id, &parameters, return_type_id);
-                        // B313: the shape B287 refuses at the attribute. The
-                        // WRITTEN `async` keyword is the key, as it is there —
-                        // an inferred-async method is not refused by the
-                        // attribute and must keep E3's report.
-                        if function.is_async
-                            && function.receiver_spelling() == Some("&mut self")
-                            && let Some(receiver_id) = parameters.first()
-                        {
-                            self.rpc_async_mut_self_receivers.push((
-                                *receiver_id,
-                                self.current_impl_subject_name.unwrap_or_default(),
-                            ));
-                        }
-                    }
-                    let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
-                    self.functions.insert(
-                        id,
-                        Function {
-                            id,
-                            name,
-                            name_span: function.name.1,
-                            generic_parameter_constraint_ids,
-                            parameters,
-                            return_type_id,
-                            body: (ids, expr_id, body_scope_id),
-                            rets,
-                            has_body: function.body.is_some(),
-                            call_count: 0,
-                            is_async: function.is_async,
-                            borrows,
-                            // Inferred by `infer_bumps` after `build()`; the fixpoint
-                            // grows this set from the empty seed.
-                            bumps: BTreeSet::new(),
-                            returns_mut_view: matches!(
-                                function.return_type.as_deref().map(|spanned| &spanned.0),
-                                Some(Node::Reference(true, _))
-                            ),
-                            returns_view: matches!(
-                                function.return_type.as_deref().map(|spanned| &spanned.0),
-                                Some(Node::Reference(_, _))
-                            ),
-                            must_use: function.must_use,
-                            deprecated: function.deprecated,
-                            internal: function.internal,
-                            platform_fence: function
-                                .platform_fence
-                                .iter()
-                                .map(|(pattern, span)| (*pattern, *span))
-                                .collect(),
-                            rpc: function.rpc,
-                            trait_only: function.trait_only,
-                        },
-                    );
-                    Some(Expr::Function(id))
-                }
-            }
+            Node::Func(..) => self.walk_func_entity(node, scope_id, id),
             Node::Call(subject, generic_arguments, arguments) => {
                 let subject_id = self.walk_expr_node(subject, scope_id);
                 // B204: bank the call's subject as the WALK saw it. The pair
@@ -34623,238 +34232,8 @@ impl<'src> Analyzer<'src> {
                 });
                 Some(Expr::Assignment(target_id, stored_value_id))
             }
-            Node::Struct(name, generic_parameters, external, resource, body, labels) => {
-                let name_span = name.1;
-                let name = name.0;
-                if let Some(labels) = labels {
-                    self.item_labels.insert(id, (**labels).clone());
-                }
-                let external = *external;
-                let resource = *resource;
-                self.declare_scope_item(scope_id, name, id);
-                self.reference_count.entry(id).or_insert(0);
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                let generic_parameter_constraint_ids = self.register_generic_parameters(
-                    id,
-                    generic_parameters.as_deref(),
-                    body_scope_id,
-                );
-                // E227: a `[hint(..)]` names the declaration's own parameters.
-                if let Some(labels) = labels {
-                    self.bank_hint_attributes(id, labels, body_scope_id);
-                }
-                // A bodyless `struct Name;` is only valid when `external`; an
-                // ordinary struct must list its fields in `{ .. }` (possibly
-                // empty).
-                if !external && body.is_none() {
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: node.1,
-                        msg: format!(
-                            "struct '{}' must declare a body or be declared `external`",
-                            name
-                        ),
-                    });
-                }
-                let mut fields = Vec::new();
-                for child in body.iter().flat_map(|body| &body.0) {
-                    let (field_name, field_name_span) = child.0.0;
-                    // An `async || T` field peels its marker (J2): calls
-                    // through the field await.
-                    let mut field_type_node = child.0.1.as_ref();
-                    // B309: a field may carry a `context` clause —
-                    // `body: (|| View) context owner_scope` — so the clause
-                    // peels FIRST and the marker peel below sees the closure
-                    // type underneath, exactly as at a parameter.
-                    let mut field_clause: Option<&Vec<(&'src str, Span)>> = None;
-                    if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
-                        field_type_node.map(|node| (&node.0, node.1))
-                    {
-                        if !clause_target_is_a_closure(&inner.0) {
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span: clause_span,
-                                msg: "a `context` clause is only supported on a closure type"
-                                    .to_string(),
-                            });
-                        }
-                        field_clause = Some(names);
-                        field_type_node = Some(inner);
-                    }
-                    match field_type_node.map(|node| &node.0) {
-                        Some(Node::AsyncType(inner)) => {
-                            self.async_fields.insert((id, fields.len()));
-                            field_type_node = Some(inner);
-                        }
-                        // The `(..)` the clause's grammar needs is grouping, so
-                        // an `(async || T) context c` field still peels.
-                        Some(Node::Tuple(elements)) if elements.len() == 1 => {
-                            if let Node::AsyncType(inner) = &elements[0].0 {
-                                self.async_fields.insert((id, fields.len()));
-                                field_type_node = Some(inner);
-                            }
-                        }
-                        _ => {}
-                    }
-                    let type_id = match field_type_node {
-                        Some(node) => {
-                            let type_id = self.walk_type_node(node, body_scope_id);
-                            // B184: the third value position where a trait is a
-                            // reading rather than an error. Recorded by type id
-                            // because the name has not resolved yet — whether
-                            // the annotation names a trait is the pre-pass's to
-                            // discover, exactly as B161's `let` and B186's
-                            // parameter are the drain's.
-                            self.field_annotation_type_ids
-                                .insert(type_id, (id, body_scope_id));
-                            // B461 deliberately registers no NESTED field
-                            // positions: A124 R3 withdrew the top-level field
-                            // reading (a trait at a field is the object, `dyn
-                            // A`), and a nested field mention keeps the same
-                            // refusal and steer rather than reviving B184's
-                            // hidden parameter one level down.
-                            type_id
-                        }
-                        None => Type::Unknown.get_type_id(self),
-                    };
-                    // B309: a field's clause has no declaration entity to index
-                    // — a field is not a value binding — so the TYPE is the
-                    // whole record, which is the point of the change.
-                    if let Some(names) = field_clause {
-                        self.record_type_context_clause(type_id, names, body_scope_id, None);
-                    }
-                    // An `[expose]`d field's type must implement `std::Source`
-                    // over a Wire element — recorded now with the type it walked
-                    // to, checked once every module's Wire names and impls are
-                    // collected (`check_expose_fields`).
-                    if child.0.2.is_exposed() {
-                        self.expose_fields_to_check.push((
-                            format!("field `{field_name}` of struct `{name}`"),
-                            child.0.1.as_ref().map(|type_node| &type_node.0),
-                            type_id,
-                            child
-                                .0
-                                .1
-                                .as_ref()
-                                .map(|type_node| type_node.1)
-                                .unwrap_or(child.1),
-                            id,
-                            child.0.2,
-                        ));
-                    }
-                    fields.push(Field {
-                        name: field_name,
-                        name_span: field_name_span,
-                        type_id,
-                        internal: child.0.3,
-                    });
-                }
-                self.structs.insert(
-                    id,
-                    Struct {
-                        id,
-                        name,
-                        name_span,
-                        generic_parameter_constraint_ids,
-                        fields,
-                        external,
-                        resource,
-                    },
-                );
-                Some(Expr::Struct(id))
-            }
-            Node::Enum(name, generic_parameters, resource, variants, labels) => {
-                let name_span = name.1;
-                let name = name.0;
-                if let Some(labels) = labels {
-                    self.item_labels.insert(id, (**labels).clone());
-                }
-                let resource = *resource;
-                self.declare_scope_item(scope_id, name, id);
-                self.reference_count.entry(id).or_insert(0);
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                let generic_parameter_constraint_ids = self.register_generic_parameters(
-                    id,
-                    generic_parameters.as_deref(),
-                    body_scope_id,
-                );
-                // E227: a `[hint(..)]` names the declaration's own parameters.
-                if let Some(labels) = labels {
-                    self.bank_hint_attributes(id, labels, body_scope_id);
-                }
-                // Variants live in the enum's own namespace, reachable through
-                // `use Enum::{ ... }` or `Enum::Variant` — not the outer scope.
-                let variants_scope = self.create_scope(None);
-                let variants_scope_id = self.push_scope(variants_scope);
-                // ONE reading of the discriminants (§10): the walk resolves
-                // every variant here, and the generators that run earlier at
-                // derive-expansion time resolve them with the same call, so a
-                // walked variant cannot lower to a value the generators do not
-                // know about.
-                let read = read_enum_backing(name, &variants.0);
-                let backing = read.backing;
-                let mut variant_declarations = Vec::new();
-                for (variant_index, (variant, variant_backing)) in
-                    variants.0.iter().zip(read.variants).enumerate()
-                {
-                    let variant_name = variant_backing.name;
-                    let data_type_ids: Vec<TypeId> = variant
-                        .0
-                        .1
-                        .iter()
-                        .map(|data_type| self.walk_type_node(data_type, body_scope_id))
-                        .collect();
-                    self.diagnostics.extend(variant_backing.diagnostics);
-                    // A rejected literal still needs a value to carry; `0` is
-                    // the same placeholder B79 used, and the enum is already
-                    // diagnosed, so nothing reads it.
-                    let backing_value = variant_backing.value.unwrap_or(BackingValue::Int(0));
-                    let variant_id = self.new_entity_id();
-                    self.expr_id_to_expr_map
-                        .insert(variant_id, Expr::EnumVariant(id, variant_index));
-                    self.expr_id_to_scope_id_map.insert(variant_id, scope_id);
-                    self.span_map.insert(variant_id, &variant.1);
-                    self.reference_count.entry(variant_id).or_insert(0);
-                    let variants_scope = self.mut_scope_for_scope_id(variants_scope_id);
-                    variants_scope
-                        .name_to_id_map
-                        .insert(variant_name, variant_id);
-                    variant_declarations.push(EnumVariantDeclaration {
-                        name: variant_name,
-                        data_type_ids,
-                        backing_value,
-                        internal: variant.0.3,
-                    });
-                }
-                // A bare-lowered enum IS a `str`/number at runtime and carries a
-                // synthesized `impl .. with Hashable` (`backed_enum_hashable_source`),
-                // so it counts as Hashable for the derive's all-fields check too —
-                // otherwise the impl table and `hashable_names` would disagree and
-                // `[derive(Hashable)] struct Key { align: Align }` would be rejected
-                // for a field the key check accepts. A resource is excluded on both
-                // sides for the same reason it is excluded there.
-                if backing.is_some() && !resource {
-                    self.hashable_names.insert(name);
-                }
-                self.enums.insert(
-                    id,
-                    Enum {
-                        id,
-                        name,
-                        name_span,
-                        generic_parameter_constraint_ids,
-                        variants: variant_declarations,
-                        variants_scope_id,
-                        backing,
-                        resource,
-                    },
-                );
-                Some(Expr::Enum(id))
-            }
+            Node::Struct(..) => self.walk_struct_entity(node, scope_id, id),
+            Node::Enum(..) => self.walk_enum_entity(node, scope_id, id),
             Node::Match(subject, legs) => {
                 let subject_id = self.walk_expr_node(subject, scope_id);
                 let mut walked_legs = Vec::new();
@@ -34953,414 +34332,17 @@ impl<'src> Analyzer<'src> {
                 ));
                 None
             }
-            Node::Impl(subject, traits, body, labels) => {
-                // B463: the head — `impl R with Wrap`, without the body — for a
-                // note that points at the block rather than covering it.
-                let header_span = Span {
-                    start: node.1.start,
-                    end: traits.last().map_or(subject.1.end, |trait_| trait_.1.end),
-                };
-                // F27 R1: an impl's `[platform(..)]` rides the item labels.
-                if let Some(labels) = labels {
-                    self.item_labels.insert(id, (**labels).clone());
-                }
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                // The impl's generic parameters are the `type X` binders in the
-                // subject pattern (anywhere: `impl List<type T>`, `impl
-                // Option<(type T, type U)>`, or a blanket `impl type T`). Register
-                // them before walking the subject so they resolve.
-                self.register_subject_binders(subject, body_scope_id);
-                // Binders may also sit in the WITH-clause's trait arguments
-                // (`impl Point with DescribeInto<type S: Sink>`) — the impl is
-                // generic over them exactly like subject binders (a bound-less
-                // one inherits the trait's declared bound for its position,
-                // with the same deferred retrofit when the trait is declared
-                // later). Registered before the body walks, since member
-                // signatures reference them.
-                for trait_ in traits {
-                    self.register_subject_binders(trait_, body_scope_id);
-                }
-                // The subject may legitimately BE a trait: `impl Iterator<type T>`
-                // and `impl Iterator<type T> with Iterable<T>` blanket over a
-                // bound, which is how std writes "every iterator also iterates".
-                // B299: the head's own type references are banked so the
-                // body-only steer can tell them apart from a body's.
-                let head_prepped_from = self.prepped_type_locals.len();
-                let subject_type_id = self.walk_trait_position_type_node(subject, body_scope_id);
-                // B184: the fourth position that can ground a hidden parameter,
-                // and the one that makes a sugared struct usable at all — a
-                // struct with methods. The impl owns the mint, so `Self` is
-                // `C<S>` for a parameter the impl is generic over.
-                self.impl_subject_annotation_type_ids
-                    .insert(subject_type_id, (id, body_scope_id));
-                // Within an `impl`, `Self` refers to the subject type.
-                self.register_self_type(body_scope_id, subject_type_id);
-                // B299: the subject may BE a bare trait, and then this body is
-                // written for every type that implements it — `self` is that
-                // type, not a value of the trait. Which it is cannot be read
-                // HERE (the subject's slot resolves later, a trait declared
-                // further down the file included), so the scope and its subject
-                // are banked and the question is asked once types are final.
-                self.impl_body_subjects
-                    .insert(body_scope_id, subject_type_id);
-                for (type_id, ..) in &self.prepped_type_locals[head_prepped_from..] {
-                    self.impl_head_type_ids.insert(*type_id);
-                }
-                // Record the SUBJECT so `self`'s variant patterns substitute
-                // the enum's declared parameters for the subject's own
-                // arguments — e.g. `Some` on an `Option<(T, U)>` subject has
-                // payload `(T, U)`, not the abstract `T` of `enum Option<T>`.
-                // The arguments come from the walk above; re-walking them here
-                // to bank them is what reported one unresolved name twice
-                // (B297).
-                if matches!(&subject.0, Node::AccessorWithGenerics(_, _)) {
-                    self.impl_subject_args
-                        .insert(body_scope_id, subject_type_id);
-                }
-                // Which struct an `[rpc]` method was declared on, for the
-                // notification rule (§9.3): the check runs after every module is
-                // walked, so the name is banked here rather than looked up.
-                let outer_impl_subject = self.current_impl_subject_name;
-                self.current_impl_subject_name = match &subject.0 {
-                    Node::Accessor(name) => Some(*name),
-                    Node::AccessorWithGenerics(name, _) => Some(*name),
-                    _ => None,
-                };
-                // B317: the same head, kept past the restore below, for the
-                // import-path index written with the registration.
-                let impl_subject_head = self.current_impl_subject_name;
-                let subject = subject_type_id;
-                let was_walking_member_body = self.walking_member_body;
-                self.walking_member_body = true;
-                let was_walking_trait_impl_body = self.walking_trait_impl_body;
-                self.walking_trait_impl_body = !traits.is_empty();
-                self.walk_expr_nodes(&body.0, body_scope_id);
-                self.walking_trait_impl_body = was_walking_trait_impl_body;
-                self.current_impl_subject_name = outer_impl_subject;
-                self.walking_member_body = was_walking_member_body;
-                let declared_members = self.collect_declared_members(body_scope_id);
-                let declarations: IndexMap<&'src str, Id> =
-                    declared_members.iter().copied().collect();
-                let implementation_index = self.implementations.len();
-                // `impl Subject with A + B` must satisfy each trait; record a
-                // conformance check per trait to run once declarations are known.
-                // The check also resolves the trait id back onto the impl.
-                for trait_ in traits {
-                    let (trait_name, trait_arguments) = match &trait_.0 {
-                        Node::Accessor(name) => (Some(*name), Vec::new()),
-                        // `with Readable<T>` — capture the trait's arguments in the
-                        // impl's generic terms (resolved in the impl body scope).
-                        Node::AccessorWithGenerics(name, generic_arguments) => {
-                            let argument_type_ids = generic_arguments
-                                .0
-                                .iter()
-                                .map(|argument| self.walk_type_node(argument, body_scope_id))
-                                .collect();
-                            (Some(*name), argument_type_ids)
-                        }
-                        _ => (None, Vec::new()),
-                    };
-                    if let Some(trait_name) = trait_name {
-                        self.prepped_trait_impls.push(TraitImplCheck {
-                            subject_type_id: subject,
-                            trait_name,
-                            trait_arguments,
-                            scope_id,
-                            declarations: declarations.clone(),
-                            span: trait_.1,
-                            source_id: self.current_source_id,
-                            implementation_index,
-                            impl_id: id,
-                        });
-                    }
-                }
-                // The name index, written in the same breath as the impl it
-                // describes — the one and only place `implementations` grows,
-                // so the two can never disagree. `declarations` is final by
-                // now (the later conformance pass only fills `trait_ids` /
-                // `trait_args`), which is what makes a registration-time index
-                // sound rather than a cache in need of invalidation.
-                for member_name in declarations.keys().copied() {
-                    self.implementations_by_member
-                        .entry(member_name)
-                        .or_default()
-                        .push(implementation_index);
-                }
-                // M30's index, written here for exactly the reason the name
-                // index above is: this is where `implementations` grows, and
-                // `declarations` is final by now.
-                for member_id in declarations.values().copied() {
-                    self.implementation_by_declaration
-                        .entry(member_id)
-                        .or_insert(implementation_index);
-                }
-                // B317's index, written in the same breath for the same reason
-                // as the two above. `current_impl_subject_name` was restored
-                // just up there, so the head is taken from the banked copy the
-                // walk set — a subject that is not a named head (a tuple, a
-                // list, a bare `&T`) contributes no namespace, which is right:
-                // an import path can only spell a name.
-                if let Some(subject_name) = impl_subject_head {
-                    // M69: shared, not copied — every `Analyzer` clone used to
-                    // deep-copy each block's member list.
-                    self.impl_namespaces
-                        .push(std::sync::Arc::new(ImplNamespace {
-                            subject_name,
-                            scope_id,
-                            members: declared_members.clone(),
-                        }));
-                }
-                self.implementations.push(Implementation {
-                    subject,
-                    impl_id: id,
-                    header_span,
-                    module_scope: scope_id,
-                    source: self.current_source_id,
-                    declarations,
-                    declared_members,
-                    trait_ids: Vec::new(),
-                    trait_args: Vec::new(),
-                    provided_trait_args: Vec::new(),
-                });
-
-                Some(Expr::Impl(id))
+            Node::Impl(..) => self.walk_impl_entity(node, scope_id, id),
+            Node::Trait(..) => self.walk_trait_entity(node, scope_id, id),
+            Node::TupleComprehension { .. } => {
+                self.walk_tuple_comprehension_entity(node, scope_id, id)
             }
-            Node::Trait(name, generic_parameters, supertraits, body, labels) => {
-                let name_span = name.1;
-                let name = name.0;
-                if let Some(labels) = labels {
-                    self.item_labels.insert(id, (**labels).clone());
-                }
-                self.declare_scope_item(scope_id, name, id);
-                self.reference_count.entry(id).or_insert(0);
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                let generic_parameter_constraint_ids = self.register_generic_parameters(
-                    id,
-                    generic_parameters.as_deref(),
-                    body_scope_id,
-                );
-                let generic_parameter_names = generic_parameters
-                    .as_ref()
-                    .map(|parameters| {
-                        parameters
-                            .0
-                            .iter()
-                            .map(|parameter| parameter.name)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // Inside a trait, `Self` is the trait itself (abstractly): a
-                // `self`-typed receiver in a default method resolves its method
-                // calls against this trait's own declarations.
-                let self_type_id = Type::Trait(id, Vec::new()).get_type_id(self);
-                self.register_self_type(body_scope_id, self_type_id);
-                self.trait_body_scopes.insert(body_scope_id);
-                // Supertraits are resolved in the body scope so their generic
-                // arguments (`PartialEq<B>`) see the trait's parameters.
-                let supertraits = supertraits
-                    .iter()
-                    .map(|supertrait| self.walk_trait_position_type_node(supertrait, body_scope_id))
-                    .collect();
-                // Bodyless methods are legitimate requirements inside a trait.
-                let was_walking_trait_body = self.walking_trait_body;
-                let was_walking_member_body = self.walking_member_body;
-                self.walking_trait_body = true;
-                self.walking_member_body = true;
-                self.walk_expr_nodes(&body.0, body_scope_id);
-                self.walking_trait_body = was_walking_trait_body;
-                self.walking_member_body = was_walking_member_body;
-                let declared_members = self.collect_declared_members(body_scope_id);
-                let declarations: IndexMap<&'src str, Id> =
-                    declared_members.iter().copied().collect();
-                // M30's twin of the impl index, at the one place `traits` grows.
-                for member_id in declarations.values().copied() {
-                    self.trait_by_declaration.entry(member_id).or_insert(id);
-                }
-                self.traits.insert(
-                    id,
-                    Trait {
-                        id,
-                        name,
-                        name_span,
-                        generic_parameter_constraint_ids,
-                        generic_parameter_names,
-                        declarations,
-                        declared_members,
-                        supertraits,
-                        resource: labels.as_ref().is_some_and(|labels| labels.resource),
-                    },
-                );
-                Some(Expr::Trait(id))
-            }
-            Node::TupleComprehension { bindings, body } => {
-                // Every source walks in the ENCLOSING scope — a zipped source
-                // cannot see an earlier binding, which names an element only
-                // inside the body.
-                let source_ids: Vec<Id> = bindings
-                    .iter()
-                    .map(|binding| self.walk_expr_node(&binding.source, scope_id))
-                    .collect();
-                // The element binders scope to the body. Their types (each
-                // source's element type) are set when the comprehension
-                // resolves.
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                let mut walked = Vec::with_capacity(bindings.len());
-                for (binding, source_id) in bindings.iter().zip(source_ids) {
-                    let binder_id = self.new_entity_id();
-                    let unknown_type_id = Type::Unknown.get_type_id(self);
-                    self.variables.insert(
-                        binder_id,
-                        Variable {
-                            id: binder_id,
-                            name: binding.binder,
-                            name_span: binding.binder_span,
-                            initial: None,
-                            type_id: unknown_type_id,
-                            mutable: false,
-                            annotated: false,
-                        },
-                    );
-                    self.expr_id_to_expr_map
-                        .insert(binder_id, Expr::Variable(binder_id));
-                    self.expr_id_to_scope_id_map
-                        .insert(binder_id, body_scope_id);
-                    self.span_map.insert(binder_id, &binding.binder_span);
-                    self.reference_count.entry(binder_id).or_insert(0);
-                    if binding.binder != "_" {
-                        self.mut_scope_for_scope_id(body_scope_id)
-                            .name_to_id_map
-                            .insert(binding.binder, binder_id);
-                    }
-                    // A method on the binder defers until its type is set (below).
-                    self.untyped_comprehension_binders.insert(binder_id);
-                    walked.push((binder_id, source_id));
-                }
-                let body_id = self.walk_expr_node(body, body_scope_id);
-                // The binders' types are set when the sources resolve (before
-                // method calls); the constraint records the
-                // `Expr::TupleComprehension`.
-                self.constraints.push(Constraint::Comprehension {
-                    id,
-                    bindings: walked,
-                    body_id,
-                });
-                None
-            }
-            Node::Closure(closure) => {
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                // A tuple parameter (`|(a, b)| ..`) desugars to a synthetic
-                // positional parameter plus a destructure run before the body.
-                let mut parameter_destructures = Vec::new();
-                let parameters = closure
-                    .parameters
-                    .0
-                    .iter()
-                    .map(|parameter| {
-                        self.walk_parameter(
-                            parameter,
-                            id,
-                            body_scope_id,
-                            scope_id,
-                            // A closure has no generic list, so B186's sugar
-                            // stops here and the trait refusal stands.
-                            None,
-                            &mut parameter_destructures,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                // A closure is a `ret` boundary with an INFERRED return type:
-                // its rets collect here and take part in that inference
-                // beside the reachable tail (proposal/ret-checking.md rule 4,
-                // lifted by B133).
-                self.return_type_stack
-                    .push(ReturnFrame::Inferred { rets: Vec::new() });
-                // B223: a closure BODY is not part of any condition the closure
-                // is written in. The condition's truth says nothing about a
-                // test that runs inside a function value — `if holds(|| x is
-                // Some(let n))` is true or false whatever the `is` answered —
-                // so the body starts from no frame, and an `is` at the root of
-                // a spine in it installs B215's expression frame. That is what
-                // gives the read past it B215's steer instead of the bare name
-                // miss B199's per-node narrowing left behind: one rule, one
-                // voice, wherever the test is written.
-                let outer_polarity = self.condition_polarity.take();
-                let expr_id = self.walk_expr_node(&closure.return_value, body_scope_id);
-                self.condition_polarity = outer_polarity;
-                let rets = match self.return_type_stack.pop() {
-                    Some(ReturnFrame::Inferred { rets }) => rets,
-                    _ => Vec::new(),
-                };
-                if !rets.is_empty() {
-                    self.constraints
-                        .push(Constraint::ClosureReturns { closure_id: id });
-                }
-                // S3 (editing-dx.md §3.4/§3.9): resolved in the body scope,
-                // like a named function's return type, so it can name the
-                // closure's own generic parameters.
-                let return_type_id = closure
-                    .return_type
-                    .as_deref()
-                    .map(|node| self.walk_type_node(node, body_scope_id));
-                self.closures.insert(
-                    id,
-                    Closure {
-                        id,
-                        parameters,
-                        parameter_destructures,
-                        return_: expr_id,
-                        rets,
-                        return_type_id,
-                    },
-                );
-                Some(Expr::Closure(id))
-            }
+            Node::Closure(..) => self.walk_closure_entity(node, scope_id, id),
             // `async <body>` lowers to an immediately-invoked, no-parameter
             // async closure. The closure is its own node (in `closures`), so the
             // async inference pass treats it as a boundary: its awaits make the
             // closure async, not the enclosing function.
-            Node::Async(body) => {
-                let closure_id = self.new_entity_id();
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                // Like a closure: a `ret` boundary with an inferred return type.
-                self.return_type_stack
-                    .push(ReturnFrame::Inferred { rets: Vec::new() });
-                let return_id = self.walk_expr_node(body, body_scope_id);
-                let rets = match self.return_type_stack.pop() {
-                    Some(ReturnFrame::Inferred { rets }) => rets,
-                    _ => Vec::new(),
-                };
-                if !rets.is_empty() {
-                    self.constraints
-                        .push(Constraint::ClosureReturns { closure_id });
-                }
-                self.closures.insert(
-                    closure_id,
-                    Closure {
-                        id: closure_id,
-                        parameters: Vec::new(),
-                        parameter_destructures: Vec::new(),
-                        return_: return_id,
-                        rets,
-                        // `async` has no return-type annotation grammar, and
-                        // this desugared closure is reached only through
-                        // `Expr::Async`, never `Expr::Closure` — S3's
-                        // return-position check (below) never sees it.
-                        return_type_id: None,
-                    },
-                );
-                self.expr_id_to_expr_map
-                    .insert(closure_id, Expr::Closure(closure_id));
-                self.span_map.insert(closure_id, &node.1);
-                self.expr_id_to_scope_id_map
-                    .insert(closure_id, body_scope_id);
-                // The type (`Promise<T>`) is inferred lazily in `infer_type_path`.
-                Some(Expr::Async(closure_id))
-            }
+            Node::Async(..) => self.walk_async_entity(node, scope_id),
             // `await <inner>` — its type (the unwrapped `T`) is inferred lazily.
             Node::Await(inner) => {
                 let inner_id = self.walk_expr_node(inner, scope_id);
@@ -35416,22 +34398,7 @@ impl<'src> Analyzer<'src> {
                 });
                 Some(Expr::Error)
             }
-            Node::Module(name, body) => {
-                self.declare_scope_item(scope_id, name, id);
-                let body_scope = self.create_scope(Some(scope_id));
-                let body_scope_id = self.push_scope(body_scope);
-                self.module_scope_ids.insert(body_scope_id);
-                let body = self.walk_expr_nodes(&body.0, body_scope_id);
-                self.modules.insert(
-                    id,
-                    Module {
-                        id,
-                        name,
-                        body: (body, body_scope_id),
-                    },
-                );
-                Some(Expr::Module(id))
-            }
+            Node::Module(..) => self.walk_module_entity(node, scope_id, id),
         };
 
         if let Some(entity) = entity {
@@ -35442,6 +34409,1174 @@ impl<'src> Analyzer<'src> {
         self.expr_id_to_scope_id_map.insert(id, scope_id);
 
         id
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Func` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_func_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Func(function) = &node.0 else {
+            unreachable!("only the `Node::Func` arm walks here")
+        };
+        let name = function.name.0;
+        // B417: `Self` names the type an `impl` or `trait` is about, so
+        // a member spelled that way could never be reached — `x.Self()`
+        // parses `Self` as the type — and declaring it shadowed the
+        // type's own `Self` in the body scope (`self.x` lost its type).
+        // Refused at the declaration, and left undeclared so the body
+        // still reads the real `Self`.
+        if name == "Self" {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: function.name.1,
+                msg: "a function cannot be named `Self`: `Self` names the type an `impl` \
+                      or `trait` is about, so `value.Self()` reads as that type and \
+                      never reaches this member. Give it another name"
+                    .to_string(),
+            });
+        } else {
+            self.declare_scope_item(scope_id, name, id);
+        }
+        self.reference_count.entry(id).or_insert(0);
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        // E148: where a `context` clause would be inserted on this
+        // function — the parser's own record, carried through so the
+        // editor's fix has a span on a function that declares none.
+        if let Some(signature_end) = function.signature_end {
+            self.function_signature_end_spans.insert(id, signature_end);
+        }
+        // B242: the DECLARATION's `context` clause. Resolution is
+        // deferred past the import fixpoint exactly as a parameter
+        // clause's is (a clause may name an imported context), and the
+        // names resolve as VALUES in the declaring scope — not the body
+        // scope, whose parameters could shadow one.
+        if let Some((names, clause_span)) = &function.contexts {
+            if self.walking_member_body {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: *clause_span,
+                    msg: "a `context` clause on a trait or `impl` method is not \
+                          supported yet: a dispatched call selects its callee at \
+                          the call site, so the requirement cannot be checked \
+                          against one declaration. Declare it on a free `fun` and \
+                          call that from the method"
+                        .to_string(),
+                });
+            } else {
+                self.prepped_function_context_clauses.push((
+                    id,
+                    names.iter().map(|(name, span)| (*name, *span)).collect(),
+                    scope_id,
+                    self.current_source_id,
+                ));
+                self.function_context_clause_spans.insert(id, *clause_span);
+            }
+        }
+        // A tuple parameter (`fun f((a, b): T)`) desugars to a synthetic
+        // positional parameter plus a destructure run before the body.
+        let mut parameter_destructures = Vec::new();
+        let parameters = function
+            .parameters
+            .0
+            .iter()
+            .map(|parameter| {
+                self.walk_parameter(
+                    parameter,
+                    id,
+                    body_scope_id,
+                    body_scope_id,
+                    Some(id),
+                    &mut parameter_destructures,
+                )
+            })
+            .collect::<Vec<_>>();
+        let generic_parameter_constraint_ids = self.register_generic_parameters(
+            id,
+            function.generic_parameters.as_ref(),
+            body_scope_id,
+        );
+        // The return type is resolved in the body scope so it can refer
+        // to the function's own generic parameters (e.g. `(): T`).
+        // An `async || T` return type peels its marker first (J2): the
+        // function returns an async closure, so calls THROUGH the
+        // returned value await.
+        let mut return_type_node = function.return_type.as_deref();
+        // B309: a RETURN may carry a `context` clause — the returned
+        // closure is injected, and its caller supplies the context at
+        // each call through it. The parser binds a clause after a
+        // non-closure return type to the FUNCTION (B242's declared
+        // clause); one after a closure return type reaches here and is
+        // the type's.
+        let mut return_clause: Option<&Vec<(&'src str, Span)>> = None;
+        if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
+            return_type_node.map(|node| (&node.0, node.1))
+        {
+            if !clause_target_is_a_closure(&inner.0) {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: clause_span,
+                    msg: "a `context` clause is only supported on a closure type".to_string(),
+                });
+            }
+            return_clause = Some(names);
+            return_type_node = Some(inner);
+        }
+        match return_type_node.map(|node| &node.0) {
+            Some(Node::AsyncType(inner)) => {
+                self.async_returning.insert(id);
+                return_type_node = Some(inner);
+            }
+            Some(Node::Tuple(elements)) if elements.len() == 1 => {
+                if let Node::AsyncType(inner) = &elements[0].0 {
+                    self.async_returning.insert(id);
+                    return_type_node = Some(inner);
+                }
+            }
+            _ => {}
+        }
+        let return_type_id =
+            return_type_node.map(|return_type| self.walk_type_node(return_type, body_scope_id));
+        // B460: the drain decides whether a bare trait here is an
+        // opaque return (a free fun, an inherent method) or a trait
+        // method's (refused).
+        if let Some(return_type_id) = return_type_id
+            && !function.external
+        {
+            let trait_member = self.walking_trait_body || self.walking_trait_impl_body;
+            self.return_annotation_owners
+                .insert(return_type_id, (id, trait_member));
+        }
+        if let (Some(names), Some(return_type_id)) = (return_clause, return_type_id) {
+            self.record_type_context_clause(return_type_id, names, body_scope_id, None);
+        }
+        if function.external {
+            // An `external` function is an intrinsic: no Vilan body, a
+            // declared (or void) return type, registered as an external
+            // function with a callable type so calls infer their return.
+            if function.body.is_some() {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: function.name.1,
+                    msg: "an `external` function cannot have a body".to_string(),
+                });
+            }
+            let return_type_id = return_type_id.unwrap_or_else(|| Type::Void.get_type_id(self));
+            let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
+            self.external_functions.insert(
+                id,
+                ExternalFunction {
+                    id,
+                    name,
+                    name_span: function.name.1,
+                    generic_parameter_constraint_ids,
+                    parameters,
+                    return_type_id,
+                    extern_binding: function.extern_binding.clone(),
+                    retains: function.extern_retains,
+                    borrows,
+                    returns_mut_view: matches!(
+                        return_type_node.map(|spanned| &spanned.0),
+                        Some(Node::Reference(true, _))
+                    ),
+                    // Seeded after `build()`: the native-container table, or
+                    // the all-`&mut` default (`infer_bumps`). Empty until then.
+                    bumps: BTreeSet::new(),
+                    call_count: 0,
+                    is_async: function.is_async,
+                    deprecated: function.deprecated,
+                    internal: function.internal,
+                },
+            );
+            let function_type_id = self.new_type_id();
+            self.write_type_slot(function_type_id, Type::Function(id));
+            self.expr_id_to_type_id_map.insert(id, function_type_id);
+            Some(Expr::ExternalFunction(id))
+        } else {
+            // The body's `ret`s check against this function's declared
+            // return type; without one they COLLECT, and the function's
+            // return type is inferred from them together with its tail
+            // (proposal/ret-checking.md rules 2 and 3).
+            self.return_type_stack.push(match return_type_id {
+                Some(declared) => ReturnFrame::Function(id, declared),
+                None => ReturnFrame::Inferred { rets: Vec::new() },
+            });
+            let (ids, expr_id, body_statement_ids) = match &function.body {
+                Some(body) => {
+                    // Parameter destructures run first, before the body.
+                    let mut ids = parameter_destructures;
+                    let statement_ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
+                    // The block's OWN statements, captured before they
+                    // are merged with the destructure ids —
+                    // `resolve_return_type` reads them to ask whether
+                    // the body leaves before the tail (B221) and to
+                    // tell "this body ends without producing a value"
+                    // from "the `;` discards this body's last value"
+                    // (S3, editing-dx.md §3.7).
+                    let body_statement_ids = statement_ids.clone();
+                    ids.extend(statement_ids);
+                    let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
+                    (ids, expr_id, body_statement_ids)
+                }
+                None => {
+                    // A signature without a body is only legitimate as a
+                    // trait method requirement; anywhere else it must be
+                    // declared `external`.
+                    if !self.walking_trait_body {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: function.name.1,
+                            msg: format!(
+                                "function '{}' must have a body or be declared `external`",
+                                name
+                            ),
+                        });
+                    }
+                    let void_id = self.new_entity_id();
+                    self.expr_id_to_expr_map.insert(void_id, Expr::Void);
+                    self.expr_id_to_scope_id_map.insert(void_id, body_scope_id);
+                    self.span_map.insert(void_id, &EMPTY_SPAN);
+                    (Vec::new(), void_id, Vec::new())
+                }
+            };
+            let rets = match self.return_type_stack.pop() {
+                Some(ReturnFrame::Inferred { rets }) => rets,
+                _ => Vec::new(),
+            };
+            // B134: `return_sites` is the one join of a function's
+            // return positions — the tail and each value-carrying
+            // `ret` — for EVERY bodied function, annotated or not.
+            // B116 built it for declared-return functions; B126 typed
+            // an unannotated function's `ret`s, so the seam readers
+            // (`infer_borrows`, the crossing scan, `check_view_escape`,
+            // the return clone sites) must see those positions too, or
+            // the two spellings of one return disagree: an unannotated
+            // `ret &self.x` was refused by the raw escape arm while
+            // its tail twin copied, and an unannotated TAIL handing
+            // back a loaned place was never a clone seam at all —
+            // live storage left the frame. A declared-return bare
+            // `ret`'s synthesized void still enters (it IS the checked
+            // value); an unannotated bare `ret` synthesizes none and
+            // has no leaves to contribute.
+            if function.body.is_some() {
+                self.return_sites.push((id, expr_id));
+                for (_, ret_value_id) in &rets {
+                    if let Some(ret_value_id) = ret_value_id {
+                        self.return_sites.push((id, *ret_value_id));
+                    }
+                }
+            }
+            // Infer the body's tail against the declared return type (the
+            // way a `let v: R = ..` annotation drives its value), so a
+            // return-position generic call binds its type parameters from
+            // `R`. Only for a real body with a declared return type.
+            if function.body.is_some()
+                && let Some(return_type_id) = return_type_id
+            {
+                self.expected_types.insert(expr_id, return_type_id);
+                self.seed_tail_expectations(expr_id, return_type_id);
+                // The synthesized void tail after a last statement that
+                // LEAVES is unreachable, and checking it draws a second
+                // diagnostic that adds no information (P28's duplicate,
+                // editing-dx.md §17.2) or — for an exhaustive
+                // `if`/`match` of `ret`s — a false one (B124, §17.7).
+                // The constraint is pushed unconditionally and
+                // `check_return_position` asks `block_diverges` instead:
+                // at walk time a `match` is not yet in
+                // `expr_id_to_expr_map` (`resolve_match` inserts it), so
+                // only the resolve-time question can see every way out.
+                self.constraints.push(Constraint::ReturnType {
+                    body_id: expr_id,
+                    return_type_id,
+                    statement_ids: body_statement_ids.clone(),
+                });
+            }
+            // Rule 3: an undeclared return is inferred from the body's
+            // return positions, which must agree. One constraint per
+            // bodied function, `ret`s or not — its pass is what leaves
+            // the record the read-only coercion path reads.
+            if function.body.is_some() && return_type_id.is_none() {
+                self.constraints
+                    .push(Constraint::FunctionReturns { function_id: id });
+            }
+            // An `[rpc]` method's declared signature must be Wire —
+            // recorded now, with the type ids its annotations walked
+            // to, and checked once every impl is in the table. Ahead of
+            // the insert below because that is what moves `parameters`.
+            if function.rpc {
+                self.collect_rpc_signature(function, id, &parameters, return_type_id);
+                // B313: the shape B287 refuses at the attribute. The
+                // WRITTEN `async` keyword is the key, as it is there —
+                // an inferred-async method is not refused by the
+                // attribute and must keep E3's report.
+                if function.is_async
+                    && function.receiver_spelling() == Some("&mut self")
+                    && let Some(receiver_id) = parameters.first()
+                {
+                    self.rpc_async_mut_self_receivers.push((
+                        *receiver_id,
+                        self.current_impl_subject_name.unwrap_or_default(),
+                    ));
+                }
+            }
+            let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
+            self.functions.insert(
+                id,
+                Function {
+                    id,
+                    name,
+                    name_span: function.name.1,
+                    generic_parameter_constraint_ids,
+                    parameters,
+                    return_type_id,
+                    body: (ids, expr_id, body_scope_id),
+                    rets,
+                    has_body: function.body.is_some(),
+                    call_count: 0,
+                    is_async: function.is_async,
+                    borrows,
+                    // Inferred by `infer_bumps` after `build()`; the fixpoint
+                    // grows this set from the empty seed.
+                    bumps: BTreeSet::new(),
+                    returns_mut_view: matches!(
+                        function.return_type.as_deref().map(|spanned| &spanned.0),
+                        Some(Node::Reference(true, _))
+                    ),
+                    returns_view: matches!(
+                        function.return_type.as_deref().map(|spanned| &spanned.0),
+                        Some(Node::Reference(_, _))
+                    ),
+                    must_use: function.must_use,
+                    deprecated: function.deprecated,
+                    internal: function.internal,
+                    platform_fence: function
+                        .platform_fence
+                        .iter()
+                        .map(|(pattern, span)| (*pattern, *span))
+                        .collect(),
+                    rpc: function.rpc,
+                    trait_only: function.trait_only,
+                },
+            );
+            Some(Expr::Function(id))
+        }
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Struct` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_struct_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Struct(name, generic_parameters, external, resource, body, labels) = &node.0
+        else {
+            unreachable!("only the `Node::Struct` arm walks here")
+        };
+        let name_span = name.1;
+        let name = name.0;
+        if let Some(labels) = labels {
+            self.item_labels.insert(id, (**labels).clone());
+        }
+        let external = *external;
+        let resource = *resource;
+        self.declare_scope_item(scope_id, name, id);
+        self.reference_count.entry(id).or_insert(0);
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        let generic_parameter_constraint_ids =
+            self.register_generic_parameters(id, generic_parameters.as_deref(), body_scope_id);
+        // E227: a `[hint(..)]` names the declaration's own parameters.
+        if let Some(labels) = labels {
+            self.bank_hint_attributes(id, labels, body_scope_id);
+        }
+        // A bodyless `struct Name;` is only valid when `external`; an
+        // ordinary struct must list its fields in `{ .. }` (possibly
+        // empty).
+        if !external && body.is_none() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: format!(
+                    "struct '{}' must declare a body or be declared `external`",
+                    name
+                ),
+            });
+        }
+        let mut fields = Vec::new();
+        for child in body.iter().flat_map(|body| &body.0) {
+            let (field_name, field_name_span) = child.0.0;
+            // An `async || T` field peels its marker (J2): calls
+            // through the field await.
+            let mut field_type_node = child.0.1.as_ref();
+            // B309: a field may carry a `context` clause —
+            // `body: (|| View) context owner_scope` — so the clause
+            // peels FIRST and the marker peel below sees the closure
+            // type underneath, exactly as at a parameter.
+            let mut field_clause: Option<&Vec<(&'src str, Span)>> = None;
+            if let Some((Node::TypeWithContexts(inner, names), clause_span)) =
+                field_type_node.map(|node| (&node.0, node.1))
+            {
+                if !clause_target_is_a_closure(&inner.0) {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: clause_span,
+                        msg: "a `context` clause is only supported on a closure type".to_string(),
+                    });
+                }
+                field_clause = Some(names);
+                field_type_node = Some(inner);
+            }
+            match field_type_node.map(|node| &node.0) {
+                Some(Node::AsyncType(inner)) => {
+                    self.async_fields.insert((id, fields.len()));
+                    field_type_node = Some(inner);
+                }
+                // The `(..)` the clause's grammar needs is grouping, so
+                // an `(async || T) context c` field still peels.
+                Some(Node::Tuple(elements)) if elements.len() == 1 => {
+                    if let Node::AsyncType(inner) = &elements[0].0 {
+                        self.async_fields.insert((id, fields.len()));
+                        field_type_node = Some(inner);
+                    }
+                }
+                _ => {}
+            }
+            let type_id = match field_type_node {
+                Some(node) => {
+                    let type_id = self.walk_type_node(node, body_scope_id);
+                    // B184: the third value position where a trait is a
+                    // reading rather than an error. Recorded by type id
+                    // because the name has not resolved yet — whether
+                    // the annotation names a trait is the pre-pass's to
+                    // discover, exactly as B161's `let` and B186's
+                    // parameter are the drain's.
+                    self.field_annotation_type_ids
+                        .insert(type_id, (id, body_scope_id));
+                    // B461 deliberately registers no NESTED field
+                    // positions: A124 R3 withdrew the top-level field
+                    // reading (a trait at a field is the object, `dyn
+                    // A`), and a nested field mention keeps the same
+                    // refusal and steer rather than reviving B184's
+                    // hidden parameter one level down.
+                    type_id
+                }
+                None => Type::Unknown.get_type_id(self),
+            };
+            // B309: a field's clause has no declaration entity to index
+            // — a field is not a value binding — so the TYPE is the
+            // whole record, which is the point of the change.
+            if let Some(names) = field_clause {
+                self.record_type_context_clause(type_id, names, body_scope_id, None);
+            }
+            // An `[expose]`d field's type must implement `std::Source`
+            // over a Wire element — recorded now with the type it walked
+            // to, checked once every module's Wire names and impls are
+            // collected (`check_expose_fields`).
+            if child.0.2.is_exposed() {
+                self.expose_fields_to_check.push((
+                    format!("field `{field_name}` of struct `{name}`"),
+                    child.0.1.as_ref().map(|type_node| &type_node.0),
+                    type_id,
+                    child
+                        .0
+                        .1
+                        .as_ref()
+                        .map(|type_node| type_node.1)
+                        .unwrap_or(child.1),
+                    id,
+                    child.0.2,
+                ));
+            }
+            fields.push(Field {
+                name: field_name,
+                name_span: field_name_span,
+                type_id,
+                internal: child.0.3,
+            });
+        }
+        self.structs.insert(
+            id,
+            Struct {
+                id,
+                name,
+                name_span,
+                generic_parameter_constraint_ids,
+                fields,
+                external,
+                resource,
+            },
+        );
+        Some(Expr::Struct(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Enum` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_enum_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Enum(name, generic_parameters, resource, variants, labels) = &node.0 else {
+            unreachable!("only the `Node::Enum` arm walks here")
+        };
+        let name_span = name.1;
+        let name = name.0;
+        if let Some(labels) = labels {
+            self.item_labels.insert(id, (**labels).clone());
+        }
+        let resource = *resource;
+        self.declare_scope_item(scope_id, name, id);
+        self.reference_count.entry(id).or_insert(0);
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        let generic_parameter_constraint_ids =
+            self.register_generic_parameters(id, generic_parameters.as_deref(), body_scope_id);
+        // E227: a `[hint(..)]` names the declaration's own parameters.
+        if let Some(labels) = labels {
+            self.bank_hint_attributes(id, labels, body_scope_id);
+        }
+        // Variants live in the enum's own namespace, reachable through
+        // `use Enum::{ ... }` or `Enum::Variant` — not the outer scope.
+        let variants_scope = self.create_scope(None);
+        let variants_scope_id = self.push_scope(variants_scope);
+        // ONE reading of the discriminants (§10): the walk resolves
+        // every variant here, and the generators that run earlier at
+        // derive-expansion time resolve them with the same call, so a
+        // walked variant cannot lower to a value the generators do not
+        // know about.
+        let read = read_enum_backing(name, &variants.0);
+        let backing = read.backing;
+        let mut variant_declarations = Vec::new();
+        for (variant_index, (variant, variant_backing)) in
+            variants.0.iter().zip(read.variants).enumerate()
+        {
+            let variant_name = variant_backing.name;
+            let data_type_ids: Vec<TypeId> = variant
+                .0
+                .1
+                .iter()
+                .map(|data_type| self.walk_type_node(data_type, body_scope_id))
+                .collect();
+            self.diagnostics.extend(variant_backing.diagnostics);
+            // A rejected literal still needs a value to carry; `0` is
+            // the same placeholder B79 used, and the enum is already
+            // diagnosed, so nothing reads it.
+            let backing_value = variant_backing.value.unwrap_or(BackingValue::Int(0));
+            let variant_id = self.new_entity_id();
+            self.expr_id_to_expr_map
+                .insert(variant_id, Expr::EnumVariant(id, variant_index));
+            self.expr_id_to_scope_id_map.insert(variant_id, scope_id);
+            self.span_map.insert(variant_id, &variant.1);
+            self.reference_count.entry(variant_id).or_insert(0);
+            let variants_scope = self.mut_scope_for_scope_id(variants_scope_id);
+            variants_scope
+                .name_to_id_map
+                .insert(variant_name, variant_id);
+            variant_declarations.push(EnumVariantDeclaration {
+                name: variant_name,
+                data_type_ids,
+                backing_value,
+                internal: variant.0.3,
+            });
+        }
+        // A bare-lowered enum IS a `str`/number at runtime and carries a
+        // synthesized `impl .. with Hashable` (`backed_enum_hashable_source`),
+        // so it counts as Hashable for the derive's all-fields check too —
+        // otherwise the impl table and `hashable_names` would disagree and
+        // `[derive(Hashable)] struct Key { align: Align }` would be rejected
+        // for a field the key check accepts. A resource is excluded on both
+        // sides for the same reason it is excluded there.
+        if backing.is_some() && !resource {
+            self.hashable_names.insert(name);
+        }
+        self.enums.insert(
+            id,
+            Enum {
+                id,
+                name,
+                name_span,
+                generic_parameter_constraint_ids,
+                variants: variant_declarations,
+                variants_scope_id,
+                backing,
+                resource,
+            },
+        );
+        Some(Expr::Enum(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Impl` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_impl_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Impl(subject, traits, body, labels) = &node.0 else {
+            unreachable!("only the `Node::Impl` arm walks here")
+        };
+        // B463: the head — `impl R with Wrap`, without the body — for a
+        // note that points at the block rather than covering it.
+        let header_span = Span {
+            start: node.1.start,
+            end: traits.last().map_or(subject.1.end, |trait_| trait_.1.end),
+        };
+        // F27 R1: an impl's `[platform(..)]` rides the item labels.
+        if let Some(labels) = labels {
+            self.item_labels.insert(id, (**labels).clone());
+        }
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        // The impl's generic parameters are the `type X` binders in the
+        // subject pattern (anywhere: `impl List<type T>`, `impl
+        // Option<(type T, type U)>`, or a blanket `impl type T`). Register
+        // them before walking the subject so they resolve.
+        self.register_subject_binders(subject, body_scope_id);
+        // Binders may also sit in the WITH-clause's trait arguments
+        // (`impl Point with DescribeInto<type S: Sink>`) — the impl is
+        // generic over them exactly like subject binders (a bound-less
+        // one inherits the trait's declared bound for its position,
+        // with the same deferred retrofit when the trait is declared
+        // later). Registered before the body walks, since member
+        // signatures reference them.
+        for trait_ in traits {
+            self.register_subject_binders(trait_, body_scope_id);
+        }
+        // The subject may legitimately BE a trait: `impl Iterator<type T>`
+        // and `impl Iterator<type T> with Iterable<T>` blanket over a
+        // bound, which is how std writes "every iterator also iterates".
+        // B299: the head's own type references are banked so the
+        // body-only steer can tell them apart from a body's.
+        let head_prepped_from = self.prepped_type_locals.len();
+        let subject_type_id = self.walk_trait_position_type_node(subject, body_scope_id);
+        // B184: the fourth position that can ground a hidden parameter,
+        // and the one that makes a sugared struct usable at all — a
+        // struct with methods. The impl owns the mint, so `Self` is
+        // `C<S>` for a parameter the impl is generic over.
+        self.impl_subject_annotation_type_ids
+            .insert(subject_type_id, (id, body_scope_id));
+        // Within an `impl`, `Self` refers to the subject type.
+        self.register_self_type(body_scope_id, subject_type_id);
+        // B299: the subject may BE a bare trait, and then this body is
+        // written for every type that implements it — `self` is that
+        // type, not a value of the trait. Which it is cannot be read
+        // HERE (the subject's slot resolves later, a trait declared
+        // further down the file included), so the scope and its subject
+        // are banked and the question is asked once types are final.
+        self.impl_body_subjects
+            .insert(body_scope_id, subject_type_id);
+        for (type_id, ..) in &self.prepped_type_locals[head_prepped_from..] {
+            self.impl_head_type_ids.insert(*type_id);
+        }
+        // Record the SUBJECT so `self`'s variant patterns substitute
+        // the enum's declared parameters for the subject's own
+        // arguments — e.g. `Some` on an `Option<(T, U)>` subject has
+        // payload `(T, U)`, not the abstract `T` of `enum Option<T>`.
+        // The arguments come from the walk above; re-walking them here
+        // to bank them is what reported one unresolved name twice
+        // (B297).
+        if matches!(&subject.0, Node::AccessorWithGenerics(_, _)) {
+            self.impl_subject_args
+                .insert(body_scope_id, subject_type_id);
+        }
+        // Which struct an `[rpc]` method was declared on, for the
+        // notification rule (§9.3): the check runs after every module is
+        // walked, so the name is banked here rather than looked up.
+        let outer_impl_subject = self.current_impl_subject_name;
+        self.current_impl_subject_name = match &subject.0 {
+            Node::Accessor(name) => Some(*name),
+            Node::AccessorWithGenerics(name, _) => Some(*name),
+            _ => None,
+        };
+        // B317: the same head, kept past the restore below, for the
+        // import-path index written with the registration.
+        let impl_subject_head = self.current_impl_subject_name;
+        let subject = subject_type_id;
+        let was_walking_member_body = self.walking_member_body;
+        self.walking_member_body = true;
+        let was_walking_trait_impl_body = self.walking_trait_impl_body;
+        self.walking_trait_impl_body = !traits.is_empty();
+        self.walk_expr_nodes(&body.0, body_scope_id);
+        self.walking_trait_impl_body = was_walking_trait_impl_body;
+        self.current_impl_subject_name = outer_impl_subject;
+        self.walking_member_body = was_walking_member_body;
+        let declared_members = self.collect_declared_members(body_scope_id);
+        let declarations: IndexMap<&'src str, Id> = declared_members.iter().copied().collect();
+        let implementation_index = self.implementations.len();
+        // `impl Subject with A + B` must satisfy each trait; record a
+        // conformance check per trait to run once declarations are known.
+        // The check also resolves the trait id back onto the impl.
+        for trait_ in traits {
+            let (trait_name, trait_arguments) = match &trait_.0 {
+                Node::Accessor(name) => (Some(*name), Vec::new()),
+                // `with Readable<T>` — capture the trait's arguments in the
+                // impl's generic terms (resolved in the impl body scope).
+                Node::AccessorWithGenerics(name, generic_arguments) => {
+                    let argument_type_ids = generic_arguments
+                        .0
+                        .iter()
+                        .map(|argument| self.walk_type_node(argument, body_scope_id))
+                        .collect();
+                    (Some(*name), argument_type_ids)
+                }
+                _ => (None, Vec::new()),
+            };
+            if let Some(trait_name) = trait_name {
+                self.prepped_trait_impls.push(TraitImplCheck {
+                    subject_type_id: subject,
+                    trait_name,
+                    trait_arguments,
+                    scope_id,
+                    declarations: declarations.clone(),
+                    span: trait_.1,
+                    source_id: self.current_source_id,
+                    implementation_index,
+                    impl_id: id,
+                });
+            }
+        }
+        // The name index, written in the same breath as the impl it
+        // describes — the one and only place `implementations` grows,
+        // so the two can never disagree. `declarations` is final by
+        // now (the later conformance pass only fills `trait_ids` /
+        // `trait_args`), which is what makes a registration-time index
+        // sound rather than a cache in need of invalidation.
+        for member_name in declarations.keys().copied() {
+            self.implementations_by_member
+                .entry(member_name)
+                .or_default()
+                .push(implementation_index);
+        }
+        // M30's index, written here for exactly the reason the name
+        // index above is: this is where `implementations` grows, and
+        // `declarations` is final by now.
+        for member_id in declarations.values().copied() {
+            self.implementation_by_declaration
+                .entry(member_id)
+                .or_insert(implementation_index);
+        }
+        // B317's index, written in the same breath for the same reason
+        // as the two above. `current_impl_subject_name` was restored
+        // just up there, so the head is taken from the banked copy the
+        // walk set — a subject that is not a named head (a tuple, a
+        // list, a bare `&T`) contributes no namespace, which is right:
+        // an import path can only spell a name.
+        if let Some(subject_name) = impl_subject_head {
+            // M69: shared, not copied — every `Analyzer` clone used to
+            // deep-copy each block's member list.
+            self.impl_namespaces
+                .push(std::sync::Arc::new(ImplNamespace {
+                    subject_name,
+                    scope_id,
+                    members: declared_members.clone(),
+                }));
+        }
+        self.implementations.push(Implementation {
+            subject,
+            impl_id: id,
+            header_span,
+            module_scope: scope_id,
+            source: self.current_source_id,
+            declarations,
+            declared_members,
+            trait_ids: Vec::new(),
+            trait_args: Vec::new(),
+            provided_trait_args: Vec::new(),
+        });
+
+        Some(Expr::Impl(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Trait` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_trait_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Trait(name, generic_parameters, supertraits, body, labels) = &node.0 else {
+            unreachable!("only the `Node::Trait` arm walks here")
+        };
+        let name_span = name.1;
+        let name = name.0;
+        if let Some(labels) = labels {
+            self.item_labels.insert(id, (**labels).clone());
+        }
+        self.declare_scope_item(scope_id, name, id);
+        self.reference_count.entry(id).or_insert(0);
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        let generic_parameter_constraint_ids =
+            self.register_generic_parameters(id, generic_parameters.as_deref(), body_scope_id);
+        let generic_parameter_names = generic_parameters
+            .as_ref()
+            .map(|parameters| {
+                parameters
+                    .0
+                    .iter()
+                    .map(|parameter| parameter.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Inside a trait, `Self` is the trait itself (abstractly): a
+        // `self`-typed receiver in a default method resolves its method
+        // calls against this trait's own declarations.
+        let self_type_id = Type::Trait(id, Vec::new()).get_type_id(self);
+        self.register_self_type(body_scope_id, self_type_id);
+        self.trait_body_scopes.insert(body_scope_id);
+        // Supertraits are resolved in the body scope so their generic
+        // arguments (`PartialEq<B>`) see the trait's parameters.
+        let supertraits = supertraits
+            .iter()
+            .map(|supertrait| self.walk_trait_position_type_node(supertrait, body_scope_id))
+            .collect();
+        // Bodyless methods are legitimate requirements inside a trait.
+        let was_walking_trait_body = self.walking_trait_body;
+        let was_walking_member_body = self.walking_member_body;
+        self.walking_trait_body = true;
+        self.walking_member_body = true;
+        self.walk_expr_nodes(&body.0, body_scope_id);
+        self.walking_trait_body = was_walking_trait_body;
+        self.walking_member_body = was_walking_member_body;
+        let declared_members = self.collect_declared_members(body_scope_id);
+        let declarations: IndexMap<&'src str, Id> = declared_members.iter().copied().collect();
+        // M30's twin of the impl index, at the one place `traits` grows.
+        for member_id in declarations.values().copied() {
+            self.trait_by_declaration.entry(member_id).or_insert(id);
+        }
+        self.traits.insert(
+            id,
+            Trait {
+                id,
+                name,
+                name_span,
+                generic_parameter_constraint_ids,
+                generic_parameter_names,
+                declarations,
+                declared_members,
+                supertraits,
+                resource: labels.as_ref().is_some_and(|labels| labels.resource),
+            },
+        );
+        Some(Expr::Trait(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Module` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_module_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Module(name, body) = &node.0 else {
+            unreachable!("only the `Node::Module` arm walks here")
+        };
+        self.declare_scope_item(scope_id, name, id);
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        self.module_scope_ids.insert(body_scope_id);
+        let body = self.walk_expr_nodes(&body.0, body_scope_id);
+        self.modules.insert(
+            id,
+            Module {
+                id,
+                name,
+                body: (body, body_scope_id),
+            },
+        );
+        Some(Expr::Module(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::MacroFun` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_macro_fun_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::MacroFun(function) = &node.0 else {
+            unreachable!("only the `Node::MacroFun` arm walks here")
+        };
+        if !self.module_scope_ids.contains(&scope_id) {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: node.1,
+                msg: "a `macro fun` must be a top-level item".to_string(),
+            });
+        }
+        // Bind the macro's NAME so imports/`use`/re-exports resolve it
+        // (the expansion layer resolves scope separately, from syntax).
+        // Items WIN name collisions — macros are a separate namespace
+        // (§4), and a derive macro deliberately shares its trait's
+        // name in the trait's own module: the item import must keep
+        // meaning the trait. `or_insert` here + plain inserts in the
+        // item arms give items precedence in either declaration order.
+        let marker = self.new_entity_id();
+        self.expr_id_to_expr_map.insert(marker, Expr::Macro);
+        self.span_map.insert(marker, &function.name.1);
+        self.expr_id_to_scope_id_map.insert(marker, scope_id);
+        let mut signature = format!("macro fun {}(", function.name.0);
+        for (index, parameter) in function.parameters.0.iter().enumerate() {
+            if index > 0 {
+                signature.push_str(", ");
+            }
+            match &parameter.pattern {
+                Pattern::Binding(name, _, _) => signature.push_str(name),
+                _ => signature.push('_'),
+            }
+            if let Some(type_) = parameter.declared_type.as_deref() {
+                signature.push_str(": ");
+                signature.push_str(&render_type(&type_.0));
+            }
+        }
+        signature.push(')');
+        if let Some(return_type) = function.return_type.as_deref() {
+            signature.push_str(": ");
+            signature.push_str(&render_type(&return_type.0));
+        }
+        self.macro_signatures.insert(marker, signature);
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        scope.macro_name_to_id.insert(function.name.0, marker);
+        // Also visible as an ITEM name when nothing shadows it, so
+        // `import pkg::x::my_macro` resolves; items win collisions.
+        scope
+            .name_to_id_map
+            .entry(function.name.0)
+            .or_insert(marker);
+        Some(Expr::Void)
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Closure` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_closure_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Closure(closure) = &node.0 else {
+            unreachable!("only the `Node::Closure` arm walks here")
+        };
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        // A tuple parameter (`|(a, b)| ..`) desugars to a synthetic
+        // positional parameter plus a destructure run before the body.
+        let mut parameter_destructures = Vec::new();
+        let parameters = closure
+            .parameters
+            .0
+            .iter()
+            .map(|parameter| {
+                self.walk_parameter(
+                    parameter,
+                    id,
+                    body_scope_id,
+                    scope_id,
+                    // A closure has no generic list, so B186's sugar
+                    // stops here and the trait refusal stands.
+                    None,
+                    &mut parameter_destructures,
+                )
+            })
+            .collect::<Vec<_>>();
+        // A closure is a `ret` boundary with an INFERRED return type:
+        // its rets collect here and take part in that inference
+        // beside the reachable tail (proposal/ret-checking.md rule 4,
+        // lifted by B133).
+        self.return_type_stack
+            .push(ReturnFrame::Inferred { rets: Vec::new() });
+        // B223: a closure BODY is not part of any condition the closure
+        // is written in. The condition's truth says nothing about a
+        // test that runs inside a function value — `if holds(|| x is
+        // Some(let n))` is true or false whatever the `is` answered —
+        // so the body starts from no frame, and an `is` at the root of
+        // a spine in it installs B215's expression frame. That is what
+        // gives the read past it B215's steer instead of the bare name
+        // miss B199's per-node narrowing left behind: one rule, one
+        // voice, wherever the test is written.
+        let outer_polarity = self.condition_polarity.take();
+        let expr_id = self.walk_expr_node(&closure.return_value, body_scope_id);
+        self.condition_polarity = outer_polarity;
+        let rets = match self.return_type_stack.pop() {
+            Some(ReturnFrame::Inferred { rets }) => rets,
+            _ => Vec::new(),
+        };
+        if !rets.is_empty() {
+            self.constraints
+                .push(Constraint::ClosureReturns { closure_id: id });
+        }
+        // S3 (editing-dx.md §3.4/§3.9): resolved in the body scope,
+        // like a named function's return type, so it can name the
+        // closure's own generic parameters.
+        let return_type_id = closure
+            .return_type
+            .as_deref()
+            .map(|node| self.walk_type_node(node, body_scope_id));
+        self.closures.insert(
+            id,
+            Closure {
+                id,
+                parameters,
+                parameter_destructures,
+                return_: expr_id,
+                rets,
+                return_type_id,
+            },
+        );
+        Some(Expr::Closure(id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::Async` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_async_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::Async(body) = &node.0 else {
+            unreachable!("only the `Node::Async` arm walks here")
+        };
+        let closure_id = self.new_entity_id();
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        // Like a closure: a `ret` boundary with an inferred return type.
+        self.return_type_stack
+            .push(ReturnFrame::Inferred { rets: Vec::new() });
+        let return_id = self.walk_expr_node(body, body_scope_id);
+        let rets = match self.return_type_stack.pop() {
+            Some(ReturnFrame::Inferred { rets }) => rets,
+            _ => Vec::new(),
+        };
+        if !rets.is_empty() {
+            self.constraints
+                .push(Constraint::ClosureReturns { closure_id });
+        }
+        self.closures.insert(
+            closure_id,
+            Closure {
+                id: closure_id,
+                parameters: Vec::new(),
+                parameter_destructures: Vec::new(),
+                return_: return_id,
+                rets,
+                // `async` has no return-type annotation grammar, and
+                // this desugared closure is reached only through
+                // `Expr::Async`, never `Expr::Closure` — S3's
+                // return-position check (below) never sees it.
+                return_type_id: None,
+            },
+        );
+        self.expr_id_to_expr_map
+            .insert(closure_id, Expr::Closure(closure_id));
+        self.span_map.insert(closure_id, &node.1);
+        self.expr_id_to_scope_id_map
+            .insert(closure_id, body_scope_id);
+        // The type (`Promise<T>`) is inferred lazily in `infer_type_path`.
+        Some(Expr::Async(closure_id))
+    }
+
+    /// `walk_expr_node_inner`'s `Node::TupleComprehension` arm, out of line: its locals live only
+    /// while this arm runs, not in the recursion's shared frame (the
+    /// `tests/deep_nesting.rs` header measures that frame).
+    #[inline(never)]
+    fn walk_tuple_comprehension_entity(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        scope_id: Id,
+        id: Id,
+    ) -> Option<Expr<'src>> {
+        let Node::TupleComprehension { bindings, body } = &node.0 else {
+            unreachable!("only the `Node::TupleComprehension` arm walks here")
+        };
+        // Every source walks in the ENCLOSING scope — a zipped source
+        // cannot see an earlier binding, which names an element only
+        // inside the body.
+        let source_ids: Vec<Id> = bindings
+            .iter()
+            .map(|binding| self.walk_expr_node(&binding.source, scope_id))
+            .collect();
+        // The element binders scope to the body. Their types (each
+        // source's element type) are set when the comprehension
+        // resolves.
+        let body_scope = self.create_scope(Some(scope_id));
+        let body_scope_id = self.push_scope(body_scope);
+        let mut walked = Vec::with_capacity(bindings.len());
+        for (binding, source_id) in bindings.iter().zip(source_ids) {
+            let binder_id = self.new_entity_id();
+            let unknown_type_id = Type::Unknown.get_type_id(self);
+            self.variables.insert(
+                binder_id,
+                Variable {
+                    id: binder_id,
+                    name: binding.binder,
+                    name_span: binding.binder_span,
+                    initial: None,
+                    type_id: unknown_type_id,
+                    mutable: false,
+                    annotated: false,
+                },
+            );
+            self.expr_id_to_expr_map
+                .insert(binder_id, Expr::Variable(binder_id));
+            self.expr_id_to_scope_id_map
+                .insert(binder_id, body_scope_id);
+            self.span_map.insert(binder_id, &binding.binder_span);
+            self.reference_count.entry(binder_id).or_insert(0);
+            if binding.binder != "_" {
+                self.mut_scope_for_scope_id(body_scope_id)
+                    .name_to_id_map
+                    .insert(binding.binder, binder_id);
+            }
+            // A method on the binder defers until its type is set (below).
+            self.untyped_comprehension_binders.insert(binder_id);
+            walked.push((binder_id, source_id));
+        }
+        let body_id = self.walk_expr_node(body, body_scope_id);
+        // The binders' types are set when the sources resolve (before
+        // method calls); the constraint records the
+        // `Expr::TupleComprehension`.
+        self.constraints.push(Constraint::Comprehension {
+            id,
+            bindings: walked,
+            body_id,
+        });
+        None
     }
 
     // Walks a match-leg pattern, creating capture variables in the leg's

@@ -17,6 +17,23 @@
 //! levels, the CLI's debug and release binaries): ~47,400 bytes (46.3 KiB) a
 //! level unoptimized — the frame has grown ~12% since N97's count — and
 //! ~2,120 bytes optimized; the gdb decomposition below is N97's.
+//! Order 44's seal re-measured it again (2026-09-30), because a thirty-level
+//! chain ABORTED the Windows shard (`0xc00000fd`, CI run 36733238486): the
+//! frame was 48,336 bytes a level at 07e8db37 and 49,120 at next's 170562b9,
+//! the 784 bytes Order 44 added in the `if` arm (B459's R15 guard
+//! continuation, +272), `impl` (B463's header span and B470's resource
+//! trait, +128), `trait`/`struct`/`enum` (+81/+80/+56), `let` (B461, +72) and
+//! the import arms (E224, +56). gdb's deltas agree with `VILAN_DEPTH_STATS`
+//! over chains of 13 and 403 levels to the byte (`walk_expr_node_inner`
+//! probed `0xb000` and subtracted `0xba8`: 48,040 bytes of locals). The fix
+//! took the ten arms whose locals were largest OUT of the shared frame, each
+//! into its own `#[inline(never)]` method: `fun` (6,064 bytes of the frame),
+//! `struct` and `enum` (2,896 each), `impl` (2,680), `trait` (2,089), the
+//! tuple comprehension (1,520), closures (1,440), `async` (1,304), `macro
+//! fun` (1,048) and `mod` (976). The frame is now **26,376 bytes (25.8 KiB)
+//! a level unoptimized** and ~1,050 optimized, and an arm's own locals are
+//! paid only on a level that runs that arm (`fun`'s 6,120-byte frame on a
+//! level that declares a function, for one).
 //! It was ~36 KiB when this comment was written; Order 36's lazy,
 //! const, callable and visibility arms landed IN that frame while the
 //! recursion stayed put, which is how a nine-level module-cycle pin came to
@@ -26,9 +43,10 @@
 //! worker below spawns with 64 MiB ON PURPOSE — not the harness convention's
 //! 256 MiB: the plant's 5000 levels cost the UNBOUNDED walk ~180 MiB
 //! unoptimized and overflowed exactly this spawn before the bound existed,
-//! while the bounded walk stops near 20.3 MiB (500 levels at the 42,464 bytes
-//! this header measures; "near 18 MiB" was the pre-N97 frame's figure and
-//! three comments went on quoting it — N111). Growing this spawn to make a
+//! while the bounded walk stops near 12.8 MiB (measured at Order 44's seal,
+//! 501 levels at 26,376 bytes; it was 20.3 MiB at N97's 42,464 bytes and
+//! "near 18 MiB" before that, a figure three comments went on quoting —
+//! N111). Growing this spawn to make a
 //! failure pass again would make the pin vacuous.
 //!
 //! The file grew past that one bound, because the recursive families that can
@@ -210,16 +228,31 @@ fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
 /// warning at all.
 ///
 /// This is the warning. Thirty levels of chain, on a thread pinned at libtest's
-/// ORIGINAL 2 MiB, measured against the frame as it is today:
+/// ORIGINAL 2 MiB, measured against the frame as N97 found it:
 ///
 /// | codegen | bytes per level of `expr-walk` | 30 levels + baseline |
 /// |---|---|---|
 /// | debug | 42,464 B (41.5 KiB) | 1.49 MiB |
 /// | release | ~4,650 B (4.5 KiB) | 0.23 MiB |
 ///
+/// and as it is today (Order 44's seal, below):
+///
+/// | codegen | bytes per level of `expr-walk` | 30 levels + baseline |
+/// |---|---|---|
+/// | debug | 26,376 B (25.8 KiB) | 1.04 MiB |
+/// | release | ~1,050 B (1.0 KiB) | 0.14 MiB |
+///
 /// (N128, 2026-09-25: debug ~47,400 B and 1.66 MiB at 33 levels — 83% of the
 /// thread; release ~2,120 B and 0.16 MiB. The frame grew; the canary did not
 /// red, and the margin it guards is now about a sixth.)
+///
+/// (Order 44's seal, 2026-09-30: the frame reached 49,120 B, ~1.73 MiB at
+/// 33 levels, and this pin ABORTED the Windows shard, whose frames run larger
+/// than Linux's. The large arms moved into their own `#[inline(never)]`
+/// methods: debug **26,376 B (25.8 KiB)** and 1.04 MiB at 33 levels — about
+/// half the thread — release ~1,050 B and 0.14 MiB. The same chain now also
+/// fits a 1.5 MiB thread, checked at the seal with a scratch copy of this
+/// pin.)
 ///
 /// So the debug leg — the one the suite runs — sat at 75% of a 2 MiB thread,
 /// and the canary reds when the frame grows by about a third, or when twelve
@@ -836,10 +869,11 @@ fn analyze_on_a_declared_stack(
 /// The plant is a 490-link method chain: under the walk's 500-level bound, so
 /// nothing refuses it by DEPTH, and flat to the parser. The stack is declared
 /// at 2 MiB, so the probe refuses past 1 MiB (the red zone's minimum). Measured
-/// with `VILAN_DEPTH_STATS` (N128, 2026-09-25), the chain's walk needs ~1 MiB
-/// optimized (~2.1 KiB a level; the 11.3 KiB AGENTS.md once recorded was an
-/// older frame) and ~21 MiB unoptimized (~47,400 bytes a level), so the probe
-/// refuses it under both profiles.
+/// with `VILAN_DEPTH_STATS` (Order 44's seal, 2026-09-30), the chain's walk
+/// needs ~0.6 MiB optimized (~1,050 bytes a level; N128 read ~2.1 KiB, and the
+/// 11.3 KiB AGENTS.md once recorded was an older frame) and ~12.6 MiB
+/// unoptimized (26,376 bytes a level), so the probe refuses it under both
+/// profiles.
 ///
 /// The THREAD is 16 MiB, larger than the declaration: it was the headroom the
 /// UNPROBED syntactic visitors needed before N128 (`collect_module_paths`, over
@@ -873,12 +907,15 @@ fn a_walk_that_would_overflow_a_declared_stack_is_refused_with_the_fences_diagno
 /// The walk's own funnel, isolated in the debug suite (N128). Since the
 /// syntactic visitors are probed, the 2 MiB declaration above is refused in
 /// `for_each_child` before the walk starts when unoptimized, so that pin no
-/// longer isolates the WALK's probe there. Declared at 16 MiB, the visitors'
-/// ~2.4 MiB fits under the floor (14 MiB used) and the walk's ~20 MiB does
+/// longer isolates the WALK's probe there. Declared at 8 MiB, the visitors'
+/// ~2.4 MiB fits under the floor (7 MiB used) and the walk's ~12.6 MiB does
 /// not, so the refusal is the walk's; the 32 MiB thread keeps even the
 /// unprobed walk off the guard page, so removing the probe reds as a program
 /// PRODUCED rather than as an abort. Debug only: optimized, the walk needs
-/// ~1.2 MiB and nothing refuses — the pin above covers that profile.
+/// ~0.6 MiB and nothing refuses — the pin above covers that profile. (The
+/// declaration was 16 MiB, floor 14, until Order 44's seal cut the walk's
+/// frame from ~49 KB to ~26 KB a level: the walk's ~12.6 MiB then fit under
+/// that floor, and the pin went red as a program produced.)
 ///
 /// Planted red by removing the `walk_expr_node` probe.
 #[cfg(debug_assertions)]
@@ -890,7 +927,7 @@ fn the_walks_own_probe_refuses_the_chain_when_the_visitors_fit() {
     );
     let Analysis {
         produced, messages, ..
-    } = analyze_on_a_declared_stack(32 * 1024 * 1024, 16 * 1024 * 1024, source);
+    } = analyze_on_a_declared_stack(32 * 1024 * 1024, 8 * 1024 * 1024, source);
     assert!(!produced, "a refused analysis lands no program");
     assert_eq!(messages.len(), 1, "{messages:#?}");
     assert!(
