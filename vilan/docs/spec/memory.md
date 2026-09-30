@@ -537,10 +537,16 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   only — R7 reads the arms against each other, so producing a different
   binding from each arm is a conditional move, not two independent returns.
 - **R5: fields.** A struct literal moves resources in. A resource field is
-  read only by loan (`self.db.exec(..)`, `&mut self.db`); moving it out of a
-  live aggregate is rejected; v1 has no partial moves. The sanctioned
-  partial move is `Option` (below). Writing *over* a resource field is
-  permitted, and is R2's overwrite: the outgoing value is destroyed first.
+  read by loan (`self.db.exec(..)`, `&mut self.db`). Moving a field *out*
+  is a **destructure** when the aggregate is one this function OWNS (an
+  `own` parameter or an owned local) and its type has no `Drop` anywhere
+  inside it: the move spends the whole aggregate, so any later use of it,
+  or of one of its other fields, is a use after move (`let tag = p.tag;
+  sink(p.a);` is the order that works). Out of a loan, or out of an
+  aggregate with a `Drop` inside, moving a field is rejected — there the
+  sanctioned partial move is `Option` (below). Writing *over* a resource
+  field is permitted, and is R2's overwrite: the outgoing value is
+  destroyed first.
 - **R6: match consumes.** Matching a resource *by value* consumes the
   subject; pattern captures move the payloads into the arm, and each capture
   **owns** what it took — it is destroyed at its last use inside the arm that

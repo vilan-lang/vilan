@@ -130,7 +130,8 @@ rather than consume.
 swaps `None` in and hands the old contents back, `replace` swaps a new value in
 and hands the old back. Both leave a valid `Option` behind, which is what makes
 them the sanctioned way to move a value *out* of a place. For a `resource` this
-is the only legal partial move (`self.slot.take()`), and `match opt.take() {
+is the partial move that works through a loan, or out of an aggregate with a
+`Drop` inside (`self.slot.take()`), and `match opt.take() {
 Some(let c) => drop(c), None => {} }` is the conditional-teardown idiom.
 
 ## `Result<T, E>`

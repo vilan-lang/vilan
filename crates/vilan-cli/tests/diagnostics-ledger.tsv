@@ -292,7 +292,7 @@ row	flagship	key
 258	flagship	{label} of `[derive(Json)]` type `{type_name}` is the resource `{rendered}`: a resource is not plain data and cannot be serialized (serializing it would copy it out of its owner); serialize a plain-data projection (an id, a key) instead
 259	flagship	'{trait_name}' is already implemented for '{subject_label}'{elsewhere}; remove or merge this impl
 260	flagship	'{member_name}' is already defined for '{subject_label}'{elsewhere}; remove or rename this one
-261	flagship	cannot move a resource field out of a live aggregate: a resource has one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make the field an `Option` and use `take`
+261	flagship	cannot move a resource field out of a live aggregate: a resource has one owner, and a field moves out only as a destructure — of an aggregate this function owns (`own`), with no `Drop` anywhere inside it; loan it with `&` / `&mut`, or make the field an `Option` and use `take`
 262	flagship	`{name}` is moved on one path through this branch but not another: a resource's end-of-scope ownership must be static; move it on every path, or restructure with `Option` + `take`
 263	flagship	`{name}` is declared outside this loop and moved inside it: the move would repeat on the next iteration; move a value declared inside the loop, or loan `{name}` with `&` / `&mut`
 264	-	cannot move the resource `{name}` out of this function: it is declared `{declared}`, a loan, and a loan changes no ownership; declare it `{owned}` to take ownership, or restructure with `Option` + `take`

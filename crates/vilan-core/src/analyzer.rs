@@ -1173,6 +1173,14 @@ struct MoveScan<'a> {
     /// `loaned_captures`: whether a leaf crosses is a property of its own
     /// signature, not of the scan root.
     value_crossings: &'a HashSet<Id>,
+    /// B469 (RULED 2026-09-29, door (a)): the resource FIELD places whose
+    /// consuming read is admitted, each mapped to the root binding it moves
+    /// out of — a root the function OWNS (`own` parameter, owned local) whose
+    /// type has no `Drop` anywhere inside it. Such a move reads as a
+    /// destructure: the root is spent there, so a later use of it or of any
+    /// of its fields is the ordinary use-after-move. Every other consuming
+    /// field read stays R5's partial move.
+    partial_move_roots: &'a HashMap<Id, Id>,
 }
 
 /// One arm's outcome, for R7's cross-arm comparison and the continuation merge.
@@ -1261,6 +1269,10 @@ enum MoveState {
 struct MoveFlow {
     moved: HashMap<Id, MoveState>,
     decl_loop_depth: HashMap<Id, u32>,
+    /// B469: a binding spent by moving ONE of its fields out, mapped to that
+    /// field place — only so a later use can name the field. A label, not a
+    /// state: `moved` alone decides.
+    moved_fields: HashMap<Id, Id>,
 }
 
 impl MoveFlow {
@@ -1268,6 +1280,7 @@ impl MoveFlow {
         MoveFlow {
             moved: HashMap::default(),
             decl_loop_depth: HashMap::default(),
+            moved_fields: HashMap::default(),
         }
     }
 }
@@ -1281,8 +1294,11 @@ enum ResourceMoveViolation {
         use_id: Id,
         binding: Id,
         move_span: Span,
+        /// B469: the field whose move spent `binding`, when it was a field.
+        moved_field: Option<Id>,
     },
-    /// R5: moving a resource field out of a live aggregate (no partial moves).
+    /// R5: moving a resource field out of a live aggregate that is not a B469
+    /// destructure (a loan, or a `Drop` somewhere inside).
     PartialMove {
         at: Id,
     },
@@ -3296,6 +3312,9 @@ pub struct Analyzer<'src> {
     /// the dedup key needs one id per trait; `classify_resource` compares
     /// the marker structurally, since a default body's `self` carries its own.
     trait_self_markers: HashMap<Id, TypeId>,
+    /// B469: chunk 3's admitted field moves (place -> owned root), published
+    /// for the whole-program drop plan beside `resource_value_places`.
+    partial_move_roots: HashMap<Id, Id>,
     /// Drop planning (destruction.md §5/§7): resource-typed local bindings still
     /// owned at their declaring scope's fall-through end — dropped there in
     /// reverse declaration order. Ownership at a program point is single-valued
@@ -6081,6 +6100,7 @@ impl<'src> Analyzer<'src> {
             reported_container_structures: HashSet::default(),
             resource_value_places: HashSet::default(),
             trait_self_markers: HashMap::default(),
+            partial_move_roots: HashMap::default(),
             dropped_bindings: HashSet::default(),
             drop_extents: HashMap::default(),
             declared_binding_extents: HashMap::default(),
@@ -12290,6 +12310,16 @@ impl<'src> Analyzer<'src> {
         let is_refinements =
             self.collect_is_refinements(&HashSet::default(), &mut HashMap::default());
         let value_crossings = self.compute_return_value_crossings();
+        // B469: which field moves read as destructures. The concrete scan
+        // knows no instantiation, so a generic inside an aggregate's type may
+        // hold a `Drop` and keeps the refusal.
+        let partial_move_roots = self.collect_partial_move_roots(
+            &resource_value_places,
+            &module_level_bindings,
+            &loaned_captures,
+            &HashMap::default(),
+        );
+        self.partial_move_roots = partial_move_roots.clone();
 
         let scan = MoveScan {
             resource_bindings: &resource_bindings,
@@ -12298,6 +12328,7 @@ impl<'src> Analyzer<'src> {
             loaned_captures: &loaned_captures,
             is_refinements: &is_refinements,
             value_crossings: &value_crossings,
+            partial_move_roots: &partial_move_roots,
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.emit_resource_move_violations(violations);
@@ -12989,6 +13020,7 @@ impl<'src> Analyzer<'src> {
             owned_bindings,
             place_overwrites,
             explicitly_dropped,
+            partial_moves: self.partial_move_roots.clone(),
         };
         // A program with no `resource` declaration anywhere plans nothing and
         // keeps its bytes. The three sets above are NOT enough to decide that
@@ -13517,6 +13549,10 @@ impl<'src> Analyzer<'src> {
             // the root binding (a consuming field read is R5's rejected partial
             // move, already diagnosed; treat it as a loan for planning).
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
+                if consuming && let Some(root) = resources.partial_moves.get(&expr_id) {
+                    owned.remove(root);
+                    return;
+                }
                 self.plan_expr(subject, false, resources, owned, plan);
             }
             Expr::Index(subject, index) => {
@@ -14512,10 +14548,24 @@ impl<'src> Analyzer<'src> {
                 }
             }
             // R5: a resource field/element access. Consuming it moves a resource
-            // out of a live aggregate — rejected (no partial moves in v1). Either
+            // out of a live aggregate — rejected unless B469 admits it. Either
             // way, reading it loans the subject (a live-owner check on the root).
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
                 if consuming && scan.resource_value_places.contains(&expr_id) {
+                    // B469: out of an owned, `Drop`-free aggregate the move is
+                    // a destructure — it spends the ROOT, here, by the same
+                    // touch a whole move of it makes (so every R1/R7/R8 rule
+                    // judges it as one).
+                    if let Some(&root) = scan.partial_move_roots.get(&expr_id) {
+                        let was_live = !flow.moved.contains_key(&root);
+                        self.scan_move_touch(
+                            root, expr_id, true, scan, flow, loop_depth, violations,
+                        );
+                        if was_live && flow.moved.contains_key(&root) {
+                            flow.moved_fields.insert(root, expr_id);
+                        }
+                        return;
+                    }
                     violations.push(ResourceMoveViolation::PartialMove { at: expr_id });
                 }
                 self.scan_move(subject, false, false, scan, flow, loop_depth, violations);
@@ -14542,6 +14592,7 @@ impl<'src> Analyzer<'src> {
                 }
                 if scan.resource_bindings.contains(&variable_id) {
                     flow.moved.remove(&variable_id);
+                    flow.moved_fields.remove(&variable_id);
                     flow.decl_loop_depth.insert(variable_id, loop_depth);
                 }
             }
@@ -14571,6 +14622,7 @@ impl<'src> Analyzer<'src> {
                             });
                         }
                         flow.moved.remove(binding);
+                        flow.moved_fields.remove(binding);
                         flow.decl_loop_depth.entry(*binding).or_insert(loop_depth);
                     }
                     _ => {
@@ -14843,6 +14895,7 @@ impl<'src> Analyzer<'src> {
                     use_id,
                     binding,
                     move_span: *move_span,
+                    moved_field: flow.moved_fields.get(&binding).copied(),
                 });
             }
             return;
@@ -14857,6 +14910,7 @@ impl<'src> Analyzer<'src> {
             }
             let span = **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN);
             flow.moved.insert(binding, MoveState::Moved(span));
+            flow.moved_fields.remove(&binding);
         }
     }
 
@@ -16037,29 +16091,49 @@ impl<'src> Analyzer<'src> {
                 use_id,
                 binding,
                 move_span,
+                moved_field,
             } => {
                 let name = self.binding_name(binding);
-                Error {
-                    trace: Vec::new(),
-                    span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "use of `{name}` after it was moved: a resource has a single owner"
+                // B469: spent by a FIELD move — the use and the note both name
+                // the field, since that is the move the author wrote.
+                let field = moved_field.and_then(|place| self.field_chain_spelling(place));
+                let (msg, note) = match field {
+                    Some(field) => (
+                        format!(
+                            "use of `{name}` after `{field}` was moved out of it: moving a \
+                             field out spends the whole aggregate"
+                        ),
+                        format!(
+                            "`{field}` was moved out of `{name}` here: once a field has moved \
+                             out, neither `{name}` nor its other fields can be used; take \
+                             what you need from `{name}` before this, or loan the field with \
+                             `&{field}`"
+                        ),
                     ),
-                    note: Some(crate::error::Note::here(
-                        move_span,
+                    None => (
+                        format!(
+                            "use of `{name}` after it was moved: a resource has a single owner"
+                        ),
                         format!(
                             "`{name}` was moved here: a resource has one owner; loan it with \
                              `&{name}` / `&mut {name}`, or restructure with `Option` + `take`"
                         ),
-                    )),
+                    ),
+                };
+                Error {
+                    trace: Vec::new(),
+                    span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
+                    msg,
+                    note: Some(crate::error::Note::here(move_span, note)),
                 }
             }
             ResourceMoveViolation::PartialMove { at } => Error {
                 trace: Vec::new(),
                 span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                 msg: "cannot move a resource field out of a live aggregate: a resource has \
-                      one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make \
-                      the field an `Option` and use `take`"
+                      one owner, and a field moves out only as a destructure — of an aggregate \
+                      this function owns (`own`), with no `Drop` anywhere inside it; loan it \
+                      with `&` / `&mut`, or make the field an `Option` and use `take`"
                     .to_string(),
                 note: None,
             },
@@ -16262,11 +16336,21 @@ impl<'src> Analyzer<'src> {
             // this one, so the refinement is recomputed under the delta set.
             let is_refinements = self.collect_is_refinements(&resources, &mut memo);
             let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
+            // B469: a field move out of an owned aggregate is a destructure when
+            // the aggregate has no `Drop` anywhere inside at THIS instantiation
+            // — so the question is asked with what the instantiation binds.
+            let known_instantiation = self.r11_instantiation_types(&instance);
+            let no_module_level: HashSet<Id> = HashSet::default();
+            let partial_move_roots = self.collect_partial_move_roots(
+                &resource_value_places,
+                &no_module_level,
+                &loaned_captures,
+                &known_instantiation,
+            );
             let violations = {
                 // A generic body's bindings are all in-body (parameters / locals);
                 // module-level resources never enter its delta set, so the loan-only
                 // corollary is inert here.
-                let no_module_level: HashSet<Id> = HashSet::default();
                 let scan = MoveScan {
                     resource_bindings: &resource_bindings,
                     resource_value_places: &resource_value_places,
@@ -16274,6 +16358,7 @@ impl<'src> Analyzer<'src> {
                     loaned_captures: &loaned_captures,
                     is_refinements: &is_refinements,
                     value_crossings: &value_crossings,
+                    partial_move_roots: &partial_move_roots,
                 };
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
@@ -16289,6 +16374,7 @@ impl<'src> Analyzer<'src> {
                 &instance,
                 &resource_bindings,
                 &resource_value_places,
+                &partial_move_roots,
                 body_is_move_clean,
             );
             self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
@@ -16360,6 +16446,7 @@ impl<'src> Analyzer<'src> {
         instance: &R11Instance,
         resource_bindings: &HashSet<Id>,
         resource_value_places: &HashSet<Id>,
+        partial_move_roots: &HashMap<Id, Id>,
         body_is_move_clean: bool,
     ) {
         if Some(instance.callee) == self.drop_fn_id {
@@ -16411,6 +16498,7 @@ impl<'src> Analyzer<'src> {
             // separately rejected under a resource instantiation, so no
             // delta-resource binding reaches the guarded pair anyway.)
             explicitly_dropped: HashSet::default(),
+            partial_moves: partial_move_roots.clone(),
         };
         self.plan_scope(
             &[],
@@ -17211,6 +17299,226 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B469: what an R11 instantiation binds, as far as it is known: the
+    /// concrete type each resource parameter (or trait-default `Self` marker)
+    /// stands for here. An admission binds `Self` to the impl's subject; an
+    /// inherited default's call to its receiver; an ordinary call to its
+    /// recorded arguments (in the CALLER's terms, so a caller's own parameter
+    /// stays unknown). Only the `Drop` question reads it.
+    fn r11_instantiation_types(&self, instance: &R11Instance) -> HashMap<TypeId, TypeId> {
+        let mut known: HashMap<TypeId, TypeId> = HashMap::default();
+        let self_marker = instance.resources.iter().copied().find(|resource| {
+            matches!(self.borrow_type_by_type_id(*resource), Type::Trait(_, arguments) if arguments.is_empty())
+        });
+        match (instance.site, self_marker) {
+            (R11Site::Admission, Some(marker)) => {
+                if let Some(implementation) = self
+                    .implementations
+                    .iter()
+                    .find(|implementation| implementation.impl_id == instance.call_id)
+                {
+                    known.insert(marker, implementation.subject);
+                }
+            }
+            (R11Site::Call, Some(marker)) => {
+                if let Some(GenericDispatch::OnType(Some(receiver), _)) =
+                    self.generic_dispatch.get(&instance.call_id)
+                {
+                    known.insert(marker, *receiver);
+                }
+            }
+            _ => {
+                for (constraint, bound) in
+                    self.r11_call_type_bindings(instance.call_id, instance.callee)
+                {
+                    if instance.resources.contains(&constraint) {
+                        known.insert(constraint, bound);
+                    }
+                }
+            }
+        }
+        known
+    }
+
+    /// B469 (RULED 2026-09-29, door (a)): the resource field places whose
+    /// consuming read is a destructure rather than R5's partial move, each
+    /// mapped to its root binding. Admitted when the place is a pure chain of
+    /// fields / tuple positions over a binding the function OWNS — an `own`
+    /// parameter, or a local that is neither a view, a module-level binding
+    /// nor a capture of a loaned subject — and the root's type has no `Drop`
+    /// anywhere inside it (F56's test), so moving one member out leaves
+    /// nothing whose teardown could run. An element of a list or an array
+    /// (`Index`) is never admitted: that is a container, not an aggregate.
+    fn collect_partial_move_roots(
+        &mut self,
+        resource_value_places: &HashSet<Id>,
+        module_level_bindings: &HashSet<Id>,
+        loaned_captures: &HashMap<Id, Id>,
+        known: &HashMap<TypeId, TypeId>,
+    ) -> HashMap<Id, Id> {
+        let mut roots: HashMap<Id, Id> = HashMap::default();
+        let candidates: Vec<(Id, Id)> = resource_value_places
+            .iter()
+            .filter_map(|place| Some((*place, self.field_chain_root(*place)?)))
+            .collect();
+        if candidates.is_empty() {
+            return roots;
+        }
+        let drop_nominals = self.drop_implementing_nominals();
+        let mut verdicts: HashMap<Id, bool> = HashMap::default();
+        for (place, root) in candidates {
+            let admitted = match verdicts.get(&root) {
+                Some(verdict) => *verdict,
+                None => {
+                    let owned = !module_level_bindings.contains(&root)
+                        && !loaned_captures.contains_key(&root)
+                        && !self.binding_or_param_is_view(root)
+                        && match self.parameters.get(&root) {
+                            Some(parameter) => parameter.convention == Convention::Own,
+                            None => self.variables.contains_key(&root),
+                        };
+                    let verdict = owned
+                        && self.dropped_binding_type_id(root).is_some_and(|type_id| {
+                            !self.type_contains_drop(
+                                type_id,
+                                known,
+                                &drop_nominals,
+                                &mut HashSet::default(),
+                            )
+                        });
+                    verdicts.insert(root, verdict);
+                    verdict
+                }
+            };
+            if admitted {
+                roots.insert(place, root);
+            }
+        }
+        roots
+    }
+
+    /// The binding a place names through fields and tuple positions only
+    /// (`self.up`, `pair.0.inner`), or `None` for any other shape.
+    fn field_chain_root(&self, place: Id) -> Option<Id> {
+        match self.expr_id_to_expr_map.get(&place)? {
+            Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
+                match self.expr_id_to_expr_map.get(subject)? {
+                    Expr::Local(binding) => Some(*binding),
+                    Expr::Field(..) | Expr::TupleIndex(..) => self.field_chain_root(*subject),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `p.a`, `self.inner.up`, `pair.0` — a field chain spelled as written
+    /// (B469's use-after-move names the field it moved).
+    fn field_chain_spelling(&self, place: Id) -> Option<String> {
+        match self.expr_id_to_expr_map.get(&place)? {
+            Expr::Local(binding) => Some(self.binding_name(*binding).to_string()),
+            Expr::Field(subject, struct_id, index) => {
+                let field = self.structs.get(struct_id)?.fields.get(*index)?.name;
+                Some(format!("{}.{field}", self.field_chain_spelling(*subject)?))
+            }
+            Expr::TupleIndex(subject, index, _) => {
+                Some(format!("{}.{index}", self.field_chain_spelling(*subject)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The nominal types that implement `Drop` (B469's and B470's question).
+    fn drop_implementing_nominals(&self) -> HashSet<Id> {
+        let Some(drop_trait_id) = self.drop_trait_id else {
+            return HashSet::default();
+        };
+        self.implementations
+            .iter()
+            .filter(|implementation| implementation.trait_ids.contains(&drop_trait_id))
+            .filter_map(|implementation| self.nominal_id(implementation.subject))
+            .collect()
+    }
+
+    /// Whether a value of this type could run a `Drop` somewhere inside it
+    /// (F56's test, B469/B470). A nominal with a `Drop` impl answers yes; an
+    /// aggregate answers for its (substituted) members. A generic parameter —
+    /// or a trait default's `Self` — answers through what `known` binds it to,
+    /// and yes when nothing does: an unknown type may be one that drops.
+    fn type_contains_drop(
+        &mut self,
+        type_id: TypeId,
+        known: &HashMap<TypeId, TypeId>,
+        drop_nominals: &HashSet<Id>,
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visiting.insert(type_id) {
+            return false;
+        }
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return true;
+        };
+        let (members, context): (Vec<TypeId>, SubstitutionContext) = match self
+            .borrow_type_by_type_id(type_id)
+        {
+            Type::Struct(id, arguments) => {
+                if drop_nominals.contains(id) {
+                    return true;
+                }
+                let Some(struct_) = self.structs.get(id) else {
+                    return false;
+                };
+                (
+                    struct_.fields.iter().map(|field| field.type_id).collect(),
+                    Self::instantiation_context(
+                        &struct_.generic_parameter_constraint_ids,
+                        arguments,
+                    ),
+                )
+            }
+            Type::Enum(id, arguments) => {
+                if drop_nominals.contains(id) {
+                    return true;
+                }
+                let Some(enum_) = self.enums.get(id) else {
+                    return false;
+                };
+                (
+                    enum_
+                        .variants
+                        .iter()
+                        .flat_map(|variant| variant.data_type_ids.iter().copied())
+                        .collect(),
+                    Self::instantiation_context(&enum_.generic_parameter_constraint_ids, arguments),
+                )
+            }
+            Type::Tuple(elements) => (elements.clone(), SubstitutionContext::default()),
+            Type::Array(element, _) => (vec![*element], SubstitutionContext::default()),
+            Type::Generic(constraint) => {
+                let constraint = *constraint;
+                return match known.get(&constraint).copied() {
+                    Some(bound) => self.type_contains_drop(bound, known, drop_nominals, visiting),
+                    None => true,
+                };
+            }
+            Type::Trait(trait_id, arguments) if arguments.is_empty() => {
+                let marker = self.trait_self_markers.get(trait_id).copied();
+                return match marker.and_then(|marker| known.get(&marker).copied()) {
+                    Some(bound) => self.type_contains_drop(bound, known, drop_nominals, visiting),
+                    None => true,
+                };
+            }
+            _ => return false,
+        };
+        for member in members {
+            let member = self.substitute_member(member, &context);
+            if self.type_contains_drop(member, known, drop_nominals, visiting) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Where an R11 instantiation's own diagnostic is spanned: the call, or —
     /// for a default an impl inherits (B463) — that impl's head, not the whole
     /// block.
@@ -17649,8 +17957,9 @@ impl<'src> Analyzer<'src> {
                 ResourceMoveViolation::PartialMove { .. } => (
                     "a resource-typed field is moved out of a live aggregate",
                     format!(
-                        "in `{name}`, a resource field is moved out of a live aggregate here: v1 \
-                         has no partial moves"
+                        "in `{name}`, a resource field is moved out of a live aggregate here, and \
+                         at this instantiation it is no destructure (the aggregate is a loan, or \
+                         may hold a `Drop`)"
                     ),
                 ),
                 ResourceMoveViolation::ConditionalMove { binding, .. } => {
@@ -56876,6 +57185,11 @@ struct ResourceOwnership {
     /// release the resource; the emitted pair is made idempotent instead (the
     /// sink empties the slot, the `finally` destroys only a full one).
     explicitly_dropped: HashSet<Id>,
+    /// B469: admitted field moves, place -> root (see `MoveScan`'s field of the
+    /// same name). A consuming read of one spends the root for planning too:
+    /// the aggregate has no `Drop` anywhere inside, so nothing is left to
+    /// destroy once its field has moved on.
+    partial_moves: HashMap<Id, Id>,
 }
 
 /// What `compute_capture_clone_sites` settles about a program's pattern

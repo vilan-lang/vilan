@@ -663,11 +663,14 @@ points at the move. Loan it instead (`&x` / `&mut x`, or a method call),
 or, if you really need two owners, restructure with `Option` + `take`.
 → [Resources](../tour/resources.md)
 
-**"cannot move a resource field out of a live aggregate: … no partial moves …"**
+**"cannot move a resource field out of a live aggregate: … a field moves out only as a destructure …"**
 `let x = s.db`, or passing / returning `s.db` by value, would move a
-resource out of a struct that is still alive: there are no partial moves.
-Loan the field (`&s.db`, `&mut s.db`, `s.db.method(…)`), or make the field
-an `Option<…>` and `take()` it out.
+resource out of a struct that is still alive, and here it cannot be a
+destructure: the struct is a loan (not `own`), or a `Drop` sits somewhere
+inside its type, which would be left to run on half a value. Loan the field
+(`&s.db`, `&mut s.db`, `s.db.method(…)`), take the struct by `own` (when
+nothing inside it has a `Drop`), or make the field an `Option<…>` and
+`take()` it out.
 → [Resources](../tour/resources.md)
 
 **"`…` is moved on one path through this branch but not another: …"**

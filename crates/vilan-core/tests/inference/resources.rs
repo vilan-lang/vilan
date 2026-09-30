@@ -1413,10 +1413,11 @@ fn b60_a_consuming_call_in_a_loop_is_rejected() {
 
 #[test]
 fn b60_a_consuming_call_on_a_field_is_a_partial_move() {
-    // R5's precedent: v1 has no partial moves, so `holder.slot.unwrap()` is
-    // rejected exactly like `own`-passing the field. `Option::take` is the
+    // R5's precedent: a consuming call on a field is `own`-passing the field.
+    // B469 admits it out of an owned, `Drop`-free aggregate (a destructure);
+    // with a `Drop` inside, it is still refused — `Option::take` is the
     // sanctioned way out of a live aggregate.
-    assert_fails_with(
+    assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
@@ -1427,7 +1428,22 @@ fn b60_a_consuming_call_on_a_field_is_a_partial_move() {
             print(holder.slot.unwrap().n);
         }
         "#,
-        "no partial moves",
+        "1\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        [resource] struct Res { n: i32 }
+        impl Res with Drop { fun drop(&mut self) {} }
+        struct Holder { slot: Option<Res> }
+        fun main() {
+            let holder = Holder { slot = Some(Res { n = 1 }) };
+            print(holder.slot.unwrap().n);
+        }
+        "#,
+        "a field moves out only as a destructure",
     );
 }
 
@@ -1898,24 +1914,47 @@ fn r5_struct_literal_moves_a_resource_in_then_use_after() {
 }
 
 #[test]
-fn r5_field_copy_out_is_rejected() {
-    // `let x = s.db` would copy a resource out of a live aggregate — R5 reject.
-    assert_fails_with(
+fn r5_field_move_out_of_an_owned_drop_free_local_is_a_destructure() {
+    // B469 (RULED 2026-09-29): `let x = s.db` out of an OWNED local whose type
+    // has no `Drop` anywhere inside it reads as a destructure — `s` is spent.
+    // Until B469 this was R5's refusal.
+    assert_compiles_and_runs(
         r#"
         [resource] struct Db { handle: i32 }
         [resource] struct Session { db: Db }
         fun main() {
             let s = Session { db = Db { handle = 1 } };
             let x = s.db;
+            print(x.handle);
         }
         "#,
-        "no partial moves",
+        "1\n",
     );
 }
 
 #[test]
-fn r5_partial_move_out_via_own_argument_is_rejected() {
+fn r5_field_copy_out_of_an_aggregate_holding_a_drop_is_rejected() {
+    // R5 stands wherever a `Drop` sits inside the aggregate: moving one member
+    // out would leave a destructor with half a value to run on.
     assert_fails_with(
+        r#"
+        import std::drop::Drop;
+        [resource] struct Db { handle: i32 }
+        impl Db with Drop { fun drop(&mut self) {} }
+        [resource] struct Session { db: Db }
+        fun main() {
+            let s = Session { db = Db { handle = 1 } };
+            let x = s.db;
+        }
+        "#,
+        "a field moves out only as a destructure",
+    );
+}
+
+#[test]
+fn r5_partial_move_out_via_own_argument_of_an_own_parameter_is_a_destructure() {
+    // B469: the aggregate is an `own` parameter and `Drop`-free — admitted.
+    assert_compiles(
         r#"
         [resource] struct Db { handle: i32 }
         [resource] struct Session { db: Db }
@@ -1923,9 +1962,27 @@ fn r5_partial_move_out_via_own_argument_is_rejected() {
         fun f(own s: Session) {
             sink(s.db);
         }
+        fun main() {
+            f(Session { db = Db { handle = 1 } });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn r5_partial_move_out_of_a_loaned_parameter_is_rejected() {
+    // A loan owns nothing, so nothing can be destructured out of it.
+    assert_fails_with(
+        r#"
+        [resource] struct Db { handle: i32 }
+        [resource] struct Session { db: Db }
+        fun sink(own d: Db) {}
+        fun f(s: Session) {
+            sink(s.db);
+        }
         fun main() {}
         "#,
-        "no partial moves",
+        "a field moves out only as a destructure",
     );
 }
 
@@ -8623,5 +8680,207 @@ fn b463_a_data_type_inheriting_a_loan_moving_default_is_untouched() {
         }
         "#,
         "1 1\n",
+    );
+}
+
+// --- B469: a field moved out of an OWNED, `Drop`-free aggregate --------------
+//
+// RULED 2026-09-29, door (a): a field may be moved out of an aggregate the
+// function owns (an `own` parameter, an owned local) when nothing uses the
+// aggregate or its other fields afterwards and no `Drop` is anywhere in the
+// aggregate's type. It reads as a destructure — the aggregate is spent — and a
+// later use is the ordinary use-after-move, naming the field. A `Drop` member
+// keeps R5's refusal. A142's pipe nodes are the customer (`self.up.start(..)`).
+
+const B469_RESOURCES: &str = r#"
+import std::drop::Drop;
+
+[resource]
+struct R { n: i32 }
+
+[resource]
+struct D { n: i32 }
+
+impl D with Drop {
+    fun drop(&mut self) {
+        print(i"drop D {self.n}");
+    }
+}
+
+[resource]
+struct Pair { a: R, b: R, tag: str }
+
+struct Holder<X> { inner: X }
+
+fun eat(own r: R) {
+    print(i"ate {r.n}");
+}
+"#;
+
+fn b469_program(rest: &str) -> String {
+    format!("{B469_RESOURCES}\n{rest}")
+}
+
+#[test]
+fn b469_a_pipe_nodes_field_move_under_own_self_is_accepted() {
+    // native-44's find 2, cut down: `Outer` is a `Drop`-free resource holding a
+    // pipe node, and `run(own self)` starts the node out of it.
+    assert_compiles_and_runs(
+        r#"
+        [resource] struct Node { v: i32 }
+        impl Node {
+            fun start(own self, react: |i32| void) {
+                react(self.v + 1);
+            }
+        }
+        [resource] struct Outer { inner: Node, tag: str }
+        impl Outer {
+            fun run(own self) {
+                let tag = self.tag;
+                self.inner.start(|v| print(i"{tag} {v}"));
+            }
+        }
+        fun main() {
+            let o = Outer { inner = Node { v = 1 }, tag = "t" };
+            o.run();
+        }
+        "#,
+        "t 2\n",
+    );
+}
+
+#[test]
+fn b469_a_field_moved_out_of_an_own_parameter_spends_it() {
+    assert_compiles_and_runs(
+        &b469_program(
+            r#"
+            fun split(own p: Pair) {
+                let tag = p.tag;
+                eat(p.a);
+                print(tag);
+            }
+            fun main() {
+                split(Pair { a = R { n = 1 }, b = R { n = 2 }, tag = "t" });
+            }
+            "#,
+        ),
+        "ate 1\nt\n",
+    );
+}
+
+#[test]
+fn b469_a_use_of_the_aggregate_after_the_move_names_the_field() {
+    let source = b469_program(
+        r#"
+        fun use_after(own p: Pair) {
+            eat(p.a);
+            print(p.tag);
+        }
+        fun main() {}
+        "#,
+    );
+    assert_fails_noting(
+        &source,
+        "use of `p` after `p.a` was moved out of it: moving a field out spends the whole aggregate",
+        "p.a",
+        "`p.a` was moved out of `p` here",
+    );
+}
+
+#[test]
+fn b469_a_second_field_moved_out_is_a_use_after_the_first() {
+    assert_fails_with(
+        &b469_program(
+            r#"
+            fun two_fields(own p: Pair) {
+                eat(p.a);
+                eat(p.b);
+            }
+            fun main() {}
+            "#,
+        ),
+        "use of `p` after `p.a` was moved out of it",
+    );
+}
+
+#[test]
+fn b469_an_aggregate_with_a_drop_member_keeps_the_refusal() {
+    assert_fails_with(
+        &b469_program(
+            r#"
+            [resource] struct WithDrop { a: R, d: D }
+            fun with_drop(own w: WithDrop) {
+                eat(w.a);
+            }
+            fun main() {}
+            "#,
+        ),
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b469_a_field_move_on_one_path_is_the_conditional_move() {
+    assert_fails_with(
+        &b469_program(
+            r#"
+            fun maybe(own p: Pair, c: bool) {
+                if c {
+                    eat(p.a);
+                }
+            }
+            fun main() {}
+            "#,
+        ),
+        "`p` is moved on one path through this branch but not another",
+    );
+}
+
+#[test]
+fn b469_a_generic_body_destructures_at_a_drop_free_instantiation_only() {
+    let generic = r#"
+        fun take<T>(own h: Holder<T>): T {
+            h.inner
+        }
+    "#;
+    assert_compiles_and_runs(
+        &b469_program(&format!(
+            "{generic}\nfun main() {{\n    let r = take(Holder<R> {{ inner = R {{ n = 3 }} }});\n    print(r.n);\n}}\n"
+        )),
+        "3\n",
+    );
+    assert_fails_with(
+        &b469_program(&format!(
+            "{generic}\nfun main() {{\n    let d = take(Holder<D> {{ inner = D {{ n = 3 }} }});\n    print(d.n);\n}}\n"
+        )),
+        "`take` is not move-clean when instantiated with a resource: a resource-typed field is \
+         moved out of a live aggregate",
+    );
+}
+
+#[test]
+fn b469_a_trait_default_destructures_when_the_inheriting_resource_has_no_drop() {
+    // B463's default body under a resource `Self`, asked with what the impl
+    // binds `Self` to: `R` has no `Drop`, so the default's field move is a
+    // destructure; `D` has one, so the same default is refused at `D`'s impl.
+    let trait_ = r#"
+        trait Split {
+            fun round_trip(own self): Self {
+                let holder = Holder<Self> { inner = self };
+                holder.inner
+            }
+        }
+    "#;
+    assert_compiles_and_runs(
+        &b469_program(&format!(
+            "{trait_}\nimpl R with Split {{}}\nfun main() {{\n    let back = R {{ n = 4 }}.round_trip();\n    print(back.n);\n}}\n"
+        )),
+        "4\n",
+    );
+    assert_fails_with(
+        &b469_program(&format!(
+            "{trait_}\nimpl D with Split {{}}\nfun main() {{}}\n"
+        )),
+        "cannot move a resource field out of a live aggregate",
     );
 }
