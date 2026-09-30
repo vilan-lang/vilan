@@ -17,7 +17,7 @@ fun main() {
 	let count = Signal::new(0);
 	let _root = mount_root("app", || {
 		view("div")
-			.child(view("p").bind_text(count.map(|n: i32| i"clicked {n} times")))
+			.child(view("p").bind_text(count.derive(|n: i32| i"clicked {n} times")))
 			.child(view("button").text("+1").on("click", || count.set_with(|n| n + 1)))
 	});
 }
@@ -47,10 +47,10 @@ Every `bind_*` sets the property now and re-sets it whenever the source
 changes. There is no render loop to trigger.
 
 A read-only binding asks for a
-[`Source<T>`](../std/reactive.md#source), not the concrete `SignalCell<T>` — a
-signal is one, and so is anything else you implement `get`/`sub` on. Only
-the bindings that write back (`bind_value`, `bind_draft`) need a real
-signal.
+[`Flow<T>`](../std/reactive.md#source-flow-and-pipe), not the concrete
+`SignalCell<T>` — a signal is one, a pipe (`count.derive(..)`) is one, and so is
+any source you implement `get`/`on_settle` on — and it consumes it. Only the
+bindings that write back (`bind_value`, `bind_draft`) need a real signal.
 
 ## Text children and mixed content
 
@@ -126,7 +126,7 @@ rather than a sentinel string.
 ```vilan,fragment
 // `None` while nothing is being dragged; `Some("row")`/`Some("col")` while
 // something is.
-view("div").bind_attr("data-dragging", drag_status.map(|status| match status {
+view("div").bind_attr("data-dragging", drag_status.derive(|status| match status {
 	DragStatus::Still => None,
 	DragStatus::Vertical => Some("row"),
 	DragStatus::Horizontal => Some("col"),
@@ -160,7 +160,7 @@ fun counter(): View {
 	<div>
 		<h2>"Counter"</h2>
 		<button on:click(|| count.set_with(|n| n + 1))>"+1"</button>
-		<p>{count.map(|n: i32| i"clicked {n} times")}</p>
+		<p>{count.derive(|n: i32| i"clicked {n} times")}</p>
 	</div>
 }
 
@@ -348,7 +348,7 @@ fun main() {
 	let _root = mount_root("app", || {
 		view("div")
 			.child(view("input").bind_draft(name))
-			.child(view("span").bind_text(name.state.map(|state: DraftState| match state {
+			.child(view("span").bind_text(name.state.derive(|state: DraftState| match state {
 				DraftState::Synced => "",
 				DraftState::Dirty => "saving…",
 				DraftState::Failed(let reason) => i"failed: {reason}",
@@ -460,7 +460,7 @@ fun main() {
 			.child(view("ul").child(each_values(names, |name| view("li").text(name))))
 			// `Task` needs no PartialEq: the row updates through its cell
 			.child(view("ol").child(each_by(tasks, |task: Task| task.id, |task: SignalCell<Task>| {
-				view("li").bind_text(task.map(|current| current.title))
+				view("li").bind_text(task.derive(|current| current.title))
 			})))
 	});
 }
@@ -642,7 +642,7 @@ value *changes* (`T: PartialEq`), so navigating to the page you're already on
 does nothing.
 
 `when_some` is the one that binds the value, and it is the reason to reach for
-it over `when(source.map(|value| value is Some(_)), ..)`: the body gets the
+it over `when(source.derive(|value| value is Some(_)), ..)`: the body gets the
 payload, and it gets it as a `SignalCell<T>` rather than as a `T`. What decides
 structure is the PRESENCE — a `None` → `Some` builds, a `Some` → `None`
 disposes — so a changed payload writes to the cell and the row stands, with
@@ -651,7 +651,7 @@ a single row, and it is why `T` needs no `PartialEq`: nothing is compared.
 Read the cell inside a binding, exactly as an `each_by` row does:
 
 ```vilan,fragment
-{when_some(selected, |account| <p>{account.map(|current| current.name)}</p>)}
+{when_some(selected, |account| <p>{account.derive(|current| current.name)}</p>)}
 ```
 
 ### Position, and placing one at the end

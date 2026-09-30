@@ -93,7 +93,7 @@ fn std_functions(program: &Program, file: &str, names: &[&str]) -> HashSet<Id> {
 /// The owner-taking calls a maker must not make: std's `.cell()` and every std
 /// `effect` spelling (the trait's and the mirrors' overrides alike).
 fn owner_taking_functions(program: &Program) -> HashSet<Id> {
-    let mut owner_taking = std_functions(program, "reactive.vl", &["cell"]);
+    let mut owner_taking = std_functions(program, "reactive.vl", &["cell", "memo"]);
     for function in program.functions.values() {
         if !matches!(
             function.name,
@@ -132,6 +132,7 @@ fn call_span(program: &Program, call_id: Id) -> Span {
 fn callee_label(program: &Program, callee: Id) -> String {
     match program.functions.get(&callee) {
         Some(function) if function.name == "cell" => "`.cell()`".to_string(),
+        Some(function) if function.name == "memo" => "`.memo()`".to_string(),
         Some(function) => format!("`{}`", function.name),
         None => "this call".to_string(),
     }
@@ -184,9 +185,10 @@ fn memo_maker_warnings(
                         "{label} inside a `Memo` maker ties what it builds to the FIRST \
                          caller's owner, and the memo keeps it after that owner is gone: \
                          every later ask is answered with a dead one. What a maker builds \
-                         outlives the caller — a derivation in a maker is `.cell_global()`, \
-                         and a lease (`.cell()`, `effect`) belongs at the call site, on what \
-                         the memo answers"
+                         outlives the caller — a derivation in a maker is sealed with \
+                         `.memo_global()` (`.cell_global()` for the writable face), and a lease \
+                         (`.memo()`, `.cell()`, `effect`) belongs at the call site, on what the \
+                         memo answers"
                     ),
                     note: None,
                 },
@@ -215,7 +217,7 @@ fn handle_tail_warnings(
     if repliers.is_empty() {
         return Vec::new();
     }
-    let derivations = std_functions(program, "reactive.vl", &["cell"]);
+    let derivations = std_functions(program, "reactive.vl", &["cell", "memo"]);
     let mut methods: Vec<Id> = Vec::new();
     for (call_id, target) in targets {
         let CallTarget::Function(callee) = target else {

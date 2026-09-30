@@ -2485,7 +2485,7 @@ fn a46_a_reactive_fragment_is_the_source_list_arm() {
             let _root = mount_root("app", || {
                 <main>
                     <header>"head"</header>
-                    {mark.map(|value: i32| <><i>{i"m{value}"}</i><b>"b"</b></>)}
+                    {mark.derive(|value: i32| <><i>{i"m{value}"}</i><b>"b"</b></>)}
                     <footer>"foot"</footer>
                 </main>
             });

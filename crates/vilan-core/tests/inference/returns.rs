@@ -1622,20 +1622,22 @@ fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
 // expectation that binds `U` is the node's annotation (the pre-flip pin wrote
 // `SignalCell<i32>`, which a node is not). Written `count.map(..).cell()` under
 // a `SignalCell<i32>` annotation, the expectation stops at `.cell()`'s receiver;
-// E226 finds the closure down the chain (the next pin).
+// E226 finds the closure down the chain (the next pin). A142 renamed `map` to
+// `Flow::derive`, whose node is `Derive<S, T, U>` — a pipe, read once with
+// `.sample()`.
 #[test]
 fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
     assert_fails_spanning_nth(
         r#"
         import std::io::print;
-        import std::reactive::{ Map, Signal, SignalCell, Source };
+        import std::reactive::{ Derive, Signal, SignalCell, Source };
 
         fun main() {
         	let count: SignalCell<i32> = Signal::new(1);
-        	let doubled: Map<SignalCell<i32>, i32, i32> = count.map(|n| {
+        	let doubled: Derive<SignalCell<i32>, i32, i32> = count.derive(|n| {
         		n * 2;
         	});
-        	print(doubled.get());
+        	print(doubled.sample());
         }
         "#,
         "}",
@@ -1656,7 +1658,7 @@ fn missing_return_value_regime_3_through_a_map_then_cell_chain() {
 
         fun main() {
         	let count: SignalCell<i32> = Signal::new(1);
-        	let doubled: SignalCell<i32> = count.map(|n| {
+        	let doubled: SignalCell<i32> = count.derive(|n| {
         		n * 2;
         	}).cell();
         	print(doubled.get());
@@ -5546,7 +5548,7 @@ fn b369_the_kolt_shape_a_context_carrying_closure_parameter_and_a_slot_impl() {
         }
 
         impl Conditional<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
-        	fun place(self, parent: View) {
+        	fun place(own self, parent: View) {
         		let region = Region::open(parent);
         		self.condition.effect(|on| {
         			if on is Some(let value) {

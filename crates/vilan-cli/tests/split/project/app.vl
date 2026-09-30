@@ -108,8 +108,8 @@ fun app(route: SignalCell<Route>): View {
 		// travel from the fetch to the app.
 		.child(view("p")
 			.class("pending")
-			.bind_text(pending().map(|busy| if busy { "..." } else { "" })))
-		.child(view("p").class("failed").bind_text(chunk_error().map(|reason| match reason {
+			.bind_text(pending().derive(|busy| if busy { "..." } else { "" })))
+		.child(view("p").class("failed").bind_text(chunk_error().derive(|reason| match reason {
 			Some(let text) => if text.len() > 0 { "!" } else { "?" },
 			None => "",
 		})))
@@ -121,6 +121,6 @@ fun app(route: SignalCell<Route>): View {
 }
 
 fun main() {
-	let route = current_path().map(parse).cell();
+	let route = current_path().derive(|path| parse(path)).cell();
 	let _root = mount_root("app", || app(route));
 }

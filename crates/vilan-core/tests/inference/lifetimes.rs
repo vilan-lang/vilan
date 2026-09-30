@@ -44,7 +44,7 @@ fn map_registers_its_subscription_into_the_ambient_owner() {
             let count = Signal::new(1);
             let owner = Owner::new();
             owner_scope.run(owner, || {
-                let doubled = count.map(|n| n * 2);
+                let doubled = count.derive(|n| n * 2);
                 doubled.effect(|value| print(value));
             });
             count.set(2);
@@ -87,7 +87,8 @@ fn combine_registers_every_input_subscription_into_the_ambient_owner() {
     );
 }
 
-// `flatten` owes TWO handles: the outer subscription, and whichever inner one
+// The total join (`switch(|inner| inner)` since A142 — `flatten` is the `Option`
+// join) owes TWO handles: the outer subscription, and whichever inner one
 // happens to be live at disposal (the rolling one it disposes on every switch
 // has no other owner).
 #[test]
@@ -103,7 +104,7 @@ fn flatten_registers_its_outer_and_live_inner_subscriptions() {
             let outer = Signal::new(first);
             let owner = Owner::new();
             owner_scope.run(owner, || {
-                let joined = outer.flatten();
+                let joined = outer.switch(|inner| inner);
                 joined.effect(|value| print(value));
             });
             outer.set(second);
@@ -119,19 +120,20 @@ fn flatten_registers_its_outer_and_live_inner_subscriptions() {
     );
 }
 
-// --- A86: `flatten` is a BLANKET over `Source`, not a member of the cell -----
+// --- A86: the join is a BLANKET over `Flow`, not a member of the cell --------
 //
-// The read contract is the trait, so an outer that is a `map` result or a
-// derived cell holds an inner signal exactly as a `SignalCell` does. The pin
+// The read contract is the trait, so an outer that is a pipe or a sealed
+// derivation holds an inner signal exactly as a `SignalCell` does. The pin
 // above (`flatten_registers_its_outer_and_live_inner_subscriptions`) is the
 // control for the cell receiver and for the ownership story; these are the
 // receivers the inherent impl could not reach.
 
 #[test]
 fn flatten_joins_a_derived_outer_not_only_a_cell() {
-    // The outer is a `map` RESULT — a `SignalCell` the user never spelled, and
-    // the shape `outer.map(..).flatten()` has wanted since A4. Switching the
-    // outer detaches the replaced inner, exactly as it does for a cell.
+    // The outer is a PIPE — the shape `outer.derive(..)` then a join has wanted
+    // since A4; over a pipe the total join is `switch(|inner| inner)` (one
+    // stage), sealed here because it is read four times. Switching the outer
+    // detaches the replaced inner, exactly as it does for a cell.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -141,8 +143,8 @@ fn flatten_joins_a_derived_outer_not_only_a_cell() {
             let first = Signal::new(1);
             let second = Signal::new(10);
             let which = Signal::new(true);
-            let picked = which.map(|flag| if flag { first } else { second });
-            let joined = picked.flatten();
+            let picked = which.derive(|flag| if flag { first } else { second });
+            let joined = picked.switch(|inner| inner).memo();
             print(joined.get());
             which.set(false);
             print(joined.get());
@@ -174,7 +176,7 @@ fn flatten_over_an_optional_inner_follows_some_and_detaches_on_none() {
         fun main() {
             let inner = Signal::new(1);
             let outer: SignalCell<Option<SignalCell<i32>>> = Signal::new(None);
-            let joined = outer.flatten();
+            let joined = outer.flatten().memo();
             print(joined.get().unwrap_or(0));
             outer.set(Some(inner));
             print(joined.get().unwrap_or(0));
@@ -228,7 +230,7 @@ fn flatten_still_joins_a_plain_cell_of_cells() {
     // The control the blanket has to subsume: the receiver the retired
     // inherent `impl SignalCell<SignalCell<type U>>` served, un-annotated, with
     // derived work stacked on the result — `vilan/test/reactive-flatten.vl`'s
-    // shape in one pin.
+    // shape in one pin. The total join is `switch(|inner| inner)` since A142.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -238,8 +240,8 @@ fn flatten_still_joins_a_plain_cell_of_cells() {
             let first = Signal::new(1);
             let second = Signal::new(10);
             let outer = Signal::new(first);
-            let joined = outer.flatten();
-            let doubled = joined.map(|value| value * 2);
+            let joined = outer.switch(|inner| inner).memo();
+            let doubled = joined.derive(|value| value * 2).memo();
             print(joined.get());
             outer.set(second);
             print(joined.get());
@@ -255,11 +257,11 @@ fn flatten_still_joins_a_plain_cell_of_cells() {
 
 // The ownerless case is leak-as-today, NOT a refusal: a derivation made where no
 // `owner_scope.run` encloses still compiles and still tracks its source, which
-// is what a module-level `current_path().map(parse)` needs. Making this an
+// is what a module-level `current_path().derive(parse)` needs. Making this an
 // error is the stronger law and a breaking change — the owner's call, not std's.
 // Since A124 S2c a module-level derivation that CACHES is spelled
-// `.cell_global()` (A130 refuses `.cell()` here): the lifetime this pin holds is
-// the one that name says.
+// `.cell_global()` (A130 refuses `.cell()` and, since A142, `.memo()` here): the
+// lifetime this pin holds is the one that name says.
 #[test]
 fn a_derivation_outside_every_owner_still_tracks_its_source() {
     assert_compiles_and_runs(
@@ -268,7 +270,7 @@ fn a_derivation_outside_every_owner_still_tracks_its_source() {
         import std::reactive::{ Signal, SignalCell };
 
         let count: SignalCell<i32> = Signal::new(1);
-        let doubled: SignalCell<i32> = count.map(|n| n * 2).cell_global();
+        let doubled: SignalCell<i32> = count.derive(|n| n * 2).cell_global();
 
         fun main() {
             print(doubled.get());
@@ -285,11 +287,10 @@ fn a_derivation_outside_every_owner_still_tracks_its_source() {
 
 // --- A123: the two DYNAMIC-DEPENDENCY combinators over `Source` --------------
 //
-// `map`/`combine` are static dependencies; `switch` and `and_then` are the
+// `derive`/`combine` are static dependencies; `switch` and `and_then` are the
 // dynamic pair — WHICH source the result follows is decided by the current
-// value. Both are blankets written directly over `on_change` rather than as
-// `self.map(select).flatten()`: one derived cell instead of two, and the
-// selector called exactly once per value of the source. The `flatten` pins
+// value. Each is one pipe stage, and its selector is called exactly once per
+// value of the source, inside the one instance its consumer started. The `flatten` pins
 // above are their control — the ownership and detach stories are the same
 // ones, reached through a selector instead of through a held inner.
 
@@ -307,7 +308,7 @@ fn switch_follows_the_source_its_selector_answers_and_detaches_from_the_last() {
             let which = Signal::new(0);
             let first = Signal::new(10);
             let second = Signal::new(20);
-            let picked = which.switch(|n| if n == 0 { first } else { second });
+            let picked = which.switch(|n| if n == 0 { first } else { second }).memo();
             print(picked.get());
             first.set(11);
             print(picked.get());
@@ -326,17 +327,16 @@ fn switch_follows_the_source_its_selector_answers_and_detaches_from_the_last() {
 }
 
 #[test]
-fn switch_calls_its_selector_when_it_is_read_and_never_at_construction() {
-    // Re-derived at A124 S2c from `proposal/reactive-pipeline.md` §2.2: a
-    // `Switch` is a cold node whose `get` is "select, then pull". So building
-    // one calls `select` NOWHERE (`built 0` — the pre-flip cell called it once
-    // here), writes nobody reads call it nowhere (`unread 0`), and one read is
-    // one call. Subscribed — a `.cell()` below it — it keeps its rolling
-    // registration: the attach selects once to wire the first inner and the
-    // cell's seed pulls once (`cell 3`), and every value of the source costs
-    // TWO calls, one to re-follow the new inner and one for the leaf's pull
-    // (three writes, `9`). The pre-flip pin read `1\n4\n20\n` (one call per
-    // value, construction included), which was the cell model's number.
+fn switch_calls_its_selector_once_per_change_inside_its_one_instance() {
+    // Re-derived at A142 S1 (the pipe model) from A124 S2c's cold-node count.
+    // Building a switch calls `select` NOWHERE (`built 0`), and writes nobody
+    // consumes call it nowhere (`unread 0`): a pipe runs only inside the
+    // instance its consumer starts. Sealed, the instance selects ONCE at start
+    // (`sealed 1`), and every value of the source costs ONE call — the
+    // re-selection — because the consumer's pull reads the followed inner, not
+    // the selector (three writes, `4`). A124's cold node read `cell 3` and `9`
+    // (a select per pull plus one per re-follow). Red when the stage's pull
+    // re-selects: `cell-after 10 7`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -356,9 +356,8 @@ fn switch_calls_its_selector_when_it_is_read_and_never_at_construction() {
             which.set(0);
             which.set(1);
             print(i"unread {calls.get()}");
-            print(i"read {picked.get()} {calls.get()}");
-            let cached = picked.cell();
-            print(i"cell {calls.get()}");
+            let cached = picked.memo();
+            print(i"sealed {cached.get()} {calls.get()}");
             which.set(0);
             which.set(1);
             which.set(0);
@@ -367,7 +366,7 @@ fn switch_calls_its_selector_when_it_is_read_and_never_at_construction() {
 
         main();
         "#,
-        "built 0\nunread 0\nread 20 1\ncell 3\ncell-after 10 9\n",
+        "built 0\nunread 0\nsealed 20 1\ncell-after 10 4\n",
     );
 }
 
@@ -420,7 +419,7 @@ fn and_then_follows_the_selected_source_and_an_outer_none_detaches() {
             let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
             let one: SignalCell<Option<i32>> = Signal::new(Some(10));
             let two: SignalCell<Option<i32>> = Signal::new(None);
-            let followed = outer.and_then(|id| if id == 1 { one } else { two });
+            let followed = outer.and_then(|id| if id == 1 { one } else { two }).memo();
             print(followed.get().unwrap_or(0));
             outer.set(Some(2));
             print(followed.get().unwrap_or(0));
@@ -487,7 +486,7 @@ fn a_switch_is_a_derivation_so_an_effect_reads_its_chain_settled() {
             let first: SignalCell<i32> = Signal::new(10);
             let second: SignalCell<i32> = Signal::new(20);
             let picked: SignalCell<i32> = which.switch(|n| if n == 0 { first } else { second }).cell();
-            let plus: SignalCell<i32> = picked.map(|value| value + 1).cell();
+            let plus: SignalCell<i32> = picked.derive(|value| value + 1).cell();
             let seen: SignalCell<str> = Signal::new("");
             let watcher = Owner::new();
             run_with_owner(watcher, || {
@@ -524,7 +523,7 @@ fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
             let one: SignalCell<Option<i32>> = Signal::new(Some(10));
             let two: SignalCell<Option<i32>> = Signal::new(Some(20));
             let followed: SignalCell<Option<i32>> = outer.and_then(|id| if id == 1 { one } else { two }).cell();
-            let plus: SignalCell<i32> = followed.map(|value| value.unwrap_or(0) + 1).cell();
+            let plus: SignalCell<i32> = followed.derive(|value| value.unwrap_or(0) + 1).cell();
             let seen: SignalCell<str> = Signal::new("");
             let watcher = Owner::new();
             run_with_owner(watcher, || {
@@ -546,30 +545,32 @@ fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
 
 #[test]
 fn switch_and_and_then_mint_nothing_until_a_leaf_and_the_composed_form_costs_the_same() {
-    // Re-derived at A124 S2c. `fresh_id` is the program's subscriber counter,
-    // so the delta across a step is the number of subscribers it minted — two
-    // `fresh_id()` calls of its own included, hence the `- 1`.
+    // Re-derived at A124 S2c, and kept by A142 S1. `fresh_id` is the program's
+    // subscriber counter, so the delta across a step is the number of
+    // subscribers it minted — two `fresh_id()` calls of its own included, hence
+    // the `- 1`.
     //
-    // The pre-flip pin counted "one derived cell rather than two": `switch` and
-    // `and_then` minted TWO subscribers at construction where the composed
-    // `map(select).flatten()` minted THREE (`2\n2\n3\n`). Under the cold model
-    // (`proposal/reactive-pipeline.md` §2.2, "construction does nothing") all
-    // three mint NOTHING when built, and a leaf on each mints the same THREE:
-    // the leaf's own record, the node's relay on the outer, and the rolling
-    // relay on whichever inner is current (§2.2's "the one place a node must
-    // keep a registration of its OWN"). The composed form IS a `Switch` over a
-    // `Map` now, so the reason `switch` was written over `on_change` — one
-    // cell fewer — is gone with the cells; what remains is the spelling.
+    // All three pipes mint NOTHING when built (a pipe runs only once consumed),
+    // and a consumer on each mints the same THREE: the consumer's own record, the
+    // stage's relay on the outer, and its relay on whichever inner is current
+    // (the one place a stage keeps a registration of its OWN). The composed
+    // spelling is `derive(select).switch(|inner| inner)` — the total join is a
+    // switch since A142 — and costs what `switch(select)` does. The values are
+    // read from what each consumer was handed: a consumed pipe has no `get`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::reactive::{ Signal, SignalCell, Source, fresh_id };
+        import std::shared::Shared;
 
         fun main() {
             let which = Signal::new(0);
             let first = Signal::new(10);
             let second = Signal::new(20);
+            let seen_a: Shared<i32> = Shared::new(0);
+            let seen_b: Shared<i32> = Shared::new(0);
+            let seen_c: Shared<i32> = Shared::new(0);
 
             let before_switch = fresh_id();
             let picked = which.switch(|n| if n == 0 { first } else { second });
@@ -582,46 +583,52 @@ fn switch_and_and_then_mint_nothing_until_a_leaf_and_the_composed_form_costs_the
             print(fresh_id() - before_and_then - 1);
 
             let before_composed = fresh_id();
-            let composed = which.map(|n| if n == 0 { first } else { second }).flatten();
+            let composed = which
+                .derive(|n| if n == 0 { first } else { second })
+                .switch(|chosen| chosen);
             print(fresh_id() - before_composed - 1);
 
             let before_a = fresh_id();
-            let _a = picked.on_change(|value| {});
+            let _a = picked.on_change(|value| { seen_a.write() = value; });
             print(fresh_id() - before_a - 1);
             let before_b = fresh_id();
-            let _b = composed.on_change(|value| {});
+            let _b = composed.on_change(|value| { seen_b.write() = value; });
             print(fresh_id() - before_b - 1);
             let before_c = fresh_id();
-            let _c = followed.on_change(|value| {});
+            let _c = followed.on_change(|value| { seen_c.write() = value.unwrap_or(0); });
             print(fresh_id() - before_c - 1);
 
             // Every one of the three is live, so none of the counts is the
             // count of a chain that failed to attach.
             which.set(1);
-            print(picked.get());
-            print(composed.get());
-            print(followed.get().unwrap_or(0));
+            inner.set(Some(7));
+            print(seen_a.read());
+            print(seen_b.read());
+            print(seen_c.read());
         }
 
         main();
         "#,
-        "0\n0\n0\n3\n3\n3\n20\n20\n5\n",
+        "0\n0\n0\n3\n3\n3\n20\n20\n7\n",
     );
 }
 
-// --- A124 S1: the push-pull pipeline as EVIDENCE ----------------------------
+// --- A142 S1: pipes are move-only, and a sealed chain is ONE instance ----------
 //
-// The paper's S1 probe (`proposal/reactive-pipeline.md` §7) measured the
-// cold-node model over today's `Source` in a module of its own. Its nodes are
-// `std::reactive`'s since S2b and the probe file is gone; these four pins are
-// its numbers, now held against the real nodes.
+// `proposal/reactive-layers.md` §3 (R29): a transformation is a PIPE — a
+// `[resource]` description with no `get()` — consumed exactly once, by sealing
+// (`.memo()`, `.cell()`, the `_global` twins, `.sample()`) or by a consumer. These
+// pins replace A124 S1's cold-node evidence (N readers = N evaluations, a node
+// read on every `get()`), which the pipe model retires: a pipe has one consumer,
+// so every stage runs once per change inside the one instance it started.
 
 #[test]
-fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
-    // Claim 1: a node allocates no cell and registers nothing, so three writes
-    // to the root of a five-deep chain do no work at all. Today's five `map`
-    // cells would have evaluated fifteen times. One `get()` then pulls the
-    // whole chain — five evaluations, paid by the reader.
+fn a142_s1_a_pipe_that_is_never_consumed_runs_nothing_and_sample_runs_it_once() {
+    // An unconsumed pipe registers nothing and computes nothing: three writes to
+    // the root of a five-stage pipe do no work. `.sample()` starts it, reads it
+    // once — five evaluations, paid at the call — and releases it: the writes
+    // after it run nothing either. Red when `sample` attaches and leaves its
+    // subscriber behind: `5` becomes `10` after the last write.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -632,68 +639,72 @@ fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
             let root: SignalCell<i32> = Signal::new(1);
             let evals: Shared<i32> = Shared::new(0);
             let chain = root
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 });
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 });
             print(evals.read());
             root.set(2);
             root.set(3);
             root.set(4);
             print(evals.read());
-            print(chain.get());
+            print(chain.sample());
             print(evals.read());
+            root.set(5);
+            print(evals.read());
+            print(root.subscribers.read().len());
         }
 
         main();
         "#,
-        "0\n0\n9\n5\n",
+        "0\n0\n9\n5\n5\n0\n",
     );
 }
 
 #[test]
-fn a124_s1_a_cold_chain_evaluates_once_per_leaf_subscriber() {
-    // Claim 2: N leaves means N evaluations, by design — the cold contract.
-    // One leaf: five. Two leaves on the same chain: ten. The notification
-    // carries no payload, so the hops themselves compute nothing; the count is
-    // exactly the leaves' pulls.
+fn a142_s1_a_five_stage_sealed_chain_puts_one_subscriber_on_its_root_and_runs_once_per_change() {
+    // The fused instance: sealing a five-stage chain mints ONE subscriber (the
+    // memo's) and puts it on the root — every stage forwards it — and a change
+    // runs the five stages once, in one pass. Reading the memo three times runs
+    // nothing. Red when a stage mints a relay of its own instead of forwarding:
+    // `minted=6 on_root=1`, or when the memo pulls twice per change: `evals=10`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive::{ Signal, SignalCell, Source, fresh_id };
         import std::shared::Shared;
 
         fun main() {
             let root: SignalCell<i32> = Signal::new(1);
             let evals: Shared<i32> = Shared::new(0);
-            let chain = root
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map(|x| { evals.write() = evals.read() + 1; x + 1 });
-            let _one = chain.on_change(|_value| {});
+            let before = fresh_id();
+            let sealed = root
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .derive(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .memo();
+            print(i"minted={fresh_id() - before - 1} on_root={root.subscribers.read().len()}");
             evals.write() = 0;
-            root.set(2);
-            print(evals.read());
-            let _two = chain.on_change(|_value| {});
-            evals.write() = 0;
-            root.set(3);
-            print(evals.read());
+            root.set(10);
+            print(i"evals={evals.read()}");
+            print(i"{sealed.get()} {sealed.get()} {sealed.get()} evals={evals.read()}");
         }
 
         main();
         "#,
-        "5\n10\n",
+        "minted=1 on_root=1\nevals=5\n15 15 15 evals=5\n",
     );
 }
 
 #[test]
-fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
-    // Claim 3: `.cell()` is one more node, composable anywhere, and it is where
-    // sharing is bought. Two leaves below a cell: the two nodes ABOVE it run
-    // once (2), the three below it run per leaf (3 x 2 = 6).
+fn a142_s1_sharing_is_sealing_the_segment_above_a_memo_runs_once() {
+    // Two consumers of one derived value need a source between them. Above the
+    // `.memo()` the two stages run once per change (2); below it each consumer
+    // built its OWN three-stage pipe, which runs once per change in its own
+    // instance (3 x 2 = 6).
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -704,16 +715,20 @@ fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
             let root: SignalCell<i32> = Signal::new(1);
             let upper: Shared<i32> = Shared::new(0);
             let lower: Shared<i32> = Shared::new(0);
-            let cached = root
-                .map(|x| { upper.write() = upper.read() + 1; x + 1 })
-                .map(|x| { upper.write() = upper.read() + 1; x + 1 })
-                .cell();
-            let below = cached
-                .map(|x| { lower.write() = lower.read() + 1; x + 1 })
-                .map(|x| { lower.write() = lower.read() + 1; x + 1 })
-                .map(|x| { lower.write() = lower.read() + 1; x + 1 });
-            let _a = below.on_change(|_value| {});
-            let _b = below.on_change(|_value| {});
+            let shared = root
+                .derive(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .derive(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .memo();
+            let _a = shared
+                .derive(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .derive(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .derive(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .on_change(|_value| {});
+            let _b = shared
+                .derive(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .derive(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .derive(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .on_change(|_value| {});
             upper.write() = 0;
             lower.write() = 0;
             root.set(2);
@@ -728,59 +743,127 @@ fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
 }
 
 #[test]
-fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
-    // Claim 4, and the honest half of R2. Two arms over one root, joined: with
-    // NO turn the leaf is told twice per settle. Since S2a both arms carry the
-    // SAME record (the leaf's id), but an inline notification walks the root's
-    // list and calls what it finds — there is no queue to dedup in, which is
-    // what "inline, eager, depth-first" has always meant. It is a duplicate
-    // CALL and never a torn pair: both calls pull, so both read the settled
-    // `(20, 102)`. The turn is where the one id pays — the S2a pin below.
+fn a142_s1_sealing_a_pipe_twice_is_refused() {
+    // R29: a second consumer is a compile error, not silent duplicate work.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let count = Signal::new(1);
+            let doubled = count.derive(|n| n * 2);
+            let first = doubled.memo();
+            let second = doubled.memo();
+        }
+        "#,
+        "use of `doubled` after it was moved: a resource has a single owner",
+    );
+}
+
+#[test]
+fn a142_s1_branching_a_pipe_is_refused() {
+    // The same refusal reached by branching: a stage built over `doubled`
+    // consumed it, so sealing it afterwards is its second use.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let count = Signal::new(1);
+            let doubled = count.derive(|n| n * 2);
+            let plus = doubled.derive(|n| n + 1);
+            let sealed = doubled.memo();
+        }
+        "#,
+        "use of `doubled` after it was moved: a resource has a single owner",
+    );
+}
+
+#[test]
+fn a142_s1_handing_one_pipe_to_two_consumers_is_refused() {
+    // A consumer (`sub`) takes `own self` too: the second consumer is refused
+    // wherever it is — a binding, an effect, a seal.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Disposable };
+
+        fun main() {
+            let count = Signal::new(1);
+            let doubled = count.derive(|n| n * 2);
+            let one = doubled.sub(|n| print(n));
+            let two = doubled.sub(|n| print(n));
+        }
+        "#,
+        "use of `doubled` after it was moved: a resource has a single owner",
+    );
+}
+
+#[test]
+fn a142_s1_a_root_is_copied_freely() {
+    // Roots are data: the same cell handed to two `own` flow parameters is two
+    // copies of one handle, and both consumers follow the one cell.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source, combine };
-        import std::shared::Shared;
+        import std::reactive::{ Flow, Signal, SignalCell };
+
+        fun show(label: str, own value: Flow<i32>) {
+            let _watch = value.sub(|n| print(i"{label} {n}"));
+        }
 
         fun main() {
-            let source: SignalCell<i32> = Signal::new(1);
-            let seen: Shared<str> = Shared::new("");
-            let arms: (dyn Source<i32>, dyn Source<i32>) = (
-                source.map(|x| x * 10),
-                source.map(|x| x + 100)
-            );
-            let diamond = combine(arms);
-            let _leaf = diamond.on_change(|pair| {
-                let (left, right) = pair;
-                seen.write() = i"{seen.read()}({left},{right})";
-            });
-            seen.write() = "";
-            source.set(2);
-            print(seen.read());
+            let count = Signal::new(1);
+            show("a", count);
+            show("b", count);
+            show("pipe", count.derive(|n| n * 10));
+            count.set(2);
         }
 
         main();
         "#,
-        "(20,102)(20,102)\n",
+        "a 1\nb 1\npipe 10\na 2\nb 2\npipe 20\n",
     );
 }
 
-// --- A124 S2a: the no-payload protocol on the read trait ---------------------
-//
-// `Source::on_settle` is the protocol now (the S1 probe carried it as a twin
-// trait), and a leaf's ONE subscriber id is threaded down its whole chain: the
-// nodes forward the record they are handed, `SignalCell::on_settle` pushes it as
-// given, and a turn's dedup — keyed on that id — collapses a diamond's
-// duplicate.
+#[test]
+fn a142_s1_a_root_has_no_memo() {
+    // R29: the sealing operations exist only on pipes. A cell is already a
+    // source, so `cell.memo()` has no method.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let count = Signal::new(1);
+            let sealed = count.memo();
+        }
+        "#,
+        "SignalCell<i32> has no method 'memo'",
+    );
+}
 
 #[test]
-fn a124_s2a_a_diamond_in_a_turn_fires_once_with_the_settled_pair() {
-    // The COUNT claim S1 could not make. Red when `SignalCell::on_settle`
-    // mints a fresh id per registration instead of pushing the leaf's record:
-    // `(30,103)(30,103)`. The leaf is the node's own `on_change`, called
-    // DIRECTLY: through a generic bound a `Combine`'s override is not selected
-    // — its trait argument is a tuple — and the call takes the default
-    // bridge, whose own dedup would hide the root's.
+fn a142_s1_a_pipe_has_no_get() {
+    // A pipe is a description: it has no `get`. The steer to `.memo()` /
+    // `.sample()` is solver-44's (A142 §3.3); this pins the refusal.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun main() {
+            let count = Signal::new(1);
+            print(count.derive(|n| n * 2).get());
+        }
+        "#,
+        "has no method 'get'",
+    );
+}
+
+#[test]
+fn a142_s1_a_diamond_of_sealed_arms_pulls_a_settled_pair_in_a_turn() {
+    // `combine` takes sources, so a diamond over one root is two sealed arms and
+    // a combined leaf. In a turn the arms are derivations (phase 1) and the leaf
+    // an effect (phase 2): the leaf runs once, on the settled pair.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -790,11 +873,7 @@ fn a124_s2a_a_diamond_in_a_turn_fires_once_with_the_settled_pair() {
         fun main() {
             let source: SignalCell<i32> = Signal::new(1);
             let seen: Shared<str> = Shared::new("");
-            let arms: (dyn Source<i32>, dyn Source<i32>) = (
-                source.map(|x| x * 10),
-                source.map(|x| x + 100)
-            );
-            let diamond = combine(arms);
+            let diamond = combine((source.derive(|x| x * 10).memo(), source.derive(|x| x + 100).memo()));
             let _leaf = diamond.on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
@@ -812,9 +891,45 @@ fn a124_s2a_a_diamond_in_a_turn_fires_once_with_the_settled_pair() {
 }
 
 #[test]
+fn a142_s1_one_consumer_over_a_root_twice_is_one_subscriber_deduped_in_a_turn() {
+    // A124 R2's dedup, through the pipe protocol: `combine` forwards the
+    // consumer's ONE record to both of its arms, and both arms are the same root,
+    // so the root holds that record twice. In a turn the two notifications are one
+    // call; inline, the root's list walk calls it twice — a duplicate CALL, never
+    // a torn pair, because both calls pull. Red when `SignalCell::on_settle` mints
+    // a fresh id per registration: `(3,3)(3,3)` in the turn.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine, turn };
+        import std::shared::Shared;
+
+        fun main() {
+            let source: SignalCell<i32> = Signal::new(1);
+            let seen: Shared<str> = Shared::new("");
+            let _leaf = combine((source, source)).on_change(|pair| {
+                let (left, right) = pair;
+                seen.write() = i"{seen.read()}({left},{right})";
+            });
+            turn(FlushPolicy::AtEnd, || {
+                source.set(3);
+            });
+            print(seen.read());
+            seen.write() = "";
+            source.set(4);
+            print(seen.read());
+        }
+
+        main();
+        "#,
+        "(3,3)\n(4,4)(4,4)\n",
+    );
+}
+
+#[test]
 fn a124_s2a_a_leaf_disposed_by_an_earlier_effect_in_its_wave_does_not_fire() {
     // Door 1 through the protocol. Both observers are queued in one wave; the
-    // first (lower id) disposes the cold chain's leaf, whose record is already
+    // first (lower id) disposes the pipe's consumer, whose record is already
     // OUT of the queue — only its liveness cell can stop it now, and that cell
     // is the one `attach` shares with the handle. Red when the root's handle
     // carries a liveness cell of its own: `leaf saw 20`.
@@ -833,7 +948,7 @@ fn a124_s2a_a_leaf_disposed_by_an_earlier_effect_in_its_wave_does_not_fire() {
                 held.read()?.dispose();
                 print("first disposed the leaf");
             });
-            held.write() = Some(source.map(|x| x * 10).on_change(|value| {
+            held.write() = Some(source.derive(|x| x * 10).on_change(|value| {
                 print(i"leaf saw {value}");
             }));
             turn(FlushPolicy::AtEnd, || {
@@ -849,19 +964,17 @@ fn a124_s2a_a_leaf_disposed_by_an_earlier_effect_in_its_wave_does_not_fire() {
 }
 
 #[test]
-fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_change() {
-    // A root that is not a `SignalCell` — `get` and `on_change` and nothing
-    // else, the `Stored` of the reference page — takes `Source::on_settle`'s
-    // DEFAULT, the payload bridge. Each arm's forward reaches the root
-    // separately and mints a bridge of its own, and each bridge WAKES the leaf
-    // through the turn rather than calling it, so the leaf's id is still the
-    // one the dedup sees. Red when the bridge calls the leaf directly:
-    // `(30,103)(30,103)`.
+fn a142_s1_a_root_of_ones_own_forwards_the_consumers_record() {
+    // A root that is not a `SignalCell` — `get` and `on_settle` and nothing else,
+    // the `Stored` of the reference page — hands the consumer's record to the
+    // cell it wraps, so the dedup is the cell's: once in a turn, and a duplicate
+    // call (never a torn pair) inline. Red when a root mints a relay of its own
+    // and wakes the consumer directly: `(30,30)(30,30)` in the turn.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{
-            FlushPolicy, Signal, SignalCell, Source, Subscription, combine, turn,
+            FlushPolicy, Signal, SignalCell, Source, Subscriber, Subscription, combine, turn,
         };
         import std::shared::Shared;
 
@@ -874,8 +987,8 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
                 self.inner.get()
             }
 
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -883,12 +996,10 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
             let cell: SignalCell<i32> = Signal::new(1);
             let root = Stored { inner = cell };
             let seen: Shared<str> = Shared::new("");
-            let arms: (dyn Source<i32>, dyn Source<i32>) = (
-                root.map(|x| x * 10),
-                root.map(|x| x + 100)
-            );
-            let diamond = combine(arms);
-            let _leaf = diamond.on_change(|pair| {
+            let _leaf = combine((root, root)).derive(|pair| {
+                let (left, right) = pair;
+                (left * 10, right + 100)
+            }).on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
             });
@@ -929,11 +1040,11 @@ fn a124_s2b_a_cell_does_not_compare_and_a_distinct_does() {
             let root: SignalCell<i32> = Signal::new(1);
             let cell_log: Shared<str> = Shared::new("");
             let distinct_log: Shared<str> = Shared::new("");
-            let cached = root.map(|x| x / 10).cell();
+            let cached = root.derive(|x| x / 10).cell();
             let _c = cached.on_change(|value| {
                 cell_log.write() = i"{cell_log.read()}{value},";
             });
-            let _d = root.map(|x| x / 10).distinct().on_change(|value| {
+            let _d = root.derive(|x| x / 10).distinct().on_change(|value| {
                 distinct_log.write() = i"{distinct_log.read()}{value},";
             });
             root.set(2);
@@ -973,7 +1084,7 @@ fn a124_s2b_a_cell_is_a_derivation_an_effect_reads_settled() {
                     None => {},
                 }
             });
-            holder.write() = Some(root.map(|x| x * 2 + 1).cell());
+            holder.write() = Some(root.derive(|x| x * 2 + 1).cell());
             turn(FlushPolicy::AtEnd, || {
                 root.set(5);
             });
@@ -1000,7 +1111,7 @@ fn a124_s2b_a_cell_made_under_an_owner_releases_its_upstream_with_it() {
         fun main() {
             let root: SignalCell<i32> = Signal::new(1);
             let owner = Owner::new();
-            let cached = run_with_owner(owner, || root.map(|x| x * 10).cell());
+            let cached = run_with_owner(owner, || root.derive(|x| x * 10).cell());
             root.set(2);
             print(i"before={root.subscribers.read().len()} cell={cached.get()}");
             owner.dispose();
@@ -1066,8 +1177,8 @@ fn a124_s2b_the_owners_disposal_releases_a_switchs_rolling_inner_registration() 
 
 #[test]
 fn a124_s2b_a_default_inherited_by_a_node_types_its_observer_from_the_node() {
-    // `sub`, `effect` and `map` are `Source` DEFAULTS, reached on a node through
-    // its impl. Each node's value type is a DIRECT binder of its impl subject
+    // `sub`, `effect` and `derive` are `Flow` members, reached on a stage through
+    // its impl. Each stage's value type is a DIRECT binder of its impl subject
     // (`Switch<.., type I: Source<U>, type U>`, `Distinct<.., type T>`), so the
     // observer's parameter is the node's `i32` and `value + 1` checks. Red with
     // `Switch` binding `U` out of `I`'s bound (`type I: Source<type U>`): `+` on
@@ -1084,8 +1195,8 @@ fn a124_s2b_a_default_inherited_by_a_node_types_its_observer_from_the_node() {
             let first: SignalCell<i32> = Signal::new(10);
             let _switched = which.switch(|n| first).sub(|value| print(value + 1));
             let _distinct = which.distinct().sub(|value| print(value + 2));
-            let labelled = which.map(|n| i"n{n}").map(|label| label.len());
-            print(labelled.get());
+            let labelled = which.derive(|n| i"n{n}").derive(|label| label.len());
+            print(labelled.sample());
         }
 
         main();
@@ -1096,10 +1207,11 @@ fn a124_s2b_a_default_inherited_by_a_node_types_its_observer_from_the_node() {
 
 #[test]
 fn a124_s2b_combine_over_the_tuple_bound_joins_three_kinds_of_source() {
-    // The n-ary `Combine` over `(U in T: dyn Source<U>)`: a root cell, a cold
-    // node and a `.cell()`, three element types, one node — read by pull and
-    // notified once per settle in a turn however many of its inputs stand on
-    // the written root.
+    // The n-ary `Combine` over `(U in T: dyn Source<U>)`: a root cell, a sealed
+    // `.memo()` and a `.cell()`, three element types, one stage — notified once
+    // per settle in a turn however many of its inputs stand on the written root.
+    // Sealed, because it is read after it is subscribed (a pipe has one
+    // consumer); its arms are sources, since a pipe cannot become a `dyn`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -1109,10 +1221,10 @@ fn a124_s2b_combine_over_the_tuple_bound_joins_three_kinds_of_source() {
             let count: SignalCell<i32> = Signal::new(1);
             let arms: (dyn Source<i32>, dyn Source<str>, dyn Source<bool>) = (
                 count,
-                count.map(|n| i"n{n}"),
-                count.map(|n| n > 2).cell()
+                count.derive(|n| i"n{n}").memo(),
+                count.derive(|n| n > 2).cell()
             );
-            let all = combine(arms);
+            let all = combine(arms).memo();
             let _leaf = all.on_change(|triple| {
                 let (n, label, big) = triple;
                 print(i"{n} {label} {big}");
@@ -1133,7 +1245,7 @@ fn a124_s2b_combine_over_the_tuple_bound_joins_three_kinds_of_source() {
 #[test]
 fn a124_s2b_pending_or_zero_reads_zero_before_completion_and_the_value_after() {
     // The item's pin, with a REAL load: a resource over `id` loads on a timer,
-    // `.or(0)` reads 0 while it is out, and the `map` below the fallback is
+    // `.or(0)` reads 0 while it is out, and the `derive` below the fallback is
     // written on `i32` — no `Option` anywhere downstream. A change of `id`
     // re-pends it and `.or` RESETS to the default until the new load lands
     // (Q2). Red when `.or` holds the last settled value instead: the re-pend
@@ -1151,7 +1263,7 @@ fn a124_s2b_pending_or_zero_reads_zero_before_completion_and_the_value_after() {
                 sleep(5);
                 Ok(n * 10)
             });
-            let shown = user.or(0).map(|n| n + 1);
+            let shown = user.or(0).derive(|n| n + 1).memo();
             print(i"before {shown.get()}");
             let _log = shown.on_change(|value| {
                 print(i"shown {value}");
@@ -1181,11 +1293,11 @@ fn a124_s2b_a_resource_state_machine_and_its_four_fallbacks() {
         import std::reactive::{ Resource, Source };
 
         fun line(r: Resource<i32>): str {
-            let optional = match r.optional().get() {
+            let optional = match r.optional().sample() {
                 Some(let value) => i"{value}",
                 None => "none",
             };
-            i"or={r.or(0).get()} latest={r.latest(-1).get()} optional={optional} pending={r.is_pending().get()}"
+            i"or={r.or(0).sample()} latest={r.latest(-1).sample()} optional={optional} pending={r.is_pending().sample()}"
         }
 
         fun main() {
@@ -1210,7 +1322,9 @@ fn a124_s2b_a_resource_state_machine_and_its_four_fallbacks() {
 // A `.cell()` is owner-tied, and a module binding's initializer has no owner, so
 // its registration stays on the upstream for the life of the program. The
 // direct spelling is refused with a steer; `.cell_global()` is the spelling that
-// names the lifetime. STATIC-ONLY (R-e): the initializer's own calls, not a
+// names the lifetime. Since A142 a seal exists only on a PIPE (a root has no
+// `.cell()`), so these pins seal `path.derive(|p| p)`, and `.memo()` — the
+// read-only seal — is refused the same way, steering to `.memo_global()`. STATIC-ONLY (R-e): the initializer's own calls, not a
 // closure it creates and not a call it makes into a function that builds one.
 
 const A130_REFUSAL: &str = "`.cell()` in the initializer of the module binding";
@@ -1224,7 +1338,7 @@ fn a130_a_cell_in_a_module_bindings_initializer_is_refused_at_the_method() {
         import std::reactive::{ Signal, SignalCell, Source };
 
         let path: SignalCell<str> = Signal::new("/");
-        let route: SignalCell<str> = path.cell();
+        let route: SignalCell<str> = path.derive(|p| p).cell();
 
         fun main() {
             print(route.get());
@@ -1239,6 +1353,54 @@ fn a130_a_cell_in_a_module_bindings_initializer_is_refused_at_the_method() {
 }
 
 #[test]
+fn a142_a130_a_memo_in_a_module_bindings_initializer_is_refused_with_its_own_twin() {
+    // `.memo()` is owner-tied exactly as `.cell()` is, and it is refused the same
+    // way — naming its own seal and steering to its own `_global` twin. Red when
+    // the check keys on `cell` alone: the program compiles.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ MemoCell, Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let route: MemoCell<str> = path.derive(|p| p).memo();
+
+        fun main() {
+            print(route.get());
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "`.memo()` in the initializer of the module binding `route`",
+    );
+    assert_fails_with(
+        source,
+        "or write `.memo_global()`, which says that lifetime",
+    );
+}
+
+#[test]
+fn a142_a130_memo_global_at_module_level_compiles_and_follows_its_source() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ MemoCell, Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let depth: MemoCell<usize> = path.derive(|p| p.len()).memo_global();
+
+        fun main() {
+            print(depth.get());
+            path.set("/docs");
+            print(depth.get());
+        }
+
+        main();
+        "#,
+        "1\n5\n",
+    );
+}
+
+#[test]
 fn a130_the_refusal_reaches_a_cell_through_a_dyn_receiver() {
     assert_fails_with(
         r#"
@@ -1247,7 +1409,7 @@ fn a130_the_refusal_reaches_a_cell_through_a_dyn_receiver() {
 
         let path: SignalCell<str> = Signal::new("/");
         let erased: dyn Source<str> = path;
-        let cached: SignalCell<str> = erased.cell();
+        let cached: SignalCell<str> = erased.derive(|p| p).cell();
 
         fun main() {
             print(cached.get());
@@ -1269,7 +1431,7 @@ fn a130_the_refusal_reaches_a_cell_inside_a_struct_literal_field() {
         }
 
         let path: SignalCell<str> = Signal::new("/");
-        let held: Holder = Holder { value = path.cell() };
+        let held: Holder = Holder { value = path.derive(|p| p).cell() };
 
         fun main() {
             print(held.value.get());
@@ -1291,7 +1453,7 @@ fn a130_the_refusal_reaches_a_cell_passed_as_an_argument() {
         }
 
         let path: SignalCell<str> = Signal::new("/");
-        let kept: SignalCell<str> = keep(path.cell());
+        let kept: SignalCell<str> = keep(path.derive(|p| p).cell());
 
         fun main() {
             print(kept.get());
@@ -1309,7 +1471,7 @@ fn a130_the_refusal_reaches_a_cell_in_a_value_if_branch() {
         import std::reactive::{ Signal, SignalCell, Source };
 
         let path: SignalCell<str> = Signal::new("/");
-        let chosen: SignalCell<str> = if true { path.cell() } else { path };
+        let chosen: SignalCell<str> = if true { path.derive(|p| p).cell() } else { path };
 
         fun main() {
             print(chosen.get());
@@ -1328,9 +1490,9 @@ fn a130_one_diagnostic_per_refused_binding_and_none_for_the_others() {
         import std::reactive::{ Signal, SignalCell, Source };
 
         let path: SignalCell<str> = Signal::new("/");
-        let first: SignalCell<str> = path.cell();
-        let global: SignalCell<str> = path.cell_global();
-        let second: SignalCell<str> = path.cell();
+        let first: SignalCell<str> = path.derive(|p| p).cell();
+        let global: SignalCell<str> = path.derive(|p| p).cell_global();
+        let second: SignalCell<str> = path.derive(|p| p).cell();
 
         fun main() {
             print(i"{first.get()}{global.get()}{second.get()}");
@@ -1366,7 +1528,7 @@ fn a130_a_closure_the_initializer_creates_is_not_refused() {
         import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
 
         let path: SignalCell<str> = Signal::new("/");
-        let cached_path = || path.cell();
+        let cached_path = || path.derive(|p| p).cell();
 
         fun main() {
             let owner = Owner::new();
@@ -1395,7 +1557,7 @@ fn a130_a_cell_reached_through_a_call_from_module_init_is_the_documented_remaind
         let path: SignalCell<str> = Signal::new("/");
 
         fun cached(): SignalCell<str> {
-            path.cell()
+            path.derive(|p| p).cell()
         }
 
         let through: SignalCell<str> = cached();
@@ -1422,7 +1584,7 @@ fn a130_a_cell_in_a_function_body_is_not_refused() {
 
         fun main() {
             let path: SignalCell<str> = Signal::new("/");
-            let cached = path.cell();
+            let cached = path.derive(|p| p).cell();
             path.set("/b");
             print(cached.get());
         }
@@ -1473,7 +1635,7 @@ fn a130_cell_global_at_module_level_compiles_and_follows_its_source() {
         import std::reactive::{ Signal, SignalCell, Source };
 
         let path: SignalCell<str> = Signal::new("/");
-        let route: SignalCell<str> = path.map(|value| "route" + value).cell_global();
+        let route: SignalCell<str> = path.derive(|value| "route" + value).cell_global();
 
         fun main() {
             print(route.get());
@@ -1491,7 +1653,8 @@ fn a130_cell_global_at_module_level_compiles_and_follows_its_source() {
 fn a130_cell_global_ignores_an_ambient_owner_where_cell_is_released_with_it() {
     // The lifetime is in the name: made under an owner, `.cell_global()` still
     // follows its source after the owner is disposed, and `.cell()` beside it
-    // does not. One subscriber is left on the root — the global's.
+    // does not — and the same for A142's read-only twins, `.memo_global()` and
+    // `.memo()`. Two subscribers are left on the root — the two globals'.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -1500,28 +1663,33 @@ fn a130_cell_global_ignores_an_ambient_owner_where_cell_is_released_with_it() {
         fun main() {
             let root: SignalCell<i32> = Signal::new(1);
             let owner = Owner::new();
-            let global = run_with_owner(owner, || root.cell_global());
-            let owned = run_with_owner(owner, || root.cell());
+            let global = run_with_owner(owner, || root.derive(|n| n).cell_global());
+            let owned = run_with_owner(owner, || root.derive(|n| n).cell());
+            let memo_global = run_with_owner(owner, || root.derive(|n| n).memo_global());
+            let memo = run_with_owner(owner, || root.derive(|n| n).memo());
             owner.dispose();
             root.set(2);
             print(i"global={global.get()} owned={owned.get()} left={root.subscribers.read().len()}");
+            print(i"memo_global={memo_global.get()} memo={memo.get()}");
         }
 
         main();
         "#,
-        "global=2 owned=1 left=1\n",
+        "global=2 owned=1 left=2\nmemo_global=2 memo=1\n",
     );
 }
 
 #[test]
 fn a124_s2c_combine_erases_a_cell_and_a_node_at_the_call() {
     // The flip's `combine`: its mapped-tuple parameter `(U in T: dyn Source<U>)`
-    // erases each element at the call, so a root cell and a cold node mix in one
+    // erases each element at the call, so a root cell and a derivation mix in one
     // literal with NO annotated tuple of `dyn`s (B398 made the position coerce
-    // its elements; before, this type-checked and threw `source[1].get is not a
-    // function` at the first read). Building it registers nothing (`built=0`);
-    // a leaf registers one record per arm on the root (`subscribed=2`), and one
-    // write fires it once in a turn with the settled pair.
+    // its elements). Since A142 a derived arm is SEALED — a pipe is a
+    // `[resource]` and cannot become a `dyn` — so the root holds the memo's one
+    // record from the start (`built=1`). The combined pipe registers nothing
+    // until consumed; its consumer puts one record per arm on what each arm is
+    // (`subscribed=2` on the root: the memo's and the consumer's), and one write
+    // fires it once in a turn with the settled pair.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -1529,10 +1697,9 @@ fn a124_s2c_combine_erases_a_cell_and_a_node_at_the_call() {
 
         fun main() {
             let name: SignalCell<str> = Signal::new("ada");
-            let both = combine((name, name.map(|value| value.len())));
+            let length = name.derive(|value| value.len()).memo();
+            let both = combine((name, length));
             print(i"built={name.subscribers.read().len()}");
-            let (first, length) = both.get();
-            print(i"{first} {length}");
             let _leaf = both.on_change(|pair| {
                 let (value, size) = pair;
                 print(i"changed {value} {size}");
@@ -1541,11 +1708,13 @@ fn a124_s2c_combine_erases_a_cell_and_a_node_at_the_call() {
             turn(FlushPolicy::AtEnd, || {
                 name.set("grace");
             });
+            let (first, size) = combine((name, length)).sample();
+            print(i"{first} {size}");
         }
 
         main();
         "#,
-        "built=0\nada 3\nsubscribed=2\nchanged grace 5\n",
+        "built=1\nsubscribed=2\nchanged grace 5\ngrace 5\n",
     );
 }
 
@@ -1569,7 +1738,7 @@ fn a124_s2c_a_node_over_a_tuple_upstream_forwards_through_its_bound() {
         fun main() {
             let a: SignalCell<i32> = Signal::new(1);
             let b: SignalCell<i32> = Signal::new(2);
-            let sum = combine((a, b)).map(|(x, y)| x + y);
+            let sum = combine((a, b)).derive(|(x, y)| x + y);
             let before = fresh_id();
             let _leaf = sum.on_change(|value| print(i"sum {value}"));
             print(i"minted {fresh_id() - before - 1}");
@@ -1735,18 +1904,18 @@ fn a135_a_handle_method_whose_tail_is_cell_warns_with_the_memo_steer() {
         r#"
         [rpc]
         fun first_name(self): SignalCell<Option<str>> {
-            self.names.map(|names| names.get(1)).cell()
+            self.names.derive(|names| names.get(1)).cell()
         }
 
         [rpc]
         fun count(self): SignalCell<usize> {
             let unused = 0;
-            self.names.map(|names| names.len()).cell()
+            self.names.derive(|names| names.len()).cell()
         }
 
         [rpc]
         fun maybe(self, id: i32): Option<SignalCell<str>> {
-            Some(self.names.map(|names| names.get(id).unwrap_or_default()).cell())
+            Some(self.names.derive(|names| names.get(id).unwrap_or_default()).cell())
         }
         "#,
     );
@@ -1775,7 +1944,7 @@ fn a135_a_handle_method_returning_what_outlives_the_call_does_not_warn() {
 
         [rpc]
         fun global(self): SignalCell<usize> {
-            self.names.map(|names| names.len()).cell_global()
+            self.names.derive(|names| names.len()).cell_global()
         }
 
         [rpc]
@@ -1785,7 +1954,7 @@ fn a135_a_handle_method_returning_what_outlives_the_call_does_not_warn() {
 
         [rpc]
         fun size(self): usize {
-            let derived = self.names.map(|names| names.len()).cell();
+            let derived = self.names.derive(|names| names.len()).cell();
             derived.get()
         }
         "#,
@@ -1823,8 +1992,8 @@ fn a136_a_cell_or_an_effect_inside_a_memo_maker_warns() {
 
         fun main() {
             owner_scope.run(Owner::new(), || {
-                let a = doubled.get_or_insert(1, || source.map(|n| n * 2).cell());
-                let b = doubled.get_or(2, || source.map(|n| n * 3).cell());
+                let a = doubled.get_or_insert(1, || source.derive(|n| n * 2).cell());
+                let b = doubled.get_or(2, || source.derive(|n| n * 3).cell());
                 let c = watched.get_or_insert(1, || {
                     source.effect(|n| {});
                     true
@@ -1858,13 +2027,314 @@ fn a136_a_maker_that_builds_what_outlives_the_caller_does_not_warn() {
 
         fun main() {
             owner_scope.run(Owner::new(), || {
-                let kept = global.get_or_insert(1, || source.map(|n| n * 2).cell_global());
-                let leased = global.get_or_insert(2, || source.map(|n| n + 1).cell_global()).map(|n| n).cell();
-                let deferred = later.get_or_insert(1, || || source.map(|n| n).cell());
-                let plain = apply(|| source.map(|n| n).cell());
+                let kept = global.get_or_insert(1, || source.derive(|n| n * 2).cell_global());
+                let leased = global.get_or_insert(2, || source.derive(|n| n + 1).cell_global()).derive(|n| n).cell();
+                let deferred = later.get_or_insert(1, || || source.derive(|n| n).cell());
+                let plain = apply(|| source.derive(|n| n).cell());
             });
         }
         "#,
     );
     assert!(found.is_empty(), "{found:#?}");
+}
+// --- A142 S2: every body a pipe runs has an owner per run --------------------
+//
+// `proposal/reactive-layers.md` §4 (R2, R14): because a pipe has exactly one
+// consumer, every body in it runs once per change inside one instance, so every
+// run of a body — a `derive` transform, a `switch` selector, an `effect` — gets
+// an owner of its own, released when the body runs again and when the instance
+// is released. The owner is an epoch of one cell per stage, and its cleanup list
+// is allocated at the run's first registration (§4.1): a run that registers
+// nothing costs a read and a write. A task a run starts belongs to the run's
+// nursery and is cancelled at its release.
+
+#[test]
+fn a142_s2_a_body_that_registers_nothing_allocates_no_owner() {
+    // `owner_lists_allocated` counts every cleanup list an owner ever made. Ten
+    // changes through a sealed two-stage chain and a plain effect allocate NONE
+    // (`quiet=0`); the same ten through an effect whose body registers one
+    // cleanup per run allocate one list per run (`busy=10`). Red when the run's
+    // owner allocates its list up front: `quiet=30` (a list per run per body).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{
+            Owner, Signal, SignalCell, Source, on_cleanup, owner_lists_allocated, run_with_owner,
+        };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(0);
+            let boundary = Owner::new();
+            let sealed = run_with_owner(boundary, || {
+                root.effect(|value: i32| {
+                    let _ignored = value + 1;
+                });
+                root.derive(|value| value + 1).derive(|value| value * 2).memo()
+            });
+            let before = owner_lists_allocated();
+            mut step = 1;
+            for step <= 10 {
+                root.set(step);
+                step += 1;
+            }
+            print(i"quiet={owner_lists_allocated() - before} value={sealed.get()}");
+            let noisy = Owner::new();
+            run_with_owner(noisy, || {
+                root.effect(|_value: i32| on_cleanup(|| {}));
+            });
+            let before_busy = owner_lists_allocated();
+            step = 1;
+            for step <= 10 {
+                root.set(step);
+                step += 1;
+            }
+            print(i"busy={owner_lists_allocated() - before_busy}");
+            noisy.dispose();
+            boundary.dispose();
+        }
+
+        main();
+        "#,
+        "quiet=0 value=22\nbusy=10\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_derive_body_releases_each_run_before_the_next_and_the_last_with_its_consumer() {
+    // R14: a `derive` body's registrations belong to its run. The cleanup of run
+    // `n` runs before run `n + 1` builds, and the last run's is released with the
+    // memo's boundary. Red when `derive` runs its body under the boundary's owner:
+    // the three cleanups all print at `dispose`, after `value 6`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let boundary = Owner::new();
+            let doubled = run_with_owner(boundary, || {
+                root.derive(|value: i32| {
+                    print(i"run {value}");
+                    on_cleanup(|| print(i"release {value}"));
+                    value * 2
+                }).memo()
+            });
+            root.set(2);
+            root.set(3);
+            print(i"value {doubled.get()}");
+            boundary.dispose();
+            print("disposed");
+        }
+
+        main();
+        "#,
+        "run 1\nrelease 1\nrun 2\nrelease 2\nrun 3\nvalue 6\nrelease 3\ndisposed\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_switch_selectors_creations_are_released_on_reselection() {
+    // A selector runs once per change of its outer (the prototype's `made=1`
+    // shape: reads run nothing), and what a selection built is released when
+    // the next selection replaces it — before the new one builds.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, on_cleanup };
+        import std::shared::Shared;
+
+        fun main() {
+            let made: Shared<i32> = Shared::new(0);
+            let flag = Signal::new(true);
+            let count = Signal::new(1);
+            let picked = flag
+                .switch(|on: bool| {
+                    made.write() = made.read() + 1;
+                    on_cleanup(|| print(i"released {on}"));
+                    count.derive(|value| if on { value * 100 } else { 0 - value })
+                })
+                .memo();
+            print(i"picked={picked.get()} made={made.read()}");
+            count.set(2);
+            print(i"picked={picked.get()} {picked.get()} made={made.read()}");
+            flag.set(false);
+            count.set(3);
+            print(i"picked={picked.get()} made={made.read()}");
+        }
+
+        main();
+        "#,
+        "picked=100 made=1\npicked=200 200 made=1\nreleased true\npicked=-3 made=2\n",
+    );
+}
+
+#[test]
+fn a142_s2_sample_releases_what_its_bodies_created() {
+    // R32: `.sample()` starts the pipe, reads it and releases it — the runs its
+    // bodies made included. The cleanup runs inside the call, before the value
+    // is printed; and nothing is left subscribed on the root.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, on_cleanup };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(4);
+            let read = root
+                .derive(|value: i32| {
+                    on_cleanup(|| print("released the run"));
+                    value + 1
+                })
+                .sample();
+            print(i"sampled {read} subscribers={root.subscribers.read().len()}");
+        }
+
+        main();
+        "#,
+        "released the run\nsampled 5 subscribers=0\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_superseded_task_is_cancelled_with_its_run() {
+    // §4.1: a task started during a run belongs to the run's nursery and is
+    // cancelled when the run is released. Two changes before the first task's
+    // sleep ends: only the LAST run's task finishes. Red when the run owns no
+    // nursery: `fetched 1` and `fetched 2` print too.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::time::sleep;
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.effect(|value: i32| {
+                    let _pending = async {
+                        sleep(30);
+                        print(i"fetched {value}");
+                    };
+                });
+            });
+            id.set(2);
+            id.set(3);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+        "fetched 3\ndone\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_derive_bodys_superseded_task_is_cancelled() {
+    // The paper's own example: `src.derive(|x| async ..)` cancels the
+    // superseded fetch when `src` changes, because the body runs once per change
+    // inside the one instance its consumer started (§4.1).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::task::Task;
+        import std::time::sleep;
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            let _fetches = run_with_owner(boundary, || {
+                id.derive(|value: i32| async {
+                    sleep(30);
+                    print(i"fetched {value}");
+                    value
+                }).memo()
+            });
+            id.set(2);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+        "fetched 2\ndone\n",
+    );
+}
+
+#[test]
+#[ignore = "A142: reactive-44 find — a spawn inside a user-written `context ambient_nursery` closure is not registered with the injected nursery, so a cancelled run's task is reported as an unhandled task error"]
+fn a142_s2_a_cancelled_runs_task_is_owned_and_reports_nothing() {
+    // The ownership half of the pin above: the run's task is REGISTERED with the
+    // run's nursery, so its cancellation is absorbed like every owned task's.
+    // Today the spawn is not connected to the injected nursery: the task is
+    // cancelled through the ambient signal (its sleep aborts) but it is unowned,
+    // so its AbortError is reported on stderr.
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::time::sleep;
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.effect(|value: i32| {
+                    let _pending = async {
+                        sleep(30);
+                        print(i"fetched {value}");
+                    };
+                });
+            });
+            id.set(2);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "fetched 2\ndone\n");
+    assert!(
+        stderr.trim().is_empty(),
+        "a cancelled owned task reports nothing: {stderr}"
+    );
+}
+
+#[test]
+fn a142_s2_scoped_effect_is_a_deprecated_alias_of_effect() {
+    // R2 merged the pair: `scoped_effect` still compiles, warns, and behaves as
+    // `effect` does.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner };
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.scoped_effect(|value: i32| {
+                    on_cleanup(|| print(i"release {value}"));
+                });
+            });
+            id.set(2);
+            boundary.dispose();
+        }
+
+        main();
+        "#;
+    assert_compiles_and_runs(source, "release 1\nrelease 2\n");
+    assert!(
+        warning_diagnostics(source)
+            .iter()
+            .any(|(message, _)| message.contains("scoped_effect")),
+        "scoped_effect warns as deprecated"
+    );
 }

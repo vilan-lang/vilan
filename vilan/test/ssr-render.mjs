@@ -7,8 +7,11 @@ function __clone(value) {
 function __shared_new(value) {
 	return { v: value };
 }
+function reissued(subscriber) {
+	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
+}
 function new2() {
-	return [ __shared_new([  ]), __shared_new(false) ];
+	return [ __shared_new([ 0, no_cleanups, false, [ 1 ] ]), 0 ];
 }
 function view(tag) {
 	const attributes = __shared_new([  ]);
@@ -56,38 +59,38 @@ function apply(self, parent, name2) {
 	set_attribute(parent[1], name2, self);
 }
 function is_void_element(tag) {
-	const $C = tag;
-	let $D = null;
-	if ($C === "area") {
-		$D = true;
-	} else if ($C === "base") {
-		$D = true;
-	} else if ($C === "br") {
-		$D = true;
-	} else if ($C === "col") {
-		$D = true;
-	} else if ($C === "embed") {
-		$D = true;
-	} else if ($C === "hr") {
-		$D = true;
-	} else if ($C === "img") {
-		$D = true;
-	} else if ($C === "input") {
-		$D = true;
-	} else if ($C === "link") {
-		$D = true;
-	} else if ($C === "meta") {
-		$D = true;
-	} else if ($C === "source") {
-		$D = true;
-	} else if ($C === "track") {
-		$D = true;
-	} else if ($C === "wbr") {
-		$D = true;
+	const $K = tag;
+	let $L = null;
+	if ($K === "area") {
+		$L = true;
+	} else if ($K === "base") {
+		$L = true;
+	} else if ($K === "br") {
+		$L = true;
+	} else if ($K === "col") {
+		$L = true;
+	} else if ($K === "embed") {
+		$L = true;
+	} else if ($K === "hr") {
+		$L = true;
+	} else if ($K === "img") {
+		$L = true;
+	} else if ($K === "input") {
+		$L = true;
+	} else if ($K === "link") {
+		$L = true;
+	} else if ($K === "meta") {
+		$L = true;
+	} else if ($K === "source") {
+		$L = true;
+	} else if ($K === "track") {
+		$L = true;
+	} else if ($K === "wbr") {
+		$L = true;
 	} else {
-		$D = false;
+		$L = false;
 	}
-	return $D;
+	return $L;
 }
 function escape_text(value) {
 	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -106,39 +109,39 @@ function render(view2) {
 	}
 	out = out + escape_text(view2[3].v);
 	for (const child of view2[2].v) {
-		const $E = child;
-		let $F = null;
-		if ($E[0] === 0) {
-			const element = $E[1];
+		const $M = child;
+		let $N = null;
+		if ($M[0] === 0) {
+			const element = $M[1];
 			out = out + render(element);
-			$F = undefined;
+			$N = undefined;
 		} else {
-			const content = $E[1];
+			const content = $M[1];
 			out = out + escape_text(content);
-			$F = undefined;
+			$N = undefined;
 		}
-		$F;
+		$N;
 	}
 	return out + "</" + view2[0] + ">";
 }
 function app(title2, todos2, page2) {
-	const heading = $g(view("h1"), title2);
-	const list = $k(view("ul"), $j(todos2, (todo) => {
+	const heading = $g(view("h1"), __clone(title2));
+	const list = $o(view("ul"), $n(todos2, (todo) => {
 		return todo;
-	}, (todo, $i) => {
+	}, (todo, $m) => {
 		return text(view("li"), todo);
 	}));
-	const nav = $w(view("nav"), $v(page2, (current, $r) => {
-		const $s = current;
-		let $t = null;
-		if ($s[0] === 0) {
-			$t = text($u(view("a"), "href", "/"), "Home");
+	const nav = $A(view("nav"), $z(__clone(page2), (current, $v) => {
+		const $w = current;
+		let $x = null;
+		if ($w[0] === 0) {
+			$x = text($y(view("a"), "href", "/"), "Home");
 		} else {
-			$t = text($u(view("a"), "href", "/about"), "About & friends");
+			$x = text($y(view("a"), "href", "/about"), "About & friends");
 		}
-		return $t;
+		return $x;
 	}));
-	return $B($B($B($u(view("main"), "id", "app"), heading), list), nav);
+	return $J($J($J($y(view("main"), "id", "app"), heading), list), nav);
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -150,99 +153,147 @@ function $a(value) {
 function $c(value) {
 	return $b(value);
 }
-function $h(self) {
+function $j(self) {
 	return __clone(self[0].v);
 }
+function $l(signal, subscriber) {
+	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
+	signal[1].v.push(reissued(subscriber));
+	return handle;
+}
+function $k(self, subscriber) {
+	return $l(self, subscriber);
+}
+function $i(self) {
+	return [ () => {
+		return $j(self);
+	}, (subscriber) => {
+		return $k(self, subscriber);
+	}, () => {
+		return;
+	} ];
+}
+function $h(flow) {
+	const instance = $i(__clone(flow));
+	const value = instance[0]();
+	instance[2]();
+	return value;
+}
 function $g(self, source) {
-	self[3].v = $h(source);
+	self[3].v = $h(__clone(source));
 	self[2].v = [  ];
 	return __clone(self);
 }
-function $j(source, key, render2) {
+function $n(source, key, render2) {
 	return [ __clone(source), key, render2 ];
 }
-function $p(self, content) {
-	place(content, self[0]);
+function $t(self, content) {
+	place(__clone(content), self[0]);
 	return [  ];
 }
-function $q(owner, body) {
+function $u(owner, body) {
 	return body(owner);
 }
-function $m(parent, source, key, render2) {
+function $q(parent, source, key, render2) {
 	const region = open(parent);
-	const items = $h(source);
+	const items = $j(source);
 	for (const item of items) {
 		const owner = new2();
-		$q(owner, ($o) => {
-			return $p(region, render2(item, $o));
+		$u(owner, ($s) => {
+			return $t(region, render2(item, $s));
 		});
 	}
 }
-function $l(self, parent) {
-	$m(parent, self[0], self[1], self[2]);
+function $p(self, parent) {
+	$q(parent, self[0], self[1], self[2]);
 }
-function $k(self, content) {
-	$l(content, self);
+function $o(self, content) {
+	$p(__clone(content), self);
 	return __clone(self);
 }
-function $u(self, name2, value) {
-	apply(value, self, name2);
+function $y(self, name2, value) {
+	apply(__clone(value), self, name2);
 	return __clone(self);
 }
-function $v(source, render2) {
+function $z(source, render2) {
 	return [ __clone(source), render2 ];
 }
-function $y(parent, source, render2) {
+function $G(self, subscriber) {
+	return $l(self, subscriber);
+}
+function $E(self) {
+	return [ () => {
+		return $j(self);
+	}, (subscriber) => {
+		return $G(self, subscriber);
+	}, () => {
+		return;
+	} ];
+}
+function $D(flow) {
+	const instance = $E(__clone(flow));
+	const value = instance[0]();
+	instance[2]();
+	return value;
+}
+function $C(parent, source, render2) {
 	const region = open(parent);
-	const value = $h(source);
+	const value = $D(__clone(source));
 	const owner = new2();
-	$q(owner, ($A) => {
-		return $p(region, render2(value, $A));
+	$u(owner, ($I) => {
+		return $t(region, render2(value, $I));
 	});
 }
-function $x(self, parent) {
-	$y(parent, self[0], self[1]);
+function $B(self, parent) {
+	$C(parent, __clone(self[0]), self[1]);
 }
-function $w(self, content) {
-	$x(content, self);
+function $A(self, content) {
+	$B(__clone(content), self);
 	return __clone(self);
-}
-function $B(self, content) {
-	place(content, self);
-	return __clone(self);
-}
-function $H(self, parent, name2) {
-	set_attribute(parent[1], name2, $h(self));
-}
-function $G(self, name2, value) {
-	$H(value, self, name2);
-	return __clone(self);
-}
-function $I(self, content) {
-	place2(content, self);
-	return __clone(self);
-}
-function $K(self, parent) {
-	parent[2].v.push([ 1, $h(self) ]);
 }
 function $J(self, content) {
-	$K(content, self);
+	place(__clone(content), self);
 	return __clone(self);
 }
-function $L(self, content) {
-	place3(content, self);
+function $Q(flow, parent, name2) {
+	set_attribute(parent[1], name2, $h(__clone(flow)));
+}
+function $P(self, parent, name2) {
+	$Q(__clone(self), parent, name2);
+}
+function $O(self, name2, value) {
+	$P(__clone(value), self, name2);
 	return __clone(self);
 }
+function $R(self, content) {
+	place2(__clone(content), self);
+	return __clone(self);
+}
+function $U(flow, parent) {
+	parent[2].v.push([ 1, $h(__clone(flow)) ]);
+}
+function $T(self, parent) {
+	$U(__clone(self), parent);
+}
+function $S(self, content) {
+	$T(__clone(content), self);
+	return __clone(self);
+}
+function $V(self, content) {
+	place3(__clone(content), self);
+	return __clone(self);
+}
+const no_cleanups = __shared_new([  ]);
 const title = $a("Tasks <live>");
 const todos = $c([ "alpha", "beta & gamma" ]);
 const page = $c([ 1 ]);
 console.log(render(app(title, todos, page)));
 console.log(render(text(view("p"), "<script>alert(\"&\")</script>")));
-console.log(render($u($u(view("img"), "src", "/logo.png"), "alt", "a & b")));
-console.log(render($B($u(view("svg"), "viewBox", "0 0 24 24"), $u(view("path"), "d", "M5 12h14"))));
+console.log(render($y($y(view("img"), "src", "/logo.png"), "alt", "a & b")));
+console.log(render($J($y(view("svg"), "viewBox", "0 0 24 24"), $y(view("path"), "d", "M5 12h14"))));
 const name = $a("world & <you>");
-const mixed = $J($I($B($I($G(view("p"), "data-live", $a("a \"quoted\" & value")), "Take "), text(view("code"), "vilan upgrade")), " & enjoy. "), name);
+const mixed = $S($R($J($R($O(view("p"), "data-live", $a("a \"quoted\" & value")), "Take "), text(view("code"), "vilan upgrade")), " & enjoy. "), name);
 console.log(render(mixed));
 const pair = [ text(view("i"), "a"), text(view("b"), "b") ];
-console.log(render($L(view("p"), pair)));
-console.log(render(text($I(view("p"), "gone"), "kept")));
+console.log(render($V(view("p"), pair)));
+console.log(render(text($R(view("p"), "gone"), "kept")));

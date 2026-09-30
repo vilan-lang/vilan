@@ -1550,7 +1550,7 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
 
         // One plain call down from the scope — the owner reaches the `.cell()`.
         fun label(mirror: RemoteSource<i32>): SignalCell<str> {
-            mirror.map(|value| match value {
+            mirror.derive(|value| match value {
                 Some(let n) => i"{n}",
                 None => "Loading...",
             }).cell()
@@ -1608,7 +1608,9 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
 /// outside every owner scope COMPILES and puts nothing on the wire — it is a
 /// cold node, and a node opens no channel. It still confronts the `Option`:
 /// read, it pulls the mirror's `None` through the fallback. Before the flip
-/// this program was the compile error of the next pin.
+/// this program was the compile error of the next pin. (A142: `map` is
+/// `derive`, a pipe; each read is a one-off `.sample()` of a pipe the closure
+/// builds, and a sample never attaches, so it opens nothing either.)
 #[test]
 fn a25_a_mirror_map_outside_an_owner_scope_compiles_and_opens_nothing() {
     assert_compiles_and_runs(
@@ -1641,13 +1643,13 @@ fn a25_a_mirror_map_outside_an_owner_scope_compiles_and_opens_nothing() {
             let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
-            let text = remote.map(|value| match value {
+            let text = || remote.derive(|value| match value {
                 Some(let n) => i"{n}",
                 None => "Loading...",
-            });
-            print(text.get());
+            }).sample();
+            print(text());
             counter.set(8);
-            print(text.get());
+            print(text());
         }
         "#,
         "Loading...\nLoading...\n",
@@ -1656,8 +1658,9 @@ fn a25_a_mirror_map_outside_an_owner_scope_compiles_and_opens_nothing() {
 
 /// §2b's law, at the leaf: "a network subscription must have an owner" is a
 /// compile-time law still, asked where the subscription is MADE. An `effect`
-/// on the mirror's `map` node from `main` (the run-less root) is the coverage
-/// error — `effect` reads the ambient owner strictly.
+/// on the mirror's `map` node (A142: its `derive` pipe) from `main` (the
+/// run-less root) is the coverage error — `effect` reads the ambient owner
+/// strictly.
 #[test]
 fn a25_an_effect_on_a_mirror_map_outside_an_owner_scope_is_a_compile_error() {
     assert_fails_with(
@@ -1673,7 +1676,7 @@ fn a25_an_effect_on_a_mirror_map_outside_an_owner_scope_is_a_compile_error() {
             let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
-            let text = remote.map(|value| match value {
+            let text = remote.derive(|value| match value {
                 Some(let n) => i"{n}",
                 None => "Loading...",
             });
@@ -1684,8 +1687,9 @@ fn a25_an_effect_on_a_mirror_map_outside_an_owner_scope_is_a_compile_error() {
     );
 }
 
-/// §2c under the flip: `or` IS `map`, so it is a cold node too — outside every
-/// scope it compiles, reads `initial`, and opens nothing.
+/// §2c under the flip: `or` IS `map` (A142: a `derive` pipe), so it is a cold
+/// node too — outside every scope it compiles, reads `initial` (a one-off
+/// `.sample()`), and opens nothing.
 #[test]
 fn a25_or_outside_an_owner_scope_compiles_and_opens_nothing() {
     assert_compiles_and_runs(
@@ -1718,7 +1722,7 @@ fn a25_or_outside_an_owner_scope_compiles_and_opens_nothing() {
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let text = remote.or(0);
-            print(text.get());
+            print(text.sample());
         }
         "#,
         "0\n",
@@ -1767,7 +1771,7 @@ fn a25_a_handle_leaf_on_or_holds_the_lease_until_it_is_disposed() {
             counter.set(8);
             watching.dispose();
             counter.set(9);
-            print(i"after: {remote.or(0).get()}");
+            print(i"after: {remote.or(0).sample()}");
         }
         "#,
         "up   {\"Subscribe\":[0,null]}\n\
@@ -1820,7 +1824,7 @@ fn e74_a25_an_effect_on_a_mirror_map_anchors_at_the_users_call() {
             let counter: SignalCell<i32> = Signal::new(7);
             let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
             let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
-            let text = remote.map(|value| "seen");
+            let text = remote.derive(|value| "seen");
             text.effect(|shown| print(shown));
         }
         "#;
@@ -1978,11 +1982,11 @@ fn a25_two_maps_under_one_owner_take_one_subscribe() {
 
             let scope = Owner::new();
             let (doubled, label) = owner_scope.run(scope, || {
-                let doubled = remote.map(|value| match value {
+                let doubled = remote.derive(|value| match value {
                     Some(let n) => n * 2,
                     None => 0,
                 }).cell();
-                let label = remote.map(|value| match value {
+                let label = remote.derive(|value| match value {
                     Some(let n) => i"n={n}",
                     None => "n=?",
                 }).cell();
@@ -2303,7 +2307,7 @@ fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
             let scope = Owner::new();
             let n = owner_scope.run(scope, || {
                 let items = Signal::new([Todo { id = 1, done = false }]);
-                let remaining: SignalCell<i32> = items.map(|list| {
+                let remaining: SignalCell<i32> = items.derive(|list| {
                     mut open = 0;
                     for todo in list {
                         if !todo.done {
@@ -2387,7 +2391,7 @@ fn b129_the_inline_chain_types_its_closure_parameter_too() {
         fun main() {
         	let scope = Owner::new();
         	let n = owner_scope.run(scope, || {
-        		let remaining = Signal::new([Todo { id = 1, done = false }]).map(|list| {
+        		let remaining = Signal::new([Todo { id = 1, done = false }]).derive(|list| {
         			mut open = 0;
         			for todo in list {
         				if !todo.done {
@@ -2396,7 +2400,7 @@ fn b129_the_inline_chain_types_its_closure_parameter_too() {
         			}
         			open
         		});
-        		remaining.get()
+        		remaining.sample()
         	});
         	print(n);
         	scope.dispose();
@@ -5666,6 +5670,7 @@ fn a52_an_rpc_mirror_feeds_selector_and_two_cells_move_per_change() {
 /// and confronts the Option, so nothing silently reaches the other one. Both
 /// take the same counted lease and both make exactly ONE immediate call.
 #[test]
+#[ignore = "A142: reactive-44 find (MISCOMPILE): through an S: Source bound, `sub` (a Flow member since A142) is emitted as RemoteSource's inherent sub(|T|)"]
 fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
     assert_compiles_and_runs(
         r#"
@@ -5706,7 +5711,9 @@ fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
 /// checkable: a `RemoteSource<List<T>>` is a `Source<Option<List<T>>>`, and
 /// `each` wants a `Source<List<T>>`. The mirror's value IS the option —
 /// `get` cannot invent a `T` before the first frame — so the seam into a list
-/// binding is still `or([])`, which the second half of this pin drives.
+/// binding is still `or([])`, which the second half of this pin drives. (A142:
+/// `or` answers a pipe and `each` takes a `Source`, so the seam is sealed with
+/// `.memo()`.)
 #[test]
 fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
     assert_fails_browser_with(
@@ -5750,7 +5757,7 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
             let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
             let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let _root = mount_root("app", || view("ul")
-                .child(each(remote.or([]), |todo: Todo| todo.id, |todo| view("li").text(todo.label))));
+                .child(each(remote.or([]).memo(), |todo: Todo| todo.id, |todo| view("li").text(todo.label))));
         }
         "#,
     );

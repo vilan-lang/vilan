@@ -1843,7 +1843,7 @@ fn owner_take_disposes_a_mapped_and_a_root_subscription() {
         fun main() {
             let owner = Owner::new();
             let count = Signal::new(0);
-            let doubled = count.map(|n| n * 2);
+            let doubled = count.derive(|n| n * 2);
             owner.take(doubled.sub(|n| print(i"a={n}")));   // mapped/late site
             owner.take(count.sub(|n| print(i"b={n}")));     // root/early site
             count.set(1);       // a=2, b=1
@@ -1881,25 +1881,26 @@ fn lone_set_notifies_synchronously() {
 fn batch_commits_value_immediately_but_defers_notification() {
     // Inside a `batch`, a root's value is committed at once (`s.get()` is
     // fresh), and what is DEFERRED is the notification, not the value. Re-derived
-    // at A124 S2c: a cold derivation (`map`) stores nothing, so a read inside
-    // the batch PULLS the committed root and is fresh too (`doubled=10` — the
-    // pre-flip pin read `doubled=0`, when `map` answered a cell); the stale
-    // mid-batch read is now what a CACHED derivation shows — `.cell()` is
-    // settled by the notification the batch defers (`cached=0`), and reads the
-    // settled value after the flush. One program, both halves of the claim.
+    // at A124 S2c: a cold derivation stores nothing, so a read inside the batch
+    // PULLS the committed root and is fresh too (`doubled=10` — the pre-flip pin
+    // read `doubled=0`, when `map` answered a cell); the stale mid-batch read is
+    // now what a CACHED derivation shows — `.cell()` is settled by the
+    // notification the batch defers (`cached=0`), and reads the settled value
+    // after the flush. One program, both halves of the claim. (A142: a `derive`
+    // pipe has no `get` and one consumer, so the fresh read is a one-off
+    // `.sample()` of its own pipe, and the cached half seals another.)
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source, batch };
         fun main() {
             let s = Signal::new(0);
-            let doubled = s.map(|n| n * 2);
-            let cached = doubled.cell();
+            let cached = s.derive(|n| n * 2).cell();
             batch(|| {
                 s.set(5);
-                print(i"in-batch s={s.get()} doubled={doubled.get()} cached={cached.get()}");
+                print(i"in-batch s={s.get()} doubled={s.derive(|n| n * 2).sample()} cached={cached.get()}");
             });
-            print(i"after doubled={doubled.get()} cached={cached.get()}");
+            print(i"after doubled={s.derive(|n| n * 2).sample()} cached={cached.get()}");
         }
         "#,
         "in-batch s=5 doubled=10 cached=0\nafter doubled=10 cached=10\n",
@@ -1967,8 +1968,8 @@ fn batch_cascade_settles_in_one_flush() {
         import std::reactive::{ Signal, SignalCell, batch };
         fun main() {
             let a = Signal::new(1);
-            let b = a.map(|n| n + 1);      // b = a + 1
-            let c = b.map(|n| n * 10);     // c = b * 10
+            let b = a.derive(|n| n + 1);      // b = a + 1
+            let c = b.derive(|n| n * 10);     // c = b * 10
             let _ = c.sub(|v| print(i"c={v}"));   // immediate: c=20
             batch(|| { a.set(5); });               // a=5 -> b=6 -> c=60
         }
@@ -2630,12 +2631,12 @@ fn expose_accepts_a_users_own_source_impl() {
     // the `Source` impl, so it is Wire-checked exactly as the cell's is.
     assert_compiles(
         r#"
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         struct Session {
             [expose] status: Stored<str>,
@@ -2651,13 +2652,13 @@ fn expose_rejects_a_users_source_over_a_non_wire_element() {
     // exposed did not widen what may cross the wire.
     assert_fails_with(
         r#"
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         struct Password { hash: str }
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         struct Session {
             [expose] secret: Stored<Password>,
@@ -6288,7 +6289,7 @@ fn b225_the_kolt_shape_two_fields_of_one_parameter_in_the_subjects_own_impl() {
         struct Searchable<T> { list: SignalCell<List<T>>, table: SignalCell<List<T>> }
         impl Searchable<type T> {
             fun new(list: SignalCell<List<T>>, key: sync |T| str) {
-                Searchable { table = list.map(|l| l.map(|x| key(x).to_lowercase())).cell(), list }
+                Searchable { table = list.derive(|l| l.map(|x| key(x).to_lowercase())).cell(), list }
             }
         }
         fun main() {
@@ -8730,8 +8731,8 @@ fn b372_signal_new_in_a_closures_return_binds_its_parameter_from_the_argument() 
 
         fun main() {
             let n = Signal::new(1);
-            let inner = n.map(|m| Signal::new(m * 2));
-            print(inner.get().get());
+            let inner = n.derive(|m| Signal::new(m * 2));
+            print(inner.sample().get());
         }
         "#,
         "2\n",
@@ -8803,8 +8804,8 @@ fn b372_the_same_through_combine_and_a_destructured_parameter() {
         fun main() {
             let a = Signal::new(1);
             let b = Signal::new(10);
-            let summed = combine((a, b)).map(|(x, y)| Signal::new(x + y));
-            print(summed.get().get());
+            let summed = combine((a, b)).derive(|(x, y)| Signal::new(x + y));
+            print(summed.sample().get());
         }
         "#,
         "11\n",
@@ -8982,7 +8983,8 @@ fn b403_a_bare_static_bound_by_its_arguments_or_its_return_compiles() {
 
 /// `let (x, y) = pair` inside `|pair| ..` waits for the call to fill `pair`
 /// (B185's rule, at a destructure) — typed as it stood, both names bound
-/// `Unknown` and the blanket `map`'s `U` stayed open.
+/// `Unknown` and the blanket `map`'s `U` stayed open. (A142: `map` is
+/// `Flow::derive`, and the pipe is read once with `.sample()`.)
 #[test]
 fn b427_a_destructured_closure_parameter_types_the_closure_tail() {
     assert_compiles_and_runs(
@@ -8992,11 +8994,11 @@ fn b427_a_destructured_closure_parameter_types_the_closure_tail() {
             "fun main() {\n",
             "\tlet a = Signal::new(1);\n",
             "\tlet b = Signal::new(2);\n",
-            "\tlet sum = combine((a, b)).map(|pair| { let (x, y) = pair; x + y });\n",
-            "\tprint(sum.get());\n",
+            "\tlet sum = combine((a, b)).derive(|pair| { let (x, y) = pair; x + y });\n",
+            "\tprint(sum.sample());\n",
             "\tlet p = Signal::new((3, 4));\n",
-            "\tlet q = p.map(|pair| { let (x, y) = pair; x * y });\n",
-            "\tprint(q.get());\n",
+            "\tlet q = p.derive(|pair| { let (x, y) = pair; x * y });\n",
+            "\tprint(q.sample());\n",
             "}\n",
         ),
         "3\n12\n",
@@ -9108,9 +9110,9 @@ fn b434_and_then_over_a_constructed_cell_binds_its_value_type() {
         import std::reactive::SignalCell;
         fun main() {
             let maybe = SignalCell::new(Some(1));
-            let chained = maybe.and_then(|v| SignalCell::new(Some(v)));
+            let chained = maybe.and_then(|v| SignalCell::new(Some(v))).memo();
             print(chained.get().unwrap());
-            let computed = maybe.and_then(|v| SignalCell::new(Some(v + 10)));
+            let computed = maybe.and_then(|v| SignalCell::new(Some(v + 10))).memo();
             print(computed.get().unwrap());
         }
         "#,

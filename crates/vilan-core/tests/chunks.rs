@@ -167,7 +167,7 @@ fun fallback_page(): View {
 }
 
 fun main() {
-    let route = current_path().map(parse);
+    let route = current_path().derive(|path| parse(path)).memo();
     mount_root("app", || {
         view("div").child(swap(route, |current| match current {
             Route::Home => home_page(),
@@ -221,7 +221,7 @@ fun left_pane(): View { view("p").child("left") }
 fun right_pane(): View { view("p").child("right") }
 
 fun main() {
-    let route = current_path().map(parse);
+    let route = current_path().derive(|path| parse(path)).memo();
     let tab = Signal::new(Tab::Left);
     mount_root("app", || {
         view("div")
@@ -349,7 +349,7 @@ fun docs_plus(page: i32): i32 {
 }
 
 fun main() {
-    let route = current_path().map(parse);
+    let route = current_path().derive(|path| parse(path)).memo();
     mount_root("app", || {
         view("div").child(swap(route, |current| match current {
             Route::Home => home_page(),

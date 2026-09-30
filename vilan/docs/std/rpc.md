@@ -45,15 +45,17 @@ struct RemoteSource<T> { … }
 impl RemoteSource<type T> with Source<Option<T>> {
 	fun get(self): Option<T>                              // passive: the cache, `None` before the first update
 	[must_use]
-	fun on_change(self, observer: |Option<T>| void): Subscription    // counted, lazy: no immediate call
+	fun on_settle(self, subscriber: Subscriber): Subscription       // counted: attach, then lease
 	[must_use]
-	fun sub(self, observer: |Option<T>| void): Subscription          // counted, eager: one immediate call
-	fun effect(self, observer: |Option<T>| void)                     // counted, eager, owner-scoped
+	fun attach_observer(self, observer: |Option<T>| void, immediately: bool): Subscription
+	                                                      // counted; eager = lease first, one immediate call
 }
+// Through `Flow` (every source is one): `on_change` (counted, lazy), `sub`
+// (counted, eager), `effect` (counted, eager, owner-scoped), `derive`, …
 
 impl RemoteSource<type T> {
 	fun status(self): SignalCell<Status>                      // passive: what the mirror was last told
-	fun or(self, initial: T): Map<RemoteSource<T>, Option<T>, T>   // a cold node: `initial` until the first update
+	fun or(self, initial: T): Derive<RemoteSource<T>, Option<T>, T>   // a pipe: `initial` until the first update
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
 }
@@ -137,16 +139,17 @@ struct KeyedSource<K, T> { … }
 impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
 	fun get(self): Option<List<T>>                            // passive: what this client subscribed to
 	[must_use]
-	fun on_change(self, observer: |Option<List<T>>| void): Subscription   // counted, lazy
+	fun on_settle(self, subscriber: Subscriber): Subscription           // counted: attach, then lease
 	[must_use]
-	fun sub(self, observer: |Option<List<T>>| void): Subscription         // counted, eager
-	fun effect(self, observer: |Option<List<T>>| void)                    // counted, eager, owner-scoped
+	fun attach_observer(self, observer: |Option<List<T>>| void, immediately: bool): Subscription
 }
+// Through `Flow`: `on_change` (counted, lazy), `sub` (counted, eager), `effect`
+// (counted, eager, owner-scoped), `derive`, …
 
 impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun status(self): SignalCell<Status>                      // passive: `Waiting` until the first patch
 	fun fault(self): Option<str>                              // passive: the first protocol fault, sticky
-	fun or(self, initial: List<T>): Map<KeyedSource<K, T>, Option<List<T>>, List<T>>   // a cold node: the whole collection
+	fun or(self, initial: List<T>): Derive<KeyedSource<K, T>, Option<List<T>>, List<T>>   // a pipe: the whole collection
 	[must_use]
 	fun sub(self, observer: |List<T>| void): Subscription     // counted, manual: the whole collection
 	fun of(self, key: K): SignalCell<Option<T>>               // counted per KEY, owner-scoped
@@ -224,7 +227,7 @@ impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 	fun get(self): List<T>
 	[must_use]
-	fun on_change(self, observer: |List<T>| void): Subscription
+	fun on_settle(self, subscriber: Subscriber): Subscription
 }
 ```
 

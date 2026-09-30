@@ -288,7 +288,7 @@ updates. That's it.
 Three patterns follow from it:
 
 - **Derive views locally.** Expose one `tasks` list and let each page
-  `map` it down (filter by workspace, sort by date). Don't add an rpc
+  `derive` it down (filter by workspace, sort by date). Don't add an rpc
   per view.
 - **Mutate via rpc, observe via mirror.** Your create/delete handlers
   write the server signal. The confirmation the user sees is their own
@@ -304,15 +304,15 @@ A mirror is a `RemoteSource<T>`, not a `SignalCell<T>`, for one honest
 reason: before the first update lands it has **no value**, and nothing
 about the type pretends otherwise. You read it one of four ways:
 
-- `mirror.or(initial)` — the common one, for a view. A source you hand
-  to `each`, `bind_text`, or a `{…}` hole: `initial` until the first sync,
-  the mirrored value after. It is a cold node — building it opens nothing —
-  and the view that places it is what **subscribes**: that opens the
-  channel, and it is released when the view is unmounted.
-- `mirror.map(|value| …)` — the same, with the `Option<T>` in your hands
+- `mirror.or(initial)` — the common one, for a view. A pipe you hand to
+  `bind_text` or a `{…}` hole (seal it with `.memo()` for `each`, which takes a
+  source): `initial` until the first sync, the mirrored value after. Building
+  it opens nothing, and the view that consumes it is what **subscribes**: that
+  opens the channel, and it is released when the view is unmounted.
+- `mirror.derive(|value| …)` — the same, with the `Option<T>` in your hands
   once, which is where a fallback of a *different* type belongs
-  (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for the
-  same-type case. Add `.cell()` where one value is read in several places.
+  (`"loading…"` from a `RemoteSource<i32>`). `or` is `derive` for the
+  same-type case. Seal with `.memo()` where one value is read in several places.
 - `mirror.sub(|value| …): Subscription` — the manual form: an observer
   of present values, and a handle you dispose yourself. For code with no
   view and no owner (a probe, a script).
@@ -330,10 +330,9 @@ holds; a `RemoteSource<List<Note>>` is therefore *not* a `Source<List<Note>>`,
 and `each` still takes `mirror.or([])` rather than the mirror. `sub` has
 one spelling per view of the value: `mirror.sub(|note| …)` is the inherent
 present-only one above, and the trait's `sub` — reached through a generic
-receiver — hands you the `Option<T>`. `map` and `or` stay inherent, which is
-what keeps their stricter law (a mirror derivation *must* have an owner) on a
-concrete receiver; a generic `S: Source<…>` calling `.map` gets the trait's
-owner-optional default.
+receiver — hands you the `Option<T>`. A derivation over a mirror is an ordinary
+pipe: it leases nothing until it is consumed, and the consumer's lease is the
+one the owner rule is asked of.
 
 ```vilan,browser
 import std::json::json_codec;
@@ -359,7 +358,7 @@ fun notes_panel(client: NotesClient<SocketTransport>): View {
 	// Counted, and released when this view is unmounted: the channel is
 	// open while — and only while — the panel is showing. `[]` until the
 	// first sync; the empty list takes its element type from the mirror.
-	let entries = client.entries.or([]);
+	let entries = client.entries.or([]).memo();
 	view("ul").child(each(entries, |note| note.id, |note| view("li").text(note.text)))
 }
 
@@ -373,16 +372,16 @@ async fun main() {
 }
 ```
 
-**Subscription follows demand.** Every subscribing leaf — a binding, an
-`each`, an `effect`, a `.cell()`, a `sub` — takes a counted lease on the
-channel, whether it sits on the mirror or on an `or`/`map` over it: the
+**Subscription follows demand.** Every consumer — a binding, an `each`, an
+`effect`, a `.memo()`, a `sub` — takes a counted lease on the channel, whether
+it sits on the mirror or on an `or`/`derive` over it: the
 first one sends `Subscribe`, the last release sends `Unsubscribe`
 (deferred to the end of the turn, so a view that re-renders in place
 churns nothing). Ten bindings on one mirror cost one channel; unmounting
 the page closes it. The owner is asked where the lease is taken: an
 `effect` on a mirror (or on its `or`) needs an ambient owner (inside a
 view, or under `run_with_owner`) — a network subscription with nobody to
-release it is a compile error, not a slow leak — and a `.cell()` ties its
+release it is a compile error, not a slow leak — and a `.memo()` ties its
 lease to the owner that is ambient.
 
 One sentence to keep in mind: **`status` reports; it does not ask.** A
@@ -445,14 +444,14 @@ impl Chat {
 // At the client — no await, one mirror, read like any other:
 let ids = client.get_messages("general", 100)!;
 let body = client.get_message(ids[3]);
-view("p").bind_text(body.map(|value| match value {
+view("p").bind_text(body.derive(|value| match value {
 	Some(let message) => message.body,
 	None => "loading…",
 }))
 ```
 
 Everything you already know about a mirror applies to this one: it is a
-`RemoteSource<T>`, you read it with `or` / `map` / `sub` / `get` /
+`RemoteSource<T>`, you read it with `or` / `derive` / `sub` / `get` /
 `status`, and **subscription follows demand**. That last rule is what
 makes the shape affordable — a hundred handles held and ten watched is
 **ten calls and ten forwards**, and the other ninety are free.
@@ -484,24 +483,25 @@ The server collapses the *channel* the same way underneath: a reply
 carrying a source it has already exported answers the channel it
 already minted, and withdraws it only when the last mirror lets go.
 
-That is what makes a stub safe inside a **cold select**. A node like
-`and_then` runs its select on every *read*, so a select that called a
-stub used to mint a fresh mirror per read — the `.cell()` below leased
-one mirror and refreshed from another, and read `[]` forever:
+That is what makes a stub safe inside a **selector**. Under A124's cold
+nodes `and_then` ran its select on every *read*, so a select that called a
+stub minted a fresh mirror per read — a `.cell()` leased one mirror and
+refreshed from another, and read `[]` forever. A pipe's selector runs once per
+change of its input, inside its one instance, and with the per-origin table
+every call answers the SAME mirror besides:
 
 ```vilan,fragment
-// The select runs on every pull; with the per-origin table every pull
-// answers the SAME mirror, so the cell reads what its lease is fed.
-let channels: SignalCell<List<i32>> = client_cell
+let channels: MemoCell<List<i32>> = client_cell
 	.and_then(|client| client.get_channels())
-	.map(|ids| ids.unwrap_or_default())
-	.cell();
+	.derive(|ids| ids.unwrap_or_default())
+	.memo();
 ```
 
 A [`Memo`](../std/collections.md#memokv) is no longer needed to get one
 handle per id; reach for one when you want to keep something *built
 over* the handle — and then what the maker builds outlives the caller,
-so a derivation in a maker is `.cell_global()`, never `.cell()`.
+so a derivation in a maker is `.memo_global()` (`.cell_global()` for a
+handle), never `.memo()`.
 
 **The element must be Wire, not the source.** The `SignalCell` never
 crosses; its values do, one `Update` frame at a time. So the Wire rule
@@ -542,7 +542,7 @@ method, not a handle.)
 **Return a cell that outlives the call.** The server dedups a reply by
 the *cell* it carries, so a getter that answers a cell the service keeps
 — a field, a row's cell — is one channel however often it is asked. A
-body that ends in `.map(..).cell()` mints a fresh cell per call instead:
+body that ends in `.derive(..).cell()` mints a fresh cell per call instead:
 the dedup never hits (one capability and one forward per call), and the
 compiler warns at that `.cell()`. Every handler runs under its
 **connection's owner**, so such a cell's subscription is released when
@@ -554,7 +554,7 @@ but the fix is to keep the derived cell, keyed by the arguments, in a
 ```vilan,fragment
 [rpc]
 fun get_channel_ids(self): SignalCell<List<i32>> {
-	self.derived.get_or_insert("ids", || self.channels.map(|all| all.keys()).cell_global())
+	self.derived.get_or_insert("ids", || self.channels.derive(|all| all.keys()).cell_global())
 }
 ```
 
@@ -750,7 +750,7 @@ fun message_row(client: ChatClient<SocketTransport>, id: str): View {
 	// server forwards that message's changes and nothing else. Released
 	// when the row unmounts, like any other lease.
 	let message = client.messages.of(id);
-	view("li").bind_text(message.map(|held| match held {
+	view("li").bind_text(message.derive(|held| match held {
 		Some(let found) => found.body,
 		None => "…",
 	}))
@@ -839,7 +839,7 @@ First, a signal you can bind a banner to:
 ```vilan,fragment
 let state = client.transport.connection_state();
 view("p").text("reconnecting…")
-	.show(state.map(|current| current == ConnectionState::Reconnecting))
+	.show(state.derive(|current| current == ConnectionState::Reconnecting))
 ```
 
 Second, explicit call failures. A call in flight when the connection drops

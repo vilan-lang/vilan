@@ -334,11 +334,11 @@ derivation built in a maker is `.cell_global()`, and a lease (`.cell()`,
 // takes its own lease, released with the view.
 let bodies: Memo<str, SignalCell<Option<RemoteSource<MessageBody>>>> = Memo::new();
 
-fun body_of(id: str): SignalCell<Option<MessageBody>> {
+fun body_of(id: str): MemoCell<Option<MessageBody>> {
 	bodies
-		.get_or_insert(id, || client_cell().map(|client| client.map(|c| c.get_message(id))).cell_global())
+		.get_or_insert(id, || client_cell().derive(|client| client.map(|c| c.get_message(id))).cell_global())
 		.and_then(|mirror| mirror)
-		.cell()
+		.memo()
 }
 ```
 

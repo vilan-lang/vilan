@@ -97,6 +97,15 @@ external fun __nursery_new(parent: Option<Nursery>): Nursery;
 [extern("__nursery_run")]
 async external fun __nursery_run<T>(n: Nursery, body: async || T): T;
 
+/// A fresh DETACHED nursery, as a value: never joined, and cancelled by whoever
+/// holds it — `OwnedNursery`'s, without the resource. What a pipe run owns its
+/// tasks through (A142 §4.1): the run's owner holds it and cancels it when the run
+/// is released.
+export [internal("a pipe run's nursery (A142 §4.1); an application owns tasks with `nursery` or `OwnedNursery`")]
+fun detached_nursery(): Nursery {
+	__nursery_new_detached()
+}
+
 /// Run `body` with a nursery: every task spawned in its dynamic extent — directly
 /// or by anything it calls — is joined before `nursery` returns. The nursery's
 /// value is the body's value; it returns only when the body AND every spawned task

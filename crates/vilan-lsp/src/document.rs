@@ -16168,19 +16168,20 @@ pub(crate) mod tests {
 
     #[test]
     fn e206_a_trait_default_renders_under_the_receivers_arguments() {
-        // `Source<T>::map` is a trait DEFAULT: the substitution comes from the
-        // receiver's own arguments rather than from the callee's list, which is
-        // the third of the three ways a signature can be generic at a site (the
-        // other two — a function's own `<T>` and an impl's binders — are pinned
-        // above).
+        // `Pipe<T>::memo` is a trait DEFAULT (A142; `Source<T>::map` was the
+        // default this pinned before the pipe split): the substitution comes from
+        // the receiver's own arguments rather than from the callee's list, which
+        // is the third of the three ways a signature can be generic at a site
+        // (the other two — a function's own `<T>` and an impl's binders — are
+        // pinned above).
         let hover = hover_at_marker(
-            "import std::reactive::{ SignalCell, Source };\n\nfun main() {\n\tlet cell = SignalCell::new(2);\n\tlet _doubled = cell.map¦(|value: i32| value * 2);\n}\n",
+            "import std::reactive::{ SignalCell, Source };\n\nfun main() {\n\tlet cell = SignalCell::new(2);\n\tlet _doubled = cell.derive(|value: i32| value * 2).memo¦();\n}\n",
             '¦',
         )
         .expect("hover on the trait default");
-        assert!(hover.contains("fun map"), "{hover}");
+        assert!(hover.contains("fun memo"), "{hover}");
         assert!(
-            hover.matches("fun map").count() == 2,
+            hover.matches("fun memo").count() == 2,
             "a generic trait default at a call site shows both readings: {hover}"
         );
         assert!(

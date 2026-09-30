@@ -39,10 +39,12 @@ import pkg::reactive::{
 	Signal,
 	SignalCell,
 	Source,
+	Subscriber,
 	Subscription,
 	as_derivation,
 	defer_to_owner,
 	fresh_id,
+	mint_subscriber,
 	register_with_owner,
 };
 import pkg::set::Set;
@@ -941,9 +943,16 @@ export impl ListCell<type T> with Source<List<T>> {
 	/// is registered, so capturing it closed a loop under counting for every
 	/// observer a `ListCell` ever had.
 	[must_use]
-	fun on_change(self, observer: |List<T>| void): Subscription {
+	fun attach_observer(self, observer: |List<T>| void, immediately: bool): Subscription {
 		let items = self.items;
-		self.published.on_change(|_sequence| observer(items.read()))
+		self.published.attach_observer(|_sequence| observer(items.read()), immediately)
+	}
+
+	/// The published cell's list is where a consumer's subscriber goes: it is
+	/// notified exactly when the run changed, and the subscriber reads `get()`.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.published.on_settle(subscriber)
 	}
 }
 
@@ -1064,7 +1073,13 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	// notification, so a handler holding the source was a loop no count could
 	// collect.
 	let read = source.reader();
-	let _owned = register_with_owner(source.on_change(|_published| {
+	// A node's attach: `on_settle` with a subscriber of its own, since the handler
+	// reads the log and not the value. Not `on_change`: under this generic `S` the
+	// native backend does not bind `ListCell`'s parameter through the blanket
+	// `Flow`. Not `attach_observer`: through a SUBTRAIT bound a supertrait
+	// default's override is not dispatched (both backends), and `Source`'s default
+	// captures the source, the loop A132 took out (reactive-44's finds).
+	let _owned = register_with_owner(source.on_settle(mint_subscriber(|| {
 		for op in read(cursor) {
 			match op {
 				// The derivative of `map g`: what arrived, mapped. Nothing else is
@@ -1081,7 +1096,7 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 				SeqOp::Move(let from, let count, let to) => out.move_range(from, count, to),
 			}
 		}
-	}));
+	})));
 	defer_to_owner(|| source.drop_cursor(cursor));
 	out
 }

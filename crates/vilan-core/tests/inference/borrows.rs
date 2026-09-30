@@ -37,7 +37,7 @@ fn reactive_map_sub_and_set_with() {
         fun main() {
             let owner = Owner::new();
             let count = Signal::new(0);
-            let doubled = count.map(|n| n * 2);
+            let doubled = count.derive(|n| n * 2);
             owner.take(doubled.sub(|n| print(n)));
             count.set_with(|n| n + 1);
         }
@@ -223,7 +223,7 @@ fn generic_call_on_closure_parameter() {
         import std::display::Display;
         fun main() {
             let count = Signal::new(0);
-            let label = count.map(|n| n.to_string());
+            let label = count.derive(|n| n.to_string());
             label.sub(|s| print(s));
         }
         "#,
@@ -265,7 +265,7 @@ fn chained_derive_binds_method_generic_from_closure_return() {
         import std::display::format;
         fun main() {
             let count = Signal::new(3);
-            let label = count.map(|n| n * 2).map(|m| format(m));
+            let label = count.derive(|n| n * 2).derive(|m| format(m));
             label.sub(|s| print(s));
             count.set(10);
         }
@@ -290,7 +290,7 @@ fn format_in_closure_argument() {
         import std::display::format;
         fun main() {
             let count = Signal::new(0);
-            let label = count.map(|n| format(n));
+            let label = count.derive(|n| format(n));
             label.sub(|s| print(s));
             count.set(5);
         }
