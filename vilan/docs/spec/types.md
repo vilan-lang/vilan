@@ -1480,9 +1480,10 @@ in a struct field of its own. A resource with NO `Drop` inside has no
 teardown to dispatch, and may become the object of a trait declared
 `[resource]` (`[resource] trait Flow<T> { … }`): such a trait says its
 objects may hold a resource, so `dyn Flow<T>` — whatever landed in it, a
-data value included — is itself a resource, moved and never copied. A
-trait extending a `[resource]` trait has resource objects too, without
-repeating the attribute. Erasing a `Drop`-free resource into the object
+data value included — is itself a resource, moved and never copied. The
+attribute is the declaring trait's alone: a trait extending a
+`[resource]` trait has data objects unless it declares the attribute
+too. Erasing a `Drop`-free resource into the object
 of an undeclared trait is refused with the steer to declare it; `dyn` of
 an undeclared trait stays data. The rules hold at every instantiation: a
 generic parameter erased into an object (`fun erase<S: Src>(own source:

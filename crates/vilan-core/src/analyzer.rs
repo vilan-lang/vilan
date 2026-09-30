@@ -2285,8 +2285,8 @@ pub struct Trait<'src> {
     /// and their members are inherited for method resolution.
     pub supertraits: Vec<TypeId>,
     /// `[resource] trait` (B470, RULED 2026-09-29): this trait's objects may
-    /// hold a resource, so `dyn` of it — or of any trait that extends it — is
-    /// itself a resource (move-only).
+    /// hold a resource, so `dyn` of it is itself a resource (move-only). Not
+    /// inherited by subtraits.
     pub resource: bool,
 }
 
@@ -10640,9 +10640,9 @@ impl<'src> Analyzer<'src> {
                 //
                 // B470 narrows the enforcement: a `Drop`-free resource may be
                 // erased into the object of a trait DECLARED `[resource]`, and
-                // that object is then move-only — so a `dyn` of such a trait
-                // (or of one extending it) is a resource, whatever landed in
-                // it, and every other `dyn` stays data.
+                // that object is then move-only — so a `dyn` of such a trait is
+                // a resource, whatever landed in it, and every other `dyn`
+                // (a subtrait's included) stays data.
                 Type::Dyn(trait_id, _) => Members::Answer(self.trait_is_resource(*trait_id), true),
                 // Everything else is a non-value or a scalar: never a resource by
                 // containment.
@@ -49909,30 +49909,16 @@ impl<'src> Analyzer<'src> {
         )
     }
 
-    /// B470: whether `dyn` of this trait may hold a resource — the trait, or
-    /// one it extends, is declared `[resource]`. A trait extending a
-    /// `[resource]` trait need not repeat the attribute: its objects are
-    /// objects of the supertrait too.
+    /// B470: whether `dyn` of this trait may hold a resource — THIS trait is
+    /// declared `[resource]`. The attribute is not inherited: a subtrait's
+    /// objects are data unless it declares the attribute itself (A142's
+    /// `Source<T> with Flow<T>` keeps `dyn Source<T>` copyable while `Flow`
+    /// is `[resource]`), and a resource erased into an undeclared subtrait's
+    /// object is steered like any other.
     fn trait_is_resource(&self, trait_id: Id) -> bool {
-        let mut stack = vec![trait_id];
-        let mut seen: HashSet<Id> = HashSet::default();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let Some(trait_) = self.traits.get(&id) else {
-                continue;
-            };
-            if trait_.resource {
-                return true;
-            }
-            for supertrait in &trait_.supertraits {
-                if let Type::Trait(super_id, _) = self.borrow_type_by_type_id(*supertrait) {
-                    stack.push(*super_id);
-                }
-            }
-        }
-        false
+        self.traits
+            .get(&trait_id)
+            .is_some_and(|trait_| trait_.resource)
     }
 
     /// B431 — trait-objects.md §8.3's Q5 at monomorphisation. B412 erases the

@@ -1504,22 +1504,38 @@ fn b470_a_drop_free_resource_into_an_undeclared_traits_object_is_steered() {
 }
 
 #[test]
-fn b470_a_trait_extending_a_resource_trait_has_move_only_objects_too() {
+fn b470_the_attribute_is_the_declaring_traits_alone() {
+    // Not inherited (the integrator's correction, 2026-09-29): a subtrait of
+    // a `[resource]` trait has data objects unless it declares the attribute
+    // itself — its `dyn` copies freely, and cannot receive a resource.
+    let subtrait = r#"
+        trait Labelled with Run {
+            fun label(self): str;
+        }
+        impl Plain with Labelled {
+            fun label(self): str { "plain" }
+        }
+    "#;
+    assert_compiles_and_runs(
+        &b470_program(&format!(
+            "{subtrait}\nfun main() {{\n    let object: dyn Labelled = Plain {{ v = 2 }};\n    \
+             let first = object;\n    let second = object;\n    print(first.label() + second.label());\n}}\n"
+        )),
+        "plainplain\n",
+    );
+    assert_fails_with(
+        &b470_program(&format!(
+            "{subtrait}\nimpl Node with Labelled {{\n    fun label(self): str {{ \"node\" }}\n}}\n\
+             fun main() {{\n    let object: dyn Labelled = Node {{ v = 1 }};\n}}\n"
+        )),
+        "`Node` is a resource, so it can become a `dyn Labelled` only when `Labelled` is declared \
+         `[resource]`",
+    );
+    // The declared supertrait's object stays move-only.
     assert_fails_with(
         &b470_program(
-            r#"
-            trait Labelled with Run {
-                fun label(self): str;
-            }
-            impl Plain with Labelled {
-                fun label(self): str { "plain" }
-            }
-            fun main() {
-                let object: dyn Labelled = Plain { v = 2 };
-                let first = object;
-                let second = object;
-            }
-            "#,
+            "fun main() {\n    let object: dyn Run = Plain { v = 2 };\n    let first = object;\n    \
+             let second = object;\n}\n",
         ),
         "use of `object` after it was moved",
     );
