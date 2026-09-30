@@ -168,6 +168,7 @@ export fun fresh_id(): i32 {
 /// subscriber a pipe's consumer attaches through the pipe. That keeps this the one place the
 /// mark is spent, as `observe` was: an attach no longer mints, it pushes a record
 /// it was HANDED, so a leaf standing on three registrations spends the mark once.
+export [internal("a node author's subscriber mint (A110 door 2's mark spent here); an application attaches through `on_change`/`sub`")]
 fun mint_subscriber(notify: || void): Subscriber {
 	let derived = minting_derivation.read();
 	minting_derivation.write() = false;
@@ -943,14 +944,22 @@ export struct Owner {
 }
 
 /// The live epoch of an owner: its number, what it must release, and the nursery
-/// its tasks run in when it has one (a pipe run's, A142 §4.1). Both are `None`
-/// until something needs them.
+/// its tasks run in when it has one (a pipe run's, A142 §4.1). An epoch that has
+/// registered nothing holds the shared, never-pushed `no_cleanups` (`listed` is
+/// false) and no nursery; each is its own only once something needs it.
 export struct OwnerCell {
 	epoch: i32,
-	// Its own cell once allocated, so a registration pushes in place.
-	cleanups: Option<Shared<List<|| void>>>,
+	// Its own cell once `listed`, so a registration pushes in place. Not an
+	// `Option`: the native backend holds a closure list in a `Shared` but not an
+	// `Option` of one.
+	cleanups: Shared<List<|| void>>,
+	listed: bool,
 	nursery: Option<Nursery>,
 }
+
+/// The cleanup list of every epoch that has registered nothing. Never pushed to:
+/// `defer` gives an epoch a list of its own at its first registration.
+let no_cleanups: Shared<List<|| void>> = Shared::new([]);
 
 /// How many cleanup lists owners have allocated since the program started — the
 /// instrument behind "a run that registers nothing allocates no owner" (A142 §4.1).
@@ -965,7 +974,7 @@ fun owner_lists_allocated(): i32 {
 export impl Owner {
 	fun new(): Owner {
 		Owner {
-			cell = Shared::new(OwnerCell { epoch = 0, cleanups = None, nursery = None }),
+			cell = Shared::new(OwnerCell { epoch = 0, cleanups = no_cleanups, listed = false, nursery = None }),
 			epoch = 0,
 		}
 	}
@@ -997,12 +1006,17 @@ export impl Owner {
 		if self.is_disposed() {
 			cleanup();
 		} else {
-			match self.cell.read().cleanups {
-				Some(let list) => list.write().push(cleanup),
-				None => {
-					owner_lists_allocated_count.write() = owner_lists_allocated_count.read() + 1;
-					self.cell.write().cleanups = Some(Shared::new([cleanup]));
-				},
+			let held = self.cell.read();
+			if held.listed {
+				held.cleanups.write().push(cleanup);
+			} else {
+				owner_lists_allocated_count.write() = owner_lists_allocated_count.read() + 1;
+				self.cell.write() = OwnerCell {
+					epoch = held.epoch,
+					cleanups = Shared::new([cleanup]),
+					listed = true,
+					nursery = held.nursery,
+				};
 			}
 		}
 	}
@@ -1018,7 +1032,13 @@ export impl Owner {
 		live.dispose();
 		let next = self.cell.read().epoch;
 		if with_nursery {
-			self.cell.write().nursery = Some(detached_nursery());
+			let held = self.cell.read();
+			self.cell.write() = OwnerCell {
+				epoch = held.epoch,
+				cleanups = held.cleanups,
+				listed = held.listed,
+				nursery = Some(detached_nursery()),
+			};
 		}
 		Owner { cell = self.cell, epoch = next }
 	}
@@ -1045,7 +1065,8 @@ export impl Owner with Disposable {
 			let held = self.cell.read();
 			self.cell.write() = OwnerCell {
 				epoch = self.epoch + 1,
-				cleanups = None,
+				cleanups = no_cleanups,
+				listed = false,
 				nursery = None,
 			};
 			// Tasks first: a cancelled task's in-flight IO rejects at once, and a
@@ -1062,25 +1083,22 @@ export impl Owner with Disposable {
 			// and the first failure is raised after the group is released. Only the
 			// first: the later ones are the same event, and a `panic` takes one
 			// message.
-			match held.cleanups {
-				Some(let cleanups) => {
-					mut failure: Option<str> = None;
-					for cleanup in cleanups.read() {
-						match guarded(cleanup) {
-							Some(let message) => {
-								if failure.is_none() {
-									failure = Some(message);
-								}
-							},
-							None => {},
-						}
-					}
-					match failure {
-						Some(let message) => panic(message),
+			if held.listed {
+				mut failure: Option<str> = None;
+				for cleanup in held.cleanups.read() {
+					match guarded(cleanup) {
+						Some(let message) => {
+							if failure.is_none() {
+								failure = Some(message);
+							}
+						},
 						None => {},
 					}
-				},
-				None => {},
+				}
+				match failure {
+					Some(let message) => panic(message),
+					None => {},
+				}
 			}
 		}
 	}

@@ -2672,7 +2672,9 @@ const KOLT_LOWERING_PROBE: &str = concat!(
 /// rebuilds the bad half. Both refused at the Order 40 seal (`parameter 1 of
 /// map`; `a ? lift`); `reactive.vl`, `reactive-on-change.vl`,
 /// `reactive-flatten.vl` and `iterator-adapters.vl` flip with them, and two of
-/// those are in [`DEFAULT_SUITE`].
+/// those are in [`DEFAULT_SUITE`]. A142 S1 renamed `map` to `derive` and made
+/// the total join `switch(|inner| inner)`; the probes seal what they read with
+/// `.memo()`, since a pipe has no `get`.
 #[test]
 fn the_reactive_combinators_map_and_flatten_build_the_same_on_both_backends() {
     let staged = stage();
@@ -2710,9 +2712,9 @@ const CELL_CHAIN_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet count = SignalCell::new(1);\n",
-    "\tlet scaled = count.map(|n| n * 10).cell();\n",
-    "\tlet labelled = scaled.map(|n| i\"#{n}\").cell();\n",
-    "\tlet parity = count.map(|n| n % 2).distinct();\n",
+    "\tlet scaled = count.derive(|n| n * 10).memo();\n",
+    "\tlet labelled = scaled.derive(|n| i\"#{n}\").memo();\n",
+    "\tlet parity = count.derive(|n| n % 2).distinct().memo();\n",
     "\tmut changes = 0;\n",
     "\tlet _watch = parity.sub(|value| {\n",
     "\t\tchanges += 1;\n",
@@ -2733,9 +2735,9 @@ const MAP_PROBE: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet count = SignalCell::new(1);\n",
-    "\tlet scaled = count.map(|n| n * 10);\n",
-    "\tlet labelled = scaled.map(|n| i\"#{n}\");\n",
-    "\tlet halves = count.map(|n| n.as_f64() / 2.0);\n",
+    "\tlet scaled = count.derive(|n| n * 10).memo();\n",
+    "\tlet labelled = scaled.derive(|n| i\"#{n}\").memo();\n",
+    "\tlet halves = count.derive(|n| n.as_f64() / 2.0).memo();\n",
     "\tcount.set(4);\n",
     "\tlet now: i32 = scaled.get();\n",
     "\tlet label: str = labelled.get();\n",
@@ -2755,7 +2757,7 @@ const FLATTEN_PROBE: &str = concat!(
     "\tlet first = SignalCell::new(1);\n",
     "\tlet second = SignalCell::new(2);\n",
     "\tlet chosen = SignalCell::new(first);\n",
-    "\tlet joined = chosen.flatten();\n",
+    "\tlet joined = chosen.switch(|inner: SignalCell<i32>| inner).memo();\n",
     "\tfirst.set(10);\n",
     "\tchosen.set(second);\n",
     "\tsecond.set(20);\n",
@@ -4147,7 +4149,7 @@ const INTERPOLATE_PROBE: &str = concat!(
     "fun main() {\n",
     "\tlet count = SignalCell::new(1);\n",
     "\tshow(\"count\", count);\n",
-    "\tlet doubled = count.map(|n| n * 2);\n",
+    "\tlet doubled = count.derive(|n| n * 2).memo();\n",
     "\tcount.set(5);\n",
     "\tshow(\"doubled\", doubled);\n",
     "\tlet name = SignalCell::new(\"ada\");\n",
@@ -5352,7 +5354,7 @@ const COMBINE_TUPLE_ELEMENT_PROBE: &str = concat!(
     "fun main() {\n",
     "\tlet point = SignalCell::new((1, 2));\n",
     "\tlet label = SignalCell::new(\"c\");\n",
-    "\tlet both = combine((point, label));\n",
+    "\tlet both = combine((point, label)).memo();\n",
     "\tlet ((x, y), l) = both.get();\n",
     "\tprint(i\"{x} {y} {l}\");\n",
     "\tpoint.set((3, 4));\n",

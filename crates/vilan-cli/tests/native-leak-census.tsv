@@ -29,10 +29,10 @@ usize-literals	0	0
 unsigned-saturate	0	0
 bytes-aliasing	0	0
 delta-law	2842	0
-reactive-on-change	27	0
-reactive-flatten	8	0
+reactive-on-change	38	0
+reactive-flatten	39	0
 list-cell	2231	0
-reactive-selector	32	0
+reactive-selector	36	0
 f64-print-boundary	0	0
 non-bmp-string-length	0	0
-native_probe_board	13	0
+native_probe_board	17	0

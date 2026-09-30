@@ -94,6 +94,15 @@ impl ListCell<type T> with Source<List<T>> {
 	fun on_settle(self, subscriber: Subscriber): Subscription {
 		self.elements.on_settle(subscriber)
 	}
+
+	/// An observer rides the elements cell's own attach, so the closure it is
+	/// registered as holds that cell and not this handle: `Source`'s default
+	/// would capture the handle, whose `elements` list holds the closure (A132's
+	/// loop).
+	[must_use]
+	fun attach_observer(self, observer: |List<T>| void, immediately: bool): Subscription {
+		self.elements.attach_observer(observer, immediately)
+	}
 }
 
 /// The cell offers its log — which is all an operator needs from it.
@@ -231,7 +240,7 @@ fun map_each<S: DeltaSource<List<i32>, SeqOp<i32>>>(source: S): ListCell<i32> {
 	}
 	let out: ListCell<i32> = ListCell<i32>::new(seeded);
 	let read = source.reader();
-	let _owned = source.on_change(|_list| {
+	let _owned = observe(source, |_list| {
 		notifications.write() = notifications.read() + 1;
 		for op in read(cursor) {
 			match op {
@@ -266,6 +275,15 @@ fun map_each<S: DeltaSource<List<i32>, SeqOp<i32>>>(source: S): ListCell<i32> {
 		}
 	});
 	out
+}
+
+/// `on_change`, reached through a `Source` bound. Two finds route it here
+/// (A142 S1, reactive-44): under `map_each`'s `DeltaSource` bound, a subtrait of
+/// `Source`, a call of `attach_observer` runs `Source`'s default and not the
+/// cell's own; and `on_change`'s blanket `Flow` hop is not yet built natively
+/// under a generic `S` whose value is a list of the cell's parameter.
+fun observe<S: Source<List<i32>>>(source: S, observer: |List<i32>| void): Subscription {
+	source.attach_observer(observer, false)
 }
 
 fun same(left: List<i32>, right: List<i32>): bool {

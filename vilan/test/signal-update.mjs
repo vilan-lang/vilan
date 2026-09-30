@@ -201,29 +201,26 @@ function release_under(handle, ambient) {
 	return $aa;
 }
 function new4() {
-	return [ __shared_new([ 0, [ 1 ], [ 1 ] ]), 0 ];
+	return [ __shared_new([ 0, no_cleanups, false, [ 1 ] ]), 0 ];
 }
 function is_disposed(self) {
 	return self[0].v[0] !== self[1];
 }
 function defer(self, cleanup) {
-	let $ad = null;
+	let $ab = null;
 	if (is_disposed(self)) {
 		cleanup();
 	} else {
-		const $ab = self[0].v[1];
-		let $ac = null;
-		if ($ab[0] === 0) {
-			const list = $ab[1];
-			$ac = list.v.push(cleanup);
+		const held = __clone(self[0].v);
+		if (held[2]) {
+			held[1].v.push(cleanup);
 		} else {
 			owner_lists_allocated_count.v = owner_lists_allocated_count.v + 1;
-			self[0].v[1] = [ 0, __shared_new([ cleanup ]) ];
-			$ac = undefined;
+			self[0].v = [ held[0], __shared_new([ cleanup ]), true, held[3] ];
 		}
-		$ad = $ac;
+		$ab = undefined;
 	}
-	return $ad;
+	return $ab;
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -352,32 +349,33 @@ function $Q(self, item, $R) {
 	});
 	return __clone(item);
 }
-function $af(body, $ag) {
-	const $ah = $ag;
-	let $ai = null;
-	if ($ah[0] === 0) {
-		const current = $ah[1];
-		$ai = body(current);
+function $ad(body, $ae) {
+	const $af = $ae;
+	let $ag = null;
+	if ($af[0] === 0) {
+		const current = $af[1];
+		$ag = body(current);
 	} else {
 		const fresh = new3();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[5].v = true;
-		$ai = result;
+		$ag = result;
 	}
-	return $ai;
+	return $ag;
 }
-function $al(self, value, $am) {
+function $aj(self, value, $ak) {
 	self[0].v = __clone(value);
-	$u(self, $am);
+	$u(self, $ak);
 }
-function $aj(self, transform, $ak) {
-	$al(self, transform($p(self)), $ak);
+function $ah(self, transform, $ai) {
+	$aj(self, transform($p(self)), $ai);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 const releasing_turns = __shared_new([  ]);
+const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
 const owner = new4();
 const todos = $a([ 1, 2 ]);
@@ -412,15 +410,15 @@ $c(watched, (list) => {
 	return;
 }, [ 1 ]);
 console.log("---");
-$af(($ae) => {
+$ad(($ac) => {
 	$c(watched, (list) => {
 		list.push(3);
 		return;
-	}, [ 0, $ae ]);
+	}, [ 0, $ac ]);
 	$c(watched, (list) => {
 		list.push(4);
 		return;
-	}, [ 0, $ae ]);
+	}, [ 0, $ac ]);
 	console.log("inside");
 	return;
 }, [ 1 ]);
@@ -429,7 +427,7 @@ $c(todos, (list) => {
 	console.log("reentrant " + $p(todos).length);
 	return;
 }, [ 1 ]);
-$aj(count, (n) => {
+$ah(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($p(count));

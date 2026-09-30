@@ -50,13 +50,13 @@ function hash(self) {
 function fold_unsigned(value2, modulus) {
 	const truncated = Math.trunc(value2);
 	const wrapped = truncated % modulus;
-	let $aa = null;
+	let $ac = null;
 	if (wrapped < 0) {
-		$aa = wrapped + modulus;
+		$ac = wrapped + modulus;
 	} else {
-		$aa = wrapped;
+		$ac = wrapped;
 	}
-	return $aa;
+	return $ac;
 }
 function saturate_unsigned(value2) {
 	const truncated = Math.trunc(value2);
@@ -70,13 +70,13 @@ function saturate_unsigned(value2) {
 }
 function fold_signed(value2, modulus, half) {
 	const wrapped = fold_unsigned(value2, modulus);
-	let $ab = null;
+	let $ad = null;
 	if (wrapped >= half) {
-		$ab = wrapped - modulus;
+		$ad = wrapped - modulus;
 	} else {
-		$ab = wrapped;
+		$ad = wrapped;
 	}
-	return $ab;
+	return $ad;
 }
 function as_i53(self) {
 	const widened = Number(self);
@@ -200,7 +200,7 @@ function same(left, right) {
 	let index = 0;
 	let equal = true;
 	while (index < left.length) {
-		if ($aq(__list_get(left, index), __list_get(right, index))) {
+		if ($as(__list_get(left, index), __list_get(right, index))) {
 			equal = false;
 		}
 		index = index + 1;
@@ -216,25 +216,25 @@ function render(list) {
 }
 function drain_mirror(source2, cursor, held, label, at_turn) {
 	let mirror = __clone(held);
-	for (const op of $ax(source2, cursor)) {
-		const $ay = op;
-		let $az = null;
-		if ($ay[0] === 2) {
-			const items = $ay[1];
+	for (const op of $az(source2, cursor)) {
+		const $aA = op;
+		let $aB = null;
+		if ($aA[0] === 2) {
+			const items = $aA[1];
 			resets_to_mirror.v = resets_to_mirror.v + 1;
 			mirror = __clone(items);
-			$az = undefined;
-		} else if ($ay[0] === 1) {
-			const at = $ay[1];
-			const _previous = $ay[2];
-			const value2 = $ay[3];
+			$aB = undefined;
+		} else if ($aA[0] === 1) {
+			const at = $aA[1];
+			const _previous = $aA[2];
+			const value2 = $aA[3];
 			ops_to_mirror.v = ops_to_mirror.v + 1;
 			__at_put(mirror, at, value2);
-			$az = undefined;
-		} else if ($ay[0] === 0) {
-			const at2 = $ay[1];
-			const removed = $ay[2];
-			const inserted = $ay[3];
+			$aB = undefined;
+		} else if ($aA[0] === 0) {
+			const at2 = $aA[1];
+			const removed = $aA[2];
+			const inserted = $aA[3];
 			ops_to_mirror.v = ops_to_mirror.v + 1;
 			let taken = 0;
 			const leaving = removed.length;
@@ -245,28 +245,28 @@ function drain_mirror(source2, cursor, held, label, at_turn) {
 			let offset = 0;
 			const count = inserted.length;
 			while (offset < count) {
-				const $aA = __list_get(inserted, offset);
-				let $aB = null;
-				if ($aA[0] === 0) {
-					const value3 = $aA[1];
-					$aB = __insert_at(mirror, at2 + offset, value3);
+				const $aC = __list_get(inserted, offset);
+				let $aD = null;
+				if ($aC[0] === 0) {
+					const value3 = $aC[1];
+					$aD = __insert_at(mirror, at2 + offset, value3);
 				} else {
-					$aB = undefined;
+					$aD = undefined;
 				}
-				$aB;
+				$aD;
 				offset = offset + 1;
 			}
-			$az = undefined;
+			$aB = undefined;
 		} else {
-			const _from = $ay[1];
-			const _count = $ay[2];
-			const _to = $ay[3];
+			const _from = $aA[1];
+			const _count = $aA[2];
+			const _to = $aA[3];
 			(() => {
 				throw "the generator emits no Move";
 			})();
-			$az = undefined;
+			$aB = undefined;
 		}
-		$az;
+		$aB;
 	}
 	checks.v = checks.v + 1;
 	if (!(same(mirror, $i(source2)))) {
@@ -481,28 +481,37 @@ function $T(self, value2, $U) {
 		return;
 	}, $U);
 }
-function $Z(signal, subscriber) {
+function $ab(signal, subscriber) {
 	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
 	return handle;
 }
-function $Y(self, subscriber) {
-	return $Z(self, subscriber);
-}
-function $X(self, subscriber) {
-	return $Y(self[0], subscriber);
-}
-function $W(self, observer, immediately) {
-	const subscription = $X(self, mint_subscriber(() => {
-		return observer($i(self));
+function $Y(signal, observer) {
+	const cell = signal[0];
+	return $ab(signal, mint_subscriber(() => {
+		const $Z = [ 0, cell ];
+		let $aa = null;
+		if ($Z[0] === 0) {
+			const live = $Z[1];
+			$aa = observer(live.v);
+		} else {
+			$aa = undefined;
+		}
+		return $aa;
 	}));
+}
+function $X(self, observer, immediately) {
+	const subscription = $Y(self, observer);
 	if (immediately) {
-		observer($i(self));
+		observer($j(self));
 	}
 	return subscription;
 }
-function $V(self, observer) {
-	return $W(self, observer, false);
+function $W(self, observer, immediately) {
+	return $X(self[0], observer, immediately);
+}
+function $V(source2, observer) {
+	return $W(source2, observer, false);
 }
 function $e(source2, $f) {
 	const cursor = $g(source2);
@@ -512,7 +521,7 @@ function $e(source2, $f) {
 	}
 	const out = $k(seeded);
 	const read = $m(source2);
-	$V(__clone(source2), (_list) => {
+	$V(source2, (_list) => {
 		notifications.v = notifications.v + 1;
 		for (const op of read(cursor)) {
 			const $u = op;
@@ -559,70 +568,70 @@ function $e(source2, $f) {
 	});
 	return out;
 }
-function $ad(self) {
+function $af(self) {
 	return $j(self[0]).length;
 }
-function $ae(self, value2, $af) {
-	return $w(self, $ad(self), 0, [ __clone(value2) ], $af);
+function $ag(self, value2, $ah) {
+	return $w(self, $af(self), 0, [ __clone(value2) ], $ah);
 }
-function $ag(self, at, value2, $ah) {
-	return $w(self, at, 0, [ __clone(value2) ], $ah);
+function $ai(self, at, value2, $aj) {
+	return $w(self, at, 0, [ __clone(value2) ], $aj);
 }
-function $ai(self, at, $aj) {
-	return $w(self, at, 1, [  ], $aj);
+function $ak(self, at, $al) {
+	return $w(self, at, 1, [  ], $al);
 }
-function $ak(self, $al) {
-	return $w(self, 0, $ad(self), [  ], $al);
+function $am(self, $an) {
+	return $w(self, 0, $af(self), [  ], $an);
 }
-function $am(body, $an) {
-	const $ao = $an;
-	let $ap = null;
-	if ($ao[0] === 0) {
-		const current = $ao[1];
-		$ap = body(current);
+function $ao(body, $ap) {
+	const $aq = $ap;
+	let $ar = null;
+	if ($aq[0] === 0) {
+		const current = $aq[1];
+		$ar = body(current);
 	} else {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[5].v = true;
-		$ap = result;
+		$ar = result;
 	}
-	return $ap;
+	return $ar;
 }
-function $ar(self, b) {
-	const $as = self;
-	let $av = null;
-	if ($as[0] === 0) {
-		const $at = b;
-		let $au = null;
-		if ($at[0] === 0) {
-			$au = $as[1] === $at[1];
+function $at(self, b) {
+	const $au = self;
+	let $ax = null;
+	if ($au[0] === 0) {
+		const $av = b;
+		let $aw = null;
+		if ($av[0] === 0) {
+			$aw = $au[1] === $av[1];
 		} else {
-			$au = false;
+			$aw = false;
 		}
-		$av = $au;
+		$ax = $aw;
 	} else {
-		const $aw = b;
-		$av = $aw[0] === 1;
+		const $ay = b;
+		$ax = $ay[0] === 1;
 	}
-	return $av;
+	return $ax;
 }
-function $aq(self, b) {
-	return !($ar(self, b));
+function $as(self, b) {
+	return !($at(self, b));
 }
-function $ax(self, cursor) {
+function $az(self, cursor) {
 	return $n(self[1], self[0][0], cursor);
 }
-function $aC(self) {
+function $aE(self) {
 	return self[0].v.length;
 }
-function $aD(self) {
+function $aF(self) {
 	return self[2].v;
 }
-function $aE(self) {
+function $aG(self) {
 	return self[1].v;
 }
-function $aG(self, cursor) {
+function $aI(self, cursor) {
 	let kept = [  ];
 	for (const held of self[3].v) {
 		if (held[0] !== cursor[0]) {
@@ -631,8 +640,8 @@ function $aG(self, cursor) {
 	}
 	self[3].v = kept;
 }
-function $aF(self, cursor) {
-	$aG(self[1], cursor);
+function $aH(self, cursor) {
+	$aI(self[1], cursor);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -657,19 +666,19 @@ let turn_index = 1;
 while (turn_index <= 400) {
 	const before = notifications.v;
 	const op_count = 1 + next_random(4);
-	$am(($ac) => {
+	$ao(($ae) => {
 		let made = 0;
 		while (made < op_count) {
-			const size = $ad(source);
+			const size = $af(source);
 			const choice = next_random(20);
 			if (choice < 9 || size === 0) {
-				$ae(source, next_random(100), [ 0, $ac ]);
+				$ag(source, next_random(100), [ 0, $ae ]);
 			} else if (choice < 13) {
-				$ag(source, pick(size), next_random(100), [ 0, $ac ]);
+				$ai(source, pick(size), next_random(100), [ 0, $ae ]);
 			} else if (choice < 16) {
-				$ai(source, pick(size), [ 0, $ac ]);
+				$ak(source, pick(size), [ 0, $ae ]);
 			} else if (choice < 18) {
-				$R(source, pick(size), next_random(100), [ 0, $ac ]);
+				$R(source, pick(size), next_random(100), [ 0, $ae ]);
 			} else if (choice < 19 && size > 15) {
 				let fresh = [  ];
 				let fill = 0;
@@ -678,11 +687,11 @@ while (turn_index <= 400) {
 					fresh.push(next_random(100));
 					fill = fill + 1;
 				}
-				$T(source, fresh, [ 0, $ac ]);
+				$T(source, fresh, [ 0, $ae ]);
 			} else if (size > 25) {
-				$ak(source, [ 0, $ac ]);
+				$am(source, [ 0, $ae ]);
 			} else {
-				$ae(source, next_random(100), [ 0, $ac ]);
+				$ag(source, next_random(100), [ 0, $ae ]);
 			}
 			made = made + 1;
 		}
@@ -733,6 +742,6 @@ if (calls.v >= naive_calls.v) {
 console.log("turns=400 checks=" + checks.v + " failures=0");
 console.log("lagging cursors: ops drained=" + ops_to_mirror.v + " resets=" + resets_to_mirror.v);
 console.log("g calls: incremental=" + calls.v + " (splice/set_at=" + incremental_calls.v + ", reset=" + reset_calls.v + ") naive-rerun=" + naive_calls.v);
-console.log("final length " + $i(source).length + ", log held " + $aC(source[1]) + " ops, base " + $aD(source[1]) + ", version " + $aE(source[1]));
-$aF(source, near);
-$aF(source, far);
+console.log("final length " + $i(source).length + ", log held " + $aE(source[1]) + " ops, base " + $aF(source[1]) + ", version " + $aG(source[1]));
+$aH(source, near);
+$aH(source, far);

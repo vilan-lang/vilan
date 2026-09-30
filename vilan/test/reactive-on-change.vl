@@ -79,12 +79,14 @@ fun main() {
 	watched.dispose();
 
 	// A custom source is a `Flow`, so it derives off `Stored`; the pipe is read
-	// AND subscribed to, so it is sealed.
-	let labelled = stored.derive(|value| i"n={value}").memo();
+	// AND subscribed to, so it is sealed — under an owner, which releases the
+	// seal's registration on the source.
+	let (labelled, sealed) = comp(|| stored.derive(|value| i"n={value}").memo());
 	print(labelled.get());
 	let shown = labelled.sub(|value| print(i"label {value}"));
 	stored.inner.set(13);
 	shown.dispose();
+	sealed.dispose();
 }
 
 main();
