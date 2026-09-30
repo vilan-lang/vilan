@@ -48,7 +48,7 @@ use vilan_core::lexing::tokenize;
 use vilan_core::token::Token;
 use vilan_ide::{Completion, CompletionIndex, CompletionKind};
 
-use crate::document::{MODIFIER_DECLARATION, MODIFIER_READONLY, TokenKind};
+use crate::document::{EditDelta, MODIFIER_DECLARATION, MODIFIER_READONLY, TokenKind};
 use crate::line_index::LineIndex;
 
 // ---------------------------------------------------------------------------
@@ -188,17 +188,6 @@ impl Anchor {
         }
         None
     }
-
-    /// Map an ANALYZED byte offset into live coordinates, or `None` when it
-    /// falls in the window. The point form of [`Anchor::map_span`], for the
-    /// offset-keyed answers (inlay hints).
-    pub fn map_offset(&self, offset: usize) -> Option<usize> {
-        self.map_span(Span {
-            start: offset,
-            end: offset,
-        })
-        .map(|span| span.start)
-    }
 }
 
 /// The start of the line containing `at` — `0`, or one past the nearest
@@ -259,7 +248,8 @@ fn next_line_start(bytes: &[u8], at: usize) -> usize {
 /// body; the edit is in the window and the shadowed use is in the tail anchor,
 /// so it can be mis-coloured for one analysis. Q1 rules exactly this
 /// acceptable for tokens ("a briefly mis-coloured identifier is cosmetic"),
-/// and hints are withheld in the window where the risk is concentrated.
+/// and for hints, which E232 serves in the window too: a hint one analysis
+/// old beats a line that jumps on every keystroke (the owner's ruling).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ShapeStamp(u64);
 
@@ -364,8 +354,8 @@ fn hash_token(token: &Token<'_>, hasher: &mut vilan_core::fx::FxHasher) {
 ///
 /// | verdict | condition | tokens | hints | completion |
 /// |---|---|---|---|---|
-/// | [`Verdict::Exact`] | an anchor exists, the stamp matches, no dependency moved | landed tokens re-mapped through the anchor, **syntax-only inside the window** | landed hints re-mapped, **withheld inside the window** | index + the landed scope, members from the landed type |
-/// | [`Verdict::Stale`] | an anchor exists, but the stamp changed or a dependency moved | **syntax-only, whole file** | landed hints re-mapped, withheld inside the window — served unchanged rather than flickered off | index + the module's own names |
+/// | [`Verdict::Exact`] | an anchor exists, the stamp matches, no dependency moved | landed tokens re-mapped through the anchor, **syntax-only inside the window** | landed hints **following the edits** — the window's too (E232) | index + the landed scope, members from the landed type |
+/// | [`Verdict::Stale`] | an anchor exists, but the stamp changed or a dependency moved | **syntax-only, whole file** | landed hints following the edits — served unchanged rather than flickered off | index + the module's own names |
 /// | [`Verdict::Unusable`] | no anchor at all: a paste replaced the file, or nothing has landed | **syntax-only, whole file** | **withheld entirely** | index only |
 ///
 /// The asymmetry between tokens and hints in the stale row is Q1's ruling and
@@ -764,7 +754,7 @@ pub struct LandedSnapshot {
     /// [`tokens_in_lines`](Self::tokens_in_lines) reads as "no tokens".
     pub token_lines: Vec<u32>,
     /// The analysis's inlay hints, in ANALYZED coordinates.
-    pub hints: Vec<(usize, String)>,
+    pub hints: Vec<LandedHint>,
     /// The declared names of every module the analysis loaded.
     pub index: SymbolIndex,
     /// Whether an analysis produced this at all.
@@ -855,29 +845,203 @@ impl LandedSnapshot {
         }
     }
 
-    /// The inlay hints the live buffer should show. Q1/Q4's ruling, in one
-    /// place: re-mapped through the anchor, **withheld inside the window**
-    /// (a hint on the line you are typing is the most likely to be wrong and
-    /// the least useful, and withholding there is invisible because the hint
-    /// was about to move anyway), served unchanged when stale rather than
-    /// flickered off, and withheld entirely when there is no anchor to serve
-    /// from.
-    pub fn hints_for(&self, anchor: &Anchor, verdict: Verdict) -> Vec<(usize, String)> {
+    /// The inlay hints the live buffer should show.
+    ///
+    /// E232 (door 2, RULED): every landed hint follows the edits since its
+    /// analysis — the recorded log when incremental sync kept one, the
+    /// byte-exact region the two texts differ in otherwise — exactly as any
+    /// other position would ([`follow_edit`]), and is served there until the
+    /// next analysis replaces the set whole. Until E232 a hint inside the
+    /// anchor's line-trimmed window was WITHHELD (Q1/Q4), which is what made
+    /// the edited line jump the moment typing started: VS Code keeps a
+    /// provider's hints in place across edits by itself, and our empty answer
+    /// for the dirty line is what took them away. A hint is dropped only when
+    /// the name it follows is deleted, or its point falls inside replaced
+    /// bytes. [`Verdict::Unusable`] (nothing byte-identical survives, or
+    /// nothing landed) still withholds everything: there is no position left
+    /// to follow.
+    ///
+    /// `abbreviate` (E227, `vilan.inlayHints.abbreviate`) serves a hinted
+    /// node's abbreviated label (`: ~Source<i32>`) with the full one as its
+    /// tooltip; off, every hint is the full type, as before E227.
+    pub fn hints_for(
+        &self,
+        trail: &EditTrail<'_>,
+        verdict: Verdict,
+        abbreviate: bool,
+    ) -> Vec<ServedHint> {
         if verdict == Verdict::Unusable {
             return Vec::new();
         }
-        let mut hints: Vec<(usize, String)> = self
+        let mut hints: Vec<ServedHint> = self
             .hints
             .iter()
-            .filter_map(|(offset, label)| {
-                anchor
-                    .map_offset(*offset)
-                    .map(|offset| (offset, label.clone()))
+            .filter_map(|hint| {
+                let name = trail.follow(hint.name)?;
+                Some(match (&hint.abbreviated, abbreviate) {
+                    (Some(abbreviated), true) => ServedHint {
+                        offset: name.end,
+                        label: abbreviated.clone(),
+                        full: Some(hint.label.clone()),
+                    },
+                    _ => ServedHint {
+                        offset: name.end,
+                        label: hint.label.clone(),
+                        full: None,
+                    },
+                })
             })
             .collect();
-        hints.sort();
+        hints.sort_by(|left, right| (left.offset, &left.label).cmp(&(right.offset, &right.label)));
         hints
     }
+}
+
+/// One inlay hint as the handler sends it: its LIVE offset, the label shown,
+/// and — when the label is an abbreviation (E227) — the full type, which the
+/// hint's tooltip carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedHint {
+    pub offset: usize,
+    pub label: String,
+    pub full: Option<String>,
+}
+
+/// One inlay hint as an analysis landed it: the binding NAME it follows, in
+/// ANALYZED coordinates (the hint sits at its end), and the label.
+///
+/// The name and not only the point, because E232's one drop rule is about the
+/// name: a hint whose name was deleted is gone, while a hint whose name was
+/// merely typed into follows its end.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LandedHint {
+    pub name: Span,
+    /// The full type, `: Map<..>` — hover's, and every hint's when
+    /// `vilan.inlayHints.abbreviate` is off.
+    pub label: String,
+    /// E227: `: ~Source<..>` where a `[hint]` abbreviates the type, else
+    /// `None`.
+    pub abbreviated: Option<String>,
+}
+
+/// How the live buffer got from the analyzed text (E232): the ordered edits
+/// incremental sync recorded, or — when there is no log (a whole-text set, an
+/// analysis adopted onto an older text) — the one region the two texts differ
+/// in, byte-exact.
+pub enum EditTrail<'a> {
+    Log(&'a [EditDelta]),
+    Region(EditDelta),
+}
+
+impl EditTrail<'_> {
+    /// The trail from `analyzed` to `live` for a document: its log when it has
+    /// one, else the byte-exact region between the two texts.
+    pub fn of<'a>(log: Option<&'a [EditDelta]>, analyzed: &str, live: &str) -> EditTrail<'a> {
+        match log {
+            Some(log) => EditTrail::Log(log),
+            None => EditTrail::Region(differing_region(analyzed, live)),
+        }
+    }
+
+    /// `name` followed through every edit of the trail, or `None` once an
+    /// edit drops it.
+    pub fn follow(&self, name: Span) -> Option<Span> {
+        match self {
+            EditTrail::Log(log) => log.iter().try_fold(name, follow_edit),
+            EditTrail::Region(edit) => follow_edit(name, edit),
+        }
+    }
+}
+
+/// The single region `analyzed` and `live` differ in: their common byte
+/// prefix and common byte suffix (the suffix clamped so the two never overlap
+/// in either text), and the replacement between. Byte identity outside it is
+/// the whole honesty argument, as it is for [`Anchor`] — this is the same
+/// scan without the trim to line boundaries, because a hint is a POINT and a
+/// point on an edited line still has an exact image when the bytes before or
+/// after it are unchanged. Several edits far apart read as one region; a hint
+/// between them falls inside it and is dropped until the analysis lands.
+pub fn differing_region(analyzed: &str, live: &str) -> EditDelta {
+    let analyzed = analyzed.as_bytes();
+    let live = live.as_bytes();
+    let prefix = analyzed
+        .iter()
+        .zip(live)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let room = analyzed.len().min(live.len()) - prefix;
+    let suffix = analyzed
+        .iter()
+        .rev()
+        .zip(live.iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count()
+        .min(room);
+    EditDelta {
+        start: prefix,
+        old_len: analyzed.len() - suffix - prefix,
+        new_len: live.len() - suffix - prefix,
+    }
+}
+
+/// E232's rule for one edit: where the hint on `name` (its point is
+/// `name.end`) goes when `edit` replaces `old_len` bytes at `start` with
+/// `new_len`, or `None` when the edit drops it.
+///
+/// - The point is BEFORE the edit (`end < start`), or the edit starts right
+///   at it and replaces text after it: typing after a hint does nothing.
+/// - The point is AFTER the replaced bytes (`end > old_end`): it moves by the
+///   edit's net width — typing before a hint, on its line or above it.
+/// - A pure insertion AT the point extends what precedes it (the name grows,
+///   or text is typed right after it), so the hint moves past the insertion.
+/// - The edit ends exactly at the point: the name's tail was replaced. If the
+///   WHOLE name was inside the replaced bytes the name is gone, and so is the
+///   hint; otherwise it follows the name's new end.
+/// - The point is strictly inside replaced bytes: it has no image. Dropped.
+fn follow_edit(name: Span, edit: &EditDelta) -> Option<Span> {
+    let start = edit.start;
+    let old_end = edit.start + edit.old_len;
+    let new_end = edit.start + edit.new_len;
+    let shift = |offset: usize| offset + edit.new_len - edit.old_len;
+    let point = name.end;
+    // The name's own start, carried so a later edit can still tell a deleted
+    // name from a shortened one.
+    let follow_start = |offset: usize| {
+        if offset < start || (offset == start && edit.old_len > 0) {
+            offset
+        } else if offset >= old_end {
+            shift(offset)
+        } else {
+            new_end
+        }
+    };
+    let moved = |end: usize| {
+        Some(Span {
+            start: follow_start(name.start).min(end),
+            end,
+        })
+    };
+    if point < start {
+        return Some(name);
+    }
+    if point > old_end {
+        return moved(shift(point));
+    }
+    if edit.old_len == 0 {
+        // `point == start == old_end`: a pure insertion at the point.
+        return moved(new_end);
+    }
+    if point == start {
+        // The edit replaces text right after the point.
+        return Some(name);
+    }
+    if point == old_end {
+        if name.start >= start {
+            return None;
+        }
+        return moved(new_end);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1155,79 @@ pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- E232: `follow_edit` and `differing_region`, one rule per case ----------
+
+    fn name(start: usize, end: usize) -> Span {
+        Span { start, end }
+    }
+
+    fn replace(start: usize, old_len: usize, new_len: usize) -> EditDelta {
+        EditDelta {
+            start,
+            old_len,
+            new_len,
+        }
+    }
+
+    #[test]
+    fn e232_a_hint_follows_each_edit_by_its_one_rule() {
+        // `let first` — the name is 4..9, the hint's point 9.
+        let first = name(4, 9);
+        // An edit after the point: unchanged.
+        assert_eq!(follow_edit(first, &replace(12, 1, 3)), Some(first));
+        // An edit starting AT the point that replaces what follows: unchanged.
+        assert_eq!(follow_edit(first, &replace(9, 2, 0)), Some(first));
+        // Before the name, on its line or above: shifted by the net width.
+        assert_eq!(follow_edit(first, &replace(0, 0, 1)), Some(name(5, 10)));
+        assert_eq!(follow_edit(first, &replace(0, 3, 0)), Some(name(1, 6)));
+        // A pure insertion AT the point extends the name.
+        assert_eq!(follow_edit(first, &replace(9, 0, 2)), Some(name(4, 11)));
+        // Typing inside the name: the point keeps following the end.
+        assert_eq!(follow_edit(first, &replace(6, 0, 1)), Some(name(4, 10)));
+        // The name's last character deleted: its new end.
+        assert_eq!(follow_edit(first, &replace(8, 1, 0)), Some(name(4, 8)));
+        // The WHOLE name deleted, or replaced: the hint goes with it.
+        assert_eq!(follow_edit(first, &replace(4, 5, 0)), None);
+        assert_eq!(follow_edit(first, &replace(4, 5, 3)), None);
+        assert_eq!(follow_edit(first, &replace(3, 7, 0)), None);
+        // The point strictly inside replaced bytes: no image.
+        assert_eq!(follow_edit(first, &replace(7, 4, 1)), None);
+    }
+
+    #[test]
+    fn e232_a_log_is_followed_edit_by_edit_and_a_later_edit_sees_the_moved_name() {
+        let first = name(4, 9);
+        // Insert two bytes before, then delete the name at its NEW place.
+        let log = [replace(0, 0, 2), replace(6, 5, 0)];
+        assert_eq!(EditTrail::Log(&log).follow(first), None);
+        // Two edits far apart — one above, one below: exact through the log.
+        let log = [replace(0, 0, 2), replace(40, 1, 1)];
+        assert_eq!(EditTrail::Log(&log).follow(first), Some(name(6, 11)));
+    }
+
+    #[test]
+    fn e232_the_region_is_byte_exact_and_never_overlaps_itself() {
+        assert_eq!(differing_region("abc", "abc"), replace(3, 0, 0));
+        assert_eq!(
+            differing_region("let a = 1;", "let a = 12;"),
+            replace(9, 0, 1)
+        );
+        // `"aa"` → `"a"`: the shared byte is prefix OR suffix, never both.
+        assert_eq!(differing_region("aa", "a"), replace(1, 1, 0));
+        // A multi-byte character replaced: the region starts on the shared
+        // lead byte, and a point on either side still maps by byte identity.
+        let region = differing_region("x é y", "x è y");
+        assert_eq!(region.start + region.old_len, 4);
+        assert_eq!(
+            EditTrail::Region(region).follow(name(0, 1)),
+            Some(name(0, 1))
+        );
+        assert_eq!(
+            EditTrail::Region(region).follow(name(5, 6)),
+            Some(name(5, 6))
+        );
+    }
 
     // --- the two-sided anchor ---------------------------------------------
 
@@ -1630,37 +1867,190 @@ mod document_path {
         );
     }
 
-    /// Q1/Q4: a hint on the line being typed disappears until the analysis
-    /// lands, and every hint outside the window keeps its landed label at an
-    /// exact position.
+    // --- E232: hints BEHAVE on the edited line ------------------------------
+    //
+    // Door (2), the owner's words: a hint's anchor follows the document's
+    // edits like any other position until the next analysis replaces the
+    // set. Typing before a hint shifts it right by the typed width; typing
+    // after it does nothing; a new line above shifts it down; typing on a
+    // line below does nothing; deleting the name it follows drops it. Every
+    // pin runs twice — through the incremental-sync edit log (`apply_change`)
+    // and through a whole-text set that leaves no log (`set_text`), which is
+    // what the buffer looks like after an analysis lands on an older text.
+
+    /// Replace `start..end` of the live buffer with `text`, ranged (the log) or
+    /// whole (no log).
+    fn edit(document: &mut Document, start: usize, end: usize, text: &str, ranged: bool) {
+        if ranged {
+            let range = tower_lsp::lsp_types::Range::new(
+                document.line_index.position(start),
+                document.line_index.position(end),
+            );
+            document.apply_change(Some(range), text);
+        } else {
+            let mut live = document.text.clone();
+            live.replace_range(start..end, text);
+            document.set_text(&live);
+        }
+    }
+
+    /// The hint served right after `name`'s first occurrence in the LIVE
+    /// buffer, if any.
+    fn hint_after(document: &Document, name: &str) -> Option<String> {
+        let at = document.text.find(name)? + name.len();
+        document
+            .keystroke_hints(false)
+            .into_iter()
+            .find(|(offset, _)| *offset == at)
+            .map(|(_, label)| label)
+    }
+
+    const FIRST_LINE: &str = "\tlet first = greet(\"a\");";
+
     #[test]
-    fn hints_are_withheld_inside_the_edit_window_and_exact_outside_it() {
+    fn e232_typing_at_the_start_of_a_hinted_line_moves_its_hint_right() {
+        for ranged in [true, false] {
+            let mut document = analyzed(SOURCE);
+            let landed = hint_after(&document, "first").expect("the fixture hints `first`");
+            let line = SOURCE.find(FIRST_LINE).expect("the line");
+            edit(&mut document, line, line, " ", ranged);
+            assert_eq!(
+                hint_after(&document, "first"),
+                Some(landed.clone()),
+                "ranged={ranged}: the hint moves right by the typed width, text unchanged — {:?}",
+                document.keystroke_hints(false)
+            );
+            // …and every hint count is kept: nothing on the line was withheld.
+            assert_eq!(
+                document.keystroke_hints(false).len(),
+                analyzed(SOURCE).keystroke_hints(false).len(),
+                "ranged={ranged}"
+            );
+        }
+    }
+
+    #[test]
+    fn e232_typing_after_a_hint_leaves_it_in_place() {
+        for ranged in [true, false] {
+            let mut document = analyzed(SOURCE);
+            let before = SOURCE.find("first").unwrap() + "first".len();
+            let argument = SOURCE.find("\"a\"").unwrap() + 2;
+            edit(&mut document, argument, argument, "b", ranged);
+            let hints = document.keystroke_hints(false);
+            assert!(
+                hints
+                    .iter()
+                    .any(|(offset, label)| *offset == before && label == ": str"),
+                "ranged={ranged}: typing after the hint on its own line does nothing — {hints:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e232_a_line_inserted_above_moves_the_hint_down_one_line() {
+        for ranged in [true, false] {
+            let mut document = analyzed(SOURCE);
+            let line = SOURCE.find(FIRST_LINE).unwrap();
+            edit(&mut document, line, line, "\tlet extra = 1;\n", ranged);
+            assert_eq!(
+                hint_after(&document, "first").as_deref(),
+                Some(": str"),
+                "ranged={ranged}: {:?}",
+                document.keystroke_hints(false)
+            );
+            // The hint's LINE is one greater than it was.
+            let at = document.text.find("first").unwrap() + "first".len();
+            let landed_line = analyzed(SOURCE)
+                .line_index
+                .position(SOURCE.find("first").unwrap() + "first".len())
+                .line;
+            assert_eq!(document.line_index.position(at).line, landed_line + 1);
+        }
+    }
+
+    #[test]
+    fn e232_typing_on_a_line_below_changes_nothing_above_it() {
+        for ranged in [true, false] {
+            let mut document = analyzed(SOURCE);
+            let first = SOURCE.find("first").unwrap() + "first".len();
+            let below = SOURCE.find("\"b\"").unwrap() + 1;
+            edit(&mut document, below, below + 1, "zz", ranged);
+            let hints = document.keystroke_hints(false);
+            assert!(
+                hints
+                    .iter()
+                    .any(|(offset, label)| *offset == first && label == ": str"),
+                "ranged={ranged}: {hints:?}"
+            );
+            // The edited line's own hint sits BEFORE the edit, so it stays too.
+            assert_eq!(hint_after(&document, "second").as_deref(), Some(": str"));
+        }
+    }
+
+    #[test]
+    fn e232_typing_inside_a_hinted_name_keeps_the_hint_at_its_end() {
+        for ranged in [true, false] {
+            let mut document = analyzed(SOURCE);
+            let end = SOURCE.find("first").unwrap() + "first".len();
+            // Append to the name, then delete one character of it.
+            edit(&mut document, end, end, "_x", ranged);
+            assert_eq!(
+                hint_after(&document, "first_x").as_deref(),
+                Some(": str"),
+                "ranged={ranged}"
+            );
+            let end = document.text.find("first_x").unwrap() + "first_x".len();
+            edit(&mut document, end - 1, end, "", ranged);
+            assert_eq!(
+                hint_after(&document, "first_").as_deref(),
+                Some(": str"),
+                "ranged={ranged}"
+            );
+        }
+    }
+
+    #[test]
+    fn e232_deleting_the_hinted_name_drops_its_hint_and_nothing_else() {
+        for ranged in [true, false] {
+            let mut document = analyzed(SOURCE);
+            let landed = document.keystroke_hints(false).len();
+            let name = SOURCE.find("first").unwrap();
+            edit(&mut document, name, name + "first".len(), "", ranged);
+            let hints = document.keystroke_hints(false);
+            let gone = name;
+            assert!(
+                hints.iter().all(|(offset, _)| *offset != gone),
+                "ranged={ranged}: the anchor is gone, so is the hint — {hints:?}"
+            );
+            assert_eq!(
+                hints.len(),
+                landed - 1,
+                "ranged={ranged}: only that one — {hints:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e232_the_landing_analysis_replaces_the_set_whole() {
         let mut document = analyzed(SOURCE);
-        let landed = document.keystroke_hints(false);
-        assert!(
-            landed.len() >= 2,
-            "the fixture must produce hints: {landed:?}"
+        let line = SOURCE.find(FIRST_LINE).unwrap();
+        edit(&mut document, line, line, "\tlet count = 1;\n", true);
+        assert_eq!(
+            hint_after(&document, "count"),
+            None,
+            "a binding typed since the analysis has no hint yet"
         );
-        let edited = SOURCE.replace(
-            "\tlet first = greet(\"a\");",
-            "\tlet first = greet(\"ab\");",
-        );
-        document.set_text(&edited);
-        let window = document.keystroke_anchor().live_window();
-        let hints = document.keystroke_hints(false);
-        assert!(
-            hints.iter().all(|(offset, _)| !window.contains(offset)),
-            "no hint may be served inside the edit window — {hints:?} against {window:?}",
-        );
-        // And the hint on the LAST line rode the shift: it still sits on
-        // `second`'s name, not one byte off it.
-        let second = edited.find("second").expect("the second binding");
-        assert!(
-            hints
-                .iter()
-                .any(|(offset, _)| *offset == second + "second".len()),
-            "a hint outside the window must be position-exact — {hints:?}",
-        );
+        let text = document.text.clone();
+        let entry = std::env::temp_dir().join(format!("vilan_e232_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&entry);
+        document.adopt_analysis(Document::analyze(
+            &text,
+            &std_root(),
+            &entry.join("main.vl"),
+        ));
+        let _ = std::fs::remove_dir_all(&entry);
+        assert_eq!(hint_after(&document, "count").as_deref(), Some(": i32"));
+        assert_eq!(hint_after(&document, "first").as_deref(), Some(": str"));
     }
 
     #[test]

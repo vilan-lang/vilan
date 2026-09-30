@@ -23,9 +23,9 @@ use vilan_core::{
 use vilan_ide::numeric_fix::NumericEdit;
 
 use crate::keystroke::{
-    Anchor, CursorContext, LandedSnapshot, ModuleSymbols, SymbolEntry, SymbolIndex, Verdict,
-    candidates, cursor_context, is_identifier_char, module_name_of, shape_stamp,
-    sort_and_deoverlap, syntax_tokens_in,
+    Anchor, CursorContext, EditTrail, LandedHint, LandedSnapshot, ModuleSymbols, ServedHint,
+    SymbolEntry, SymbolIndex, Verdict, candidates, cursor_context, is_identifier_char,
+    module_name_of, shape_stamp, sort_and_deoverlap, syntax_tokens_in,
 };
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
@@ -948,6 +948,40 @@ pub struct Document {
     /// focused document and the [`RETAINED_PROGRAMS`] most recently focused.
     /// See [`ReleasedTables`] and [`Document::release_analysis`].
     released: Option<Box<ReleasedTables>>,
+    /// F27 R3 (`platform-coloring.md` §8.4 item 2): the items of this file the
+    /// analysis above did NOT collect — the platform-fenced twins its
+    /// platform excludes (`platform_color::select_twins`), as outermost item
+    /// spans in the analyzed text. Empty for a file with no twins, which is
+    /// every file but a handful.
+    twin_fenced_out: Vec<Span>,
+    /// The FURTHER legs' analyses of a file carrying twins, KEPT (R3's Q6,
+    /// ruled: "the editor keeps the second platform's analysis only for files
+    /// with twins"). Every other file's further legs publish their diagnostics
+    /// and are dropped, as E113 built them. A caret request inside a twin this
+    /// analysis fenced out is answered by the leg that admits it
+    /// ([`Document::answering`]). Empty unless `twin_fenced_out` is not.
+    twin_legs: Vec<TwinLeg>,
+}
+
+/// One further leg of a file carrying platform-fenced twins (F27 R3), kept
+/// whole so the twins its platform admits have hover, go-to-definition,
+/// completion, hints and colour — which the primary leg, never having
+/// collected them, cannot give.
+pub struct TwinLeg {
+    /// The items THIS leg does not collect.
+    fenced_out: Vec<Span>,
+    document: Box<Document>,
+}
+
+/// The file's platform-fenced twins that `platform` does not collect — the
+/// same syntactic selection the analyzer makes before it collects anything —
+/// or nothing when the text does not parse or carries no twins.
+fn twins_fenced_out(text: &str, platform: BuildPlatform) -> Vec<Span> {
+    let (tree, _errors) = vilan_core::parsing::parse(text);
+    tree.map(|(items, _)| {
+        vilan_core::platform_color::select_twins(&items, text, platform).fenced_out
+    })
+    .unwrap_or_default()
 }
 
 /// The analyzed `Program` together with the allocations it borrows for
@@ -1657,6 +1691,8 @@ impl Document {
             // Nothing was analyzed, so nothing was released: this document has
             // no tables to fall back to and never claims otherwise (M63).
             released: None,
+            twin_fenced_out: Vec::new(),
+            twin_legs: Vec::new(),
         }
     }
 
@@ -1686,6 +1722,34 @@ impl Document {
     }
 
     fn analyze_on_this_thread(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
+        // Prefer the project's declared platform and source root (the file's role in
+        // its `vilan.toml`); fall back to inferring the platform from imports and
+        // rooting `pkg::` at the file's own directory.
+        //
+        // Timed for the same reason the core pipeline's phases are (E106): this
+        // is not a lookup. `platform_color::file_platforms` walks the loader's
+        // `pkg::` graph from EVERY entry of the manifest until one reaches this
+        // file (E113), and the walk resolves and parses each module it reaches
+        // — per analysis, so per keystroke — while `resolve_dependencies`
+        // re-reads the manifest closure beside it. The core line cannot see any
+        // of it: it starts inside `analyze`.
+        let phase_context_start = vilan_core::PhaseClock::now();
+        let context = resolve_project_context(entry_path, text);
+        let phase_context = phase_context_start.elapsed();
+        Self::analyze_in_context(text, std_dir, entry_path, context, Some(phase_context))
+    }
+
+    /// The analysis proper, under a resolved `context`. `phase_context` is the
+    /// primary leg's context-resolution time; a KEPT twin leg (F27 R3) passes
+    /// `None` — it has no further legs of its own and prints no phase line.
+    fn analyze_in_context(
+        text: &str,
+        std_dir: &Path,
+        entry_path: &Path,
+        mut context: ProjectContext,
+        phase_context: Option<vilan_core::PhaseSpan>,
+    ) -> Self {
+        let primary = phase_context.is_some();
         // A fresh analysis has one snapshot: its text IS both the live and the
         // analyzed one, so both indices share a single `Arc`. They part company
         // only when an edit lands (`set_text`).
@@ -1699,20 +1763,6 @@ impl Document {
             LeakSite::LspEntryText,
             text.len(),
         );
-        // Prefer the project's declared platform and source root (the file's role in
-        // its `vilan.toml`); fall back to inferring the platform from imports and
-        // rooting `pkg::` at the file's own directory.
-        //
-        // Timed for the same reason the core pipeline's phases are (E106): this
-        // is not a lookup. `platform_color::file_platforms` walks the loader's
-        // `pkg::` graph from EVERY entry of the manifest until one reaches this
-        // file (E113), and the walk resolves and parses each module it reaches
-        // — per analysis, so per keystroke — while `resolve_dependencies`
-        // re-reads the manifest closure beside it. The core line cannot see any
-        // of it: it starts inside `analyze`.
-        let phase_context_start = vilan_core::PhaseClock::now();
-        let mut context = resolve_project_context(entry_path, text);
-        let phase_context = phase_context_start.elapsed();
         let manifest_problem = context.manifest_problem.take();
         let manifest_dir = context.manifest_dir.take();
         let unloaded_by_entries = context.unloaded_by_entries.take();
@@ -1843,6 +1893,7 @@ impl Document {
         // process-global and thread-local for the entry pair, and §7.9.4's
         // store gate and macro carve-out keep every global out of the owned
         // modules.
+        let analyzed_platform = program.as_ref().map(|program| program.platform);
         let program =
             unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) };
         let phase_index = phase_index_start.elapsed();
@@ -1851,23 +1902,81 @@ impl Document {
         // user is looking at. Each is a full analysis under that leg's platform
         // whose program is published and then dropped — the diagnostics are all
         // the editor keeps, and hover/goto/completion stay the primary leg's.
+        //
+        // F27 R3 (§8.4 item 2) is the exception: in a file carrying twins,
+        // the twins this leg fenced out are live in another, so those legs'
+        // analyses are KEPT whole — a caret request inside such a twin is
+        // answered by the leg that admits it (`answering`), and its hints and
+        // colour are that leg's (`capture_landed`). A bare file (no project)
+        // gets its twins' legs here too, over the platform the analysis
+        // inferred, exactly as `vilan check <file>` adds them.
         let phase_legs_start = vilan_core::PhaseClock::now();
-        let shared_diagnostics = context
-            .shared_platforms
-            .iter()
-            .flat_map(|platform| {
-                Self::diagnostics_under(
-                    text,
-                    &std,
-                    &pkg_root,
-                    entry_path,
-                    *platform,
-                    // Each leg gets its own E119 reason: a shared module's miss
-                    // under the browser leg is explained by the browser leg.
-                    &context.workspace_for(*platform),
-                )
-            })
-            .collect();
+        let twin_fenced_out = match (primary, analyzed_platform) {
+            (true, Some(platform)) => twins_fenced_out(text, platform),
+            _ => Vec::new(),
+        };
+        let mut shared_diagnostics: Vec<PublishedDiagnostic> = Vec::new();
+        let mut twin_legs: Vec<TwinLeg> = Vec::new();
+        if twin_fenced_out.is_empty() {
+            shared_diagnostics = context
+                .shared_platforms
+                .iter()
+                .flat_map(|platform| {
+                    Self::diagnostics_under(
+                        text,
+                        &std,
+                        &pkg_root,
+                        entry_path,
+                        *platform,
+                        // Each leg gets its own E119 reason: a shared module's
+                        // miss under the browser leg is explained by the
+                        // browser leg.
+                        &context.workspace_for(*platform),
+                    )
+                })
+                .collect();
+        } else {
+            let mut legs: Vec<(BuildPlatform, BuildWorkspace)> = context
+                .shared_platforms
+                .iter()
+                .map(|platform| (*platform, context.workspace_for(*platform)))
+                .collect();
+            if context.platform.is_none()
+                && let Some(inferred) = analyzed_platform
+            {
+                for (platform, fence) in vilan_core::platform_color::twin_legs(text, &[inferred]) {
+                    let mut workspace = context.workspace.clone();
+                    workspace.platform_reason = Some(
+                        vilan_core::platform_color::PlatformReason::Twin(fence.clone()).clause(),
+                    );
+                    workspace.platform_kind =
+                        Some(vilan_core::platform_color::PlatformReason::Twin(fence).kind());
+                    legs.push((platform, workspace));
+                }
+            }
+            for (platform, workspace) in legs {
+                let leg_context = ProjectContext {
+                    platform: Some(platform),
+                    pkg_root: context.pkg_root.clone(),
+                    workspace,
+                    ..ProjectContext::none()
+                };
+                let document =
+                    Self::analyze_in_context(text, std_dir, entry_path, leg_context, None);
+                shared_diagnostics.extend(publish(
+                    document.program.as_ref(),
+                    &document.diagnostics,
+                    &document.diagnostic_sources,
+                    &document.warnings,
+                    &document.warning_sources,
+                ));
+                twin_legs.push(TwinLeg {
+                    fenced_out: twins_fenced_out(text, platform),
+                    document: Box::new(document),
+                });
+            }
+        }
+        let legs_count = context.shared_platforms.len().max(twin_legs.len());
         let phase_legs = phase_legs_start.elapsed();
         let mut document = Document {
             // A fresh analysis IS the analyzed text: the map is identity.
@@ -1904,6 +2013,8 @@ impl Document {
             // A fresh analysis holds its program (M63); the server releases it
             // later, if this document is not one of the focused few.
             released: None,
+            twin_fenced_out,
+            twin_legs,
         };
         // E121: the keystroke path's whole-program walk, paid HERE — once per
         // analysis, on the analysis thread — instead of once per request on
@@ -1932,16 +2043,13 @@ impl Document {
         // outside the only line that could see it. `lsp-landed` is that walk,
         // and it is on the line now for the same reason `lsp-index` is: a cost
         // nobody prints is a cost nobody budgets (N43's rule).
-        if vilan_core::phase_timing_enabled() {
+        if let Some(phase_context) = phase_context
+            && vilan_core::phase_timing_enabled()
+        {
             eprintln!(
                 "[vilan phase] lsp-context {} lsp-analyze {} lsp-index {} \
                  lsp-landed {} lsp-legs {} legs {}",
-                phase_context,
-                phase_analyze,
-                phase_index,
-                phase_landed,
-                phase_legs,
-                context.shared_platforms.len(),
+                phase_context, phase_analyze, phase_index, phase_landed, phase_legs, legs_count,
             );
         }
         document
@@ -1953,11 +2061,14 @@ impl Document {
         if !self.program.is_some() {
             return LandedSnapshot::default();
         }
+        let mut tokens = self.semantic_tokens();
+        let mut hints = self.landed_hints();
+        self.merge_twin_answers(&mut tokens, &mut hints);
         let mut landed = LandedSnapshot {
             stamp: shape_stamp(self.analyzed_text()),
-            tokens: self.semantic_tokens(),
+            tokens,
             token_lines: Vec::new(),
-            hints: self.inlay_hints(),
+            hints,
             index: self.landed_symbol_index(entry_path),
             landed: true,
         };
@@ -2396,6 +2507,11 @@ impl Document {
         // analyzed snapshot is broken until the next analysis lands.
         self.live_edits = None;
         self.refresh_keystroke_index();
+        // F27 R3: a kept leg answers requests about this buffer, so it holds
+        // the same live text.
+        for leg in &mut self.twin_legs {
+            leg.document.set_text(text);
+        }
     }
 
     /// Apply one LSP content change to the LIVE snapshot: a ranged event
@@ -2423,6 +2539,11 @@ impl Document {
             });
         }
         self.refresh_keystroke_index();
+        // F27 R3: the kept legs follow the same edit, so a request routed to
+        // one reads the buffer on screen.
+        for leg in &mut self.twin_legs {
+            leg.document.apply_change(Some(range), replacement);
+        }
     }
 
     /// E121 §2.1.4: bring the edited module's entry in the symbol index back to
@@ -2672,7 +2793,19 @@ impl Document {
             // released tables are always absent — and THIS document's are
             // cleared below, by the program arriving.
             released: _,
+            twin_fenced_out,
+            mut twin_legs,
         } = analysis;
+        // F27 R3: the kept legs are the analysis side too, and they were built
+        // over the ANALYZED text; bring each leg's live side to this
+        // document's, so a request routed to one reads the buffer on screen.
+        for leg in &mut twin_legs {
+            if leg.document.text != self.text {
+                leg.document.set_text(&self.text);
+            }
+        }
+        self.twin_fenced_out = twin_fenced_out;
+        self.twin_legs = twin_legs;
         // The analysis side, in full. `program` is the pair of the new
         // program and the allocations it borrows; assigning it drops the
         // OUTGOING pair — its program first, then its entry text and tree are
@@ -2802,6 +2935,9 @@ impl Document {
         // overlay-served module copies (`AnalyzedProgram`'s `Drop`, the same
         // reclaim `adopt_analysis` takes for a superseded analysis).
         self.program = AnalyzedProgram::none();
+        // F27 R3's kept legs are caret-request tables for exactly the focused
+        // documents, so they go with the program; a refocus re-analyzes.
+        self.twin_legs.clear();
         true
     }
 
@@ -3605,6 +3741,22 @@ impl Document {
                 signature.push_str(&format!(" = {value}"));
             }
             let mut out = format!("```vilan\n{signature}\n```");
+            // E227 (Q5): the abbreviation beneath the full type, when the inlay
+            // hint shows one — outside the fence, because the fence is vilan
+            // and `~` is not. The reader who wonders what the hint means
+            // hovers the name, and learns the mapping here.
+            if let Some(hint) = program.hint_labels.get(&binding) {
+                let hosts = hint
+                    .hosts
+                    .iter()
+                    .map(|host| format!("`{host}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "\n\nShown as `{}` (`[hint]` on {hosts})",
+                    hint.label
+                ));
+            }
             if let Some(docs) = self.analysis(program).doc_comment_of(binding) {
                 out.push_str("\n\n");
                 out.push_str(&docs);
@@ -3864,17 +4016,152 @@ impl Document {
 
     /// The innermost type reference under `offset` in the open file, as
     /// `(definition id, label)`.
+    /// F27 R3 (§8.4 item 2): the analysis that answers a caret request at
+    /// ANALYZED `offset` — this one, unless the offset lies inside a twin this
+    /// analysis fenced out, where it is the kept leg that admits that twin.
+    /// Every leg analyzed the same text, so an offset means the same byte in
+    /// each.
+    pub fn answering(&self, offset: usize) -> &Document {
+        let Some(twin) = self
+            .twin_fenced_out
+            .iter()
+            .find(|span| span.start <= offset && offset <= span.end)
+        else {
+            return self;
+        };
+        self.twin_legs
+            .iter()
+            .find(|leg| !leg.fenced_out.contains(twin))
+            .map_or(self, |leg| &leg.document)
+    }
+
+    /// Go-to-definition across the legs (F27 R3, §8.4 item 4): the answering
+    /// analysis's definition first, then every OTHER leg's that admits the
+    /// position and lands somewhere else — a call to a twin function names
+    /// the twin each platform compiles. Each answer carries the analysis it
+    /// came from, whose program names its `SourceId`. A file with no twins
+    /// answers exactly [`definition`](Self::definition)'s one location.
+    pub fn definitions(&self, offset: usize) -> Vec<(&Document, SourceId, Span)> {
+        let answering = self.answering(offset);
+        let mut found: Vec<(&Document, SourceId, Span)> = Vec::new();
+        let mut seen: Vec<(Option<PathBuf>, Span)> = Vec::new();
+        let others = std::iter::once(self)
+            .chain(self.twin_legs.iter().map(|leg| &*leg.document))
+            .filter(|analysis| !std::ptr::eq(*analysis, answering));
+        for analysis in std::iter::once(answering).chain(others) {
+            // A leg that fenced the position out has nothing to say about it.
+            if analysis
+                .twin_fenced_out_of(self)
+                .iter()
+                .any(|span| span.start <= offset && offset <= span.end)
+            {
+                continue;
+            }
+            let Some((source, span)) = analysis.definition(offset) else {
+                continue;
+            };
+            let place = (
+                (source != SourceId(0))
+                    .then(|| {
+                        analysis
+                            .program
+                            .as_ref()
+                            .and_then(|program| program.source_path(source))
+                            .map(Path::to_path_buf)
+                    })
+                    .flatten(),
+                span,
+            );
+            if !seen.contains(&place) {
+                seen.push(place);
+                found.push((analysis, source, span));
+            }
+        }
+        found
+    }
+
+    /// The items `self` fenced out, where `self` is `primary` or one of its
+    /// kept legs.
+    fn twin_fenced_out_of<'a>(&'a self, primary: &'a Document) -> &'a [Span] {
+        if std::ptr::eq(self, primary) {
+            return &primary.twin_fenced_out;
+        }
+        primary
+            .twin_legs
+            .iter()
+            .find(|leg| std::ptr::eq(&*leg.document, self))
+            .map_or(&[], |leg| &leg.fenced_out)
+    }
+
+    /// F27 R3 (§8.4 items 2–3): inside a twin this analysis fenced out, the
+    /// colour and the hints are the admitting leg's — the twin is live there,
+    /// and this analysis, never having collected it, has neither to give.
+    fn merge_twin_answers(
+        &self,
+        tokens: &mut Vec<(Span, TokenKind, u32)>,
+        hints: &mut Vec<LandedHint>,
+    ) {
+        if self.twin_fenced_out.is_empty() {
+            return;
+        }
+        let inside = |twin: &Span, span: &Span| twin.start <= span.start && span.end <= twin.end;
+        for twin in &self.twin_fenced_out {
+            let Some(leg) = self
+                .twin_legs
+                .iter()
+                .find(|leg| !leg.fenced_out.contains(twin))
+            else {
+                continue;
+            };
+            tokens.retain(|(span, ..)| !inside(twin, span));
+            tokens.extend(
+                leg.document
+                    .landed
+                    .tokens
+                    .iter()
+                    .filter(|(span, ..)| inside(twin, span))
+                    .cloned(),
+            );
+            hints.retain(|hint| !inside(twin, &hint.name));
+            hints.extend(
+                leg.document
+                    .landed
+                    .hints
+                    .iter()
+                    .filter(|hint| inside(twin, &hint.name))
+                    .cloned(),
+            );
+        }
+        tokens.sort_by_key(|(span, ..)| (span.start, span.end));
+        hints.sort_by_key(|hint| hint.name.end);
+    }
+
     /// Inlay type hints: `: T` after each UNANNOTATED binding whose type
     /// resolved — inference made a decision the source doesn't show, so the
     /// editor shows it in place. Sorted by position.
+    ///
+    /// The point-and-label view the pins read; the server serves the landed
+    /// capture ([`landed_hints`](Self::landed_hints)) through the keystroke
+    /// path, so this is compiled with the tests.
+    #[cfg(test)]
     pub fn inlay_hints(&self) -> Vec<(usize, String)> {
+        self.landed_hints()
+            .into_iter()
+            .map(|hint| (hint.name.end, hint.label))
+            .collect()
+    }
+
+    /// [`inlay_hints`](Self::inlay_hints) with the binding NAME each hint
+    /// follows — what the landed snapshot keeps, so a hint can follow the
+    /// edits after it (E232).
+    pub fn landed_hints(&self) -> Vec<LandedHint> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
         // The same hoist as `semantic_tokens`, for the same reason and over the
         // same whole-program table (M27/M58).
         let source_of = program.source_lookup();
-        let mut hints: Vec<(usize, String)> = Vec::new();
+        let mut hints: Vec<LandedHint> = Vec::new();
         for (id, variable) in &program.variables {
             if variable.annotated || source_of.of(*id) != Some(SourceId(0)) {
                 continue;
@@ -3885,13 +4172,20 @@ impl Document {
             if label.is_empty() || label == "?" || label.contains("Unknown") {
                 continue;
             }
-            let range = variable.name_span.into_range();
-            if range.is_empty() {
+            if variable.name_span.into_range().is_empty() {
                 continue;
             }
-            hints.push((range.end, format!(": {label}")));
+            hints.push(LandedHint {
+                name: variable.name_span,
+                label: format!(": {label}"),
+                // E227: the abbreviated form, where a `[hint]` gave one.
+                abbreviated: program
+                    .hint_labels
+                    .get(id)
+                    .map(|hint| format!(": {}", hint.label)),
+            });
         }
-        hints.sort();
+        hints.sort_by_key(|hint| hint.name.end);
         hints
     }
 
@@ -4346,14 +4640,31 @@ impl Document {
             - self.analyzed_index.position(analyzed_suffix_start).line as i64
     }
 
-    /// Inlay hints for the LIVE buffer, in LIVE coordinates — Q1/Q4's ruling:
-    /// re-mapped through the anchor, withheld inside the edit window, served
-    /// unchanged rather than flickered off when stale, withheld entirely when
-    /// no anchor survives.
+    /// Inlay hints for the LIVE buffer, in LIVE coordinates: every landed hint
+    /// follows the edits since its analysis (E232 — the edited line's hints
+    /// stay in place instead of jumping), served unchanged rather than
+    /// flickered off when stale, withheld entirely when no anchor survives.
+    #[cfg(test)]
     pub fn keystroke_hints(&self, dependency_moved: bool) -> Vec<(usize, String)> {
-        let anchor = self.keystroke_anchor();
+        self.keystroke_hints_served(dependency_moved, false)
+            .into_iter()
+            .map(|hint| (hint.offset, hint.label))
+            .collect()
+    }
+
+    /// [`keystroke_hints`](Self::keystroke_hints) as the handler serves them:
+    /// with `abbreviate` (`vilan.inlayHints.abbreviate`, E227) a hinted node's
+    /// abbreviated label, carrying the full type for the hint's tooltip. Both
+    /// forms are in the landed capture, so the setting switches live, with no
+    /// re-analysis.
+    pub fn keystroke_hints_served(
+        &self,
+        dependency_moved: bool,
+        abbreviate: bool,
+    ) -> Vec<ServedHint> {
         let verdict = self.keystroke_verdict(dependency_moved);
-        self.landed.hints_for(&anchor, verdict)
+        let trail = EditTrail::of(self.live_edits.as_deref(), self.analyzed_text(), &self.text);
+        self.landed.hints_for(&trail, verdict, abbreviate)
     }
 
     /// Completion candidates at a LIVE `offset`, answered from the symbol
@@ -29026,5 +29337,408 @@ mod m85_field_hover_cost {
              {growth:.0}× the fields · load={load}",
             profile()
         );
+    }
+}
+
+/// F27 R3's editor half (`platform-coloring.md` §8.4 items 2–4, R3's Q6 as
+/// ruled): a file carrying platform-fenced twins keeps its further legs'
+/// analyses, and a caret request inside a twin the primary leg fenced out is
+/// answered by the leg that admits it.
+#[cfg(test)]
+mod twin_routing_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// A bare file: its primary leg is the inferred `node`, so the BROWSER twin
+    /// is the one it fences out — and the one only a kept leg can answer for.
+    const TWINS: &str = "[platform(\"browser\")]\n\
+         fun place(): str {\n\tlet spot = \"browser\";\n\tspot\n}\n\n\
+         [platform(\"@process\")]\n\
+         fun place(): str {\n\tlet count = 7;\n\ti\"process {count}\"\n}\n\n\
+         fun main() {\n\tprint(place());\n}\n";
+
+    fn analyzed(tag: &str, text: &str, manifest: Option<&str>) -> (PathBuf, Document) {
+        let directory =
+            std::env::temp_dir().join(format!("vilan_f27_twins_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch package");
+        if let Some(manifest) = manifest {
+            std::fs::write(directory.join("vilan.toml"), manifest).expect("the manifest");
+        }
+        let entry = directory.join("src/main.vl");
+        std::fs::write(&entry, text).expect("the file");
+        let document = Document::analyze(text, &std_root(), &entry);
+        (directory, document)
+    }
+
+    fn at(text: &str, needle: &str) -> usize {
+        text.find(needle).expect("the needle")
+    }
+
+    #[test]
+    fn hover_inside_the_fenced_out_twin_is_the_admitting_legs() {
+        let (directory, document) = analyzed("hover", TWINS, None);
+        let offset = at(TWINS, "spot =") + 1;
+        assert_eq!(
+            document.hover(offset),
+            None,
+            "the primary leg never collected the browser twin — the premise"
+        );
+        let hover = document.answering(offset).hover(offset).unwrap_or_default();
+        assert!(hover.contains("let spot: str"), "{hover:?}");
+        // The twin the primary admits is still the primary's own.
+        let count = at(TWINS, "count =") + 1;
+        assert!(std::ptr::eq(document.answering(count), &document));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_call_to_a_twin_goes_to_both_the_answering_legs_first() {
+        let (directory, document) = analyzed("goto", TWINS, None);
+        let offset = at(TWINS, "place());") + 1;
+        let targets: Vec<usize> = document
+            .definitions(offset)
+            .into_iter()
+            .map(|(_, source, span)| {
+                assert_eq!(source, SourceId(0), "both twins are in this file");
+                span.start
+            })
+            .collect();
+        let browser = at(TWINS, "place(): str {\n\tlet spot");
+        let process = at(TWINS, "place(): str {\n\tlet count");
+        assert_eq!(targets, vec![process, browser], "the primary's twin first");
+        // A name every leg resolves alike still answers once.
+        let print = at(TWINS, "print(") + 1;
+        assert!(document.definitions(print).len() <= 1);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn completion_inside_the_fenced_out_twin_offers_its_members() {
+        let (directory, mut document) = analyzed("complete", TWINS, None);
+        // Type `spot.` inside the browser twin, as the editor sends it.
+        let end = at(TWINS, "\tspot\n}") + "\tspot".len();
+        let range = tower_lsp::lsp_types::Range::new(
+            document.line_index.position(end),
+            document.line_index.position(end),
+        );
+        document.apply_change(Some(range), ".");
+        let live = end + 1;
+        let answering =
+            document.answering(document.analyzed_offset(document.line_index.position(live)));
+        let labels: Vec<String> = answering
+            .keystroke_completion(live, false)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "len"),
+            "a `str`'s members, from the leg that knows `spot`: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn hints_and_colour_inside_the_fenced_out_twin_are_the_admitting_legs() {
+        let (directory, document) = analyzed("paint", TWINS, None);
+        let spot_end = at(TWINS, "spot =") + "spot".len();
+        let hints = document.keystroke_hints(false);
+        assert!(
+            hints
+                .iter()
+                .any(|(offset, label)| *offset == spot_end && label == ": str"),
+            "the browser twin's binding is hinted: {hints:?}"
+        );
+        let count_end = at(TWINS, "count =") + "count".len();
+        assert!(
+            hints
+                .iter()
+                .any(|(offset, label)| *offset == count_end && label == ": i32"),
+            "{hints:?}"
+        );
+        let spot = at(TWINS, "spot =");
+        let tokens = document.keystroke_tokens(false);
+        assert!(
+            tokens
+                .iter()
+                .any(|(span, kind, _)| span.start == spot && *kind == TokenKind::Variable),
+            "the browser twin's local is coloured: {tokens:?}"
+        );
+        // And nothing grays or squiggles it: it is live in its own leg.
+        assert!(
+            document
+                .published_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.path.is_some()),
+            "a twin file that compiles on both legs publishes nothing on itself: {:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_package_file_keeps_its_twin_leg_and_routes_to_it() {
+        // A browser package: the PROCESS twin is the fenced-out one here.
+        let (directory, document) = analyzed(
+            "package",
+            TWINS,
+            Some("[package]\nname = \"app\"\ntarget = \"browser\"\n"),
+        );
+        let offset = at(TWINS, "count =") + 1;
+        assert_eq!(document.hover(offset), None, "the premise");
+        let hover = document.answering(offset).hover(offset).unwrap_or_default();
+        assert!(hover.contains("let count: i32"), "{hover:?}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_file_without_twins_keeps_no_leg() {
+        let text = "fun main() {\n\tlet spot = 1;\n}\n";
+        let (directory, document) = analyzed("plain", text, None);
+        assert!(document.twin_legs.is_empty() && document.twin_fenced_out.is_empty());
+        let offset = at(text, "spot") + 1;
+        assert!(std::ptr::eq(document.answering(offset), &document));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_kept_legs_follow_the_live_text_and_go_with_a_release() {
+        let (directory, mut document) = analyzed("lifecycle", TWINS, None);
+        assert_eq!(document.twin_legs.len(), 1, "one further leg: browser");
+        document.set_text(&format!("// edited\n{TWINS}"));
+        assert!(
+            document
+                .twin_legs
+                .iter()
+                .all(|leg| leg.document.text == document.text)
+        );
+        assert!(document.release_analysis());
+        assert!(
+            document.twin_legs.is_empty(),
+            "released with the program (M63)"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E227 (`proposal/inlay-hint-abbreviation.md` §7, ruled R-d): a type shown
+/// by the trait it is used as, in the inlay hint only.
+#[cfg(test)]
+mod hint_abbreviation_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    fn analyzed(tag: &str, text: &str) -> (PathBuf, Document) {
+        let directory =
+            std::env::temp_dir().join(format!("vilan_e227_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let entry = directory.join("main.vl");
+        let document = Document::analyze(text, &std_root(), &entry);
+        (directory, document)
+    }
+
+    /// The served hint after `name`'s first occurrence, abbreviated.
+    fn served(document: &Document, text: &str, name: &str) -> Option<ServedHint> {
+        let at = text.find(name)? + name.len();
+        document
+            .keystroke_hints_served(false, true)
+            .into_iter()
+            .find(|hint| hint.offset == at)
+    }
+
+    const NODES: &str = "import std::reactive::{ Flow, Pipe, SignalCell, Source, combine };\n\n\
+         fun main() {\n\
+         \tlet names = SignalCell::new([\"a\", \"b\"]);\n\
+         \tlet index = SignalCell::new(0usize);\n\
+         \tlet selected = combine((names, index)).derive(|(list, at)| list.get(at));\n\
+         \tlet pair = (combine((names, index)).derive(|(list, at)| list.get(at)), 3);\n\
+         \tlet sealed = combine((names, index)).memo();\n\
+         \tlet taken = [1, 2, 3, 4].iter().map(|x| x * 2).filter(|x| x > 2).take(1);\n\
+         \tlet cell = SignalCell::new(1);\n\
+         \tlet numbers = [1, 2];\n\
+         \tprint(i\"{selected.sample()} {pair.1} {sealed.get().1} {taken.count()} {cell.get()} {numbers.len()}\");\n\
+         }\n";
+
+    #[test]
+    fn inlay_hint_abbreviates_a_hinted_node() {
+        let (directory, document) = analyzed("node", NODES);
+        let hint = served(&document, NODES, "selected").expect("a hint on `selected`");
+        assert_eq!(hint.label, ": ~Pipe<Option<str>>");
+        assert_eq!(
+            hint.full.as_deref(),
+            Some(": Derive<Combine<(List<str>, usize)>, (List<str>, usize), Option<str>>"),
+            "the full type rides along, for the tooltip"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn inlay_hint_abbreviates_a_nested_node_inside_a_tuple() {
+        let (directory, document) = analyzed("nested", NODES);
+        let hint = served(&document, NODES, "pair").expect("a hint on `pair`");
+        assert_eq!(hint.label, ": (~Pipe<Option<str>>, i32)");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// tracking-44's tracked `derive(|| ..)` is a pipe stage like any other,
+    /// and collections-44's stages and seal show as the collection traits
+    /// they are: `.coll()` as `~CollPipe<T>`, `.memo()`'s `ListMemo` as
+    /// `~CollSource<T>`.
+    #[test]
+    fn inlay_hint_abbreviates_tracked_and_collection_stages() {
+        let text = "import std::option::Option::{ self, None, Some };\n\
+             import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, comp, derive };\n\n\
+             fun main() {\n\
+             \tlet a = SignalCell::new(1);\n\
+             \tlet tracked = derive(|| a.track() + 1);\n\
+             \tlet fetched: SignalCell<List<i32>> = Signal::new([1, 2, 3]);\n\
+             \tlet kept = fetched.coll();\n\
+             \tlet (evens, scope) = comp(|| fetched.coll().filter(|n| n % 2 == 0).memo());\n\
+             \tprint(i\"{tracked.sample()} {evens.get().len()}\");\n\
+             \tscope.dispose();\n}\n";
+        let (directory, document) = analyzed("tracked_coll", text);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the fixture compiles: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| error.msg.clone())
+                .collect::<Vec<_>>()
+        );
+        let label = |name: &str| served(&document, text, name).map(|hint| hint.label);
+        assert_eq!(label("tracked").as_deref(), Some(": ~Pipe<i32>"));
+        assert_eq!(label("kept").as_deref(), Some(": ~CollPipe<i32>"));
+        assert_eq!(label("evens").as_deref(), Some(": ~CollSource<i32>"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// `.transient()`'s seal (A142 S3) is shown as the `TransientSource` it
+    /// is — the trait that carries `state()`, `latest()` and `is_pending()`,
+    /// which a bare `~Source<Option<T>>` would hide.
+    #[test]
+    fn inlay_hint_abbreviates_a_transient_seal_as_its_transient_source() {
+        let text = "import std::reactive::{ Flow, Pipe, SignalCell, Source };\n\
+             import std::transient::{ Transient, TransientSource };\n\n\
+             async fun double(x: i32): i32 {\n\tx * 2\n}\n\n\
+             fun main() {\n\tlet id = SignalCell::new(1);\n\
+             \tlet loaded = id.derive(|x: i32| async double(x)).transient();\n\
+             \tprint(i\"{loaded.get()}\");\n}\n";
+        let (directory, document) = analyzed("transient", text);
+        let hint = served(&document, text, "loaded").expect("a hint on `loaded`");
+        assert_eq!(hint.label, ": ~TransientSource<i32, str>");
+        assert_eq!(hint.full.as_deref(), Some(": Transient<i32, str>"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A SEALED face (A142 R11): `.memo()` hands back a `MemoCell`, shown
+    /// as the `Source` it is.
+    #[test]
+    fn inlay_hint_abbreviates_a_sealed_memo_as_its_source() {
+        let (directory, document) = analyzed("sealed", NODES);
+        let hint = served(&document, NODES, "sealed").expect("a hint on `sealed`");
+        assert_eq!(hint.label, ": ~Source<(List<str>, usize)>");
+        assert_eq!(hint.full.as_deref(), Some(": MemoCell<(List<str>, usize)>"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn inlay_hint_abbreviates_an_iterator_adapter_chain() {
+        let (directory, document) = analyzed("iterator", NODES);
+        let hint = served(&document, NODES, "taken").expect("a hint on `taken`");
+        assert_eq!(hint.label, ": ~Iterator<i32>");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn inlay_hint_leaves_an_unhinted_type_whole() {
+        let (directory, document) = analyzed("whole", NODES);
+        for (name, full) in [("cell", ": SignalCell<i32>"), ("numbers", ": List<i32>")] {
+            let hint = served(&document, NODES, name).expect("a hint");
+            assert_eq!(hint.label, full, "{name}");
+            assert_eq!(hint.full, None, "{name}: nothing abbreviated, no tooltip");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+        // A program that names no hinted type has an EMPTY table.
+        let plain = "import std::reactive::{ SignalCell, Source };\n\nfun main() {\n\tlet cell = SignalCell::new(1);\n\tprint(i\"{cell.get()}\");\n}\n";
+        let (directory, document) = analyzed("plain", plain);
+        let program = document.program.as_ref().expect("a program");
+        assert!(program.hint_labels.is_empty(), "{:?}", program.hint_labels);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_setting_off_serves_every_hint_whole() {
+        let (directory, document) = analyzed("off", NODES);
+        let at = NODES.find("selected").unwrap() + "selected".len();
+        let hint = document
+            .keystroke_hints_served(false, false)
+            .into_iter()
+            .find(|hint| hint.offset == at)
+            .expect("a hint");
+        assert_eq!(
+            hint.label,
+            ": Derive<Combine<(List<str>, usize)>, (List<str>, usize), Option<str>>"
+        );
+        assert_eq!(hint.full, None);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn hover_shows_both_forms_and_only_when_they_differ() {
+        let (directory, document) = analyzed("hover", NODES);
+        let hover = document
+            .hover(NODES.find("selected").unwrap() + 1)
+            .expect("a hover");
+        assert!(
+            hover.contains(
+                "let selected: Derive<Combine<(List<str>, usize)>, (List<str>, usize), Option<str>>"
+            ),
+            "the fence keeps the full type: {hover}"
+        );
+        assert!(
+            hover.contains("Shown as `~Pipe<Option<str>>` (`[hint]` on `Derive`)"),
+            "{hover}"
+        );
+        let plain = document
+            .hover(NODES.find("cell =").unwrap() + 1)
+            .expect("a hover");
+        assert!(!plain.contains("Shown as"), "{plain}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A package author's own lever, and Q3's rule: the abbreviation is
+    /// admitted PER INSTANTIATION. `Node`'s impl provides `Stream<U>` only over
+    /// a `Stream` upstream, so a `Node` over an `i32` — a value the struct
+    /// admits and the impl does not — hints its full type: the abbreviation
+    /// never promises what the value lacks.
+    #[test]
+    fn an_instantiation_the_impl_does_not_admit_hints_its_full_type() {
+        let text = "trait Stream<T> {\n\tfun peek(self): T;\n}\n\n\
+             struct Cell<T> {\n\tvalue: T,\n}\n\n\
+             impl Cell<type T> with Stream<T> {\n\tfun peek(self): T {\n\t\tself.value\n\t}\n}\n\n\
+             [hint(Stream<U>)]\n\
+             struct Node<S, T, U> {\n\tup: S,\n\tstep: |T| U,\n}\n\n\
+             impl Node<type S: Stream<type T>, T, type U> with Stream<U> {\n\
+             \tfun peek(self): U {\n\t\t(self.step)(self.up.peek())\n\t}\n}\n\n\
+             fun main() {\n\
+             \tlet streamed = Node { up = Cell { value = 2 }, step = |x: i32| x > 1 };\n\
+             \tlet stranded = Node { up = 5, step = |x: i32| x > 1 };\n\
+             \tprint(i\"{streamed.peek()} {stranded.up}\");\n}\n";
+        let (directory, document) = analyzed("admission", text);
+        let streamed = served(&document, text, "streamed").expect("a hint");
+        assert_eq!(streamed.label, ": ~Stream<bool>");
+        let stranded = served(&document, text, "stranded").expect("a hint");
+        assert_eq!(
+            stranded.label, ": Node<i32, i32, bool>",
+            "not admitted: the full type, never a claim the value cannot keep"
+        );
+        assert_eq!(stranded.full, None);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

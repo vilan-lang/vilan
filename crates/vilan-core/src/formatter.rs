@@ -5304,6 +5304,13 @@ impl<'src> Printer<'src> {
             self.out.push_str("\")]");
             self.end_attribute_line();
         }
+        // E227: the hint's argument is a type, printed as every type is.
+        for hint in &labels.hint {
+            self.out.push_str("[hint(");
+            self.print_type(&hint.0.0);
+            self.out.push_str(")]");
+            self.end_attribute_line();
+        }
         if !labels.platform.is_empty() {
             self.print_platform_attribute(&labels.platform);
             self.end_attribute_line();
@@ -9127,6 +9134,27 @@ mod idempotency {
             "the canonical spelling reprints byte-identically"
         );
         assert_fixed_point("internal_e221", source);
+    }
+
+    #[test]
+    fn a_hint_label_survives_the_reprint_in_its_place_in_the_prefix() {
+        // E227: the argument is a TYPE, printed as types are, between
+        // `[internal]` and `[platform]` — the prefix's order.
+        let source = concat!(
+            "export [hint(Source<U>)]\n",
+            "struct Map<S, T, U> {\n\tup: S,\n}\n\n",
+            "[internal(\"a node\")]\n",
+            "[hint(Iterator<(usize, T)>)]\n",
+            "[resource] struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
+            "[hint(Source<Option<T>>)]\n",
+            "enum Maybe<T> {\n\tSome(T),\n\tNone,\n}\n",
+        );
+        let formatted = format(source);
+        assert_eq!(
+            formatted, source,
+            "the canonical spelling reprints byte-identically"
+        );
+        assert_fixed_point("hint_e227", source);
     }
 }
 

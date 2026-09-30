@@ -8402,3 +8402,87 @@ fn a_bound_binder_grounds_from_the_most_specific_provider() {
         "true\nwrapped\ntrue\nplain\n",
     );
 }
+
+// --- E227: `[hint(Trait<..>)]`, the declaration checks ------------------------
+//
+// The attribute names the trait application a struct or an enum is SHOWN as
+// in an inlay hint (`proposal/inlay-hint-abbreviation.md` §3.2). Every check
+// is a refusal with a steer, and none is a warning; a well-formed hint changes
+// nothing a program means.
+
+/// The shared shape: a node over an upstream, and the impl that provides
+/// `Stream<U>` only when the upstream is a stream — CONDITIONAL, as every std
+/// node's is. The declaration check is structural, so the bound does not stand
+/// in its way.
+const HINTED_NODE: &str = "trait Stream<T> {\n\tfun peek(self): T;\n}\n\n\
+    struct Cell<T> {\n\tvalue: T,\n}\n\n\
+    impl Cell<type T> with Stream<T> {\n\tfun peek(self): T {\n\t\tself.value\n\t}\n}\n\n\
+    [hint(Stream<U>)]\n\
+    struct Node<S, T, U> {\n\tup: S,\n\tstep: |T| U,\n}\n\n\
+    impl Node<type S: Stream<type T>, T, type U> with Stream<U> {\n\
+    \tfun peek(self): U {\n\t\t(self.step)(self.up.peek())\n\t}\n}\n";
+
+#[test]
+fn e227_a_hint_naming_an_implemented_trait_application_compiles() {
+    assert_compiles(&format!(
+        "{HINTED_NODE}\nfun main() {{\n\tlet cell = Cell {{ value = 2 }};\n\
+         \tlet node = Node {{ up = cell, step = |x: i32| x + 1 }};\n\tprint(node.peek());\n}}\n"
+    ));
+}
+
+#[test]
+fn e227_a_hint_no_impl_provides_is_refused() {
+    // `Source<T>` — the upstream's type, not the node's: the mistake the item's
+    // own first sketch made (`Signal` for `Map`) in another shape.
+    assert_fails_once_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(Stream<T>)]"),
+        "`[hint(Stream<T>)]`: no impl of `Stream<T>` for `Node<S, T, U>`",
+    );
+}
+
+#[test]
+fn e227_a_hint_that_is_not_a_trait_application_is_refused() {
+    assert_fails_once_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(List<U>)]"),
+        "`[hint(List<U>)]` must name a trait application",
+    );
+}
+
+#[test]
+fn e227_a_hint_naming_a_free_type_is_refused_at_the_name() {
+    assert_fails_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(Stream<Missing>)]"),
+        "Missing",
+    );
+}
+
+#[test]
+fn e227_two_hints_on_one_declaration_are_refused() {
+    assert_fails_once_with(
+        &HINTED_NODE.replace("[hint(Stream<U>)]", "[hint(Stream<U>)]\n[hint(Stream<U>)]"),
+        "`Node` carries more than one `[hint(..)]`",
+    );
+}
+
+#[test]
+fn e227_a_hint_on_a_trait_a_binding_or_an_impl_is_refused() {
+    for (written, kind) in [
+        (
+            "[hint(Source<i32>)]\ntrait Named {\n\tfun name(self): str;\n}\n",
+            "a trait is not a type",
+        ),
+        (
+            "[hint(Source<i32>)]\nlet shared = 3;\n",
+            "a module binding is not a type",
+        ),
+        (
+            "struct Plain {\n\tat: i32,\n}\n\n[hint(Source<i32>)]\nimpl Plain {\n\tfun at(self): i32 {\n\t\tself.at\n\t}\n}\n",
+            "an `impl` block is not a type",
+        ),
+    ] {
+        assert_fails_once_with(
+            &format!("import std::reactive::Source;\n\n{written}\nfun main() {{}}\n"),
+            kind,
+        );
+    }
+}

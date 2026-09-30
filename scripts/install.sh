@@ -5,10 +5,13 @@
 #   curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh
 #
 # Idempotent: re-running it updates in place. It touches the install
-# directory and, when VS Code is on this machine, its extensions: the release's
-# `vilan-vscode.vsix` is installed alongside the toolchain (E229), because an
-# editor extension older than its language server silently lacks what the
-# server's release notes promise. Opt out with VILAN_NO_VSCODE=1, or a flag:
+# directory and, when VS Code is on this machine, its extensions: the Vilan
+# extension is installed alongside the toolchain (E229), because an editor
+# extension older than its language server silently lacks what the server's
+# release notes promise. From the gallery by id when the editor can reach it —
+# an install VS Code keeps updated from then on — and otherwise from the
+# release's own `vilan-vscode.vsix`, verified with the toolchain (E230; `vilan
+# upgrade` runs the same step). Opt out with VILAN_NO_VSCODE=1, or a flag:
 #
 #   curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh -s -- --no-vscode
 set -eu
@@ -17,6 +20,7 @@ REPO="vilan-lang/vilan"
 BASE_URL="https://github.com/$REPO/releases/latest/download"
 BIN_DIR="${VILAN_INSTALL_DIR:-$HOME/.vilan/bin}"
 VSIX="vilan-vscode.vsix"
+EXTENSION_ID="vilan-lang.vilan"
 
 say() { printf '%s\n' "$1"; }
 fail() { printf 'install: %s\n' "$1" >&2; exit 1; }
@@ -139,8 +143,10 @@ main() {
         extension="VS Code extension: not installed (--no-vscode / VILAN_NO_VSCODE)"
     elif [ -z "$editor" ]; then
         extension="VS Code extension: not installed (no \`code\` on PATH) — it is $VSIX on https://github.com/$REPO/releases"
+    elif "$editor" --install-extension "$EXTENSION_ID" --force > "$workdir/editor.log" 2>&1; then
+        extension="VS Code extension: installed $EXTENSION_ID from the gallery with \`$editor\` (it updates itself from now on) — reload VS Code to use it"
     elif "$editor" --install-extension "$workdir/$VSIX" --force > "$workdir/editor.log" 2>&1; then
-        extension="VS Code extension: installed $VSIX with \`$editor\` — reload VS Code to use it"
+        extension="VS Code extension: installed $VSIX (the gallery was unreachable) with \`$editor\` — reload VS Code to use it"
     else
         extension="VS Code extension: NOT installed — \`$editor --install-extension\` failed: $(tail -n 1 "$workdir/editor.log")"
     fi

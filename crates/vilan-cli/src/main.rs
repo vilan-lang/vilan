@@ -221,6 +221,10 @@ enum Command {
         /// Report whether a newer release exists without changing anything.
         #[arg(long)]
         check: bool,
+        /// Leave the VS Code extension alone (also `VILAN_NO_VSCODE=1`), as
+        /// the installers' own opt-out does.
+        #[arg(long)]
+        no_vscode: bool,
     },
     /// Work on the toolchain's own caches under `~/.vilan`.
     Cache {
@@ -460,7 +464,7 @@ fn run_cli() -> ExitCode {
             stdout,
             stats,
         } => bindgen::bindgen(file, output, platform, only, stdout, stats),
-        Command::Upgrade { check } => upgrade::upgrade(check),
+        Command::Upgrade { check, no_vscode } => upgrade::upgrade(check, no_vscode),
         Command::Cache { command } => match command {
             CacheCommand::Prune { all, dry_run } => cache_prune(all, dry_run),
         },

@@ -4312,7 +4312,8 @@ export impl MirrorTable<type M> {
 	}
 }
 
-export struct RemoteSource<T> {
+export [hint(Source<Option<T>>)]
+struct RemoteSource<T> {
 	// Cells, not plain fields: a reconnect rebind points the mirror at the fresh
 	// connection's channel (the id cell is SHARED with the `ReactiveClient` route,
 	// so routing moves in the same write).

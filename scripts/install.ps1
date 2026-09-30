@@ -5,15 +5,18 @@
 #
 # Idempotent: re-running it updates in place. It only ever touches the install
 # directory, the *user* PATH and — when VS Code's `code` is on PATH — the user's
-# VS Code extensions, so it needs no administrator rights. The release's
-# `vilan-vscode.vsix` is installed alongside the toolchain (E229): an editor
-# extension older than its language server silently lacks what the server's
-# release notes promise. Opt out by setting VILAN_NO_VSCODE first:
+# VS Code extensions, so it needs no administrator rights. The Vilan
+# extension is installed alongside the toolchain (E229): an editor extension
+# older than its language server silently lacks what the server's release
+# notes promise. From the gallery by id when the editor can reach it, else from
+# the release's verified `vilan-vscode.vsix` (E230). Opt out by setting
+# VILAN_NO_VSCODE first:
 #
 #   $env:VILAN_NO_VSCODE = '1'; irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
 
 $repo = 'vilan-lang/vilan'
 $vsix = 'vilan-vscode.vsix'
+$extensionId = 'vilan-lang.vilan'
 $baseUrl = "https://github.com/$repo/releases/latest/download"
 $binDir = if ($env:VILAN_INSTALL_DIR) {
     $env:VILAN_INSTALL_DIR
@@ -147,11 +150,19 @@ function Main {
         } elseif (-not $editor) {
             $extension = "VS Code extension: not installed (no ``code`` on PATH) — it is $vsix on https://github.com/$repo/releases"
         } else {
-            $log = & $editor.Source --install-extension (Join-Path $workdir $vsix) --force 2>&1
+            # E230: the gallery id first — an install VS Code keeps updated
+            # from then on — and the verified release vsix when the gallery
+            # cannot be reached (`vilan upgrade` runs the same step).
+            $log = & $editor.Source --install-extension $extensionId --force 2>&1
             if ($LASTEXITCODE -eq 0) {
-                $extension = "VS Code extension: installed $vsix — reload VS Code to use it"
+                $extension = "VS Code extension: installed $extensionId from the gallery (it updates itself from now on) — reload VS Code to use it"
             } else {
-                $extension = "VS Code extension: NOT installed — ``code --install-extension`` failed: $(@($log)[-1])"
+                $log = & $editor.Source --install-extension (Join-Path $workdir $vsix) --force 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    $extension = "VS Code extension: installed $vsix (the gallery was unreachable) — reload VS Code to use it"
+                } else {
+                    $extension = "VS Code extension: NOT installed — ``code --install-extension`` failed: $(@($log)[-1])"
+                }
             }
         }
     } finally {

@@ -10,8 +10,11 @@ tests is the VS Code extension.
 ## Getting it
 
 The [toolchain install](../tour/hello-vilan.md#install-the-toolchain) puts
-`vilan-lsp` next to `vilan` in `~/.vilan/bin`. Then install **Vilan**
-(`vilan-lang.vilan`) from the VS Code Marketplace or Open VSX. The
+`vilan-lsp` next to `vilan` in `~/.vilan/bin`, and — when VS Code's `code`
+is on your `PATH` — installs **Vilan** (`vilan-lang.vilan`) from the VS
+Code Marketplace or Open VSX too; `vilan upgrade` brings the extension to
+the toolchain's version each time it runs. Otherwise install it from
+either gallery yourself. The
 extension activates on a `.vl` file or a workspace containing a
 `vilan.toml`, and finds the server by looking, in order, at
 `vilan.server.path`, a `target/release/vilan-lsp` or `target/debug/`
@@ -58,7 +61,29 @@ the declaration itself, show the one line they always did.
 
 **Inlay hints** — the inferred type of a binding you left unannotated
 (`let`/`mut`, a `for` binder, a comprehension binder). A parameter is not
-hinted: its type is written in the signature already.
+hinted: its type is written in the signature already. While you type, a
+hint stays where it is and follows the text like any other position —
+typing before it on its line moves it right, a line inserted above moves
+it down, typing after it or below it leaves it alone — and keeps its last
+analysed type until the next analysis replaces the set; deleting the name
+it follows removes it.
+
+A pipeline node's type spells its whole upstream, so a type whose
+declaration carries **`[hint(Trait<..>)]`** is hinted by the trait it is
+used as: `let selected = combine((names, index)).derive(..)` shows
+`: ~Pipe<Option<str>>`, not `: Derive<Combine<(List<str>, usize)>, …>`. The
+`~` marks the abbreviation — it lexes nowhere, so it cannot be mistaken
+for a type you could write — and a node nested in another type
+abbreviates in place (`(~Pipe<Option<str>>, i32)`). It is printed only
+when the value's own instantiation is admitted by an impl of that trait,
+so it never promises what the value lacks. The hint's tooltip carries the
+full type, and hover shows both: the full type in the declaration, and
+*Shown as `~Pipe<Option<str>>`* beneath it. std's pipe stages
+(`~Pipe<T>`) and collection stages (`~CollPipe<T>`, sealed as
+`~CollSource<T>`), its sealed `MemoCell` and `RemoteSource` (`~Source<..>`),
+`.transient()`'s seal (`~TransientSource<T, E>`) and
+its iterator adapters (`~Iterator<T>`) carry the attribute, and a package's
+own types can too. `vilan.inlayHints.abbreviate` turns it off.
 
 **Semantic highlighting** from the analyzer, over the TextMate grammar,
 which also highlights `vilan` fences inside Markdown.
@@ -88,6 +113,15 @@ bar says it for the vilan file in front of you — `analyzed as: browser —
 declared`, `analyzed as: node — default-entry` — with the whole reason in
 its tooltip. A file can say it itself: `[platform("browser")] mod self;` as
 its first line — and at the top of a file, completion offers that line.
+
+A file holding platform-fenced **twins** (a function or a trait `impl`
+written once under `[platform("browser")]` and once under
+`[platform("@process")]`) is analyzed under each twin's platform, and the
+editor keeps every one of those analyses: inside the twin the file's own
+platform excludes, hover, completion, inlay hints and colour come from the
+analysis that admits it, as they do everywhere else. Go-to-definition on a
+call to a twin offers both twins, the one the file's platform compiles
+first.
 
 **A generic `<` closes itself.** `List<`, `HashMap<`, `fun pair<` and a
 generic call's own argument list each get their `>` as you type the `<`.
@@ -345,6 +379,7 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 | `vilan.server.path` | — | an explicit `vilan-lsp` binary; changing it restarts the client |
 | `vilan.stdPath` | — | an explicit `std` root, overriding discovery |
 | `vilan.inlayHints.enabled` | `true` | |
+| `vilan.inlayHints.abbreviate` | `true` | show a `[hint]`ed type by its trait, `~Source<T>`; off shows every full type |
 | `vilan.semanticTokens.enabled` | `true` | off falls back to the TextMate grammar |
 | `vilan.completion.functionCall` | `full` | `parensOnly`, or `none` |
 | `vilan.autoClosing.generics` | `true` | pair a generic `<` and type over its `>`; off for Vim emulation |

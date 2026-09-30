@@ -52,6 +52,10 @@ export function compareVersions(left: string, right: string): number | undefined
     return 0;
 }
 
+/// E231: the file the packaging writes the extension's commit into, beside
+/// `package.json` (`scripts/install-dev.sh`, release.yml's `vsix` job).
+export const BUILD_SHA_FILE = 'build-sha.txt';
+
 /// The extension's gallery identity — `publisher.name` in `package.json`.
 /// Every release publishes it to the VS Code Marketplace and Open VSX
 /// (release.yml's `publish-marketplace` / `publish-openvsx`), each version
@@ -65,9 +69,44 @@ export function extensionInstallCommand(version: string): string {
     return `code --install-extension ${EXTENSION_ID}@${version} --force`;
 }
 
-/// The gap between this extension (`extension`) and the server it started
-/// (`server`, the `serverInfo.version` it answered, `undefined` when it
-/// answered none), or `undefined` when there is none to name.
+/// E231: the server's `serverInfo.version` read apart. Since E231 the server
+/// answers `<version> (<sha>)` — `vilan --version`'s shape, from one build
+/// stamp — and before it the bare version. The commit is `undefined` for the
+/// bare form and for a tarball build's `unknown`; a dirty tree's `-dirty`
+/// suffix is read past, since the build is still that commit's.
+export function parseServerVersion(server: string): { version: string; sha: string | undefined } {
+    const match = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(server.trim());
+    if (!match) {
+        return { version: server.trim(), sha: undefined };
+    }
+    return { version: match[1], sha: normalizeSha(match[2]) };
+}
+
+/// A build stamp as a commit: `undefined` for `unknown` or an empty stamp, and
+/// the `-dirty` suffix dropped.
+export function normalizeSha(stamp: string | undefined): string | undefined {
+    const sha = stamp?.trim().replace(/-dirty$/, '');
+    return sha && /^[0-9a-f]{4,40}$/i.test(sha) ? sha.toLowerCase() : undefined;
+}
+
+/// Whether two short shas name one commit: one is a prefix of the other (git
+/// abbreviates to different lengths in different places).
+export function sameCommit(left: string, right: string): boolean {
+    return left.startsWith(right) || right.startsWith(left);
+}
+
+/// The gap between this extension (`extension`, and `extensionSha`, the commit
+/// its packaging embedded — `undefined` for a vsix packaged without one) and
+/// the server it started (`server`, the `serverInfo.version` it answered,
+/// `undefined` when it answered none), or `undefined` when there is none to
+/// name.
+///
+/// E231: when BOTH halves carry a commit and the versions agree, the commits
+/// are compared too — a dev build between releases keeps the last release's
+/// crate version, so a sealed-tip server and a stale extension compared equal.
+/// Two commits of one version name the dev refresh, which installs both halves
+/// from one checkout; which half is the stale one a sha cannot say. A half
+/// without a commit is compared by version alone, as before.
 ///
 /// Three shapes. The server is NEWER: the editor is the stale half, and the
 /// command installs the server's release's extension (the installer does this
@@ -76,7 +115,30 @@ export function extensionInstallCommand(version: string): string {
 /// (every server before E229): the toolchain is the stale half, and
 /// `vilan upgrade` closes it. Two strings that are not versions (a hand build
 /// with an odd manifest) are named plainly, with the upgrade.
-export function versionGap(extension: string, server: string | undefined): VersionGap | undefined {
+export function versionGap(
+    extension: string,
+    server: string | undefined,
+    extensionSha?: string,
+): VersionGap | undefined {
+    if (server !== undefined && server !== '') {
+        const parsed = parseServerVersion(server);
+        const ownSha = normalizeSha(extensionSha);
+        if (parsed.version === extension) {
+            if (parsed.sha === undefined || ownSha === undefined || sameCommit(parsed.sha, ownSha)) {
+                return undefined;
+            }
+            return {
+                message:
+                    `Vilan: this extension (${extension}, built from ${ownSha}) and the language ` +
+                    `server (${extension}, built from ${parsed.sha}) come from different commits — ` +
+                    'one of them is stale. Re-run `scripts/install-dev.sh` from the checkout you ' +
+                    'build the toolchain from (it installs both halves), then reload the window.',
+                command: 'scripts/install-dev.sh',
+                releaseUrl: `${RELEASES_URL}/tag/v${extension}`,
+            };
+        }
+        server = parsed.version;
+    }
     if (server === extension) {
         return undefined;
     }

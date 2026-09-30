@@ -320,6 +320,8 @@ jobs:
         working-directory: editors/vscode
         run: |
           npm ci
+          # E231: the commit the extension compares with the server's stamp.
+          git rev-parse --short=9 HEAD > build-sha.txt
           npx --yes @vscode/vsce package --out ../../vilan-vscode.vsix
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
