@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: feature -->
+**A `[resource]` trait's object is moved into its consuming members natively (B470's native half).** `Flow` is declared `[resource]`, so a `dyn Flow<T>` is move-only and its pointer unique; a table slot whose member takes `own self` now takes the object's pointer and moves the value out of it, where it copied the pipe out from behind a borrow at every `start`, `on_change` and `effect`. A receiver at its last use hands its pointer over whole; any other (a `dyn Source<T>`, still data) hands on a counted copy of the pointer and the value is copied out as before. A142's mixed-arm selector and a `dyn Flow` handed to an `own` parameter print the same bytes natively as on node.
+
+<!-- family: feature -->
 **A struct holding an `Option` of a cell of closures — `Option<Shared<List<|| void>>>`, an owner's lazily allocated cleanup list — builds natively.** A cell compares by identity (JavaScript's `===` on the object), so an `Option` or a `List` of one has reference equality too; the native backend refused the struct by name, and A142 S2's `OwnerCell` was written around the refusal.
 
 <!-- family: feature -->

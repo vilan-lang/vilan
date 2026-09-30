@@ -6743,3 +6743,127 @@ const OPTION_CELL_PROBE: &str = concat!(
     "\t}\n",
     "}\n",
 );
+
+/// B470's native half: a `[resource]` trait's object is MOVED into its
+/// consuming members. `Flow` is declared `[resource]` (A142 R39), so a
+/// `dyn Flow<i32>` is move-only and its pointer unique; a slot whose member
+/// takes `own self` takes the pointer (`self: Rc<Self>`) and moves the value
+/// out of it (`vilan_rt::unshare`), where it copied the pipe out from behind a
+/// borrow. Two programs: the mixed-arm selector (`dyn_objects`'
+/// `a142_a_mixed_arm_selector_…`), whose arms are a `Derive` pipe and a root,
+/// and a `dyn Flow` handed to an `own` parameter and consumed once.
+#[test]
+fn a_resource_trait_object_is_moved_into_its_consuming_members_natively() {
+    let staged = stage();
+    for (program, source) in [
+        ("native_probe_b470_selector.vl", B470_SELECTOR_PROBE),
+        ("native_probe_b470_once.vl", B470_ONCE_PROBE),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: a `dyn Flow` must build and print the same on both backends"
+        );
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("build the probe");
+        let source = String::from_utf8_lossy(&emitted.stdout);
+        // The table's consuming slots move the value out of the pointer.
+        let slots: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains("fn start(") || line.contains("fn on_change("))
+            .filter(|line| line.trim_start().starts_with("fn "))
+            .collect();
+        assert!(
+            !slots.is_empty()
+                && slots
+                    .iter()
+                    .all(|line| line.contains("self: std::rc::Rc<Self>")),
+            "{program}: a consuming slot must take the object's pointer:\n{}",
+            slots.join("\n")
+        );
+        assert!(
+            source.contains("vilan_rt::unshare(self)") && !source.contains("(self.clone(),"),
+            "{program}: the object's value must be moved out, not copied:\n{source}"
+        );
+    }
+    // The object handed to an `own` parameter is consumed by its one call:
+    // the parameter's pointer is given over, not bumped and copied.
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_b470_once.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    let watch = source
+        .split("\nfn ")
+        .find(|function| function.starts_with("watch_"))
+        .unwrap_or_else(|| panic!("no `watch` in the emitted source:\n{source}"));
+    assert!(
+        watch.contains(").into_object()") && !watch.contains(".clone().into_object()"),
+        "the `own` object must be handed over whole:\n{watch}"
+    );
+}
+
+const B470_SELECTOR_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Flow, MemoCell, Signal, SignalCell, Source };\n",
+    "\n",
+    "fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value * 100)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag = Signal::new(true);\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet picked: MemoCell<i32> = flag.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();\n",
+    "\tprint(i\"{picked.get()}\");\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(i\"{picked.get()}\");\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);
+
+const B470_ONCE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Disposable, Flow, Signal, SignalCell, Source, Subscription };\n",
+    "\n",
+    "fun pick(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value + 1)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun watch(label: str, own flow: dyn Flow<i32>): Subscription {\n",
+    "\tflow.on_change(|value| print(i\"{label} {value}\"))\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet piped = pick(true, count);\n",
+    "\tlet a = watch(\"piped\", piped);\n",
+    "\tlet b = watch(\"root\", pick(false, count));\n",
+    "\tcount.set(5);\n",
+    "\ta.dispose();\n",
+    "\tb.dispose();\n",
+    "\tcount.set(9);\n",
+    "\tprint(\"done\");\n",
+    "}\n",
+    "\n",
+    "main();\n",
+);

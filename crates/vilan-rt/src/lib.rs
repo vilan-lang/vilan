@@ -776,6 +776,19 @@ impl<T: ?Sized> Dyn<T> {
     pub fn object(&self) -> &T {
         &self.object
     }
+
+    /// The erased value's POINTER, for a slot that consumes its receiver
+    /// (`own self`, B470): `ObjectFlow::start(x.into_object())`.
+    pub fn into_object(self) -> Rc<T> {
+        self.object
+    }
+}
+
+/// The value behind a consuming slot's pointer: moved out when the pointer is
+/// the only one — a `[resource]` object always is, since it is move-only — and
+/// copied out otherwise, as a borrowing slot always did (B470).
+pub fn unshare<T: Clone>(object: Rc<T>) -> T {
+    Rc::try_unwrap(object).unwrap_or_else(|shared| (*shared).clone())
 }
 
 impl<T: ?Sized> Clone for Dyn<T> {
