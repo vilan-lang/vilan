@@ -2065,6 +2065,51 @@ fn a141_a_handler_storing_what_outlives_the_connection_does_not_warn() {
     assert!(found.is_empty(), "{found:#?}");
 }
 
+/// A145 + A135 (c): a handle method written as the read-only seal is found
+/// through its `reply_source_memo` route like any other, so a tail `.memo()` —
+/// a fresh memo per call — warns with the same steer; a stored memo does not.
+#[test]
+fn a145_a_memo_handle_method_whose_tail_is_memo_warns() {
+    let source = r#"
+    import std::reactive::{ MemoCell, Signal, SignalCell };
+
+    [service(StoreClient)]
+    struct Store {
+        count: SignalCell<i32>,
+        kept: MemoCell<i32>,
+    }
+
+    impl Store {
+        [rpc]
+        fun fresh(self): MemoCell<i32> {
+            self.count.derive(|n| n * 2).memo()
+        }
+
+        [rpc]
+        fun maybe(self, present: bool): Option<MemoCell<i32>> {
+            Some(self.count.derive(|n| n + 1).memo())
+        }
+
+        [rpc]
+        fun kept(self): MemoCell<i32> {
+            self.kept
+        }
+    }
+
+    fun main() {}
+"#;
+    let mut methods: Vec<String> = warning_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("returns a signal handle it builds with"))
+        .map(|(message, range)| {
+            assert_eq!(&source[range], "memo", "{message}");
+            message.split('`').nth(1).unwrap_or_default().to_string()
+        })
+        .collect();
+    methods.sort_unstable();
+    assert_eq!(methods, vec!["fresh", "maybe"]);
+}
+
 // --- A136 door (b): an owner-taking call inside a `Memo` maker ---------------
 
 /// The warnings a program raises that name A136's hazard, as the text each

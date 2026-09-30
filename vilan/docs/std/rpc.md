@@ -14,7 +14,7 @@ signal fields, the macro generates:
 // client side
 FooClient::connect(url: str, codec: Codec): Result<FooClient<SocketTransport>, RpcError>
 client.some_rpc(args…): Result<T, RpcError>     // per [rpc] method; implicitly awaited
-client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source; sync, unleased
+client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source (SignalCell or MemoCell); sync, unleased
 client.some_keyed(args…): KeyedSource<K, V>     // per [rpc] method returning a KeyedCell; same, keyed
 client.some_signal: RemoteSource<T>             // per [expose] field; a typed mirror (below)
 client.some_map: KeyedSource<K, V>              // per [expose(keyed)] field; a patched mirror (below)

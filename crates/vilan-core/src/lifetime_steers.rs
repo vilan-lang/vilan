@@ -244,7 +244,13 @@ fn handle_tail_warnings(
     let repliers = std_functions(
         program,
         "rpc.vl",
-        &["reply_source", "reply_source_option", "reply_source_keyed"],
+        &[
+            "reply_source",
+            "reply_source_option",
+            "reply_source_keyed",
+            "reply_source_memo",
+            "reply_source_memo_option",
+        ],
     );
     if repliers.is_empty() {
         return Vec::new();

@@ -19104,7 +19104,7 @@ impl<'src> Analyzer<'src> {
                 self.structs.get(&id).map(|struct_| struct_.name)?,
                 arguments.as_slice(),
             ) {
-                ("SignalCell", [element]) => Some(*element),
+                ("SignalCell" | "MemoCell", [element]) => Some(*element),
                 // A79's keyed handle: the ELEMENT is the second argument.
                 // Its KEY is `resolved_handle_return_key`'s answer (B319).
                 ("KeyedCell", [_key, element]) => Some(*element),
@@ -61121,7 +61121,11 @@ fn without_spaces(spelling: &str) -> String {
 /// plain value, which is the one outcome neither side wants.
 fn handle_return_element<'a>(node: &'a Node<'a>) -> Option<&'a Node<'a>> {
     match node {
-        Node::AccessorWithGenerics(name, arguments) if *name == "SignalCell" => {
+        // A145: the read-only seal `MemoCell<T>` is a handle too — a handle is
+        // only ever READ over the wire — with the same sole-argument element.
+        Node::AccessorWithGenerics(name, arguments)
+            if *name == "SignalCell" || *name == "MemoCell" =>
+        {
             match arguments.0.as_slice() {
                 [element] => Some(&element.0),
                 _ => None,

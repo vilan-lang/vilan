@@ -3319,6 +3319,41 @@ fn a_handle_return_whose_element_is_not_wire_is_refused_at_the_element() {
     );
 }
 
+/// A145: the read-only seal `MemoCell<T>` is a handle return too, so the same
+/// rule applies to it — the refusal names the element, bare and inside
+/// `Option`, where it used to say `MemoCell<Secret>` was not Wire.
+#[test]
+fn a145_a_memo_handle_return_whose_element_is_not_wire_is_refused_at_the_element() {
+    for returned in ["MemoCell<Secret>", "Option<MemoCell<Secret>>"] {
+        let body = if returned.starts_with("Option") {
+            "Some(self.secret)"
+        } else {
+            "self.secret"
+        };
+        let source = format!(
+            r#"
+        import std::io::print;
+        import std::reactive::{{ MemoCell, Pipe, Signal, SignalCell }};
+        struct Secret {{ token: str }}
+        [service(StoreClient)]
+        struct Store {{
+            secret: MemoCell<Secret>,
+        }}
+        impl Store {{
+            [rpc]
+            fun watch(self): {returned} {{ {body} }}
+        }}
+        fun main() {{ print("store"); }}
+        main();
+        "#
+        );
+        assert_fails_with(
+            &source,
+            "returns a signal handle whose element `Secret` is not Wire",
+        );
+    }
+}
+
 /// The control, and the two shapes the mapping admits: `SignalCell<T>` becomes
 /// `RemoteSource<T>` at the client and `Option<SignalCell<T>>` becomes
 /// `Option<RemoteSource<T>>`, both over a Wire element.

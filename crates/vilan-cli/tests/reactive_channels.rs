@@ -4643,6 +4643,114 @@ fn a142_s3_a_mirror_is_a_transient_absent_versus_pending_over_a_socket() {
     );
 }
 
+// --- A145: the read-only seal crosses as a handle ----------------------------
+
+/// A145 OVER A SOCKET: `MemoCell<T>` — the read-only seal of a derivation (A142
+/// R20) — and `Option<MemoCell<T>>` are `[rpc]` handle returns, exactly like
+/// `SignalCell<T>`: the route exports the cell behind the memo, and the client
+/// mints a `RemoteSource<T>`. Before, both were refused as "not Wire" and the
+/// stubs typed as the raw return.
+const A145_MEMO_HANDLE_SOCKET: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::map::Map;
+import std::process::exit;
+import std::reactive::{ MemoCell, Pipe, Signal, SignalCell, Source };
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::RemoteSource;
+import std::rpc_server::Service;
+import std::shared::Shared;
+import std::time::sleep;
+
+// A server derivation exposed READ-ONLY: the handle method answers the sealed
+// memo, which lives as long as the service (made once, at the top).
+[service(CounterClient)]
+struct Counter {
+	count: SignalCell<i32>,
+	doubled: MemoCell<i32>,
+	labels: Shared<Map<i32, MemoCell<str>>>,
+}
+
+impl Counter {
+	[rpc]
+	fun bump(self, to: i32): i32 {
+		self.count.set(to);
+		to
+	}
+
+	[rpc]
+	fun doubled(self): MemoCell<i32> {
+		self.doubled
+	}
+
+	[rpc]
+	fun label(self, id: i32): Option<MemoCell<str>> {
+		self.labels.read().get(id)
+	}
+}
+
+let count: SignalCell<i32> = Signal::new(1);
+let counter: Counter = Counter {
+	count,
+	doubled = count.derive(|x| x * 2).memo_global(),
+	labels = Shared::new(Map::new()),
+};
+
+fun main() {
+	counter.labels.write().insert(1, count.derive(|x| i"n{x}").memo_global());
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+async fun until(ready: || bool) {
+	mut tries = 0;
+	for !ready() && tries < 300 {
+		sleep(10);
+		tries += 1;
+	}
+}
+
+async fun run(port: i32) {
+	match CounterClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			let doubled: RemoteSource<i32> = client.doubled();
+			let label: RemoteSource<str> = client.label(1);
+			let missing: RemoteSource<str> = client.label(9);
+			let _a = doubled.sub(|value| {});
+			let _b = label.sub(|value| {});
+			let _c = missing.sub(|value| {});
+			until(|| doubled.get().is_some() && label.get().is_some());
+			print(i"seed: doubled={doubled.get().unwrap_or(0 - 1)} label={label.get().unwrap_or("-")} missing={missing.status().get().debug()}");
+			print(i"bump:{client.bump(5).unwrap_or(0 - 1)}");
+			until(|| doubled.get() == Some(10));
+			print(i"after: doubled={doubled.get().unwrap_or(0 - 1)} label={label.get().unwrap_or("-")}");
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#;
+
+#[test]
+fn a145_a_memo_cell_is_an_rpc_handle_return_over_a_socket() {
+    let stdout = run_program("a145_memo_handle_socket", A145_MEMO_HANDLE_SOCKET);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "seed: doubled=2 label=n1 missing=Absent",
+            "bump:5",
+            "after: doubled=10 label=n5"
+        ],
+        "a MemoCell handle must cross as a mirror; got:\n{stdout}"
+    );
+}
+
 // --- A135: a handler runs under its CONNECTION's owner ----------------------
 
 /// A135 IN PROCESS: kolt's shape — a handle method whose body is

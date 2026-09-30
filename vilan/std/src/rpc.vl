@@ -1897,6 +1897,25 @@ fun reply_source_option<T: Wire>(request: RpcRequest, source: Option<SignalCell<
 	}
 }
 
+/// `reply_source` for a handle written as the READ-ONLY seal, `MemoCell<T>` (A145):
+/// the wire only ever reads a handle, so the memo crosses exactly as the cell
+/// behind it does — one channel, `RemoteSource<T>` at the client.
+fun reply_source_memo<T: Wire>(request: RpcRequest, source: MemoCell<T>): RpcOutcome {
+	reply_source(request, source.cell)
+}
+
+/// `reply_source_option` for `Option<MemoCell<T>>` (A145).
+fun reply_source_memo_option<T: Wire>(
+	request: RpcRequest,
+	source: Option<MemoCell<T>>,
+): RpcOutcome {
+	let cell: Option<SignalCell<T>> = match source {
+		Some(let memo) => Some(memo.cell),
+		None => None,
+	};
+	reply_source_option(request, cell)
+}
+
 /// `reply_source` for the KEYED form (A79): `KeyedCell<K, T>` in, the channel id of
 /// a DYNAMIC keyed exposure on the wire, `KeyedSource<K, T>` at the client.
 /// Element-grained end to end — the forward sends the ops the mutation recorded
@@ -6297,7 +6316,11 @@ export macro fun handle_element(type_: TypeExpr): str {
 		};
 		ret keyed_element;
 	}
-	if type_.name != "SignalCell" {
+	// `MemoCell<T>` (A145) is the READ-ONLY seal of a derivation (A142 R20), and a
+	// handle is only ever READ over the wire, so the read-only face crosses as well
+	// as the writable one: its element is its sole argument, like `SignalCell`'s,
+	// and the route exports the cell behind it.
+	if type_.name != "SignalCell" && type_.name != "MemoCell" {
 		ret "";
 	}
 	if type_.arguments.len() != 1 {
@@ -6307,6 +6330,23 @@ export macro fun handle_element(type_: TypeExpr): str {
 		Some(let element) => element.render(),
 		None => "",
 	}
+}
+
+/// Whether a handle return is WRITTEN as the read-only seal — `MemoCell<T>` or
+/// `Option<MemoCell<T>>` (A145) — which is what picks the route's `_memo` replier.
+export macro fun handle_is_memo(type_: TypeExpr): bool {
+	import macro_std::option::Option::{ Some, None };
+
+	if type_.name == "MemoCell" {
+		ret true;
+	}
+	if type_.name == "Option" && type_.arguments.len() == 1 {
+		ret match type_.arguments.get(0) {
+			Some(let inner) => inner.name == "MemoCell",
+			None => false,
+		};
+	}
+	false
 }
 
 /// The KEY of a return type read as a KEYED signal handle (`KeyedCell<K, T>`,
@@ -6661,8 +6701,14 @@ export macro fun service(item: Item): Source {
 			Some(let found) => found,
 			None => "",
 		};
-		let replier = if kind == "plain" {
+		// A handle written as the read-only seal (A145) exports the cell behind it.
+		let memo = handle_is_memo(method.return_type);
+		let replier = if kind == "plain" && memo {
+			"rpc::reply_source_memo(__request, "
+		} else if kind == "plain" {
 			"rpc::reply_source(__request, "
+		} else if kind == "option" && memo {
+			"rpc::reply_source_memo_option(__request, "
 		} else if kind == "option" {
 			"rpc::reply_source_option(__request, "
 		} else if kind == "keyed" {

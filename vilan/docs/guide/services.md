@@ -406,7 +406,14 @@ channel id, and what the client's stub answers is a mirror:
 | --- | --- |
 | `SignalCell<T>` | `RemoteSource<T>` |
 | `Option<SignalCell<T>>` | `RemoteSource<T>` |
+| `MemoCell<T>` | `RemoteSource<T>` |
+| `Option<MemoCell<T>>` | `RemoteSource<T>` |
 | `KeyedCell<K, T>` | `KeyedSource<K, T>` |
+
+A handle is only ever *read* over the wire, so the read-only seal of a
+derivation — `MemoCell<T>`, what `.memo()` answers — crosses exactly as
+the writable cell does. Keep it on the service (a field, or a `Memo`
+whose maker writes `.memo_global()`) rather than sealing one per call.
 
 **The stub is sync, and it makes no call.** No `async`, no `!`, no
 `Result` — because there is nothing to await: the mirror is handed back
