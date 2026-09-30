@@ -113,7 +113,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc.vl",
-        52,
+        56,
         "R + O + E: sessions, wiring, the mirrors' leases. FIVE fewer since \
          A112 S1: `KeyedCell`'s own log, version, base and cursors, and its \
          cursor's sequence, are `DeltaLog`'s now (see `delta.vl`). +4 at A134 \
@@ -123,9 +123,21 @@ const CENSUS: &[(&str, usize, &str)] = &[
          mirror out, run by the mirror's last release), and a `MirrorTable`'s \
          entries (R: a module binding the `[service]` expansion declares). +1 \
          at A137: a keyed mirror's join hook (E: filled once its deliverer \
-         exists, run by its own `acquire`/`rebind`).",
+         exists, run by its own `acquire`/`rebind`). +1 at A139: its per-KEY \
+         join hook (E: the same shape, run after each per-key `Subscribe`). \
+         +2 at A140: each mirror's revive hook, plain and keyed (E: filled by \
+         the client that enlisted it, run by its `rebind`). +1 at A143: a \
+         client's wire demand (R: one per `ReactiveClient`, every mirror's \
+         `Subscribe`/`Unsubscribe` registered in it, cleared by a reconnect \
+         and by `dispose`).",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
+    (
+        "transient.vl",
+        1,
+        "E: a `Transient`'s generation claim (A142 S3) — made by `.transient()`, \
+         read by each settling task to drop a superseded reply",
+    ),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
 
@@ -239,7 +251,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 154,
+        total, 159,
         "the total number of `Shared` construction sites in std changed"
     );
 

@@ -29,6 +29,7 @@ import std::reactive::{
 | `Constant<T>` | struct | `Source::constant(v)`: a source that never changes |
 | `Derive`, `Switch`, `SwitchSome`, `AndThen`, `ThenSome`, `Combine`, `Distinct`, `DistinctBy` | `[resource]` structs | the pipe stages: hold their upstream until a consumer starts them; what the combinators return |
 | `Instance<T>` | struct | a started flow — the one consumer's `pull`/`attach`/`release` (for stage authors) |
+| `TransientState`, `TransientSource`, `.transient()` | `std::transient` | values that come and go — pending, ready, refreshing, failed with the stale value, absent; a flow of tasks sealed so the latest task wins ([std::transient](transient.md)) |
 | `Resource<T>`, `ResourceState<T>` | struct/enum | a value that may still be loading — pending, settled, failed — built by `source.load(fetch)` or `Resource::pending()`, read through its fallbacks |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |

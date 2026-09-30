@@ -406,7 +406,14 @@ channel id, and what the client's stub answers is a mirror:
 | --- | --- |
 | `SignalCell<T>` | `RemoteSource<T>` |
 | `Option<SignalCell<T>>` | `RemoteSource<T>` |
+| `MemoCell<T>` | `RemoteSource<T>` |
+| `Option<MemoCell<T>>` | `RemoteSource<T>` |
 | `KeyedCell<K, T>` | `KeyedSource<K, T>` |
+
+A handle is only ever *read* over the wire, so the read-only seal of a
+derivation — `MemoCell<T>`, what `.memo()` answers — crosses exactly as
+the writable cell does. Keep it on the service (a field, or a `Memo`
+whose maker writes `.memo_global()`) rather than sealing one per call.
 
 **The stub is sync, and it makes no call.** No `async`, no `!`, no
 `Result` — because there is nothing to await: the mirror is handed back
@@ -472,6 +479,14 @@ whatever it last held, and the **next** 0→1 lease asks again. So a row
 that re-renders after a failure retries by itself, and a view that shows
 a spinner or a retry button reads `status()` to decide which.
 
+A mirror is also a [transient source](../std/transient.md): `state()`
+answers the same facts as a `TransientState` — `Waiting` is `Pending`,
+`Ready` is `Ready(v)`, `Absent` is `Absent`, and `Failed(e)` is
+`Failed(e, stale)`, carrying what the mirror last held. `latest()` and
+`is_pending()` are pipes that lease the mirror while a view binds them:
+bind `latest()` to keep the last value on screen while a re-mint is on
+its way.
+
 **One handle per origin.** A stub call is keyed by its *origin* — the
 method and its arguments, as the wire would carry them — and the
 client hands back the mirror it already minted for that origin: two
@@ -528,7 +543,12 @@ is *wired*, before the first call: register the session and stamp it
 `into_protocol(codec).for_connection(id)`) and handles work in process
 too, which is how `vilan/examples/rpc` is written. Everything a generated
 `Client::connect` builds rides the socket, so reaching this at all means
-having assembled the client by hand.
+having assembled the client by hand. In process, delivery is *inline*: a
+`duplex_pair` answers a mirror's `Subscribe` with its seed inside the send,
+where a socket answers on a later task. So a subscriber over a mirror can
+be told the seed twice in process and once over a socket: the same value,
+one more notification. That is the in-process transport's contract, and
+a count of notifications is measured over a socket.
 
 **A handle-returning method must be safe to re-run.** Its return type is
 the declaration that it is a *getter*: the runtime issues the call at
@@ -544,12 +564,15 @@ the *cell* it carries, so a getter that answers a cell the service keeps
 — a field, a row's cell — is one channel however often it is asked. A
 body that ends in `.derive(..).cell()` mints a fresh cell per call instead:
 the dedup never hits (one capability and one forward per call), and the
-compiler warns at that `.cell()`. Every handler runs under its
-**connection's owner**, so such a cell's subscription is released when
-the connection closes rather than kept for the life of the process —
-but the fix is to keep the derived cell, keyed by the arguments, in a
-[`Memo`](../std/collections.md#memokv) on the service whose maker writes
-`.cell_global()`:
+compiler warns at that `.cell()`. Every handler runs under the owner of
+the **instance** that answers it: a `Service::factory` instance is one
+per connection, so its handlers run under the **connection's owner** and
+such a cell's subscription is released when the connection closes; a
+`Service::new` instance answers every client, so its handlers run under
+the **service's owner** and what they build lives as long as the service.
+Either way the fix is to keep the derived cell, keyed by the arguments,
+in a [`Memo`](../std/collections.md#memokv) on the service whose maker
+writes `.cell_global()`:
 
 ```vilan,fragment
 [rpc]
@@ -557,6 +580,15 @@ fun get_channel_ids(self): SignalCell<List<i32>> {
 	self.derived.get_or_insert("ids", || self.channels.derive(|all| all.keys()).cell_global())
 }
 ```
+
+**A cache the connections share outlives each of them.** A
+`Service::factory` handler that stores a derived cell on a store every
+instance shares — a module-level cell, through `Shared::write` or a
+`get_or_insert` maker — builds it under its connection's owner, and the
+store hands it out dead once that connection closes. The compiler warns
+at a `.cell()` a handler stores that way (a `Memo` maker's warns
+wherever it is written). A derivation cached across calls is
+`.cell_global()`.
 
 **When the server frees it.** Demand decides. A mirror's last lease
 going away sends `Unsubscribe`, and for a channel a reply minted that
@@ -572,9 +604,15 @@ remount must find it on the same id.)
 "Last lease" means the last one on the **channel**, not on your mirror:
 where two mirrors ended up sharing a channel because they named the same
 source — two methods answering one cell, say — the first to let go
-withdraws nothing. The second one's `Subscribe` joins the forward the
-first already holds, so the server sends it no seed; the client seeds it
-from its sibling instead, and it reads the channel's value at once.
+withdraws nothing. The client keeps **one forward per channel**, at the
+union of its mirrors' demands: the second mirror's lease joins what the
+first already holds, nothing goes on the wire, and the client seeds it
+from its sibling, so it reads the channel's value at once. On a keyed
+channel a whole-collection lease covers every key: a sibling's
+`sub_key(k)` beside it asks the server for nothing and is seeded with
+the sibling's element for `k`. Each mirror takes only the changes its
+own leases ask for, so a mirror holding one key is never told about the
+others, and no change reaches a mirror twice.
 
 Two consequences worth having in mind. A dispose and a remount anywhere
 inside one macrotask — two event handlers, a route change, an `each`

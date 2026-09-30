@@ -14,7 +14,7 @@ signal fields, the macro generates:
 // client side
 FooClient::connect(url: str, codec: Codec): Result<FooClient<SocketTransport>, RpcError>
 client.some_rpc(args…): Result<T, RpcError>     // per [rpc] method; implicitly awaited
-client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source; sync, unleased
+client.some_handle(args…): RemoteSource<T>      // per [rpc] method RETURNING a source (SignalCell or MemoCell); sync, unleased
 client.some_keyed(args…): KeyedSource<K, V>     // per [rpc] method returning a KeyedCell; same, keyed
 client.some_signal: RemoteSource<T>             // per [expose] field; a typed mirror (below)
 client.some_map: KeyedSource<K, V>              // per [expose(keyed)] field; a patched mirror (below)
@@ -58,6 +58,13 @@ impl RemoteSource<type T> {
 	fun or(self, initial: T): Derive<RemoteSource<T>, Option<T>, T>   // a pipe: `initial` until the first update
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
+}
+
+// A mirror is a transient source (std::transient): Status mapped arm for arm.
+impl RemoteSource<type T> with TransientSource<T, RpcError> {
+	fun state(self): MemoCell<TransientState<T, RpcError>>   // passive, like `status`
+	fun latest(self): dyn Pipe<Option<T>>                    // leases while bound; keeps the stale value
+	fun is_pending(self): dyn Pipe<bool>                     // leases while bound
 }
 
 [derive(PartialEq, Debug)]
