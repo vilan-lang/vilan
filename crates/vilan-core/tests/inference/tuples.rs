@@ -7162,7 +7162,8 @@ fn b377_an_unused_binding_over_a_nested_let_still_runs_it() {
 // --- time). The instance whose layout `.map` gets wrong is emitted unrolled.
 
 /// The item's repro, through shipped `combine`. Red before the fix: `x=1,2
-/// y=c l=undefined`, twice.
+/// y=c l=undefined`, twice. (A142: `combine` answers a pipe, sealed with
+/// `.memo()` to be read twice.)
 #[test]
 fn b397_combine_over_a_tuple_valued_source_reads_flat() {
     assert_compiles_and_runs(
@@ -7173,7 +7174,7 @@ fn b397_combine_over_a_tuple_valued_source_reads_flat() {
             "fun main() {\n",
             "\tlet point = SignalCell::new((1, 2));\n",
             "\tlet label = SignalCell::new(\"c\");\n",
-            "\tlet both = combine((point, label));\n",
+            "\tlet both = combine((point, label)).memo();\n",
             "\tlet ((x, y), l) = both.get();\n",
             "\tprint(i\"{x} {y} {l}\");\n",
             "\tpoint.set((3, 4));\n",
@@ -7856,7 +7857,9 @@ fn a122_map_refuses_a_parameter_annotated_off_the_element() {
 /// output subscribes to the whole source, so each fires on every change of it
 /// — a change to the other position and a `set` that changes nothing included
 /// (Q4 ruled: no `PartialEq` gate; `.distinct()` at the consumer is the gate).
-/// `sub` also calls once on subscribing, hence 1 + 3.
+/// `sub` also calls once on subscribing, hence 1 + 3. (A142: the outputs are
+/// pipes with one consumer each, so the `sub`s consume them, and the settled
+/// values are read through a second `divorce`, sampled.)
 #[test]
 fn a122_divorce_splits_a_pair_and_every_output_fires_on_every_change() {
     assert_compiles_and_runs(
@@ -7878,9 +7881,10 @@ fn a122_divorce_splits_a_pair_and_every_output_fires_on_every_change() {
             "\tsource.set((2, \"a\"));\n",
             "\tsource.set((2, \"b\"));\n",
             "\tsource.set((2, \"b\"));\n",
-            "\tprint(i\"{left.get()} {right.get()} {left_fired} {right_fired}\");\n",
+            "\tlet (left_now, right_now) = divorce(source);\n",
+            "\tprint(i\"{left_now.sample()} {right_now.sample()} {left_fired} {right_fired}\");\n",
             "\tlet (a, b, c) = divorce(SignalCell::new((1, (2, 3), \"c\")));\n",
-            "\tprint(i\"{a.get()} {b.get().1} {c.get()}\");\n",
+            "\tprint(i\"{a.sample()} {b.sample().1} {c.sample()}\");\n",
             "}\n",
         ),
         "2 b 4 4\n1 3 c\n",
@@ -7889,6 +7893,8 @@ fn a122_divorce_splits_a_pair_and_every_output_fires_on_every_change() {
 
 /// The round trip the item names: `divorce(combine((a, b, c)))` re-derives
 /// each input's value, a two-slot one included, after writes to two of them.
+/// (A142: `divorce` takes a `Source`, so the `combine` pipe is sealed with
+/// `.memo()` first; each output is a pipe, read once with `.sample()`.)
 #[test]
 fn a122_divorce_of_combine_round_trips() {
     assert_compiles_and_runs(
@@ -7900,10 +7906,11 @@ fn a122_divorce_of_combine_round_trips() {
             "\tlet a = SignalCell::new(1);\n",
             "\tlet b = SignalCell::new(\"x\");\n",
             "\tlet c = SignalCell::new((7, 8));\n",
-            "\tlet (a2, b2, c2) = divorce(combine((a, b, c)));\n",
+            "\tlet (a2, b2, c2) = divorce(combine((a, b, c)).memo());\n",
             "\ta.set(5);\n",
             "\tc.set((9, 10));\n",
-            "\tprint(i\"{a2.get()} {b2.get()} {c2.get().0} {c2.get().1}\");\n",
+            "\tlet (c20, c21) = c2.sample();\n",
+            "\tprint(i\"{a2.sample()} {b2.sample()} {c20} {c21}\");\n",
             "}\n",
         ),
         "5 x 9 10\n",

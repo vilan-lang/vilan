@@ -80,7 +80,7 @@ fun connection_banner(client: NotesClient<SocketTransport>): View {
 	view("p")
 		.styled(muted)
 		.text("reconnecting…")
-		.show(state.map(|current| current == ConnectionState::Reconnecting))
+		.show(state.derive(|current| current == ConnectionState::Reconnecting))
 }
 
 // Username + password + one button. Register-or-login keeps the surface
@@ -115,7 +115,7 @@ fun sign_in_panel(client: NotesClient<SocketTransport>, token: SignalCell<str>):
 			.bind_value(password))
 		.child(view("button").styled(button).text("Sign in").on("click", submit))
 		.child(view("p").styled(muted).bind_text(status))
-		.show(token.map(|current| current == ""))
+		.show(token.derive(|current| current == ""))
 }
 
 // The routed app, visible once signed in. Pages swap on the route.
@@ -132,7 +132,7 @@ fun authed_panel(
 			Route::Note(let id) => note_page(client, id, notes, token),
 			Route::NotFound => not_found_page(),
 		}))
-		.show(token.map(|current| current != ""))
+		.show(token.derive(|current| current != ""))
 }
 
 // "/" — the live list plus an add form. Rows are keyed by note id.
@@ -191,7 +191,7 @@ fun note_page(
 	token: SignalCell<str>,
 ): View {
 	let entry = notes
-		.map(|list| {
+		.derive(|list| {
 			mut found: Option<Note> = None;
 			for note in list {
 				if note.id == note_id {
@@ -201,12 +201,12 @@ fun note_page(
 			found
 		})
 		.cell();
-	let present = entry.map(|current| current is Some(let _note));
+	let present = entry.derive(|current| current is Some(let _note)).memo();
 
 	view("div")
 		.styled(shell)
 		.child(view("p").child(link("← All notes", Route::Home)))
-		.child(view("p").styled(muted).text("loading…").show(present.map(|has| !has)))
+		.child(view("p").styled(muted).text("loading…").show(present.derive(|has| !has)))
 		.child(when(present, || note_editor(client, note_id, entry, token)))
 }
 
@@ -240,13 +240,13 @@ fun note_editor(
 	view("div")
 		.styled(shell)
 		.child(view("input").styled(field).attr("placeholder", "Title…").bind_draft(title))
-		.child(view("span").styled(muted).bind_text(title.state.map(state_text)))
+		.child(view("span").styled(muted).bind_text(title.state.derive(state_text)))
 		.child(view("textarea")
 			.styled(field)
 			.attr("placeholder", "Write…")
 			.attr("rows", "8")
 			.bind_draft(body))
-		.child(view("span").styled(muted).bind_text(body.state.map(state_text)))
+		.child(view("span").styled(muted).bind_text(body.state.derive(state_text)))
 }
 
 fun not_found_page(): View {

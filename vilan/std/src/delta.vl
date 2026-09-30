@@ -39,6 +39,7 @@ import pkg::reactive::{
 	Signal,
 	SignalCell,
 	Source,
+	Subscriber,
 	Subscription,
 	as_derivation,
 	defer_to_owner,
@@ -941,9 +942,16 @@ export impl ListCell<type T> with Source<List<T>> {
 	/// is registered, so capturing it closed a loop under counting for every
 	/// observer a `ListCell` ever had.
 	[must_use]
-	fun on_change(self, observer: |List<T>| void): Subscription {
+	fun attach_observer(self, observer: |List<T>| void, immediately: bool): Subscription {
 		let items = self.items;
-		self.published.on_change(|_sequence| observer(items.read()))
+		self.published.attach_observer(|_sequence| observer(items.read()), immediately)
+	}
+
+	/// The published cell's list is where a consumer's subscriber goes: it is
+	/// notified exactly when the run changed, and the subscriber reads `get()`.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.published.on_settle(subscriber)
 	}
 }
 

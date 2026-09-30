@@ -1354,7 +1354,7 @@ fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
     assert_compiles_browser(
         r#"
         import std::ui::{ View, view, mount_root };
-        import std::reactive::{ Signal, SignalCell, Source, Subscription, observe };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         import std::display::Display;
 
         // A user's own `Source` (A33's motivating shape), so the extension is
@@ -1363,8 +1363,8 @@ fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
         impl Doubled with Source<i32> {
             fun get(self): i32 { self.inner.get() * 2 }
             [must_use]
-            fun on_change(self, observer: |i32| void): Subscription {
-                observe(self.inner, |value| { observer(value * 2); })
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -1643,7 +1643,7 @@ fn an_exposed_source_whose_element_is_not_a_written_argument_is_refused() {
     // says so at the field instead.
     let source = r#"
         import std::io::print;
-        import std::reactive::{ Source, SignalCell, Subscription };
+        import std::reactive::{ Source, SignalCell, Subscriber, Subscription };
         [derive(Wire)]
         struct Note { id: i32 }
         struct Feed {
@@ -1651,7 +1651,7 @@ fn an_exposed_source_whose_element_is_not_a_written_argument_is_refused() {
         }
         impl Feed with Source<Note> {
             fun get(self): Note { self.inner.get() }
-            fun on_change(self, observer: |Note| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(FeedClient)]
         struct Store {
@@ -1676,7 +1676,7 @@ fn a_user_source_written_with_its_element_still_exposes() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Source, SignalCell, Subscription };
+        import std::reactive::{ Source, SignalCell, Subscriber, Subscription };
         [derive(Wire)]
         struct Note { id: i32 }
         struct Feed<T> {
@@ -1684,7 +1684,7 @@ fn a_user_source_written_with_its_element_still_exposes() {
         }
         impl Feed<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(FeedClient)]
         struct Store {
@@ -2453,15 +2453,15 @@ fn b243_a_one_block_signal_impl_reaches_source_sub_and_effect_on_change() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Source, SignalCell, Subscription, comp };
+        import std::reactive::{ Signal, Source, SignalCell, Subscriber, Subscription, comp };
 
         struct Cell<T> { inner: SignalCell<T> }
 
         impl Cell<type T> with Signal<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
             fun set(self, value: T) { self.inner.set(value) }
             fun notify(self) { self.inner.notify() }
@@ -2490,21 +2490,23 @@ fn b243_a_one_block_signal_impl_reaches_source_sub_and_effect_on_change() {
 /// a type that implements `Source` only through a one-block `impl .. with
 /// Signal<T>` — "Cell<i32> has no method 'map'" (B419). Kept as the program
 /// the pin used to be; an impl's PROVIDED set now closes over the supertrait
-/// chain.
+/// chain. (A142: `map` is `Flow::derive`, reached through the blanket
+/// `impl type S: Source<T> with Flow<T>` — the same blanket-over-a-supertrait
+/// shape; the pipe is sealed with `.memo()` to be read across the `set`.)
 #[test]
 fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Source, SignalCell, Subscription };
+        import std::reactive::{ Signal, Source, SignalCell, Subscriber, Subscription };
 
         struct Cell<T> { inner: SignalCell<T> }
 
         impl Cell<type T> with Signal<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
             fun set(self, value: T) { self.inner.set(value) }
             fun notify(self) { self.inner.notify() }
@@ -2512,7 +2514,7 @@ fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
 
         fun main() {
             let c = Cell { inner = Signal::new(1) };
-            let doubled = c.map(|v| v * 2);
+            let doubled = c.derive(|v| v * 2).memo();
             print(doubled.get());
             c.set(5);
             print(doubled.get());
@@ -2585,15 +2587,15 @@ fn b243_the_split_impl_still_works() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Source, SignalCell, Subscription };
+        import std::reactive::{ Signal, Source, SignalCell, Subscriber, Subscription };
 
         struct Cell<T> { inner: SignalCell<T> }
 
         impl Cell<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription {
-                self.inner.on_change(observer)
+            fun on_settle(self, subscriber: Subscriber): Subscription {
+                self.inner.on_settle(subscriber)
             }
         }
 
@@ -2604,8 +2606,7 @@ fn b243_the_split_impl_still_works() {
 
         fun main() {
             let c = Cell { inner = Signal::new(1) };
-            let doubled = c.map(|v| v * 2);
-            print(doubled.get());
+            print(c.derive(|v| v * 2).sample());
         }
         main();
         "#,
@@ -2937,14 +2938,14 @@ fn a52_an_expose_of_a_user_source_type_is_accepted() {
     assert_compiles(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         [derive(Wire, PartialEq, Debug)]
         struct Task { id: i32 }
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(StoreClient)]
         struct Store {
@@ -3641,14 +3642,14 @@ fn a_user_source_type_in_a_return_position_is_not_read_as_a_handle() {
     assert_fails_with(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::reactive::{ Signal, SignalCell, Source, Subscriber, Subscription };
         [derive(Wire, PartialEq, Debug)]
         struct Task { id: i32 }
         struct Stored<T> { inner: SignalCell<T> }
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
             [must_use]
-            fun on_change(self, observer: |T| void): Subscription { self.inner.on_change(observer) }
+            fun on_settle(self, subscriber: Subscriber): Subscription { self.inner.on_settle(subscriber) }
         }
         [service(StoreClient)]
         struct Store {
@@ -4508,7 +4509,14 @@ fn b371_the_members_result_carries_the_callers_bound() {
 /// following the inner cell across a set. Since A124 S2c `map(f).flatten()`
 /// answers a cold node, so the four B371 bodies end in `.cell()` — the
 /// `SignalCell<U>` their signatures name; the generic `map` reaching the body
-/// at all is B408's.
+/// at all is B408's. A142 renamed `map` to `derive` and made `flatten` the
+/// `Option` join only: the TOTAL join of a source of sources is
+/// `.switch(|inner| inner)`, whose `I: Flow<U>` binds at the caller's abstract
+/// `I: Source<U>` — the same grounding B371 fixed — so the three total-join
+/// bodies spell it that way, and the `Option` twin keeps std's `flatten`. The
+/// selector's parameter is annotated (`|inner: I|`): unannotated, it is typed as
+/// an unsubstituted `T` in a generic body (reactive-44's find, pinned by
+/// `a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter`).
 #[test]
 fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
     assert_compiles_and_runs(
@@ -4518,7 +4526,7 @@ fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.map(f).flatten().cell()
+                self.derive(f).switch(|inner: I| inner).cell()
             }
         }
 
@@ -4545,7 +4553,7 @@ fn b371_switch_over_std_flatten_runs_as_a_free_function() {
         import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
 
         fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
-            source.map(f).flatten().cell()
+            source.derive(f).switch(|inner: I| inner).cell()
         }
 
         fun main() {
@@ -4563,8 +4571,8 @@ fn b371_switch_over_std_flatten_runs_as_a_free_function() {
 }
 
 /// The annotation the item's repro carried to keep B300(a)'s inference gap
-/// out of the picture is no longer needed: `flatten`'s `U` binds to the
-/// caller's `U` through the caller's own `I: Source<U>`.
+/// out of the picture is no longer needed: the join's `U` (A142: `switch`'s)
+/// binds to the caller's `U` through the caller's own `I: Source<U>`.
 #[test]
 fn b371_the_result_infers_without_an_annotation() {
     assert_compiles_and_runs(
@@ -4574,7 +4582,7 @@ fn b371_the_result_infers_without_an_annotation() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.map(f).flatten().cell()
+                self.derive(f).switch(|inner: I| inner).cell()
             }
         }
 
@@ -4591,6 +4599,36 @@ fn b371_the_result_infers_without_an_annotation() {
     );
 }
 
+/// reactive-44's find (REPORT-reactive-44): the total join written as a pipe in
+/// a generic body, with the selector's parameter UNannotated. `.derive(f)` is a
+/// `Derive<S, T, I>` over the caller's abstract `I`, and `.switch(|inner| inner)`
+/// types `inner` as an unsubstituted `T` — "cannot infer 'U'" and "generic
+/// parameter 'T' is missing the bound ': Flow<U>'". The same body at concrete
+/// types, or with `|inner: I|`, compiles (the three B371 pins above).
+#[test]
+#[ignore = "A142: reactive-44 find: a pipe stage's closure parameter in a generic body is typed as the trait's unsubstituted T"]
+fn a142_an_unannotated_join_selector_in_a_generic_body_types_its_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
+
+        fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
+            source.derive(f).switch(|inner| inner).cell()
+        }
+
+        fun main() {
+            let n = Signal::new(1);
+            run_with_owner(Owner::new(), || {
+                let doubled: SignalCell<i32> = switch_to(n, |m| Signal::new(m * 2));
+                print(doubled.get());
+            });
+        }
+        "#,
+        "2\n",
+    );
+}
+
 /// The control: the OPTION twin, whose inner dispatch is on a pattern-bound
 /// local, compiled and ran before and must still.
 #[test]
@@ -4603,7 +4641,7 @@ fn b371_the_optional_twin_is_unchanged() {
 
         impl type S: Source<type T> {
             fun and_then_to<U, I: Source<U>>(self, f: sync |T| Option<I>): SignalCell<Option<U>> {
-                self.map(f).flatten().cell()
+                self.derive(f).flatten().cell()
             }
         }
 
@@ -7334,21 +7372,23 @@ fn b408_a_trait_member_a_blanket_provides_is_reachable_through_a_bound() {
 
 /// std's shape, the item's own: `.cell()` and `.distinct()` — blankets over
 /// `S: Source<T>` — called in generic code, and what they return read at the
-/// concrete caller after a write.
+/// concrete caller after a write. (A142: both are reached through `Flow` now —
+/// `.cell()` seals a PIPE, so the generic body derives first, as a root has no
+/// `.cell()`; `.distinct()` answers a pipe, read once with `.sample()`.)
 #[test]
 fn b408_std_cell_and_distinct_are_reachable_in_generic_code() {
     assert_compiles_and_runs(
         concat!(
             "import std::io::print;\n",
             "import std::reactive::{ Distinct, Signal, SignalCell, Source };\n",
-            "fun cached<S: Source<i32>>(s: S): SignalCell<i32> { s.cell() }\n",
+            "fun cached<S: Source<i32>>(s: S): SignalCell<i32> { s.derive(|v| v).cell() }\n",
             "fun deduped<S: Source<i32>>(s: S): Distinct<S, i32> { s.distinct() }\n",
             "fun main() {\n",
             "\tlet a = Signal::new(3);\n",
             "\tlet c = cached(a);\n",
             "\tlet d = deduped(a);\n",
             "\ta.set(5);\n",
-            "\tprint(i\"{c.get()} {d.get()}\");\n",
+            "\tprint(i\"{c.get()} {d.sample()}\");\n",
             "}\n",
         ),
         "5 5\n",

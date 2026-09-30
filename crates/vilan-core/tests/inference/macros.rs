@@ -2120,6 +2120,9 @@ fn a_macro_stamps_a_numeric_family() {
 
 // The join follows the CURRENT inner: switching detaches the replaced inner
 // (its later sets must not leak through) and adopts the new one's value.
+// A142: the total join of a source of sources is `.switch(|inner| inner)`
+// (`flatten` is the `Option` join only), and it is a pipe, sealed with
+// `.memo()` so it stays attached and is read three times.
 #[test]
 fn flatten_follows_the_current_inner_and_detaches_the_old() {
     assert_compiles_and_runs(
@@ -2131,7 +2134,7 @@ fn flatten_follows_the_current_inner_and_detaches_the_old() {
             let first = Signal::new(1);
             let second = Signal::new(10);
             let outer = Signal::new(first);
-            let joined = outer.flatten();
+            let joined = outer.switch(|inner| inner).memo();
             first.set(2);
             print(joined.get());
             outer.set(second);

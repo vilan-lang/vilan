@@ -4852,7 +4852,9 @@ fn calling_a_method_call_result_directly_parses() {
 fn swap_renders_a_dynamic_subtree_per_route_value() {
     // The canonical router shape: nested route enums, a hand-written
     // parse/href pair, `link` through the app's `Routable` impl, and a `swap`
-    // whose render closure matches the (unannotated) route value.
+    // whose render closure matches the (unannotated) route value. (A142: the
+    // derived route is a pipe, which a closure cannot capture, so it is sealed
+    // with `.memo()` — the route source the view reads.)
     assert_compiles_browser(
         r#"
         import std::ui::{ View, mount_root, swap, view };
@@ -4901,7 +4903,7 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
         }
 
         fun main() {
-            let route = current_path().map(parse);
+            let route = current_path().derive(parse).memo();
             let _root = mount_root("app", || view("main")
                 .child(link("Home", Route::Home))
                 .child(view("button").on("click", || navigate(href(Route::Home))))
@@ -5066,7 +5068,9 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
     // binding must check the bound against the RESOLVED `Route`, not demand
     // `U: PartialEq`. The method resolution now DEFERS while a closure
     // argument's body is untyped, so `U` binds from the closure's return on
-    // the retry instead of freezing abstract.
+    // the retry instead of freezing abstract. (A142: `map` is `derive`, whose
+    // pipe a closure cannot capture — so the unannotated binding is built
+    // inside the view closure and the pipe itself goes to `swap`.)
     assert_compiles_browser(
         r#"
         import std::ui::{ View, mount_root, swap, view };
@@ -5084,12 +5088,14 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
         }
 
         fun main() {
-            let route = current_path().map(|path| parse(path));
-            let _root = mount_root("app", || view("main")
-                .child(swap(route, |current| match current {
-                    Route::Home => view("section").text("home"),
-                    Route::Other => view("section").text("other"),
-                })));
+            let _root = mount_root("app", || {
+                let route = current_path().derive(|path| parse(path));
+                view("main")
+                    .child(swap(route, |current| match current {
+                        Route::Home => view("section").text("home"),
+                        Route::Other => view("section").text("other"),
+                    }))
+            });
         }
         "#,
     );

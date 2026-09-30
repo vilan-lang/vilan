@@ -380,14 +380,14 @@ struct Badge {
 
 [platform("browser")]
 impl Badge with Slot {
-    fun place(self, parent: View) {
+    fun place(own self, parent: View) {
         parent.element.set_attribute("data-badge", self.label);
     }
 }
 
 [platform("@process")]
 impl Badge with Slot {
-    fun place(self, parent: View) {
+    fun place(own self, parent: View) {
         ui::set_attribute(parent.attributes, "data-badge", self.label);
     }
 }
@@ -10010,19 +10010,24 @@ fn b206_an_ordinary_parameter_still_renders_as_written() {
 
 #[test]
 fn b249_a_trait_parameter_takes_the_impls_argument() {
-    // The find's own shape, against std's own `Source<T>`: `T` is nested inside a
-    // closure type, which is why it is a substitution and not a per-position
-    // lookup.
+    // The find's own shape, against std's own reactive trait: `T` is nested
+    // inside a closure type, which is why it is a substitution and not a
+    // per-position lookup. A142 moved `on_change` off `Source` (whose required
+    // attach is now the `T`-free `on_settle`) onto `Flow<T>`, where it is still a
+    // requirement with `T` inside its observer's closure type — so the pin names
+    // `Flow<i32>`, the trait that still carries the shape.
     let source = r#"
-        import std::reactive::Source;
+        import std::reactive::Flow;
         struct Counted { n: i32 }
-        impl Counted with Source<i32> { }
+        impl Counted with Flow<i32> { }
         fun main() {}
         "#;
-    assert_fails_with(
-        source,
-        "declare `fun on_change(self, observer: |i32| void): Subscription`",
-    );
+    // The substitution is the claim, so the pin reads the declaration around
+    // the receiver: the line renders `Flow`'s `own self` as a bare `self` (a
+    // separate find — copied verbatim it is refused for its receiver), and this
+    // pin must not be the one that fixes that spelling in place.
+    assert_fails_with(source, "missing 'on_change'; declare `fun on_change(");
+    assert_fails_with(source, ", observer: |i32| void): Subscription`");
     assert_fails_without(source, "|T| void");
 }
 

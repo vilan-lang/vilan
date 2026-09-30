@@ -104,20 +104,17 @@ function __with_finally(body, after) {
 	}
 }
 const __vilan_chunks = __chunk_registry();
-function home_page($bl, $bm) {
-	return __vilan_chunks.fn.home_page($bl, $bm);
+function home_page($bh, $bi) {
+	return __vilan_chunks.fn.home_page($bh, $bi);
 }
-function docs_page(page, $bp, $bq) {
-	return __vilan_chunks.fn.docs_page(page, $bp, $bq);
+function docs_page(page, $bl, $bm) {
+	return __vilan_chunks.fn.docs_page(page, $bl, $bm);
 }
-function not_found_page($bt, $bu) {
-	return __vilan_chunks.fn.not_found_page($bt, $bu);
+function not_found_page($bp, $bq) {
+	return __vilan_chunks.fn.not_found_page($bp, $bq);
 }
 function hash(self) {
 	return __hash(self);
-}
-function as_derivation() {
-	minting_derivation.v = true;
 }
 function fresh_id() {
 	const id = next_subscriber_id.v;
@@ -206,24 +203,24 @@ function drain(turn) {
 function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
 }
-function dispose(self, $T) {
-	const $U = $T;
-	let $V = null;
-	if ($U[0] === 0) {
-		const established = $U[1];
-		$V = [ 0, established ];
+function dispose(self, $V) {
+	const $W = $V;
+	let $X = null;
+	if ($W[0] === 0) {
+		const established = $W[1];
+		$X = [ 0, established ];
 	} else {
-		$V = $n(draining_turns.v);
+		$X = $n(draining_turns.v);
 	}
-	const ambient = $V;
+	const ambient = $X;
 	release_under(self, ambient);
 }
 function release_under(handle, ambient) {
 	handle[2].v = false;
-	const $W = [ 0, handle[0] ];
-	let $X = null;
-	if ($W[0] === 0) {
-		const subscribers = $W[1];
+	const $Y = [ 0, handle[0] ];
+	let $Z = null;
+	if ($Y[0] === 0) {
+		const subscribers = $Y[1];
 		let kept = [  ];
 		for (const subscriber of subscribers.v) {
 			if (subscriber[0] !== handle[1]) {
@@ -231,15 +228,15 @@ function release_under(handle, ambient) {
 			}
 		}
 		subscribers.v = kept;
-		$X = undefined;
+		$Z = undefined;
 	} else {
-		$X = undefined;
+		$Z = undefined;
 	}
-	$X;
-	const $Y = ambient;
-	let $Z = null;
-	if ($Y[0] === 0) {
-		const turn = $Y[1];
+	$Z;
+	const $aa = ambient;
+	let $ab = null;
+	if ($aa[0] === 0) {
+		const turn = $aa[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
 			if (subscriber2[0] !== handle[1]) {
@@ -256,26 +253,26 @@ function release_under(handle, ambient) {
 		}
 		turn[1].v = kept_derived;
 		turn[3].v.delete(hash(handle[1]));
-		$Z = undefined;
+		$ab = undefined;
 	} else {
-		$Z = undefined;
+		$ab = undefined;
 	}
-	$Z;
-	const $aa = handle[3].v;
-	let $ab = null;
-	if ($aa[0] === 0) {
-		const release = $aa[1];
+	$ab;
+	const $ac = handle[3].v;
+	let $ad = null;
+	if ($ac[0] === 0) {
+		const release = $ac[1];
 		handle[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
 		});
-		$ab = undefined;
+		$ad = undefined;
 	} else {
-		$ab = undefined;
+		$ad = undefined;
 	}
-	return $ab;
+	return $ad;
 }
 function new3() {
 	return [ __shared_new([  ]), __shared_new(false) ];
@@ -288,52 +285,67 @@ function defer(self, cleanup) {
 	}
 }
 function dispose2(self) {
-	let $cs = null;
+	let $co = null;
 	if (!(self[1].v)) {
 		self[1].v = true;
 		let failure = [ 1 ];
 		for (const cleanup of self[0].v) {
-			const $cm = __guarded(cleanup);
-			let $cn = null;
-			if ($cm[0] === 0) {
-				const message = $cm[1];
-				if ($co(failure)) {
+			const $ci = __guarded(cleanup);
+			let $cj = null;
+			if ($ci[0] === 0) {
+				const message = $ci[1];
+				if ($ck(failure)) {
 					failure = [ 0, message ];
 				}
-				$cn = undefined;
+				$cj = undefined;
 			} else {
-				$cn = undefined;
+				$cj = undefined;
 			}
-			$cn;
+			$cj;
 		}
 		self[0].v = [  ];
-		const $cq = failure;
-		let $cr = null;
-		if ($cq[0] === 0) {
-			const message2 = $cq[1];
-			$cr = (() => {
+		const $cm = failure;
+		let $cn = null;
+		if ($cm[0] === 0) {
+			const message2 = $cm[1];
+			$cn = (() => {
 				throw message2;
 			})();
 		} else {
-			$cr = undefined;
+			$cn = undefined;
 		}
-		$cs = $cr;
+		$co = $cn;
 	}
-	return $cs;
+	return $co;
 }
-function get_owner($aK) {
-	return $aK;
+function get_owner($aJ) {
+	return $aJ;
 }
-function register_with_owner(subscription, $N, $O) {
-	const $P = $O;
-	let $Q = null;
-	if ($P[0] === 0) {
-		const owner = $P[1];
-		$Q = $R(owner, subscription, $N);
+function register_with_owner(subscription, $P, $Q) {
+	const $R = $Q;
+	let $S = null;
+	if ($R[0] === 0) {
+		const owner = $R[1];
+		$S = $T(owner, subscription, $P);
 	} else {
-		$Q = __clone(subscription);
+		$S = __clone(subscription);
 	}
-	return $Q;
+	return $S;
+}
+function also_releasing(handle, release) {
+	const previous = handle[3].v;
+	handle[3].v = [ 0, () => {
+		release();
+		const $N = previous;
+		let $O = null;
+		if ($N[0] === 0) {
+			const earlier = $N[1];
+			$O = earlier();
+		} else {
+			$O = undefined;
+		}
+		return $O;
+	} ];
 }
 function ensure_wired($e) {
 	if (!(wired.v)) {
@@ -351,10 +363,10 @@ function current_path($d) {
 	ensure_wired($d);
 	return path_signal;
 }
-function navigate(path, $au) {
-	ensure_wired($au);
+function navigate(path, $aw) {
+	ensure_wired($aw);
 	history.pushState("", "", path);
-	$f(path_signal, path, $au);
+	$f(path_signal, path, $aw);
 }
 function segments(path) {
 	let parts = [  ];
@@ -376,87 +388,87 @@ function chunk_error() {
 	return chunk_failure();
 }
 function view(tag) {
-	let $ah = null;
+	let $aj = null;
 	if (is_svg_tag(tag)) {
-		$ah = [ document.createElementNS("http://www.w3.org/2000/svg", tag) ];
+		$aj = [ document.createElementNS("http://www.w3.org/2000/svg", tag) ];
 	} else {
-		$ah = [ document.createElement(tag) ];
+		$aj = [ document.createElement(tag) ];
 	}
-	return $ah;
+	return $aj;
 }
 function is_svg_tag(tag) {
-	const $af = tag;
-	let $ag = null;
-	if ($af === "svg") {
-		$ag = true;
-	} else if ($af === "path") {
-		$ag = true;
-	} else if ($af === "circle") {
-		$ag = true;
-	} else if ($af === "ellipse") {
-		$ag = true;
-	} else if ($af === "rect") {
-		$ag = true;
-	} else if ($af === "line") {
-		$ag = true;
-	} else if ($af === "polyline") {
-		$ag = true;
-	} else if ($af === "polygon") {
-		$ag = true;
-	} else if ($af === "g") {
-		$ag = true;
-	} else if ($af === "defs") {
-		$ag = true;
-	} else if ($af === "use") {
-		$ag = true;
-	} else if ($af === "symbol") {
-		$ag = true;
-	} else if ($af === "marker") {
-		$ag = true;
-	} else if ($af === "pattern") {
-		$ag = true;
-	} else if ($af === "mask") {
-		$ag = true;
-	} else if ($af === "clipPath") {
-		$ag = true;
-	} else if ($af === "linearGradient") {
-		$ag = true;
-	} else if ($af === "radialGradient") {
-		$ag = true;
-	} else if ($af === "stop") {
-		$ag = true;
-	} else if ($af === "text") {
-		$ag = true;
-	} else if ($af === "tspan") {
-		$ag = true;
-	} else if ($af === "textPath") {
-		$ag = true;
-	} else if ($af === "filter") {
-		$ag = true;
-	} else if ($af === "foreignObject") {
-		$ag = true;
-	} else if ($af === "feGaussianBlur") {
-		$ag = true;
-	} else if ($af === "feColorMatrix") {
-		$ag = true;
-	} else if ($af === "feOffset") {
-		$ag = true;
-	} else if ($af === "feMerge") {
-		$ag = true;
-	} else if ($af === "feMergeNode") {
-		$ag = true;
-	} else if ($af === "feFlood") {
-		$ag = true;
-	} else if ($af === "feComposite") {
-		$ag = true;
-	} else if ($af === "feBlend") {
-		$ag = true;
-	} else if ($af === "feDropShadow") {
-		$ag = true;
+	const $ah = tag;
+	let $ai = null;
+	if ($ah === "svg") {
+		$ai = true;
+	} else if ($ah === "path") {
+		$ai = true;
+	} else if ($ah === "circle") {
+		$ai = true;
+	} else if ($ah === "ellipse") {
+		$ai = true;
+	} else if ($ah === "rect") {
+		$ai = true;
+	} else if ($ah === "line") {
+		$ai = true;
+	} else if ($ah === "polyline") {
+		$ai = true;
+	} else if ($ah === "polygon") {
+		$ai = true;
+	} else if ($ah === "g") {
+		$ai = true;
+	} else if ($ah === "defs") {
+		$ai = true;
+	} else if ($ah === "use") {
+		$ai = true;
+	} else if ($ah === "symbol") {
+		$ai = true;
+	} else if ($ah === "marker") {
+		$ai = true;
+	} else if ($ah === "pattern") {
+		$ai = true;
+	} else if ($ah === "mask") {
+		$ai = true;
+	} else if ($ah === "clipPath") {
+		$ai = true;
+	} else if ($ah === "linearGradient") {
+		$ai = true;
+	} else if ($ah === "radialGradient") {
+		$ai = true;
+	} else if ($ah === "stop") {
+		$ai = true;
+	} else if ($ah === "text") {
+		$ai = true;
+	} else if ($ah === "tspan") {
+		$ai = true;
+	} else if ($ah === "textPath") {
+		$ai = true;
+	} else if ($ah === "filter") {
+		$ai = true;
+	} else if ($ah === "foreignObject") {
+		$ai = true;
+	} else if ($ah === "feGaussianBlur") {
+		$ai = true;
+	} else if ($ah === "feColorMatrix") {
+		$ai = true;
+	} else if ($ah === "feOffset") {
+		$ai = true;
+	} else if ($ah === "feMerge") {
+		$ai = true;
+	} else if ($ah === "feMergeNode") {
+		$ai = true;
+	} else if ($ah === "feFlood") {
+		$ai = true;
+	} else if ($ah === "feComposite") {
+		$ai = true;
+	} else if ($ah === "feBlend") {
+		$ai = true;
+	} else if ($ah === "feDropShadow") {
+		$ai = true;
 	} else {
-		$ag = false;
+		$ai = false;
 	}
-	return $ag;
+	return $ai;
 }
 function text(self, content) {
 	self[0].textContent = content;
@@ -468,8 +480,8 @@ function class2(self, name) {
 }
 function on_event(self, event, handler) {
 	self[0].addEventListener(event, (dispatched) => {
-		return $t([ 1 ], ($av) => {
-			return handler(dispatched, $av);
+		return $t([ 1 ], ($ax) => {
+			return handler(dispatched, $ax);
 		});
 	});
 	return __clone(self);
@@ -480,21 +492,21 @@ function chunk_pending() {
 function chunk_failure() {
 	return chunk_error_signal;
 }
-function set_chunk_pending(busy, $bL) {
-	if ($C(chunk_pending_signal) !== busy) {
-		$bF(chunk_pending_signal, busy, $bL);
+function set_chunk_pending(busy, $bH) {
+	if ($D(chunk_pending_signal) !== busy) {
+		$bB(chunk_pending_signal, busy, $bH);
 	}
 }
-function clear_chunk_error($bC) {
-	const $bD = $C(chunk_error_signal);
-	let $bE = null;
-	if ($bD[0] === 0) {
-		const _reason = $bD[1];
-		$bE = $bF(chunk_error_signal, [ 1 ], $bC);
+function clear_chunk_error($by) {
+	const $bz = $D(chunk_error_signal);
+	let $bA = null;
+	if ($bz[0] === 0) {
+		const _reason = $bz[1];
+		$bA = $bB(chunk_error_signal, [ 1 ], $by);
 	} else {
-		$bE = undefined;
+		$bA = undefined;
 	}
-	return $bE;
+	return $bA;
 }
 function open(parent) {
 	const anchor = document.createTextNode("");
@@ -524,13 +536,13 @@ function close(self) {
 	const rows = __clone(self[2].v);
 	let at = 0;
 	for (const row of rows) {
-		let $ct = null;
+		let $cp = null;
 		if (at + 1 < rows.length) {
-			$ct = __at(rows, at + 1)[0];
+			$cp = __at(rows, at + 1)[0];
 		} else {
-			$ct = self[0];
+			$cp = self[0];
 		}
-		const end = __clone($ct);
+		const end = __clone($cp);
 		cut_row(self, row, end);
 		drop_row(self, row);
 		at = at + 1;
@@ -559,11 +571,11 @@ function mount(id, view2) {
 	element.appendChild(view2[0]);
 }
 function mount_root(id, body) {
-	const $cN = $t([ 1 ], ($cK) => {
-		return $cL(body);
+	const $cL = $t([ 1 ], ($cI) => {
+		return $cJ(body);
 	});
-	const built = $cN[0];
-	const root = $cN[1];
+	const built = $cL[0];
+	const root = $cL[1];
 	mount(id, built);
 	if (__hmr_active()) {
 		const element = document.getElementById(id);
@@ -601,17 +613,17 @@ function parse(path) {
 	return [ 2 ];
 }
 function href(route2) {
-	const $ao = route2;
-	let $ap = null;
-	if ($ao[0] === 0) {
-		$ap = "/";
-	} else if ($ao[0] === 1) {
-		const page = $ao[1];
-		$ap = "/docs/" + page;
+	const $aq = route2;
+	let $ar = null;
+	if ($aq[0] === 0) {
+		$ar = "/";
+	} else if ($aq[0] === 1) {
+		const page = $aq[1];
+		$ar = "/docs/" + page;
 	} else {
-		$ap = "/404";
+		$ar = "/404";
 	}
-	return $ap;
+	return $ar;
 }
 function to_path(self) {
 	return href(self);
@@ -620,64 +632,64 @@ function announce(name, value) {
 	console.log("init " + name + "=" + value);
 	return value;
 }
-function panel(title, body, $bn, $bo) {
-	return $aw($aw(view("section"), text(view("h2"), title), $bn, $bo), text(view("p"), body), $bn, $bo);
+function panel(title, body, $bj, $bk) {
+	return $ay($ay(view("section"), text(view("h2"), title), $bj, $bk), text(view("p"), body), $bj, $bk);
 }
-function app(route2, $ad, $ae) {
-	$bv(route2);
-	return $cb($aw($aw($aw(view("main"), $aw($aw(view("nav"), $ai("Home", [ 0 ], $ad, $ae), $ad, $ae), $ai("Docs", [ 1, 1 ], $ad, $ae), $ad, $ae), $ad, $ae), $aB(class2(view("p"), "pending"), $x(pending(), (busy) => {
-		let $az = null;
+function app(route2, $af, $ag) {
+	$br(route2);
+	return $bX($ay($ay($ay(view("main"), $ay($ay(view("nav"), $ak("Home", [ 0 ], $af, $ag), $af, $ag), $ak("Docs", [ 1, 1 ], $af, $ag), $af, $ag), $af, $ag), $aD(class2(view("p"), "pending"), $x(pending(), (busy) => {
+		let $aB = null;
 		if (busy) {
-			$az = "...";
+			$aB = "...";
 		} else {
-			$az = "";
+			$aB = "";
 		}
-		return $az;
-	}), $ad, $ae), $ad, $ae), $aX(class2(view("p"), "failed"), $x(chunk_error(), (reason) => {
-		const $aT = reason;
-		let $aU = null;
-		if ($aT[0] === 0) {
-			const text2 = $aT[1];
-			let $aV = null;
+		return $aB;
+	}), $af, $ag), $af, $ag), $aV(class2(view("p"), "failed"), $x(chunk_error(), (reason) => {
+		const $aR = reason;
+		let $aS = null;
+		if ($aR[0] === 0) {
+			const text2 = $aR[1];
+			let $aT = null;
 			if (text2.length > 0) {
-				$aV = "!";
+				$aT = "!";
 			} else {
-				$aV = "?";
+				$aT = "?";
 			}
-			$aU = $aV;
+			$aS = $aT;
 		} else {
-			$aU = "";
+			$aS = "";
 		}
-		return $aU;
-	}), $ad, $ae), $ad, $ae), $bx(route2, (current, $bi) => {
-		const $bj = current;
-		let $bk = null;
-		if ($bj[0] === 0) {
-			$bk = home_page($ad, $bi);
-		} else if ($bj[0] === 1) {
-			const page = $bj[1];
-			$bk = docs_page(page, $ad, $bi);
+		return $aS;
+	}), $af, $ag), $af, $ag), $bt(__clone(route2), (current, $be) => {
+		const $bf = current;
+		let $bg = null;
+		if ($bf[0] === 0) {
+			$bg = home_page($af, $be);
+		} else if ($bf[0] === 1) {
+			const page = $bf[1];
+			$bg = docs_page(page, $af, $be);
 		} else {
-			$bk = not_found_page($ad, $bi);
+			$bg = not_found_page($af, $be);
 		}
-		return $bk;
-	}), $ad, $ae);
+		return $bg;
+	}), $af, $ag);
 }
 function eq(self, other) {
-	const $cw = [ self, other ];
-	let $cx = null;
-	if ($cw[0][0] === 0 && $cw[1][0] === 0) {
-		$cx = true;
-	} else if ($cw[0][0] === 1 && $cw[1][0] === 1) {
-		const s0 = $cw[0][1];
-		const o0 = $cw[1][1];
-		$cx = s0 === o0;
-	} else if ($cw[0][0] === 2 && $cw[1][0] === 2) {
-		$cx = true;
+	const $cs = [ self, other ];
+	let $ct = null;
+	if ($cs[0][0] === 0 && $cs[1][0] === 0) {
+		$ct = true;
+	} else if ($cs[0][0] === 1 && $cs[1][0] === 1) {
+		const s0 = $cs[0][1];
+		const o0 = $cs[1][1];
+		$ct = s0 === o0;
+	} else if ($cs[0][0] === 2 && $cs[1][0] === 2) {
+		$ct = true;
 	} else {
-		$cx = false;
+		$ct = false;
 	}
-	return $cx;
+	return $ct;
 }
 function $a(value) {
 	let subscribers = [  ];
@@ -733,221 +745,263 @@ function $t(policy, body) {
 function $x(self, transform) {
 	return [ __clone(self), transform ];
 }
-function $C(self) {
+function $D(self) {
 	return __clone(self[0].v);
 }
-function $B(self) {
-	return self[1]($C(self[0]));
+function $F(signal, subscriber) {
+	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
+	signal[1].v.push(reissued(subscriber));
+	return handle;
 }
-function $F(self, $i) {
-	const $G = $i;
-	let $H = null;
-	if ($G[0] === 0) {
-		const turn = $G[1];
-		$H = enqueue(turn, self[1].v);
+function $E(self, subscriber) {
+	return $F(self, subscriber);
+}
+function $C(self) {
+	return [ () => {
+		return $D(self);
+	}, (subscriber) => {
+		return $E(self, subscriber);
+	}, () => {
+		return;
+	} ];
+}
+function $B(self) {
+	const transform = self[1];
+	const upstream = $C(__clone(self[0]));
+	const pull = upstream[0];
+	return [ () => {
+		return transform(pull());
+	}, upstream[1], upstream[2] ];
+}
+function $I(self, $i) {
+	const $J = $i;
+	let $K = null;
+	if ($J[0] === 0) {
+		const turn = $J[1];
+		$K = enqueue(turn, self[1].v);
 	} else {
-		const $I = $n(draining_turns.v);
-		let $J = null;
-		if ($I[0] === 0) {
-			const draining = $I[1];
-			$J = enqueue(draining, self[1].v);
+		const $L = $n(draining_turns.v);
+		let $M = null;
+		if ($L[0] === 0) {
+			const draining = $L[1];
+			$M = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$J = undefined;
+			$M = undefined;
 		}
-		$H = $J;
+		$K = $M;
 	}
-	return $H;
+	return $K;
 }
-function $E(self, value, $g) {
+function $H(self, value, $g) {
 	self[0].v = __clone(value);
-	$F(self, $g);
+	$I(self, $g);
 }
-function $M(signal, subscriber) {
-	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
-	signal[1].v.push(reissued(subscriber));
-	return handle;
-}
-function $L(self, subscriber) {
-	return $M(self, subscriber);
-}
-function $K(self, subscriber) {
-	return $L(self[0], subscriber);
-}
-function $R(self, item, $S) {
+function $T(self, item, $U) {
 	if (self[1].v) {
-		dispose(item, $S);
+		dispose(item, $U);
 	} else {
 		self[0].v.push(() => {
-			dispose(item, $S);
+			dispose(item, $U);
 			return;
 		});
 	}
 	return __clone(item);
 }
 function $y(self, $z, $A) {
-	const cached = $a($B(self));
-	as_derivation();
-	register_with_owner($K(self, mint_subscriber(() => {
-		$E(cached, $B(self), $z);
+	const instance = $B(self);
+	const pull = instance[0];
+	const cached = $a(pull());
+	const refreshed = instance[1](subscriber_of(() => {
+		$H(cached, pull(), $z);
 		return;
-	})), $z, $A);
+	}, true));
+	also_releasing(refreshed, instance[2]);
+	register_with_owner(refreshed, $z, $A);
 	return cached;
 }
-function $aq(self, name, value, $ar, $as) {
-	apply(value, self, name, $ar, $as);
+function $as(self, name, value, $at, $au) {
+	apply(__clone(value), self, name, $at, $au);
 	return __clone(self);
 }
-function $al(self, route2, $am, $an) {
+function $an(self, route2, $ao, $ap) {
 	const path = to_path(route2);
-	return on_event($aq($aq(self, "href", path, $am, $an), "draggable", "false", $am, $an), "click", (event, $at) => {
+	return on_event($as($as(self, "href", path, $ao, $ap), "draggable", "false", $ao, $ap), "click", (event, $av) => {
 		if (plain_left_click(event)) {
 			event.preventDefault();
-			navigate(path, [ 0, $at ]);
+			navigate(path, [ 0, $av ]);
 		}
 		return;
 	});
 }
-function $ai(label, route2, $aj, $ak) {
-	return text($al(view("a"), route2, $aj, $ak), label);
+function $ak(label, route2, $al, $am) {
+	return text($an(view("a"), route2, $al, $am), label);
 }
-function $aw(self, content, $ax, $ay) {
-	place(content, self, $ax, $ay);
+function $ay(self, content, $az, $aA) {
+	place(__clone(content), self, $az, $aA);
 	return __clone(self);
 }
-function $aO(self) {
-	return self[1]($C(self[0]));
+function $aP(self, subscriber) {
+	return $F(self, subscriber);
 }
-function $aN(source, observer) {
-	return mint_subscriber(() => {
-		return observer($aO(source));
-	});
+function $aN(self) {
+	return [ () => {
+		return $D(self);
+	}, (subscriber) => {
+		return $aP(self, subscriber);
+	}, () => {
+		return;
+	} ];
 }
-function $aR(self, subscriber) {
-	return $M(self, subscriber);
+function $aM(self) {
+	const transform = self[1];
+	const upstream = $aN(__clone(self[0]));
+	const pull = upstream[0];
+	return [ () => {
+		return transform(pull());
+	}, upstream[1], upstream[2] ];
 }
-function $aQ(self, subscriber) {
-	return $aR(self[0], subscriber);
+function $aL(flow, observer, immediately) {
+	const instance = $aM(flow);
+	const pull = instance[0];
+	const subscription = instance[1](mint_subscriber(() => {
+		return observer(pull());
+	}));
+	also_releasing(subscription, instance[2]);
+	if (immediately) {
+		observer(pull());
+	}
+	return subscription;
 }
-function $aM(source, observer) {
-	return $aQ(source, $aN(source, observer));
+function $aK(self, observer) {
+	return $aL(self, observer, true);
 }
-function $aL(self, observer) {
-	return $aM(self, observer);
+function $aG(self, observer, $aH, $aI) {
+	$T(get_owner($aI), $aK(self, observer), $aH);
 }
-function $aH(self, observer, $aI, $aJ) {
-	$R(get_owner($aJ), $aL(self, observer), $aI);
-}
-function $aE(self, observer, $aF, $aG) {
-	$aH(self, observer, $aF, $aG);
-	observer($aO(self));
-}
-function $aB(self, source, $aC, $aD) {
+function $aD(self, source, $aE, $aF) {
 	const element = __clone(self[0]);
-	$aE(source, (value) => {
+	$aG(source, (value) => {
 		element.textContent = value;
 		return;
-	}, $aC, $aD);
+	}, $aE, $aF);
 	return __clone(self);
 }
-function $bc(source, observer) {
-	return mint_subscriber(() => {
-		return observer($aO(source));
-	});
+function $ba(self) {
+	return [ () => {
+		return $D(self);
+	}, (subscriber) => {
+		return $aP(self, subscriber);
+	}, () => {
+		return;
+	} ];
 }
-function $bf(self, subscriber) {
-	return $aR(self[0], subscriber);
+function $aZ(self) {
+	const transform = self[1];
+	const upstream = $ba(__clone(self[0]));
+	const pull = upstream[0];
+	return [ () => {
+		return transform(pull());
+	}, upstream[1], upstream[2] ];
 }
-function $bb(source, observer) {
-	return $bf(source, $bc(source, observer));
+function $aY(flow, observer, immediately) {
+	const instance = $aZ(flow);
+	const pull = instance[0];
+	const subscription = instance[1](mint_subscriber(() => {
+		return observer(pull());
+	}));
+	also_releasing(subscription, instance[2]);
+	if (immediately) {
+		observer(pull());
+	}
+	return subscription;
 }
-function $ba(self, observer) {
-	return $bb(self, observer);
+function $aX(self, observer) {
+	return $aY(self, observer, true);
 }
-function $aZ(self, observer, $aI, $aJ) {
-	$R(get_owner($aJ), $ba(self, observer), $aI);
+function $aW(self, observer, $aH, $aI) {
+	$T(get_owner($aI), $aX(self, observer), $aH);
 }
-function $aY(self, observer, $aF, $aG) {
-	$aZ(self, observer, $aF, $aG);
-	observer($aO(self));
-}
-function $aX(self, source, $aC, $aD) {
+function $aV(self, source, $aE, $aF) {
 	const element = __clone(self[0]);
-	$aY(source, (value) => {
+	$aW(source, (value) => {
 		element.textContent = value;
 		return;
-	}, $aC, $aD);
+	}, $aE, $aF);
 	return __clone(self);
 }
-function $bv(source) {
-	__chunk_preload(__chunk_arm($C(source)));
+function $br(source) {
+	__chunk_preload(__chunk_arm($D(source)));
 }
-function $bF(self, value, $g) {
+function $bB(self, value, $g) {
 	self[0].v = __clone(value);
-	$F(self, $g);
+	$I(self, $g);
 }
-function $bX(signal, observer) {
+function $bT(signal, observer) {
 	const cell = signal[0];
-	return $M(signal, mint_subscriber(() => {
-		const $bY = [ 0, cell ];
-		let $bZ = null;
-		if ($bY[0] === 0) {
-			const live = $bY[1];
-			$bZ = observer(live.v);
+	return $F(signal, mint_subscriber(() => {
+		const $bU = [ 0, cell ];
+		let $bV = null;
+		if ($bU[0] === 0) {
+			const live = $bU[1];
+			$bV = observer(live.v);
 		} else {
-			$bZ = undefined;
+			$bV = undefined;
 		}
-		return $bZ;
+		return $bV;
 	}));
 }
-function $bW(self, observer) {
-	return $bX(self, observer);
+function $bS(self, observer, immediately) {
+	const subscription = $bT(self, observer);
+	if (immediately) {
+		observer($D(self));
+	}
+	return subscription;
 }
-function $bV(self, observer, $aI, $aJ) {
-	$R(get_owner($aJ), $bW(self, observer), $aI);
+function $bR(self, observer) {
+	return $bS(self, observer, true);
 }
-function $bU(self, observer, $aF, $aG) {
-	$bV(self, observer, $aF, $aG);
-	observer($C(self));
+function $bQ(self, observer, $aH, $aI) {
+	$T(get_owner($aI), $bR(self, observer), $aH);
 }
-function $bx(source, render, $by) {
-	const gated = $a($C(source));
+function $bt(source, render, $bu) {
+	const gated = $a($D(source));
 	const armed = __shared_new(false);
 	const generation = __shared_new(0);
-	const advance = (value, $bz) => {
+	const advance = (value, $bv) => {
 		armed.v = true;
-		$E(gated, value, [ 0, $bz ]);
+		$H(gated, value, [ 0, $bv ]);
 		return;
 	};
-	const wire = ($bA) => {
-		$bU(source, (value) => {
-			return $t([ 1 ], ($bB) => {
+	const wire = ($bw) => {
+		$bQ(__clone(source), (value) => {
+			return $t([ 1 ], ($bx) => {
 				const mine = generation.v + 1;
 				generation.v = mine;
-				clear_chunk_error([ 0, $bB ]);
+				clear_chunk_error([ 0, $bx ]);
 				const arm = __chunk_arm(value);
 				if (__chunk_ready(arm)) {
-					set_chunk_pending(false, [ 0, $bB ]);
-					advance(value, $bB);
+					set_chunk_pending(false, [ 0, $bx ]);
+					advance(value, $bx);
 				} else {
-					set_chunk_pending(true, [ 0, $bB ]);
+					set_chunk_pending(true, [ 0, $bx ]);
 					__chunk_load(arm, () => {
-						return $t([ 1 ], ($bS) => {
+						return $t([ 1 ], ($bO) => {
 							if (generation.v === mine) {
-								set_chunk_pending(false, [ 0, $bS ]);
-								advance(value, $bS);
+								set_chunk_pending(false, [ 0, $bO ]);
+								advance(value, $bO);
 							}
 							return;
 						});
 					}, (reason) => {
-						return $t([ 1 ], ($bT) => {
+						return $t([ 1 ], ($bP) => {
 							if (generation.v === mine) {
-								set_chunk_pending(false, [ 0, $bT ]);
-								$bF(chunk_error_signal, [ 0, reason ], [ 0, $bT ]);
+								set_chunk_pending(false, [ 0, $bP ]);
+								$bB(chunk_error_signal, [ 0, reason ], [ 0, $bP ]);
 							}
 							return;
 						});
@@ -955,79 +1009,79 @@ function $bx(source, render, $by) {
 				}
 				return;
 			});
-		}, $by, $bA);
+		}, $bu, $bw);
 		return;
 	};
-	return [ __clone(source), render, [ 0, __clone(gated) ], armed, wire ];
+	return [ [ 1 ], render, [ 0, __clone(gated) ], armed, wire ];
 }
-function $co(self) {
-	const $cp = self;
-	return $cp[0] === 1;
+function $ck(self) {
+	const $cl = self;
+	return $cl[0] === 1;
 }
-function $cG(self, content, end, $cH, $cI) {
+function $cC(self, content, end, $cD, $cE) {
 	const marker = document.createTextNode("");
 	host(self).insertBefore(marker, end);
 	const staging = document.createDocumentFragment();
-	place(content, [ __clone(staging) ], $cH, $cI);
+	place(__clone(content), [ __clone(staging) ], $cD, $cE);
 	host(self).insertBefore(staging, end);
 	return [ marker ];
 }
-function $cD(self, content, $cE, $cF) {
-	return $cG(self, content, self[0], $cE, $cF);
+function $cz(self, content, $cA, $cB) {
+	return $cC(self, __clone(content), self[0], $cA, $cB);
 }
-function $cJ(owner, body) {
+function $cF(owner, body) {
 	return body(owner);
 }
-function $ch(parent, source, render, armed, $ci, $cj) {
+function $cd(parent, source, render, armed, $ce, $cf) {
 	const region = open(parent);
 	const last_value = __shared_new([ 1 ]);
 	const live_row = __shared_new([ 1 ]);
 	const live_owner = __shared_new([ 1 ]);
-	defer(get_owner($cj), () => {
-		const $ck = live_owner.v;
-		let $cl = null;
-		if ($ck[0] === 1) {
-			$cl = $ck;
+	defer(get_owner($cf), () => {
+		const $cg = live_owner.v;
+		let $ch = null;
+		if ($cg[0] === 1) {
+			$ch = $cg;
 		} else {
-			$cl = [ 0, dispose2($ck[1]) ];
+			$ch = [ 0, dispose2($cg[1]) ];
 		}
-		$cl;
+		$ch;
 		close(region);
 		return;
 	});
-	$bU(source, (value) => {
-		const $cu = last_value.v;
-		let $cv = null;
-		if ($cu[0] === 0) {
-			const previous = $cu[1];
-			$cv = eq(previous, value);
+	$bQ(__clone(source), (value) => {
+		const $cq = last_value.v;
+		let $cr = null;
+		if ($cq[0] === 0) {
+			const previous = $cq[1];
+			$cr = eq(previous, value);
 		} else {
-			$cv = false;
+			$cr = false;
 		}
-		const unchanged = $cv;
+		const unchanged = $cr;
 		if (armed.v && !(unchanged)) {
-			const $cy = live_owner.v;
-			let $cz = null;
-			if ($cy[0] === 1) {
-				$cz = $cy;
+			const $cu = live_owner.v;
+			let $cv = null;
+			if ($cu[0] === 1) {
+				$cv = $cu;
 			} else {
-				$cz = [ 0, dispose2($cy[1]) ];
+				$cv = [ 0, dispose2($cu[1]) ];
 			}
-			$cz;
-			const $cA = live_row.v;
-			let $cB = null;
-			if ($cA[0] === 0) {
-				const row = $cA[1];
+			$cv;
+			const $cw = live_row.v;
+			let $cx = null;
+			if ($cw[0] === 0) {
+				const row = $cw[1];
 				cut_row(region, row, region[0]);
 				drop_row(region, row);
-				$cB = undefined;
+				$cx = undefined;
 			} else {
-				$cB = undefined;
+				$cx = undefined;
 			}
-			$cB;
+			$cx;
 			const owner = new3();
-			const row2 = $cJ(owner, ($cC) => {
-				return $cD(region, render(value, $cC), $ci, $cC);
+			const row2 = $cF(owner, ($cy) => {
+				return $cz(region, render(value, $cy), $ce, $cy);
 			});
 			hold_rows(region, [ __clone(row2) ]);
 			last_value.v = [ 0, __clone(value) ];
@@ -1035,25 +1089,35 @@ function $ch(parent, source, render, armed, $ci, $cj) {
 			live_owner.v = [ 0, owner ];
 		}
 		return;
-	}, $ci, $cj);
+	}, $ce, $cf);
 }
-function $cc(self, parent, $cd, $ce) {
-	self[4]($ce);
-	const $cf = self[2];
-	let $cg = null;
-	if ($cf[0] === 0) {
-		const gated = $cf[1];
-		$cg = $ch(parent, gated, self[1], self[3], $cd, $ce);
+function $bY(self, parent, $bZ, $ca) {
+	self[4]($ca);
+	const render = self[1];
+	const armed = self[3];
+	const $cb = self[0];
+	let $cc = null;
+	if ($cb[0] === 0) {
+		const source = $cb[1];
+		$cc = $cd(parent, __clone(source), render, armed, $bZ, $ca);
 	} else {
-		$cg = $ch(parent, self[0], self[1], self[3], $cd, $ce);
+		const $cG = self[2];
+		let $cH = null;
+		if ($cG[0] === 0) {
+			const gated = $cG[1];
+			$cH = $cd(parent, __clone(gated), render, armed, $bZ, $ca);
+		} else {
+			$cH = undefined;
+		}
+		$cc = $cH;
 	}
-	return $cg;
+	return $cc;
 }
-function $cb(self, content, $ax, $ay) {
-	$cc(content, self, $ax, $ay);
+function $bX(self, content, $az, $aA) {
+	$bY(__clone(content), self, $az, $aA);
 	return __clone(self);
 }
-function $cL(body) {
+function $cJ(body) {
 	const scope = new3();
 	const result = body(scope);
 	return [ result, scope ];
@@ -1072,12 +1136,12 @@ const LABEL = "scale " + SCALED;
 __vilan_chunks.url[0] = "app.Route_Home.js";
 __vilan_chunks.url[1] = "app.Route_Docs.js";
 __vilan_chunks.url[2] = "app.Route_NotFound.js";
-__vilan_chunks.fn.$ai = $ai;
-__vilan_chunks.fn.$aw = $aw;
+__vilan_chunks.fn.$ak = $ak;
+__vilan_chunks.fn.$ay = $ay;
 __vilan_chunks.fn.LABEL = LABEL;
 __vilan_chunks.fn.panel = panel;
 __vilan_chunks.fn.view = view;
 const route = $y($x(current_path([ 1 ]), parse), [ 1 ], [ 1 ]);
-mount_root("app", ($ac) => {
-	return app(route, [ 1 ], $ac);
+mount_root("app", ($ae) => {
+	return app(route, [ 1 ], $ae);
 });

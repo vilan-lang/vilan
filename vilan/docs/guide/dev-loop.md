@@ -529,14 +529,14 @@ fun missing_page(): View {
 }
 
 fun main() {
-	let route = current_path().map(parse);
 	let _root = mount_root("app", || {
+		let route = current_path().derive(|path| parse(path));
 		view("main")
 			// Visible only while a route chunk is in flight; the page behind
 			// it is the one you were already on.
 			.child(view("div").class("spinner").text("Loading…").show(pending()))
 			// …and if it never arrives, say so. The next click retries.
-			.child(view("div").class("error").bind_text(chunk_error().map(|failure| match failure {
+			.child(view("div").class("error").bind_text(chunk_error().derive(|failure| match failure {
 				Some(let reason) => "Could not load that page: " + reason,
 				None => "",
 			})))

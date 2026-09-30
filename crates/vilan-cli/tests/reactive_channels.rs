@@ -132,7 +132,7 @@ fun main() {
 		// argument is the Option, which is the truth about a mirror that has
 		// been told nothing.
 		let rendered = mirror.or([]);
-		print(i"or-len:{rendered.get().len()}");
+		print(i"or-len:{rendered.sample().len()}");
 	});
 	store.update(|&mut list| { list.push(Row { id = "d", value = 4 }); });
 	scope.dispose();
@@ -773,7 +773,7 @@ fun main() {
 	let channels = 20;
 	let per_channel = 50;
 	let store: SignalCell<List<Message>> = Signal::new(corpus(channels, per_channel));
-	let one_channel = store.map(|all: List<Message>| all.filter(|message| message.channel == 0));
+	let one_channel = store.derive(|all: List<Message>| all.filter(|message| message.channel == 0)).memo();
 
 	// (1) today's `[expose]` over the whole platform.
 	let whole = Shared::new(0);
@@ -2935,7 +2935,7 @@ fun main() {
 	owner_scope.run(page, || {
 		let ids: SignalCell<List<i32>> = client_cell
 			.and_then(|held| held.get_channels())
-			.map(|value| value.unwrap_or_default())
+			.derive(|value| value.unwrap_or_default())
 			.cell();
 		ids.effect(|value| print(i"cold-select sees {value.len()}"));
 	});
@@ -3071,7 +3071,7 @@ async fun run(port: i32) {
 			owner_scope.run(page, || {
 				let ids: SignalCell<List<i32>> = client_cell
 					.and_then(|held| held.get_channels())
-					.map(|value| value.unwrap_or_default())
+					.derive(|value| value.unwrap_or_default())
 					.cell();
 				ids.effect(|value| {
 					seen.write() += 1;
@@ -3429,7 +3429,7 @@ impl Store {
 	[rpc]
 	fun get_channels(self): SignalCell<List<i32>> {
 		self.calls.write() += 1;
-		self.channels.map(|ids| ids).cell()
+		self.channels.derive(|ids| ids).cell()
 	}
 }
 
@@ -3526,7 +3526,7 @@ impl Store {
 	[rpc]
 	fun get_channels(self): SignalCell<List<i32>> {
 		self.calls.write() += 1;
-		self.channels.map(|ids| ids).cell()
+		self.channels.derive(|ids| ids).cell()
 	}
 }
 
@@ -3658,11 +3658,11 @@ let handles_f: Memo<i32, SignalCell<Option<List<str>>>> = Memo::new();
 fun messages_f(client_cell: SignalCell<Option<Client<LocalTransport>>>, id: i32): SignalCell<List<str>> {
 	handles_f
 		.get_or_insert(id, || client_cell
-			.map(|client| client.map(|client| client.get_messages(id)))
+			.derive(|client| client.map(|client| client.get_messages(id)))
 			.cell()
 			.and_then(|mirror| mirror)
 			.cell())
-		.map(|x| x.unwrap_or_default())
+		.derive(|x| x.unwrap_or_default())
 		.cell()
 }
 
@@ -3673,10 +3673,10 @@ let handles_g: Memo<i32, SignalCell<Option<RemoteSource<List<str>>>>> = Memo::ne
 fun messages_g(client_cell: SignalCell<Option<Client<LocalTransport>>>, id: i32): SignalCell<List<str>> {
 	handles_g
 		.get_or_insert(id, || client_cell
-			.map(|client| client.map(|client| client.get_messages(id)))
+			.derive(|client| client.map(|client| client.get_messages(id)))
 			.cell_global())
 		.and_then(|mirror| mirror)
-		.map(|x| x.unwrap_or_default())
+		.derive(|x| x.unwrap_or_default())
 		.cell()
 }
 

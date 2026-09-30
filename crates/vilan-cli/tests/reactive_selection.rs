@@ -105,7 +105,7 @@ fn on_change_skips_the_value_the_source_already_holds() {
     );
 }
 
-const HAND_WRITTEN_SOURCE: &str = r#"import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscription };
+const HAND_WRITTEN_SOURCE: &str = r#"import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscriber, Subscription };
 
 struct Stored<T> {
 	inner: SignalCell<T>,
@@ -117,8 +117,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		self.inner.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.inner.on_settle(subscriber)
 	}
 }
 
@@ -130,8 +130,9 @@ fun main() {
 	stored.inner.set(12);
 	watched.dispose();
 	stored.inner.set(13);
-	// Q5's widening: `map` is a `Source` member, so it derives off `Stored`.
-	let labelled = stored.map(|value| i"n={value}");
+	// A source is a `Flow`, so a pipe derives off `Stored`; read as well as
+	// subscribed to, it is sealed.
+	let labelled = stored.derive(|value| i"n={value}").memo();
 	print(labelled.get());
 	let shown = labelled.sub(|value| print(i"label {value}"));
 	stored.inner.set(14);
@@ -141,11 +142,11 @@ fun main() {
 main();
 "#;
 
-/// A `Source` that implements only `get`/`on_change` — the two A49 made the
-/// trait's requirements — gets `map` (reactive-traits Q5's widening) and the
-/// whole eager family from the trait defaults. Here the LAZY member is the
-/// impl's own; `an_on_change_only_source_gets_a_working_eager_sub` below is the
-/// derived half.
+/// A `Source` that implements only `get`/`on_settle` — the requirements since
+/// A142 — gets `derive` and the whole consumer family through `Flow`. Here the
+/// LAZY member (`on_change`, through `Source::attach_observer`'s default) is
+/// exercised; `an_on_change_only_source_gets_a_working_eager_sub` below is the
+/// eager half.
 #[test]
 fn the_trait_defaults_serve_a_hand_written_source() {
     let stdout = build_and_run("hand_written_source", HAND_WRITTEN_SOURCE);
@@ -157,7 +158,7 @@ fn the_trait_defaults_serve_a_hand_written_source() {
 
 // --- A49: `on_change` is the requirement, `sub` the derived eager form -------
 
-const ON_CHANGE_ONLY_SOURCE: &str = r#"import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscription, comp };
+const ON_CHANGE_ONLY_SOURCE: &str = r#"import std::reactive::{ Disposable, Signal, SignalCell, Source, Subscriber, Subscription, comp };
 
 struct Stored<T> {
 	inner: SignalCell<T>,
@@ -169,8 +170,8 @@ impl Stored<type T> with Source<T> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		self.inner.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.inner.on_settle(subscriber)
 	}
 }
 
@@ -221,7 +222,8 @@ fn an_on_change_only_source_gets_a_working_eager_sub() {
 
 /// `combine` attaches to its inputs WITHOUT a first call — re-derived at A124
 /// S2c, where `combine` is a cold `Combine` node and the claim moves into the
-/// node's attach.
+/// node's attach, and at A142 S1, where the node is a pipe stage and its attach
+/// is the `attach` its instance hands the consumer.
 ///
 /// The pre-flip gate held `combine`'s own body: it seeded a derived cell from a
 /// snapshot and then attached each input with `on_change` (never the eager `sub`,
@@ -251,14 +253,18 @@ fn combine_attaches_to_its_inputs_without_the_first_call() {
         "combine must build the cold node and attach nothing; its body is:\n{combine}"
     );
     let node = source
-        .split_once("impl Combine<type T> with Source<T> {")
-        .expect("Combine implements Source")
+        .split_once("impl Combine<type T> with Flow<T> {")
+        .expect("Combine is a Flow stage")
         .1;
     let node = node.split_once("\n}\n").expect("the impl is delimited").0;
     let attach = node
-        .split_once("fun on_settle(")
-        .expect("Combine overrides on_settle")
+        .split_once("attach = |subscriber: Subscriber| {")
+        .expect("Combine's instance attaches")
         .1;
+    let attach = attach
+        .split_once("release =")
+        .expect("the attach closure ends before the release")
+        .0;
     assert!(
         attach.contains("source.on_settle(subscriber)"),
         "Combine must forward the leaf's record to each input; its attach is:\n{attach}"

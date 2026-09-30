@@ -307,16 +307,14 @@ When a function already does what your closure would do, pass the
 function itself:
 
 ```vilan
-import std::reactive::Signal;
-
 fun exclaim(text: str): str {
 	text + "!"
 }
 
 fun main() {
-	let words = Signal::new("hello");
+	let words = ["hello", "there"];
 	let loud = words.map(exclaim);   // instead of .map(|w| exclaim(w))
-	print(loud.get());
+	print(loud[0]);
 }
 ```
 

@@ -45,9 +45,9 @@ export trait Disposable {
 /// A registered observer of a signal: `notify` re-runs it when the signal's value
 /// changes; `id` lets a `Subscription` find and remove it.
 ///
-/// The id is the OBSERVER's, not the registration's (A124 R2). A leaf reading a
-/// chain of cold nodes mints ONE subscriber and every node forwards it to its
-/// upstream untouched (`Source::on_settle`), so a diamond puts the same record on a
+/// The id is the OBSERVER's, not the registration's (A124 R2). The consumer of a
+/// pipe mints ONE subscriber and every stage forwards it to its upstream untouched
+/// (`Source::on_settle`), so a diamond puts the same record on a
 /// root's list twice, or on two roots' lists once each — and `enqueue`'s dedup,
 /// keyed on this id, collapses the duplicate notify into one call. Nothing is lost
 /// by the collapse: every copy of one record is the same record, the same `notify`,
@@ -95,7 +95,7 @@ export struct Subscriber {
 	/// cell: liveness CHANGES after the subscriber is made and every copy must
 	/// see the change, and a class never changes at all. It is decided by the
 	/// one thing that mints an observer's subscriber (`mint_subscriber`, reached
-	/// from `observe` and from a cold chain's leaf) from the mark
+	/// from `observe` and from a pipe's consumer) from the mark
 	/// `as_derivation` leaves, and it is read at exactly one place (`enqueue`,
 	/// to pick the bucket).
 	derived: bool,
@@ -116,11 +116,11 @@ let always_live: Shared<bool> = Shared::new(true);
 /// `observe` the marked attach reaches.
 ///
 /// Tagging a derivation AT ITS OWN `on_change` call is not something the trait can
-/// express: `Source::map` calls `self.on_change(..)`, and for a generic source that
-/// is the impl's member and not `observe`. But every `Source` in the world bottoms
-/// out in `observe` — `RemoteSource::on_change` is
-/// `self.cache.on_change(observer)`, `KeyedCell`'s is
-/// `self.elements.on_change(observer)` — so the mark is left at the derivation site
+/// express: a generic `on_change` reaches the impl's own `attach_observer`, not
+/// `observe`. But every observer in the world is minted in one place — `observe`
+/// for a cell, `Flow::on_change`'s pulling subscriber for a pipe, and every other
+/// source bottoms out in one of those (`RemoteSource`'s lazy attach is
+/// `self.cache.on_change(observer)`) — so the mark is left at the derivation site
 /// and read where the `Subscriber` is actually minted, one layer below every impl.
 ///
 /// CONSUMED rather than merely read, which is what keeps the window one
@@ -150,22 +150,6 @@ export fun as_derivation() {
 	minting_derivation.write() = true;
 }
 
-/// `as_derivation` in the ARGUMENT position: mark, and hand `observer` straight
-/// back so the mark can be left inside an expression that has no room for a
-/// statement above it. Arguments are evaluated after the receiver and before
-/// the call, so `source.on_change(as_derivation_for(|value| ..))` marks exactly
-/// the attach it is written on.
-///
-/// `combine`'s mapped-tuple comprehension is the caller, and it is the only one:
-/// the comprehension mints a subscriber per input and there is nowhere in it to put
-/// a statement. Nothing is captured and nothing is copied — a closure is a
-/// reference on this backend, where the `source` a `SignalCell`-shaped marker would
-/// take is a struct and would be cloned.
-fun as_derivation_for<T>(observer: |T| void): |T| void {
-	minting_derivation.write() = true;
-	observer
-}
-
 /// Monotonic ids for subscribers — module-level, one counter for the program.
 let next_subscriber_id: Shared<i32> = Shared::new(0);
 
@@ -180,7 +164,7 @@ export fun fresh_id(): i32 {
 ///
 /// Every observer std subscribes is minted here: `observe`'s payload observer and,
 /// since the protocol split the mint from the attach (A124 S2a), the no-payload
-/// leaf a chain of cold nodes is read through. That keeps this the one place the
+/// subscriber a pipe's consumer attaches through the pipe. That keeps this the one place the
 /// mark is spent, as `observe` was: an attach no longer mints, it pushes a record
 /// it was HANDED, so a leaf standing on three registrations spends the mark once.
 fun mint_subscriber(notify: || void): Subscriber {
@@ -189,11 +173,10 @@ fun mint_subscriber(notify: || void): Subscriber {
 	subscriber_of(notify, derived)
 }
 
-/// A subscriber of a known class, mark untouched. The RELAY shape: a node that must
-/// keep a registration of its OWN — a `Switch`'s rolling inner, a `Distinct`'s
-/// comparison, the payload bridge `Source::on_settle` defaults to — registers one
-/// of these upstream and re-notifies its downstream through `wake`, so the
-/// downstream's id is still the one the turn dedups on.
+/// A subscriber of a known class, mark untouched. The RELAY shape: a stage that
+/// must keep a registration of its OWN — a `Switch`'s re-selection, a `Distinct`'s
+/// comparison — registers one of these upstream and re-notifies its downstream
+/// through `wake`, so the downstream's id is still the one the turn dedups on.
 ///
 /// A relay is always a DERIVATION: it decides whether (and which) downstream to
 /// wake, and that has to happen in the wave's first phase, where a derivation it
@@ -431,7 +414,8 @@ export fun drain(turn: Turn) {
 			mut budget = 100000;
 			for !turn.is_quiescent() && budget > 0 {
 				// PHASE 1 — DERIVATIONS, to a fixpoint (A110 door 2). A
-				// `map`/`combine`/`flatten`/`selector` subscriber exists to
+				// sealed pipe's (`.memo()`/`.cell()`), a stage relay's or a
+				// `selector`'s subscriber exists to
 				// publish a value, not to act on one, so every derivation the
 				// wave can reach — and every derivation those writes reach,
 				// until nothing new is enqueued — runs before any effect. That
@@ -725,7 +709,7 @@ export impl Subscription {
 	}
 }
 
-/// The handle a cold node hands back when it could not simply FORWARD its
+/// The handle a stage hands back when it could not simply FORWARD its
 /// downstream's subscriber (A124 R2) — a `Combine`'s arms, a `Switch`'s own
 /// registrations; a relay needing only its liveness chained uses `also_retiring`.
 /// Disposing it retires `subscriber` itself: its liveness goes down (so a copy
@@ -742,9 +726,9 @@ fun retiring(subscriber: Subscriber, release: || void): Subscription {
 }
 
 /// Make `handle` retire `subscriber` as well when it is disposed — for a handle
-/// that is a RELAY's own (`Source::on_settle`'s payload bridge, `Distinct`'s
-/// comparison), whose disposal must also lower the liveness of the observer the
-/// relay wakes, so a wake already queued for it is skipped (A110 door 1).
+/// that is a RELAY's own (`Distinct`'s comparison), whose disposal must also lower
+/// the liveness of the observer the relay wakes, so a wake already queued for it is
+/// skipped (A110 door 1).
 ///
 /// The retirement is CHAINED onto the handle's release rather than wrapped in a
 /// second handle whose release disposes this one, and that is not an economy. A
@@ -1063,8 +1047,9 @@ export fun get_owner(): Owner {
 /// it SAFELY: inside a boundary the cell dies with the boundary (the leak A28
 /// measured — 25 mount/dispose rounds left 25 dead subscribers on the module path
 /// signal — is gone), and outside every boundary it lives as long as its source.
-/// (The cold combinators — `map`, `switch`, `flatten`, `and_then`, `combine` —
-/// register nothing at all until a leaf subscribes, so they need no owner.)
+/// (The combinators — `derive`, `switch`, `flatten`, `and_then`, `combine` —
+/// build pipes, which register nothing at all until they are consumed, so they
+/// need no owner.)
 ///
 /// The ownerless case is therefore leak-as-today, not a refusal — except in a
 /// module binding's initializer, where `.cell()` is refused and `.cell_global()`
@@ -1169,142 +1154,376 @@ export fun comp<T>(body: (sync || T) context owner_scope): (T, Owner) {
 	(result, scope)
 }
 
-/// The read-only view of a reactive value: read the current value and subscribe to
-/// its changes. `SignalCell<T>` implements it (and adds `set`/`set_with`); a
-/// *remote* handle implements it too (its `on_change` flows over a transport), so
-/// code that only observes can't tell a local signal from a remote one — the split
-/// the reactive north star needs (`proposal/transport-rpc.md` §8).
+// === Sources and pipes (A142 R29, `proposal/reactive-layers.md` §3) ===========
+//
+// Two kinds of reactive value, and the whole layer is built from them:
+//
+//   - a `Source` HAS STATE and can be read: a root cell, a sealed memo, a
+//     constant, a remote mirror. Copying one copies a handle.
+//   - a PIPE is a transformation (`derive`, `switch`, `distinct`, …): a
+//     DESCRIPTION with no `get`. Its node types are `[resource]`s, so a pipe
+//     has one owner and is consumed exactly once — SEALED into a source
+//     (`.memo()`, `.cell()`, the `_global` twins, `.sample()`) or handed to a
+//     CONSUMER (an effect, a UI binding).
+//
+// `Flow` is what both are: anything a pipeline can start from. It carries the
+// combinators and the consumers, and every one of them takes `own self` — for a
+// source that is a copy, for a pipe it is the move that makes a second consumer a
+// compile error ("use of `p` after it was moved"). `Pipe` adds the sealing
+// operations, which exist on pipes only, so `cell.memo()` has no method.
+//
+// Because a pipe has exactly one consumer, every body in it runs once per change of
+// its input, inside the one INSTANCE that consumer started. That is what lets a
+// stage keep its own state (a `switch` its current inner, a `distinct` its last
+// value) and, since S2, give every run of its body an owner.
+//
+// **`own self` everywhere, including trait defaults (B463).** A default whose
+// receiver is the loan `self` can move a resource `Self` into an aggregate
+// undetected, which is exactly what a combinator does with its receiver. `own self`
+// is refused-or-sound on every compiler; a loan `self` here is the hole.
+
+/// The read-only view of a reactive value: read the current value, and let a
+/// subscriber be told when it may have changed. `SignalCell<T>` implements it (and
+/// adds `set`/`set_with` through `Signal`); a *remote* handle implements it too, so
+/// code that only observes can't tell a local signal from a remote one
+/// (`proposal/transport-rpc.md` §8).
 ///
-/// **`on_change` is the primitive and `sub` is derived from it** (backlog A49).
-/// An implementation writes `get` and the LAZY attach — the one that adds an
-/// observer and does not call it — and the eager pair (`sub`, `effect`) plus
-/// `effect_on_change` and `map` all come free. The inverse arrangement, which
-/// this trait carried until A49, cannot work: `sub`'s contract is "one
-/// immediate call, then one per change", so a lazy default over an eager
-/// requirement can only ATTACH and then SWALLOW the call it did not want — a
-/// wrapper allocation, an extra branch on every notification for the life of
-/// the subscription, and a first change that is silently indistinguishable
-/// from the seeding call. Building the eager form over the lazy one is pure
-/// addition: attach, then make the call. Nothing is swallowed anywhere.
-export trait Source<T> {
+/// **Two members, both the implementer's.** `get` is the read, and `on_settle` is
+/// the attach: the node author's primitive the whole pipeline is built on. Every
+/// consumer — `on_change`, `sub`, `effect`, the UI bindings — lives on `Flow`,
+/// which every `Source` is through the blanket below, so a type that writes these
+/// two gets the whole surface.
+///
+/// A transformation is NOT a `Source` (A142 R29): `count.derive(double)` has no
+/// `get`. Seal it (`.memo()`) where it is shared or read, or read it once with
+/// `.sample()`.
+export trait Source<T> with Flow<T> {
 	fun get(self): T;
 
-	/// Subscribe WITHOUT the immediate first call (backlog A43, made the
-	/// requirement by A49): `observer` runs on every CHANGE from here on, and never
-	/// for the value the source already holds.
-	///
-	/// This is the trait's subscription primitive. `sub` is exactly this plus one
-	/// call with the current value, so the pair is the eager/lazy opt-out Solid
-	/// spells `on(deps, fn, { defer: true })` — vilan has neither overloading nor
-	/// optional parameters, so the opt-out is a NAME.
-	///
-	/// Reach for it when the first value is already accounted for: a derivation
-	/// that seeded its own initial value (`map`, `combine`), a side effect that
-	/// must not fire on the state the program starts in — a "you have unsaved
-	/// changes" prompt, an analytics ping. Every UI binding wants the opposite (the
-	/// immediate call IS the initial paint), which is why `sub`/`effect` exist
-	/// beside it.
-	[must_use]
-	fun on_change(self, observer: |T| void): Subscription;
-
-	/// The NO-PAYLOAD attach (A124 R2) — the node author's member, where
-	/// `on_change` is the one every application writes.
-	///
-	/// `subscriber` is told that this source MAY have changed, and is handed no
-	/// value: it reads `get()` if it wants one. That is what lets a chain of cold
-	/// nodes cost nothing per hop. A node that transforms its upstream (`map`)
-	/// or joins several (`combine`) implements this by FORWARDING `subscriber` to
-	/// each upstream untouched — no subscriber minted, no transform run — so a
-	/// leaf reading a five-deep chain puts ONE record on the root, and a diamond
-	/// puts the same record on the root twice, which a turn's dedup collapses
-	/// into one call (the id is the leaf's; see `Subscriber`).
+	/// The NO-PAYLOAD attach (A124 R2): `subscriber` is told that this source MAY
+	/// have changed, and is handed no value — it reads `get()` if it wants one.
+	/// That is what lets a chain of pipe stages cost nothing per hop: a leaf's ONE
+	/// subscriber is forwarded untouched to the root, so a five-stage chain puts
+	/// one record on its root, and a diamond puts the same record on the root twice,
+	/// which a turn's dedup collapses into one call (the id is the leaf's; see
+	/// `Subscriber`).
 	///
 	/// The handle this returns must RETIRE `subscriber` when it is disposed — after
-	/// it, the subscriber never fires. Forwarding meets that for free. A node that
-	/// has to keep a registration of its OWN (a `switch` re-selecting its inner)
-	/// registers a relay of its own id upstream, wakes `subscriber` from it through
-	/// the turn, and hands back a handle that retires `subscriber` — it never
-	/// forwards `subscriber` to a registration it disposes by itself, because
-	/// disposing that would retire the observer below it.
+	/// it, the subscriber never fires. Attaching the record as given meets that for
+	/// free: the handle carries the record's own liveness cell. A source that must
+	/// keep a registration of its OWN (a mirror's lease) chains its teardown onto
+	/// the handle's release.
 	///
-	/// The DEFAULT is the payload bridge, right for a ROOT — a cell, a mirror, a
-	/// storage-backed wrapper — whose `on_change` is where a value is stored and a
-	/// subscriber is minted anyway: attach through `on_change`, discard the value,
-	/// wake `subscriber`. It is exactly WRONG for a node, which would run its
-	/// transform to produce a value only to throw it away, once per hop (the S1
-	/// probe measured 15 evaluations where forwarding costs 5); so every node in
-	/// `std::reactive` overrides it, and `SignalCell` overrides it with the direct
-	/// attach. The bridge is a DERIVATION (A110 door 2): it wakes in the wave's
-	/// first phase, so the observer it wakes keeps its own class.
+	/// A root that stores its value in a `SignalCell` implements this in one line,
+	/// by handing `subscriber` to that cell's `on_settle`.
 	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		as_derivation();
-		let relayed = self.on_change(|_value| wake(subscriber));
-		also_retiring(relayed, subscriber);
-		relayed
-	}
+	fun on_settle(self, subscriber: Subscriber): Subscription;
 
-	/// Subscribe: `observer` fires ONCE NOW with the value the source already
-	/// holds, then once per change. The eager form, derived — attach lazily,
-	/// then make that one call.
+	/// Attach an OBSERVER, and call it once now when `immediately` — the root's
+	/// `on_change` (false) and `sub` (true), which `Flow` answers through for every
+	/// source. The default is `on_settle` with a pulling subscriber, then the call.
 	///
-	/// A trait DEFAULT since A49. An implementation only overrides it to skip the
-	/// indirection (`SignalCell` does); one that overrides it to change the number
-	/// of immediate calls is outside the contract every binding in `std::ui` reads.
+	/// A root overrides it to skip the indirection (`SignalCell` attaches directly)
+	/// or to keep a contract of its own: a mirror's seeding frame arrives INSIDE
+	/// its lease over an in-process transport, so its eager form leases first and
+	/// makes the one immediate call itself, where the default would make it twice.
 	[must_use]
-	fun sub(self, observer: |T| void): Subscription {
-		let subscription = self.on_change(observer);
-		observer(self.get());
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription {
+		let subscription = self.on_settle(mint_subscriber(|| observer(self.get())));
+		if immediately {
+			observer(self.get());
+		}
 		subscription
 	}
 
+	/// A `Source` that always holds `value` (A142 R3): `get()` is `value`, and a
+	/// subscription is a no-op. It fits a static value into a position that asks
+	/// for a reactive one — a `switch` arm, a `then_some`, a field typed
+	/// `dyn Source<T>`. (`MaybeSignal`'s static arm is a different thing, and
+	/// stays: it takes a plain value with no wrapper at all, R26.)
+	fun constant(value: T): Constant<T> {
+		Constant<T> { value }
+	}
+}
+
+/// `Source::constant(value)`'s answer.
+export struct Constant<T> {
+	value: T,
+}
+
+export impl Constant<type T> with Source<T> {
+	fun get(self): T {
+		self.value
+	}
+
+	/// Nothing ever changes, so nothing is registered anywhere; the handle only
+	/// retires the subscriber, which is the one obligation `on_settle` puts on it.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		retiring(subscriber, || {})
+	}
+}
+
+/// A STARTED flow: the instance one consumer made by calling `start`, and the
+/// consumer's three handles on it.
+///
+/// Starting is split from attaching so that the consumer holds `pull` BEFORE any
+/// subscriber can fire — an attach may deliver a notification inside the call (a
+/// mirror's seeding frame over an in-process transport arrives inside its
+/// `Subscribe`), and the observer that wakes has to be able to read.
+export struct Instance<T> {
+	/// Read the instance's current value: one application per stateless stage,
+	/// and a stateful stage's own state. A consumer calls it once per wake-up,
+	/// which is what makes every body run once per change.
+	pull: || T,
+	/// Attach the consumer's ONE subscriber (at most once): every stage forwards it
+	/// to its roots, or wakes it from a relay of its own. Disposing the handle
+	/// detaches every registration the instance made.
+	attach: |Subscriber| Subscription,
+	/// Release what the instance's bodies built (the per-run owners, A142 §4).
+	/// Consumers chain it onto the attach handle (`also_releasing`), so disposing
+	/// the handle releases both; `.sample()`, which never attaches, calls it
+	/// directly.
+	release: || void,
+}
+
+/// Anything a pipeline can start from (A142 R30): every `Source`, through the
+/// blanket below, and every pipe stage. It carries the combinators and the
+/// consumers; the sealing operations are `Pipe`'s.
+///
+/// Every member takes `own self`. On a source that is a copy — a root is data, and
+/// passing the same `SignalCell` to two consumers is fine. On a pipe it is a move,
+/// so handing one pipe to two consumers, or branching it (`let q = p.derive(..);
+/// p.memo();`), is "use of `p` after it was moved". Two consumers of one derived
+/// value need a `Source` between them: seal it with `.memo()`.
+export trait Flow<T> {
+	/// Start this flow for its one consumer: the node author's member, where every
+	/// member below is the consumer's. A stage starts its upstream, keeps whatever
+	/// state its instance needs, and hands back how to read it, attach to it and
+	/// release it.
+	[must_use]
+	fun start(own self): Instance<T>;
+
+	/// Subscribe WITHOUT the immediate first call (A43): `observer` runs on every
+	/// CHANGE from here on, and never for the value the flow already holds.
+	///
+	/// Reach for it when the first value is already accounted for: a side effect
+	/// that must not fire on the state the program starts in — a "you have unsaved
+	/// changes" prompt, an analytics ping. Every UI binding wants the opposite (the
+	/// immediate call IS the initial paint), which is why `sub`/`effect` exist
+	/// beside it.
+	///
+	/// REQUIRED rather than a default, like `sub`, so that each impl answers it
+	/// itself: a stage with `observe_flow`, and every source through the blanket
+	/// below with its own `attach_observer` (a mirror's lease, a cell's direct
+	/// attach) — which a default overridden in the blanket would not reach through
+	/// a generic bound.
+	[must_use]
+	fun on_change(own self, observer: |T| void): Subscription;
+
+	/// Subscribe: `observer` fires ONCE NOW with the current value, then once per
+	/// change. The eager form. You hold the `Subscription`; `effect` is the
+	/// owner-tied spelling.
+	[must_use]
+	fun sub(own self, observer: |T| void): Subscription;
+
 	/// `on_change` registered with the ambient owner — the scope-tied lazy attach,
 	/// and a static requirement of an enclosing `owner_scope.run`.
-	fun effect_on_change(self, observer: |T| void) {
+	fun effect_on_change(own self, observer: |T| void) {
 		get_owner().take(self.on_change(observer));
 	}
 
-	/// Subscribe and register with the ambient owner (backlog A5): the scope-tied
-	/// `sub` — nothing to hold, nothing to drop by hand. Requires an enclosing
-	/// `owner_scope.run`, statically. A trait DEFAULT, so every `Source` gets it
-	/// (B14 wired the dispatch edges that make a default body's context read
-	/// coverable).
-	///
-	/// Built over `effect_on_change` exactly as `sub` is built over `on_change`:
-	/// register the lazy attach, then make the one immediate call.
-	fun effect(self, observer: |T| void) {
-		self.effect_on_change(observer);
-		observer(self.get());
+	/// Subscribe and register with the ambient owner (A5): the scope-tied `sub` —
+	/// nothing to hold, nothing to drop by hand. Requires an enclosing
+	/// `owner_scope.run`, statically.
+	fun effect(own self, observer: |T| void) {
+		get_owner().take(self.sub(observer));
 	}
 
 	/// `effect`, with an OWNER PER RUN (tracker A114): whatever `body` registers —
-	/// an `on_cleanup`, a nested `effect`/`map`, a `take`, a mirror's lease — is
-	/// released BEFORE the next run, and when the enclosing boundary goes.
-	///
-	/// This is the per-run cleanup A113 row 4 found missing. A plain `effect` body
-	/// that subscribes, or arms a timer, or opens a channel, accumulates one of
-	/// those per change for as long as the boundary lives: the boundary releases
-	/// them all, eventually, together. Routing them through a form (`swap` mints a
-	/// fresh `Owner` per instantiation and disposes the last) was the only way to
-	/// get the run-scoped lifetime, and it costs a DOM boundary for a lifetime
-	/// question. This is that mechanism with no view in it.
-	///
-	/// Requires an enclosing `owner_scope.run`, statically, twice over: the
-	/// subscription is `effect`'s, and the last run's owner is released through
-	/// `on_cleanup`.
-	///
-	/// The forms are NOT built on this (R2): `swap`/`when`/`each` keep their own
-	/// per-instantiation owners. One mechanism is the goal, and rebasing them is
-	/// its own change.
-	fun scoped_effect(self, body: (sync |T| void) context owner_scope) {
+	/// an `on_cleanup`, a nested `effect`, a `take`, a mirror's lease — is released
+	/// BEFORE the next run, and when the enclosing boundary goes.
+	fun scoped_effect(own self, body: (sync |T| void) context owner_scope) {
 		self.effect(scoped_runner(body));
 	}
 
-	/// `scoped_effect` WITHOUT the immediate first call — the lazy half of the
-	/// pair, exactly as `effect_on_change` is `effect`'s.
-	fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope) {
+	/// `scoped_effect` WITHOUT the immediate first call.
+	fun scoped_effect_on_change(own self, body: (sync |T| void) context owner_scope) {
 		self.effect_on_change(scoped_runner(body));
 	}
+}
+
+/// The combinators every flow has — a BLANKET over `Flow` rather than trait
+/// defaults, so that a `dyn Source<T>` reaches them too: a trait member with a
+/// generic of its own (`derive<U>`) cannot sit in an object's table, and a blanket
+/// method is chosen statically, with the object as its receiver.
+export impl type F: Flow<type T> {
+	/// A pipe of `transform` applied to this flow's value (A142 R1, the rename of
+	/// `Source.map`). It runs when the pipe's consumer reads it — once per change,
+	/// inside the one instance that consumed it.
+	fun derive<U>(own self, transform: sync |T| U): Derive<F, T, U> {
+		Derive<F, T, U> { up = self, transform }
+	}
+
+	/// The DYNAMIC dependency (A123): follow the flow `select` builds for this
+	/// flow's current value, and re-select when it changes — Rx's `switchMap`.
+	/// `select` runs once per change of this flow, and it must BUILD the flow it
+	/// answers (a closure cannot capture a prebuilt pipe); the flow a previous
+	/// selection built is released at re-selection.
+	fun switch<U, I: Flow<U>>(own self, select: sync |T| I): Switch<F, T, I, U> {
+		Switch<F, T, I, U> { up = self, select }
+	}
+
+	/// This flow, passing a change on only when `key` of the value differs from
+	/// `key` of the last value passed on (A142 R7). The value passed downstream is
+	/// the whole `T`.
+	fun distinct_by<K: PartialEq>(own self, key: sync |T| K): DistinctBy<F, T, K> {
+		DistinctBy<F, T, K> { up = self, key }
+	}
+}
+
+/// Every `Source` is a `Flow` (A142 R30): starting one reads it and attaches to it,
+/// and `own self` is a copy. An object satisfies the bound too, so a
+/// `dyn Source<T>` starts the same way.
+export impl type S: Source<type T> with Flow<T> {
+	fun start(own self): Instance<T> {
+		Instance<T> {
+			pull = || self.get(),
+			attach = |subscriber: Subscriber| self.on_settle(subscriber),
+			release = || {},
+		}
+	}
+
+	[must_use]
+	fun on_change(own self, observer: |T| void): Subscription {
+		self.attach_observer(observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |T| void): Subscription {
+		self.attach_observer(observer, true)
+	}
+}
+
+/// A stage's `on_change` (`immediately` false) and `sub` (true), written once:
+/// start the flow, attach one pulling subscriber, and chain the instance's release
+/// onto the handle. The subscriber is MINTED, so it spends the derivation mark
+/// (`as_derivation`) like every observer does.
+fun observe_flow<T, F: Flow<T>>(own flow: F, observer: |T| void, immediately: bool): Subscription {
+	let instance = flow.start();
+	let pull = instance.pull;
+	let subscription = (instance.attach)(mint_subscriber(|| observer(pull())));
+	also_releasing(subscription, instance.release);
+	if immediately {
+		observer(pull());
+	}
+	subscription
+}
+
+/// A transformation: a `Flow` with no `get` of its own, consumed exactly once (A142
+/// R29). The node types are `[resource]`s and implement this with no body — the
+/// sealing operations are all defaults, written once over `start`.
+///
+/// **Sharing is sealing.** Two consumers of one derived value need a `Source`
+/// between them:
+///
+///     let total = cart.derive(|c| c.sum()).memo();   // one instance, one run per change
+///     text(total);                                    // a source is data: pass it anywhere
+///     badge(total.derive(|t| t > 100));               // each consumer builds its own pipe
+export trait Pipe<T> with Flow<T> {
+	/// Seal into a READ-ONLY source backed by one cell (A142 R11/R20): the pipe's
+	/// one consumer, run once per change, with the value cached for every reader.
+	/// Nothing downstream can `set` a derivation.
+	///
+	/// Owner-tied, like every consumer (A28): made inside a boundary its
+	/// registration dies with the boundary; outside every boundary it lives as long
+	/// as its source. A module binding's initializer has no owner and refuses it —
+	/// `.memo_global()` says that lifetime (A130). It does NOT compare: every
+	/// change above it is a write, and a write always notifies — `.distinct()` is
+	/// the stage that compares.
+	fun memo(own self): MemoCell<T> {
+		MemoCell<T> { cell = self.cell() }
+	}
+
+	/// Seal into the WRITABLE cell (R20). A local `set` holds until the next change
+	/// upstream overwrites it — a legitimate pattern (a local override of a derived
+	/// value), and the only difference from `.memo()`.
+	fun cell(own self): SignalCell<T> {
+		let instance = self.start();
+		let pull = instance.pull;
+		let cached = SignalCell::new(pull());
+		// A DERIVATION (A110 door 2): it publishes a value, so a turn settles it
+		// before any effect reads it.
+		let refreshed = (instance.attach)(subscriber_of(|| {
+			cached.set(pull());
+		}, true));
+		also_releasing(refreshed, instance.release);
+		let _owned = register_with_owner(refreshed);
+		cached
+	}
+
+	/// `.memo()` for a value that lives as long as the PROGRAM — the spelling for a
+	/// module-level derivation (A130), and for anything a `Memo` maker builds.
+	fun memo_global(own self): MemoCell<T> {
+		MemoCell<T> { cell = self.cell_global() }
+	}
+
+	/// `.cell()` for a cell that lives as long as the PROGRAM (A130): it registers
+	/// with NO owner, even inside a boundary, and nothing releases it. What it
+	/// holds — the upstream's list → its record → this cell's refresh → the chain
+	/// above → the upstream — is a loop for the life of the program BY DESIGN
+	/// (`proposal/reactive-pipeline.md` §2.4); the standing no-cycle gate excludes
+	/// it by the refresh closure's name.
+	fun cell_global(own self): SignalCell<T> {
+		let instance = self.start();
+		let pull = instance.pull;
+		let cached = SignalCell::new(pull());
+		// NAMED, and the name is load-bearing: the emitted closure carries it, and
+		// the no-cycle gate's walk excludes the loop through a closure of this name
+		// (`reactive_lifetimes.rs`) — the one loop that is the design.
+		let cell_global_refresh = || {
+			cached.set(pull());
+		};
+		let _for_the_program = (instance.attach)(subscriber_of(cell_global_refresh, true));
+		cached
+	}
+
+	/// A one-off read (A142 R32): start the pipe, take its current value, and
+	/// release it — including anything its bodies built. It subscribes to nothing,
+	/// so it opens no channel; its cost is written at the call:
+	/// `on_click(|| submit(total_of(cart).sample()))` runs the chain once per click.
+	fun sample(own self): T {
+		let instance = self.start();
+		let value = (instance.pull)();
+		(instance.release)();
+		value
+	}
+}
+
+/// Read any flow ONCE: start it, pull, release — `Pipe::sample` for a flow that may
+/// be a source as well as a pipe. The server renderer's read, which hears no change
+/// after its one pass; an application reads a source with `get` and a pipe with
+/// `.sample()`.
+export [internal("the server renderer's one read of a flow — read a source with `get`, a pipe with `.sample()`")]
+fun read_once<T, F: Flow<T>>(own flow: F): T {
+	let instance = flow.start();
+	let value = (instance.pull)();
+	(instance.release)();
+	value
+}
+
+/// `release` chained onto `handle`'s own release, so disposing the handle releases
+/// the instance behind it too — the consumer's half of `Instance`. Chained rather
+/// than wrapped for `also_retiring`'s reason: no second handle, no context read.
+fun also_releasing(handle: Subscription, release: || void) {
+	let previous = handle.release.read();
+	handle.release.write() = Some(|| {
+		release();
+		match previous {
+			Some(let earlier) => earlier(),
+			None => {},
+		}
+	});
 }
 
 /// The WRITABLE half of the pair: `Source` reads, `Signal` writes. A component
@@ -1382,23 +1601,6 @@ export impl SignalCell<type T> with Source<T> {
 		self.value.read()
 	}
 
-	/// The trait's requirement, and for the canonical cell it is `observe` itself —
-	/// attach to the subscriber list, hand back the handle that detaches it.
-	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		observe(self, observer)
-	}
-
-	/// The trait's default body, specialized: identical in effect, one call
-	/// shallower. Every UI binding in the program lands here, so the cell reaches
-	/// `observe` directly rather than through the trait's `on_change`.
-	[must_use]
-	fun sub(self, observer: |T| void): Subscription {
-		let subscription = observe(self, observer);
-		observer(self.get());
-		subscription
-	}
-
 	/// The protocol's root (A124 R2): push the record a leaf minted, AS GIVEN,
 	/// onto this cell's list. No subscriber is minted here and no value is read —
 	/// the id, the class and the liveness cell are the leaf's, which is what lets
@@ -1407,12 +1609,23 @@ export impl SignalCell<type T> with Source<T> {
 	fun on_settle(self, subscriber: Subscriber): Subscription {
 		attach(self, subscriber)
 	}
+
+	/// The trait's default, specialized: identical in effect, one call shallower.
+	/// Every UI binding over a cell lands here, so the cell reaches `observe`
+	/// directly.
+	[must_use]
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription {
+		let subscription = observe(self, observer);
+		if immediately {
+			observer(self.get());
+		}
+		subscription
+	}
 }
 
 /// Attach `observer` to `signal`'s subscriber list and hand back the handle that
 /// detaches it — `sub` WITHOUT the immediate first call. `sub` is this plus that
-/// call; a derivation (`map`) seeds its own first value and must not pay for a
-/// second `transform`.
+/// call, and it is the cell's own `attach_observer`.
 ///
 /// The notify closure captures the VALUE CELL, never the signal
 /// (`proposal/lifetimes.md` §5, V1). Capturing `self` closed a back edge — signal →
@@ -1430,11 +1643,9 @@ export impl SignalCell<type T> with Source<T> {
 /// (`downgrade` is the identity until something counts, C14 S4); what lands
 /// here is the edge, written where the graph can be checked against it.
 ///
-/// Concrete `Signal` and NOT widenable to `Source` (A33): this reads the STRUCTURE
-/// — the value cell and the subscriber list — not the trait's `get`/`sub`, and the
-/// whole reason it exists is to attach without the immediate first call that `sub`
-/// makes. There is no `Source` spelling for that, so `map`, which is built on it,
-/// stays a `Signal` method too.
+/// Concrete `SignalCell` and NOT widenable to `Source` (A33): this reads the
+/// STRUCTURE — the value cell and the subscriber list — not the trait's
+/// `get`/`on_settle`. The `Source` spelling of the same attach is `on_change`.
 export fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 	let cell = signal.value.downgrade();
 	attach(signal, mint_subscriber(|| {
@@ -1559,6 +1770,33 @@ export impl SignalCell<type T> {
 	}
 }
 
+/// A SEALED derivation's read-only face — what `.memo()` and `.memo_global()` hand
+/// back (A142 R11/R20). A `Source`: read it, pass it anywhere, build any number of
+/// pipes over it. It has no `set`: a derivation is written by its upstream only.
+/// (`.cell()` is the writable twin, a `SignalCell`.)
+///
+/// One cell underneath, so a memo read by N consumers ran its chain once per change,
+/// whatever N is.
+export struct MemoCell<T> {
+	cell: SignalCell<T>,
+}
+
+export impl MemoCell<type T> with Source<T> {
+	fun get(self): T {
+		self.cell.get()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		attach(self.cell, subscriber)
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |T| void, immediately: bool): Subscription {
+		self.cell.attach_observer(observer, immediately)
+	}
+}
+
 /// A component value that may be STATIC or REACTIVE, with no ceremony at the call
 /// site (B157). A component takes one parameter bounded on this trait and accepts
 /// both `badge("draft")` and `badge(Signal::new("draft"))`; the value's TYPE
@@ -1570,68 +1808,73 @@ export impl SignalCell<type T> {
 /// anywhere — which impl runs is settled at the call, by the specificity order
 /// (spec §5.4).
 ///
+/// `own self`, because the reactive arm CONSUMES: a pipe handed to a component is
+/// that component's to start (A142 R29).
+///
 /// The reactive arm registers with the AMBIENT OWNER (`effect`), so a component's
 /// subscription dies with the boundary that built it. That is also why `bind` may
 /// only be called under one: the requirement is static, and it flows through the
 /// bound.
 export trait MaybeSignal<T> {
-	fun bind(self, react: |T| void);
+	fun bind(own self, react: |T| void);
 }
 
-/// The static case: the value is the value, so hand it over once.
+/// The static case: the value is the value, so hand it over once (R26: unchanged by
+/// A142).
 ///
 /// A BLANKET (B158) — the least specific tier, so any impl below outranks it
 /// wherever both match.
 export impl type T with MaybeSignal<T> {
-	fun bind(self, react: |T| void) {
+	fun bind(own self, react: |T| void) {
 		react(self);
 	}
 }
 
-/// The reactive case, over the READ trait: a cell, a derivation, a `RemoteSource`,
-/// a mirror of one's own. Bounded on `Source` rather than on `Signal` because
-/// `bind` only reads — a component that wants to write back asks for `Signal<T>`
-/// directly.
+/// The reactive case, over `Flow`: a cell, a sealed memo, a `RemoteSource`, a
+/// mirror of one's own — or a pipe (`badge(count.derive(label))`), which the
+/// component starts.
 ///
 /// The binder in the bound is the impl's own parameter (B165), which is what makes
 /// this one impl rather than one per element type.
-export impl type S: Source<type T> with MaybeSignal<T> {
-	fun bind(self, react: |T| void) {
+export impl type F: Flow<type T> with MaybeSignal<T> {
+	fun bind(own self, react: |T| void) {
 		self.effect(react);
 	}
 }
 
-/// The product combinator: a source of the tuple of its inputs' current values,
+/// The product combinator: a pipe of the tuple of its inputs' current values,
 /// changing whenever any input changes. Variadic over the inputs' (distinct) types
 /// via a mapped-tuple parameter — `combine((a, b, c))` of sources of `A`, `B` and
-/// `C` is a `Combine<(A, B, C)>`, a `Source<(A, B, C)>`.
+/// `C` is a `Combine<(A, B, C)>`, a `Pipe<(A, B, C)>`.
 ///
-/// A cold NODE since A124 S2c: it stores nothing and registers nothing until a leaf
-/// reads or subscribes; `.cell()` it where the pair is shared or read hot. Each
-/// input is ANY source — a cell, a node, a mirror — erased to `dyn Source<U>` at
-/// the argument (A33's per-element existential, answered by R3's `dyn`), so
-/// `combine((name, name.map(len)))` mixes kinds freely.
+/// Each input is a SOURCE — a cell, a sealed memo, a mirror — erased to
+/// `dyn Source<U>` at the argument (A33's per-element existential, answered by
+/// `dyn`). A pipe input is sealed first
+/// (`combine((name, name.derive(len).memo()))`): a `[resource]` cannot become a
+/// `dyn` (memory.md R7/R10), and the inputs are read from the combined pipe's own
+/// pulls.
 export fun combine<T: (2..)>(sources: (U in T: dyn Source<U>)): Combine<T> {
 	Combine<T> { sources }
 }
 
-/// The reverse of `combine`: one derived source per position of a tuple-valued
-/// source — `divorce(pair)` over a `Source<(A, B)>` is a pair of sources of `A` and
-/// of `B`, and `divorce(combine((a, b)))` re-derives `a`'s and `b`'s values.
+/// The reverse of `combine`: one derived pipe per position of a tuple-valued source
+/// — `divorce(pair)` over a `Source<(A, B)>` is a pair of pipes of `A` and of `B`,
+/// and `divorce(combine((a, b)).memo())` re-derives `a`'s and `b`'s values.
 ///
-/// Each output is a cold `map` node reading its own position (`whole.get(key)`,
-/// `std::tuple`), so nothing is evaluated or registered until a leaf reads or
-/// subscribes; `.cell()` an output where it is shared or read hot. Every output
-/// subscribes to the WHOLE source, so each one fires on every change of the
-/// source — including a change to another position, and a `set` that changes
-/// nothing. Where a consumer wants to fire only when ITS position moved, it
-/// gates that output: `divorce(pair).0.distinct()` (A124 Q3 — `.distinct()` is
-/// the node that compares, and it asks `PartialEq` of that one element only).
+/// Each output is a `derive` reading its own position (`whole.get(key)`,
+/// `std::tuple`), started by whichever consumer takes it. Every output follows the
+/// WHOLE source, so each one fires on every change of the source — including a
+/// change to another position, and a `set` that changes nothing. Where a consumer
+/// wants to fire only when ITS position moved, it gates that output:
+/// `divorce(pair).0.distinct()` (`.distinct()` asks `PartialEq` of that one element
+/// only).
 ///
-/// The source is read once here, for its POSITIONS only: `keys()` needs a value of
-/// the tuple to count them.
-export fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Map<S, T, U>) {
-	source.get().keys().map(|key| source.map(|whole| whole.get(key)))
+/// It takes a `Source` rather than a `Flow` because it reads it more than once —
+/// once here for its POSITIONS (`keys()` needs a value of the tuple to count them),
+/// and once per output (A142 R34: a parameter read twice asks for a `Source`, and
+/// the caller seals).
+export fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Derive<S, T, U>) {
+	source.get().keys().map(|key| source.derive(|whole| whole.get(key)))
 }
 
 // === Per-key selection (backlog A44; Solid's `createSelector`) ===============
@@ -1722,473 +1965,533 @@ export impl Selector<type T: Hashable + PartialEq> {
 	}
 }
 
-// The monadic join (backlog A4): follow whichever inner signal the outer currently
-// holds — a DYNAMIC dependency. When the outer switches, the result detaches from
-// the replaced inner and follows the new one from its current value; when the
-// current inner changes, the result updates. The rolling INNER subscription is
-// disposed on every switch, so a replaced inner stops driving the result — and BOTH
-// halves are the ambient owner's (A28): the outer subscription is registered, and
-// the inner one that happens to be live at disposal is deferred, so nothing
-// survives the boundary.
+// === The pipe stages (A142 §3; A124's nodes, made move-only) =================
 //
-// A BLANKET over the READ trait (A86), not an inherent member of the cell: the read
-// contract is `Source`, so a `map` result, a derived cell, a mirror and a plain
-// `SignalCell` all hold inner signals the same way, and only the cell had a join. A
-// default method on `Source<T>` cannot express this — a default cannot add a bound
-// on `T`, and this needs `T` to be a source itself — so the bound-in-the-subject
-// spelling is the honest one.
-export impl type S: Source<type I: Source<type U>> {
-	fun flatten(self): Switch<S, I, I, U> {
-		Switch<S, I, I, U> { up = self, select = |inner| inner }
+// A stage holds its upstream and its operation, and nothing else until a consumer
+// STARTS it. Starting builds the instance: stateless stages (`Derive`) compose
+// their upstream's pull and forward its attach, so a sealed chain puts the
+// consumer's ONE subscriber on its root and evaluates the stages fused, once per
+// change; stateful stages (`Switch`, `Distinct`) keep their state in the instance
+// and relay.
+//
+// Every stage is a `[resource]`: a pipe is consumed exactly once. A stage's
+// upstream is moved into `start` and started there, so the instance a consumer
+// holds is plain data — closures and cells — and no closure ever captures a pipe.
+//
+// A relay is a stage's OWN registration (the re-selection a `switch` makes, the
+// comparison a `distinct` makes). It wakes the consumer's subscriber through the
+// turn (`wake`), where its id still dedups, and it is always a DERIVATION: it
+// decides whether and which downstream to wake, and that has to happen in the
+// wave's first phase.
+
+/// A relay that only wakes `subscriber`: the registration a stage puts on the flow
+/// it currently FOLLOWS (a `switch`'s inner), which it detaches at re-selection
+/// without retiring the consumer below it.
+fun relay_to(subscriber: Subscriber): Subscriber {
+	subscriber_of(|| wake(subscriber), true)
+}
+
+/// Detach the registration a stage holds in `handle`, if it holds one.
+fun detach_held(handle: Shared<Option<Subscription>>) {
+	match handle.read() {
+		Some(let held) => detach(held),
+		None => {},
 	}
+	handle.write() = None;
 }
 
-/// The OPTIONAL join (A86): an outer source of `Option<inner source>` — the shape a
-/// lazily-created signal has, and the one `flatten` above cannot take because
-/// `Option<I>` is not itself a `Source`.
+/// `derive` as a stage: the upstream and the transform, nothing else. Its instance
+/// is its upstream's with the transform applied at the pull, and its attach is its
+/// upstream's, forwarded — no subscriber minted, no transform run.
 ///
-/// `None` on the outer is `None` on the result, and it DETACHES: whichever inner
-/// was live stops driving. A `Some(inner)` follows that inner from its current
-/// value, wrapped. The ownership story is `flatten`'s exactly — one registered
-/// outer subscription, one rolling inner one deferred to the ambient owner.
-///
-/// **What it is, exactly: `sequence` then join** — and the name overpromises
-/// (tracker A123). The outer is a source of `Option<inner>` and the inner is a
-/// plain `Source<U>`, so the `Option` is lifted out of the way and the two
-/// `Source` layers are joined. It is NOT the join of the composite
-/// `Source`-of-`Option`, which would take `Source<Option<Source<Option<U>>>>`
-/// straight to `Source<Option<U>>` — and that third `flatten` cannot be added
-/// beside these two: its subject overlaps this one and there is no overloading
-/// to pick between them. A chain over a model layer of optional cells is
-/// therefore `outer.map(|x| x.map(select)).flatten().map(|x| x.flatten())`,
-/// with the trailing join every time. `and_then` below IS that composite shape
-/// in one node, and is the everyday spelling; reach for this `flatten` when the
-/// inner source is already in hand rather than selected.
-export impl type S: Source<Option<type I: Source<type U>>> {
-	fun flatten(self): FlattenOption<S, I, U> {
-		FlattenOption<S, I, U> { up = self }
-	}
-}
-
-/// The dynamic dependency ON THE TOTAL ENCODING OF A PARTIAL SIGNAL (tracker A123):
-/// `self` holds `Some(value)` or nothing, `select` answers a source that holds
-/// `Some(result)` or nothing, and this follows it — the Kleisli composition of
-/// `Source<Option<T>>`, `Option::and_then` one level up.
-///
-/// It is the everyday spelling of `self.map(|x| x.map(select)).flatten().map(|x| x.flatten())`,
-/// which is what a chain over a model layer of `SignalCell<Option<T>>` cells
-/// otherwise writes by hand: the outer `None` (nothing selected, nothing
-/// loaded) and the inner `None` (the followed source has nothing yet) collapse
-/// into one `None`, and the trailing join disappears.
-///
-/// `None` on the outer DETACHES, exactly as it does in the `Option` `flatten`
-/// above: a later write to the abandoned inner does not reach the result. The ownership story is `flatten`'s exactly — one
-/// registered outer subscription, one rolling inner one deferred to the
-/// ambient owner.
-export impl type S: Source<Option<type T>> {
-	fun and_then<U, I: Source<Option<U>>>(self, select: sync |T| I): AndThen<S, T, I, U> {
-		AndThen<S, T, I, U> { up = self, select }
-	}
-}
-
-// === The pipeline's nodes (A124 S2b, `proposal/reactive-pipeline.md` §2) ======
-//
-// A derivation as a DESCRIPTION rather than as state: a node holds its upstream and
-// its operation and nothing else, `get()` PULLS through the chain, and it attaches
-// downstream through `on_settle` by forwarding — so a chain nothing reads costs its
-// allocations and no evaluation at all, and one read costs one application per
-// node. State lives at the two ends: the root cell, and `.cell()` where a consumer
-// wants a cached value (a shared derivation, a hot read).
-//
-// Since the flip (A124 S2c, v0.41.0) the combinators return these nodes: `map` a
-// `Map`, `switch` and the total `flatten` a `Switch`, the `Option` `flatten` a
-// `FlattenOption`, `and_then` an `AndThen`, and `.cell()` is where a value is
-// cached.
-//
-// A node reaches its upstream through its bound (`self.up.on_settle(..)`), and the
-// upstream's own `on_settle` is what answers — its override where it has one, a
-// forward — even when the trait's argument is a TUPLE (a `Combine`'s always is): so
-// a leaf below a `combine(..).map(..)` puts ONE record on each root, and the
-// payload bridge (`Source::on_settle`'s default) is reached only by a source that
-// really has nothing but `on_change`. (B410 fixed the selection at a tuple argument;
-// before it such a hop took the bridge and minted a relay of its own.)
-
-/// A node's `on_change`, written once: its own `on_settle`, handed the pulling
-/// observer. Reached through the bound — so the node's override answers even when
-/// the trait's argument is a tuple (B410; before it every node had to call its own
-/// `on_settle` on `self`, because through a bound a `Combine`'s call landed on the
-/// payload bridge, which calls back into `on_change`, and the two recursed).
-fun subscribe_pulling<T, S: Source<T>>(source: S, observer: |T| void): Subscription {
-	source.on_settle(pulling(source, observer))
-}
-
-/// The pulling observer — what a node's `on_change` hands its own `on_settle`:
-/// ONE subscriber, minted here (so it spends the derivation mark like any mint),
-/// whose notification reads `source` and hands `observer` the value.
-///
-/// The notification captures `source` STRONGLY, where `observe`'s captures its
-/// value cell weakly (C14 S3): a pull has to reach the node, and a node is a plain
-/// struct with no handle to downgrade. So a subscribed leaf closes a loop — root
-/// list → this record → `source` → the root — for exactly as long as it is
-/// subscribed; disposing it takes the record off every list and the loop with it.
-fun pulling<T, S: Source<T>>(source: S, observer: |T| void): Subscriber {
-	mint_subscriber(|| observer(source.get()))
-}
-
-/// `map` as a NODE: the upstream and the transform, nothing else.
-///
-/// Three type parameters where the paper's sketch wrote two (`Map<S, U>`): the
-/// transform is a FIELD, and a field's type must name every type it mentions, so
-/// the upstream's `T` is a parameter of the struct. The transform is held plain
-/// (`|T| U`, not `sync |T| U`): `sync` is accepted on a parameter and not on a
-/// field, so it is checked where the node is built — the J2 pattern `std::rpc`
-/// already uses.
-export struct Map<S, T, U> {
+/// Three type parameters: the transform is a FIELD, and a field's type must name
+/// every type it mentions, so the upstream's `T` is a parameter of the struct. The
+/// transform is held plain (`|T| U`, not `sync |T| U`): `sync` is accepted on a
+/// parameter and not on a field, so it is checked where the stage is built.
+export [resource] struct Derive<S, T, U> {
 	up: S,
 	transform: |T| U,
 }
 
-export impl Map<type S: Source<type T>, T, type U> with Source<U> {
-	/// The PULL: one call up the chain, one application of the transform — a cold
-	/// node's whole cost, paid by the reader.
-	fun get(self): U {
-		(self.transform)(self.up.get())
+export impl Derive<type S: Flow<type T>, T, type U> with Flow<U> {
+	[must_use]
+	fun on_change(own self, observer: |U| void): Subscription {
+		observe_flow(self, observer, false)
 	}
 
 	[must_use]
-	fun on_change(self, observer: |U| void): Subscription {
-		subscribe_pulling(self, observer)
+	fun sub(own self, observer: |U| void): Subscription {
+		observe_flow(self, observer, true)
 	}
 
-	/// FORWARDED, not wrapped: no subscriber minted here, no transform run.
-	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		self.up.on_settle(subscriber)
+	fun start(own self): Instance<U> {
+		let transform = self.transform;
+		let upstream = self.up.start();
+		let pull = upstream.pull;
+		Instance<U> {
+			pull = || transform(pull()),
+			attach = upstream.attach,
+			release = upstream.release,
+		}
 	}
 }
 
-/// `switch` as a NODE (A123's dynamic dependency, cold): which inner source to
-/// follow is decided by the upstream's CURRENT value, at every read.
+export impl Derive<type S: Flow<type T>, T, type U> with Pipe<U> {}
+
+/// `switch` as a stage (A123's dynamic dependency): which flow to follow is decided
+/// by the upstream's value, ONCE PER CHANGE of it, inside the instance.
 ///
-/// Its `get` is pure — select, then pull. Its attach is the one place a node must
-/// keep a registration of its OWN: a downstream told "something settled" has to be
-/// told again when the NEW inner changes, and only a live registration on that
-/// inner can do it. So `on_settle` registers two relays of its own — one on the
-/// upstream that re-selects, one on whichever inner is current — and wakes the
-/// downstream from each through the turn, where its id still dedups; it never
-/// forwards the downstream's own record to the rolling inner, because disposing
-/// that at the next switch would retire the observer below it.
+/// The instance keeps the flow it currently follows — started, with a relay of the
+/// stage's own on it — and a relay on the upstream that re-selects: it detaches and
+/// releases the followed instance, builds the next one with `select`, and wakes the
+/// consumer. It never forwards the consumer's own record to the followed flow,
+/// because detaching that at the next re-selection would retire the consumer.
 ///
-/// FOUR type parameters, and the fourth, `U`, is in no field: it is the inner's
-/// value type, bound DIRECTLY in the impl subject (`type I: Source<U>, type U`)
-/// rather than read out of `I`'s bound (`type I: Source<type U>`). Bound the second
-/// way, a default the node inherits (`sub`, `effect`) types its observer's
-/// parameter as the trait's unsubstituted `T`, and `picked.sub(|value| value + 1)`
-/// is refused (filed at A124 S2b).
-export struct Switch<S, T, I, U> {
+/// FOUR type parameters, and the fourth, `U`, is in no field: it is the followed
+/// flow's value type, bound DIRECTLY in the impl subject
+/// (`type I: Flow<U>, type U`) rather than read out of `I`'s bound (A124 S2b: read
+/// out of the bound, an inherited default's observer parameter is the trait's
+/// unsubstituted `T`).
+export [resource] struct Switch<S, T, I, U> {
 	up: S,
 	select: |T| I,
 }
 
-export impl Switch<type S: Source<type T>, T, type I: Source<U>, type U> with Source<U> {
-	fun get(self): U {
-		(self.select)(self.up.get()).get()
+export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U> {
+	[must_use]
+	fun on_change(own self, observer: |U| void): Subscription {
+		observe_flow(self, observer, false)
 	}
 
 	[must_use]
-	fun on_change(self, observer: |U| void): Subscription {
-		subscribe_pulling(self, observer)
+	fun sub(own self, observer: |U| void): Subscription {
+		observe_flow(self, observer, true)
 	}
 
-	/// The rolling registration, owned by the handle: disposing it releases the
-	/// outer relay, whichever inner relay is live, and retires `subscriber` — A28's
-	/// story, `flatten`'s shape.
-	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
-		let follow = || {
-			match inner_subscription.read() {
-				Some(let previous) => detach(previous),
-				None => {},
-			}
-			let inner = (self.select)(self.up.get());
-			inner_subscription.write() = Some(inner.on_settle(subscriber_of(|| wake(subscriber), true)));
-		};
-		follow();
-		let outer = self.up.on_settle(subscriber_of(|| {
-			follow();
-			wake(subscriber);
-		}, true));
-		retiring(subscriber, || {
-			match inner_subscription.read() {
-				Some(let previous) => detach(previous),
-				None => {},
-			}
-			inner_subscription.write() = None;
-			detach(outer);
-		})
+	fun start(own self): Instance<U> {
+		let select = self.select;
+		let outer = self.up.start();
+		let outer_pull = outer.pull;
+		// The FIRST selection is made here, at start — the instance's state begins
+		// with it, and a consumer's first pull reads it.
+		let followed: Shared<Instance<U>> = Shared::new(select(outer_pull()).start());
+		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
+		Instance<U> {
+			pull = || (followed.read().pull)(),
+			attach = |subscriber: Subscriber| {
+				followed_handle.write() = Some((followed.read().attach)(relay_to(subscriber)));
+				let outer_handle = (outer.attach)(subscriber_of(|| {
+					detach_held(followed_handle);
+					(followed.read().release)();
+					let next = select(outer_pull()).start();
+					followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
+					followed.write() = next;
+					wake(subscriber);
+				}, true));
+				retiring(subscriber, || {
+					detach_held(followed_handle);
+					detach(outer_handle);
+				})
+			},
+			release = || {
+				(followed.read().release)();
+				(outer.release)();
+			},
+		}
 	}
 }
 
-/// `combine` as a NODE over the TUPLE BOUND: a source of the tuple of its inputs'
-/// current values, each input any `Source` — the per-element existential A33 named
-/// as the reason `combine` is held to `SignalCell` inputs, answered by
-/// `dyn Source<U>` (R3).
-///
-/// Built by `combine`, whose mapped-tuple parameter erases each element to
-/// `dyn Source<U>` at the call (B398 made that position coerce its elements).
-export struct Combine<T: (2..)> {
+export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Pipe<U> {}
+
+/// `switch_some` as a stage (A142 R8): `Switch` over a flow of `Option<T>`, where
+/// `None` DETACHES — nothing is followed and the stage reads `None` — and `Some(x)`
+/// follows the flow `select` builds for `x`, wrapped.
+export [resource] struct SwitchSome<S, T, I, U> {
+	up: S,
+	select: |T| I,
+}
+
+export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U> with Flow<
+	Option<U>,
+> {
+	[must_use]
+	fun on_change(own self, observer: |Option<U>| void): Subscription {
+		observe_flow(self, observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |Option<U>| void): Subscription {
+		observe_flow(self, observer, true)
+	}
+
+	fun start(own self): Instance<Option<U>> {
+		let select = self.select;
+		let outer = self.up.start();
+		let outer_pull = outer.pull;
+		let followed: Shared<Option<Instance<U>>> = Shared::new(match outer_pull() {
+			Some(let value) => Some(select(value).start()),
+			None => None,
+		});
+		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
+		Instance<Option<U>> {
+			pull = || match followed.read() {
+				Some(let instance) => Some((instance.pull)()),
+				None => None,
+			},
+			attach = |subscriber: Subscriber| {
+				match followed.read() {
+					Some(let instance) => {
+						followed_handle.write() = Some((instance.attach)(relay_to(subscriber)));
+					},
+					None => {},
+				}
+				let outer_handle = (outer.attach)(subscriber_of(|| {
+					detach_held(followed_handle);
+					match followed.read() {
+						Some(let previous) => (previous.release)(),
+						None => {},
+					}
+					followed.write() = match outer_pull() {
+						Some(let value) => {
+							let next = select(value).start();
+							followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
+							Some(next)
+						},
+						None => None,
+					};
+					wake(subscriber);
+				}, true));
+				retiring(subscriber, || {
+					detach_held(followed_handle);
+					detach(outer_handle);
+				})
+			},
+			release = || {
+				match followed.read() {
+					Some(let instance) => (instance.release)(),
+					None => {},
+				}
+				(outer.release)();
+			},
+		}
+	}
+}
+
+export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U> with Pipe<
+	Option<U>,
+> {}
+
+/// `and_then` as a stage (A123's Kleisli composition): `None` on the outer is
+/// `None`; `Some(value)` follows the `Flow<Option<U>>` that `select` builds for it,
+/// and the two absences collapse into one. The instance is `SwitchSome`'s, without
+/// the wrapping.
+export [resource] struct AndThen<S, T, I, U> {
+	up: S,
+	select: |T| I,
+}
+
+export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, type U> with Flow<
+	Option<U>,
+> {
+	[must_use]
+	fun on_change(own self, observer: |Option<U>| void): Subscription {
+		observe_flow(self, observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |Option<U>| void): Subscription {
+		observe_flow(self, observer, true)
+	}
+
+	fun start(own self): Instance<Option<U>> {
+		let select = self.select;
+		let outer = self.up.start();
+		let outer_pull = outer.pull;
+		let followed: Shared<Option<Instance<Option<U>>>> = Shared::new(match outer_pull() {
+			Some(let value) => Some(select(value).start()),
+			None => None,
+		});
+		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
+		Instance<Option<U>> {
+			pull = || match followed.read() {
+				Some(let instance) => (instance.pull)(),
+				None => None,
+			},
+			attach = |subscriber: Subscriber| {
+				match followed.read() {
+					Some(let instance) => {
+						followed_handle.write() = Some((instance.attach)(relay_to(subscriber)));
+					},
+					None => {},
+				}
+				let outer_handle = (outer.attach)(subscriber_of(|| {
+					detach_held(followed_handle);
+					match followed.read() {
+						Some(let previous) => (previous.release)(),
+						None => {},
+					}
+					followed.write() = match outer_pull() {
+						Some(let value) => {
+							let next = select(value).start();
+							followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
+							Some(next)
+						},
+						None => None,
+					};
+					wake(subscriber);
+				}, true));
+				retiring(subscriber, || {
+					detach_held(followed_handle);
+					detach(outer_handle);
+				})
+			},
+			release = || {
+				match followed.read() {
+					Some(let instance) => (instance.release)(),
+					None => {},
+				}
+				(outer.release)();
+			},
+		}
+	}
+}
+
+export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, type U> with Pipe<
+	Option<U>,
+> {}
+
+/// `then_some` as a stage: a flow of `bool` gating a SOURCE. While the flag is true
+/// the stage follows `source`, as `Some`; while it is false it reads `None` and is
+/// detached. It takes a `Source` rather than a pipe because it starts the followed
+/// flow afresh each time the flag TURNS true, and a pipe starts once.
+export [resource] struct ThenSome<F, S, T> {
+	up: F,
+	source: S,
+}
+
+export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Flow<Option<T>> {
+	[must_use]
+	fun on_change(own self, observer: |Option<T>| void): Subscription {
+		observe_flow(self, observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |Option<T>| void): Subscription {
+		observe_flow(self, observer, true)
+	}
+
+	fun start(own self): Instance<Option<T>> {
+		let source = self.source;
+		let outer = self.up.start();
+		let outer_pull = outer.pull;
+		let following: Shared<bool> = Shared::new(outer_pull());
+		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
+		Instance<Option<T>> {
+			pull = || if following.read() { Some(source.get()) } else { None },
+			attach = |subscriber: Subscriber| {
+				if following.read() {
+					followed_handle.write() = Some(source.on_settle(relay_to(subscriber)));
+				}
+				let outer_handle = (outer.attach)(subscriber_of(|| {
+					let on = outer_pull();
+					if on != following.read() {
+						following.write() = on;
+						if on {
+							followed_handle.write() = Some(source.on_settle(relay_to(subscriber)));
+						} else {
+							detach_held(followed_handle);
+						}
+						wake(subscriber);
+					}
+				}, true));
+				retiring(subscriber, || {
+					detach_held(followed_handle);
+					detach(outer_handle);
+				})
+			},
+			release = outer.release,
+		}
+	}
+}
+
+export impl ThenSome<type F: Flow<bool>, type S: Source<T>, type T> with Pipe<Option<T>> {}
+
+/// `combine` as a stage over the TUPLE BOUND: a pipe of the tuple of its inputs'
+/// current values. Its attach forwards the SAME subscriber to every input, so a
+/// diamond standing on one root puts one consumer's record on it once per arm — and
+/// a turn calls it once. The handle disposes every arm.
+export [resource] struct Combine<T: (2..)> {
 	sources: (U in T: dyn Source<U>),
 }
 
-export impl Combine<type T> with Source<T> {
-	fun get(self): T {
-		(source in self.sources => source.get())
+export impl Combine<type T> with Flow<T> {
+	[must_use]
+	fun on_change(own self, observer: |T| void): Subscription {
+		observe_flow(self, observer, false)
 	}
 
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		subscribe_pulling(self, observer)
+	fun sub(own self, observer: |T| void): Subscription {
+		observe_flow(self, observer, true)
 	}
 
-	/// The SAME subscriber forwarded to every input, so a diamond standing on one
-	/// root puts one observer's record on it once per arm — and a turn calls it
-	/// once. The handle disposes every arm, each of which retires `subscriber`.
-	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		let arms = (source in self.sources => source.on_settle(subscriber));
-		retiring(subscriber, || {
-			let _released = (arm in arms => detach(arm));
-		})
-	}
-}
-
-/// `flatten` over `Source<Option<inner>>` as a NODE: `None` on the outer is `None`,
-/// and `Some(inner)` reads that inner, wrapped. Its attach keeps the rolling
-/// registration `Switch` keeps — on whichever inner is current, none while the
-/// outer holds `None` — as a relay of its own.
-export struct FlattenOption<S, I, U> {
-	up: S,
-}
-
-export impl FlattenOption<type S: Source<Option<I>>, type I: Source<U>, type U> with Source<
-	Option<U>,
-> {
-	fun get(self): Option<U> {
-		match self.up.get() {
-			Some(let inner) => Some(inner.get()),
-			None => None,
+	fun start(own self): Instance<T> {
+		let sources = self.sources;
+		Instance<T> {
+			pull = || (source in sources => source.get()),
+			attach = |subscriber: Subscriber| {
+				let arms = (source in sources => source.on_settle(subscriber));
+				retiring(subscriber, || {
+					let _released = (arm in arms => detach(arm));
+				})
+			},
+			release = || {},
 		}
 	}
-
-	[must_use]
-	fun on_change(self, observer: |Option<U>| void): Subscription {
-		subscribe_pulling(self, observer)
-	}
-
-	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
-		let follow = || {
-			match inner_subscription.read() {
-				Some(let previous) => detach(previous),
-				None => {},
-			}
-			inner_subscription.write() = match self.up.get() {
-				Some(let inner) => Some(inner.on_settle(subscriber_of(|| wake(subscriber), true))),
-				None => None,
-			};
-		};
-		follow();
-		let outer = self.up.on_settle(subscriber_of(|| {
-			follow();
-			wake(subscriber);
-		}, true));
-		retiring(subscriber, || {
-			match inner_subscription.read() {
-				Some(let previous) => detach(previous),
-				None => {},
-			}
-			inner_subscription.write() = None;
-			detach(outer);
-		})
-	}
 }
 
-/// `and_then` as a NODE (A123's Kleisli composition, cold): `None` on the outer is
-/// `None`; `Some(value)` reads the `Source<Option<U>>` that `select` answers for
-/// it. The rolling registration is `FlattenOption`'s.
+export impl Combine<type T> with Pipe<T> {}
+
+/// `.distinct()` as a stage (A142 R7): the upstream's value, passed on ONLY when it
+/// differs from the last one passed on. Sealing does not compare — every change
+/// above a `.memo()` is a write, and a write always notifies — so the equality is
+/// this stage's, and `T: PartialEq` is asked here and nowhere else.
 ///
-/// **`select` runs on every PULL** — each `get`, and each re-follow — so it must be
-/// PURE: the same outer value must answer the same source. A select that MINTS a
-/// fresh source per call reads one object and subscribes another (A134: `.cell()`
-/// read a mirror nothing leased while the leased one went unread). A generated rpc
-/// handle stub is safe here — it answers one mirror per origin — and so is a field
-/// or a memoized value; a constructor (`Signal::new`, a `.cell()`) is not, and
-/// belongs under a `.cell()` of its own above the `and_then`.
-export struct AndThen<S, T, I, U> {
+/// The last value is the INSTANCE's state: the relay reads the upstream once per
+/// change, keeps what it read, and the consumer's pull reads what was kept — so the
+/// chain above runs once per change, not once per read.
+export [resource] struct Distinct<S, T> {
 	up: S,
-	select: |T| I,
 }
 
-export impl AndThen<type S: Source<Option<T>>, type T, type I: Source<Option<U>>, type U> with Source<
-	Option<U>,
-> {
-	fun get(self): Option<U> {
-		match self.up.get() {
-			Some(let value) => (self.select)(value).get(),
-			None => None,
+export impl Distinct<type S: Flow<T>, type T: PartialEq> with Flow<T> {
+	[must_use]
+	fun on_change(own self, observer: |T| void): Subscription {
+		observe_flow(self, observer, false)
+	}
+
+	[must_use]
+	fun sub(own self, observer: |T| void): Subscription {
+		observe_flow(self, observer, true)
+	}
+
+	fun start(own self): Instance<T> {
+		let upstream = self.up.start();
+		let pull = upstream.pull;
+		let last: Shared<T> = Shared::new(pull());
+		Instance<T> {
+			pull = || last.read(),
+			attach = |subscriber: Subscriber| {
+				let relayed = (upstream.attach)(subscriber_of(|| {
+					let now = pull();
+					if now != last.read() {
+						last.write() = now;
+						wake(subscriber);
+					}
+				}, true));
+				also_retiring(relayed, subscriber);
+				relayed
+			},
+			release = upstream.release,
 		}
 	}
-
-	[must_use]
-	fun on_change(self, observer: |Option<U>| void): Subscription {
-		subscribe_pulling(self, observer)
-	}
-
-	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
-		let follow = || {
-			match inner_subscription.read() {
-				Some(let previous) => detach(previous),
-				None => {},
-			}
-			inner_subscription.write() = match self.up.get() {
-				Some(let value) => Some((self.select)(value).on_settle(subscriber_of(|| wake(subscriber), true))),
-				None => None,
-			};
-		};
-		follow();
-		let outer = self.up.on_settle(subscriber_of(|| {
-			follow();
-			wake(subscriber);
-		}, true));
-		retiring(subscriber, || {
-			match inner_subscription.read() {
-				Some(let previous) => detach(previous),
-				None => {},
-			}
-			inner_subscription.write() = None;
-			detach(outer);
-		})
-	}
 }
 
-/// `.distinct()` as a NODE (Q3): the upstream's value, passed on to a downstream
-/// ONLY when it differs from the last one that downstream was told of. `.cell()`
-/// does not compare — it notifies on every settle, as every `set` does — so the
-/// equality is this node's, and `T: PartialEq` is asked here and nowhere else.
-///
-/// It keeps one value per ATTACH, not per node: the comparison is a property of
-/// what a given downstream has seen. Its relay reads the upstream once per settle
-/// to decide, and the downstream it wakes reads it again — a `.cell()` above it is
-/// the answer when the upstream is expensive.
-///
-/// The value type is a parameter of its own, bound DIRECTLY in the impl subject,
-/// for `Switch`'s reason: read out of the upstream's bound, an inherited default's
-/// observer parameter would be typed as the trait's unsubstituted `T`.
-export struct Distinct<S, T> {
+export impl Distinct<type S: Flow<T>, type T: PartialEq> with Pipe<T> {}
+
+/// `.distinct_by(key)` as a stage (A142 R7): `Distinct`, comparing `key` of the
+/// value rather than the value, and passing the whole value on.
+export [resource] struct DistinctBy<S, T, K> {
 	up: S,
+	key: |T| K,
 }
 
-export impl Distinct<type S: Source<T>, type T: PartialEq> with Source<T> {
-	fun get(self): T {
-		self.up.get()
+export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Flow<T> {
+	[must_use]
+	fun on_change(own self, observer: |T| void): Subscription {
+		observe_flow(self, observer, false)
 	}
 
 	[must_use]
-	fun on_change(self, observer: |T| void): Subscription {
-		subscribe_pulling(self, observer)
+	fun sub(own self, observer: |T| void): Subscription {
+		observe_flow(self, observer, true)
 	}
 
-	[must_use]
-	fun on_settle(self, subscriber: Subscriber): Subscription {
-		let last: Shared<T> = Shared::new(self.up.get());
-		let relayed = self.up.on_settle(subscriber_of(|| {
-			let now = self.up.get();
-			if now != last.read() {
-				last.write() = now;
-				wake(subscriber);
-			}
-		}, true));
-		also_retiring(relayed, subscriber);
-		relayed
-	}
-}
-
-/// The combinators and the materialising end, as blankets over the read trait —
-/// which an object satisfies too, so each of them reaches through a `dyn Source<T>`
-/// (`proposal/reactive-pipeline.md` §3.4).
-export impl type S: Source<type T> {
-	/// A derived source: `transform` of this one's value, computed when it is READ
-	/// (A124). The result is a cold `Map` node — it stores nothing and registers
-	/// nothing until something reads or subscribes, and each reader pays one
-	/// application per change. Write `.cell()` after it where it is shared or read
-	/// hot.
-	fun map<U>(self, transform: sync |T| U): Map<S, T, U> {
-		Map<S, T, U> { up = self, transform }
-	}
-
-	/// The DYNAMIC dependency (A123), cold: follow whichever source `select`
-	/// answers for this one's current value, and re-follow when it changes — Rx's
-	/// `switchMap`. The rolling registration is the node's own relay (`Switch`).
-	fun switch<U, I: Source<U>>(self, select: sync |T| I): Switch<S, T, I, U> {
-		Switch<S, T, I, U> { up = self, select }
-	}
-
-	/// `.cell()` (R2, the owner's name) — the ONE stateful node: what is above,
-	/// materialised into a cached `SignalCell`. Write it where a derivation is
-	/// SHARED (two readers of a cold chain evaluate it twice; below a cell, once)
-	/// or read HOT (a `get()` in a loop pulls the whole chain every time).
-	///
-	/// It does NOT compare (Q3): every settle above it is a `set`, and a `set`
-	/// always notifies — `.distinct()` is the node that compares. It is owner-tied
-	/// like every derivation (A28): made inside a boundary its registration dies
-	/// with the boundary. It is marked a DERIVATION (A110 door 2), so a turn
-	/// settles it before any effect reads it. And it is composable anywhere: the
-	/// result is a source again, so a chain continues through it — anywhere but a
-	/// module binding's initializer, which has no owner to tie it to and refuses it
-	/// with a steer to `.cell_global()` (A130).
-	fun cell(self): SignalCell<T> {
-		let cached = SignalCell::new(self.get());
-		as_derivation();
-		let _owned = register_with_owner(self.on_settle(mint_subscriber(|| {
-			cached.set(self.get());
-		})));
-		cached
-	}
-
-	/// `.cell()` for a cell that lives as long as the PROGRAM — the spelling for a
-	/// module-level derivation (A130). A `.cell()` is owner-tied, and a module
-	/// binding's initializer has no owner to tie it to: its registration would stay
-	/// on the upstream for the life of the program while the name promised a scope.
-	/// So `.cell()` there is refused, and this is the spelling that says the
-	/// lifetime out loud: it registers with NO owner, even inside a boundary, and
-	/// nothing releases it. What it holds — the upstream's list → its record → this
-	/// cell's refresh → the chain above → the upstream — is a loop for the life of
-	/// the program BY DESIGN (`proposal/reactive-pipeline.md` §2.4); the standing
-	/// no-cycle gate excludes it by this name. Otherwise it is `.cell()`: no
-	/// comparison, a derivation (A110 door 2), a source again.
-	fun cell_global(self): SignalCell<T> {
-		let cached = SignalCell::new(self.get());
-		as_derivation();
-		// NAMED, and the name is load-bearing: the emitted closure carries it, and
-		// the no-cycle gate's walk excludes the loop through a closure of this name
-		// (`reactive_lifetimes.rs`) — the one loop that is the design.
-		let cell_global_refresh = || {
-			cached.set(self.get());
-		};
-		let _for_the_program = self.on_settle(mint_subscriber(cell_global_refresh));
-		cached
+	fun start(own self): Instance<T> {
+		let key = self.key;
+		let upstream = self.up.start();
+		let pull = upstream.pull;
+		let first = pull();
+		let last: Shared<T> = Shared::new(first);
+		let last_key: Shared<K> = Shared::new(key(first));
+		Instance<T> {
+			pull = || last.read(),
+			attach = |subscriber: Subscriber| {
+				let relayed = (upstream.attach)(subscriber_of(|| {
+					let now = pull();
+					let now_key = key(now);
+					if now_key != last_key.read() {
+						last.write() = now;
+						last_key.write() = now_key;
+						wake(subscriber);
+					}
+				}, true));
+				also_retiring(relayed, subscriber);
+				relayed
+			},
+			release = upstream.release,
+		}
 	}
 }
 
-export impl type S: Source<type T: PartialEq> {
-	/// This source, passing a change on only when the value differs from the last
-	/// one passed on — the `Distinct` node, `T: PartialEq` asked here only (Q3).
-	fun distinct(self): Distinct<S, T> {
-		Distinct<S, T> { up = self }
+export impl DistinctBy<type S: Flow<T>, type T, type K: PartialEq> with Pipe<T> {}
+
+/// The combinators whose receiver needs a bound of its own — a default cannot add a
+/// bound on `T`, so each is a blanket over the flows it applies to.
+export impl type F: Flow<type T: PartialEq> {
+	/// This flow, passing a change on only when the value differs from the last one
+	/// passed on — the `Distinct` stage, `T: PartialEq` asked here only (R7).
+	fun distinct(own self): Distinct<F, T> {
+		Distinct<F, T> { up = self }
+	}
+}
+
+export impl type F: Flow<Option<type T>> {
+	/// `switch` over an optional value (A142 R8): `None` detaches and reads `None`,
+	/// `Some(x)` follows the flow `select` builds for `x`, wrapped in `Some`.
+	fun switch_some<U, I: Flow<U>>(own self, select: sync |T| I): SwitchSome<F, T, I, U> {
+		SwitchSome<F, T, I, U> { up = self, select }
+	}
+
+	/// The Kleisli form (A123): `select` answers a `Flow<Option<U>>`, and the outer
+	/// `None` (nothing selected) and the inner `None` (the followed flow holds
+	/// nothing yet) collapse into one — `Option::and_then`, one level up.
+	fun and_then<U, I: Flow<Option<U>>>(own self, select: sync |T| I): AndThen<F, T, I, U> {
+		AndThen<F, T, I, U> { up = self, select }
+	}
+}
+
+export impl type F: Flow<bool> {
+	/// Follow `source`, as `Some`, while this flag is true, and read `None` (and
+	/// hold no registration on `source`) while it is false.
+	fun then_some<T, S: Source<T>>(own self, source: S): ThenSome<F, S, T> {
+		ThenSome<F, S, T> { up = self, source }
+	}
+}
+
+/// The join (A86, A142 §3.2): a flow of `Option<source>` — `None` reads `None` and
+/// detaches, `Some(inner)` follows that inner, wrapped. `switch_some(|x| x)`.
+///
+/// A pipe cannot travel through a flow (its values are copied into every consumer),
+/// so a flow of flows is always a flow of SOURCES. The TOTAL join of a flow of
+/// sources — A4's `flatten` over a `Source<Source<U>>` — is `.switch(|inner|
+/// inner)`, one stage: a second blanket `flatten` over `Flow<I: Source<U>>` beside
+/// this one resolves by declaration order rather than by its nested bound
+/// (reactive-44's `flatten` find, REPORT-reactive-44), so only one of the two can
+/// carry the name, and A142 §3.2 gives it to this one.
+export impl type F: Flow<Option<type I: Source<type U>>> {
+	fun flatten(own self): SwitchSome<F, I, I, U> {
+		SwitchSome<F, I, I, U> { up = self, select = |inner| inner }
 	}
 }
 
@@ -2264,8 +2567,8 @@ export impl Resource<type T> {
 
 	/// Total, with `default` standing in while pending or failed — and AGAIN on
 	/// every re-pend (Q2: it resets).
-	fun or(self, default: T): Map<SignalCell<ResourceState<T>>, ResourceState<T>, T> {
-		self.state.map(|state| {
+	fun or(self, default: T): Derive<SignalCell<ResourceState<T>>, ResourceState<T>, T> {
+		self.state.derive(|state| {
 			match state {
 				ResourceState::Settled(let value) => value,
 				_ => default,
@@ -2275,9 +2578,9 @@ export impl Resource<type T> {
 
 	/// Total, HOLDING the last settled value across a re-pend or a failure;
 	/// `default` only before the first settle.
-	fun latest(self, default: T): Map<SignalCell<ResourceState<T>>, ResourceState<T>, T> {
+	fun latest(self, default: T): Derive<SignalCell<ResourceState<T>>, ResourceState<T>, T> {
 		let latest = self.latest;
-		self.state.map(|state| {
+		self.state.derive(|state| {
 			match state {
 				ResourceState::Settled(let value) => value,
 				_ => latest.read().unwrap_or(default),
@@ -2286,8 +2589,8 @@ export impl Resource<type T> {
 	}
 
 	/// Total, with absence as a value: `None` while pending or failed.
-	fun optional(self): Map<SignalCell<ResourceState<T>>, ResourceState<T>, Option<T>> {
-		self.state.map(|state| {
+	fun optional(self): Derive<SignalCell<ResourceState<T>>, ResourceState<T>, Option<T>> {
+		self.state.derive(|state| {
 			match state {
 				ResourceState::Settled(let value) => Some(value),
 				_ => None,
@@ -2297,8 +2600,8 @@ export impl Resource<type T> {
 
 	/// `true` exactly while pending — the spinner, which is what keeps `.latest`
 	/// honest about showing stale data.
-	fun is_pending(self): Map<SignalCell<ResourceState<T>>, ResourceState<T>, bool> {
-		self.state.map(|state| {
+	fun is_pending(self): Derive<SignalCell<ResourceState<T>>, ResourceState<T>, bool> {
+		self.state.derive(|state| {
 			match state {
 				ResourceState::Pending => true,
 				_ => false,

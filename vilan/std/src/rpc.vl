@@ -37,13 +37,14 @@ import pkg::reactive::{
 	DeltaCursor,
 	DeltaLog,
 	DeltaSource,
+	Derive,
 	Disposable,
 	FlushPolicy,
-	Map as MapNode,
 	Owner,
 	SeqOp,
 	SignalCell,
 	Source,
+	Subscriber,
 	Subscription,
 	as_derivation,
 	at_release_settle,
@@ -3931,9 +3932,9 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 		self.cache.get()
 	}
 
-	/// The trait's subscription primitive, counted like every other observing
-	/// path: attach WITHOUT the immediate call, and hold the channel open until
-	/// the subscription is disposed.
+	/// The trait's attach, counted like every other observing path: put the
+	/// subscriber on the cache, and hold the channel open until the handle is
+	/// disposed.
 	///
 	/// ORDER is the whole content of this body, and it is forced rather than
 	/// chosen: attach FIRST, then take the lease. Taking the lease is what
@@ -3941,34 +3942,32 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 	/// `Update` comes back INSIDE that call — so acquiring first would drop the
 	/// first value on a `duplex_pair` and deliver it over a socket, which is a
 	/// transport-dependent contract and not one at all. Attached first, the
-	/// seed is a change from the `None` the mirror held when the observer was
-	/// registered, on every transport. Nothing is swallowed: `on_change`'s
-	/// contract is "never for the value the source ALREADY holds", and an
-	/// unopened mirror already holds `None`.
+	/// seed is a change from the `None` the mirror held when the subscriber was
+	/// registered, on every transport.
 	[must_use]
-	fun on_change(self, observer: |Option<T>| void): Subscription {
-		let subscription = self.cache.on_change(observer);
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let subscription = self.cache.on_settle(subscriber);
 		subscription.release.write() = Some(|| self.release());
 		self.acquire();
 		subscription
 	}
 
-	/// The trait's `sub` default, OVERRIDDEN — because the default is
-	/// `on_change` plus one call with `get()`, and on a mirror `on_change`
-	/// itself delivers the seeding frame, so the default would make the
-	/// immediate call TWICE. `lease` is the honest eager form: take the lease,
-	/// then attach with `SignalCell::sub`, whose one immediate call is the
-	/// contract's.
+	/// The trait's observer attach, OVERRIDDEN for the EAGER form — because the
+	/// default is the lazy attach plus one call with `get()`, and on a mirror the
+	/// lazy attach itself delivers the seeding frame, so the default would make
+	/// the immediate call TWICE. `lease` is the honest eager form: take the lease,
+	/// then attach with the cell's `sub`, whose one immediate call is the
+	/// contract's. The lazy form is the default's order, attach then lease.
 	[must_use]
-	fun sub(self, observer: |Option<T>| void): Subscription {
-		self.lease(observer)
-	}
-
-	/// `effect` for the same reason as `sub`, and by the same body plus the
-	/// ambient owner: the trait's default is `effect_on_change` and one call,
-	/// and `effect_on_change` is `on_change`, which already made it.
-	fun effect(self, observer: |Option<T>| void) {
-		get_owner().take(self.lease(observer));
+	fun attach_observer(self, observer: |Option<T>| void, immediately: bool): Subscription {
+		if immediately {
+			self.lease(observer)
+		} else {
+			let subscription = self.cache.on_change(observer);
+			subscription.release.write() = Some(|| self.release());
+			self.acquire();
+			subscription
+		}
 	}
 }
 
@@ -3986,8 +3985,8 @@ export impl RemoteSource<type T> {
 	/// leases under the view that places it; `sub`/`on_change` hand the lease back
 	/// as a `Subscription` for you to dispose. Each leaf takes its own lease on the
 	/// one count, so two leaves send one `Subscribe`.
-	fun or(self, initial: T): MapNode<RemoteSource<T>, Option<T>, T> {
-		self.map(|value| match value {
+	fun or(self, initial: T): Derive<RemoteSource<T>, Option<T>, T> {
+		self.derive(|value| match value {
 			Some(let present) => present,
 			None => initial,
 		})
@@ -4608,8 +4607,13 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |List<T>| void): Subscription {
-		self.elements.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.elements.on_settle(subscriber)
+	}
+
+	[must_use]
+	fun attach_observer(self, observer: |List<T>| void, immediately: bool): Subscription {
+		self.elements.attach_observer(observer, immediately)
 	}
 }
 
@@ -4808,44 +4812,29 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with S
 		self.cache.get()
 	}
 
-	/// The trait's subscription primitive, counted like every other observing
-	/// path: attach WITHOUT the immediate call, and hold the channel open
-	/// until the subscription is disposed.
-	///
-	/// ORDER is forced here exactly as it is on `RemoteSource`: attach FIRST,
-	/// then take the lease. Taking the lease is what sends `Subscribe`, and
-	/// over an in-process transport the server's seeding `Patch` comes back
-	/// INSIDE that call — so acquiring first would drop the seed on a
-	/// `duplex_pair` and deliver it over a socket. Attached first, the seed is
-	/// a change from the `None` the mirror held when the observer was
-	/// registered, on every transport.
+	/// The trait's attach, counted like every other observing path — ORDER forced
+	/// exactly as it is on `RemoteSource`: attach FIRST, then take the lease, so
+	/// the seeding `Patch` an in-process transport delivers inside the lease is a
+	/// change, on every transport.
 	[must_use]
-	fun on_change(self, observer: |Option<List<T>>| void): Subscription {
-		let subscription = self.cache.on_change(observer);
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		let subscription = self.cache.on_settle(subscriber);
 		subscription.release.write() = Some(|| self.release());
 		self.acquire();
 		subscription
 	}
 
-	/// The trait's `sub` default, OVERRIDDEN — the default is `on_change` plus one
-	/// call with `get()`, and on a mirror `on_change` itself delivers the seeding
-	/// patch, so the default would make the immediate call TWICE. `lease` is the
-	/// honest eager form.
-	///
-	/// It shares its name with the inherent `sub` below, which takes `|List<T>|`
-	/// and outranks it on a concrete receiver. The two are told apart by the
-	/// observer's own parameter type: `mirror.sub` reaches the inherent one —
-	/// the shape every caller was written against, and the one a view wants —
-	/// while a generic `S: Source<Option<List<T>>>` reaches this one.
+	/// The eager form leases first, for `RemoteSource::attach_observer`'s reason.
 	[must_use]
-	fun sub(self, observer: |Option<List<T>>| void): Subscription {
-		self.lease(observer)
-	}
-
-	/// `effect` for the same reason as `sub`, and by the same body plus the ambient
-	/// owner.
-	fun effect(self, observer: |Option<List<T>>| void) {
-		get_owner().take(self.lease(observer));
+	fun attach_observer(self, observer: |Option<List<T>>| void, immediately: bool): Subscription {
+		if immediately {
+			self.lease(observer)
+		} else {
+			let subscription = self.cache.on_change(observer);
+			subscription.release.write() = Some(|| self.release());
+			self.acquire();
+			subscription
+		}
 	}
 }
 
@@ -4993,8 +4982,8 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	}
 
 	/// `initial` until the first patch — `RemoteSource::or`'s cold node.
-	fun or(self, initial: List<T>): MapNode<KeyedSource<K, T>, Option<List<T>>, List<T>> {
-		self.map(|value| match value {
+	fun or(self, initial: List<T>): Derive<KeyedSource<K, T>, Option<List<T>>, List<T>> {
+		self.derive(|value| match value {
 			Some(let present) => present,
 			None => initial,
 		})

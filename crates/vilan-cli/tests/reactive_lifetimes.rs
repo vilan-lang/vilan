@@ -142,7 +142,7 @@ fun main() {
 	let path = current_path();
 	mut round = 0;
 	for round < 25 {
-		let root = mount_root("app", || view("main").bind_text(path.map(parse).map(label)));
+		let root = mount_root("app", || view("main").bind_text(path.derive(parse).derive(label)));
 		root.dispose();
 		round += 1;
 	}
@@ -230,17 +230,17 @@ import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 import std::ui::{ View, each, mount_root, view };
 
 let path: SignalCell<str> = Signal::new("/");
-let depth: SignalCell<usize> = path.map(|value| value.len()).cell_global();
+let depth: SignalCell<usize> = path.derive(|value| value.len()).cell_global();
 
 fun row(item: str): View {
 	view("li").text(item)
 }
 
 fun app(items: SignalCell<List<str>>, draft: SignalCell<str>): View {
-	let route: SignalCell<str> = path.map(|value| "route" + value).cell();
+	let route: SignalCell<str> = path.derive(|value| "route" + value).cell();
 	view("main")
 		.child(view("h1").bind_text(route))
-		.child(view("p").bind_text(depth.map(|n| i"{n}")))
+		.child(view("p").bind_text(depth.derive(|n| i"{n}")))
 		.child(view("input").bind_value(draft))
 		.child(view("button").text("add").on("click", || {
 			items.update(|&mut list| { list.push(draft.get()); });
@@ -640,7 +640,7 @@ import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, owner_sco
 
 fun main() {
 	let route: SignalCell<i32> = Signal::new(0);
-	let shell: SignalCell<i32> = route.map(|value| value / 10).cell();
+	let shell: SignalCell<i32> = route.derive(|value| value / 10).cell();
 	let boundary = Owner::new();
 	let fired: SignalCell<i32> = Signal::new(0);
 
@@ -740,7 +740,7 @@ fun main() {
 	// it from inside that wave. The outer is created FIRST, so ascending
 	// subscriber id runs it first (A110 door 2).
 	let path: SignalCell<i32> = Signal::new(0);
-	let gate: SignalCell<i32> = path.map(|value| value / 10).cell();
+	let gate: SignalCell<i32> = path.derive(|value| value / 10).cell();
 	let later_boundary = Owner::new();
 	let later_fired: SignalCell<i32> = Signal::new(0);
 	let _later_outer = path.on_change(|_value: i32| {
@@ -869,7 +869,7 @@ fun main() {
 	// `turn_scope` IS established and the scrub always worked.
 	let second_turn = Turn::new();
 	let second_trigger: SignalCell<i32> = Signal::new(0);
-	let second_derived: SignalCell<i32> = second_trigger.map(|value| value * 10).cell();
+	let second_derived: SignalCell<i32> = second_trigger.derive(|value| value * 10).cell();
 	let second_boundary = Owner::new();
 	let second_fired: Shared<i32> = Shared::new(0);
 	owner_scope.run(second_boundary, || {
@@ -965,7 +965,7 @@ import std::reactive::{
 fun main() {
 	// --- order: the outer runs first, and both run.
 	let source: SignalCell<i32> = Signal::new(0);
-	let coarse: SignalCell<i32> = source.map(|value| value / 10).cell();
+	let coarse: SignalCell<i32> = source.derive(|value| value / 10).cell();
 	let host = Owner::new();
 	mut wired = false;
 	run_with_owner(host, || {
@@ -986,7 +986,7 @@ fun main() {
 	// --- nested: the outer's run replaces the instantiation the inner belongs
 	// to, so the inner never runs at all.
 	let route: SignalCell<i32> = Signal::new(0);
-	let shell: SignalCell<i32> = route.map(|value| value / 10).cell();
+	let shell: SignalCell<i32> = route.derive(|value| value / 10).cell();
 	let boundary = Owner::new();
 	let built: SignalCell<i32> = Signal::new(0);
 	let torn: SignalCell<i32> = Signal::new(0);
@@ -1073,8 +1073,8 @@ import std::reactive::{
 
 fun main() {
 	let root: SignalCell<i32> = Signal::new(1);
-	let once: SignalCell<i32> = root.map(|value| value * 2).cell();
-	let twice: SignalCell<i32> = once.map(|value| value + 1).cell();
+	let once: SignalCell<i32> = root.derive(|value| value * 2).cell();
+	let twice: SignalCell<i32> = once.derive(|value| value + 1).cell();
 	let seen: SignalCell<str> = Signal::new("");
 	let watcher = Owner::new();
 	run_with_owner(watcher, || {
@@ -1111,14 +1111,15 @@ fn a110_door2_an_effect_reads_a_derivation_chains_final_value_once() {
     );
 }
 
-/// The same claim with COLD arms (A124 S2a, `proposal/reactive-pipeline.md`
-/// §2.3), and with the count made the claim. The derivation chain is two
-/// `map_node`s — nodes, which store nothing and are READ by pulling — and the
-/// effect stands on a diamond: the root joined with that chain. Under pull the
-/// VALUE half holds by construction (every read is of settled state, so `5/3`
-/// cannot happen). The COUNT half is what the threaded id buys: both arms
-/// forward the effect's ONE subscriber record to the root, so the root's list
-/// holds it twice, and the turn's dedup — keyed on that id — calls it once.
+/// The same claim through a DIAMOND (A124 S2a, re-derived at A142 S1). The
+/// derivation chain is two `derive` stages sealed with `.memo()` — `combine`
+/// takes sources, and the chain is read too — and the effect stands on the root
+/// joined with that memo. The effect's ONE subscriber record is forwarded by the
+/// combined pipe to both arms: the root's list and the memo's. In a turn the memo
+/// is a derivation (phase 1) and re-notifies the same record, which the turn's
+/// dedup — keyed on that id — collapses, so the effect runs once, in phase 2, on
+/// the settled pair. The combined pipe is built INSIDE the owner's closure: a
+/// closure cannot capture a pipe.
 ///
 /// Red when `SignalCell::on_settle` mints a fresh id per registration instead
 /// of pushing the leaf's record: `fixpoint=5/11,5/11,`.
@@ -1129,13 +1130,11 @@ import std::reactive::{
 
 fun main() {
 	let root: SignalCell<i32> = Signal::new(1);
-	let twice = root.map(|value| value * 2).map(|value| value + 1);
-	let arms: (dyn Source<i32>, dyn Source<i32>) = (root, twice);
-	let pair = combine(arms);
+	let twice = root.derive(|value| value * 2).derive(|value| value + 1).memo();
 	let seen: SignalCell<str> = Signal::new("");
 	let watcher = Owner::new();
 	run_with_owner(watcher, || {
-		pair.effect_on_change(|both: (i32, i32)| {
+		combine((root, twice)).effect_on_change(|both: (i32, i32)| {
 			let (left, right) = both;
 			seen.set_with(|log| i"{log}{left}/{right},");
 		});
@@ -1387,10 +1386,11 @@ fn a114_a_throwing_scoped_effect_body_does_not_leak_the_run_it_started() {
 /// requirement is static (no owner, no compile). One subscriber each while the
 /// boundary lives, none after it goes.
 ///
-/// **Row 3 — the derivations.** Re-derived at A124 S2c: the combinators (`map`,
-/// `combine`, `flatten`) are COLD NODES that register nothing at all, inside a
+/// **Row 3 — the derivations.** Re-derived at A124 S2c and kept by A142: the
+/// combinators (`derive`, `combine`, the join — `switch(|inner| inner)` since
+/// A142) are PIPES that register nothing at all until consumed, inside a
 /// boundary or out (`cold: map=0 combine=0+0 flatten=0+0`) — there is nothing for
-/// a boundary to release. What registers is the materialising end: a `.cell()`
+/// a boundary to release. What registers is the consumer: a `.cell()`
 /// of each, and `selector`, route their subscription through
 /// `register_with_owner`, so inside a boundary every one detaches with it —
 /// A28's measured leak, closed, now at the node that holds state. OUTSIDE every
@@ -1429,27 +1429,27 @@ fun main() {
 	let outer: SignalCell<SignalCell<i32>> = Signal::new(inner);
 	let cold = Owner::new();
 	run_with_owner(cold, || {
-		let _m = mapped.map(|value| value + 1);
+		let _m = mapped.derive(|value| value + 1);
 		let _c = combine((left, right));
-		let _f = outer.flatten();
+		let _f = outer.switch(|held| held);
 	});
 	print(i"row3: cold map={mapped.subscribers.read().len()} combine={left.subscribers.read().len()}+{right.subscribers.read().len()} flatten={outer.subscribers.read().len()}+{inner.subscribers.read().len()}");
 	cold.dispose();
 
 	let derivations = Owner::new();
 	run_with_owner(derivations, || {
-		let _m = mapped.map(|value| value + 1).cell();
+		let _m = mapped.derive(|value| value + 1).cell();
 		let _c = combine((left, right)).cell();
 		let _s = selector(picked);
-		let _f = outer.flatten().cell();
+		let _f = outer.switch(|held| held).cell();
 	});
 	counts("inside-live", mapped, left, right, picked, outer, inner);
 	derivations.dispose();
 	counts("inside-disposed", mapped, left, right, picked, outer, inner);
 
 	let module_level: SignalCell<i32> = Signal::new(0);
-	let _cold = module_level.map(|value| value + 1);
-	let _ownerless = module_level.map(|value| value + 1).cell();
+	let _cold = module_level.derive(|value| value + 1);
+	let _ownerless = module_level.derive(|value| value + 1).cell();
 	print(i"row3: ownerless cell={module_level.subscribers.read().len()}");
 }
 "#;

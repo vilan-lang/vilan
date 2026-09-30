@@ -889,9 +889,9 @@ fn gate_source_name(
             // A85's value form.
             if let js::Node::Local(name) = subject.as_ref()
                 && let Some((preload, source_at)) = gates.get(name)
-                && let Some(js::Node::Local(source)) = arguments.get(*source_at)
+                && let Some(source) = arguments.get(*source_at).and_then(plain_source_name)
             {
-                return Some((preload.clone(), source.clone()));
+                return Some((preload.clone(), source));
             }
             gate_source_name(subject, gates).or_else(|| {
                 arguments
@@ -915,6 +915,27 @@ fn gate_source_name(
         | js::Node::Property(inner, _) => gate_source_name(inner, gates),
         js::Node::Array(items) | js::Node::Sequence(items) => {
             items.iter().find_map(|item| gate_source_name(item, gates))
+        }
+        _ => None,
+    }
+}
+
+/// The plain name a gate's source argument reads, seen through the rule-1 copy
+/// an `own` parameter takes (`__clone(route)`): `swap` consumes its source
+/// (`own`, A142 R29), so a route passed at a use that is not its last arrives
+/// wrapped, and the preload reads the same value through the bare name. Any other
+/// shape is still "no preload".
+fn plain_source_name(argument: &js::Node) -> Option<String> {
+    match argument {
+        js::Node::Local(source) => Some(source.clone()),
+        js::Node::Call(subject, arguments)
+            if matches!(subject.as_ref(), js::Node::Local(helper) if helper == "__clone")
+                && arguments.len() == 1 =>
+        {
+            match &arguments[0] {
+                js::Node::Local(source) => Some(source.clone()),
+                _ => None,
+            }
         }
         _ => None,
     }

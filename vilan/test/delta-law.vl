@@ -43,6 +43,7 @@ import std::reactive::{
 	Signal,
 	SignalCell,
 	Source,
+	Subscriber,
 	Subscription,
 	batch,
 };
@@ -90,8 +91,8 @@ impl ListCell<type T> with Source<List<T>> {
 	}
 
 	[must_use]
-	fun on_change(self, observer: |List<T>| void): Subscription {
-		self.elements.on_change(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.elements.on_settle(subscriber)
 	}
 }
 

@@ -109,7 +109,7 @@ When you only need a yes/no answer instead of a full match, `is` tests a
 pattern as a boolean:
 
 ```vilan,fragment
-let present = entry.map(|current| current is Some(let _task));
+let present = entry.derive(|current| current is Some(let _task));
 ```
 
 A `let` inside the pattern **captures**, and the capture is in scope

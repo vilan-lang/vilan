@@ -2320,8 +2320,8 @@ fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
 fn slot_twins_module(browser_value: &str) -> String {
     format!(
         "import std::ui;\nimport std::ui::{{ Slot, View }};\n\nexport struct Badge {{\n\tlabel: str,\n}}\n\n\
-         export [platform(\"browser\")]\nimpl Badge with Slot {{\n\tfun place(self, parent: View) {{\n\t\tparent.element.set_attribute(\"data-badge\", {browser_value});\n\t}}\n}}\n\n\
-         export [platform(\"@process\")]\nimpl Badge with Slot {{\n\tfun place(self, parent: View) {{\n\t\tui::set_attribute(parent.attributes, \"data-badge\", self.label);\n\t}}\n}}\n"
+         export [platform(\"browser\")]\nimpl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tparent.element.set_attribute(\"data-badge\", {browser_value});\n\t}}\n}}\n\n\
+         export [platform(\"@process\")]\nimpl Badge with Slot {{\n\tfun place(own self, parent: View) {{\n\t\tui::set_attribute(parent.attributes, \"data-badge\", self.label);\n\t}}\n}}\n"
     )
 }
 

@@ -33,7 +33,7 @@ fun todos(): View {
 	// `remaining` depends only on `items` — one input, so plain `derive`. The
 	// result is a read-only `Source`; only the root `Signal`s above can be `set`.
 	let remaining: SignalCell<i32> = items
-		.map(|list| {
+		.derive(|list| {
 			mut open = 0;
 			for todo in list {
 				if !todo.done {
@@ -50,7 +50,7 @@ fun todos(): View {
 	// is data: `visible` recomputes exactly when either input changes — no body is
 	// run to "find" the dependencies.
 	let visible: SignalCell<List<Todo>> = combine((items, filter))
-		.map(|(list, filter)| {
+		.derive(|(list, filter)| {
 			mut shown: List<Todo> = [];
 			for todo in list {
 				let keep = filter == "all"
@@ -86,7 +86,7 @@ fun todos(): View {
 			// `bind_value` is two-way: the input shows `draft` and writes it on input.
 			.child(view("input").attr("placeholder", "What needs doing?").bind_value(draft))
 			.child(view("button").text("Add").on("click", add)))
-		.child(view("p").bind_text(remaining.map(|n| format(n) + " remaining")))
+		.child(view("p").bind_text(remaining.derive(|n| format(n) + " remaining")))
 		.child(view("div")
 			.class("filters")
 			.child(filter_button(filter, "all", "All"))
@@ -99,12 +99,12 @@ fun todos(): View {
 		.child(view("p")
 			.class("empty")
 			.text("Nothing here 🎉")
-			.show(visible.map(|list| list.len() == 0)))
+			.show(visible.derive(|list| list.len() == 0)))
 		// `when` mounts/unmounts CONTENT — a disposal boundary: the summary's
 		// binding below exists only while something is done, and is disposed
 		// (not just hidden) when the condition drops.
-		.child(when(items.map(|list| count_done(list) > 0), || {
-			view("p").class("summary").bind_text(items.map(|list| i"{count_done(list)} done"))
+		.child(when(items.derive(|list| count_done(list) > 0), || {
+			view("p").class("summary").bind_text(items.derive(|list| i"{count_done(list)} done"))
 		}))
 }
 
@@ -123,7 +123,7 @@ fun count_done(list: List<Todo>): i32 {
 fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 	view("button")
 		.text(label)
-		.bind_class(filter.map(|current| if current == value { "active" } else { "" }))
+		.bind_class(filter.derive(|current| if current == value { "active" } else { "" }))
 		.on("click", || filter.set(value))
 }
 

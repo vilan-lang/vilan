@@ -105,35 +105,42 @@ fun main() {
 [memory model](../tour/memory-model.md) chapter explains why that's a
 feature.)
 
-## Derived state: `map`, `combine`, `flatten`
+## Derived state: `derive`, pipes and `.memo()`
 
-Build state as a graph and let it compute itself. Every combinator below
-returns a **node** — a description of a value, holding the source it reads and
-what it does to it, and nothing else. A node computes when it is READ: `get()`
-pulls through the chain, and a subscriber is told "something changed" and pulls
-too. Building one registers nothing and runs nothing.
+Build state as a graph and let it compute itself. Two kinds of reactive value
+make up the graph:
 
-- `signal.map(transform)` gives a source of the transformed value, computed
-  when it is read:
+- A **source** has state and can be read: a `SignalCell`, a constant, an rpc
+  mirror, and a sealed derivation. `get()` reads it, and copying one copies a
+  handle to the same state.
+- A **pipe** is a transformation: `count.derive(|n| n * 2)`. It is a
+  *description* — the source it reads and what it does to it — with no `get()`
+  of its own, and it runs only once something consumes it.
 
-  ```vilan
-  import std::reactive::{ Signal, SignalCell };
-  fun main() {
-  	let count = Signal::new(2);
-  	let doubled = count.map(|n: i32| n * 2);
-  	print(doubled.get());
-  	count.set(5);
-  	print(doubled.get());
-  }
-  ```
-- `combine((a, b, …))` gives a source of the tuple of several sources'
-  values — cells, nodes and mirrors mixed freely. It fires when any of
-  them changes. Takes two or more.
-- `nested.flatten()` on **any source whose element is a source** follows
-  whichever inner signal is current, and detaches from a replaced one — a
-  `SignalCell<SignalCell<U>>`, a `map` result that picks between signals, a
-  mirror. An outer of `Option<inner>` joins too: `None` gives `None` and
-  detaches, `Some(inner)` follows that inner.
+A pipe is consumed exactly **once**: by a consumer (an `effect`, a UI binding),
+or by **sealing** it into a source.
+
+```vilan
+import std::reactive::{ Signal, SignalCell };
+
+fun main() {
+	let count = Signal::new(2);
+	let doubled = count.derive(|n: i32| n * 2).memo();   // seal: a source again
+	print(doubled.get());
+	count.set(5);
+	print(doubled.get());
+}
+```
+
+- `source.derive(transform)` gives a pipe of the transformed value.
+- `combine((a, b, …))` gives a pipe of the tuple of several sources' values,
+  changing when any of them changes. Takes two or more; each input is a source,
+  so a derived input is sealed first.
+- `.memo()` seals a pipe into a read-only source backed by one cell: the pipe
+  runs once per change of its input, and every reader shares the value.
+  `.cell()` seals into a writable `SignalCell` instead (a local `set` holds until
+  the next change upstream overwrites it). `.sample()` reads a pipe once — start
+  it, take its value, release it — and subscribes to nothing.
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, combine };
@@ -141,36 +148,59 @@ import std::reactive::{ Signal, SignalCell, combine };
 fun main() {
 	let first = Signal::new("Ada");
 	let last = Signal::new("Lovelace");
-	let full = combine((first, last)).map(|pair: (str, str)| {
-		let (a, b) = pair;
-		a + " " + b
-	});
+	let full = combine((first, last))
+		.derive(|pair: (str, str)| {
+			let (a, b) = pair;
+			a + " " + b
+		})
+		.memo();
 	print(full.get());
 	first.set("Grace");
 	print(full.get());
 }
 ```
 
-A named function can stand in for the closure (`signal.map(parse)`).
-See [functions & closures](../tour/functions-and-closures.md).
+**Why a pipe is consumed once.** Every stage of a pipe runs inside the one
+consumer that started it, once per change of its input — five stages sealed
+into one `.memo()` put one subscription on the root and run once per change, in
+one pass. Handing the same pipe to two consumers would run it twice, so the
+compiler refuses it: the second use is "use of `p` after it was moved". Two
+readers of one derived value need a source between them, and sealing is that
+source:
+
+```vilan
+import std::reactive::{ Signal, SignalCell };
+
+fun main() {
+	let cart = Signal::new(3);
+	let total = cart.derive(|n: i32| n * 25).memo();   // one instance, one run per change
+	let big = total.derive(|cents: i32| cents > 100).memo();
+	let label = total.derive(|cents: i32| i"{cents} cents").memo();
+	print(i"{label.get()} {big.get()}");
+}
+```
+
+A source is data — pass it anywhere, as often as you like. A pipe is built where
+it is consumed, and each consumer builds its own over a shared source.
 
 A dependency is **static** when the expression fixes what the result reads —
-that is `map` and `combine` — and **dynamic** when the current value decides
+that is `derive` and `combine` — and **dynamic** when the current value decides
 *which* source to follow next, which is what "the selected channel's unread
-count" needs. `flatten` is the primitive underneath the dynamic half; two
-combinators are its everyday spelling, and each is one node rather than a
-chain:
+count" needs:
 
-- `source.switch(select)` follows whichever source `select` answers for the
-  current value and re-follows when this one changes — Rx's `switchMap`. It
-  means `source.map(select).flatten()`.
-- `source.and_then(select)` is the same on a `Source<Option<T>>`, the total
-  encoding of a signal that may hold nothing yet: `None` on the outer is
-  `None` on the result, `Some(value)` follows the `Source<Option<U>>` that
-  `select` answers, and the two absences collapse into one. It is
-  `Option::and_then` one level up, and it replaces the
-  `map(|x| x.map(f)).flatten().map(|x| x.flatten())` a model layer of
-  optional cells otherwise writes by hand.
+- `source.switch(select)` follows whichever flow `select` builds for the current
+  value and re-selects when this one changes — Rx's `switchMap`. `select` runs
+  once per change, and whatever the previous selection built is released.
+- `source.switch_some(select)` is the same over an `Option`: `None` detaches and
+  reads `None`, `Some(x)` follows what `select` builds for `x`, wrapped.
+- `source.and_then(select)` is the Kleisli form over a `Source<Option<T>>`:
+  `select` answers a `Source<Option<U>>`, and the two absences collapse into
+  one. It is `Option::and_then` one level up.
+- `flag.then_some(source)` follows `source` while the flag is true and reads
+  `None` (holding nothing) while it is false.
+- `nested.flatten()` over a source of `Option<source>` follows whichever inner
+  source is current and detaches from a replaced one (`None` reads `None`). The
+  total join of a source of sources is `nested.switch(|inner| inner)`.
 
 ```vilan
 import std::reactive::{ Signal, SignalCell };
@@ -179,7 +209,7 @@ fun main() {
 	let which = Signal::new(0);
 	let first = Signal::new(10);
 	let second = Signal::new(20);
-	let picked = which.switch(|n: i32| if n == 0 { first } else { second });
+	let picked = which.switch(|n: i32| if n == 0 { first } else { second }).memo();
 	print(picked.get());     // 10
 	first.set(11);
 	print(picked.get());     // 11 — the current inner drives the result
@@ -190,32 +220,30 @@ fun main() {
 }
 ```
 
-Both are nodes, like `map`, with one difference: subscribed, they keep a
-registration of their own on whichever inner is current, and re-wire it at
-every switch. The handle the subscriber holds owns that registration, so an
-effect made inside a boundary releases the outer and the live inner together
-when the boundary goes.
+A selector must **build** the flow it answers: a closure cannot capture a pipe
+built outside it (a pipe is consumed once, and the selector runs once per
+change). Selecting between sources, as above, is always fine — a source is data.
 
-### Where a derivation lives: `.cell()` and `dyn Source<T>`
+When an unchanged value should stay quiet, `.distinct()` passes a change on only
+when the value differs from the last one (it asks `T: PartialEq`), and
+`.distinct_by(key)` compares `key` of the value. Sealing does not compare: every
+change above a `.memo()` is a write, and a write always notifies.
 
-A derivation is a *description* of a value: the source it reads and what it does
-to it. It does not have to be stored anywhere. Read it with `get()` and it pulls
-through its chain; subscribe to it and it tells you when the source changed, and
-you pull. A chain nobody reads costs nothing, and a chain one reader reads costs
-one evaluation per change. Three rules cover where one should live:
+`Source::constant(value)` is a source that never changes — the way to fit a
+static value into a position that asks for a reactive one.
 
-- **A chain is cold.** Leave a derivation with one reader as it is — no cell, no
-  cache, nothing to keep in step.
-- **`.cell()` where you share it or read it hot.** Two readers of a cold chain
-  each evaluate it; below a `.cell()` the chain above runs once and the readers
-  share the cached value. A `get()` in a loop pulls the whole chain every time;
-  after a `.cell()` it is one read. `.cell()` is a source again, so a chain can
-  go on through it, and it can sit anywhere in one — after the expensive part,
-  not at every step.
+### Where a derivation lives: `.memo()` and `dyn Source<T>`
+
+- **A pipe is built where it is consumed.** A binding over a derivation takes
+  the pipe directly: `text.bind_text(count.derive(|n| i"{n}"))`. Nothing is
+  stored, and the binding is the pipe's one consumer.
+- **`.memo()` where you share it or read it.** A derivation read by two
+  consumers, or read with `get()`, is sealed once and shared. `.memo()` can sit
+  anywhere in a chain — after the expensive part, not at every step.
 - **`dyn Source<T>` where you store it.** A struct field names a type, and two
   derivations built differently are two types. A field of type `dyn Source<T>`
-  holds any of them — a cell, a derivation, a mirror — and a list of such structs
-  mixes them freely.
+  holds any source — a cell, a sealed memo, a mirror — and a list of such
+  structs mixes them freely. A pipe is not a source, so it is sealed first.
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Source };
@@ -226,10 +254,10 @@ struct Label {
 
 fun main() {
 	let count = Signal::new(2);
-	let total = count.map(|n: i32| n * 100).cell();   // shared below: cache it
+	let total = count.derive(|n: i32| n * 100).memo();   // shared below: seal it
 	let labels: List<Label> = [
 		Label { text = Signal::new("fixed") },
-		Label { text = total.map(|cents: i32| i"{cents} cents") },
+		Label { text = total.derive(|cents: i32| i"{cents} cents").memo() },
 	];
 	count.set(3);
 	for label in labels {
@@ -239,35 +267,29 @@ fun main() {
 }
 ```
 
-`.cell()` does not compare: every change above it is a write, and a write always
-notifies. When an unchanged value should stay quiet, `.distinct()` is the node
-that compares (it asks `T: PartialEq`, and nothing else in the chain does).
+**What a pipe's type is, and where you write it.** `derive` answers a
+`Derive<S, T, U>`, `switch` a `Switch`, `switch_some` and `flatten` a
+`SwitchSome`, `and_then` an `AndThen`, `combine` a `Combine` — types you rarely
+spell. Leave a binding unannotated, take a parameter as a `Flow<T>` bound (any
+source or pipe satisfies it; write `own` on it, since a pipe is consumed), or
+seal it where a `MemoCell<T>` or `SignalCell<T>` is what you mean. A struct that
+holds a pipe becomes move-only itself, so a model layer stores sealed sources, or
+offers methods that build pipes on request.
 
-**What a node's type is, and where you write it.** `map` answers a
-`Map<S, T, U>`, `switch` and the total `flatten` a `Switch`, the `Option`
-`flatten` a `FlattenOption`, `and_then` an `AndThen`, `combine` a `Combine` —
-types you rarely spell. Leave a binding unannotated, take a parameter as a
-`Source<T>` bound (any node satisfies it), store one as `dyn Source<T>`, or
-`.cell()` it where a `SignalCell<T>` is what you mean. An annotation of
-`SignalCell<U>` on a `map` is the one spelling that no longer fits, and so is
-handing a node to a `Signal<T>` parameter, which is the WRITABLE half — a node
-cannot be written to; a `.cell()` of it can (and the next change overwrites
-what you wrote).
-
-**At module level, `.cell_global()`.** A `.cell()` ties its registration to the
-ambient owner, and a module binding's initializer has none, so there the
-compiler refuses `.cell()` and steers you to build it under the owner that reads
-it — or to write `.cell_global()`, which says the cell lives for the program:
+**At module level, `.memo_global()`.** A `.memo()` ties its subscription to the
+ambient owner, and a module binding's initializer has none, so there the compiler
+refuses `.memo()` (and `.cell()`) and steers you to build it under the owner that
+reads it — or to write `.memo_global()` (`.cell_global()`), which says the value
+lives for the program:
 
 ```vilan
-import std::reactive::{ Signal, SignalCell, Source };
+import std::reactive::{ Signal, SignalCell, MemoCell, Source };
 
 let path: SignalCell<str> = Signal::new("/docs/intro");
-let is_deep = path.map(|value: str| value.len() > 5);            // a node: fine anywhere
-let segments: SignalCell<usize> = path.map(|value: str| value.len()).cell_global();
+let segments: MemoCell<usize> = path.derive(|value: str| value.len()).memo_global();
 
 fun main() {
-	print(is_deep.get());
+	print(segments.get());
 	path.set("/");
 	print(segments.get());
 }
@@ -275,7 +297,7 @@ fun main() {
 
 ### Selection over a list: `selector`
 
-`map` is the wrong tool for one particular shape — "is *this* row the
+`derive` is the wrong tool for one particular shape — "is *this* row the
 selected one?", asked once per row. A derivation per row means every row
 recomputes on every change: `n` notifications to move a highlight one
 row. `selector(source)` keeps one subscription and a cell per key, so a
@@ -383,9 +405,9 @@ Five rules, and they are the whole answer:
 |---|---|---|
 | `signal.effect(..)` / `effect_on_change(..)` | the ambient owner (required, *statically*) | the boundary is disposed |
 | `signal.sub(..)` / `on_change(..)` / `observe(..)` | **nobody** — you hold the `Subscription` | you call `dispose()`, or the owner you gave it to is disposed |
-| `map` / `combine` / `flatten` / `switch` / `and_then` | nothing to release — a node registers nothing until a leaf subscribes | — |
-| `.cell()` / `selector` **inside** a boundary | the ambient owner | the boundary is disposed |
-| `.cell()` / `selector` **outside** every boundary (a function body), `.cell_global()` anywhere | nobody — it lives as long as its source | never (deliberate: see below) |
+| `derive` / `combine` / `flatten` / `switch` / `and_then` | nothing to release — a pipe registers nothing until it is consumed | — |
+| `.memo()` / `.cell()` / `selector` **inside** a boundary | the ambient owner | the boundary is disposed |
+| `.memo()` / `.cell()` / `selector` **outside** every boundary (a function body), `.memo_global()` / `.cell_global()` anywhere | nobody — it lives as long as its source | never (deliberate: see below) |
 | `signal.scoped_effect(..)`, and anything its body registers | that **run's** owner | before the next run, and with the boundary |
 
 Two of those rows are worth a sentence.
@@ -396,14 +418,14 @@ destructors here, so a handle you forget about keeps firing. Hold it and
 which does that for you — and `effect` is the one to reach for.
 
 **A cached derivation made outside every boundary lives as long as its
-source, on purpose.** `current_path().map(parse)` at the top of `main` is a
-node and costs nothing until something reads it; a `.cell()` of it there is
+source, on purpose.** `current_path().derive(|path| parse(path))` at the top of
+`main` is a pipe and costs nothing until something consumes it; a `.memo()` of it there is
 meant to last as long as the program. Refusing that would be the stricter rule
 and would break the idiom, so vilan does not — except in a module binding's
 initializer, where the lifetime is spelled `.cell_global()`. Inside a boundary
-a `.cell()` dies with the boundary, which is what a component wants. A
+a `.memo()` dies with the boundary, which is what a component wants. A
 *mirror* is where the owner is asked strictly: an `effect` on a
-`RemoteSource` (or on a node over one) requires an owner, because its
+`RemoteSource` (or on a pipe over one) requires an owner, because its
 subscription costs a network frame.
 
 A disposed owner is **single-use**: a `take` or `defer` that arrives
@@ -736,7 +758,7 @@ this now":
 
 ```vilan,fragment
 let rows: SignalCell<List<str>> = Signal::new([]);
-let lengths = rows.map(|list: List<str>| list.map(|text: str| text.len()));
+let lengths = rows.derive(|list: List<str>| list.map(|text: str| text.len()));
 // N calls of the inner function on every push
 ```
 
@@ -755,7 +777,7 @@ fun main() {
 }
 ```
 
-It is an ordinary `Source<List<T>>` besides — `each`, `map`, `effect` all
+It is an ordinary `Source<List<T>>` besides — `each`, `derive`, `effect` all
 take it — and nothing that ignores the changes pays for them. `each`,
 `each_values` and `each_by` use them: a push into a 1,000-row `ListCell`
 builds one row, where the same push into a `SignalCell<List<T>>` re-reads
@@ -795,11 +817,12 @@ element: its result is kept, and nothing re-runs it.
   and let the owner handle it.
 - Disposal stops *future* deliveries. A watcher already queued in the
   currently-settling turn may fire one final time.
-- Derivations (`map`/`combine`/`flatten`/`switch`/`and_then`) are nodes:
-  they register nothing, so there is nothing to dispose. A `.cell()` takes
+- Derivations (`derive`/`combine`/`flatten`/`switch`/`and_then`) are pipes:
+  they register nothing until consumed, so there is nothing to dispose. A `.memo()` takes
   the ambient owner when there is one, so one built inside a view dies with
   the view; built at the top of `main` it lives as long as its source, and
-  at module level it is spelled `.cell_global()`. Either way you never hold
+  at module level it is spelled `.memo_global()`. Either way you never hold
   a handle.
-- Two readers of one node each evaluate it. When a derivation is expensive
-  or read in several places, `.cell()` it once and share the cell.
+- A pipe has one consumer. A derivation read in several places is sealed
+  once with `.memo()` and the source shared; handing one pipe to two
+  consumers is a compile error rather than silent duplicate work.

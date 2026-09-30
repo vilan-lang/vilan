@@ -1,7 +1,7 @@
-// `flatten` (backlog A4) — the monadic join: follow whichever inner signal
-// the outer currently holds. A DYNAMIC dependency: switching the outer
-// detaches the replaced inner (its later sets must not leak through) and
-// follows the new inner from its current value.
+// The monadic join (backlog A4) — `switch(|inner| inner)` over a source of
+// sources: follow whichever inner signal the outer currently holds. A DYNAMIC
+// dependency: switching the outer detaches the replaced inner (its later sets must
+// not leak through) and follows the new inner from its current value.
 import std::io::print;
 import std::reactive::Signal;
 
@@ -9,7 +9,7 @@ fun main() {
 	let first = Signal::new(1);
 	let second = Signal::new(10);
 	let outer = Signal::new(first);
-	let joined = outer.flatten();
+	let joined = outer.switch(|inner| inner).memo();
 	print(joined.get());
 	first.set(2);
 	print(joined.get());
@@ -20,8 +20,8 @@ fun main() {
 	second.set(11);
 	print(joined.get());
 
-	// The joined result is itself a signal: derived work stacks on it.
-	let doubled = joined.map(|value| value * 2);
+	// The sealed join is itself a source: derived work stacks on it.
+	let doubled = joined.derive(|value| value * 2).memo();
 	second.set(21);
 	print(doubled.get());
 }
