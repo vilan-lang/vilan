@@ -1387,3 +1387,42 @@ fn b435_a_written_type_argument_on_a_method_erases_the_closures_result() {
         "3\n2\n",
     );
 }
+
+#[test]
+#[ignore = "B470: held until `Flow` is declared `[resource]` — B470 as built makes a subtrait's object inherit the attribute, and `Source<T> with Flow<T>` would make `dyn Source<T>` move-only against the ruling (reactive-44's question); green on a gate branch over c65ba161 with `Flow`/`Pipe` declared"]
+fn a142_a_mixed_arm_selector_erases_a_pipe_and_a_root_into_one_flow_object() {
+    // B470's shape for A142: a `switch` selector whose arms are a PIPE (a
+    // `Derive`, a `[resource]` stage) and a ROOT (a `SignalCell`), met in one
+    // `dyn Flow<i32>` because the arms erase where they land. Measured on the
+    // gate branch (lane + F56/F53/parity + B463/B469/B470, `[resource] trait
+    // Flow`/`Pipe`): `100` then `3` on BOTH backends. The explicit
+    // `switch<i32, dyn Flow<i32>>` is a second find: `U` is not bound through
+    // the object's trait argument (`cannot infer 'U' for this call`).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, MemoCell, Signal, SignalCell, Source };
+
+        fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {
+            if on {
+                count.derive(|value| value * 100)
+            } else {
+                count
+            }
+        }
+
+        fun main() {
+            let flag = Signal::new(true);
+            let count = Signal::new(1);
+            let picked: MemoCell<i32> = flag.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();
+            print(i"{picked.get()}");
+            flag.set(false);
+            count.set(3);
+            print(i"{picked.get()}");
+        }
+
+        main();
+        "#,
+        "100\n3\n",
+    );
+}

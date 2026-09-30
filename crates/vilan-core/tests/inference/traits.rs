@@ -7763,3 +7763,62 @@ fn b417_a_method_named_self_is_refused_where_it_is_declared() {
         "cannot access field",
     );
 }
+
+// --- A supertrait default's override, reached through a SUBTRAIT bound -------
+
+#[test]
+#[ignore = "A142: reactive-44 find (MISCOMPILE, both backends, predates A142): through a subtrait bound, a supertrait method with a default runs the default even where the type overrides it"]
+fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
+    // `Mine` overrides `Base::name`. Through `S: Base` the override runs;
+    // through `S: Sub` (a subtrait of `Base`) the DEFAULT runs today, on JS and
+    // natively, and on the 0.41.1 toolchain as well. A142 reached it: `map_each`
+    // over a `DeltaSource` bound called `Source::attach_observer`, and a
+    // `ListCell`'s own observer was bypassed for the default, which captures the
+    // source (A132's loop, 92 cells live at `list-cell`'s native end).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base {
+            fun name(self): str {
+                "the default"
+            }
+        }
+
+        trait Sub with Base {
+            fun tag(self): i32;
+        }
+
+        struct Mine {}
+
+        impl Mine with Base {
+            fun name(self): str {
+                "the override"
+            }
+        }
+
+        impl Mine with Sub {
+            fun tag(self): i32 {
+                7
+            }
+        }
+
+        fun through_base<S: Base>(value: S): str {
+            value.name()
+        }
+
+        fun through_sub<S: Sub>(value: S): str {
+            value.name()
+        }
+
+        fun main() {
+            let mine = Mine {};
+            print(through_base(mine));
+            print(through_sub(mine));
+        }
+
+        main();
+        "#,
+        "the override\nthe override\n",
+    );
+}
