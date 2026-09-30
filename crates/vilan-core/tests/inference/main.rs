@@ -21,6 +21,7 @@ mod backed_enums;
 mod borrows;
 mod bounds;
 mod callable;
+mod collections;
 mod const_eval;
 mod contextual_keywords;
 mod dyn_objects;

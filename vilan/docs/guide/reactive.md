@@ -840,6 +840,44 @@ whole list arrives from somewhere (a fetch, a form) and you want the
 derivations to stay cheap. A `g` handed to `map_each` must be pure in its
 element: its result is kept, and nothing re-runs it.
 
+## Collections that follow: `filter`, `map`, `any` over a `ListCell`
+
+`map_each` is one operator. The rest of the family works the same way — a
+`ListCell` (or anything sealed from one) has `map`, `filter`, `filter_map`,
+`any`, `all`, `count` and `flatten`, and each returns a **collection pipe**:
+a move-only description, consumed once, exactly like a `derive` pipe. Seal it
+with `.memo()` where two things read it, or hand it straight to `each`:
+
+```vilan,browser
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::ui::{ each, mount_root, view };
+
+[derive(PartialEq)]
+struct Task {
+	id: usize,
+	title: str,
+}
+
+fun main() {
+	let finished: List<SignalCell<bool>> = [Signal::new(false), Signal::new(true)];
+	let tasks: ListCell<Task> = ListCell::of([
+		Task { id = 0, title = "write" },
+		Task { id = 1, title = "ship" },
+	]);
+	let _root = mount_root("app", || view("ul").child(each(
+		tasks.filter(|task| finished[task.id].derive(|done| !done)),
+		|task| task.id,
+		|task| view("li").text(task.title),
+	)));
+}
+```
+
+The closure may return a plain value or a reactive one, and the operator
+**follows** what it returns: here each task's `derive` is started for that task,
+and when one flips, one row arrives or leaves — nothing else is re-read. A
+closure returning a plain value (`|task| task.id > 3`) subscribes to nothing at
+all. What a closure registers is released when its element leaves.
+
 ## Traps
 
 - `sub` gives you a `Subscription` to dispose manually. Prefer `effect`

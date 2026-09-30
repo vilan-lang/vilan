@@ -119,7 +119,7 @@ shared	0
 side-effect-let	0
 signal-update	20
 spread-parameters	16
-ssr-render	37
+ssr-render	41
 string-interpolation	0
 string-methods	0
 struct-literal-call	0

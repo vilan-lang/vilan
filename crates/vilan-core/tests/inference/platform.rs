@@ -10687,3 +10687,31 @@ fn b304_a_closure_that_never_touches_its_parameter_compiles() {
         "#,
     );
 }
+
+/// A bound-directed call of a SUPERTRAIT's member (`P: Pipe<T>` calling
+/// `Flow::start`) reaches the impls of the trait that declares it, and nothing
+/// else. The dispatch record names only the bound's own trait, which declares
+/// no `start`, and the candidate set fell back to EVERY member named `start`
+/// in the program — `std::http`'s `Server::start` among them — so a browser
+/// build that sealed a derivation while `std::http` was loaded was refused as
+/// reaching the `process` layer (collections-44's find, kolt's client build:
+/// `.cell()` → `Flow::start` → a collection stage → `IntoElement`'s pipe arm →
+/// `start (std::http)`). Beside it the same class for `get` through
+/// `CollSource`'s supertrait chain coloured a `CollInstance`'s closures async
+/// in any program that also spelled an async `get` (`generics.rs`'s
+/// `service_client_name_defaults_to_struct_client`).
+#[test]
+fn a_supertrait_member_called_through_a_bound_reaches_only_its_implementors() {
+    assert_compiles_browser(
+        r#"
+        import std::http::Server;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let next = count.derive(|value| value + 1).cell();
+            print(next.get());
+        }
+        "#,
+    );
+}

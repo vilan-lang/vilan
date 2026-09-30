@@ -916,6 +916,34 @@ const HASH_EQUALITY_PROBE: &str = concat!(
     "}\n",
 );
 
+/// A142 S4: the collection pipes on both backends — the operators' seeded
+/// random walk against an oracle recomputed after every step (the same walk as
+/// `inference/collections.rs`'s), and the following shapes: `map` over a
+/// returned pipe and a returned source, `flatten`, `filter_map(|m| m)` and
+/// `any(|m| m.is_pending())` over `Option`-valued sources, and the element
+/// runs' owners released on leave, re-run and disposal.
+#[test]
+fn a142_collection_pipes_build_the_same_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_collection_walk.vl",
+            include_str!("native/collection_walk.vl"),
+        ),
+        (
+            "native_probe_collection_follow.vl",
+            include_str!("native/collection_follow.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: a collection pipe must build and answer the same on both backends"
+        );
+    }
+}
+
 /// F23: a context-threaded hidden parameter is typed from the flavour the
 /// CONTEXT PASS recorded, and one program carries both readings.
 ///

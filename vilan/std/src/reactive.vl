@@ -22,18 +22,33 @@ import pkg::tuple::Tuple;
 // `proposal/incremental-collections.md` §4 is the design; `std::rpc`'s `KeyedCell`
 // is the first consumer (A54's machinery, lifted).
 export import pkg::delta::{
+	CollFilter,
+	CollFilterMap,
+	CollFlatten,
+	CollFlow,
+	CollInstance,
+	CollMap,
+	CollPipe,
+	CollSource,
+	CollTally,
 	DeltaCursor,
 	DeltaFeed,
 	DeltaLog,
 	DeltaSource,
+	ElementRun,
+	IntoElement,
+	IntoFlow,
 	ListCell,
+	ListMemo,
 	MapOp,
+	RowFeed,
 	SeqOp,
 	Sequence,
 	SequenceCell,
 	SetOp,
 	Tracked,
 	delta_log_limit,
+	element_holds_allocated,
 	map_each,
 };
 
@@ -182,6 +197,7 @@ fun mint_subscriber(notify: || void): Subscriber {
 /// A relay is always a DERIVATION: it decides whether (and which) downstream to
 /// wake, and that has to happen in the wave's first phase, where a derivation it
 /// wakes still joins the fixpoint and an effect it wakes still runs after it.
+export [internal("a node author's relay mint (A124 R2): a stage that keeps a registration of its own")]
 fun subscriber_of(notify: || void, derived: bool): Subscriber {
 	Subscriber { id = fresh_id(), notify, live = Shared::new(true), derived }
 }
@@ -585,6 +601,7 @@ fun reissued(subscriber: Subscriber): Subscriber {
 /// default a hidden context parameter that `SignalCell`'s override does not take,
 /// and one table signature cannot carry a parameter only some implementations
 /// declare: every `dyn Source` would stop building natively.
+export [internal("a node author's relay wake (A124 R2)")]
 fun wake(subscriber: Subscriber) {
 	defer_subscriber(None, subscriber);
 }
@@ -795,6 +812,7 @@ export impl Subscription with Disposable {
 /// IS the answer — or from inside the release of the handle an owner's teardown
 /// disposed, whose `dispose` PUBLISHED its ambient turn for exactly that extent
 /// (`releasing_turns`), which is where this reads it.
+export [internal("a node's release of a registration it made for itself (A124 S2b)")]
 fun detach(handle: Subscription) {
 	// Inside a release, the turn that release published (B283's own answer,
 	// which is `dispose`'s ambient one); else the draining turn, else none.
@@ -1047,6 +1065,55 @@ export impl Owner {
 		Owner { cell = self.cell, epoch = next }
 	}
 
+	/// The live epoch's nursery, made at the first ask — a collection stage's one
+	/// nursery for every element run (`run_element`), cancelled when the stage's
+	/// owner is disposed.
+	[internal("a collection stage's nursery (A142 §6.4)")]
+	fun stage_nursery(self): Nursery {
+		match self.nursery() {
+			Some(let held) => held,
+			None => {
+				let made = detached_nursery();
+				let held = self.cell.read();
+				self.cell.write() = OwnerCell {
+					epoch = held.epoch,
+					cleanups = held.cleanups,
+					listed = held.listed,
+					nursery = Some(made),
+				};
+				made
+			},
+		}
+	}
+
+	/// Move what the live epoch has registered into a FRESH owner and answer it,
+	/// leaving the epoch listing nothing: `None`, and no allocation, when it
+	/// registered nothing. An element's run under a collection stage's scratch
+	/// owner is split off this way (A142 §6.4), so an element owns exactly what its
+	/// own run registered.
+	[internal("a collection stage's per-element owner (A142 §6.4)")]
+	fun split_registrations(self): Option<Owner> {
+		let held = self.cell.read();
+		if !held.listed || self.is_disposed() {
+			ret None;
+		}
+		self.cell.write() = OwnerCell {
+			epoch = held.epoch,
+			cleanups = no_cleanups,
+			listed = false,
+			nursery = held.nursery,
+		};
+		Some(Owner {
+			cell = Shared::new(OwnerCell {
+				epoch = 0,
+				cleanups = held.cleanups,
+				listed = true,
+				nursery = None,
+			}),
+			epoch = 0,
+		})
+	}
+
 	/// The nursery of this owner's live epoch, if it has one. A run renewed with a
 	/// nursery has one; `run_body` establishes it for the body.
 	[internal("a pipe stage's per-run nursery (A142 §4.1)")]
@@ -1218,6 +1285,28 @@ fun run_body<T>(runs: Owner, body: (|| T) context (owner_scope, ambient_nursery)
 /// epoch gone and is disposed on the spot (B291).
 fun release_runs(runs: Owner) {
 	Owner { cell = runs.cell, epoch = runs.cell.read().epoch }.dispose();
+}
+
+/// Run `body` as ONE ELEMENT's run of a collection stage (A142 §6.4): under the
+/// stage's scratch owner `stage`, with the stage's nursery ambient, and answer the
+/// body's value beside the owner its registrations were split into — `None` when it
+/// registered nothing, which is what keeps a plain element free (§6.1).
+///
+/// Not `run_body`: a collection stage runs its closure once per ELEMENT, and an
+/// epoch per element would release one element's run at the next element's. The
+/// stage's epoch is never renewed here; a run's registrations move to an owner of
+/// the element's own, released when the element leaves or re-runs. A task the body
+/// starts is registered with the STAGE's nursery (the host registers it at the
+/// `async` expression, where no element owner exists yet), so it is cancelled with
+/// the stage's instance rather than with the element.
+export [internal("a collection stage's per-element run (A142 §6.4)")]
+fun run_element<T>(
+	stage: Owner,
+	body: (|| T) context (owner_scope, ambient_nursery),
+): (T, Option<Owner>) {
+	let nursery = stage.stage_nursery();
+	let value = owner_scope.run(stage, || ambient_nursery.run(nursery, || body()));
+	(value, stage.split_registrations())
 }
 
 /// Establish `owner` as the ambient owner for the dynamic extent of `body` — the
@@ -1520,6 +1609,7 @@ export impl type S: Source<type T> with Flow<T> {
 /// start the flow, attach one pulling subscriber, and chain the instance's release
 /// onto the handle. The subscriber is MINTED, so it spends the derivation mark
 /// (`as_derivation`) like every observer does.
+export [internal("a stage author's `on_change`/`sub`, written once")]
 fun observe_flow<T, F: Flow<T>>(own flow: F, observer: |T| void, immediately: bool): Subscription {
 	let instance = flow.start();
 	let pull = instance.pull;
@@ -1626,6 +1716,7 @@ fun read_once<T, F: Flow<T>>(own flow: F): T {
 /// `release` chained onto `handle`'s own release, so disposing the handle releases
 /// the instance behind it too — the consumer's half of `Instance`. Chained rather
 /// than wrapped for `also_retiring`'s reason: no second handle, no context read.
+export [internal("a consumer's release chained onto its handle")]
 fun also_releasing(handle: Subscription, release: || void) {
 	let previous = handle.release.read();
 	handle.release.write() = Some(|| {
@@ -2008,8 +2099,9 @@ export fun divorce<T: (2..), S: Source<T>>(source: S): (U in T: Derive<S, T, U>)
 /// method call threads the caller's ambient owner the ordinary way, which is what
 /// lets a row's entry die with the row.
 export struct Selector<T> {
-	// One cell per key, keyed by `key.hash()` (the canonical key `HashMap`/`HashSet` use).
-	// Every `of` for the same key hands back the same cell.
+	// One cell per key, keyed by `key.hash()` (the canonical key
+	// `HashMap`/`HashSet` use). Every `of` for the same key hands back the same
+	// cell.
 	cells: Shared<NativeMap<SignalCell<bool>>>,
 	// The source's current value, mirrored here so `of` can seed a fresh cell and
 	// the change observer can find the key that is LEAVING.

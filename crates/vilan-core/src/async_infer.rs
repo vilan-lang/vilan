@@ -755,9 +755,20 @@ pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
     };
     match dispatch {
         GenericDispatch::OnConstraint(constraint_id, member) => {
-            // Single-bound `T: Trait` resolves precisely to that trait's impls.
+            // Single-bound `T: Trait` resolves precisely to that trait's impls —
+            // or, when the member is a SUPERTRAIT's (`P: Pipe<T>` calling
+            // `Flow::start`), to the impls of the supertrait that declares it.
+            // Reading only the bound's own trait found nothing there and fell
+            // back to every same-named member in the program, so a generic
+            // `p.start()` reached `std::http`'s `Server::start` and colored a
+            // browser build that never touches a server (collections-44's find).
             let precise = trait_of(program, constraint_id)
-                .map(|trait_id| trait_method_candidates(program, trait_id, member))
+                .map(|trait_id| {
+                    declaring_traits_in_chain(program, trait_id, member)
+                        .into_iter()
+                        .flat_map(|declaring| trait_method_candidates(program, declaring, member))
+                        .collect::<Vec<Id>>()
+                })
                 .unwrap_or_default();
             // A multi-bound parameter records only its first bound, so a member
             // from another bound finds nothing precise — fall back to every
@@ -1000,6 +1011,34 @@ fn trait_of(program: &Program, constraint_id: TypeId) -> Option<Id> {
 /// Every member named `member` an impl of `trait_id` provides, plus the trait's
 /// own default for it — the candidates a dispatch bounded by that trait selects
 /// among at monomorphization.
+/// The traits in `trait_id`'s supertrait chain (itself first) that DECLARE
+/// `member` — the traits whose impls a bound-directed call of `member` can
+/// reach. Empty when none does, which leaves the caller its fallback.
+fn declaring_traits_in_chain(program: &Program, trait_id: Id, member: &str) -> Vec<Id> {
+    let mut pending = vec![trait_id];
+    let mut seen: Vec<Id> = Vec::new();
+    let mut declaring = Vec::new();
+    while let Some(id) = pending.pop() {
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        let Some(trait_) = program.traits.get(&id) else {
+            continue;
+        };
+        if trait_.declarations.contains_key(member) {
+            declaring.push(id);
+            continue;
+        }
+        for supertrait in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, _)) = program.type_id_to_type_map.get(supertrait) {
+                pending.push(*super_id);
+            }
+        }
+    }
+    declaring
+}
+
 fn trait_method_candidates(program: &Program, trait_id: Id, member: &str) -> Vec<Id> {
     let mut candidates = Vec::new();
     if let Some(trait_) = program.traits.get(&trait_id)
