@@ -480,6 +480,13 @@ std/traits.md h2 stddefault
 std/traits.md h2 stdoperators-the-operator-traits
 std/traits.md h2 stdoperators-try-and-lift
 std/traits.md h2 stdoperators-callable
+std/transient.md h1 stdtransient-reference
+std/transient.md h2 at-a-glance
+std/transient.md h2 transientstate
+std/transient.md h2 transientsource
+std/transient.md h2 transient-a-flow-of-tasks
+std/transient.md h2 tasksource-one-task
+std/transient.md h2 a-remote-mirror
 tour/async.md h1 async
 tour/async.md h2 opting-out-of-waiting-async-and-await
 tour/async.md h2 async-closures
