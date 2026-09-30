@@ -1692,6 +1692,50 @@ const B423_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B462: a tuple variant where a closure is expected is its constructor on
+/// both backends — `Some` into `map`, a user variant with two payloads into a
+/// two-parameter closure, the generics taken from the expected type.
+#[test]
+fn a_variant_standing_for_a_closure_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b462.vl"), B462_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b462.vl"),
+        Verdict::Identical,
+        "a variant coerced to a closure must build the same value on both backends"
+    );
+}
+
+const B462_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Shape {\n",
+    "\tRect(i32, i32),\n",
+    "\tDot,\n",
+    "}\n",
+    "\n",
+    "fun build(make: |i32, i32| Shape): Shape {\n",
+    "\tmake(2, 3)\n",
+    "}\n",
+    "\n",
+    "fun area(shape: Shape): i32 {\n",
+    "\tmatch shape {\n",
+    "\t\tShape::Rect(let w, let h) => w * h,\n",
+    "\t\tShape::Dot => 0,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs = [1, 2].map(Some);\n",
+    "\tprint(xs.len());\n",
+    "\tprint(xs[1].unwrap());\n",
+    "\tlet f: |i32| Option<i32> = Some;\n",
+    "\tprint(f(3).unwrap());\n",
+    "\tprint(area(build(Shape::Rect)));\n",
+    "}\n",
+);
+
 /// B458: `Context::clear` lowers to a plain call of its body with the value
 /// absent — a `get_safe` inside answers `None`, a closure minted inside keeps
 /// the cleared state, a `run` inside re-establishes — the same on both

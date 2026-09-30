@@ -617,3 +617,4 @@ NEW	-	the trait default `{name}` is not move-clean when a resource inherits it: 
 NEW	-	`{rendered}` is a resource, so it can become a `{object_label}` only when `{trait_name}` is declared `[resource]`: mark the trait `[resource]` — its trait objects may hold a resource, and are moved, never copied
 NEW	-	`clear` must be called on a named context with a closure literal body
 NEW	-	'{type_label}' does not match the annotation on '{name}', '{annotation_label}': each trait written inside the annotation must be met by ONE type that implements it (values of different types need a trait object there, `dyn …`)
+NEW	-	`{name}` carries a payload, so it is not a value on its own: call it (`{name}({list})`), or pass it where a closure is expected, where it stands for `|{list}| {name}({list})`

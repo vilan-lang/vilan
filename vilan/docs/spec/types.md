@@ -1158,6 +1158,15 @@ let n = f("abc");                      // 3 — arity and argument types
 An ineligible `fun` has no value form at all, so it can be neither
 stored nor called this way; the error names which rule it hit.
 
+A **tuple variant** named without a call coerces the same way, where a
+closure type is expected: `Some` against `|i32| Option<i32>` is `|x|
+Some(x)`, one parameter per payload, the enum's generics taken from the
+expected type (`[1, 2].map(Some)`, `build(Shape::Rect)` for a `|i32, i32|
+Shape` parameter). Only where a closure is expected — `let f = Some;` has
+no type to take the generics from, and a payload variant named as a value
+anywhere else is refused (call it, `Some(x)`). A unit variant (`None`) is
+already a value and never coerces.
+
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
 

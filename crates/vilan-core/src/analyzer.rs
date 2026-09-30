@@ -3345,6 +3345,10 @@ pub struct Analyzer<'src> {
     /// `(site, the value's type, the object type)`, for the post-build
     /// question of whether it may be.
     resource_erasures: Vec<(Id, TypeId, TypeId)>,
+    /// B462: every reference to a tuple variant that stands for a closure,
+    /// as `(enum, variant, arity, the closure type)` — the emitter
+    /// eta-expands it there.
+    variant_coercions: HashMap<Id, (Id, usize, usize, TypeId)>,
     /// B461: the type slots written NESTED inside a parameter's, a field's or
     /// a binding's annotation (a generic argument, a tuple element, an array
     /// element), with the position they stand in.
@@ -6146,6 +6150,7 @@ impl<'src> Analyzer<'src> {
             trait_self_markers: HashMap::default(),
             partial_move_roots: HashMap::default(),
             resource_erasures: Vec::new(),
+            variant_coercions: HashMap::default(),
             nested_annotation_owners: HashMap::default(),
             existential_annotation_holes: HashSet::default(),
             binding_existential_constraints: Vec::new(),
@@ -37518,8 +37523,182 @@ impl<'src> Analyzer<'src> {
             waiting_on.push(expr_id);
         }
         self.note_callable_coercion(expr_id, constraint, &inferred);
+        self.note_variant_coercion(expr_id, &inferred);
         self.note_dyn_coercion(expr_id, constraint, &inferred, substitution_context);
         inferred
+    }
+
+    /// B462: an expression naming a tuple variant that inferred as a CLOSURE
+    /// is the coercion site — the emitter builds the eta-expansion there. Only
+    /// the reference (`Local`) is recorded; the variant entity itself is
+    /// shared by every mention.
+    fn note_variant_coercion(&mut self, expr_id: Id, inferred: &Type) {
+        let Type::Closure(parameters, _, _) = inferred else {
+            return;
+        };
+        let Some(Expr::Local(target)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return;
+        };
+        let Some(&Expr::EnumVariant(enum_id, variant_index)) = self.expr_id_to_expr_map.get(target)
+        else {
+            return;
+        };
+        let arity = parameters.len();
+        let closure_type = inferred.clone().get_type_id(self);
+        self.variant_coercions
+            .insert(expr_id, (enum_id, variant_index, arity, closure_type));
+    }
+
+    /// B462: the closure type a tuple variant stands for at an expected
+    /// closure type — one parameter per payload, the enum's generics bound
+    /// from the expected parameters and return. `None` when the arity differs
+    /// (the ordinary mismatch then speaks).
+    fn variant_as_closure(
+        &mut self,
+        enum_id: Id,
+        variant_index: usize,
+        expected_parameters: &[TypeId],
+        expected_return: TypeId,
+        substitution_context: &SubstitutionContext,
+    ) -> Option<Type> {
+        let (payload, generics) = {
+            let enum_ = self.enums.get(&enum_id)?;
+            (
+                enum_.variants.get(variant_index)?.data_type_ids.clone(),
+                enum_.generic_parameter_constraint_ids.clone(),
+            )
+        };
+        if payload.len() != expected_parameters.len() {
+            return None;
+        }
+        let mut bound: SubstitutionContext = HashMap::default();
+        for (declared, expected) in payload.iter().zip(expected_parameters) {
+            let declared = declared.get_type(self);
+            let expected = self.substitute_type(&expected.get_type(self), substitution_context);
+            if let Some((_, bindings)) =
+                self.reconcile_type(&declared, &expected, &HashMap::default())
+            {
+                for (generic, value) in bindings {
+                    if generics.contains(&generic) {
+                        bound.entry(generic).or_insert(value);
+                    }
+                }
+            }
+        }
+        let expected_return =
+            self.substitute_type(&expected_return.get_type(self), substitution_context);
+        if let Type::Enum(returned_enum, arguments) = &expected_return
+            && *returned_enum == enum_id
+            && arguments.len() == generics.len()
+        {
+            for (generic, argument) in generics.iter().zip(arguments) {
+                if !matches!(
+                    self.borrow_type_by_type_id(*argument),
+                    Type::Unknown | Type::Generic(_)
+                ) {
+                    bound.entry(*generic).or_insert(*argument);
+                }
+            }
+        }
+        let arguments: Vec<TypeId> = generics
+            .iter()
+            .map(|generic| {
+                bound
+                    .get(generic)
+                    .copied()
+                    .unwrap_or_else(|| Type::Unknown.get_type_id(self))
+            })
+            .collect();
+        let parameters: Vec<TypeId> = payload
+            .iter()
+            .map(|declared| {
+                let declared = declared.get_type(self);
+                self.substitute_type(&declared, &bound).get_type_id(self)
+            })
+            .collect();
+        let returned = Type::Enum(enum_id, arguments).get_type_id(self);
+        Some(Type::Closure(parameters, returned, Vec::new()))
+    }
+
+    /// B462's other half: a TUPLE variant named as a value where no closure is
+    /// expected (`let f = Some;`, `let o: Option<i32> = Some;`) has no payload
+    /// to build — it compiled to the bare tag, a value no pattern can read
+    /// back. Refused where it is written, with both spellings that mean
+    /// something.
+    fn refuse_bare_payload_variants(&mut self) {
+        let call_subjects: HashSet<Id> = self
+            .function_calls
+            .values()
+            .map(|call| call.subject_id)
+            .chain(
+                self.arity_invalid_calls
+                    .iter()
+                    .map(|(_, subject_id)| *subject_id),
+            )
+            .chain(
+                self.written_call_arguments
+                    .iter()
+                    .map(|(_, subject_id, _)| *subject_id),
+            )
+            .collect();
+        let mut sites: Vec<(Id, Id)> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(expr_id, expr)| match expr {
+                Expr::Local(target) => Some((*expr_id, *target)),
+                _ => None,
+            })
+            .filter(|(expr_id, target)| {
+                !call_subjects.contains(expr_id)
+                    && !self.variant_coercions.contains_key(expr_id)
+                    && matches!(
+                        self.expr_id_to_expr_map.get(target),
+                        Some(Expr::EnumVariant(enum_id, index))
+                            if self.enums.get(enum_id).and_then(|enum_| enum_.variants.get(*index))
+                                .is_some_and(|variant| !variant.data_type_ids.is_empty())
+                    )
+            })
+            .collect();
+        sites.sort_by_key(|(expr_id, _)| expr_id.0);
+        for (expr_id, target) in sites {
+            if self.frozen_entity(expr_id) {
+                continue;
+            }
+            let Some(&Expr::EnumVariant(enum_id, index)) = self.expr_id_to_expr_map.get(&target)
+            else {
+                continue;
+            };
+            let Some(variant) = self
+                .enums
+                .get(&enum_id)
+                .and_then(|enum_| enum_.variants.get(index))
+            else {
+                continue;
+            };
+            let name = variant.name;
+            let placeholders: Vec<String> = (0..variant.data_type_ids.len())
+                .map(|position| {
+                    ["x", "y", "z", "w"]
+                        .get(position)
+                        .map_or_else(|| format!("p{position}"), |name| name.to_string())
+                })
+                .collect();
+            let list = placeholders.join(", ");
+            let span = **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{name}` carries a payload, so it is not a value on its own: call it \
+                         (`{name}({list})`), or pass it where a closure is expected, where it \
+                         stands for `|{list}| {name}({list})`"
+                    ),
+                },
+                expr_id,
+            );
+        }
     }
 
     /// A124 R3: record an expression at which a concrete value is erased into a
@@ -38682,6 +38861,24 @@ impl<'src> Analyzer<'src> {
                     .get(&enum_id)
                     .map(|enum_| enum_.generic_parameter_constraint_ids.len())
                     .unwrap_or(0);
+                // B462: a TUPLE variant named without a call, where a closure
+                // is expected, IS that closure — `|A, B| E<..>`, its generics
+                // taken from the expected type (`Some` against `|i32| U` is
+                // `|i32| Option<i32>`). Anywhere else a payload variant as a
+                // value is refused after the build (`refuse_bare_payload_variants`).
+                if !payload_less
+                    && let Type::Closure(expected_parameters, expected_return, _) =
+                        constraint.as_ref()
+                    && let Some(coerced) = self.variant_as_closure(
+                        enum_id,
+                        *variant_index,
+                        expected_parameters,
+                        *expected_return,
+                        substitution_context,
+                    )
+                {
+                    return coerced;
+                }
                 match (payload_less && parameters > 0, constraint.as_ref()) {
                     (false, _) => Type::Enum(enum_id, Vec::new()),
                     (true, Type::Enum(wanted_id, wanted_arguments))
@@ -56291,6 +56488,8 @@ impl<'src> Analyzer<'src> {
         // B470: the coercion sites' resource erasures, now that every `Drop`
         // impl is on record.
         self.refuse_resource_erasures();
+        // B462: a tuple variant named as a value nowhere a closure is expected.
+        self.refuse_bare_payload_variants();
         // B431: Q5 (a `dyn` holds no resource) at every INSTANTIATION of an
         // erased parameter, which the coercion site cannot see.
         self.refuse_resource_parameter_erasures();
@@ -58529,6 +58728,9 @@ pub struct Program<'src> {
     /// in the program — the vtable's slot set (§6.2's reachability).
     pub dyn_dispatched_members: HashSet<(Id, &'src str)>,
     pub callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// B462: references to a tuple variant standing for a closure, as
+    /// `(enum, variant, arity, the closure type)` — eta-expanded at the site.
+    pub variant_coercions: HashMap<Id, (Id, usize, usize, TypeId)>,
     /// A124 R3: the recorded `dyn` coercion sites — expression id to the type
     /// being erased. The emitter builds one `(value, vtable)` pair per entry.
     pub dyn_coercions: HashMap<Id, (TypeId, Id, Vec<TypeId>)>,
@@ -67998,6 +68200,7 @@ fn analyze_over_world<'src>(
         tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
+        variant_coercions: std::mem::take(&mut analyzer.variant_coercions),
         dyn_coercions: std::mem::take(&mut analyzer.dyn_coercions),
         dyn_tuple_coercions: std::mem::take(&mut analyzer.dyn_tuple_coercions),
         dyn_method_calls: std::mem::take(&mut analyzer.dyn_method_calls),

@@ -4724,6 +4724,25 @@ impl<'src> Transformer<'src> {
     }
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
+        // B462: a tuple variant standing for a closure is its eta-expansion,
+        // `(a, b) => variant(a, b)`, built at the site.
+        if let Some(&(enum_id, variant_index, arity, _)) = self.program.variant_coercions.get(&id) {
+            let names: Vec<String> = (0..arity).map(|_| self.ng.next_name()).collect();
+            let data = names
+                .iter()
+                .map(|name| js::Node::Local(name.clone()))
+                .collect();
+            let value = self.variant_value(enum_id, variant_index, data);
+            return Some(js::Node::Closure(js::Closure {
+                parameters: names
+                    .into_iter()
+                    .map(|name| js::Parameter { name })
+                    .collect(),
+                body: vec![js::Node::Return(Box::new(value))],
+                is_async: false,
+                origin: None,
+            }));
+        }
         let node = self.walk_entity_seams(id, block)?;
         // B340 Q1: a `Callable` value in a closure-typed position. A struct is
         // a plain JS array — it cannot be applied — so the coercion IS the

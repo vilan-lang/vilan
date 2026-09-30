@@ -446,3 +446,105 @@ fn a_callable_call_folds_in_a_const_expression() {
         "const folded = 1;",
     );
 }
+
+// --- B462: a tuple variant where a closure is expected --------------------------
+//
+// `Some` named without a call, at a position whose expected type is a closure,
+// IS that closure — `|A, B| E<..>`, its generics taken from the expected type.
+// Only a tuple variant, and only where a closure is expected (B348's rule
+// shape); a payload variant named as a value anywhere else is refused (it
+// compiled to the bare tag).
+
+#[test]
+fn b462_a_variant_passed_to_map_is_its_constructor() {
+    assert_compiles_and_runs(
+        r#"
+        fun main() {
+            let xs = [1, 2].map(Some);
+            print(xs.len());
+            print(xs[1].unwrap());
+        }
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn b462_the_generics_come_from_the_expected_closure_type() {
+    assert_compiles_and_runs(
+        r#"
+        fun main() {
+            let f: |i32| Option<i32> = Some;
+            print(f(3).unwrap());
+            let g: |str| Result<str, i32> = Ok;
+            print(g("ok").unwrap());
+        }
+        "#,
+        "3\nok\n",
+    );
+}
+
+#[test]
+fn b462_a_user_variant_with_two_payloads_coerces_to_a_two_parameter_closure() {
+    assert_compiles_and_runs(
+        r#"
+        enum Shape {
+            Rect(i32, i32),
+            Dot,
+        }
+        fun build(make: |i32, i32| Shape): Shape {
+            make(2, 3)
+        }
+        fun area(shape: Shape): i32 {
+            match shape {
+                Shape::Rect(let w, let h) => w * h,
+                Shape::Dot => 0,
+            }
+        }
+        fun main() {
+            print(area(build(Shape::Rect)));
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn b462_a_source_derivation_takes_the_variant() {
+    // The sketch's `count.derive(Some)`, spelled with today's `map`.
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::SignalCell;
+        fun main() {
+            let count = SignalCell::new(4);
+            let wrapped = count.map(Some).cell();
+            print(wrapped.get().unwrap());
+            count.set(5);
+            print(wrapped.get().unwrap());
+        }
+        "#,
+        "4\n5\n",
+    );
+}
+
+#[test]
+fn b462_a_payload_variant_where_no_closure_is_expected_is_refused() {
+    let refusal = "`Some` carries a payload, so it is not a value on its own: call it (`Some(x)`), \
+                   or pass it where a closure is expected, where it stands for `|x| Some(x)`";
+    assert_fails_with("fun main() {\n    let f = Some;\n}\n", refusal);
+    assert_fails_with(
+        "fun main() {\n    let o: Option<i32> = Some;\n    print(o.is_some());\n}\n",
+        refusal,
+    );
+}
+
+#[test]
+fn b462_a_unit_variant_does_not_coerce() {
+    assert_fails(
+        r#"
+        fun main() {
+            let xs = [1, 2].map(None);
+        }
+        "#,
+    );
+}
