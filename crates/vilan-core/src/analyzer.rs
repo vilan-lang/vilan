@@ -1372,6 +1372,19 @@ impl ResourceMoveViolation {
     }
 }
 
+/// B461: where a bare trait NESTED in an annotation stands — the reading
+/// each position gives it (a mint for a parameter, an existential for a
+/// `let`). A field is not one: A124 R3 made a trait at a field the object.
+#[derive(Clone, Copy, Debug)]
+enum NestedAnnotationOwner {
+    /// Inside a parameter's annotation: an implicit generic of the function
+    /// (B186's reading, one per mention).
+    Parameter(Id, Id),
+    /// Inside a `let` binding's annotation: an existential the initializer
+    /// grounds (B161's constraint reading, one level down).
+    Binding,
+}
+
 /// Why B470 refuses a resource erasure.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResourceErasureRefusal {
@@ -3332,6 +3345,20 @@ pub struct Analyzer<'src> {
     /// `(site, the value's type, the object type)`, for the post-build
     /// question of whether it may be.
     resource_erasures: Vec<(Id, TypeId, TypeId)>,
+    /// B461: the type slots written NESTED inside a parameter's, a field's or
+    /// a binding's annotation (a generic argument, a tuple element, an array
+    /// element), with the position they stand in.
+    nested_annotation_owners: HashMap<TypeId, NestedAnnotationOwner>,
+    /// B461: the existential holes a nested bare trait in a `let` annotation
+    /// resolves to — `Type::Generic` over the bound, owned by no declaration.
+    existential_annotation_holes: HashSet<TypeId>,
+    /// B461: a binding whose (non-trait) annotation holds an existential, as
+    /// `(binding, the annotation, its span)`: the annotation is a constraint
+    /// on the type the initializer grounds, checked after the build.
+    binding_existential_constraints: Vec<(Id, TypeId, Span)>,
+    /// B461: the initializer of each such binding, with the annotation — for
+    /// the mixed-literal steer, which the literal cannot otherwise see.
+    existential_initializers: HashMap<Id, TypeId>,
     /// Drop planning (destruction.md §5/§7): resource-typed local bindings still
     /// owned at their declaring scope's fall-through end — dropped there in
     /// reverse declaration order. Ownership at a program point is single-valued
@@ -6119,6 +6146,10 @@ impl<'src> Analyzer<'src> {
             trait_self_markers: HashMap::default(),
             partial_move_roots: HashMap::default(),
             resource_erasures: Vec::new(),
+            nested_annotation_owners: HashMap::default(),
+            existential_annotation_holes: HashSet::default(),
+            binding_existential_constraints: Vec::new(),
+            existential_initializers: HashMap::default(),
             dropped_bindings: HashSet::default(),
             drop_extents: HashMap::default(),
             declared_binding_extents: HashMap::default(),
@@ -7689,6 +7720,48 @@ impl<'src> Analyzer<'src> {
     /// arms that will not unify have already failed with the ordinary mismatch,
     /// and the skip below keeps this check from filing a second, misleading
     /// report on top of it.
+    /// B461: a binding annotated with a type that holds an existential
+    /// (`let x: Option<Source<i32>> = ..`) — the initializer grounded the
+    /// binding's type; the annotation must admit it, each hole met by a type
+    /// that implements the hole's trait.
+    fn check_binding_existential_constraints(&mut self) {
+        for (variable_id, annotation, span) in
+            std::mem::take(&mut self.binding_existential_constraints)
+        {
+            let Some(variable) = self.variables.get(&variable_id) else {
+                continue;
+            };
+            let name = variable.name;
+            let value_type = variable.type_id.get_type(self);
+            if matches!(
+                value_type,
+                Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
+            ) {
+                continue;
+            }
+            if self.annotation_admits(annotation, &value_type, 0) {
+                continue;
+            }
+            let type_label = self.pretty_print_type(&value_type, &HashMap::default());
+            let annotation_label =
+                self.pretty_print_type(&annotation.get_type(self), &HashMap::default());
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "'{type_label}' does not match the annotation on '{name}', \
+                         '{annotation_label}': each trait written inside the annotation must be \
+                         met by ONE type that implements it (values of different types need a \
+                         trait object there, `dyn …`)"
+                    ),
+                },
+                variable_id,
+            );
+        }
+    }
+
     fn check_binding_trait_constraints(&mut self) {
         for constraint in std::mem::take(&mut self.binding_trait_constraints) {
             let Some(variable) = self.variables.get(&constraint.variable_id) else {
@@ -7704,12 +7777,25 @@ impl<'src> Analyzer<'src> {
             ) {
                 continue;
             }
-            if self.satisfies_trait_bound(
-                &value_type,
-                constraint.trait_id,
-                &constraint.arguments,
-                0,
-            ) {
+            let satisfied = if constraint
+                .arguments
+                .iter()
+                .any(|argument| self.type_id_holds_existential(*argument))
+            {
+                self.value_satisfies_with_holes(
+                    &value_type,
+                    constraint.trait_id,
+                    &constraint.arguments,
+                )
+            } else {
+                self.satisfies_trait_bound(
+                    &value_type,
+                    constraint.trait_id,
+                    &constraint.arguments,
+                    0,
+                )
+            };
+            if satisfied {
                 continue;
             }
             let Some(trait_label) =
@@ -30204,6 +30290,272 @@ impl<'src> Analyzer<'src> {
         constraint_id
     }
 
+    /// B461's mixed-literal steer: the list literal `literal` lands where its
+    /// element position was written as a bare trait — a parameter's implicit
+    /// generic or a `let` annotation's existential —
+    /// so its elements must all be ONE type, and values of two types need the
+    /// trait object there.
+    fn bare_trait_element_steer(
+        &self,
+        literal: Id,
+        expected_element: Option<&Type>,
+    ) -> Option<String> {
+        let constraint = match expected_element {
+            Some(Type::Generic(constraint)) => *constraint,
+            _ => {
+                let annotation = self.existential_initializers.get(&literal)?;
+                match self.type_id_to_type_map.get(annotation)? {
+                    Type::Struct(_, arguments) => {
+                        match self.type_id_to_type_map.get(arguments.first()?)? {
+                            Type::Generic(constraint) => *constraint,
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        if !self.existential_annotation_holes.contains(&constraint)
+            && !self.implicit_generic_scopes.contains_key(&constraint)
+        {
+            return None;
+        }
+        let Some(Type::Trait(trait_id, arguments)) = self.type_id_to_type_map.get(&constraint)
+        else {
+            return None;
+        };
+        let name = self.traits.get(trait_id)?.name;
+        let bound = self.trait_label_with_arguments(name, arguments);
+        Some(format!(
+            " The elements' type was written `{bound}`, a trait: written inside a type it stands \
+             for ONE type that implements it, so every element must be that type; for elements \
+             of different types write `dyn {bound}` there"
+        ))
+    }
+
+    /// B461: the drained arm turns a binding annotation that holds an
+    /// existential into a constraint (the binding grounds from its
+    /// initializer). A tuple or an array annotation is written at the walk and
+    /// never drained, so the same reading is given here, once the drain has
+    /// resolved the elements.
+    fn ground_existential_structural_annotations(&mut self) {
+        if self.existential_annotation_holes.is_empty() {
+            return;
+        }
+        let mut annotations: Vec<(TypeId, Id)> = self
+            .binding_annotation_type_ids
+            .iter()
+            .map(|(type_id, variable_id)| (*type_id, *variable_id))
+            .filter(|(type_id, _)| {
+                matches!(
+                    self.type_id_to_type_map.get(type_id),
+                    Some(Type::Tuple(_) | Type::Array(..))
+                )
+            })
+            .collect();
+        annotations.sort_by_key(|(type_id, _)| type_id.0);
+        for (type_id, variable_id) in annotations {
+            let annotation_type = type_id.get_type(self);
+            if !self.type_holds_existential(&annotation_type) {
+                continue;
+            }
+            let annotation = annotation_type.clone().get_type_id(self);
+            let span = self
+                .variables
+                .get(&variable_id)
+                .map(|variable| variable.name_span)
+                .unwrap_or(EMPTY_SPAN);
+            self.binding_existential_constraints
+                .push((variable_id, annotation, span));
+            if let Some(initial) = self
+                .variables
+                .get(&variable_id)
+                .and_then(|variable| variable.initial)
+            {
+                self.existential_initializers.insert(initial, annotation);
+            }
+            self.write_type_slot(type_id, Type::Unknown);
+        }
+    }
+
+    /// B461: an EXISTENTIAL hole for a bare trait nested in a `let`
+    /// annotation — a `Generic` over the bound that no declaration owns. It
+    /// never becomes a value's type: the binding grounds from its
+    /// initializer, and the hole is only asked "does the grounded type fit".
+    fn mint_existential_hole(&mut self, trait_id: Id, arguments: Vec<TypeId>) -> TypeId {
+        let constraint_id = self.type_id_for_type(Type::Trait(trait_id, arguments));
+        if let Some(trait_) = self.traits.get(&trait_id) {
+            self.generic_constraint_names
+                .insert(constraint_id, trait_.name);
+        }
+        self.existential_annotation_holes.insert(constraint_id);
+        constraint_id
+    }
+
+    /// B461: record every slot NESTED in the annotation whose top slot is
+    /// `top` — generic arguments (through the unqualified-name queue, which is
+    /// where they wait for the drain), tuple and array elements — as standing
+    /// in `owner`'s position. A closure type's parts are not nested positions:
+    /// a trait there keeps the value-position refusal.
+    fn register_nested_annotation(&mut self, top: TypeId, owner: NestedAnnotationOwner) {
+        let mut stack: Vec<TypeId> = self.annotation_child_type_ids(top);
+        let mut seen: HashSet<TypeId> = HashSet::default();
+        while let Some(child) = stack.pop() {
+            if !seen.insert(child) {
+                continue;
+            }
+            self.nested_annotation_owners.insert(child, owner);
+            stack.extend(self.annotation_child_type_ids(child));
+        }
+    }
+
+    /// The slots an annotation's slot `type_id` was written with.
+    fn annotation_child_type_ids(&self, type_id: TypeId) -> Vec<TypeId> {
+        if let Some((.., arguments, _)) = self
+            .prepped_type_locals
+            .iter()
+            .rev()
+            .find(|(slot, ..)| *slot == type_id)
+        {
+            return arguments.clone();
+        }
+        match self.type_id_to_type_map.get(&type_id) {
+            Some(Type::Tuple(elements)) => elements.clone(),
+            Some(Type::Array(element, _)) => vec![*element],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether a type mentions a B461 existential hole anywhere.
+    fn type_holds_existential(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Generic(constraint) => self.existential_annotation_holes.contains(constraint),
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                arguments
+                    .iter()
+                    .any(|argument| self.type_id_holds_existential(*argument))
+            }
+            Type::Tuple(elements) => elements
+                .iter()
+                .any(|element| self.type_id_holds_existential(*element)),
+            Type::Array(element, _) => self.type_id_holds_existential(*element),
+            _ => false,
+        }
+    }
+
+    fn type_id_holds_existential(&self, type_id: TypeId) -> bool {
+        self.type_id_to_type_map
+            .get(&type_id)
+            .is_some_and(|type_| self.type_holds_existential(type_))
+    }
+
+    /// B461: whether an annotation with existential holes admits a grounded
+    /// value type — structurally, each hole met by a type implementing the
+    /// hole's trait (at its arguments, holes and all).
+    fn annotation_admits(&mut self, annotation: TypeId, value: &Type, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let annotation_type = annotation.get_type(self);
+        match (&annotation_type, value) {
+            (Type::Generic(constraint), _)
+                if self.existential_annotation_holes.contains(constraint) =>
+            {
+                match constraint.get_type(self) {
+                    Type::Trait(trait_id, arguments) => {
+                        self.value_satisfies_with_holes(value, trait_id, &arguments)
+                    }
+                    _ => true,
+                }
+            }
+            (Type::Struct(left, left_arguments), Type::Struct(right, right_arguments))
+            | (Type::Enum(left, left_arguments), Type::Enum(right, right_arguments))
+                if left == right && left_arguments.len() == right_arguments.len() =>
+            {
+                let pairs: Vec<(TypeId, TypeId)> = left_arguments
+                    .iter()
+                    .copied()
+                    .zip(right_arguments.iter().copied())
+                    .collect();
+                pairs.into_iter().all(|(wanted, got)| {
+                    let got = got.get_type(self);
+                    self.annotation_admits(wanted, &got, depth + 1)
+                })
+            }
+            (Type::Tuple(wanted), Type::Tuple(got)) if wanted.len() == got.len() => {
+                let pairs: Vec<(TypeId, TypeId)> =
+                    wanted.iter().copied().zip(got.iter().copied()).collect();
+                pairs.into_iter().all(|(wanted, got)| {
+                    let got = got.get_type(self);
+                    self.annotation_admits(wanted, &got, depth + 1)
+                })
+            }
+            (Type::Array(wanted, wanted_length), Type::Array(got, got_length))
+                if wanted_length == got_length =>
+            {
+                let got = got.get_type(self);
+                self.annotation_admits(*wanted, &got, depth + 1)
+            }
+            _ if self.type_holds_existential(&annotation_type) => false,
+            _ => self.compare_type(value, &annotation_type, &HashMap::default()),
+        }
+    }
+
+    /// B461: `value` implements `trait_id` at `arguments`, where the arguments
+    /// may hold existential holes: the trait is implemented, and some impl
+    /// providing it provides arguments the holes admit.
+    fn value_satisfies_with_holes(
+        &mut self,
+        value: &Type,
+        trait_id: Id,
+        arguments: &[TypeId],
+    ) -> bool {
+        if !arguments
+            .iter()
+            .any(|argument| self.type_id_holds_existential(*argument))
+        {
+            return self.satisfies_trait_bound(value, trait_id, arguments, 0);
+        }
+        if !self.type_implements_trait(value, trait_id) {
+            return false;
+        }
+        let providers: Vec<(TypeId, Vec<TypeId>)> = self
+            .implementations
+            .iter()
+            .filter_map(|implementation| {
+                let (_, provided) = implementation
+                    .provided_trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)?;
+                self.impl_subject_admits(
+                    value,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+                .then(|| (implementation.subject, provided.clone()))
+            })
+            .collect();
+        for (provider_subject, written) in providers {
+            let provided =
+                self.instantiated_home_arguments(value, trait_id, &written, provider_subject);
+            if provided.len() != arguments.len() {
+                continue;
+            }
+            let pairs: Vec<(TypeId, TypeId)> = arguments
+                .iter()
+                .copied()
+                .zip(provided.iter().copied())
+                .collect();
+            if pairs.into_iter().all(|(wanted, got)| {
+                let got = got.get_type(self);
+                self.annotation_admits(wanted, &got, 1)
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// B261: the FACE an implicit binder wears in an operator or dispatch
     /// head — `impl Add` for the parameter written `a: Add`,
     /// `impl Signal<List<i32>>` when the bound carries arguments. Every other
@@ -33390,6 +33742,7 @@ impl<'src> Analyzer<'src> {
                         // because the name has not resolved yet — whether the
                         // annotation names a trait is the drain's to discover.
                         self.binding_annotation_type_ids.insert(type_id, id);
+                        self.register_nested_annotation(type_id, NestedAnnotationOwner::Binding);
                         type_id
                     }
                     None => Type::Unknown.get_type_id(self),
@@ -33618,6 +33971,12 @@ impl<'src> Analyzer<'src> {
                             // parameter are the drain's.
                             self.field_annotation_type_ids
                                 .insert(type_id, (id, body_scope_id));
+                            // B461 deliberately registers no NESTED field
+                            // positions: A124 R3 withdrew the top-level field
+                            // reading (a trait at a field is the object, `dyn
+                            // A`), and a nested field mention keeps the same
+                            // refusal and steer rather than reviving B184's
+                            // hidden parameter one level down.
                             type_id
                         }
                         None => Type::Unknown.get_type_id(self),
@@ -34452,6 +34811,10 @@ impl<'src> Analyzer<'src> {
                 if let Some(owner_id) = implicit_generic_owner {
                     self.parameter_annotation_type_ids
                         .insert(type_id, (owner_id, type_scope_id));
+                    self.register_nested_annotation(
+                        type_id,
+                        NestedAnnotationOwner::Parameter(owner_id, type_scope_id),
+                    );
                 }
                 type_id
             }
@@ -38108,10 +38471,17 @@ impl<'src> Analyzer<'src> {
                                 let expected =
                                     self.pretty_print_type(&element_type, &HashMap::default());
                                 let got = self.pretty_print_type(&item_type, &HashMap::default());
+                                // B461: where the literal lands in a position a
+                                // bare trait was written at (`List<Source<i32>>`),
+                                // the trait stands for ONE type — the steer is
+                                // the object.
+                                let steer = self
+                                    .bare_trait_element_steer(expr_id, expected_element.as_ref())
+                                    .unwrap_or_default();
                                 self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                     span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
-                                        "Expected {expected} (this literal's element type), but got {got} instead."
+                                        "Expected {expected} (this literal's element type), but got {got} instead.{steer}"
                                     ),
                                 });
                             }
@@ -52270,6 +52640,26 @@ impl<'src> Analyzer<'src> {
                                 owner_id,
                                 owner_scope_id,
                             ));
+                        } else if let Some(owner) =
+                            self.nested_annotation_owners.get(&type_id).copied()
+                        {
+                            // B461: a bare trait NESTED in an annotation reads
+                            // as its position reads a top-level one — ONE type
+                            // per mention, so every element of a
+                            // `List<Source<i32>>` is the same source type (a
+                            // mixed list is `List<dyn Source<i32>>`).
+                            implicit_generic_id = Some(match owner {
+                                NestedAnnotationOwner::Parameter(owner_id, owner_scope_id) => self
+                                    .mint_implicit_generic(
+                                        *trait_id,
+                                        arguments.clone(),
+                                        owner_id,
+                                        owner_scope_id,
+                                    ),
+                                NestedAnnotationOwner::Binding => {
+                                    self.mint_existential_hole(*trait_id, arguments.clone())
+                                }
+                            });
                         } else {
                             // B184: whether a FIELD is one of the positions
                             // this steer may name depends on the declaration —
@@ -52337,6 +52727,36 @@ impl<'src> Analyzer<'src> {
                     // to the mint above. Both are the same desugaring one level
                     // apart, and both are written here so the one arm that owns
                     // an annotation's slot keeps owning it.
+                    // B461: a binding whose annotation holds an existential
+                    // (a nested bare trait) cannot BE its type — the hole has
+                    // no concrete type of its own — so, as B161's bare trait
+                    // does, it grounds from its initializer and the annotation
+                    // is checked against what it grounded to, after the build.
+                    let existential_binding = bare_trait_id.is_none()
+                        && hidden_field_type.is_none()
+                        && hidden_mention_type.is_none()
+                        && !refused_arity
+                        && self
+                            .binding_annotation_type_ids
+                            .get(&type_id)
+                            .copied()
+                            .filter(|_| self.type_holds_existential(&subject_type))
+                            .inspect(|variable_id| {
+                                let annotation = subject_type.clone().get_type_id(self);
+                                self.binding_existential_constraints.push((
+                                    *variable_id,
+                                    annotation,
+                                    span,
+                                ));
+                                if let Some(initial) = self
+                                    .variables
+                                    .get(variable_id)
+                                    .and_then(|variable| variable.initial)
+                                {
+                                    self.existential_initializers.insert(initial, annotation);
+                                }
+                            })
+                            .is_some();
                     self.write_type_slot(
                         type_id,
                         match (hidden_field_type, hidden_mention_type) {
@@ -52346,6 +52766,7 @@ impl<'src> Analyzer<'src> {
                                 (Some(_), Some(constraint_id)) => Type::Generic(constraint_id),
                                 (Some(_), None) => Type::Unknown,
                                 (None, _) if refused_arity => Type::Unknown,
+                                (None, _) if existential_binding => Type::Unknown,
                                 (None, _) => subject_type,
                             },
                         },
@@ -52544,6 +52965,10 @@ impl<'src> Analyzer<'src> {
         // A124 R3: every `dyn Trait<..>` slot, written once the trait path it
         // wraps has resolved — which is what both drains above have just done.
         self.resolve_dyn_annotations();
+        // B461: a binding annotation whose TOP slot the drain never visits — a
+        // tuple or an array, written at the walk — may hold an existential in
+        // an element; it takes B161's reading the same way the drained ones do.
+        self.ground_existential_structural_annotations();
 
         // Record each `impl … with Trait`'s resolved trait ids (and its `with`
         // reference) BEFORE static access resolves, so the `[trait_only]`
@@ -66341,6 +66766,7 @@ fn analyze_over_world<'src>(
         // B161's binding-position twin of the bound check above, in the same place
         // and for the same reason: every binding's type has settled by here.
         analyzer.check_binding_trait_constraints();
+        analyzer.check_binding_existential_constraints();
         analyzer.check_binding_hidden_nominal_constraints();
         // B251's twin of the bound check above, at the third binding channel:
         // a WRITTEN type application (`let h: Held<i32, SignalCell<List<str>>>`).

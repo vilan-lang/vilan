@@ -415,21 +415,20 @@ fn a_bounded_generic_satisfies_a_trait_annotation() {
 // --- B161: NARROWED, not repealed — every other position still refuses ---
 
 #[test]
-fn a_trait_nested_in_a_binding_annotation_is_still_refused() {
-    // §12.2's silently heterogeneous `List<Trait>`: the constraint reading is
-    // the binding's OWN annotation, not any trait spelled anywhere under it.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun main() {{
-                let pack: List<Greet> = [Dog {{ name = "a" }}];
-                print(pack.length());
-            }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
+fn a_trait_nested_in_a_binding_annotation_is_one_type() {
+    // §12.2's silently heterogeneous `List<Trait>` was why this was refused.
+    // B461 reads the nested trait as ONE type implementing it, grounded by the
+    // initializer — a homogeneous pack compiles; a mixed one is refused with
+    // the steer to the object (`b461_*`).
+    assert_compiles(&format!(
+        r#"{GREET}
+        fun main() {{
+            let pack: List<Greet> = [Dog {{ name = "a" }}];
+            print(pack.len());
+        }}
+        main();
+        "#
+    ));
 }
 
 #[test]
@@ -1168,21 +1167,9 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
     // withdrew the hidden parameter at that position — so a field is a refusal
     // again, steered to `dyn Greet` rather than to the sugar
     // (`b184_a_trait_at_a_struct_field_is_refused_and_steers_to_dyn`). The
-    // parameter leg left with B186 and stays gone. What this pins is the
-    // return, the nested spelling, and the CLOSURE parameter — the position
-    // that has no generic list to append to.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun main() {{
-                let pack: List<Greet> = [Dog {{ name = "a" }}];
-                print(pack.length());
-            }}
-            main();
-            "#
-        ),
-        steer,
-    );
+    // parameter leg left with B186 and stays gone, and the nested `let` leg
+    // left with B461. What this pins is the return and the CLOSURE parameter
+    // — the position that has no generic list to append to.
     assert_fails_with(
         &format!(
             r#"{GREET}
@@ -1198,20 +1185,17 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
 }
 
 #[test]
-fn b186_a_nested_trait_spelling_on_a_parameter_is_still_refused() {
-    // The sugar is the parameter's OWN annotation, not any trait spelled
-    // under it — `List<Greet>` mints an inner type id the sugar never sees,
-    // exactly as B161's nested case does.
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun describe(pack: List<Greet>): i32 {{ pack.length() }}
-            fun main() {{ print(describe([Dog {{ name = "a" }}])); }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
+fn b186_a_nested_trait_spelling_on_a_parameter_mints_its_own_generic() {
+    // B461: the sugar reaches a trait spelled UNDER the parameter's annotation
+    // too — `List<Greet>` reads `<G: Greet> … List<G>`, one generic per
+    // mention.
+    assert_compiles(&format!(
+        r#"{GREET}
+        fun describe(pack: List<Greet>): usize {{ pack.len() }}
+        fun main() {{ print(describe([Dog {{ name = "a" }}])); }}
+        main();
+        "#
+    ));
 }
 
 #[test]
@@ -7795,5 +7779,123 @@ fn b417_a_method_named_self_is_refused_where_it_is_declared() {
         fun main() {}
         "#,
         "cannot access field",
+    );
+}
+
+// --- B461: a bare trait NESTED in an annotation --------------------------------
+//
+// Each nested mention reads as its position reads a top-level one: at a
+// parameter an implicit generic of the function (B186), at a `let` an
+// existential the initializer grounds (B161). ONE type per mention — a mixed
+// list is `List<dyn Trait>`, and the refusal says so. A field keeps A124 R3's
+// refusal (a trait at a field is the object).
+
+#[test]
+fn b461_the_owners_let_with_a_nested_signal_compiles_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        fun main() {
+            let b: Signal<Option<Signal<i32>>> = SignalCell::new(Some(SignalCell::new(4)));
+            print(b.get().unwrap().get());
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn b461_a_let_with_a_concrete_outer_and_a_nested_trait_grounds_from_its_initializer() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let o: Option<Source<i32>> = Some(SignalCell::new(5));
+            print(o.unwrap().get());
+            let pair: (Source<i32>, str) = (SignalCell::new(6), "x");
+            print(pair.0.get());
+        }
+        "#,
+        "5\n6\n",
+    );
+}
+
+#[test]
+fn b461_nested_traits_at_a_parameter_each_mint_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun total(sources: List<Source<i32>>): i32 {
+            mut sum = 0;
+            for source in sources {
+                sum = sum + source.get();
+            }
+            sum
+        }
+        fun first(source: Source<List<Source<i32>>>): i32 {
+            source.get()[0].get()
+        }
+        fun both(left: List<Source<i32>>, right: List<Source<i32>>): i32 {
+            total(left) + total(right)
+        }
+        fun main() {
+            print(total([SignalCell::new(1), SignalCell::new(2)]));
+            print(first(SignalCell::new([SignalCell::new(9)])));
+            print(both([SignalCell::new(1)], [SignalCell::new(2).map(|x| x * 10)]));
+        }
+        "#,
+        "3\n9\n21\n",
+    );
+}
+
+#[test]
+fn b461_a_mixed_literal_at_a_let_steers_to_the_object() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun main() {
+            let mixed: List<Source<i32>> = [SignalCell::new(1), SignalCell::new(2).map(|x| x)];
+            print(mixed.len());
+        }
+        "#,
+        "The elements' type was written `Source<i32>`, a trait: written inside a type it stands \
+         for ONE type that implements it, so every element must be that type; for elements of \
+         different types write `dyn Source<i32>` there",
+    );
+}
+
+#[test]
+fn b461_a_mixed_literal_at_a_parameter_steers_to_the_object() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Source, SignalCell };
+        fun count(sources: List<Source<i32>>): usize { sources.len() }
+        fun main() {
+            print(count([SignalCell::new(1), SignalCell::new(2).map(|x| x)]));
+        }
+        "#,
+        "for elements of different types write `dyn Source<i32>` there",
+    );
+}
+
+#[test]
+fn b461_a_let_whose_value_does_not_meet_the_nested_trait_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::Source;
+        fun main() {
+            let o: Option<Source<i32>> = Some(5);
+        }
+        "#,
+        "'Option<i32>' does not match the annotation on 'o'",
+    );
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        fun main() {
+            let b: Signal<Option<Signal<i32>>> = SignalCell::new(Some(5));
+        }
+        "#,
+        "'SignalCell<Option<i32>>' does not implement trait",
     );
 }

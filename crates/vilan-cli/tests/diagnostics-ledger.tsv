@@ -616,3 +616,4 @@ NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out 
 NEW	-	the trait default `{name}` is not move-clean when a resource inherits it: {summary}, and a trait default cannot destroy a resource `Self` (its teardown is planned once, before any implementing type is known); move it out on every path, or declare `{name}` in this impl
 NEW	-	`{rendered}` is a resource, so it can become a `{object_label}` only when `{trait_name}` is declared `[resource]`: mark the trait `[resource]` — its trait objects may hold a resource, and are moved, never copied
 NEW	-	`clear` must be called on a named context with a closure literal body
+NEW	-	'{type_label}' does not match the annotation on '{name}', '{annotation_label}': each trait written inside the annotation must be met by ONE type that implements it (values of different types need a trait object there, `dyn …`)

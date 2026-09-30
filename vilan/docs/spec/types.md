@@ -541,10 +541,16 @@ therefore reaches `SignalCell`'s own — its fields included — and a
 reassignment must still be a `SignalCell<i32>`.
 
 The reading is universal: any trait name in this position, for every
-trait. It applies to the binding's OWN annotation only — a trait nested
-inside one (`&Display`, `List<Display>`) is a value position like any
-other and is refused, which is what keeps a heterogeneous container
-impossible.
+trait — and it reaches a trait NESTED inside the annotation too (`let b:
+Signal<Option<Signal<i32>>> = …`, `let o: Option<Source<i32>> = …`,
+`List<Display>`, a tuple's element). Each nested mention stands for ONE
+type that implements it, grounded by the initializer: `Signal<Option<
+Signal<i32>>>` reads "some `Signal` of an `Option` of some one
+`Signal<i32>`", and the binding keeps the initializer's concrete type.
+One type per mention is what keeps a heterogeneous container impossible:
+every element of a `List<Source<i32>>` is the same source type, a list
+literal mixing two is refused with the steer to `List<dyn Source<i32>>`,
+and the object is the spelling for values of different types.
 
 An `if` needs no rule of its own. Its arms unify first (§5.11), and the
 constraint meets the one type that unification produced:
@@ -586,12 +592,15 @@ else follows from the desugaring, and nothing about it is new:
   parameters, so the annotation is refused there like any other value
   position.
 
-The reading is the binding's in one respect: it applies to the
-parameter's OWN annotation, never to a trait nested inside one
-(`List<Display>`), which stays refused. A `&` is not such a nesting — it
-is a call convention, erased before the annotation is read — so
-`&Display` is "a view of something implementing `Display`" at a parameter
-and at a binding alike.
+A trait NESTED inside a parameter's annotation is read the same way,
+one implicit generic per mention: `fun total(sources: List<Source<i32>>)`
+is `fun total<S: Source<i32>>(sources: List<S>)`, and `fun first(source:
+Source<List<Source<i32>>>)` has two, the inner bounding the outer's
+argument. Every element of such a list is the same type (`List<dyn
+Source<i32>>` holds different ones). A `&` is not a nesting — it is a
+call convention, erased before the annotation is read — so `&Display` is
+"a view of something implementing `Display`" at a parameter and at a
+binding alike.
 
 ### A trait annotation on a struct field
 
@@ -614,7 +623,9 @@ embeds one. `dyn Trait` is the value the field wants when what varies is
 the implementation; a written parameter is the answer when one instance
 should keep its concrete type. The refusal is the same on an attributed
 (`[derive(..)]`, `[service(..)]`) declaration, where `dyn Trait` is a
-spelling a generator can read.
+spelling a generator can read, and on a trait NESTED in a field's
+annotation (`List<Display>`), which the binding and parameter readings do
+not reach for the same reason.
 
 ### Associated functions
 

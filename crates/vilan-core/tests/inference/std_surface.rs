@@ -4416,15 +4416,27 @@ fn b72_a_bare_trait_generic_argument_is_refused() {
     // §2.3: `List<A>` type-checked, and then narrowed to `List<Bag>` at the
     // first element because the `(Struct|Enum, Trait)` arm returns the concrete
     // side — so a genuinely heterogeneous list built by `push` compiled and ran.
-    // Refused at the argument, by the same rule and at the same arm.
-    assert_fails_with(
+    // B461 (2026-09-29) reads the nested trait as an EXISTENTIAL: ONE type that
+    // implements `A`, grounded by what the list holds — so a homogeneous list
+    // compiles, and the heterogeneous one §2.3 was about is refused at the
+    // second type (the steer names `dyn A`).
+    assert_compiles(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun main() { mut xs: List<A> = []; xs.push(Bag { n = 1 }); }
         "#,
-        "'A' is a trait, not a type",
+    );
+    assert_fails(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Box2 { n: i32 }
+        impl Box2 with A { fun name(self): str { "box" } }
+        fun main() { mut xs: List<A> = []; xs.push(Bag { n = 1 }); xs.push(Box2 { n = 2 }); }
+        "#,
     );
 }
 
