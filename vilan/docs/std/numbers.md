@@ -60,10 +60,9 @@ functions rather than wait for that design. When it lands they become
 that rewrites callers. The rename is scheduled, not a surprise: reach for
 `max_value()`/`min_value()` freely today.
 
-The pair reports the **type's** range, which is deliberately not the range of
-literals the compiler admits: `128i8` compiles, because the signed literal
-check tests the magnitude so that `-128i8` can be written at all, yet
-`i8::max_value()` is `127`. Trust the functions over the looseness.
+The pair reports the **type's** range, and a literal is checked against the
+same range: `127i8` and `-128i8` compile, and `128i8` is refused as out of
+range for `i8` (the minimum's magnitude is admitted only under its `-`).
 
 Floats have no pair, for two reasons that are worth stating rather than
 guessing at. `f64`'s finite bounds cannot be written as vilan literals at all

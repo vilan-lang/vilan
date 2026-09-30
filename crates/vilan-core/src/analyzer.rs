@@ -56451,7 +56451,18 @@ impl<'src> Analyzer<'src> {
                 }
                 continue;
             }
-            if value.map(|value| value <= bound).unwrap_or(false) {
+            // B428 (RULED 2026-09-29, R-i: the looseness is withdrawn): a
+            // signed type's positive literal tops at 2^(n-1) - 1. The BOUND is
+            // the magnitude, which the minimum needs under its `-` (`-128i8`,
+            // now read with its negation since B407); without one, `128i8`
+            // exceeded `i8::max_value()` and compiled. `i53`'s window is the
+            // symmetric ±2^53, so its bound is its maximum too.
+            let limit = if signed && negation.is_none() && name != "i53" {
+                bound - 1
+            } else {
+                bound
+            };
+            if value.map(|value| value <= limit).unwrap_or(false) {
                 continue;
             }
             let range = if matches!(name, "i53" | "u53" | "usize") {

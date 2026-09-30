@@ -962,10 +962,9 @@ export impl f64 {
 // L4's `[deprecated("steer")]` window, which rewrites callers — the rename is
 // scheduled, not a surprise, so reach for these freely today.
 //
-// These are the TYPE's range, which is deliberately NOT the LITERAL admission
-// range: `128i8` compiles, because the signed literal check admits the
-// magnitude so that `-128i8` can be written at all (numeric-types.md §3), yet
-// `i8::max_value()` is 127. The wide pair is the symmetric ±2^53 window
+// These are the TYPE's range, and since B428 they are the LITERAL admission range
+// too: `127i8` and `-128i8` compile, `128i8` is refused (the minimum's magnitude is
+// admitted only under its `-`). The wide pair is the symmetric ±2^53 window
 // (spec/lexical.md), one past `Number.MAX_SAFE_INTEGER`. Floats get no pair —
 // docs/std/numbers.md records why.
 

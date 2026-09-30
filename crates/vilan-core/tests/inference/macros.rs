@@ -1709,8 +1709,8 @@ main();
 
 // --- Sized numeric types (proposal/numeric-types.md) ---
 
-// Every new suffix types its literal; `128i8` is admitted (the minimum is
-// written as unary minus over the literal); unsuffixed literals adopt an
+// Every new suffix types its literal; the largest literal is the type's maximum
+// (`127i8`; B428 withdrew the `128i8` looseness); unsuffixed literals adopt an
 // expected sized type.
 #[test]
 fn sized_numeric_literals_type_and_run() {
@@ -1726,7 +1726,7 @@ fn sized_numeric_literals_type_and_run() {
             let e = 5i53;
             let f = 5u53;
             let g = 2.5f32;
-            let allowed = 128i8;
+            let allowed = 127i8;
             let expected: u8 = 7;
             let fractional: f32 = 1.5;
             print(a + a);
@@ -1742,7 +1742,7 @@ fn sized_numeric_literals_type_and_run() {
 
         main();
         "#,
-        "10\n200\n10\n60000\n10\n2.5\n128\n7\n1.5\n",
+        "10\n200\n10\n60000\n10\n2.5\n127\n7\n1.5\n",
     );
 }
 
@@ -1951,26 +1951,50 @@ fn a_u53_literal_past_the_window_errors() {
     );
 }
 
-// The signed literal check admits the MAGNITUDE `2^(n-1)` so that the minimum
-// can be written as unary minus over a literal (`-128i8`) — numeric-types.md
-// §3's documented looseness. So `128i8` compiles while exceeding the type's
-// maximum: `max_value()` is the TYPE's bound, deliberately not "the largest
-// literal that compiles". Pinned so the pair is never "corrected" to match.
+// B428 (RULED 2026-09-29, R-i): the documented `128i8` looseness is WITHDRAWN.
+// The signed literal check admitted the MAGNITUDE `2^(n-1)` so that the minimum
+// could be written as unary minus over a literal; B407 reads the negation, so
+// the magnitude is admitted only under a `-` now, and a positive literal tops at
+// the type's maximum at every width. This pin used to hold the opposite (that
+// `128i8 > i8::max_value()` compiled and printed `true`).
 #[test]
-fn the_signed_literal_looseness_reaches_one_past_max_value() {
+fn b428_a_signed_literal_tops_at_the_types_maximum() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
 
         fun main() {
-            print(128i8 > i8::max_value());
-            print(32768i16 > i16::max_value());
-            print(2147483648i32 > i32::max_value());
+            print(127i8 == i8::max_value());
+            print(-128i8 == i8::min_value());
+            print(32767i16 == i16::max_value());
+            print(-32768i16 == i16::min_value());
+            print(2147483647i32 == i32::max_value());
+            print(-2147483648i32 == i32::min_value());
         }
         main();
         "#,
-        "true\ntrue\ntrue\n",
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n",
     );
+    for (literal, name, range) in [
+        ("128i8", "i8", "-128 ..= 127"),
+        ("32768i16", "i16", "-32768 ..= 32767"),
+        ("2147483648i32", "i32", "-2147483648 ..= 2147483647"),
+    ] {
+        assert_fails_spanning(
+            &format!("fun main() {{ let x = {literal}; }}\nmain();\n"),
+            literal,
+            &format!(
+                "the literal `{}` is out of range for `{name}` ({range})",
+                literal.trim_end_matches(name)
+            ),
+        );
+    }
+    // An unsuffixed literal at an annotated `i8` takes the same bound.
+    assert_fails_with(
+        "fun main() { let x: i8 = 128; }\nmain();\n",
+        "the literal `128` is out of range for `i8` (-128 ..= 127)",
+    );
+    assert_compiles("fun main() { let x: i8 = 127; let y: i8 = -128; }\nmain();\n");
 }
 
 // Integer division truncates toward zero (numeric-types.md §2) — both signs,
