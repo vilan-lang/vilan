@@ -6585,3 +6585,77 @@ const SHARED_FIELD_PROBE: &str = concat!(
     "\tprint(follow(\"x\")());\n",
     "}\n",
 );
+
+/// F58: `on_change` through the blanket `Flow` impl, reached under a generic
+/// bound `S: Source<List<X>>` whose value is a `ListCell<X>`. The blanket's
+/// binder `T` grounds from the provider `impl ListCell<type E> with
+/// Source<List<E>>` as `List<E>` — written in the PROVIDER's binder, which
+/// the substitution never bound, so the instance was refused by name ("an
+/// unbound generic type parameter (parameter 1 of struct `ListCell`)"). The
+/// provider's own binder now binds from the receiver. Two shapes: a toy
+/// source and std's own `ListCell` observed through a generic.
+#[test]
+fn a_blanket_reached_through_a_list_source_bound_builds_the_same_on_both_backends() {
+    let staged = stage();
+    for (program, source) in [
+        ("native_probe_f58_toy.vl", F58_TOY_PROBE),
+        ("native_probe_f58_list_cell.vl", F58_LIST_CELL_PROBE),
+    ] {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: a blanket reached through a `Source<List<X>>` bound must build and \
+             print the same on both backends"
+        );
+    }
+}
+
+const F58_TOY_PROBE: &str = concat!(
+    "trait Src<T> {\n",
+    "\tfun get(self): T;\n",
+    "}\n",
+    "struct LC<T> {\n",
+    "\titems: List<T>,\n",
+    "}\n",
+    "impl LC<type T> with Src<List<T>> {\n",
+    "\tfun get(self): List<T> {\n",
+    "\t\tself.items\n",
+    "\t}\n",
+    "}\n",
+    "trait Fl<T> {\n",
+    "\tfun now(own self): T;\n",
+    "}\n",
+    "impl type S: Src<type T> with Fl<T> {\n",
+    "\tfun now(own self): T {\n",
+    "\t\tself.get()\n",
+    "\t}\n",
+    "}\n",
+    "fun watch<S: Src<List<str>>>(source: S) {\n",
+    "\tprint(source.now().len());\n",
+    "}\n",
+    "fun main() {\n",
+    "\twatch(LC<str> { items = [\"a\", \"b\"] });\n",
+    "}\n",
+);
+
+const F58_LIST_CELL_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::delta::ListCell;\n",
+    "import std::reactive::{ Disposable, Source };\n",
+    "\n",
+    "fun watch<S: Source<List<str>>>(source: S) {\n",
+    "\tlet watching = source.on_change(|list| print(i\"changed {list.len()}\"));\n",
+    "\tsource.get();\n",
+    "\twatching.dispose();\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet source: ListCell<str> = ListCell::new();\n",
+    "\twatch(source);\n",
+    "\tlet kept = source.on_change(|list| print(i\"kept {list.len()}\"));\n",
+    "\tsource.push(\"b\");\n",
+    "\tkept.dispose();\n",
+    "}\n",
+    "main();\n",
+);

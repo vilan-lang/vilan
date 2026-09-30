@@ -510,8 +510,8 @@ function $X(self, observer, immediately) {
 function $W(self, observer, immediately) {
 	return $X(self[0], observer, immediately);
 }
-function $V(source2, observer) {
-	return $W(source2, observer, false);
+function $V(self, observer) {
+	return $W(self, observer, false);
 }
 function $e(source2, $f) {
 	const cursor = $g(source2);
@@ -521,7 +521,7 @@ function $e(source2, $f) {
 	}
 	const out = $k(seeded);
 	const read = $m(source2);
-	$V(source2, (_list) => {
+	$V(__clone(source2), (_list) => {
 		notifications.v = notifications.v + 1;
 		for (const op of read(cursor)) {
 			const $u = op;

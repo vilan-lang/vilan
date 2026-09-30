@@ -44,7 +44,6 @@ import pkg::reactive::{
 	as_derivation,
 	defer_to_owner,
 	fresh_id,
-	mint_subscriber,
 	register_with_owner,
 };
 import pkg::set::Set;
@@ -1073,13 +1072,12 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	// notification, so a handler holding the source was a loop no count could
 	// collect.
 	let read = source.reader();
-	// A node's attach: `on_settle` with a subscriber of its own, since the handler
-	// reads the log and not the value. Not `on_change`: under this generic `S` the
-	// native backend does not bind `ListCell`'s parameter through the blanket
-	// `Flow`. Not `attach_observer`: through a SUBTRAIT bound a supertrait
-	// default's override is not dispatched (both backends), and `Source`'s default
-	// captures the source, the loop A132 took out (reactive-44's finds).
-	let _owned = register_with_owner(source.on_settle(mint_subscriber(|| {
+	// `on_change`, through the blanket `Flow` over `Source` (F58 built that hop
+	// natively). Not `attach_observer` directly: through this SUBTRAIT bound a
+	// supertrait default's override is not dispatched (both backends), and
+	// `Source`'s default captures the source, the loop A132 took out; the
+	// blanket's own `Source` bound reaches the cell's override.
+	let _owned = register_with_owner(source.on_change(|_published| {
 		for op in read(cursor) {
 			match op {
 				// The derivative of `map g`: what arrived, mapped. Nothing else is
@@ -1096,7 +1094,7 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 				SeqOp::Move(let from, let count, let to) => out.move_range(from, count, to),
 			}
 		}
-	})));
+	}));
 	defer_to_owner(|| source.drop_cursor(cursor));
 	out
 }

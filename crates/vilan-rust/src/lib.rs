@@ -9864,6 +9864,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             type_id,
             &mut substitution,
         );
+        // F58: a blanket's bound binder can come back written in its
+        // PROVIDER's binder (`T = List<E>` for a `ListCell<E>` source); bind
+        // that one too, so the instance renders `List<str>`.
+        impl_select::bind_provider_binders(self.program, selected.impl_subject, &mut substitution);
         substitution.extend(self.own_generic_entries(member_id, own_generic_values));
         let name = self.ensure_function(member_id, &substitution)?.name;
         Ok(NativeDispatch::Call(name))

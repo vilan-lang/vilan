@@ -168,7 +168,6 @@ export fun fresh_id(): i32 {
 /// subscriber a pipe's consumer attaches through the pipe. That keeps this the one place the
 /// mark is spent, as `observe` was: an attach no longer mints, it pushes a record
 /// it was HANDED, so a leaf standing on three registrations spends the mark once.
-export [internal("a node author's subscriber mint (A110 door 2's mark spent here); an application attaches through `on_change`/`sub`")]
 fun mint_subscriber(notify: || void): Subscriber {
 	let derived = minting_derivation.read();
 	minting_derivation.write() = false;
