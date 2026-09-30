@@ -4903,7 +4903,7 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
         }
 
         fun main() {
-            let route = current_path().derive(parse).memo();
+            let route = current_path().derive(|value| parse(value)).memo();
             let _root = mount_root("app", || view("main")
                 .child(link("Home", Route::Home))
                 .child(view("button").on("click", || navigate(href(Route::Home))))

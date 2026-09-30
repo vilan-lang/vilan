@@ -145,7 +145,7 @@ fun app(route: SignalCell<Route>): View {
 }
 
 fun main() {
-	let route = current_path().derive(parse).cell();
+	let route = current_path().derive(|value| parse(value)).cell();
 	let _root = mount_root("app", || app(route));
 }
 "#;

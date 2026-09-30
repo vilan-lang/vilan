@@ -1680,6 +1680,25 @@ impl<'a> Interpreter<'a> {
             // false — keeping the guarded `dev::*` / std hooks inert here, so the
             // equivalence gate holds.
             "__hmr_active" => Ok(Value::Bool(false)),
+            // A pipe run's nursery (A142 S2, `std::task::detached_nursery`),
+            // mirroring the shape `helper_source`'s `__Nursery` presents where
+            // std reads it: `cancel()`. The expansion environment has no tasks —
+            // every `async` is refused — so the nursery owns nothing and
+            // cancelling it has nothing to abort: a no-op, which is the whole of
+            // what the host's would do to an empty nursery.
+            "__nursery_new_detached" => {
+                let env = self.root_scope();
+                let cancel = Value::Closure(Rc::new(ClosureData {
+                    parameters: &[],
+                    body: &[],
+                    env,
+                    name: Some("cancel"),
+                    origin: None,
+                }));
+                let mut nursery = IndexMap::new();
+                nursery.insert(Rc::from("cancel"), cancel);
+                Ok(Value::Object(Rc::new(RefCell::new(nursery))))
+            }
             // The reactive core's two exception seams (tracker B292), mirroring
             // `helper_source`'s JS. Only a vilan `panic` is a THROW here
             // (`FailureKind::Thrown`); fuel, depth, an unsupported capability
@@ -2711,6 +2730,19 @@ impl<'a> Interpreter<'a> {
                 )),
                 other => Err(Failure::unsupported(format!("the Map method `{other}`"))),
             },
+            // A host object whose method is a function-valued property — the
+            // nursery `__nursery_new_detached` answers (A142 S2) is the one
+            // emitted code reaches, through `[extern(method, "cancel")]`.
+            Value::Object(object) => {
+                let property = object.borrow().get(method).cloned();
+                match property {
+                    Some(callable @ Value::Closure(_)) => self.call_value(&callable, arguments),
+                    _ => Err(Failure::unsupported(format!(
+                        "the method `{method}` on {}",
+                        type_name(receiver)
+                    ))),
+                }
+            }
             other => Err(Failure::unsupported(format!(
                 "the method `{method}` on {}",
                 type_name(other)

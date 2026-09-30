@@ -2791,7 +2791,7 @@ fun main() {
 	let key: SignalCell<i32> = Signal::new(0);
 	let boundary = Owner::new();
 	run_with_owner(boundary, || {
-		key.scoped_effect(|run: i32| {
+		key.effect(|run: i32| {
 			mirror.effect(|value: Option<i32>| {
 				print(i"run {run} sees {value.unwrap_or(0)}");
 			});

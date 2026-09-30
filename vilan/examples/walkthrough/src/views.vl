@@ -240,13 +240,13 @@ fun note_editor(
 	view("div")
 		.styled(shell)
 		.child(view("input").styled(field).attr("placeholder", "Title…").bind_draft(title))
-		.child(view("span").styled(muted).bind_text(title.state.derive(state_text)))
+		.child(view("span").styled(muted).bind_text(title.state.derive(|state| state_text(state))))
 		.child(view("textarea")
 			.styled(field)
 			.attr("placeholder", "Write…")
 			.attr("rows", "8")
 			.bind_draft(body))
-		.child(view("span").styled(muted).bind_text(body.state.derive(state_text)))
+		.child(view("span").styled(muted).bind_text(body.state.derive(|state| state_text(state))))
 }
 
 fun not_found_page(): View {

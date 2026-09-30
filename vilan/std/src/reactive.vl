@@ -6,6 +6,7 @@ import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, Weak };
+import pkg::task::{ Nursery, ambient_nursery, detached_nursery };
 import pkg::time::Timer;
 import pkg::tuple::Tuple;
 
@@ -925,17 +926,48 @@ fun release_under(handle: Subscription, ambient: Option<Turn>) {
 /// SECOND `dispose` released it. With it, the promise is kept the only way it still
 /// can be — the item is disposed ON THE SPOT, because the extent it would have
 /// belonged to is already over.
+///
+/// **An owner is one EPOCH of a cell (A142 S2).** The cell holds the live epoch's
+/// number, its cleanups and its nursery; an `Owner` value names one epoch, and it
+/// is disposed exactly when the cell has moved past it. That is what lets a pipe
+/// stage give every RUN of its body an owner of its own without allocating one: the
+/// stage keeps one cell, each run is the next epoch of it, and releasing a run is
+/// advancing the epoch — so a late registration from a released run (an `await`
+/// that resumed after the next run began) finds its epoch gone and is disposed on
+/// the spot, B291's promise, while the next run registers into the live one. The
+/// cleanup list is allocated at the epoch's FIRST registration, so a run that
+/// registers nothing costs a read and a write (A142 §4.1).
 export struct Owner {
-	cleanups: Shared<List<|| void>>,
-	// Set BEFORE the cleanups run, so a cleanup that registers back into this owner
-	// (a `defer` reached from another `dispose`) is disposed on the spot rather
-	// than appended to a list the loop has already snapshotted.
-	disposed: Shared<bool>,
+	cell: Shared<OwnerCell>,
+	epoch: i32,
+}
+
+/// The live epoch of an owner: its number, what it must release, and the nursery
+/// its tasks run in when it has one (a pipe run's, A142 §4.1). Both are `None`
+/// until something needs them.
+export struct OwnerCell {
+	epoch: i32,
+	// Its own cell once allocated, so a registration pushes in place.
+	cleanups: Option<Shared<List<|| void>>>,
+	nursery: Option<Nursery>,
+}
+
+/// How many cleanup lists owners have allocated since the program started — the
+/// instrument behind "a run that registers nothing allocates no owner" (A142 §4.1).
+let owner_lists_allocated_count: Shared<i32> = Shared::new(0);
+
+/// `owner_lists_allocated_count`, read. A pin's instrument, not an application's.
+export [internal("an instrument for the lazy-owner pin (A142 §4.1); it counts, it decides nothing")]
+fun owner_lists_allocated(): i32 {
+	owner_lists_allocated_count.read()
 }
 
 export impl Owner {
 	fun new(): Owner {
-		Owner { cleanups = Shared::new([]), disposed = Shared::new(false) }
+		Owner {
+			cell = Shared::new(OwnerCell { epoch = 0, cleanups = None, nursery = None }),
+			epoch = 0,
+		}
 	}
 
 	/// Whether this owner has been disposed. A late registration is not an error —
@@ -943,7 +975,7 @@ export impl Owner {
 	/// register-and-immediately-release (a remote mirror, whose lease is a network
 	/// frame) reads this first.
 	fun is_disposed(self): bool {
-		self.disposed.read()
+		self.cell.read().epoch != self.epoch
 	}
 
 	/// Take ownership of a disposable (a `Subscription`, a `View`, or a child
@@ -952,13 +984,9 @@ export impl Owner {
 	/// so a caller that chains on it reads a disposed handle rather than a live one
 	/// nothing will ever release.
 	fun take<T: Disposable>(self, item: T): T {
-		if self.disposed.read() {
+		self.defer(|| {
 			item.dispose();
-		} else {
-			self.cleanups.write().push(|| {
-				item.dispose();
-			});
-		}
+		});
 		item
 	}
 
@@ -966,43 +994,92 @@ export impl Owner {
 	/// single `Disposable` (e.g. `each` disposing whichever rows are live). On a
 	/// disposed owner the cleanup runs immediately, for `take`'s reason.
 	fun defer(self, cleanup: || void) {
-		if self.disposed.read() {
+		if self.is_disposed() {
 			cleanup();
 		} else {
-			self.cleanups.write().push(cleanup);
+			match self.cell.read().cleanups {
+				Some(let list) => list.write().push(cleanup),
+				None => {
+					owner_lists_allocated_count.write() = owner_lists_allocated_count.read() + 1;
+					self.cell.write().cleanups = Some(Shared::new([cleanup]));
+				},
+			}
+		}
+	}
+
+	/// The owner of this cell's NEXT run: the live epoch is released (its cleanups
+	/// run, its nursery is cancelled) and the epoch after it opened, with a fresh
+	/// nursery for its tasks when `with_nursery` — a pipe stage's per-run owner
+	/// (A142 §4). Reached from any epoch of the cell: a stage keeps the cell and
+	/// renews through whichever epoch it last handed out.
+	[internal("a pipe stage's per-run owner (A142 §4); an application disposes an owner and makes a new one")]
+	fun renew(self, with_nursery: bool): Owner {
+		let live = Owner { cell = self.cell, epoch = self.cell.read().epoch };
+		live.dispose();
+		let next = self.cell.read().epoch;
+		if with_nursery {
+			self.cell.write().nursery = Some(detached_nursery());
+		}
+		Owner { cell = self.cell, epoch = next }
+	}
+
+	/// The nursery of this owner's live epoch, if it has one. A run renewed with a
+	/// nursery has one; `run_body` establishes it for the body.
+	[internal("a pipe stage's per-run nursery (A142 §4.1)")]
+	fun nursery(self): Option<Nursery> {
+		if self.is_disposed() {
+			None
+		} else {
+			self.cell.read().nursery
 		}
 	}
 }
 
 export impl Owner with Disposable {
-	/// Idempotent: a second `dispose` runs nothing. The flag goes up FIRST, so
+	/// Idempotent: a second `dispose` runs nothing. The epoch advances FIRST, so
 	/// anything a cleanup registers back into this owner is disposed on the spot
-	/// instead of landing on the emptied list.
+	/// instead of landing on the emptied list — and so does a late registration
+	/// made through this epoch's handle after a newer epoch opened.
 	fun dispose(self) {
-		if !self.disposed.read() {
-			self.disposed.write() = true;
+		if !self.is_disposed() {
+			let held = self.cell.read();
+			self.cell.write() = OwnerCell {
+				epoch = self.epoch + 1,
+				cleanups = None,
+				nursery = None,
+			};
+			// Tasks first: a cancelled task's in-flight IO rejects at once, and a
+			// cleanup below that inspects what the run left sees it settled.
+			match held.nursery {
+				Some(let nursery) => nursery.cancel(),
+				None => {},
+			}
 			// Every cleanup runs, even past a throwing one (tracker B292).
 			// `drain`'s finally would be the wrong guard here: a disposal group is
 			// a LIST OF PROMISES, not one update, and abandoning the rest of it
 			// leaks every subscription after the failure — now permanently, because
-			// the flag above makes a second `dispose` a no-op. So the loop finishes
+			// the epoch above makes a second `dispose` a no-op. So the loop finishes
 			// and the first failure is raised after the group is released. Only the
 			// first: the later ones are the same event, and a `panic` takes one
 			// message.
-			mut failure: Option<str> = None;
-			for cleanup in self.cleanups.read() {
-				match guarded(cleanup) {
-					Some(let message) => {
-						if failure.is_none() {
-							failure = Some(message);
+			match held.cleanups {
+				Some(let cleanups) => {
+					mut failure: Option<str> = None;
+					for cleanup in cleanups.read() {
+						match guarded(cleanup) {
+							Some(let message) => {
+								if failure.is_none() {
+									failure = Some(message);
+								}
+							},
+							None => {},
 						}
-					},
-					None => {},
-				}
-			}
-			self.cleanups.write() = [];
-			match failure {
-				Some(let message) => panic(message),
+					}
+					match failure {
+						Some(let message) => panic(message),
+						None => {},
+					}
+				},
 				None => {},
 			}
 		}
@@ -1091,47 +1168,34 @@ export fun on_cleanup(cleanup: || void) {
 	get_owner().defer(cleanup);
 }
 
-/// The per-run owner machinery the two scoped forms share (A114): a cell holding
-/// the CURRENT run's owner, and an observer that releases it before making the next
-/// one.
+/// Run `body` as the NEXT run of a stage body whose runs `runs` holds (A142 §4):
+/// the previous run is released — whatever it registered, and the tasks it
+/// started — and `body` runs with a fresh epoch of `runs` as its ambient owner and
+/// a fresh nursery as its ambient nursery. Every body a pipe runs goes through
+/// here: a `derive` transform, a `switch` selector, an `effect`.
 ///
-/// A function returning the observer rather than a body duplicated into both
-/// trait defaults, because the two differ only in which eager/lazy member they
-/// hand it to — `scoped_effect` is `effect`, `scoped_effect_on_change` is
-/// `effect_on_change`, exactly as `sub` is `on_change` plus one call.
-///
-/// `body` is INJECTED (`context owner_scope`), not captured: it is a literal at the
+/// `body` is INJECTED (the `context` clause), not captured: it is a literal at the
 /// user's call site, born before the run's owner exists, so capture-at-creation
 /// would hand it the BOUNDARY's owner and the whole point would be lost.
-/// `run_with_owner` supplies the run's owner to it instead
-/// (proposal/ambient-owner.md §5).
 ///
-/// The LAST run's owner is released by the enclosing boundary, through
-/// `on_cleanup` — which is this function's own ambient owner, the boundary's,
-/// read where `scoped_runner` is CALLED. Without it the final run's
-/// registrations would outlive the effect, which is the leak the form exists to
-/// close.
-fun scoped_runner<T>(body: (sync |T| void) context owner_scope): |T| void {
-	let current: Shared<Option<Owner>> = Shared::new(None);
-	on_cleanup(|| {
-		match current.read() {
-			Some(let last) => last.dispose(),
-			None => {},
-		}
-		current.write() = None;
-	});
-	|value: T| {
-		// Release BEFORE building: the contract is that a run's registrations are
-		// gone before the next run starts, so a timer the last run armed cannot
-		// fire against this one's state.
-		match current.read() {
-			Some(let previous) => previous.dispose(),
-			None => {},
-		}
-		let fresh = Owner::new();
-		current.write() = Some(fresh);
-		run_with_owner(fresh, || body(value));
+/// Nothing here allocates an owner: the run's owner is the next epoch of the one
+/// cell the stage already holds, and its cleanup list is allocated at the run's
+/// first registration (`Owner::defer`). The nursery IS allocated per run — the
+/// host's spawn machinery registers a task with the ambient nursery at the `async`
+/// expression, so one has to exist before the body runs.
+fun run_body<T>(runs: Owner, body: (|| T) context (owner_scope, ambient_nursery)): T {
+	let run = runs.renew(true);
+	match run.nursery() {
+		Some(let nursery) => owner_scope.run(run, || ambient_nursery.run(nursery, || body())),
+		None => panic("a renewed run carries its nursery"),
 	}
+}
+
+/// Release the LAST run a stage made — at the instance's release, when no run
+/// follows. A late registration from it (an `await` resuming afterwards) finds its
+/// epoch gone and is disposed on the spot (B291).
+fun release_runs(runs: Owner) {
+	Owner { cell = runs.cell, epoch = runs.cell.read().epoch }.dispose();
 }
 
 /// Establish `owner` as the ambient owner for the dynamic extent of `body` — the
@@ -1327,29 +1391,44 @@ export trait Flow<T> {
 	[must_use]
 	fun sub(own self, observer: |T| void): Subscription;
 
-	/// `on_change` registered with the ambient owner — the scope-tied lazy attach,
-	/// and a static requirement of an enclosing `owner_scope.run`.
-	fun effect_on_change(own self, observer: |T| void) {
-		get_owner().take(self.on_change(observer));
+	/// `effect` WITHOUT the immediate first call: `body` runs on every CHANGE from
+	/// here on, each run under an owner of its own (`effect`'s contract otherwise).
+	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery)) {
+		let runs = Owner::new();
+		let subscription = self.on_change(|value: T| run_body(runs, || body(value)));
+		also_releasing(subscription, || release_runs(runs));
+		get_owner().take(subscription);
 	}
 
-	/// Subscribe and register with the ambient owner (A5): the scope-tied `sub` —
-	/// nothing to hold, nothing to drop by hand. Requires an enclosing
-	/// `owner_scope.run`, statically.
-	fun effect(own self, observer: |T| void) {
-		get_owner().take(self.sub(observer));
+	/// Subscribe and register with the ambient owner (A5): `body` runs once now and
+	/// once per change, and the subscription dies with the enclosing boundary.
+	/// Requires an enclosing `owner_scope.run`, statically.
+	///
+	/// **Every run has an owner of its own (A142 R2, merging A114's
+	/// `scoped_effect`).** Whatever `body` registers — an `on_cleanup`, a nested
+	/// `effect`, a seal, a `take`, a mirror's lease — is released BEFORE the next
+	/// run, and the last run's with the boundary; a task `body` starts is owned by
+	/// the run and cancelled at its release. A body that registers nothing pays for
+	/// no owner (§4.1): the run's owner is an epoch of one cell per effect, and its
+	/// cleanup list is made at its first registration.
+	fun effect(own self, body: (|T| void) context (owner_scope, ambient_nursery)) {
+		let runs = Owner::new();
+		let subscription = self.sub(|value: T| run_body(runs, || body(value)));
+		also_releasing(subscription, || release_runs(runs));
+		get_owner().take(subscription);
 	}
 
-	/// `effect`, with an OWNER PER RUN (tracker A114): whatever `body` registers —
-	/// an `on_cleanup`, a nested `effect`, a `take`, a mirror's lease — is released
-	/// BEFORE the next run, and when the enclosing boundary goes.
+	/// `effect`'s name before A142 R2 merged the two: every `effect` run has its
+	/// own owner now.
+	[deprecated("use `effect`: every run of an effect's body has an owner of its own (A142 R2)")]
 	fun scoped_effect(own self, body: (sync |T| void) context owner_scope) {
-		self.effect(scoped_runner(body));
+		self.effect(|value: T| body(value));
 	}
 
-	/// `scoped_effect` WITHOUT the immediate first call.
+	/// `effect_on_change`'s name before A142 R2.
+	[deprecated("use `effect_on_change`: every run has an owner of its own (A142 R2)")]
 	fun scoped_effect_on_change(own self, body: (sync |T| void) context owner_scope) {
-		self.effect_on_change(scoped_runner(body));
+		self.effect_on_change(|value: T| body(value));
 	}
 }
 
@@ -1361,7 +1440,10 @@ export impl type F: Flow<type T> {
 	/// A pipe of `transform` applied to this flow's value (A142 R1, the rename of
 	/// `Source.map`). It runs when the pipe's consumer reads it — once per change,
 	/// inside the one instance that consumed it.
-	fun derive<U>(own self, transform: sync |T| U): Derive<F, T, U> {
+	fun derive<U>(
+		own self,
+		transform: (sync |T| U) context (owner_scope, ambient_nursery),
+	): Derive<F, T, U> {
 		Derive<F, T, U> { up = self, transform }
 	}
 
@@ -1370,7 +1452,10 @@ export impl type F: Flow<type T> {
 	/// `select` runs once per change of this flow, and it must BUILD the flow it
 	/// answers (a closure cannot capture a prebuilt pipe); the flow a previous
 	/// selection built is released at re-selection.
-	fun switch<U, I: Flow<U>>(own self, select: sync |T| I): Switch<F, T, I, U> {
+	fun switch<U, I: Flow<U>>(
+		own self,
+		select: (sync |T| I) context (owner_scope, ambient_nursery),
+	): Switch<F, T, I, U> {
 		Switch<F, T, I, U> { up = self, select }
 	}
 
@@ -1838,7 +1923,7 @@ export impl type T with MaybeSignal<T> {
 /// this one impl rather than one per element type.
 export impl type F: Flow<type T> with MaybeSignal<T> {
 	fun bind(own self, react: |T| void) {
-		self.effect(react);
+		self.effect(|value: T| react(value));
 	}
 }
 
@@ -2010,7 +2095,7 @@ fun detach_held(handle: Shared<Option<Subscription>>) {
 /// parameter and not on a field, so it is checked where the stage is built.
 export [resource] struct Derive<S, T, U> {
 	up: S,
-	transform: |T| U,
+	transform: (|T| U) context (owner_scope, ambient_nursery),
 }
 
 export impl Derive<type S: Flow<type T>, T, type U> with Flow<U> {
@@ -2028,10 +2113,17 @@ export impl Derive<type S: Flow<type T>, T, type U> with Flow<U> {
 		let transform = self.transform;
 		let upstream = self.up.start();
 		let pull = upstream.pull;
+		let runs = Owner::new();
 		Instance<U> {
-			pull = || transform(pull()),
+			pull = || {
+				let value = pull();
+				run_body(runs, || transform(value))
+			},
 			attach = upstream.attach,
-			release = upstream.release,
+			release = || {
+				release_runs(runs);
+				(upstream.release)();
+			},
 		}
 	}
 }
@@ -2054,7 +2146,7 @@ export impl Derive<type S: Flow<type T>, T, type U> with Pipe<U> {}
 /// unsubstituted `T`).
 export [resource] struct Switch<S, T, I, U> {
 	up: S,
-	select: |T| I,
+	select: (|T| I) context (owner_scope, ambient_nursery),
 }
 
 export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U> {
@@ -2070,11 +2162,12 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U
 
 	fun start(own self): Instance<U> {
 		let select = self.select;
+		let runs = Owner::new();
 		let outer = self.up.start();
 		let outer_pull = outer.pull;
 		// The FIRST selection is made here, at start — the instance's state begins
 		// with it, and a consumer's first pull reads it.
-		let followed: Shared<Instance<U>> = Shared::new(select(outer_pull()).start());
+		let followed: Shared<Instance<U>> = Shared::new(run_body(runs, || select(outer_pull())).start());
 		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
 		Instance<U> {
 			pull = || (followed.read().pull)(),
@@ -2083,7 +2176,7 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U
 				let outer_handle = (outer.attach)(subscriber_of(|| {
 					detach_held(followed_handle);
 					(followed.read().release)();
-					let next = select(outer_pull()).start();
+					let next = run_body(runs, || select(outer_pull())).start();
 					followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
 					followed.write() = next;
 					wake(subscriber);
@@ -2094,6 +2187,7 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Flow<U
 				})
 			},
 			release = || {
+				release_runs(runs);
 				(followed.read().release)();
 				(outer.release)();
 			},
@@ -2108,7 +2202,7 @@ export impl Switch<type S: Flow<type T>, T, type I: Flow<U>, type U> with Pipe<U
 /// follows the flow `select` builds for `x`, wrapped.
 export [resource] struct SwitchSome<S, T, I, U> {
 	up: S,
-	select: |T| I,
+	select: (|T| I) context (owner_scope, ambient_nursery),
 }
 
 export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U> with Flow<
@@ -2126,10 +2220,11 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
+		let runs = Owner::new();
 		let outer = self.up.start();
 		let outer_pull = outer.pull;
 		let followed: Shared<Option<Instance<U>>> = Shared::new(match outer_pull() {
-			Some(let value) => Some(select(value).start()),
+			Some(let value) => Some(run_body(runs, || select(value)).start()),
 			None => None,
 		});
 		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
@@ -2153,11 +2248,16 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 					}
 					followed.write() = match outer_pull() {
 						Some(let value) => {
-							let next = select(value).start();
+							let next = run_body(runs, || select(value)).start();
 							followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
 							Some(next)
 						},
-						None => None,
+						// Detached: what the last selection built is released now,
+						// not at the next `Some`.
+						None => {
+							release_runs(runs);
+							None
+						},
 					};
 					wake(subscriber);
 				}, true));
@@ -2167,6 +2267,7 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 				})
 			},
 			release = || {
+				release_runs(runs);
 				match followed.read() {
 					Some(let instance) => (instance.release)(),
 					None => {},
@@ -2187,7 +2288,7 @@ export impl SwitchSome<type S: Flow<Option<T>>, type T, type I: Flow<U>, type U>
 /// the wrapping.
 export [resource] struct AndThen<S, T, I, U> {
 	up: S,
-	select: |T| I,
+	select: (|T| I) context (owner_scope, ambient_nursery),
 }
 
 export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, type U> with Flow<
@@ -2205,10 +2306,11 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 
 	fun start(own self): Instance<Option<U>> {
 		let select = self.select;
+		let runs = Owner::new();
 		let outer = self.up.start();
 		let outer_pull = outer.pull;
 		let followed: Shared<Option<Instance<Option<U>>>> = Shared::new(match outer_pull() {
-			Some(let value) => Some(select(value).start()),
+			Some(let value) => Some(run_body(runs, || select(value)).start()),
 			None => None,
 		});
 		let followed_handle: Shared<Option<Subscription>> = Shared::new(None);
@@ -2232,11 +2334,16 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 					}
 					followed.write() = match outer_pull() {
 						Some(let value) => {
-							let next = select(value).start();
+							let next = run_body(runs, || select(value)).start();
 							followed_handle.write() = Some((next.attach)(relay_to(subscriber)));
 							Some(next)
 						},
-						None => None,
+						// Detached: what the last selection built is released now,
+						// not at the next `Some`.
+						None => {
+							release_runs(runs);
+							None
+						},
 					};
 					wake(subscriber);
 				}, true));
@@ -2246,6 +2353,7 @@ export impl AndThen<type S: Flow<Option<T>>, type T, type I: Flow<Option<U>>, ty
 				})
 			},
 			release = || {
+				release_runs(runs);
 				match followed.read() {
 					Some(let instance) => (instance.release)(),
 					None => {},
@@ -2459,14 +2567,20 @@ export impl type F: Flow<type T: PartialEq> {
 export impl type F: Flow<Option<type T>> {
 	/// `switch` over an optional value (A142 R8): `None` detaches and reads `None`,
 	/// `Some(x)` follows the flow `select` builds for `x`, wrapped in `Some`.
-	fun switch_some<U, I: Flow<U>>(own self, select: sync |T| I): SwitchSome<F, T, I, U> {
+	fun switch_some<U, I: Flow<U>>(
+		own self,
+		select: (sync |T| I) context (owner_scope, ambient_nursery),
+	): SwitchSome<F, T, I, U> {
 		SwitchSome<F, T, I, U> { up = self, select }
 	}
 
 	/// The Kleisli form (A123): `select` answers a `Flow<Option<U>>`, and the outer
 	/// `None` (nothing selected) and the inner `None` (the followed flow holds
 	/// nothing yet) collapse into one — `Option::and_then`, one level up.
-	fun and_then<U, I: Flow<Option<U>>>(own self, select: sync |T| I): AndThen<F, T, I, U> {
+	fun and_then<U, I: Flow<Option<U>>>(
+		own self,
+		select: (sync |T| I) context (owner_scope, ambient_nursery),
+	): AndThen<F, T, I, U> {
 		AndThen<F, T, I, U> { up = self, select }
 	}
 }

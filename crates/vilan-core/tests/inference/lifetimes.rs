@@ -2037,3 +2037,304 @@ fn a136_a_maker_that_builds_what_outlives_the_caller_does_not_warn() {
     );
     assert!(found.is_empty(), "{found:#?}");
 }
+// --- A142 S2: every body a pipe runs has an owner per run --------------------
+//
+// `proposal/reactive-layers.md` §4 (R2, R14): because a pipe has exactly one
+// consumer, every body in it runs once per change inside one instance, so every
+// run of a body — a `derive` transform, a `switch` selector, an `effect` — gets
+// an owner of its own, released when the body runs again and when the instance
+// is released. The owner is an epoch of one cell per stage, and its cleanup list
+// is allocated at the run's first registration (§4.1): a run that registers
+// nothing costs a read and a write. A task a run starts belongs to the run's
+// nursery and is cancelled at its release.
+
+#[test]
+fn a142_s2_a_body_that_registers_nothing_allocates_no_owner() {
+    // `owner_lists_allocated` counts every cleanup list an owner ever made. Ten
+    // changes through a sealed two-stage chain and a plain effect allocate NONE
+    // (`quiet=0`); the same ten through an effect whose body registers one
+    // cleanup per run allocate one list per run (`busy=10`). Red when the run's
+    // owner allocates its list up front: `quiet=30` (a list per run per body).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{
+            Owner, Signal, SignalCell, Source, on_cleanup, owner_lists_allocated, run_with_owner,
+        };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(0);
+            let boundary = Owner::new();
+            let sealed = run_with_owner(boundary, || {
+                root.effect(|value: i32| {
+                    let _ignored = value + 1;
+                });
+                root.derive(|value| value + 1).derive(|value| value * 2).memo()
+            });
+            let before = owner_lists_allocated();
+            mut step = 1;
+            for step <= 10 {
+                root.set(step);
+                step += 1;
+            }
+            print(i"quiet={owner_lists_allocated() - before} value={sealed.get()}");
+            let noisy = Owner::new();
+            run_with_owner(noisy, || {
+                root.effect(|_value: i32| on_cleanup(|| {}));
+            });
+            let before_busy = owner_lists_allocated();
+            step = 1;
+            for step <= 10 {
+                root.set(step);
+                step += 1;
+            }
+            print(i"busy={owner_lists_allocated() - before_busy}");
+            noisy.dispose();
+            boundary.dispose();
+        }
+
+        main();
+        "#,
+        "quiet=0 value=22\nbusy=10\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_derive_body_releases_each_run_before_the_next_and_the_last_with_its_consumer() {
+    // R14: a `derive` body's registrations belong to its run. The cleanup of run
+    // `n` runs before run `n + 1` builds, and the last run's is released with the
+    // memo's boundary. Red when `derive` runs its body under the boundary's owner:
+    // the three cleanups all print at `dispose`, after `value 6`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let boundary = Owner::new();
+            let doubled = run_with_owner(boundary, || {
+                root.derive(|value: i32| {
+                    print(i"run {value}");
+                    on_cleanup(|| print(i"release {value}"));
+                    value * 2
+                }).memo()
+            });
+            root.set(2);
+            root.set(3);
+            print(i"value {doubled.get()}");
+            boundary.dispose();
+            print("disposed");
+        }
+
+        main();
+        "#,
+        "run 1\nrelease 1\nrun 2\nrelease 2\nrun 3\nvalue 6\nrelease 3\ndisposed\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_switch_selectors_creations_are_released_on_reselection() {
+    // A selector runs once per change of its outer (the prototype's `made=1`
+    // shape: reads run nothing), and what a selection built is released when
+    // the next selection replaces it — before the new one builds.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, on_cleanup };
+        import std::shared::Shared;
+
+        fun main() {
+            let made: Shared<i32> = Shared::new(0);
+            let flag = Signal::new(true);
+            let count = Signal::new(1);
+            let picked = flag
+                .switch(|on: bool| {
+                    made.write() = made.read() + 1;
+                    on_cleanup(|| print(i"released {on}"));
+                    count.derive(|value| if on { value * 100 } else { 0 - value })
+                })
+                .memo();
+            print(i"picked={picked.get()} made={made.read()}");
+            count.set(2);
+            print(i"picked={picked.get()} {picked.get()} made={made.read()}");
+            flag.set(false);
+            count.set(3);
+            print(i"picked={picked.get()} made={made.read()}");
+        }
+
+        main();
+        "#,
+        "picked=100 made=1\npicked=200 200 made=1\nreleased true\npicked=-3 made=2\n",
+    );
+}
+
+#[test]
+fn a142_s2_sample_releases_what_its_bodies_created() {
+    // R32: `.sample()` starts the pipe, reads it and releases it — the runs its
+    // bodies made included. The cleanup runs inside the call, before the value
+    // is printed; and nothing is left subscribed on the root.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, on_cleanup };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(4);
+            let read = root
+                .derive(|value: i32| {
+                    on_cleanup(|| print("released the run"));
+                    value + 1
+                })
+                .sample();
+            print(i"sampled {read} subscribers={root.subscribers.read().len()}");
+        }
+
+        main();
+        "#,
+        "released the run\nsampled 5 subscribers=0\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_superseded_task_is_cancelled_with_its_run() {
+    // §4.1: a task started during a run belongs to the run's nursery and is
+    // cancelled when the run is released. Two changes before the first task's
+    // sleep ends: only the LAST run's task finishes. Red when the run owns no
+    // nursery: `fetched 1` and `fetched 2` print too.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::time::sleep;
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.effect(|value: i32| {
+                    let _pending = async {
+                        sleep(30);
+                        print(i"fetched {value}");
+                    };
+                });
+            });
+            id.set(2);
+            id.set(3);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+        "fetched 3\ndone\n",
+    );
+}
+
+#[test]
+fn a142_s2_a_derive_bodys_superseded_task_is_cancelled() {
+    // The paper's own example: `src.derive(|x| async ..)` cancels the
+    // superseded fetch when `src` changes, because the body runs once per change
+    // inside the one instance its consumer started (§4.1).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::task::Task;
+        import std::time::sleep;
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            let _fetches = run_with_owner(boundary, || {
+                id.derive(|value: i32| async {
+                    sleep(30);
+                    print(i"fetched {value}");
+                    value
+                }).memo()
+            });
+            id.set(2);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+        "fetched 2\ndone\n",
+    );
+}
+
+#[test]
+#[ignore = "A142: reactive-44 find — a spawn inside a user-written `context ambient_nursery` closure is not registered with the injected nursery, so a cancelled run's task is reported as an unhandled task error"]
+fn a142_s2_a_cancelled_runs_task_is_owned_and_reports_nothing() {
+    // The ownership half of the pin above: the run's task is REGISTERED with the
+    // run's nursery, so its cancellation is absorbed like every owned task's.
+    // Today the spawn is not connected to the injected nursery: the task is
+    // cancelled through the ambient signal (its sleep aborts) but it is unowned,
+    // so its AbortError is reported on stderr.
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::time::sleep;
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.effect(|value: i32| {
+                    let _pending = async {
+                        sleep(30);
+                        print(i"fetched {value}");
+                    };
+                });
+            });
+            id.set(2);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "fetched 2\ndone\n");
+    assert!(
+        stderr.trim().is_empty(),
+        "a cancelled owned task reports nothing: {stderr}"
+    );
+}
+
+#[test]
+fn a142_s2_scoped_effect_is_a_deprecated_alias_of_effect() {
+    // R2 merged the pair: `scoped_effect` still compiles, warns, and behaves as
+    // `effect` does.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner };
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.scoped_effect(|value: i32| {
+                    on_cleanup(|| print(i"release {value}"));
+                });
+            });
+            id.set(2);
+            boundary.dispose();
+        }
+
+        main();
+        "#;
+    assert_compiles_and_runs(source, "release 1\nrelease 2\n");
+    assert!(
+        warning_diagnostics(source)
+            .iter()
+            .any(|(message, _)| message.contains("scoped_effect")),
+        "scoped_effect warns as deprecated"
+    );
+}

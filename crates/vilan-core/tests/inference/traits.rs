@@ -4526,7 +4526,7 @@ fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.derive(f).switch(|inner: I| inner).cell()
+                self.derive(|value| f(value)).switch(|inner: I| inner).cell()
             }
         }
 
@@ -4553,7 +4553,7 @@ fn b371_switch_over_std_flatten_runs_as_a_free_function() {
         import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
 
         fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
-            source.derive(f).switch(|inner: I| inner).cell()
+            source.derive(|value| f(value)).switch(|inner: I| inner).cell()
         }
 
         fun main() {
@@ -4582,7 +4582,7 @@ fn b371_the_result_infers_without_an_annotation() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.derive(f).switch(|inner: I| inner).cell()
+                self.derive(|value| f(value)).switch(|inner: I| inner).cell()
             }
         }
 
@@ -4641,7 +4641,7 @@ fn b371_the_optional_twin_is_unchanged() {
 
         impl type S: Source<type T> {
             fun and_then_to<U, I: Source<U>>(self, f: sync |T| Option<I>): SignalCell<Option<U>> {
-                self.derive(f).flatten().cell()
+                self.derive(|value| f(value)).flatten().cell()
             }
         }
 

@@ -1,13 +1,13 @@
 const __vilan_chunks = globalThis.__vilan_chunks;
-const $ak = __vilan_chunks.fn.$ak;
-const $ay = __vilan_chunks.fn.$ay;
+const $aI = __vilan_chunks.fn.$aI;
+const $aW = __vilan_chunks.fn.$aW;
 const panel = __vilan_chunks.fn.panel;
 const view = __vilan_chunks.fn.view;
-function docs_page(page, $bl, $bm) {
-	return $ay($ay(view("article"), panel("Docs", "page " + page, $bl, $bm), $bl, $bm), docs_nav(page, $bl, $bm), $bl, $bm);
+function docs_page(page, $bQ, $bR) {
+	return $aW($aW(view("article"), panel("Docs", "page " + page, $bQ, $bR), $bQ, $bR), docs_nav(page, $bQ, $bR), $bQ, $bR);
 }
-function docs_nav(page, $bn, $bo) {
-	return $ay(view("nav"), $ak("Next", [ 1, page + 1 ], $bn, $bo), $bn, $bo);
+function docs_nav(page, $bS, $bT) {
+	return $aW(view("nav"), $aI("Next", [ 1, page + 1 ], $bS, $bT), $bS, $bT);
 }
 __vilan_chunks.fn.docs_nav = docs_nav;
 __vilan_chunks.fn.docs_page = docs_page;

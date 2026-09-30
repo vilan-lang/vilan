@@ -11,7 +11,7 @@ function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
 }
 function new2() {
-	return [ __shared_new([  ]), __shared_new(false) ];
+	return [ __shared_new([ 0, [ 1 ], [ 1 ] ]), 0 ];
 }
 function view(tag) {
 	const attributes = __shared_new([  ]);

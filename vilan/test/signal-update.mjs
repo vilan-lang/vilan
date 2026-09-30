@@ -201,7 +201,29 @@ function release_under(handle, ambient) {
 	return $aa;
 }
 function new4() {
-	return [ __shared_new([  ]), __shared_new(false) ];
+	return [ __shared_new([ 0, [ 1 ], [ 1 ] ]), 0 ];
+}
+function is_disposed(self) {
+	return self[0].v[0] !== self[1];
+}
+function defer(self, cleanup) {
+	let $ad = null;
+	if (is_disposed(self)) {
+		cleanup();
+	} else {
+		const $ab = self[0].v[1];
+		let $ac = null;
+		if ($ab[0] === 0) {
+			const list = $ab[1];
+			$ac = list.v.push(cleanup);
+		} else {
+			owner_lists_allocated_count.v = owner_lists_allocated_count.v + 1;
+			self[0].v[1] = [ 0, __shared_new([ cleanup ]) ];
+			$ac = undefined;
+		}
+		$ad = $ac;
+	}
+	return $ad;
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -324,42 +346,39 @@ function $K(self, observer) {
 	return $L(self, observer, true);
 }
 function $Q(self, item, $R) {
-	if (self[1].v) {
+	defer(self, () => {
 		dispose(item, $R);
-	} else {
-		self[0].v.push(() => {
-			dispose(item, $R);
-			return;
-		});
-	}
+		return;
+	});
 	return __clone(item);
 }
-function $ac(body, $ad) {
-	const $ae = $ad;
-	let $af = null;
-	if ($ae[0] === 0) {
-		const current = $ae[1];
-		$af = body(current);
+function $af(body, $ag) {
+	const $ah = $ag;
+	let $ai = null;
+	if ($ah[0] === 0) {
+		const current = $ah[1];
+		$ai = body(current);
 	} else {
 		const fresh = new3();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[5].v = true;
-		$af = result;
+		$ai = result;
 	}
-	return $af;
+	return $ai;
 }
-function $ai(self, value, $aj) {
+function $al(self, value, $am) {
 	self[0].v = __clone(value);
-	$u(self, $aj);
+	$u(self, $am);
 }
-function $ag(self, transform, $ah) {
-	$ai(self, transform($p(self)), $ah);
+function $aj(self, transform, $ak) {
+	$al(self, transform($p(self)), $ak);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 const releasing_turns = __shared_new([  ]);
+const owner_lists_allocated_count = __shared_new(0);
 const owner = new4();
 const todos = $a([ 1, 2 ]);
 $c(todos, (list) => {
@@ -393,15 +412,15 @@ $c(watched, (list) => {
 	return;
 }, [ 1 ]);
 console.log("---");
-$ac(($ab) => {
+$af(($ae) => {
 	$c(watched, (list) => {
 		list.push(3);
 		return;
-	}, [ 0, $ab ]);
+	}, [ 0, $ae ]);
 	$c(watched, (list) => {
 		list.push(4);
 		return;
-	}, [ 0, $ab ]);
+	}, [ 0, $ae ]);
 	console.log("inside");
 	return;
 }, [ 1 ]);
@@ -410,7 +429,7 @@ $c(todos, (list) => {
 	console.log("reentrant " + $p(todos).length);
 	return;
 }, [ 1 ]);
-$ag(count, (n) => {
+$aj(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($p(count));

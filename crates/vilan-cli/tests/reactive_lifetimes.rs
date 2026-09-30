@@ -142,7 +142,7 @@ fun main() {
 	let path = current_path();
 	mut round = 0;
 	for round < 25 {
-		let root = mount_root("app", || view("main").bind_text(path.derive(parse).derive(label)));
+		let root = mount_root("app", || view("main").bind_text(path.derive(|value| parse(value)).derive(|value| label(value))));
 		root.dispose();
 		round += 1;
 	}
@@ -973,8 +973,14 @@ fun main() {
 			print(i"order: OUTER with {value}");
 			if !wired {
 				wired = true;
-				source.effect_on_change(|inner: i32| {
-					print(i"order: inner with {inner}");
+				// Registered with the HOST, not the run: under A142 R2 what a
+				// body registers is its run's and is released at the next run,
+				// and this half needs the inner to outlive the outer's second
+				// run so the order of the two can be read.
+				run_with_owner(host, || {
+					source.effect_on_change(|inner: i32| {
+						print(i"order: inner with {inner}");
+					});
 				});
 			}
 		});
@@ -1172,7 +1178,8 @@ fn a124_s2a_door2_a_cold_diamond_fires_its_effect_once_with_the_settled_pair() {
 
 // --- A114: an effect with an OWNER PER RUN ----------------------------------
 
-/// `Source::scoped_effect` and the free `on_cleanup` (tracker A114, R2 at Order
+/// `effect`'s owner per run (A114's `scoped_effect`, which A142 R2 merged into
+/// `effect`) and the free `on_cleanup` (tracker A114, R2 at Order
 /// 39's GO), on the sequence A113 row 4 named as missing: a per-run cleanup.
 ///
 /// Four sections, and the first is the item's own user-code probe
@@ -1196,8 +1203,8 @@ fn a124_s2a_door2_a_cold_diamond_fires_its_effect_once_with_the_settled_pair() {
 /// half of "one name, the ambient owner decides": it runs ONCE, at teardown,
 /// and not per change.
 ///
-/// **`lazy:`** — `scoped_effect_on_change` makes no immediate run, exactly as
-/// `effect_on_change` makes no immediate call.
+/// **`lazy:`** — `effect_on_change` makes no immediate run, exactly as
+/// `on_change` makes no immediate call.
 const A114_SCOPED_EFFECT: &str = r#"import std::io::print;
 import std::reactive::{
 	Disposable, FlushPolicy, Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner,
@@ -1209,7 +1216,7 @@ fun main() {
 	let other: SignalCell<str> = Signal::new("a");
 	let boundary = Owner::new();
 	run_with_owner(boundary, || {
-		id.scoped_effect(|value: i32| {
+		id.effect(|value: i32| {
 			print(i"inline: run {value}");
 			on_cleanup(|| print(i"inline: cleanup {value}"));
 			other.effect(|text: str| print(i"inline: inner {value} sees {text}"));
@@ -1229,7 +1236,7 @@ fun main() {
 	let cleanups: SignalCell<i32> = Signal::new(0);
 	let scope = Owner::new();
 	run_with_owner(scope, || {
-		key.scoped_effect(|_value: i32| {
+		key.effect(|_value: i32| {
 			runs.set_with(|count| count + 1);
 			on_cleanup(|| cleanups.set_with(|count| count + 1));
 		});
@@ -1259,7 +1266,7 @@ fun main() {
 	let lazy_runs: SignalCell<i32> = Signal::new(0);
 	let lazy_scope = Owner::new();
 	run_with_owner(lazy_scope, || {
-		lazy_key.scoped_effect_on_change(|_value: i32| {
+		lazy_key.effect_on_change(|_value: i32| {
 			lazy_runs.set_with(|count| count + 1);
 		});
 	});
@@ -1335,7 +1342,7 @@ fun main() {
 	let released: SignalCell<i32> = Signal::new(0);
 	let scope = Owner::new();
 	run_with_owner(scope, || {
-		id.scoped_effect(|value: i32| {
+		id.effect(|value: i32| {
 			on_cleanup(|| released.set_with(|count| count + 1));
 			if value == 1 {
 				panic("the body refused");
@@ -1490,10 +1497,12 @@ fn a113_the_owned_forms_and_every_derivation_detach_with_their_boundary() {
 /// contract, not a bug — the caller holds the handle and disposes it, or hands
 /// it to an owner.
 ///
-/// **Row 4 — a plain effect's body has no per-run cleanup.** Two `set`s later
-/// the body's nested subscription has been made three times and all three are
-/// live, because `Owner::defer` runs at DISPOSAL only. That is the row A114
-/// answers: `scoped_effect` in the same shape holds exactly one.
+/// **Row 4 — an effect's body has an owner per run (A142 R2).** Before A142 a
+/// plain effect's body accumulated: two `set`s later its nested subscription had
+/// been made three times and all three were live (`plain watchers=3`), and A114's
+/// `scoped_effect` was the form that held one. R2 merged the two: `effect` IS the
+/// per-run form, so the same body holds exactly ONE nested subscription, and the
+/// boundary's disposal releases the last run's.
 const A113_MANUAL_FORMS: &str = r#"import std::io::print;
 import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, run_with_owner };
 
@@ -1525,25 +1534,14 @@ fun main() {
 	});
 	key.set(1);
 	key.set(2);
-	print(i"row4: plain watchers={watched.subscribers.read().len()}");
+	print(i"row4: effect watchers={watched.subscribers.read().len()}");
 	page.dispose();
-	print(i"row4: plain-disposed watchers={watched.subscribers.read().len()}");
-	let scoped_page = Owner::new();
-	run_with_owner(scoped_page, || {
-		key.scoped_effect(|_value: i32| {
-			watched.effect(|_seen: i32| {});
-		});
-	});
-	key.set(3);
-	key.set(4);
-	print(i"row4: scoped watchers={watched.subscribers.read().len()}");
-	scoped_page.dispose();
-	print(i"row4: scoped-disposed watchers={watched.subscribers.read().len()}");
+	print(i"row4: effect-disposed watchers={watched.subscribers.read().len()}");
 }
 "#;
 
 #[test]
-fn a113_the_manual_forms_release_nothing_and_a_plain_effects_body_accumulates() {
+fn a113_the_manual_forms_release_nothing_and_an_effects_body_releases_each_run() {
     let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
     let stdout = build_and_run("a113_manual", A113_MANUAL_FORMS, &harness, &[]);
     let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
@@ -1557,16 +1555,13 @@ fn a113_the_manual_forms_release_nothing_and_a_plain_effects_body_accumulates() 
             "row2: after-dispose=1",
             "row2: taken=2",
             "row2: bag-disposed=1",
-            // Three runs of a plain effect body, three live nested
-            // subscriptions.
-            "row4: plain watchers=3",
-            "row4: plain-disposed watchers=0",
-            // The same body under `scoped_effect`: one.
-            "row4: scoped watchers=1",
-            "row4: scoped-disposed watchers=0",
+            // Three runs of an effect body, ONE live nested subscription: each
+            // run's owner released the last (A142 R2; `plain watchers=3` before).
+            "row4: effect watchers=1",
+            "row4: effect-disposed watchers=0",
         ],
-        "a dropped subscription must stay subscribed and a plain effect's body \
-         must accumulate, both as documented; got:\n{stdout}"
+        "a dropped subscription must stay subscribed and an effect's body must \
+         release each run, both as documented; got:\n{stdout}"
     );
 }
 

@@ -2866,7 +2866,7 @@ fun report(label: str) {
 }
 
 fun main() {
-	let _root = mount_root("app", || view("main").child(swap(route.derive(shell_of), |shell: Shell| {
+	let _root = mount_root("app", || view("main").child(swap(route.derive(|value| shell_of(value)), |shell: Shell| {
 		match shell {
 			Shell::Login => view("section").text("sign in"),
 			Shell::App => view("div").child(swap(route, |path: str| page(path))),

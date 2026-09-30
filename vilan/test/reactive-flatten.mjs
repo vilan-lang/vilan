@@ -8,6 +8,14 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __guarded(body) {
+	try {
+		body();
+		return [ 1 ];
+	} catch (error) {
+		return [ 0, error && error.message ? error.message : String(error) ];
+	}
+}
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
@@ -21,6 +29,81 @@ function __list_get(list, index) {
 }
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
+}
+class __Nursery {
+	constructor(parent) {
+		this.children = [];
+		this.failedTask = undefined;
+		this.failWake = undefined;
+		this.controller = new AbortController();
+		if (parent) {
+			const signal = parent.controller.signal;
+			if (signal.aborted) this.controller.abort(signal.reason);
+			else signal.addEventListener("abort", () => this.controller.abort(signal.reason), { once: true });
+		}
+	}
+	cancel() {
+		this.controller.abort();
+	}
+	__fail(task) {
+		if (this.failedTask === undefined) {
+			this.failedTask = task;
+			this.controller.abort();
+			if (this.failWake) this.failWake();
+		}
+	}
+	is_cancelled() {
+		return this.controller.signal.aborted;
+	}
+	signal_of() {
+		return this.controller.signal;
+	}
+}
+function __nursery_new(parent) {
+	return new __Nursery(parent && parent[0] === 0 ? parent[1] : undefined);
+}
+function __nursery_new_detached() {
+	const n = __nursery_new(undefined);
+	n.detached = true;
+	n.__fail = function (task) {
+		if (!task.observed) {
+			globalThis.setTimeout(() => {
+				if (!task.observed) console.error("unhandled task error (spawned in " + task.origin + "): " + String(task.error));
+			}, 0);
+		}
+	};
+	return n;
+}
+function __nursery_is_cancel(error) {
+	return !!error && error.name === "AbortError";
+}
+async function __nursery_run(n, body) {
+	let result;
+	let bodyError;
+	let bodyFailed = false;
+	try {
+		result = await body();
+	} catch (error) {
+		bodyFailed = true;
+		bodyError = error;
+	}
+	if (bodyFailed) n.controller.abort();
+	const failed = new Promise((resolve) => {
+		n.failWake = resolve;
+		if (n.failedTask !== undefined) resolve();
+	});
+	let index = 0;
+	while (!bodyFailed && n.failedTask === undefined && index < n.children.length) {
+		try {
+			await Promise.race([n.children[index], failed]);
+		} catch (error) {}
+		if (n.failedTask === undefined) index += 1;
+	}
+	if (!bodyFailed && n.failedTask === undefined) return result;
+	for (const task of n.children) task.then(null, () => {});
+	if (bodyFailed) throw bodyError;
+	const winner = n.failedTask;
+	throw typeof winner.error === "string" ? winner.error + " (in task spawned in " + winner.origin + ")" : winner.error;
 }
 function __shared_new(value) {
 	return { v: value };
@@ -44,18 +127,18 @@ function subscriber_of(notify, derived) {
 	return [ fresh_id(), notify, __shared_new(true), derived ];
 }
 function is_quiescent(self) {
-	return $x(self[0].v) && $x(self[1].v);
+	return $S(self[0].v) && $S(self[1].v);
 }
 function enqueue(turn, subscribers) {
 	for (const subscriber of subscribers) {
 		const key = hash(subscriber[0]);
-		let $w = null;
+		let $R = null;
 		if (subscriber[3]) {
 			if (!(turn[3].v.has(key))) {
 				turn[3].v.set(key, true);
 				turn[1].v.push(__clone(subscriber));
 			}
-			$w = undefined;
+			$R = undefined;
 		} else if (!(turn[2].v.has(key))) {
 			turn[2].v.set(key, true);
 			let index = turn[0].v.length;
@@ -64,7 +147,7 @@ function enqueue(turn, subscribers) {
 			}
 			__insert_at(turn[0].v, index, __clone(subscriber));
 		}
-		$w;
+		$R;
 	}
 	if (turn[5].v && !(turn[6].v) && !(turn[4].v)) {
 		turn[6].v = true;
@@ -82,7 +165,7 @@ function drain(turn) {
 		__with_finally(() => {
 			let budget = 100000;
 			while (!(is_quiescent(turn)) && budget > 0) {
-				while (!($x(turn[1].v)) && budget > 0) {
+				while (!($S(turn[1].v)) && budget > 0) {
 					const derivations = turn[1].v;
 					turn[1].v = [  ];
 					turn[3].v = new Map();
@@ -112,26 +195,26 @@ function drain(turn) {
 	}
 }
 function defer_subscriber(turn, subscriber) {
-	const $u = turn;
-	let $v = null;
-	if ($u[0] === 0) {
-		const ambient = $u[1];
-		$v = enqueue(ambient, [ reissued(subscriber) ]);
+	const $P = turn;
+	let $Q = null;
+	if ($P[0] === 0) {
+		const ambient = $P[1];
+		$Q = enqueue(ambient, [ reissued(subscriber) ]);
 	} else {
-		const $B = $y(draining_turns.v);
-		let $C = null;
-		if ($B[0] === 0) {
-			const draining = $B[1];
-			$C = enqueue(draining, [ reissued(subscriber) ]);
+		const $W = $T(draining_turns.v);
+		let $X = null;
+		if ($W[0] === 0) {
+			const draining = $W[1];
+			$X = enqueue(draining, [ reissued(subscriber) ]);
 		} else {
 			if (subscriber[2].v) {
 				subscriber[1]();
 			}
-			$C = undefined;
+			$X = undefined;
 		}
-		$v = $C;
+		$Q = $X;
 	}
-	return $v;
+	return $Q;
 }
 function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
@@ -147,36 +230,36 @@ function detached(id, live, release) {
 	const empty = __shared_new(subscribers);
 	return [ empty, id, live, __shared_new([ 0, release ]) ];
 }
-function dispose(self, $ag) {
-	const $ah = $ag;
-	let $ai = null;
-	if ($ah[0] === 0) {
-		const established = $ah[1];
-		$ai = [ 0, established ];
+function dispose(self, $aD) {
+	const $aE = $aD;
+	let $aF = null;
+	if ($aE[0] === 0) {
+		const established = $aE[1];
+		$aF = [ 0, established ];
 	} else {
-		$ai = $y(draining_turns.v);
+		$aF = $T(draining_turns.v);
 	}
-	const ambient = $ai;
+	const ambient = $aF;
 	release_under(self, ambient);
 }
 function detach(handle) {
-	const $I = $y(releasing_turns.v);
-	let $J = null;
-	if ($I[0] === 0) {
-		const at_release = $I[1];
-		$J = at_release;
+	const $ad = $T(releasing_turns.v);
+	let $ae = null;
+	if ($ad[0] === 0) {
+		const at_release = $ad[1];
+		$ae = at_release;
 	} else {
-		$J = $y(draining_turns.v);
+		$ae = $T(draining_turns.v);
 	}
-	const turn = $J;
+	const turn = $ae;
 	release_under(handle, turn);
 }
 function release_under(handle, ambient) {
 	handle[2].v = false;
-	const $K = [ 0, handle[0] ];
-	let $L = null;
-	if ($K[0] === 0) {
-		const subscribers = $K[1];
+	const $af = [ 0, handle[0] ];
+	let $ag = null;
+	if ($af[0] === 0) {
+		const subscribers = $af[1];
 		let kept = [  ];
 		for (const subscriber of subscribers.v) {
 			if (subscriber[0] !== handle[1]) {
@@ -184,15 +267,15 @@ function release_under(handle, ambient) {
 			}
 		}
 		subscribers.v = kept;
-		$L = undefined;
+		$ag = undefined;
 	} else {
-		$L = undefined;
+		$ag = undefined;
 	}
-	$L;
-	const $M = ambient;
-	let $N = null;
-	if ($M[0] === 0) {
-		const turn = $M[1];
+	$ag;
+	const $ah = ambient;
+	let $ai = null;
+	if ($ah[0] === 0) {
+		const turn = $ah[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
 			if (subscriber2[0] !== handle[1]) {
@@ -209,51 +292,148 @@ function release_under(handle, ambient) {
 		}
 		turn[1].v = kept_derived;
 		turn[3].v.delete(hash(handle[1]));
-		$N = undefined;
+		$ai = undefined;
 	} else {
-		$N = undefined;
+		$ai = undefined;
 	}
-	$N;
-	const $O = handle[3].v;
-	let $P = null;
-	if ($O[0] === 0) {
-		const release = $O[1];
+	$ai;
+	const $aj = handle[3].v;
+	let $ak = null;
+	if ($aj[0] === 0) {
+		const release = $aj[1];
 		handle[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
 		});
-		$P = undefined;
+		$ak = undefined;
 	} else {
-		$P = undefined;
+		$ak = undefined;
 	}
-	return $P;
+	return $ak;
 }
-function register_with_owner(subscription, $aa, $ab) {
-	const $ac = $ab;
-	let $ad = null;
-	if ($ac[0] === 0) {
-		const owner = $ac[1];
-		$ad = $ae(owner, subscription, $aa);
+function new2() {
+	return [ __shared_new([ 0, [ 1 ], [ 1 ] ]), 0 ];
+}
+function is_disposed(self) {
+	return self[0].v[0] !== self[1];
+}
+function defer(self, cleanup) {
+	let $aI = null;
+	if (is_disposed(self)) {
+		cleanup();
 	} else {
-		$ad = __clone(subscription);
+		const $aG = self[0].v[1];
+		let $aH = null;
+		if ($aG[0] === 0) {
+			const list = $aG[1];
+			$aH = list.v.push(cleanup);
+		} else {
+			owner_lists_allocated_count.v = owner_lists_allocated_count.v + 1;
+			self[0].v[1] = [ 0, __shared_new([ cleanup ]) ];
+			$aH = undefined;
+		}
+		$aI = $aH;
 	}
-	return $ad;
+	return $aI;
+}
+function renew(self, with_nursery) {
+	const live = [ self[0], self[0].v[0] ];
+	dispose2(live);
+	const next = self[0].v[0];
+	if (with_nursery) {
+		self[0].v[2] = [ 0, detached_nursery() ];
+	}
+	return [ self[0], next ];
+}
+function nursery(self) {
+	let $G = null;
+	if (is_disposed(self)) {
+		$G = [ 1 ];
+	} else {
+		$G = self[0].v[2];
+	}
+	return $G;
+}
+function dispose2(self) {
+	let $F = null;
+	if (!(is_disposed(self))) {
+		const held = self[0].v;
+		self[0].v = [ self[1] + 1, [ 1 ], [ 1 ] ];
+		const $v = held[2];
+		let $w = null;
+		if ($v[0] === 0) {
+			const nursery2 = $v[1];
+			$w = nursery2.cancel();
+		} else {
+			$w = undefined;
+		}
+		$w;
+		const $x = held[1];
+		let $y = null;
+		if ($x[0] === 0) {
+			const cleanups = $x[1];
+			let failure = [ 1 ];
+			for (const cleanup of cleanups.v) {
+				const $z = __guarded(cleanup);
+				let $A = null;
+				if ($z[0] === 0) {
+					const message = $z[1];
+					if ($B(failure)) {
+						failure = [ 0, message ];
+					}
+					$A = undefined;
+				} else {
+					$A = undefined;
+				}
+				$A;
+			}
+			const $D = failure;
+			let $E = null;
+			if ($D[0] === 0) {
+				const message2 = $D[1];
+				$E = (() => {
+					throw message2;
+				})();
+			} else {
+				$E = undefined;
+			}
+			$y = $E;
+		} else {
+			$y = undefined;
+		}
+		$F = $y;
+	}
+	return $F;
+}
+function register_with_owner(subscription, $ax, $ay) {
+	const $az = $ay;
+	let $aA = null;
+	if ($az[0] === 0) {
+		const owner = $az[1];
+		$aA = $aB(owner, subscription, $ax);
+	} else {
+		$aA = __clone(subscription);
+	}
+	return $aA;
+}
+function release_runs(runs) {
+	dispose2([ runs[0], runs[0].v[0] ]);
 }
 function also_releasing(handle, release) {
 	const previous = handle[3].v;
 	handle[3].v = [ 0, () => {
 		release();
-		const $Y = previous;
-		let $Z = null;
-		if ($Y[0] === 0) {
-			const earlier = $Y[1];
-			$Z = earlier();
+		const $av = previous;
+		let $aw = null;
+		if ($av[0] === 0) {
+			const earlier = $av[1];
+			$aw = earlier();
 		} else {
-			$Z = undefined;
+			$aw = undefined;
 		}
-		return $Z;
+		return $aw;
 	} ];
 }
 function relay_to(subscriber) {
@@ -262,16 +442,19 @@ function relay_to(subscriber) {
 	}, true);
 }
 function detach_held(handle) {
-	const $D = handle.v;
-	let $E = null;
-	if ($D[0] === 0) {
-		const held = $D[1];
-		$E = detach(held);
+	const $Y = handle.v;
+	let $Z = null;
+	if ($Y[0] === 0) {
+		const held = $Y[1];
+		$Z = detach(held);
 	} else {
-		$E = undefined;
+		$Z = undefined;
 	}
-	$E;
+	$Z;
 	handle.v = [ 1 ];
+}
+function detached_nursery() {
+	return __nursery_new_detached();
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -283,58 +466,83 @@ function $a(value) {
 function $c(value) {
 	return $b(value);
 }
-function $e(self, select) {
+function $g(self, select) {
 	return [ __clone(self), select ];
 }
-function $n(self) {
+function $p(self) {
 	return __clone(self[0].v);
 }
-function $p(signal, subscriber) {
+function $r(signal, subscriber) {
 	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
 	return handle;
 }
-function $o(self, subscriber) {
-	return $p(self, subscriber);
+function $q(self, subscriber) {
+	return $r(self, subscriber);
 }
-function $m(self) {
+function $o(self) {
 	return [ () => {
-		return $n(self);
+		return $p(self);
 	}, (subscriber) => {
-		return $o(self, subscriber);
+		return $q(self, subscriber);
 	}, () => {
 		return;
 	} ];
 }
-function $s(self, subscriber) {
-	return $p(self, subscriber);
+function $B(self) {
+	const $C = self;
+	return $C[0] === 1;
 }
-function $q(self) {
+function $u(runs, body) {
+	const run = renew(runs, true);
+	const $H = nursery(run);
+	let $I = null;
+	if ($H[0] === 0) {
+		const nursery2 = $H[1];
+		$I = (($J) => {
+			return (($K) => {
+				return body($J, $K);
+			})(nursery2);
+		})(run);
+	} else {
+		$I = (() => {
+			throw "a renewed run carries its nursery";
+		})();
+	}
+	return $I;
+}
+function $N(self, subscriber) {
+	return $r(self, subscriber);
+}
+function $L(self) {
 	return [ () => {
-		return $n(self);
+		return $p(self);
 	}, (subscriber) => {
-		return $s(self, subscriber);
+		return $N(self, subscriber);
 	}, () => {
 		return;
 	} ];
 }
-function $x(self) {
+function $S(self) {
 	return self.length === 0;
 }
-function $y(self) {
-	let $A = null;
-	if ($x(self)) {
-		$A = [ 1 ];
+function $T(self) {
+	let $V = null;
+	if ($S(self)) {
+		$V = [ 1 ];
 	} else {
-		$A = __list_get(self, self.length - 1);
+		$V = __list_get(self, self.length - 1);
 	}
-	return $A;
+	return $V;
 }
-function $l(self) {
+function $n(self) {
 	const select = self[1];
-	const outer2 = $m(__clone(self[0]));
+	const runs = new2();
+	const outer2 = $o(__clone(self[0]));
 	const outer_pull = outer2[0];
-	const followed = __shared_new($q(select(outer_pull())));
+	const followed = __shared_new($L($u(runs, ($s, $t) => {
+		return select(outer_pull(), $s, $t);
+	})));
 	const followed_handle = __shared_new([ 1 ]);
 	return [ () => {
 		return followed.v[0]();
@@ -343,7 +551,9 @@ function $l(self) {
 		const outer_handle = outer2[1](subscriber_of(() => {
 			detach_held(followed_handle);
 			followed.v[2]();
-			const next = $q(select(outer_pull()));
+			const next = $L($u(runs, ($al, $am) => {
+				return select(outer_pull(), $al, $am);
+			}));
 			followed_handle.v = [ 0, next[1](relay_to(subscriber)) ];
 			followed.v = next;
 			wake(subscriber);
@@ -355,130 +565,154 @@ function $l(self) {
 			return;
 		});
 	}, () => {
+		release_runs(runs);
 		followed.v[2]();
 		outer2[2]();
 		return;
 	} ];
 }
-function $S(self, $T) {
-	const $U = $T;
-	let $V = null;
-	if ($U[0] === 0) {
-		const turn = $U[1];
-		$V = enqueue(turn, self[1].v);
+function $ap(self, $aq) {
+	const $ar = $aq;
+	let $as = null;
+	if ($ar[0] === 0) {
+		const turn = $ar[1];
+		$as = enqueue(turn, self[1].v);
 	} else {
-		const $W = $y(draining_turns.v);
-		let $X = null;
-		if ($W[0] === 0) {
-			const draining = $W[1];
-			$X = enqueue(draining, self[1].v);
+		const $at = $T(draining_turns.v);
+		let $au = null;
+		if ($at[0] === 0) {
+			const draining = $at[1];
+			$au = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$X = undefined;
+			$au = undefined;
 		}
-		$V = $X;
+		$as = $au;
 	}
-	return $V;
+	return $as;
 }
-function $Q(self, value, $R) {
+function $an(self, value, $ao) {
 	self[0].v = __clone(value);
-	$S(self, $R);
+	$ap(self, $ao);
 }
-function $ae(self, item, $af) {
-	if (self[1].v) {
-		dispose(item, $af);
-	} else {
-		self[0].v.push(() => {
-			dispose(item, $af);
-			return;
-		});
-	}
+function $aB(self, item, $aC) {
+	defer(self, () => {
+		dispose(item, $aC);
+		return;
+	});
 	return __clone(item);
 }
-function $i(self, $j, $k) {
-	const instance = $l(self);
+function $k(self, $l, $m) {
+	const instance = $n(self);
 	const pull = instance[0];
 	const cached = $b(pull());
 	const refreshed = instance[1](subscriber_of(() => {
-		$Q(cached, pull(), $j);
+		$an(cached, pull(), $l);
 		return;
 	}, true));
 	also_releasing(refreshed, instance[2]);
-	register_with_owner(refreshed, $j, $k);
+	register_with_owner(refreshed, $l, $m);
 	return cached;
 }
-function $f(self, $g, $h) {
-	return [ $i(self, $g, $h) ];
+function $h(self, $i, $j) {
+	return [ $k(self, $i, $j) ];
 }
-function $aj(self) {
-	return $n(self[0]);
+function $aJ(self) {
+	return $p(self[0]);
 }
-function $ak(self, value, $R) {
+function $aK(self, value, $ao) {
 	self[0].v = __clone(value);
-	$S(self, $R);
+	$ap(self, $ao);
 }
-function $aq(self, transform) {
+function $aS(self, transform) {
 	return [ __clone(self), transform ];
 }
-function $av(self, subscriber) {
-	return $p(self[0], subscriber);
+function $aX(self, subscriber) {
+	return $r(self[0], subscriber);
 }
-function $au(self) {
+function $aW(self) {
 	return [ () => {
-		return $aj(self);
+		return $aJ(self);
 	}, (subscriber) => {
-		return $av(self, subscriber);
+		return $aX(self, subscriber);
 	}, () => {
 		return;
 	} ];
 }
-function $at(self) {
-	const transform = self[1];
-	const upstream = $au(__clone(self[0]));
-	const pull = upstream[0];
-	return [ () => {
-		return transform(pull());
-	}, upstream[1], upstream[2] ];
+function $ba(runs, body) {
+	const run = renew(runs, true);
+	const $bb = nursery(run);
+	let $bc = null;
+	if ($bb[0] === 0) {
+		const nursery2 = $bb[1];
+		$bc = (($J) => {
+			return (($K) => {
+				return body($J, $K);
+			})(nursery2);
+		})(run);
+	} else {
+		$bc = (() => {
+			throw "a renewed run carries its nursery";
+		})();
+	}
+	return $bc;
 }
-function $as(self, $j, $k) {
-	const instance = $at(self);
+function $aV(self) {
+	const transform = self[1];
+	const upstream = $aW(__clone(self[0]));
+	const pull = upstream[0];
+	const runs = new2();
+	return [ () => {
+		const value = pull();
+		return $ba(runs, ($aY, $aZ) => {
+			return transform(value, $aY, $aZ);
+		});
+	}, upstream[1], () => {
+		release_runs(runs);
+		upstream[2]();
+		return;
+	} ];
+}
+function $aU(self, $l, $m) {
+	const instance = $aV(self);
 	const pull = instance[0];
 	const cached = $b(pull());
 	const refreshed = instance[1](subscriber_of(() => {
-		$Q(cached, pull(), $j);
+		$an(cached, pull(), $l);
 		return;
 	}, true));
 	also_releasing(refreshed, instance[2]);
-	register_with_owner(refreshed, $j, $k);
+	register_with_owner(refreshed, $l, $m);
 	return cached;
 }
-function $ar(self, $g, $h) {
-	return [ $as(self, $g, $h) ];
+function $aT(self, $i, $j) {
+	return [ $aU(self, $i, $j) ];
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 const releasing_turns = __shared_new([  ]);
+const owner_lists_allocated_count = __shared_new(0);
 const first = $a(1);
 const second = $a(10);
 const outer = $c(first);
-const joined = $f($e(__clone(outer), (inner) => {
+const joined = $h($g(__clone(outer), (inner, $e, $f) => {
 	return __clone(inner);
 }), [ 1 ], [ 1 ]);
-console.log($aj(joined));
-$Q(first, 2, [ 1 ]);
-console.log($aj(joined));
-$ak(outer, second, [ 1 ]);
-console.log($aj(joined));
-$Q(first, 99, [ 1 ]);
-console.log($aj(joined));
-$Q(second, 11, [ 1 ]);
-console.log($aj(joined));
-const doubled = $ar($aq(joined, (value) => {
+console.log($aJ(joined));
+$an(first, 2, [ 1 ]);
+console.log($aJ(joined));
+$aK(outer, second, [ 1 ]);
+console.log($aJ(joined));
+$an(first, 99, [ 1 ]);
+console.log($aJ(joined));
+$an(second, 11, [ 1 ]);
+console.log($aJ(joined));
+const doubled = $aT($aS(joined, (value, $aQ, $aR) => {
 	return value * 2;
 }), [ 1 ], [ 1 ]);
-$Q(second, 21, [ 1 ]);
-console.log($aj(doubled));
+$an(second, 21, [ 1 ]);
+console.log($aJ(doubled));

@@ -399,7 +399,7 @@ fun main() {
 
 ### Who cleans up what
 
-Five rules, and they are the whole answer:
+Six rules, and they are the whole answer:
 
 | What you wrote | Who releases the observer | When |
 |---|---|---|
@@ -408,7 +408,7 @@ Five rules, and they are the whole answer:
 | `derive` / `combine` / `flatten` / `switch` / `and_then` | nothing to release — a pipe registers nothing until it is consumed | — |
 | `.memo()` / `.cell()` / `selector` **inside** a boundary | the ambient owner | the boundary is disposed |
 | `.memo()` / `.cell()` / `selector` **outside** every boundary (a function body), `.memo_global()` / `.cell_global()` anywhere | nobody — it lives as long as its source | never (deliberate: see below) |
-| `signal.scoped_effect(..)`, and anything its body registers | that **run's** owner | before the next run, and with the boundary |
+| anything an `effect` body, a `derive` body or a `switch` selector registers — and any task it starts | that **run's** owner | before the next run, and with the boundary (a task is cancelled) |
 
 Two of those rows are worth a sentence.
 
@@ -422,7 +422,7 @@ source, on purpose.** `current_path().derive(|path| parse(path))` at the top of
 `main` is a pipe and costs nothing until something consumes it; a `.memo()` of it there is
 meant to last as long as the program. Refusing that would be the stricter rule
 and would break the idiom, so vilan does not — except in a module binding's
-initializer, where the lifetime is spelled `.cell_global()`. Inside a boundary
+initializer, where the lifetime is spelled `.memo_global()`. Inside a boundary
 a `.memo()` dies with the boundary, which is what a component wants. A
 *mirror* is where the owner is asked strictly: an `effect` on a
 `RemoteSource` (or on a pipe over one) requires an owner, because its
@@ -433,14 +433,14 @@ after it was disposed runs the cleanup on the spot rather than parking
 it on a list nothing will read again. That is what makes ownership hold
 across `await`.
 
-### An owner per run: `scoped_effect`
+### An owner per run
 
-An effect's body normally runs under the *boundary's* owner, so whatever
-it registers accumulates: one subscription, timer or lease per change,
-released all together when the boundary goes. That is right for a body
-that reads and writes, and wrong for a body that *opens* something.
-
-`scoped_effect` gives every run its own owner:
+Every body a pipe runs — an `effect`'s, a `derive`'s, a `switch` selector — runs
+**under an owner of its own, per run**. Whatever the body registers (an
+`on_cleanup`, a nested `effect`, a `.memo()`, a mirror's lease) is released
+**before the next run**, and the last run's with the boundary; a task the body
+starts is cancelled at the same moment. So a body that *opens* something opens
+one at a time:
 
 ```vilan
 import std::reactive::{ Owner, Signal, Source, on_cleanup, run_with_owner };
@@ -450,7 +450,7 @@ fun main() {
 	let detail = Signal::new("loading");
 	let page = Owner::new();
 	run_with_owner(page, || {
-		selected.scoped_effect(|id: i32| {
+		selected.effect(|id: i32| {
 			on_cleanup(|| print(i"closing {id}"));
 			// One subscription on `detail` at a time, not one per selection.
 			detail.effect(|text: str| print(i"{id}: {text}"));
@@ -461,11 +461,40 @@ fun main() {
 }
 ```
 
-Everything the body registered is released **before the next run**, and
-the last run is released with the boundary. `on_cleanup` is one name
-whose meaning the ambient owner decides: inside a `scoped_effect` it is
-per run, inside any other boundary it is once, at teardown.
-`scoped_effect_on_change` is the same without the immediate first run.
+`on_cleanup` is one name whose meaning the ambient owner decides: inside a body
+it is per run, inside any other boundary it is once, at teardown. A body that
+registers nothing pays for no owner — the run's owner is allocated at its first
+registration. (`scoped_effect` is the old name of this behaviour, kept one
+release as a deprecated alias of `effect`.)
+
+A task works the same way: a `derive` whose body starts a fetch cancels the
+superseded one when its input changes, because the old run is released before
+the new one starts:
+
+```vilan
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::time::sleep;
+
+fun main() {
+	let id = Signal::new(1);
+	let page = Owner::new();
+	run_with_owner(page, || {
+		id.effect(|value: i32| {
+			let _pending = async {
+				sleep(20);
+				print(i"loaded {value}");
+			};
+		});
+	});
+	id.set(2);          // run 1's task is cancelled; only `loaded 2` prints
+	sleep(60);
+	page.dispose();
+}
+```
+
+Because a body's owner and nursery are INJECTED into it (a `context` clause), a
+body must be a closure literal (or a local closure): `count.derive(|n| label(n))`,
+not `count.derive(label)`.
 
 Creating reactive state *outside* any owner is a compile error. That
 sounds strict, but it's the property that makes leaks impossible by

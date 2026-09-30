@@ -70,6 +70,20 @@ import pkg::reactive::{
 import pkg::shared::Shared;
 import pkg::style::Style;
 
+/// A binding's subscription: `observer` now and on every change, released with
+/// the nearest boundary. `effect` without the per-run owner (A142 §4): every body
+/// a binding runs writes the DOM and registers nothing, so it pays for no owner
+/// and no nursery per change. A form that builds per value (`when`, `swap`,
+/// `each`) keeps the owners it makes itself.
+fun follow<T, F: Flow<T>>(own flow: F, observer: |T| void) {
+	get_owner().take(flow.sub(observer));
+}
+
+/// `follow` without the immediate call.
+fun follow_changes<T, F: Flow<T>>(own flow: F, observer: |T| void) {
+	get_owner().take(flow.on_change(observer));
+}
+
 /// A handle to a DOM element under construction — nothing more: ownership is the
 /// enclosing boundary's job.
 export struct View {
@@ -166,7 +180,7 @@ export impl View {
 	/// a subscription parked in a `let _sub` outlives the view it writes to.
 	fun style_var<S: Flow<str>>(self, name: str, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_style_property(name, value);
 		});
 		self
@@ -229,7 +243,7 @@ export impl View {
 	/// (A33).
 	fun bind_text<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_text(value);
 		});
 		self
@@ -238,7 +252,7 @@ export impl View {
 	/// Reactive CSS class.
 	fun bind_class<S: Flow<str>>(self, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_attribute("class", value);
 		});
 		self
@@ -251,7 +265,7 @@ export impl View {
 	/// construct-in-const rule holds with a signal in the middle.
 	fun bind_styled<S: Flow<Style>>(self, own source: S): View {
 		let element = self.element;
-		source.effect(|value| {
+		follow(source, |value| {
 			element.set_attribute("class", value.class_list());
 		});
 		self
@@ -291,7 +305,7 @@ export impl View {
 	/// alike).
 	fun toggle_attr<S: Flow<bool>>(self, name: str, own source: S): View {
 		let element = self.element;
-		source.effect(|present| {
+		follow(source, |present| {
 			if present {
 				element.set_attribute(name, "");
 			} else {
@@ -316,7 +330,7 @@ export impl View {
 	/// with nothing pointing back.
 	fun bind_value<S: Signal<str>>(self, signal: S): View {
 		let element = self.element;
-		signal.effect(|value| {
+		follow(signal, |value| {
 			element.set_value(value);
 		});
 		write_back_value(self.element, signal);
@@ -333,7 +347,7 @@ export impl View {
 	/// construction — this pushes.
 	fun bind_draft(self, draft: Draft<str>): View {
 		let element = self.element;
-		draft.local.effect(|value| {
+		follow(draft.local, |value| {
 			// Skip the no-op write (a push echoing through `local`): setting an
 			// input's value, even to itself, can move the caret.
 			if element.value() != value {
@@ -492,7 +506,7 @@ export impl View {
 	fun show<S: Flow<bool>>(self, own condition: S): View {
 		let element = self.element;
 		let restored = element.style_property("display");
-		condition.effect(|visible| {
+		follow(condition, |visible| {
 			element.set_hidden(!visible);
 			if visible {
 				element.set_style_property("display", restored);
@@ -873,7 +887,7 @@ fun place_text_flow<F: Flow<str>>(own flow: F, parent: View) {
 	// parent element's, and it was placed while the caller was building that
 	// parent, not by a boundary.
 	get_owner().defer(|| node.remove());
-	flow.effect(|value| {
+	follow(flow, |value| {
 		node.set_text(value);
 	});
 }
@@ -939,7 +953,7 @@ fun place_view_flow<F: Flow<View>>(own flow: F, parent: View) {
 	// already dies with it (an ambient `effect`); this is the DOM half, which
 	// matters exactly when the parent survives.
 	get_owner().defer(|| region.close());
-	flow.effect(|next: View| {
+	follow(flow, |next: View| {
 		match live.read() {
 			Some(let previous) => previous.element.remove(),
 			None => {},
@@ -985,7 +999,7 @@ fun place_views_flow<F: Flow<List<View>>>(own flow: F, parent: View) {
 	// A88, as for the single-view arm above: the run and its anchor leave with the
 	// boundary.
 	get_owner().defer(|| region.close());
-	flow.effect(|next: List<View>| {
+	follow(flow, |next: List<View>| {
 		for previous in live.read() {
 			previous.element.remove();
 		}
@@ -1151,7 +1165,7 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 	// would. Threading an ambient turn in from the build instead is what made
 	// this function a context node, which the gate cannot afford.
 	let wire = || {
-		source.effect(|value: T| turn(FlushPolicy::AtSuspension, || {
+		follow(source, |value: T| turn(FlushPolicy::AtSuspension, || {
 			// Claim this navigation's generation before anything can await, so a
 			// continuation can tell whether it is still the latest.
 			let mine = generation.read() + 1;
@@ -1237,7 +1251,7 @@ export impl Conditional<type S: Flow<bool>, type C: Slot> with Slot {
 			region.close();
 		});
 		let body = self.body;
-		self.condition.effect(|on| {
+		follow(self.condition, |on| {
 			if on {
 				match live_row.read() {
 					Some(let _present) => {},
@@ -1340,7 +1354,7 @@ fun place_swap<T: PartialEq, S: Flow<T>, C: Slot>(
 		live_owner.read()?.dispose();
 		region.close();
 	});
-	source.effect(|value: T| {
+	follow(source, |value: T| {
 		let unchanged = match last_value.read() {
 			Some(let previous) => previous == value,
 			None => false,
@@ -1761,7 +1775,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 	};
 	match source.delta_cursor() {
 		// No log, so nothing to apply: the pass is the only answer there is.
-		None => source.effect(reconcile_pass),
+		None => follow(source, reconcile_pass),
 		Some(let cursor) => {
 			// The cursor is the boundary's, like every subscription here: a
 			// disposed `each` stops pinning the log's history.
@@ -1769,7 +1783,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			// Attached WITHOUT the immediate call, then seeded — `map_each`'s order
 			// and for its reason: the cursor was minted at the sequence the seed is
 			// read at, so the seed is exactly the state the cursor names.
-			source.effect_on_change(|_published| {
+			follow_changes(source, |_published| {
 				for op in live_ops(source.delta_since(cursor)) {
 					match op {
 						// A splice that only removes or only inserts cannot re-meet
@@ -2061,13 +2075,13 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 	};
 	match source.delta_cursor() {
 		// No log, so nothing to apply: the pass is the only answer there is.
-		None => source.effect(reconcile_pass),
+		None => follow(source, reconcile_pass),
 		Some(let cursor) => {
 			// The cursor is the boundary's, like every subscription here.
 			get_owner().defer(|| source.drop_delta_cursor(cursor));
 			// Attached WITHOUT the immediate call, then seeded — `place_each`'s
 			// order, for its reason.
-			source.effect_on_change(|_published| {
+			follow_changes(source, |_published| {
 				for op in live_ops(source.delta_since(cursor)) {
 					match op {
 						// Positional when it only removes or only inserts; the pass
@@ -2170,7 +2184,7 @@ export impl type S: Source<str> with AttrValue {
 
 fun apply_text_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
-	flow.effect(|value| {
+	follow(flow, |value| {
 		element.set_attribute(name, value);
 	});
 }
@@ -2217,7 +2231,7 @@ export impl type S: Source<Option<str>> with AttrValue {
 
 fun apply_optional_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
-	flow.effect(|value| {
+	follow(flow, |value| {
 		match value {
 			Some(let text) => element.set_attribute(name, text),
 			None => element.remove_attribute(name),
@@ -2265,7 +2279,7 @@ export impl type S: Source<str> with AttrBinding {
 
 fun bind_text_attribute_flow<F: Flow<str>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
-	flow.effect(|value| {
+	follow(flow, |value| {
 		element.set_attribute(name, value);
 	});
 }
@@ -2292,7 +2306,7 @@ export impl type S: Source<Option<str>> with AttrBinding {
 
 fun bind_optional_attribute_flow<F: Flow<Option<str>>>(own flow: F, parent: View, name: str) {
 	let element = parent.element;
-	flow.effect(|value| {
+	follow(flow, |value| {
 		match value {
 			Some(let text) => element.set_attribute(name, text),
 			None => element.remove_attribute(name),
@@ -2431,7 +2445,7 @@ fun place_when_some<T, S: Flow<Option<T>>, C: Slot>(
 		live_owner.read()?.dispose();
 		region.close();
 	});
-	source.effect(|value: Option<T>| {
+	follow(source, |value: Option<T>| {
 		match value {
 			Some(let payload) => {
 				match live_cell.read() {

@@ -90,7 +90,7 @@ impl SignalCell<type T> with Source<T> {
 }
 // Every source is a `Flow` (the blanket), so the cell has the consumers and the
 // combinators too — each taking `own self`, which for a cell is a copy:
-//   on_change / sub / effect / effect_on_change / scoped_effect
+//   on_change / sub / effect / effect_on_change (an owner per run)
 //   derive / switch / distinct_by, and the bounded blankets below
 impl type F: Flow<Option<type T>> {
 	fun switch_some<U, I: Flow<U>>(own self, select: sync |T| I): SwitchSome<F, T, I, U>
@@ -257,10 +257,12 @@ trait Flow<T> {
 	fun on_change(own self, observer: |T| void): Subscription         // no first call
 	[must_use]
 	fun sub(own self, observer: |T| void): Subscription               // + one immediate call
-	fun effect_on_change(own self, observer: |T| void)                // owner-registered
-	fun effect(own self, observer: |T| void)                          // owner-registered, eager
-	fun derive<U>(own self, transform: sync |T| U): Derive<Self, T, U>
-	fun switch<U, I: Flow<U>>(own self, select: sync |T| I): Switch<Self, T, I, U>
+	fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+	                                                                  // owner-registered; an owner per run
+	fun effect(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+	                                                                  // the same, eager
+	fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, ambient_nursery)): Derive<Self, T, U>
+	fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, ambient_nursery)): Switch<Self, T, I, U>
 	fun distinct_by<K: PartialEq>(own self, key: sync |T| K): DistinctBy<Self, T, K>
 	…
 }
@@ -492,23 +494,35 @@ fun main() {
 }
 ```
 
-### scoped_effect — an owner per run
+### An owner per run — every body a pipe runs
 
 ```vilan,fragment
-fun scoped_effect(self, body: (sync |T| void) context owner_scope)
-fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope)
+fun effect(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+fun effect_on_change(own self, body: (|T| void) context (owner_scope, ambient_nursery))
+fun derive<U>(own self, transform: (sync |T| U) context (owner_scope, ambient_nursery)): Derive<Self, T, U>
+fun switch<U, I: Flow<U>>(own self, select: (sync |T| I) context (owner_scope, ambient_nursery)): Switch<Self, T, I, U>
 fun on_cleanup(cleanup: || void)
+[deprecated] fun scoped_effect(own self, body: (sync |T| void) context owner_scope)   // = effect
 ```
 
-`effect`, except that **every run gets its own `Owner`**. Whatever the body
-registers — an `on_cleanup`, a nested `effect` or `map`, an `owner.take`, a
-mirror's lease — is released before the next run, and when the enclosing
-boundary goes.
+**Every run of a body a pipe runs gets its own `Owner`** (A142 R2/R14): an
+`effect`'s, a `derive`'s, a `switch`/`switch_some`/`and_then` selector's.
+Whatever the body registers — an `on_cleanup`, a nested `effect`, a `.memo()`,
+an `owner.take`, a mirror's lease — is released before the next run, and the
+last run's when the consumer is released (the enclosing boundary, for an
+`effect` or a `.memo()`; the call itself, for `.sample()`). A task the body
+starts runs in the run's nursery and is **cancelled** when the run is released,
+so a superseded fetch stops rather than landing late. A pipe has exactly one
+consumer, so every body runs once per change inside one instance, and "a run"
+always means "one run per change".
 
-A plain `effect` body that subscribes to something accumulates one subscription
-per change for as long as the boundary lives. That is usually what you want for
-a body that only reads and writes; it is never what you want for a body that
-opens something:
+The owner is allocated LAZILY: a stage keeps one owner cell for the life of its
+instance, each run is the next epoch of it, and the cleanup list is made at the
+run's first registration — a body that registers nothing costs a read and a
+write, and allocates no owner. (A run's nursery is created per run: the host's
+spawn machinery registers a task at the `async` expression, so one has to
+exist before the body runs.) The bindings in `std::ui` do not pay even that:
+their bodies write the DOM and register nothing, so they attach plainly.
 
 ```vilan
 import std::reactive::{ Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner };
@@ -519,7 +533,7 @@ fun main() {
 	let page = Owner::new();
 	run_with_owner(page, || {
 		// One subscription on `detail` at a time, not one per selection.
-		selected.scoped_effect(|id: i32| {
+		selected.effect(|id: i32| {
 			on_cleanup(|| print(i"closing {id}"));
 			detail.effect(|text: str| print(i"{id}: {text}"));
 		});
@@ -530,21 +544,28 @@ fun main() {
 ```
 
 `on_cleanup(cleanup)` is `get_owner().defer(cleanup)` under a name, and it is
-**one name whose meaning the ambient owner decides**: inside a `scoped_effect`
-the ambient owner is that run's, so the cleanup runs per run; inside any other
-boundary — a mounted view, a `swap` instantiation, an `each` row — it is the
-boundary's, so it runs once, at teardown. Like `effect`, it requires an
-enclosing owner *statically*: a cleanup with nothing in scope to run it is a
-compile error, not a silent no-op.
+**one name whose meaning the ambient owner decides**: inside a body the ambient
+owner is that run's, so the cleanup runs per run; inside any other boundary — a
+mounted view, a `swap` instantiation, an `each` row — it is the boundary's, so
+it runs once, at teardown. Like `effect`, it requires an enclosing owner
+*statically*: a cleanup with nothing in scope to run it is a compile error, not
+a silent no-op.
 
-The order inside a run is: release the previous run, install the fresh owner,
+The order inside a run is: release the previous run, install the fresh epoch,
 call the body. So a body that throws has already had its owner installed, and
 what it registered before throwing is released by the next run (or by the
-boundary).
+consumer's release). A registration that arrives after its run was released —
+an `await` that resumed late — is released on the spot.
+
+The body's owner and nursery are INJECTED (the `context` clause), which is what
+makes them the RUN's rather than the boundary's; the price is that a body is a
+closure literal or a local closure — a named function is refused at the call
+(`count.derive(|n| label(n))`, not `count.derive(label)`). `scoped_effect` and
+`scoped_effect_on_change` are `effect`'s and `effect_on_change`'s names before
+the two merged, kept one release as deprecated aliases.
 
 `swap`, `when` and `each` are **not** built on this — they keep their own
-per-instantiation owners. Reach for `scoped_effect` when you want that lifetime
-without a view.
+per-instantiation owners.
 
 ## selector — per-key selection
 
