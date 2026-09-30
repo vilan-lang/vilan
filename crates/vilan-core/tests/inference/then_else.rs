@@ -195,3 +195,151 @@ fn b459_then_is_a_name_everywhere_but_after_an_operand() {
         "5\n",
     );
 }
+
+// --- R15 (RULED 2026-09-29): the guard's bindings reach the rest of the block --
+//
+// `opt is Some(let v) else ret;` is `if opt is Some(let v) {} else { ret; }`,
+// where B171 scopes `v` to the empty then-block. When the `else` statement
+// DIVERGES — `ret`, `jump`, a `panic(..)`, an endless loop (B204's four
+// leaves) — the only way past the statement is the condition's TRUE path, so
+// the captures that path binds are published into the enclosing block from
+// the statement's end: Swift's `guard`, Rust's `let … else`. B187's shape,
+// mirrored (there, a diverging THEN publishes the FALSE-path captures).
+
+#[test]
+fn r15_a_guards_binding_reaches_the_rest_of_the_block() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::{ panic, print };
+
+        fun describe(found: Option<i32>): str {
+            found is Some(let n) else ret "none";
+            i"got {n}"
+        }
+
+        fun total(xs: List<Option<i32>>): i32 {
+            mut sum = 0;
+            for x in xs {
+                x is Some(let value) else jump continue;
+                sum += value;
+            }
+            sum
+        }
+
+        fun must(found: Option<str>): str {
+            found is Some(let text) else panic("missing");
+            text
+        }
+
+        fun main() {
+            print(describe(Some(4)));
+            print(describe(None));
+            print(total([ Some(1), None, Some(5) ]));
+            print(must(Some("here")));
+            // The `then` + `else` statement form publishes too.
+            let pair: Option<i32> = Some(2);
+            pair is Some(let p) then print("present") else ret;
+            print(p * 10);
+        }
+        main();
+        "#,
+        "got 4\nnone\n6\nhere\npresent\n20\n",
+    );
+}
+
+/// A NON-diverging `else` proves nothing about the path past the statement:
+/// the capture stays the then-block's (B171), and a read after it misses.
+#[test]
+fn r15_a_non_diverging_else_does_not_extend_the_binding() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let found: Option<i32> = Some(1);
+            found is Some(let n) else print("none");
+            print(n);
+        }
+        main();
+        "#,
+        "cannot find 'n'",
+    );
+    // Nor does the keyword `if` it spells — R15 is the sugar's rule.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let found: Option<i32> = Some(1);
+            if found is Some(let n) {} else { ret; }
+            print(n);
+        }
+        main();
+        "#,
+        "cannot find 'n'",
+    );
+}
+
+/// Only what the condition's TRUE path binds is published: a capture under a
+/// negation or in one arm of `||` is not proven by the condition holding.
+#[test]
+fn r15_only_the_true_paths_captures_are_published() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let a: Option<i32> = Some(1);
+            let b: Option<i32> = None;
+            a is Some(let x) || b is Some(let x) else ret;
+            print(x);
+        }
+        main();
+        "#,
+        "cannot find 'x'",
+    );
+}
+
+/// Nested and chained guards: each publishes into the block it is written in,
+/// a later guard reads an earlier one's binding, and a guard inside a nested
+/// block publishes there and no further.
+#[test]
+fn r15_nested_guards_each_publish_into_their_own_block() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun pick(outer: Option<Option<i32>>): i32 {
+            outer is Some(let inner) else ret -1;
+            inner is Some(let value) else ret -2;
+            {
+                value > 1 else ret 0;
+                let scaled = value * 2;
+                scaled is 4 else ret 3;
+            }
+            value
+        }
+
+        fun main() {
+            print(pick(Some(Some(2))));
+            print(pick(Some(None)));
+            print(pick(None));
+            print(pick(Some(Some(1))));
+        }
+        main();
+        "#,
+        "2\n-2\n-1\n0\n",
+    );
+    // A binding published inside a nested block ends with it.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() {
+            let found: Option<i32> = Some(1);
+            {
+                found is Some(let n) else ret;
+            }
+            print(n);
+        }
+        main();
+        "#,
+        "cannot find 'n'",
+    );
+}

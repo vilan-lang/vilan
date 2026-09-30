@@ -57,6 +57,21 @@ fun main() {
 }
 ```
 
+When a guard's `else` leaves — `ret`, `jump`, a `panic` — the only way past
+it is the condition holding, so what an `is` in the condition binds stays
+bound for the rest of the block:
+
+```vilan
+fun describe(found: Option<i32>): str {
+	found is Some(let n) else ret "none";
+	i"got {n}"
+}
+
+fun main() {
+	print(describe(Some(4)));
+}
+```
+
 The word binds looser than `||` and tighter than `=`: `a || b then x else y`
 tests `a || b`, and `label = ok then "yes" else "no";` assigns the whole form.
 A branch is a single statement with no block of its own, so a `let` there is

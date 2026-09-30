@@ -766,7 +766,14 @@ At a statement's HEAD, a form ended by the statement's `;` is a
 (`if c { S; } else { S; }`): each branch is one statement whose value is
 discarded, so the branches need not unify, and a branch that is itself a form
 is read as a statement too. A branch has no block of its own, so a `let` as
-a branch is refused. The same form parenthesized, or at a block's end with no
+a branch is refused. The one rule that is not a rewrite (R15): when the
+`else` statement of a statement form DIVERGES — `ret`, `jump`, a `panic(…)`,
+an endless loop — the statement can be left only along the condition's TRUE
+path, so the `is` bindings that path makes reach the rest of the enclosing
+block, from the statement's end (`opt is Some(let v) else ret;` binds `v`
+below it). A capture under `!` or in one operand of `||` is not proven by
+the condition holding and is not extended; the keyword `if` keeps its own
+scoping. The same form parenthesized, or at a block's end with no
 `;`, is a value. `then` is a contextual keyword: it is read only after a
 complete operand, where no name can stand, so `let then = 1;` and
 `promise.then(f)` are unaffected.
