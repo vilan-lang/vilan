@@ -295,25 +295,25 @@
    "patterns": [
     {
      "name": "keyword.control.vilan",
-     "match": "\\b(if|else|match|for|in|is|ret|await)\\b"
+     "match": "(?<!\\.)\\b(if|else|match|for|in|is|ret|await)\\b(?!\\s*(?::(?!:)|=(?![=>])))"
     },
     {
      "name": "keyword.control.import.vilan",
-     "match": "\\b(import|use)\\b"
+     "match": "(?<!\\.)\\b(import|use)\\b(?!\\s*(?::(?!:)|=(?![=>])))"
     },
     {
      "comment": "Declaration keywords that introduce a named item.",
      "name": "storage.type.vilan",
-     "match": "\\b(fun|struct|enum|impl|trait|type|mod|macro)\\b"
+     "match": "(?<!\\.)\\b(fun|struct|enum|impl|trait|type|mod|macro)\\b(?!\\s*(?::(?!:)|=(?![=>])))"
     },
     {
      "name": "storage.modifier.vilan",
-     "match": "\\b(let|mut|external|export|async|const)\\b"
+     "match": "(?<!\\.)\\b(let|mut|external|export|async|const)\\b(?!\\s*(?::(?!:)|=(?![=>])))"
     },
     {
      "comment": "`with` (trait impl / bound), the `borrows` return clause, and `css` (the head of a `css { … }` block).",
      "name": "keyword.other.vilan",
-     "match": "\\b(css)\\b"
+     "match": "(?<!\\.)\\b(css)\\b(?!\\s*(?::(?!:)|=(?![=>])))"
     },
     {
      "comment": "The `context` CLAUSE \u2014 on a closure type (`(|| void) context owner_scope`, multi `context (a, b)`) and on a `fun` DECLARATION, where it sits after the RETURN type (`fun f(): i32 context settings`, contexts.md \u00a73; B343/R9 keeps that position). It is a contextual keyword (a value or module may be NAMED `context`), so it is guarded on BOTH sides: something a type or a parameter list can END with before it, and a NAME or the multi form's `(` after it \u2014 which is what keeps `context.run(..)` and `context.get()` plain.",
@@ -397,8 +397,17 @@
      }
     },
     {
+     "comment": "B459: `then`, the infix conditional \u2014 contextual, a keyword only after a complete operand (something an expression can END with before it) and before the branch that follows. A name there is never legal (vilan never puts two names side by side), so the guard is both sides, as for `context`: the word is not followed by what a NAME is followed by (`=`, `.`, `:`, `,`, `;`, a closer, or `in`/`is`/`as`), which keeps `let then = 1`, `for then in xs`, `then: i32` and `promise.then(f)` plain.",
+     "match": "(?<=[A-Za-z0-9_\\)\\]\\}\"'])\\s+(then)\\b(?=\\s+(?![=.:,;\\)\\]\\}]|i[ns]\\b|as\\b)\\S)",
+     "captures": {
+      "1": {
+       "name": "keyword.control.vilan"
+      }
+     }
+    },
+    {
      "name": "constant.language.vilan",
-     "match": "\\b(true|false|null)\\b"
+     "match": "(?<!\\.)\\b(true|false|null)\\b(?!\\s*(?::(?!:)|=(?![=>])))"
     },
     {
      "name": "variable.language.self.vilan",

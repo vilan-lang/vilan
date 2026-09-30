@@ -733,6 +733,140 @@ fn b414_the_contextual_keywords_are_coloured_by_position_in_both_grammars() {
     }
 }
 
+/// B414 S4 (the member tier): a RESERVED word names a member, and both
+/// grammars paint it as the name it is at the two member positions a line
+/// regex can see — after a member `.` (R-k writes the name against it) and
+/// before a field's `:` or a literal field's `=` — while every keyword reading
+/// keeps its colour. Run the way each engine runs its rules: the TextMate
+/// keyword lists as regexes over a line, the book's member and field modes as
+/// the leftmost match that takes the word before the keyword list can.
+#[test]
+fn b414_s4_a_reserved_word_in_a_member_position_is_painted_as_a_name() {
+    const MEMBERS: &[(&str, &str)] = &[
+        ("event.type", "type"),
+        ("bag.if()", "if"),
+        ("found?.match()", "match"),
+        ("struct Event { type: str }", "type"),
+        ("Event { type = kind, if = 1 }", "type"),
+    ];
+    const KEYWORDS: &[&str] = &[
+        "if x == y {",
+        "} else {",
+        "match value {",
+        "true => 1,",
+        "let found = x == null;",
+        "fun type_(self): str",
+        "for x in xs {",
+    ];
+    let textmate = textmate_grammar(&[]);
+    let keyword_rules: Vec<&Rule> = textmate
+        .rules("keywords")
+        .into_iter()
+        .filter(|rule| rule.regex.starts_with("(?<!\\.)"))
+        .collect();
+    assert_eq!(
+        keyword_rules.len(),
+        6,
+        "{TEXTMATE_GRAMMAR}: the six generated keyword lists carry the member guard"
+    );
+    for (text, word) in MEMBERS {
+        for rule in &keyword_rules {
+            assert!(
+                regex_match_positions(&rule.regex, text)
+                    .iter()
+                    .all(|(_, matched)| matched != word),
+                "{TEXTMATE_GRAMMAR}: {:?} paints the member `{word}` in {text:?} as a keyword",
+                rule.regex
+            );
+        }
+    }
+    for text in KEYWORDS {
+        assert!(
+            keyword_rules
+                .iter()
+                .any(|rule| !regex_match_positions(&rule.regex, text).is_empty()),
+            "{TEXTMATE_GRAMMAR}: no keyword list paints the keyword in {text:?}"
+        );
+    }
+    // The book: the member and field modes are the leftmost match at the
+    // word, so the keyword list never sees it.
+    let highlight = highlight_grammar(&[]);
+    let member = highlight
+        .rules("")
+        .into_iter()
+        .find(|rule| rule.regex.starts_with("(?<=\\.)"))
+        .expect("the book's member-name mode");
+    let field = highlight
+        .rules("")
+        .into_iter()
+        .find(|rule| rule.regex.contains("(?::(?!:)|=(?![=>]))"))
+        .expect("the book's field-name mode");
+    for (text, word) in MEMBERS {
+        let at = text.find(word).expect("the word is in the text");
+        let taken = [member, field].iter().any(|rule| {
+            regex_match_positions(&rule.regex, text)
+                .iter()
+                .any(|(offset, matched)| *offset == at && matched == word)
+        });
+        assert!(
+            taken,
+            "{HIGHLIGHT_THEME}: no member or field mode takes `{word}` in {text:?}"
+        );
+    }
+    for text in ["true => 1,", "if x == y {", "let found = x == null;"] {
+        assert!(
+            regex_match_positions(&field.regex, text)
+                .iter()
+                .all(|(_, matched)| !["true", "if", "null"].contains(&matched.as_str())),
+            "{HIGHLIGHT_THEME}: the field mode takes a keyword in {text:?}"
+        );
+    }
+}
+
+/// B459: `then`, the infix conditional, colours as a keyword in BOTH grammars
+/// after a complete operand and before its branch, and stays a name wherever
+/// a name stands — a binding, a `for` binder, a parameter, a member, a call.
+#[test]
+fn b459_then_is_coloured_by_position_in_both_grammars() {
+    let keywords: &[&str] = &[
+        "let label = ready then \"on\" else \"off\";",
+        "x > 0 then ret x;",
+        "n < 0 then -1 else 1",
+        "f(a) then go();",
+        "list[0] then a else b",
+        "i\"x\" == s then a else b",
+        "a || b then print(x) else print(y);",
+    ];
+    let names: &[&str] = &[
+        "let then = 1;",
+        "mut then: i32 = 2;",
+        "for then in thens {",
+        "fun then(self) {",
+        "promise.then(f)",
+        "ret then;",
+        "f(then, other)",
+        "x = then;",
+    ];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "then");
+        assert_eq!(
+            regex_matches(&rule.regex, keywords),
+            vec![true; keywords.len()],
+            "{file}: {:?} misses `then` in a keyword position among {keywords:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, names),
+            vec![false; names.len()],
+            "{file}: {:?} colours `then` where it is an ordinary name ({names:?})",
+            rule.regex,
+        );
+    }
+}
+
 // --- Primitive types ---------------------------------------------------------
 
 #[test]
@@ -1155,6 +1289,23 @@ fn word_list_regex(words: &[&str]) -> String {
     format!(r"\b({})\b", words.join("|"))
 }
 
+/// A KEYWORD word-list regex: [`word_list_regex`] guarded for the member tier
+/// (B414 S4). A reserved word names a member wherever one stands, and two of
+/// those positions a line regex can see exactly: right after a member `.` —
+/// R-k writes the name against its dot, so a one-character lookbehind is the
+/// whole test — and before a field's `:` or a literal field's `=` (`type:
+/// str`, `Event { type = t }`), where no keyword reading is followed by
+/// either (`::`, `==` and `=>` are other tokens: `true => 1` stays a
+/// literal). A method DECLARED with a reserved name (`fun type(self)`) is left
+/// to the language server's semantic tokens, which paint it as the method it
+/// is.
+fn keyword_list_regex(words: &[&str]) -> String {
+    format!(
+        r"(?<!\.){}(?!\s*(?::(?!:)|=(?![=>])))",
+        word_list_regex(words)
+    )
+}
+
 /// The TextMate primitive-type words: every lowercase scalar primitive that is
 /// not already a keyword (`null` is), plus the built-in type words. `BigInt`
 /// is PascalCase and rides the user-type shape rule instead.
@@ -1217,7 +1368,7 @@ fn textmate_fragments() -> Vec<TextmateFragment> {
     let keyword_rule = |anchor, role| TextmateFragment {
         anchor,
         field: "match",
-        value: word_list_regex(&role_words(role)),
+        value: keyword_list_regex(&role_words(role)),
     };
     let markers = marker_alternation();
     vec![
@@ -2492,6 +2643,90 @@ fn b414_each_demoted_keyword_is_a_keyword_in_its_position_and_a_name_elsewhere()
             let scope = token.innermost();
             assert!(
                 !scope.starts_with("keyword") && !scope.starts_with("storage"),
+                "{needle:?} is a NAME and is painted {scope}"
+            );
+        }
+    }
+}
+
+/// B414 S4, through the real TextMate engine: reserved words read as members
+/// (after `.`, before a field's `:`/`=`) are names, and the same words read as
+/// keywords on the same lines keep their scopes.
+#[test]
+fn b414_s4_reserved_members_are_names_to_the_textmate_engine() {
+    let Some(painting) = painting(concat!(
+        "struct Event { type: str, if: i32 }\n",
+        "fun main() {\n",
+        "\tlet event = Event { type = \"click\", if = 1 };\n",
+        "\tif event.if == 1 { print(event.type); } else { ret; }\n",
+        "\tlet kind = found?.match();\n",
+        "}\n",
+    )) else {
+        return;
+    };
+    for (needle, scope) in [
+        ("if event", "keyword.control.vilan"),
+        ("else {", "keyword.control.vilan"),
+        ("let kind", "storage.modifier.vilan"),
+        ("struct Event", "storage.type.vilan"),
+    ] {
+        assert_eq!(painting.scope_at(needle), scope, "{needle:?}");
+    }
+    for needle in [
+        "type: str",
+        "if: i32",
+        "type = \"click\"",
+        "if = 1",
+        "if == 1",
+        "type);",
+        "match();",
+    ] {
+        let (start, _, line) = painting.locate(needle);
+        let word_end = start
+            + needle
+                .find([':', ' ', ')', '(', ';'])
+                .unwrap_or(needle.len());
+        for token in painting
+            .tokens
+            .iter()
+            .filter(|token| token.line == line && token.start < word_end && token.end > start)
+        {
+            let scope = token.innermost();
+            assert!(
+                !scope.starts_with("keyword") && !scope.starts_with("storage"),
+                "{needle:?} is a MEMBER and is painted {scope}"
+            );
+        }
+    }
+}
+
+/// B459 through the real TextMate engine: `then` in the three forms is the
+/// control keyword, and a binding named `then` and a `.then(..)` call are not.
+#[test]
+fn b459_then_is_a_keyword_to_the_textmate_engine_only_in_its_position() {
+    let Some(painting) = painting(concat!(
+        "fun main() {\n",
+        "\tlet label = ready then \"on\" else \"off\";\n",
+        "\tready else ret;\n",
+        "\tlet then = promise.then(done);\n",
+        "}\n",
+    )) else {
+        return;
+    };
+    assert_eq!(painting.scope_at("then \"on\""), "keyword.control.vilan");
+    assert_eq!(painting.scope_at("else \"off\""), "keyword.control.vilan");
+    assert_eq!(painting.scope_at("else ret"), "keyword.control.vilan");
+    for needle in ["then = promise", "then(done)"] {
+        let (start, _, line) = painting.locate(needle);
+        let word_end = start + "then".len();
+        for token in painting
+            .tokens
+            .iter()
+            .filter(|token| token.line == line && token.start < word_end && token.end > start)
+        {
+            let scope = token.innermost();
+            assert!(
+                !scope.starts_with("keyword"),
                 "{needle:?} is a NAME and is painted {scope}"
             );
         }

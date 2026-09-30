@@ -3564,6 +3564,14 @@ impl Document {
             {
                 *word
             }
+            // B414 S4: a RESERVED word the parser read as a MEMBER name
+            // (`event.type`, a method `fun match(self)`) is that member, and
+            // hovers as one — never as the keyword it spells.
+            _ if vilan_core::parsing::keyword_member_readings(self.analyzed_text())
+                .contains(_span) =>
+            {
+                return None;
+            }
             _ => keyword_lexeme(token)?,
         };
         let (_, sentence, path) = KEYWORD_DOCS
@@ -15039,6 +15047,92 @@ pub(crate) mod tests {
                 "{keyword} must classify back to itself"
             );
         }
+    }
+
+    /// B459: `then` hovers as the infix conditional where the parser read it
+    /// as one, and as nothing of the kind where it is a name — a binding and a
+    /// `.then(..)` call — in the same file.
+    #[test]
+    fn b459_then_hovers_as_the_keyword_only_where_it_is_one() {
+        let text = concat!(
+            "struct Promise { value: i32 }\n",
+            "impl Promise { fun then(self): i32 { self.value } }\n",
+            "fun main() {\n",
+            "\tlet ready = true;\n",
+            "\tlet label = ready then \"on\" else \"off\";\n",
+            "\tlet then = Promise { value = 1 }.then();\n",
+            "}\n",
+        );
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let hover_at = |needle: &str| {
+            let offset = text.match_indices(needle).next().expect(needle).0;
+            document.hover(offset + 1)
+        };
+        assert!(
+            hover_at("then \"on\"").is_some_and(
+                |hover| hover.starts_with("**`then`**") && hover.contains("infix conditional")
+            ),
+            "{:?}",
+            hover_at("then \"on\"")
+        );
+        for needle in ["then = Promise", "then();"] {
+            let hover = hover_at(needle);
+            assert!(
+                hover
+                    .as_deref()
+                    .is_none_or(|hover| !hover.starts_with("**`then`**")),
+                "`then` as a NAME at {needle:?} must not hover as the keyword: {hover:?}"
+            );
+        }
+    }
+
+    /// B414 S4: a RESERVED word read as a MEMBER — a field declared, given in
+    /// a literal and read, a method declared and called — hovers as that
+    /// member (the field's or method's own hover), never as the keyword it
+    /// spells; the same word in its keyword position still hovers as the
+    /// keyword.
+    #[test]
+    fn b414_s4_a_reserved_member_hovers_as_the_member_not_the_keyword() {
+        let text = concat!(
+            "struct Event { type: str }\n",
+            "impl Event { fun match(self): str { self.type } }\n",
+            "fun main() {\n",
+            "\tlet event = Event { type = \"click\" };\n",
+            "\tlet kind = event.match();\n",
+            "\tmatch kind { _ => {} }\n",
+            "}\n",
+        );
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let hover_at = |needle: &str| {
+            let offset = text.match_indices(needle).next().expect(needle).0;
+            document.hover(offset + 1)
+        };
+        for (needle, word) in [
+            ("type: str", "type"),
+            ("match(self)", "match"),
+            ("type }", "type"),
+            ("type = ", "type"),
+            ("match();", "match"),
+        ] {
+            let hover = hover_at(needle);
+            assert!(
+                hover
+                    .as_deref()
+                    .is_none_or(|hover| !hover.starts_with(&format!("**`{word}`**"))),
+                "`{word}` as a MEMBER at {needle:?} must not hover as the keyword: {hover:?}"
+            );
+        }
+        // The field read and the method call hover as the member itself.
+        assert!(
+            hover_at("match();").is_some_and(|hover| hover.contains("fun match")),
+            "{:?}",
+            hover_at("match();")
+        );
+        assert!(
+            hover_at("match kind").is_some_and(|hover| hover.starts_with("**`match`**")),
+            "the keyword reading keeps its hover: {:?}",
+            hover_at("match kind")
+        );
     }
 
     /// B414 (contextual-keywords.md Q5): a demoted keyword keeps its hover in

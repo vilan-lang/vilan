@@ -370,6 +370,7 @@ fn descend_if<'src>(branch: NodeIfBranch<'src>, source: &'src str) -> NodeIfBran
                 condition,
                 mut then,
                 else_,
+                spelling,
             } = *if_;
             let condition = desugar_boxed(condition, source);
             desugar_block(&mut then.0, source);
@@ -378,6 +379,7 @@ fn descend_if<'src>(branch: NodeIfBranch<'src>, source: &'src str) -> NodeIfBran
                 condition,
                 then,
                 else_,
+                spelling,
             }))
         }
         NodeIfBranch::Else(mut body) => {

@@ -34,4 +34,5 @@ list-cell	66	183
 reactive-selector	10	28
 f64-print-boundary	0	0
 non-bmp-string-length	0	0
+keyword-members	1	2
 native_probe_board	1	21

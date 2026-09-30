@@ -28,6 +28,7 @@ block comments.
 
 ```text
 IDENT = ascii_letter | "_" , { ascii_letter | digit | "_" } ;
+RESERVED = (* a word of the reserved list below: its own token, never IDENT *) ;
 ```
 
 Identifiers are ASCII. The following words are **reserved**; they lex as
@@ -42,13 +43,24 @@ ret       struct    trait    type    use     true    false
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
 
+A reserved word is still a **member name** (B414 S4): the name after a
+member `.` or `?.`, a field declared in a struct or given with `=` in a
+struct literal, a method declared in an `impl` or a `trait`, and a segment
+after `::` in an expression path — `event.type`, `Event { type = kind }`,
+`fun match(self)`, `Kit::if()`. Each of those positions is entered after a
+token that commits to it, so no keyword reading can begin there (§3.6). A
+reserved word never names a binding, a parameter, a free function or a
+type, and the struct-literal shorthand `{ type }` — which reads a binding
+of that name — stays refused. After a member dot the name is written
+AGAINST the dot, with nothing between them (§3.6).
+
 The following words are **contextual keywords**: they lex as `IDENT` and
 take meaning only by position, and are ordinary identifiers everywhere
 else (`vilan --print-keywords` prints both lists, each word flagged):
 
 ```text
 as        borrows   context   dyn       jump      lazy      only
-own       self      Self      sync      void      with
+own       self      Self      sync      then      void      with
 ```
 
 `with` is the trait list of an `impl` or `trait` head (§3.3); `borrows`
@@ -57,7 +69,8 @@ the return clause after a declaration's return type (§3.3); `own` and
 opens a `lazy let` (§3.4); `dyn` the trait-object marker at a type's head
 (§3.9 — `dyn::` is a path instead); `jump` loop control when its target
 follows (§3.4); `context` the clause after a closure type or a return type
-(§3.9); `sync` the marker opening a closure type (§3.9); `void` the unit
+(§3.9); `sync` the marker opening a closure type (§3.9); `then` the
+infix conditional after a complete operand (§3.8); `void` the unit
 value and type; `self` and `Self` the receiver and its type (`self` is
 also the file's own module in `mod self;`, §3.1); `as` the alias on an
 import path leaf and `only` the trailing modifier on an import (§3.2).

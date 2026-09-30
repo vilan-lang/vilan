@@ -14,8 +14,9 @@ use std::cell::Cell;
 
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
-    GenericArguments, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    ItemLabels, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
+    GenericArguments, GenericParameters, If, IfSpelling, ImplSelector, ImportBranch,
+    ImportModifier, ImportTail, ItemLabels, Node, NodeIfBranch, NodeList, Pattern,
+    StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -4411,6 +4412,12 @@ impl<'src> Printer<'src> {
                 _ => true,
             };
         }
+        if let Node::If(NodeIfBranch::If(if_)) = node
+            && matches!(if_.spelling, IfSpelling::Then { .. })
+        {
+            // B459: a `then` form ends at an expression, not at a `}`.
+            return true;
+        }
         !matches!(
             node,
             Node::If(_)
@@ -7643,6 +7650,9 @@ impl<'src> Printer<'src> {
                 self.out.push_str("= ");
                 self.print_split_operand(value, 0, split);
             }
+            Node::If(NodeIfBranch::If(if_)) if matches!(if_.spelling, IfSpelling::Then { .. }) => {
+                self.print_then_form(if_, split)
+            }
             Node::If(branch) => self.print_if_branch(branch, split),
             Node::Match(subject, legs) => {
                 self.out.push_str("match ");
@@ -7920,6 +7930,87 @@ impl<'src> Printer<'src> {
     /// before, so an `if` too wide for its line still has somewhere to go. The
     /// decision is made once at the head of the chain and threaded down, so an
     /// `else if` never disagrees with the `if` it hangs off.
+    /// A `then`/`else` form (B459), reprinted in the spelling it was written
+    /// in: `c then a else b`, the statement forms `c then S`, `c else S` and
+    /// `c then S else S` (the statement's `;` is the statement printer's).
+    ///
+    /// The line-break rule (B459 Q5): on one line when it fits; over budget,
+    /// the form breaks BEFORE each `then` and `else`, one level in — the
+    /// operator-leading shape a split binary chain takes, so every
+    /// continuation line says how it joins before it says anything else. An
+    /// `else`-chain flattens onto the same level (`else b` ⏎ `then y` ⏎ `else
+    /// z`), which reparses to the same right-nested chain.
+    fn print_then_form(&mut self, if_: &If<'src>, split: Split) {
+        let start = self.out.len();
+        let cursor = self.cursor;
+        self.print_then_form_parts(if_, false);
+        if split != Split::Off && !self.probing && self.first_line_over_budget(start) {
+            self.out.truncate(start);
+            self.cursor = cursor;
+            self.indent += 1;
+            self.print_then_form_parts(if_, true);
+            self.indent -= 1;
+        }
+    }
+
+    fn print_then_form_parts(&mut self, if_: &If<'src>, broken: bool) {
+        let IfSpelling::Then { then_word, .. } = if_.spelling else {
+            unreachable!("only a `then` form reaches here");
+        };
+        self.print_operand(&if_.condition, 0);
+        if then_word.is_some() {
+            self.then_form_joint(broken, "then ");
+            self.print_expr(Self::then_form_branch(&if_.then.0));
+        }
+        if let Some((branch, _)) = &if_.else_ {
+            self.then_form_joint(broken, "else ");
+            match branch {
+                NodeIfBranch::Else(block) => {
+                    let body = Self::then_form_branch(&block.0);
+                    match &body.0 {
+                        Node::If(NodeIfBranch::If(inner))
+                            if broken
+                                && matches!(
+                                    inner.spelling,
+                                    IfSpelling::Then {
+                                        then_word: Some(_),
+                                        ..
+                                    }
+                                ) =>
+                        {
+                            self.print_then_form_parts(inner, true)
+                        }
+                        _ => self.print_expr(body),
+                    }
+                }
+                // The parser never chains a `then` form through an `if`
+                // branch; printed as the chain it would be, all the same.
+                NodeIfBranch::If(_) => self.print_if_chain(branch, false, Split::Off),
+            }
+        }
+    }
+
+    /// The joint before a `then`/`else`: a space, or a fresh line one level in.
+    fn then_form_joint(&mut self, broken: bool, word: &str) {
+        if broken {
+            self.line();
+        } else {
+            self.out.push(' ');
+        }
+        self.out.push_str(word);
+    }
+
+    /// A `then` form's branch: the expression reading's tail, or the statement
+    /// reading's one statement (its tail left `Void`).
+    fn then_form_branch<'body>(
+        body: &'body (NodeList<'src>, Box<Spanned<Node<'src>>>),
+    ) -> &'body Spanned<Node<'src>> {
+        match (&body.1.0, body.0.first()) {
+            (Node::Void, Some(statement)) => statement,
+            _ => &body.1,
+        }
+    }
+
     fn print_if_branch(&mut self, branch: &NodeIfBranch<'src>, split: Split) {
         let inline =
             split == Split::Off && !self.at_line_start() && self.arms_are_expressions(branch);
@@ -8280,6 +8371,83 @@ mod reformats {
         assert_formats(
             "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
             "fun slot(x: i32) borrows x context turn {\n\tx;\n}\n",
+        );
+    }
+
+    // B459: the `then`/`else` forms reprint in the spelling they were written
+    // in — the expression form, the three statement forms (each taking the
+    // statement's `;`), a chain, a closure body — and are a fixed point.
+    #[test]
+    fn b459_then_forms_reprint_as_written() {
+        let source = concat!(
+            "fun sign(n: i32): str {\n\tn < 0 then \"negative\" else n == 0 then \"zero\" else \"positive\"\n}\n\n",
+            "fun main() {\n",
+            "\tlet label = ready then \"on\" else \"off\";\n",
+            "\tready then go() else count += 1;\n",
+            "\tready then go();\n",
+            "\tready else ret;\n",
+            "\tlet pick = |x: bool| x then 1 else 2;\n",
+            "\tprint(1 + (ready then 10 else 20));\n",
+            "}\n",
+        );
+        assert_formats(source, source);
+        // Not a bail handing the source back: the reprint itself succeeds.
+        assert_eq!(super::reprint(source).as_deref(), Ok(source));
+    }
+
+    // B459 Q5, the line-break rule: over budget, the form breaks BEFORE each
+    // `then` and `else`, one level in, and an `else`-chain flattens onto that
+    // level.
+    #[test]
+    fn b459_a_long_then_form_breaks_before_then_and_else() {
+        assert_formats(
+            concat!(
+                "fun long(flag: bool): str {\n",
+                "\tflag then \"a rather long first branch string here\" else \"and a rather long second branch as well\"\n",
+                "}\n",
+            ),
+            concat!(
+                "fun long(flag: bool): str {\n",
+                "\tflag\n",
+                "\t\tthen \"a rather long first branch string here\"\n",
+                "\t\telse \"and a rather long second branch as well\"\n",
+                "}\n",
+            ),
+        );
+        assert_formats(
+            concat!(
+                "fun main() {\n",
+                "\tlet label = count < 0 then \"a negative number, long\" else count == 0 then \"zero, also long\" else \"positive\";\n",
+                "}\n",
+            ),
+            concat!(
+                "fun main() {\n",
+                "\tlet label = count < 0\n",
+                "\t\tthen \"a negative number, long\"\n",
+                "\t\telse count == 0\n",
+                "\t\tthen \"zero, also long\"\n",
+                "\t\telse \"positive\";\n",
+                "}\n",
+            ),
+        );
+    }
+
+    // E233: the same one order for a VIEW return type. `&i32 context c
+    // borrows xs` used to reprint as written: the `&` production took the
+    // clause onto `i32`, so there was no declaration clause for the printer to
+    // put last.
+    #[test]
+    fn e233_a_view_return_types_clause_normalizes_after_borrows() {
+        let canonical =
+            "fun first(xs: &List<i32>): &i32 borrows xs context settings {\n\t&xs[0]\n}\n";
+        assert_formats(
+            "fun first(xs: &List<i32>): &i32 context settings borrows xs {\n\t&xs[0]\n}\n",
+            canonical,
+        );
+        assert_formats(canonical, canonical);
+        assert_formats(
+            "fun first(xs: &mut List<i32>): &mut i32 context (a, b) borrows xs {\n\t&mut xs[0]\n}\n",
+            "fun first(xs: &mut List<i32>): &mut i32 borrows xs context (a, b) {\n\t&mut xs[0]\n}\n",
         );
     }
 

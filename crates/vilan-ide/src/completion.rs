@@ -329,8 +329,13 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "else",
-        "The alternative branch of an `if`.",
+        "The alternative branch of an `if` or a `then` form; after a condition with no `then`, the guard statement `ok else ret;`.",
         "tour/control-flow.html#if--else",
+    ),
+    (
+        "then",
+        "The infix conditional, sugar over `if`: `ready then a else b` is a value, and `ready then go();` a statement.",
+        "tour/control-flow.html#then--else",
     ),
     (
         "match",

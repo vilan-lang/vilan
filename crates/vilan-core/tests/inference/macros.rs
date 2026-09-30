@@ -3622,6 +3622,46 @@ main();
     );
 }
 
+/// E233: a VIEW return type takes the declaration's clause too. The `&`
+/// production parses a whole type after it, so `&i32 context offset` put the
+/// clause on `i32` — refused ("only supported on a closure type") where the
+/// same clause after `i32` binds to the function. Both written orders now reach
+/// the function, compile and read the context through the returned view.
+#[test]
+fn e233_a_view_return_type_binds_the_clause_to_the_function_in_both_orders() {
+    assert_compiles_and_runs(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let offset: Context<usize> = Context::new();
+
+fun clause_first(xs: &List<i32>): &i32 context offset borrows xs {
+    &xs[offset.get()]
+}
+
+fun borrows_first(xs: &List<i32>): &i32 borrows xs context offset {
+    &xs[offset.get()]
+}
+
+fun mutable_view(xs: &mut List<i32>): &mut i32 context offset borrows xs {
+    &mut xs[offset.get()]
+}
+
+fun main() {
+    mut xs = [7, 8, 9];
+    offset.run(1usize, || {
+        print(*clause_first(&xs));
+        print(*borrows_first(&xs));
+        print(*mutable_view(&mut xs));
+    });
+}
+main();
+        "#,
+        "8\n8\n8\n",
+    );
+}
+
 // --- E84: the demotion/trace contract widens to any dependency package ---
 // (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
 // user did not write — std or ANY external/linked package — demotes and

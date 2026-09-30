@@ -120,6 +120,31 @@
 		const CONTEXTUAL_LAZY = { className: "keyword", begin: "\\blazy\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
 		const CONTEXTUAL_DYN = { className: "keyword", begin: "\\bdyn\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
 		const CONTEXTUAL_JUMP = { className: "keyword", begin: "\\bjump\\b(?=\\s{1,8}(?!i[ns]\\b|as\\b)[A-Za-z_])" };
+		// B414 S4, the member tier: every word — a reserved one included —
+		// names a member, so `event.type`, `bag.if()` and a field `type: str`
+		// are NAMES. R-k writes a member's name against its dot, which makes
+		// the member read a one-character lookbehind; a field's name is the
+		// word before a `:` or a literal's `=` (never `::`, `==` or `=>`, so
+		// `true => 1` keeps its literal). A mode with no keywords of its own
+		// takes the word before the keyword list can (highlight.js modes do
+		// not inherit keywords), and paints it plain. FIELD_NAME is listed
+		// after ELEMENT_EVENT, which wins the tie at `on:click`'s `on`.
+		const MEMBER_NAME = {
+			begin: "(?<=\\.)[a-z_][A-Za-z0-9_]*",
+			relevance: 0,
+		};
+		const FIELD_NAME = {
+			begin: "\\b[a-z_][A-Za-z0-9_]*(?=\\s*(?::(?!:)|=(?![=>])))",
+			relevance: 0,
+		};
+		// B459: `then`, the infix conditional, is CONTEXTUAL — a keyword only
+		// after a complete operand and before a branch, never where a NAME
+		// stands (`let then = 1`, `for then in xs`, `then: i32`,
+		// `promise.then(f)`): guarded on both sides, like `context`.
+		const CONTEXTUAL_THEN = {
+			className: "keyword",
+			begin: "(?<=[A-Za-z0-9_\\)\\]\\}\"']\\s{1,8})then\\b(?=\\s{1,8}(?![=.:,;\\)\\]\\}]|i[ns]\\b|as\\b)\\S)",
+		};
 		const TYPE = {
 			className: "type",
 			begin: "\\b[A-Z][a-zA-Z0-9_]*",
@@ -173,6 +198,7 @@
 				INTERPOLATED,
 				PLAIN_STRING,
 				NUMBER,
+				MEMBER_NAME,
 				CONTEXT_CLAUSE,
 				SYNC_MARKER,
 				IMPORT_ALIAS,
@@ -182,8 +208,10 @@
 				CONTEXTUAL_LAZY,
 				CONTEXTUAL_DYN,
 				CONTEXTUAL_JUMP,
+				CONTEXTUAL_THEN,
 				ELEMENT_TAG,
 				ELEMENT_EVENT,
+				FIELD_NAME,
 				FUNCTION,
 				TYPE,
 			],

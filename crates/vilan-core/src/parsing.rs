@@ -60,9 +60,9 @@ use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, ComprehensionBinding, Convention,
     CssBody, CssDeclaration, CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem,
     EnumVariant, ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
-    GenericParameters, If, ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels,
-    Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField,
-    TupleBound,
+    GenericParameters, If, IfSpelling, ImplSelector, ImportBranch, ImportModifier, ImportTail,
+    ItemLabels, Labels, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr,
+    StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -192,6 +192,18 @@ pub enum Found {
     EndOfInput,
 }
 
+/// What a member position holds right after its `.` ([`Parser::member_after_dot`],
+/// R-k).
+enum DotMember {
+    /// A name written against the dot (or reported and read on the same line).
+    Read,
+    /// No member: the mid-edit `Error` member, silent at parse.
+    Missing,
+    /// A name stranded on the next line: the chain declines, the expectation
+    /// noted.
+    Decline,
+}
+
 /// What [`Parser::recover_missing_terminator`] did with the statement it read —
 /// three outcomes where there used to be two, because "reported it" and "kept
 /// it" are not the same decision.
@@ -242,6 +254,47 @@ const A_NAME_AFTER_PATH_SEPARATOR: &str = "a name after `::`";
 const A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE: &str = "a name after `::` on the same line: a `::` path does not cross a line break, because `a::` \
      at the end of a line joins whatever the next line starts with — join the line, or import \
      the path under a shorter name (`import a::b::c as d;`) and write `d`";
+
+/// The expectation a member `.` records when its name does not follow it
+/// directly (B414 S4, R-k RULED 2026-09-29: "only `.{NAME}` is legal").
+///
+/// E142's argument, one token over: `value.` at the end of a line joined
+/// whatever the next line started with, so a half-typed `list.` above
+/// `helper();` was the member call `list.helper()` and no diagnostic could
+/// exist. The member tier makes that worse rather than rare — every word is a
+/// member name after `.` now, so `list.` above `let x = 1;` would read
+/// `list.let` — and the owner's ruling is the strict form: nothing at all
+/// between the dot and the name, on one line or across two. A chain written
+/// over several lines breaks BEFORE the dot, which the rule leaves exactly as
+/// it was.
+///
+/// Spelled as an expectation, like its E142 sibling, so the "found X expected
+/// …" frame puts the stranded name into the message.
+const A_MEMBER_NAME_AGAINST_ITS_DOT: &str = "a member name written against its `.` — `value.name`, with no space or line \
+     break between them, because a `.` at the end of a line would join whatever the next line \
+     starts with. A chain continued on the next line breaks BEFORE the dot, and the next line \
+     begins `.name()`";
+
+/// The rule a `then` form read as a VALUE without its `else` breaks (B459
+/// Q3, RULED 2026-09-29: "no bare `then` in expression position"). Curated
+/// (diagnostics-standard.md B6): a value needs both branches, exactly as an
+/// `if` used for its value needs its `else`, and the bare form has one reading
+/// — the statement — whose spelling the rule names.
+const THEN_NEEDS_ITS_ELSE: &str = "a `then` used as a VALUE needs its `else`, as an `if` used for its value does — \
+     `ready then a else b`. Without one, `ready then go();` is a STATEMENT, which stands where a \
+     statement does and ends with its `;`";
+
+/// The rule the guard read as a VALUE breaks (B459). Curated: `c else S;` has
+/// no value to give — the branch it names runs when `c` is false and the
+/// other one does not exist — so it is a statement or nothing.
+const THE_GUARD_IS_A_STATEMENT: &str = "`value else S;` is the GUARD, a statement: it stands where a statement does \
+     and ends with its `;` — a value needs both branches, `ready then a else b`";
+
+/// The rule a `let` as a `then`/`else` branch breaks (B459 Q8). Curated: a
+/// branch is ONE statement with no block of its own, so the binding would be
+/// scoped to a block nobody wrote and read by nothing.
+const A_BRANCH_BINDS_NOTHING: &str = "a `then`/`else` branch is one statement with no block of its own, so a `let` \
+     there binds a name nothing can read — bind it before the form, or write an `if` with a block";
 
 /// The rule `fun f(): || void context c` breaks (B343, R9 RULED 2026-09-17).
 /// Curated (diagnostics-standard.md B6): the prohibition explains itself, and
@@ -690,6 +743,147 @@ fn take_misbound_return_clause(node: &mut Node<'_>) -> bool {
     true
 }
 
+/// E233 — a declaration's return type `&T context c` (or `&mut T …`) as the
+/// peel in [`Parser::parse_function`] expects it: the clause lifted off the
+/// view's target onto the view, so `TypeWithContexts(&T, c)` and not
+/// `&TypeWithContexts(T, c)`.
+///
+/// The `&` production parses a whole TYPE after it, clause suffix included,
+/// so the clause a writer put after `&i32` lands on `i32`, where it means
+/// nothing — the analyzer refused it ("a `context` clause is only supported on
+/// a closure type") and the formatter, finding no function clause to print,
+/// reprinted the written order. A target that carries its own clause (a
+/// closure type, B309) keeps it: `&(|| View) context owner` is a view of an
+/// injected closure. Every other shape comes back unchanged.
+fn hoist_clause_out_of_a_view(annotation: Spanned<Node<'_>>) -> Spanned<Node<'_>> {
+    let (node, span) = annotation;
+    let Node::Reference(mutable, target) = node else {
+        return (node, span);
+    };
+    let (target, target_span) = hoist_clause_out_of_a_view(*target);
+    match target {
+        Node::TypeWithContexts(inner, names) if !return_type_carries_its_own_clause(&inner.0) => {
+            let view_span = Span::from(span.start..inner.1.end);
+            (
+                Node::TypeWithContexts(
+                    Box::new((Node::Reference(mutable, inner), view_span)),
+                    names,
+                ),
+                span,
+            )
+        }
+        other => (
+            Node::Reference(mutable, Box::new((other, target_span))),
+            span,
+        ),
+    }
+}
+
+/// Whether `node` is a `then`/`else` form (B459) — the one `Node::If` that
+/// is not block-like: it ends at an expression, not at a `}`, so as a
+/// statement it takes the `;` every expression statement takes.
+fn is_then_form(node: &Node<'_>) -> bool {
+    matches!(
+        node,
+        Node::If(NodeIfBranch::If(if_)) if matches!(if_.spelling, IfSpelling::Then { .. })
+    )
+}
+
+/// B459: a `then`/`else` form terminated at STATEMENT position, re-read as
+/// the statement it is (Q6) — each branch a statement whose value is
+/// discarded, so the branches need not unify: `c then f() else g();` is
+/// `if c { f(); } else { g(); }`. A branch that is itself a form is at
+/// statement position too, so the reading recurses (`a then b then f();`,
+/// and the `else`-chain `a then f() else b then g() else h();`). Anything
+/// else comes back unchanged.
+fn read_as_statement(node: Spanned<Node<'_>>) -> Spanned<Node<'_>> {
+    let (Node::If(NodeIfBranch::If(mut if_)), span) = node else {
+        return node;
+    };
+    let IfSpelling::Then {
+        then_word,
+        else_word,
+        statement: false,
+    } = if_.spelling
+    else {
+        return (Node::If(NodeIfBranch::If(if_)), span);
+    };
+    if_.spelling = IfSpelling::Then {
+        then_word,
+        else_word,
+        statement: true,
+    };
+    if_.then = branch_as_statement(if_.then);
+    if_.else_ = if_.else_.map(|(branch, branch_span)| match branch {
+        NodeIfBranch::Else(block) => (NodeIfBranch::Else(branch_as_statement(block)), branch_span),
+        chained => (chained, branch_span),
+    });
+    (Node::If(NodeIfBranch::If(if_)), span)
+}
+
+/// One branch body of [`read_as_statement`]: `{ a }` becomes `{ a; }`, the
+/// tail moved into the statements (itself re-read) and the tail left `Void`
+/// at the branch's last character — where an `if` block's own `Void` sits, on
+/// its `}`. An empty branch (the guard's `then`) is already a statement.
+fn branch_as_statement<'src>(
+    block: Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>,
+) -> Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)> {
+    let ((mut statements, tail), span) = block;
+    if matches!(tail.0, Node::Void) {
+        return ((statements, tail), span);
+    }
+    let end = tail.1.end;
+    statements.push(read_as_statement(*tail));
+    let void_span = Span::from(end.saturating_sub(1)..end);
+    ((statements, Box::new((Node::Void, void_span))), span)
+}
+
+/// The `then`/`else` forms still read as VALUES once the parse is done
+/// (B459): each needs both branches (Q3), and the guard, which has one,
+/// is a statement only. Run over the finished tree, because a form's reading
+/// is its enclosing statement's to decide — `a then b then f();` is a
+/// statement whose inner form, without its own `else`, is legal only once the
+/// outer one has been read as a statement.
+fn refuse_then_forms_read_as_values(root: &Spanned<NodeList<'_>>, errors: &mut Vec<ParseError>) {
+    fn visit(node: &Spanned<Node<'_>>, errors: &mut Vec<ParseError>) {
+        if let Node::If(NodeIfBranch::If(if_)) = &node.0
+            && let IfSpelling::Then {
+                then_word,
+                else_word,
+                statement: false,
+            } = if_.spelling
+        {
+            let refusal = match (then_word, else_word) {
+                (None, Some(word)) => {
+                    Some((word, ParseErrorReason::Rule(THE_GUARD_IS_A_STATEMENT)))
+                }
+                (Some(word), None) => Some((word, ParseErrorReason::Rule(THEN_NEEDS_ITS_ELSE))),
+                _ => None,
+            };
+            if let Some((span, reason)) = refusal {
+                errors.push(ParseError {
+                    span,
+                    reason,
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
+        node.0.for_each_child(&mut |child| visit(child, errors));
+    }
+    for statement in &root.0 {
+        visit(statement, errors);
+    }
+}
+
+/// Whether `token` is one of the RESERVED words (`lexing::KEYWORDS`) — the/// Whether `token` is one of the RESERVED words (`lexing::KEYWORDS`) — the
+/// words the lexer hands back as their own token rather than as a name. The
+/// member tier (B414 S4) admits them wherever a member name stands; a
+/// contextual keyword needs no admitting, since it lexes as an identifier.
+fn is_reserved_word(token: &Token<'_>) -> bool {
+    lexing::KEYWORDS.iter().any(|(_, keyword)| keyword == token)
+}
+
 fn starts_item(token: &Token<'_>) -> bool {
     matches!(
         token,
@@ -893,6 +1087,8 @@ fn parse_with(
 
     let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
     let root = parser.parse_program();
+    let mut then_form_errors = Vec::new();
+    refuse_then_forms_read_as_values(&root, &mut then_form_errors);
     debug_assert_eq!(
         parser.position,
         tokens.len(),
@@ -924,6 +1120,7 @@ fn parse_with(
         })
         .collect();
     errors.append(&mut parser.errors);
+    errors.append(&mut then_form_errors);
     // The depth bound's refusal (B142), which was held off `parser.errors` so
     // that `attempt` could not roll it back — see `Parser::nesting_refusal`. It
     // sorts into place with the rest below.
@@ -948,6 +1145,25 @@ pub fn contextual_keyword_readings(source: &str) -> Vec<Span> {
     let mut parser = Parser::new(&tokens, source, false);
     parser.parse_program();
     let mut indices = std::mem::take(&mut parser.contextual_readings);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+        .into_iter()
+        .filter_map(|index| tokens.get(index).map(|(_, span)| *span))
+        .collect()
+}
+
+/// The spans of `source`'s RESERVED words the parser read as MEMBER names
+/// (B414 S4) — `type` in `event.type` or in a field `type: str`, `match` in an
+/// `impl`'s `fun match(self)`. The editor's raw-parse read, the member tier's
+/// twin of [`contextual_keyword_readings`]: a reserved word lexes as its own
+/// token, so a keyword hover would otherwise answer for every one of them.
+/// Sorted, without duplicates.
+pub fn keyword_member_readings(source: &str) -> Vec<Span> {
+    let (tokens, _) = lexing::tokenize(source);
+    let mut parser = Parser::new(&tokens, source, false);
+    parser.parse_program();
+    let mut indices = std::mem::take(&mut parser.member_readings);
     indices.sort_unstable();
     indices.dedup();
     indices
@@ -1071,6 +1287,20 @@ struct Parser<'a, 'src> {
     /// [`contextual_keyword_readings`], the editor's raw-parse question "is
     /// this `with` the keyword or a name?" (hover, contextual-keywords.md Q5).
     contextual_readings: Vec<usize>,
+    /// The token indices at which a RESERVED word was read as a MEMBER name
+    /// (B414 S4) — `x.type`, `fun match(self)` in an `impl`, a field `if: i32`.
+    /// Pushed by [`Parser::eat_member_name`] and rolled back with
+    /// `contextual_readings` when an [`Parser::attempt`] declines; read only by
+    /// [`keyword_member_readings`], so the editor hovers such a word as the
+    /// member it is and not as the keyword it spells.
+    member_readings: Vec<usize>,
+    /// The token index at which the statement being parsed begins, while its
+    /// expression is read (B459). A `then`/`else` form that starts THERE may
+    /// be the statement reading — the only place the guard `c else S;` can
+    /// stand — and one that starts anywhere else is an operand. Set and
+    /// restored around each statement's expression, so a statement nested in
+    /// a block inside it has its own.
+    statement_head: Option<usize>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -1301,6 +1531,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             nesting_refusal: None,
             import_path_failure: None,
             contextual_readings: Vec::new(),
+            member_readings: Vec::new(),
+            statement_head: None,
         }
     }
 
@@ -1452,6 +1684,105 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
+    /// A MEMBER name (B414 S4, contextual-keywords.md §5): an identifier, or
+    /// any RESERVED word — `event.type`, `fun match(self)` in an `impl`, a
+    /// field `if: i32`. Each member position is entered after a token that
+    /// commits to it (`.`, `::`, `fun` inside a member body, a struct body's
+    /// `{`/`,`), so no production can start there with the keyword and the
+    /// admission costs no lookahead. The word is the source text of the
+    /// token (a reserved word's token carries none), and a reserved reading is
+    /// recorded for the editor ([`Parser::member_readings`]).
+    fn eat_member_name(&mut self) -> Option<&'src str> {
+        let (token, span) = self.tokens.get(self.position)?;
+        match token {
+            Token::Ident(name) => {
+                let name = *name;
+                self.bump();
+                Some(name)
+            }
+            token if is_reserved_word(token) => {
+                let word = self.source.get(span.into_range())?;
+                self.member_readings.push(self.position);
+                self.bump();
+                Some(word)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the token at the cursor can be a member name — an identifier,
+    /// a reserved word, or a tuple index (`.0`).
+    fn peek_is_member_name(&self) -> bool {
+        match self.peek() {
+            Some(Token::Ident(_) | Token::Number(..)) => true,
+            Some(token) => is_reserved_word(token),
+            None => false,
+        }
+    }
+
+    /// R-k (B414 S4, RULED 2026-09-29): the name after a member `.` is
+    /// written against it. Called with the dot just consumed, before its name
+    /// is read; answers what the member position holds.
+    ///
+    /// - Nothing between them: the member, read as before.
+    /// - No name at all (`list.` before a `}` or a `;`): the mid-edit shape
+    ///   completion lives on — an `Error` member, silent here, the receiver
+    ///   still analyzed.
+    /// - A space on the same line (`list. len()`): reported, and the member is
+    ///   read anyway — the reading is not in doubt, only the spelling.
+    /// - A line break before a word that BEGINS a statement or an item
+    ///   (`list.` ⏎ `let x = 1;`): the half-typed dot above the next line. The
+    ///   word is not taken — under the member tier it could be — and the dot
+    ///   gets the `Error` member it always got, so the statement's missing-`;`
+    ///   recovery keeps it and the receiver stays analyzed for completion.
+    /// - A line break before any other word (`list.` ⏎ `helper();`): declined
+    ///   with the expectation noted, exactly as E142 declines a `::` that ends
+    ///   its line, so the next line is never swallowed as the member and the
+    ///   statement's recovery reports the one mistake, at the stranded name.
+    fn member_after_dot(&mut self) -> DotMember {
+        if !self.peek_is_member_name() {
+            return DotMember::Missing;
+        }
+        let Some(dot) = self
+            .position
+            .checked_sub(1)
+            .and_then(|at| self.tokens.get(at))
+        else {
+            return DotMember::Read;
+        };
+        let dot_span = dot.1;
+        let name_span = self.here_span();
+        let gap = self
+            .source
+            .get(dot_span.into_range().end..name_span.into_range().start)
+            .unwrap_or("");
+        if gap.is_empty() {
+            return DotMember::Read;
+        }
+        if gap.contains('\n') {
+            if starts_statement_or_item(self.tokens, self.position) {
+                return DotMember::Missing;
+            }
+            self.note_expected(A_MEMBER_NAME_AGAINST_ITS_DOT);
+            return DotMember::Decline;
+        }
+        let found = self
+            .source
+            .get(name_span.into_range())
+            .unwrap_or_default()
+            .to_string();
+        self.errors.push(ParseError {
+            span: Span::from(dot_span.into_range().start..name_span.into_range().end),
+            reason: ParseErrorReason::Expected {
+                found: Found::Token(found),
+                expected: vec![A_MEMBER_NAME_AGAINST_ITS_DOT.to_string()],
+            },
+            context: self.context_stack.clone(),
+            hint: None,
+        });
+        DotMember::Read
+    }
+
     // --- Contextual keywords (B414, proposal/contextual-keywords.md) --------
 
     /// Whether the cursor is at the identifier `word` — how every contextual
@@ -1549,6 +1880,13 @@ impl<'a, 'src> Parser<'a, 'src> {
                 .is_some_and(|index| *index >= start)
             {
                 self.contextual_readings.pop();
+            }
+            while self
+                .member_readings
+                .last()
+                .is_some_and(|index| *index >= start)
+            {
+                self.member_readings.pop();
             }
             // `nesting_refusal` is deliberately NOT restored: like
             // `farthest_failure`, it records how deep the input went, which no
@@ -2110,8 +2448,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         let Some(statement) = self.attempt(|parser| {
             // The three forms that take a terminator — the same three
             // `note_terminator` records one for.
+            let head = parser.position;
             let body = parser
-                .attempt(Self::parse_expression)
+                .attempt(Self::parse_statement_expression)
+                .map(|expression| parser.read_at_statement_position(expression, head))
                 .or_else(|| parser.attempt(Self::parse_import))
                 .or_else(|| parser.attempt(Self::parse_use))?;
             let at_a_fresh_statement = parser.at_end()
@@ -2547,9 +2887,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         // (`if`/`for`/`match`/`{ }`) used as a statement — which needs no `;` but
         // must not be the last thing in its block (chumsky's `not_block_end`).
         if let Some(statement) = self.attempt(|parser| {
-            let expression = parser.parse_expression()?;
+            let head = parser.position;
+            let expression = parser.parse_statement_expression()?;
             if parser.eat_ctrl(';') {
-                return Some(expression);
+                return Some(parser.read_at_statement_position(expression, head));
             }
             // A block-bearing form needs no `;` (chumsky's `not_block_end`). Its
             // own continuation rule is stated where the form is parsed
@@ -2797,6 +3138,37 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.parse_secondary(false)
     }
 
+    /// An expression statement's expression: [`Parser::parse_expression`] with
+    /// the statement's head recorded, so a `then`/`else` form starting there
+    /// may be the statement reading and the guard may stand (B459).
+    fn parse_statement_expression(&mut self) -> Option<Spanned<Node<'src>>> {
+        let outer = self.statement_head.replace(self.position);
+        let expression = self.parse_expression();
+        self.statement_head = outer;
+        expression
+    }
+
+    /// A statement's expression, terminated: a `then`/`else` form that IS the
+    /// statement is re-read as one ([`read_as_statement`]). "Is the statement"
+    /// means it begins at the statement's first token — a parenthesized form
+    /// keeps its inner span, so `(c then f());` is an operand in parentheses
+    /// and stays a value, in the compiler's parse and the formatter's alike.
+    fn read_at_statement_position(
+        &self,
+        expression: Spanned<Node<'src>>,
+        head: usize,
+    ) -> Spanned<Node<'src>> {
+        let starts_the_statement = self
+            .tokens
+            .get(head)
+            .is_some_and(|(_, span)| span.start == expression.1.start);
+        if starts_the_statement {
+            read_as_statement(expression)
+        } else {
+            expression
+        }
+    }
+
     /// The condition-position expression (`if`/`for` conditions, a `for … in`
     /// iterable, a `match` subject): the secondary grammar with struct literals
     /// excluded as operands, so the `{` after `if Foo` is the block, not a literal
@@ -2863,7 +3235,116 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// then `&&`, then `||` (each looser than the last). Built over the chain in the
     /// selected struct-literal mode.
     fn parse_operators(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
-        self.parse_logical_or(no_struct)
+        self.parse_conditional(no_struct)
+    }
+
+    /// B459: the infix conditional — `c then a else b`, and at a statement's
+    /// head the statement forms `c then S;`, `c else S;` (the guard) and `c
+    /// then S else S;`. Sugar over `if`: the form parses to a `Node::If`
+    /// spelled [`IfSpelling::Then`], and the statement reading is decided by
+    /// the statement that ends it ([`read_as_statement`]).
+    ///
+    /// The tier sits above assignment and below `||` (Q1): `a || b then x
+    /// else y` tests `a || b`, and `v = c then x else y` assigns the form.
+    /// Each branch is a whole expression, so a chain is right-associative
+    /// (Q2): `a then x else b then y else z` is an `else`-if chain, and an
+    /// `else` binds to the nearest `then` without one. `then` is CONTEXTUAL
+    /// (Q4): only here, after a complete operand, where no name can stand —
+    /// vilan never puts two names side by side — so `let then = 1;` and
+    /// `promise.then(f)` are unaffected. A bare `else` after an operand is the
+    /// guard, and is read only at a statement's head: anywhere else the
+    /// `else` belongs to an enclosing form's `then` (`c then f() else g();`).
+    ///
+    /// The part after the condition is ATTEMPTED: a `then` whose branches do
+    /// not parse is taken back, so a missing `;` before a line that starts
+    /// with a name `then` is still reported as the missing `;`.
+    fn parse_conditional(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let at_statement_head = self.statement_head == Some(start);
+        let condition = self.parse_logical_or(no_struct)?;
+        let guard = at_statement_head && self.peek_is(&Token::Else);
+        if !self.peek_is_word("then") && !guard {
+            return Some(condition);
+        }
+        let after_condition = self.position;
+        let form = self.attempt(|parser| {
+            let then = if parser.peek_is_word("then") {
+                let word = parser.here_span();
+                parser.contextual_readings.push(parser.position);
+                parser.bump();
+                Some((word, parser.parse_then_branch(no_struct)?))
+            } else {
+                None
+            };
+            let otherwise = if parser.peek_is(&Token::Else) {
+                let word = parser.here_span();
+                parser.bump();
+                Some((word, parser.parse_then_branch(no_struct)?))
+            } else {
+                None
+            };
+            Some((then, otherwise))
+        });
+        let Some((then, otherwise)) = form else {
+            self.position = after_condition;
+            return Some(condition);
+        };
+        let then_word = then.as_ref().map(|(word, _)| *word);
+        let else_word = otherwise.as_ref().map(|(word, _)| *word);
+        let then_block = match then {
+            Some((_, branch)) => {
+                let span = branch.1;
+                ((Vec::new(), Box::new(branch)), span)
+            }
+            // The guard's `then` is the empty block `if c {} else { S; }`
+            // has, placed at its `else`.
+            None => {
+                let at = else_word.map_or(condition.1.end, |word| word.start);
+                let span = Span::from(at..at);
+                ((Vec::new(), Box::new((Node::Void, span))), span)
+            }
+        };
+        let else_ = otherwise.map(|(_, branch)| {
+            let span = branch.1;
+            (
+                NodeIfBranch::Else(((Vec::new(), Box::new(branch)), span)),
+                span,
+            )
+        });
+        Some((
+            Node::If(NodeIfBranch::If(Box::new(If {
+                condition: Box::new(condition),
+                then: then_block,
+                else_,
+                spelling: IfSpelling::Then {
+                    then_word,
+                    else_word,
+                    statement: false,
+                },
+            }))),
+            self.span_from(start),
+        ))
+    }
+
+    /// One branch of a `then`/`else` form: a whole expression (a statement, at
+    /// statement position — every statement vilan has is an expression
+    /// production), in the enclosing condition mode. A `let` parses and is
+    /// refused (Q8, [`A_BRANCH_BINDS_NOTHING`]).
+    fn parse_then_branch(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        let branch = if no_struct {
+            self.parse_secondary(true)?
+        } else {
+            self.parse_expression()?
+        };
+        if matches!(branch.0, Node::Let(..)) {
+            self.errors.push(ParseError {
+                span: branch.1,
+                reason: ParseErrorReason::Rule(A_BRANCH_BINDS_NOTHING),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
+        Some(branch)
     }
 
     fn parse_logical_or(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
@@ -3196,7 +3677,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is_ctrl('.') {
             let dot_span = self.here_span();
             self.bump();
-            let member = self.parse_member_call();
+            let member = match self.member_after_dot() {
+                DotMember::Read => self.parse_member_call(),
+                DotMember::Missing => None,
+                DotMember::Decline => return None,
+            };
             return Some(Some(Postfix::Member(
                 member.unwrap_or((Node::Error, dot_span)),
             )));
@@ -3224,7 +3709,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.bump(); // `?`
             self.bump(); // `.`
             let dot_span = self.span_from(start);
-            let member = self.parse_member_call();
+            let member = match self.member_after_dot() {
+                DotMember::Read => self.parse_member_call(),
+                DotMember::Missing => None,
+                DotMember::Decline => return None,
+            };
             return Some(Some(Postfix::LiftMember(
                 member.unwrap_or((Node::Error, dot_span)),
             )));
@@ -3248,7 +3737,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some((node, span));
         }
         let start = self.position;
-        let name = self.eat_ident()?;
+        let name = self.eat_member_name()?;
         let accessor = (Node::Accessor(name), self.span_from(start));
         // An optional single fused call: `<generics>? ( args )`. If generics parse
         // but no `(` follows, they are backtracked and the bare accessor is kept.
@@ -3416,7 +3905,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.position = save;
                 return None;
             }
-            match self.eat_ident() {
+            // B414 S4: a segment after `::` is a member position — any word
+            // (`Event::type(..)`, a static named for a reserved word).
+            match self.eat_member_name() {
                 Some(member) => {
                     // No generic arguments: in expression position a `<...>`
                     // after the member belongs to the CALL that follows, which
@@ -3427,25 +3918,6 @@ impl<'a, 'src> Parser<'a, 'src> {
                     );
                 }
                 None => {
-                    // `Length::css(…)` — the spelling the keyword promotion
-                    // renamed. RECOVER over the word rather than rolling the
-                    // `::` back: rolled back, the failure surfaces at the
-                    // operator as a missing `;` and the word the reader has to
-                    // change is never named. Consuming it into an error
-                    // stand-in lets the enclosing statement parse, so the rule
-                    // is the one diagnostic the mistake raises.
-                    if self.peek_is(&Token::Css) {
-                        let span = self.here_span();
-                        self.bump();
-                        self.errors.push(ParseError {
-                            span,
-                            reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
-                            context: self.context_stack.clone(),
-                            hint: None,
-                        });
-                        current = (Node::Error, self.span_from(start));
-                        continue;
-                    }
                     // `style::` with nothing after it — the shape a path is in
                     // while it is being TYPED. The roll-back alone told the
                     // reader nothing: `style` became the whole value, the `::`
@@ -3642,7 +4114,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         &mut self,
     ) -> Option<Spanned<(&'src str, Option<Spanned<Node<'src>>>)>> {
         let start = self.position;
-        let name = self.eat_ident()?;
+        // B414 S4: a field given WITH `=` is a member position, so any word
+        // names it (`Event { type = kind }`); the shorthand `{ type }` reads a
+        // binding of that name, which a reserved word can never be.
+        let name = if !matches!(self.peek(), Some(Token::Ident(_))) && self.peek_at_is_op(1, "=") {
+            self.eat_member_name()?
+        } else {
+            self.eat_ident()?
+        };
         let value = if self.eat_op("=") {
             Some(self.parse_expression()?)
         } else {
@@ -4046,8 +4525,14 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_css_dotted_inner(&mut self) -> Option<CssItem<'src>> {
         let start = self.position;
         self.expect_ctrl('.')?;
+        // R-k: a dotted item's name is written against its dot, as a member's
+        // is everywhere else.
+        if self.peek_is_member_name() && !self.previous_token_is_adjacent() {
+            self.report_css_failure(A_MEMBER_NAME_AGAINST_ITS_DOT);
+            return None;
+        }
         let name_span = self.here_span();
-        let Some(name) = self.eat_ident() else {
+        let Some(name) = self.eat_member_name() else {
             self.report_css_failure(
                 "a condition combinator (`.hover { … }`) or a chain link (`.ghost();`)",
             );
@@ -4256,6 +4741,20 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
     }
 
+    /// Whether the token at the cursor touches the one before it — no trivia
+    /// between them. `false` at the start of the stream.
+    fn previous_token_is_adjacent(&self) -> bool {
+        match (
+            self.position
+                .checked_sub(1)
+                .and_then(|at| self.tokens.get(at)),
+            self.tokens.get(self.position),
+        ) {
+            (Some(previous), Some(current)) => previous.1.end == current.1.start,
+            _ => false,
+        }
+    }
+
     fn peek_at_is_op(&self, offset: usize, symbol: &str) -> bool {
         matches!(self.peek_at(offset), Some(Token::Op(found)) if *found == symbol)
     }
@@ -4402,6 +4901,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         // Chain form — the link node exactly as a written chain builds it.
         if self.peek_is_ctrl('.') {
             self.bump();
+            // R-k: a head's items are separated by whitespace, so a name that
+            // does not touch the dot is the NEXT item (`<input . disabled>`)
+            // and the link is the unfinished one — reported the way a dot with
+            // no name is, with the rule's own expectation.
+            if self.peek_is_member_name() && !self.previous_token_is_adjacent() {
+                let context = self.context_stack.clone();
+                self.emit_failure(
+                    self.position,
+                    vec![A_MEMBER_NAME_AGAINST_ITS_DOT.to_string()],
+                    context,
+                );
+                return Some(None);
+            }
             let Some(link) = self.attempt(Self::parse_member_call) else {
                 // A dot with no name after it: the shape a head is in while a
                 // chain link is being TYPED (`<div .`). The dot has already
@@ -4754,6 +5266,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 condition: Box::new(condition),
                 then,
                 else_,
+                spelling: IfSpelling::Keyword,
             })),
             self.span_from(start),
         ))
@@ -5951,7 +6464,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         let external = self.eat(&Token::External);
         self.expect(&Token::Fun)?;
         let name_start = self.position;
-        let name = self.eat_ident()?;
+        // B414 S4: a METHOD — a `fun` in an `impl` or `trait` item list — is
+        // reached through a receiver or a `::` path, never through the atom
+        // production, so any word names it; a free function binds a name and
+        // keeps the identifier rule.
+        let name = if self.in_member_body {
+            self.eat_member_name()?
+        } else {
+            self.eat_ident()?
+        };
         let name = (name, self.span_from(name_start));
         let generic_parameters = self.parse_generic_parameters();
         let parameters = self.parse_function_parameters()?;
@@ -6041,6 +6562,11 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         let mut contexts: Option<(Vec<Spanned<&'src str>>, Span)> = None;
         if let Some(annotation) = return_type.take() {
+            // E233: `&T context c` reads the clause on the VIEW's target (the
+            // `&` production takes a whole type), which is the same mis-binding
+            // the peel below undoes for a bare `T` — hoisted first so both
+            // spellings reach it as one shape.
+            let annotation = hoist_clause_out_of_a_view(*annotation);
             match annotation.0 {
                 Node::TypeWithContexts(inner, names)
                     if !return_type_carries_its_own_clause(&inner.0) =>
@@ -6508,7 +7034,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.refuse_misplaced_resource_attribute();
         let exposed = self.eat_expose_attribute();
         let name_start = self.position;
-        let name = self.eat_ident()?;
+        // B414 S4: a declared field is a member position — any word.
+        let name = self.eat_member_name()?;
         let name = (name, self.span_from(name_start));
         let type_ = if self.eat_op(":") {
             Some(self.parse_type()?)
@@ -7041,7 +7568,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.eat_op("::") {
             if self.eat_ctrl('{') {
                 let names =
-                    self.comma_list(Self::eat_member_name, |parser| parser.peek_is_ctrl('}'));
+                    self.comma_list(Self::eat_selector_member, |parser| parser.peek_is_ctrl('}'));
                 match names {
                     Some(names) => members = names,
                     None => {
@@ -7060,7 +7587,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                     ));
                 }
             } else {
-                match self.eat_member_name() {
+                match self.eat_selector_member() {
                     Some(member) => members.push(member),
                     None => {
                         return Some(self.selector_refusal(
@@ -7084,9 +7611,12 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// One member name inside a selector's `::name` / `::{ a, b }` tail, with
     /// its span. `as` on one is refused where it is written
     /// ([`IMPL_SELECTOR_REFUSES_AS`]) and eaten, so the set still reads.
-    fn eat_member_name(&mut self) -> Option<(&'src str, Span)> {
+    ///
+    /// A selector names METHODS, so the name is a member name (B414 S4): a
+    /// method declared `fun type(self)` is selected as `(impl T)::type`.
+    fn eat_selector_member(&mut self) -> Option<(&'src str, Span)> {
         let start = self.position;
-        let name = self.eat_name()?;
+        let name = self.eat_member_name()?;
         let span = self.span_from(start);
         self.refuse_selector_alias();
         Some((name, span))
@@ -8030,7 +8560,7 @@ fn is_block_like(node: &Node<'_>) -> bool {
     matches!(
         node,
         Node::If(_) | Node::For(..) | Node::ForIn(..) | Node::Match(..) | Node::Block(_)
-    )
+    ) && !is_then_form(node)
 }
 
 /// Apply one plain postfix to a subject, spanning from the chain's start. A
@@ -8746,6 +9276,53 @@ mod tests {
                     vec!["a", "b"]
                 );
             }
+            other => panic!("expected Func, got {other:?}"),
+        }
+    }
+
+    // E233: a VIEW return type (`&T`, `&mut T`) takes the clause the same way —
+    // the `&` production parses a whole type, so the clause first lands on the
+    // view's target and is hoisted onto the declaration from there. The return
+    // type keeps its `&`, and spans only the view.
+    #[test]
+    fn e233_a_view_return_types_context_clause_binds_to_the_declaration() {
+        for (source, mutable) in [
+            (
+                "fun pick(xs: &L): &i32 context settings borrows xs { xs }",
+                false,
+            ),
+            (
+                "fun pick(xs: &L): &i32 borrows xs context settings { xs }",
+                false,
+            ),
+            (
+                "fun pick(xs: &mut L): &mut i32 context settings borrows xs { xs }",
+                true,
+            ),
+        ] {
+            match only_item(source) {
+                Node::Func(function) => {
+                    let (names, _) = function.contexts.as_ref().expect("a declared clause");
+                    assert_eq!(names[0].0, "settings", "{source}");
+                    assert_eq!(function.borrows, Some("xs"), "{source}");
+                    let returns = function.return_type.as_ref().expect("a return type");
+                    match &returns.0 {
+                        Node::Reference(written, target) => {
+                            assert_eq!(*written, mutable, "{source}");
+                            assert!(matches!(target.0, Node::Accessor("i32")), "{source}");
+                        }
+                        other => panic!("expected a view return type, got {other:?} ({source})"),
+                    }
+                    let view = if mutable { "&mut i32" } else { "&i32" };
+                    assert_eq!(&source[returns.1.into_range()], view, "{source}");
+                }
+                other => panic!("expected Func, got {other:?}"),
+            }
+        }
+        // A view of a CLOSURE type keeps the clause on the closure (B309): the
+        // hoist is the non-closure peel's, not a second rule.
+        match only_item("fun pick(): &(|| i32) context settings { x }") {
+            Node::Func(function) => assert!(function.contexts.is_none()),
             other => panic!("expected Func, got {other:?}"),
         }
     }
@@ -10429,5 +11006,260 @@ mod tests {
             rendered_errors("fun main() {\n\tlet s = dyn Shape;\n}\n"),
             vec![DYN_IS_A_TYPE_MARKER.to_string()]
         );
+    }
+
+    // --- B414 S4: the member tier, and R-k --------------------------------------
+
+    /// The RESERVED words the parser read as MEMBER names in `source`, in order.
+    fn member_readings(source: &str) -> Vec<&str> {
+        keyword_member_readings(source)
+            .into_iter()
+            .map(|span| &source[span.into_range()])
+            .collect()
+    }
+
+    #[test]
+    fn b414_s4_a_reserved_word_is_read_as_a_member_at_each_member_position() {
+        let source = concat!(
+            "struct Event { type: str, if: i32 }\n",
+            "trait Shape { fun match(self): str; }\n",
+            "impl Event { fun for(self): i32 { self.if } fun in(): Event { Event { type = \"x\", if = 1 } } }\n",
+            "import a::{ (impl Event)::ret };\n",
+            "fun main() {\n",
+            "\tlet e = Event::in();\n",
+            "\tlet n = e.for() + e.if;\n",
+            "\tlet kind = found?.match();\n",
+            "\tif e.if == 1 { ret; } else { ret; }\n",
+            "}\n",
+        );
+        let (_, errors) = parse(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            member_readings(source),
+            vec![
+                // declared: fields, a trait method, two impl methods
+                "type", "if", "match", "for", "if", "in", "type", "if",
+                // an impl selector's member
+                "ret", // `::`, `.`, `?.`
+                "in", "for", "if", "match", "if",
+            ],
+        );
+    }
+
+    #[test]
+    fn b414_s4_a_reserved_word_is_no_member_where_a_name_is_bound() {
+        // A free function, a binding, a parameter and the literal shorthand
+        // (`{ type }` reads a binding) keep the identifier rule.
+        for source in [
+            "fun type(): i32 { 1 }\n",
+            "fun main() { let type = 1; }\n",
+            "fun f(type: i32) {}\n",
+            "fun main() { let e = Event { type }; }\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(!errors.is_empty(), "{source:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn b414_s4_r_k_a_member_name_is_written_against_its_dot() {
+        let steer = format!("found 'n' expected {A_MEMBER_NAME_AGAINST_ITS_DOT}");
+        // Same line: reported, and the member is still read — one error.
+        assert_eq!(
+            rendered_errors("fun main() { let a = s. n; }\n"),
+            vec![steer.clone()]
+        );
+        assert_eq!(
+            rendered_errors("fun main() { let a = s?. n; }\n"),
+            vec![steer.clone()]
+        );
+        // Across a line: the next line's first word is never the member.
+        assert_eq!(
+            rendered_errors("fun main() {\n\tlet a = s.\n\t\tn;\n}\n"),
+            vec![steer]
+        );
+        let (tree, errors) = parse("fun main() {\n\tlet a = s.\n\tlet b = 2;\n}\n");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let (statements, _) = tree.expect("a tree");
+        let Node::Func(main) = &statements[0].0 else {
+            panic!("expected main");
+        };
+        let body = main.body.as_ref().expect("a body");
+        assert!(
+            body.0
+                .0
+                .iter()
+                .any(|statement| matches!(&statement.0, Node::Let(..))),
+            "the next line's `let b` survives as its own statement"
+        );
+        // Nothing between the dot and its name, and nothing after a trailing
+        // dot at all — both unchanged, as is the chain broken BEFORE its dot.
+        for source in [
+            "fun main() { let a = s.n; }\n",
+            "fun main() {\n\tlet a = xs\n\t\t.len();\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source:?}: {errors:?}");
+        }
+        let (_, errors) = parse("fun main() { s. }\n");
+        assert!(
+            errors.is_empty(),
+            "the mid-edit `s.` still recovers silently: {errors:?}"
+        );
+    }
+
+    // --- B459: the `then`/`else` forms -----------------------------------------
+
+    /// The `If` a `then` form parses to, and its spelling.
+    fn then_form<'a, 'src>(node: &'a Node<'src>) -> (&'a If<'src>, bool, bool, bool) {
+        let Node::If(NodeIfBranch::If(if_)) = node else {
+            panic!("expected a `then` form, got {node:?}");
+        };
+        let IfSpelling::Then {
+            then_word,
+            else_word,
+            statement,
+        } = if_.spelling
+        else {
+            panic!("expected the `then` spelling, got {:?}", if_.spelling);
+        };
+        (if_, then_word.is_some(), else_word.is_some(), statement)
+    }
+
+    /// The statements of `fun main() { … }`'s body.
+    fn main_statements(source: &str) -> Vec<Spanned<Node<'_>>> {
+        let (mut statements, _) = program(source);
+        let Node::Func(main) = statements.remove(0).0 else {
+            panic!("expected `fun main`");
+        };
+        main.body.expect("a body").0.0
+    }
+
+    #[test]
+    fn b459_the_expression_form_sits_above_assignment_and_below_or() {
+        // `a || b then x else y` tests `a || b` (Q1).
+        let node = expr("a || b then x else y");
+        let (if_, then, otherwise, statement) = then_form(&node.0);
+        assert!(then && otherwise && !statement);
+        assert!(matches!(if_.condition.0, Node::Binary(BinaryOp::Or, _, _)));
+        // `v = c then x else y` assigns the whole form.
+        let node = expr("v = c then x else y");
+        let Node::Assign(_, None, value) = &node.0 else {
+            panic!("expected an assignment, got {node:?}");
+        };
+        then_form(&value.0);
+        // The expression form's branches are the block TAILS: `if c { x } else { y }`.
+        let node = expr("c then x else y");
+        let (if_, ..) = then_form(&node.0);
+        assert!(if_.then.0.0.is_empty());
+        assert!(matches!(if_.then.0.1.0, Node::Accessor("x")));
+        let Some((NodeIfBranch::Else(block), _)) = &if_.else_ else {
+            panic!("expected an else block");
+        };
+        assert!(matches!(block.0.1.0, Node::Accessor("y")));
+    }
+
+    #[test]
+    fn b459_a_chain_is_right_associative_and_else_binds_the_nearest_then() {
+        // Q2: `a then x else b then y else z` is an `else`-if chain.
+        let node = expr("a then x else b then y else z");
+        let (if_, ..) = then_form(&node.0);
+        let Some((NodeIfBranch::Else(block), _)) = &if_.else_ else {
+            panic!("expected an else block");
+        };
+        let (inner, then, otherwise, _) = then_form(&block.0.1.0);
+        assert!(then && otherwise);
+        assert!(matches!(inner.condition.0, Node::Accessor("b")));
+        // The dangling `else`: `a then b then x else y` nests the `else` in.
+        let node = expr("a then b then x else y");
+        let (outer, _, outer_else, _) = then_form(&node.0);
+        assert!(!outer_else, "the `else` is the nearest `then`'s");
+        let (_, _, inner_else, _) = then_form(&outer.then.0.1.0);
+        assert!(inner_else);
+    }
+
+    #[test]
+    fn b459_at_statement_position_the_statement_reading_applies() {
+        let statements = main_statements(concat!(
+            "fun main() {\n",
+            "\tc then f() else g();\n",
+            "\tc then f();\n",
+            "\tc else ret;\n",
+            "\ta then b then f() else g();\n",
+            "\tlet v = c then 1 else 2;\n",
+            "\t(c then 1 else 2);\n",
+            "}\n",
+        ));
+        // `c then f() else g();` is `if c { f(); } else { g(); }` (Q6).
+        let (if_, then, otherwise, statement) = then_form(&statements[0].0);
+        assert!(then && otherwise && statement);
+        assert_eq!(if_.then.0.0.len(), 1);
+        assert!(matches!(if_.then.0.1.0, Node::Void));
+        // `c then f();` and the guard `c else ret;`.
+        let (_, then, otherwise, statement) = then_form(&statements[1].0);
+        assert!(then && !otherwise && statement);
+        let (guard, then, otherwise, statement) = then_form(&statements[2].0);
+        assert!(!then && otherwise && statement);
+        assert!(
+            guard.then.0.0.is_empty(),
+            "the guard's `then` is the empty block"
+        );
+        // A form that is a statement's branch is read as a statement too.
+        let (outer, ..) = then_form(&statements[3].0);
+        let (_, _, _, inner_statement) = then_form(&outer.then.0.0[0].0);
+        assert!(inner_statement);
+        // An initializer and a parenthesized form are VALUES.
+        let Node::Let(_, _, Some(value), ..) = &statements[4].0 else {
+            panic!("expected a let, got {:?}", statements[4].0);
+        };
+        let (_, _, _, statement) = then_form(&value.0);
+        assert!(!statement);
+        let (_, _, _, statement) = then_form(&statements[5].0);
+        assert!(!statement, "`(c then 1 else 2);` is a value in parentheses");
+    }
+
+    #[test]
+    fn b459_a_value_needs_both_branches_and_the_guard_is_a_statement() {
+        assert_eq!(
+            rendered_errors("fun main() { let x = c then 1; }\n"),
+            vec![THEN_NEEDS_ITS_ELSE.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("fun main() { (c then f()); }\n"),
+            vec![THEN_NEEDS_ITS_ELSE.to_string()]
+        );
+        assert_eq!(
+            rendered_errors("fun main() { c then let x = 1; }\n"),
+            vec![A_BRANCH_BINDS_NOTHING.to_string()]
+        );
+        // The guard reads only at a statement's head.
+        assert!(declines("fun main() { let x = c else 1; }\n"));
+        // A form with both branches is a value anywhere, a block's tail included.
+        for source in [
+            "fun f(): i32 { c then 1 else 2 }\n",
+            "fun main() { let pick = |x: bool| x then 1 else 2; }\n",
+            "fun main() { print(1 + (a then 10 else 20)); }\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(errors.is_empty(), "{source:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn b459_then_is_a_keyword_only_after_a_complete_operand() {
+        let source = concat!(
+            "fun then(then: i32): i32 { then }\n",
+            "fun main() {\n",
+            "\tlet then = 1;\n",
+            "\tlet next = then + then;\n",
+            "\tpromise.then(done);\n",
+            "\tready then go() else then(2);\n",
+            "}\n",
+        );
+        let (_, errors) = parse(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(readings(source), vec!["then"]);
+        let at = source.find("then go").expect("the keyword");
+        assert_eq!(contextual_keyword_readings(source)[0].start, at);
     }
 }

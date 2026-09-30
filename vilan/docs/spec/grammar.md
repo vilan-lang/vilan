@@ -5,8 +5,8 @@ The full syntactic grammar, in the notation of §1.3. Token classes
 `module`.
 
 A quoted terminal that is a **contextual keyword** (§2.2 — `with`,
-`borrows`, `own`, `lazy`, `dyn`, `jump`, `as`, `only`, `context`, `sync`,
-`self`) matches an `IDENT` of that spelling, and only at the position its
+`borrows`, `own`, `lazy`, `dyn`, `jump`, `then`, `as`, `only`, `context`,
+`sync`, `self`) matches an `IDENT` of that spelling, and only at the position its
 production puts it; everywhere else the same word is an ordinary `IDENT`
 (B414). Each is decided without backtracking. `with` (after an `impl`
 subject or a `trait` head) and `borrows` (after a return type) sit where no
@@ -15,7 +15,8 @@ head, `lazy` before `let`/`mut`, `jump` before its target and `dyn` at a
 type's head are PREFIXES of a name, and the grammar never puts two names side
 by side, so the word is the keyword when a name follows it (for `dyn`, when
 anything but `::` follows it) and a name otherwise: `fun f(own: Owner)`,
-`|lazy| lazy.force()`, `jump.height`, `dyn::Registry`.
+`|lazy| lazy.force()`, `jump.height`, `dyn::Registry`. `then` follows a
+complete operand (§3.8), which is where no name can stand either.
 
 ## 3.1 Modules and statements
 
@@ -32,6 +33,7 @@ statement = derived-item
           | macro-invocation [ ";" ]
           | export         (* the visibility marker, §3.2 *)
           | expression ";"
+          | then-statement ";"   (* B459, §3.8 *)
           | if-expr        (* not before "}" — see below *)
           | for-expr       (* not before "}" *)
           | match-expr     (* not before "}" *)
@@ -71,7 +73,7 @@ path-branch = [ "#" ] NAME [ "::" ( path-branch | path-set )
 path-set    = "{" set-element { "," set-element } [ "," ] "}" ;
 set-element = path-branch | impl-selector ;
 impl-selector = "(" "impl" type ")"
-                [ "::" ( NAME | "{" NAME { "," NAME } [ "," ] "}" ) ] ;
+                [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
 export      = "export" [ "(" "in" path-branch ")" ]
@@ -144,7 +146,7 @@ function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "async" ] [ "external" ]
-           "fun" IDENT [ generic-params ]
+           "fun" MEMBER [ generic-params ]   (* IDENT unless an impl/trait member *)
            "(" [ parameter { "," parameter } [ "," ] ] ")"
            [ ":" type ] [ "borrows" IDENT ] [ context-clause ]
            ( block | ";" ) ;
@@ -287,7 +289,7 @@ struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-at
          (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
 field  = [ internal-label ]
-         [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
+         [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] MEMBER [ ":" type ] ;
 internal-label = "[" "internal" "(" STRING ")" "]" ;
 deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
 resource-attr    = "[" "resource" "]" ;   (* B413 *)
@@ -514,11 +516,12 @@ The tightest expression tier, `chain`:
 chain   = path { call-suffix | postfix } ;
 path    = ( IDENT generic-args ␣"::"  (* generic static head *)
           | atom )
-          { "::" IDENT } ;
+          { "::" MEMBER } ;
 call-suffix = [ generic-args ] "(" [ entry { "," entry } [ "," ] ] ")" ;
 member  = NUMBER                          (* tuple index: .0 *)
-        | IDENT [ call-suffix ] ;         (* field / ONE fused method call *)
-postfix = "." member
+        | MEMBER [ call-suffix ] ;        (* field / ONE fused method call *)
+MEMBER  = IDENT | RESERVED ;              (* any word, B414 S4 (§2.2) *)
+postfix = "." member                     (* span-adjacent: `.` then the member *)
         | "[" expression "]"             (* index *)
         | "!"                            (* try-assert, §5.10 *)
         | "(" [ entry { "," entry } [ "," ] ] ")"
@@ -556,11 +559,29 @@ css-item     = css-declaration | css-rule | css-link ;
 css-declaration = css-property "(" [ expression { "," expression } [ "," ] ]
                ")" ";" ;               (* a CALL: the property is the name *)
 css-property = { "-" } element-name ;  (* span-adjacent, as an element name is *)
-css-rule     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
+css-rule     = "." MEMBER [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                css-body ;
-css-link     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
+css-link     = "." MEMBER [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                ";" ;                   (* a chain link, verbatim *)
 ```
+
+A **member name** is any word, a reserved one included (B414 S4, §2.2):
+`event.type`, `bag.if()`, `found?.match()`, `Kit::if()`. The positions that
+take one — the name after a member `.`/`?.`, a head item's or a `css`
+item's dot, a segment after `::`, a struct field, a literal field given with
+`=`, a method declared in an `impl` or `trait`, an impl selector's member —
+are each entered after a token that commits to them, so no keyword reading
+can begin there and the admission needs no lookahead. A member dot and its
+name are **span-adjacent**: nothing, not a space and not a line break,
+stands between `.` (or `?.`) and the member (R-k). Without the rule a
+half-typed `list.` at the end of a line would take whatever the next line
+starts with as its member — `helper` in `helper();`, and under the member
+tier even `let` — and swallow the next statement, the way E142's rule keeps
+a `::` path from doing (§3.2). A chain written over several lines breaks
+BEFORE each dot — `value` on one line, `.name()` opening the next — which
+the rule leaves exactly as it was. A space on the dot's own line is refused
+with the member still read; a line break after the dot takes nothing from
+the next line.
 
 `Name<Args>` is read as a generic path head only when `::` immediately
 follows (`List<str>::new()`); otherwise `<` is a comparison. A member
@@ -667,6 +688,7 @@ From tightest to loosest; every binary level is left-associative:
 | 10 | `is` pattern | at most one per operand (no chaining) |
 | 11 | `&&` | |
 | 12 | `\|\|` | |
+| 13 | `then` … `else` | B459; right-associative, above assignment (§3.8) |
 
 Bitwise operators bind tighter than comparisons (`a & b == c` is
 `(a & b) == c`).
@@ -678,12 +700,17 @@ expression     = "const" expression        (* weak prefix: captures to the end *
                | secondary-expr ;
 secondary-expr = closure | block | if-expr | for-expr | match-expr
                | jump | let | ret | assignment
-               | operator-expr ;           (* §3.7 levels 1–12 *)
+               | conditional-expr ;        (* §3.7 levels 1–13 *)
+conditional-expr = operator-expr [ "then" expression "else" expression ] ;
+then-statement = operator-expr             (* at a statement's head only *)
+                 ( "then" expression [ "else" expression ]
+                 | "else" expression ) ;   (* the guard *)
 condition-expr = secondary-expr ;    (* struct-init and css-block excluded *)
 
 struct-init   = type-path                      (* §3.9; qualified heads too *)
                 "{" [ init-field { "," init-field } [ "," ] ] "}" ;
-init-field    = IDENT [ "=" expression ] ;   (* shorthand: name alone *)
+init-field    = IDENT [ "=" expression ]      (* shorthand: name alone *)
+              | MEMBER "=" expression ;     (* a reserved field name, B414 S4 *)
 closure       = ( "||" | "|" [ closure-param { "," closure-param } [ "," ] ] "|" )
                 [ ":" type ] expression ;
 closure-param = parameter ;   (* the same rule as a function's, less "..." *)
@@ -721,6 +748,35 @@ Two consequences of the tier split are normative:
 A closure's body is one expression (commonly a block). `||` in operand
 position always begins a zero-parameter closure; logical-or is only
 recognized between two operands.
+
+**`then` / `else`** (B459) is SUGAR over `if`, desugared before analysis:
+`c then a else b` is `if c { a } else { b }`, and typing, the scope of `c`'s
+`is` bindings (they reach `a`, not `b`), emission and diagnostics are the
+`if`'s. As a `conditional-expr` — a VALUE — the form needs both branches,
+exactly as an `if` used for its value does; a `then` without its `else`, or a
+bare `else`, in value position is refused. It binds looser than `||` and
+tighter than assignment: `a || b then x else y` tests `a || b`, and `v = c
+then x else y` assigns the form. Each branch is a whole expression, so the
+form is right-associative: `a then x else b then y else z` is an `else if`
+chain, and an `else` belongs to the nearest `then` that has none.
+
+At a statement's HEAD, a form ended by the statement's `;` is a
+`then-statement`, read as the statement forms `c then S;` (`if c { S; }`),
+`c else S;` (`if c {} else { S; }`, the **guard**) and `c then S else S;`
+(`if c { S; } else { S; }`): each branch is one statement whose value is
+discarded, so the branches need not unify, and a branch that is itself a form
+is read as a statement too. A branch has no block of its own, so a `let` as
+a branch is refused. The one rule that is not a rewrite (R15): when the
+`else` statement of a statement form DIVERGES — `ret`, `jump`, a `panic(…)`,
+an endless loop — the statement can be left only along the condition's TRUE
+path, so the `is` bindings that path makes reach the rest of the enclosing
+block, from the statement's end (`opt is Some(let v) else ret;` binds `v`
+below it). A capture under `!` or in one operand of `||` is not proven by
+the condition holding and is not extended; the keyword `if` keeps its own
+scoping. The same form parenthesized, or at a block's end with no
+`;`, is a value. `then` is a contextual keyword: it is read only after a
+complete operand, where no name can stand, so `let then = 1;` and
+`promise.then(f)` are unaffected.
 
 ## 3.9 Types
 

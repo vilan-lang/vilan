@@ -373,6 +373,7 @@ fn descend_if(branch: NodeIfBranch<'_>) -> NodeIfBranch<'_> {
                 condition,
                 mut then,
                 else_,
+                spelling,
             } = *if_;
             let condition = seal_boxed(condition);
             seal_body(&mut then.0);
@@ -381,6 +382,7 @@ fn descend_if(branch: NodeIfBranch<'_>) -> NodeIfBranch<'_> {
                 condition,
                 then,
                 else_,
+                spelling,
             }))
         }
         NodeIfBranch::Else(mut body) => {

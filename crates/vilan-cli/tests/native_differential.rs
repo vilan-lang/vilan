@@ -171,6 +171,11 @@ const DEFAULT_SUITE: &[&str] = &[
     // rather than left as an unverified claim in `vilan_rt::str_len`'s doc
     // comment.
     "non-bmp-string-length.vl",
+    // B414 S4: every reserved word names a member — fields, methods, a trait
+    // default, a `::` static, a lifted link and a `[derive(Json)]` round trip
+    // over a `"type"` key — and the Rust emitter's own keywords (`type`,
+    // `match`, `if`, `in`, `for`, `ret`) must survive as member names natively.
+    "keyword-members.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named

@@ -7,8 +7,8 @@ use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet, FxIndexMap as IndexM
 use crate::id::Id;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure,
-    ExternBinding, Func, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    Labels, Node, NodeIfBranch, NodeList, Pattern, ServiceAttr,
+    ExternBinding, Func, GenericParameters, IfSpelling, ImplSelector, ImportBranch, ImportModifier,
+    ImportTail, Labels, Node, NodeIfBranch, NodeList, Pattern, ServiceAttr,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -3139,11 +3139,14 @@ struct GuardContinuation<'src> {
     scope_id: Id,
     /// The end of the `if` — a continuation binding is visible from there on.
     visible_from: usize,
-    /// The then-block, the thing that has to diverge for any of this to hold.
-    then_statements: Vec<Id>,
-    then_tail: Id,
-    /// What the condition binds by being FALSE (`name`, entity, `visible_until`)
-    /// — B195's else set, which with no `else` has the continuation for a home.
+    /// The block that has to diverge for any of this to hold: B187's
+    /// then-block, or (R15) a `then`-spelled statement's `else`.
+    diverging_statements: Vec<Id>,
+    diverging_tail: Id,
+    /// What the condition binds on the path that does NOT diverge (`name`,
+    /// entity, `visible_until`): for B187 what it binds by being FALSE — B195's
+    /// else set, which with no `else` has the continuation for a home — and
+    /// for R15 what it binds by being TRUE.
     captures: Vec<(&'src str, Id, usize)>,
 }
 
@@ -3579,6 +3582,12 @@ pub struct Analyzer<'src> {
     /// Drained by the `if` walk, which declares them into the else branch's own
     /// scope (and into an `else if`'s, and on down the chain).
     else_visible_captures: Vec<(&'src str, Id, usize)>,
+    /// R15 (B459): the captures the condition being walked binds on its TRUE
+    /// path all the way past the condition — on the spine, outside every `||`
+    /// operand and every negation — as `(name, entity, visible_until)`.
+    /// Drained by the `if` walk, which publishes them past a `then`-spelled
+    /// guard whose `else` diverges.
+    then_visible_captures: Vec<(&'src str, Id, usize)>,
     // Diagnostic source attribution (backlog E1): `(index, source)` marks — a
     // diagnostic at index `i` belongs to the source of the last mark with
     // `index <= i` (default: the entry, `SourceId(0)`). Marks are dropped at
@@ -6297,6 +6306,7 @@ impl<'src> Analyzer<'src> {
             condition_polarity: None,
             expression_position_captures: HashMap::default(),
             else_visible_captures: Vec::new(),
+            then_visible_captures: Vec::new(),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: HashSet::default(),
@@ -33580,14 +33590,20 @@ impl<'src> Analyzer<'src> {
 
                 /// Returns the walked branch plus the captures THIS branch's
                 /// own condition proves by being false — what B195 hands the
-                /// `else` and what B187 publishes past a diverging guard. Empty
-                /// for a bare `else`, which has no condition of its own.
+                /// `else` and what B187 publishes past a diverging guard — and
+                /// the ones it proves by being true, which R15 publishes past a
+                /// `then`-spelled guard. Both empty for a bare `else`, which has
+                /// no condition of its own.
                 fn walk_branch<'src>(
                     s: &mut Analyzer<'src>,
                     branch: &'src NodeIfBranch,
                     scope_id: Id,
                     inherited: &InheritedCaptures<'src>,
-                ) -> (ExprIfBranch, InheritedCaptures<'src>) {
+                ) -> (
+                    ExprIfBranch,
+                    InheritedCaptures<'src>,
+                    InheritedCaptures<'src>,
+                ) {
                     match branch {
                         NodeIfBranch::If(if_) => {
                             let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
@@ -33603,10 +33619,15 @@ impl<'src> Analyzer<'src> {
                                 .condition_polarity
                                 .replace(ConditionPolarity::root(if_.condition.1.end));
                             let outer_captures = std::mem::take(&mut s.else_visible_captures);
+                            let outer_true_captures = std::mem::take(&mut s.then_visible_captures);
                             let condition_id = s.walk_expr_node(&if_.condition, body_scope_id);
                             s.condition_polarity = outer_polarity;
                             let negated_captures =
                                 std::mem::replace(&mut s.else_visible_captures, outer_captures);
+                            let true_captures = std::mem::replace(
+                                &mut s.then_visible_captures,
+                                outer_true_captures,
+                            );
                             // A lifted condition was already rejected above
                             // with its targeted message — no second report.
                             if !matches!(if_.condition.0, Node::LiftRegion(..)) {
@@ -33629,6 +33650,7 @@ impl<'src> Analyzer<'src> {
                                     walked_else,
                                 ),
                                 negated_captures,
+                                true_captures,
                             )
                         }
                         NodeIfBranch::Else(body) => {
@@ -33636,11 +33658,16 @@ impl<'src> Analyzer<'src> {
                             declare_inherited(s, body_scope_id, inherited);
                             let else_ids = s.walk_expr_nodes(&body.0.0, body_scope_id);
                             let else_expr_id = s.walk_expr_node(&body.0.1, body_scope_id);
-                            (ExprIfBranch::Else((else_ids, else_expr_id)), Vec::new())
+                            (
+                                ExprIfBranch::Else((else_ids, else_expr_id)),
+                                Vec::new(),
+                                Vec::new(),
+                            )
                         }
                     }
                 }
-                let (branch, false_path_captures) = walk_branch(self, if_, scope_id, &Vec::new());
+                let (branch, false_path_captures, true_path_captures) =
+                    walk_branch(self, if_, scope_id, &Vec::new());
                 // B187, the guard clause — negate, diverge, continue. With no
                 // `else` and a then-branch that provably diverges, the ONLY way
                 // past this `if` is the condition's false path, which is the
@@ -33666,9 +33693,39 @@ impl<'src> Analyzer<'src> {
                     self.guard_continuations.push(GuardContinuation {
                         scope_id,
                         visible_from: node.1.end,
-                        then_statements: then_ids.clone(),
-                        then_tail: *then_tail,
+                        diverging_statements: then_ids.clone(),
+                        diverging_tail: *then_tail,
                         captures: false_path_captures,
+                    });
+                }
+                // R15 (B459, RULED 2026-09-29), B187 mirrored — the one place
+                // the `then`/`else` sugar is not a pure rewrite. A `then`-
+                // spelled STATEMENT (`opt is Some(let v) else ret;`, or `c then
+                // S else ret;`) whose `else` diverges can be left only along
+                // the condition's TRUE path, so the captures that path binds are
+                // published into the enclosing scope from the statement's end —
+                // Swift's `guard`, Rust's `let … else`. The keyword `if` it
+                // spells keeps B171's scoping: the rule is the sugar's. Decided
+                // with B187's candidates in `resolve_world`, so all four
+                // divergence leaves count.
+                if let NodeIfBranch::If(written) = if_
+                    && matches!(
+                        written.spelling,
+                        IfSpelling::Then {
+                            statement: true,
+                            ..
+                        }
+                    )
+                    && let ExprIfBranch::If(_, _, Some(walked_else)) = &branch
+                    && let ExprIfBranch::Else((else_ids, else_tail)) = walked_else.as_ref()
+                    && !true_path_captures.is_empty()
+                {
+                    self.guard_continuations.push(GuardContinuation {
+                        scope_id,
+                        visible_from: node.1.end,
+                        diverging_statements: else_ids.clone(),
+                        diverging_tail: *else_tail,
+                        captures: true_path_captures,
                     });
                 }
                 // A value `if` — one with a final `else` — has its arms unified
@@ -35642,6 +35699,16 @@ impl<'src> Analyzer<'src> {
                     // it to the `if` walk, which declares it there.
                     if polarity.is_some_and(|polarity| polarity.same_in_else) {
                         self.else_visible_captures.push((name, capture_id, or_cap));
+                    }
+                    // R15: a capture that reaches past the condition unbounded
+                    // is one its TRUE path binds — the root frame's even
+                    // parity, which `&&` keeps and `||`, `!` and a step off the
+                    // spine each cap. A guard publishes exactly these.
+                    if polarity.is_some_and(|polarity| polarity.expression_root.is_none())
+                        && visible_until == LocalDeclaration::FOREVER
+                    {
+                        self.then_visible_captures
+                            .push((name, capture_id, visible_until));
                     }
                 }
                 WalkPattern::Binding(capture_id)
@@ -55001,15 +55068,16 @@ impl<'src> Analyzer<'src> {
         // B222: and the guard clauses, decided with those leaves in hand — the
         // first read of the divergence analysis in this build, and the reason
         // the walk records a candidate instead of taking the verdict itself.
-        // The then-block has to diverge on EVERY path, and all four leaves
+        // The guarded block has to diverge on EVERY path, and all four leaves
         // count (`ret`, `jump`, a `panic(…)`, an endless `for { … }`) because
         // the checker has one divergence analysis and this is it; then the
-        // captures the condition binds by being FALSE become ordinary
+        // captures of the path that does NOT diverge become ordinary
         // declarations in the enclosing scope, visible from the end of the `if`
-        // onward (B187).
+        // onward — the FALSE path's past a diverging then-block (B187), the TRUE
+        // path's past a `then`-spelled guard's diverging `else` (R15).
         for guard in std::mem::take(&mut self.guard_continuations) {
             let diverges = Divergence::new(&self.expr_id_to_expr_map, &self.divergence_leaves)
-                .block(&guard.then_statements, guard.then_tail);
+                .block(&guard.diverging_statements, guard.diverging_tail);
             if !diverges {
                 continue;
             }
