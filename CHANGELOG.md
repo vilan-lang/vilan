@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: feature -->
+**A field read on a call whose return type is inferred builds natively: `make_square(2).side`, where `make_square` writes no return type — and B460's checked returns, which take the same path.** The call's type was read off the written signature alone, so the field read had no struct to find its field in and was refused by name. It now reads the return as the callee's emitted signature does (written, or the analyzer's inference). Tracker F59.
+
+<!-- family: feature -->
 **`on_change` (and every blanket `Flow` member) reached through a generic `Source<List<X>>` bound builds natively, and the two places written around it go back to `on_change`.** The blanket `impl type S: Source<type T> with Flow<T>` grounds its `T` from the receiver's own `Source` impl — for a `ListCell<E>`, `List<E>`, written in the PROVIDER's binder `E`, which the native substitution never bound, so `map_each`'s attach and `delta-law.vl`'s were refused by name ("an unbound generic type parameter (parameter 1 of struct `ListCell`)"). The provider's binder now binds from the receiver (`impl_select::bind_provider_binders`; a binder two receivers would bind differently is left unbound and refused, never guessed). `std::delta::map_each` attaches with `on_change` again rather than a hand-minted subscriber (so `mint_subscriber` is private again), and `delta-law.vl` drops its `observe` helper; the native leak census holds at `live = 0` on both. Tracker F58.
 
 <!-- family: feature -->

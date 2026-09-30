@@ -6659,3 +6659,37 @@ const F58_LIST_CELL_PROBE: &str = concat!(
     "}\n",
     "main();\n",
 );
+
+/// F59: a field read on a call whose return type is INFERRED — `fun make(..)
+/// { Square { .. } }` has no written return, and neither has B460's checked
+/// return — builds natively. The call's type was read off the written
+/// signature alone, so `make(2).side` had no struct to name its field from.
+#[test]
+fn a_field_read_on_an_inferred_return_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_f59.vl"), F59_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_f59.vl"),
+        Verdict::Identical,
+        "a field read on an inferred return must build and print the same on both backends"
+    );
+}
+
+const F59_PROBE: &str = concat!(
+    "struct Square {\n",
+    "\tside: i32,\n",
+    "\tname: str,\n",
+    "}\n",
+    "fun make_square(side: i32) {\n",
+    "\tSquare { side = side, name = \"sq\" }\n",
+    "}\n",
+    "fun relabel(side: i32) {\n",
+    "\tlet made = make_square(side);\n",
+    "\tSquare { side = made.side * 2, name = i\"{made.name}!\" }\n",
+    "}\n",
+    "fun main() {\n",
+    "\tprint(make_square(2).side);\n",
+    "\tprint(relabel(3).side);\n",
+    "\tprint(relabel(3).name);\n",
+    "}\n",
+);

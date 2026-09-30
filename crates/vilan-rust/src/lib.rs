@@ -3098,6 +3098,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(Expr::Local(target)) | Some(Expr::Parameter(target)) => *target,
             _ => return None,
         };
+        // F59: the callee's return as its signature is EMITTED — written, or
+        // the analyzer's inference for an unannotated one (`fun make() { Square
+        // { .. } }`, and B460's checked returns). A field read off the call
+        // (`make(2).side`) had no struct to find its field in.
         if let Some(function) = self.program.functions.get(&target) {
             return function.return_type_id;
         }
