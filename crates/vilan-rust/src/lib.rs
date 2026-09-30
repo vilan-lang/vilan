@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    AdaptedInstance, Backing, BackingValue, Expr, ExprIfBranch, ExprMatchLeg, ExprPattern,
-    GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
+    ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -173,6 +173,45 @@ const PRELUDE: &str = "\
 use vilan_rt::Js as _;
 use vilan_rt::Json as _;
 ";
+
+/// F56: every nominal declaration (struct or enum) with an `impl … with Drop`.
+///
+/// Read off `drop_method_checks`, which the analyzer fills with each impl's
+/// `drop` function keyed on the RESOLVED std `Drop` entity — so a user's own
+/// `trait Drop` never counts — and then off the impl blocks declaring those
+/// functions, whose subject names the declaration. A generic resource
+/// (`impl Guard<type T> with Drop`) is one declaration with one `drop`, so the
+/// answer is per declaration, not per instantiation.
+fn drop_implementing_nominals(program: &Program<'_>) -> HashSet<Id> {
+    let drop_functions: HashSet<Id> = program
+        .drop_method_checks
+        .iter()
+        .map(|(function_id, _, _)| *function_id)
+        .collect();
+    let mut nominals = HashSet::new();
+    if drop_functions.is_empty() {
+        return nominals;
+    }
+    for implementation in &program.implementations {
+        let Some(member) = implementation.declarations.get("drop") else {
+            continue;
+        };
+        let function_id = match program.entity_map.get(member) {
+            Some(Expr::Function(function_id)) => *function_id,
+            _ => *member,
+        };
+        if !drop_functions.contains(&function_id) {
+            continue;
+        }
+        match program.type_id_to_type_map.get(&implementation.subject) {
+            Some(Type::Struct(id, _)) | Some(Type::Enum(id, _)) => {
+                nominals.insert(*id);
+            }
+            _ => {}
+        }
+    }
+    nominals
+}
 
 fn unsupported(what: &str, span: Span) -> Error {
     Error {
@@ -445,6 +484,12 @@ struct Emitter<'a, 'src> {
     /// trait's name and the RENDERED concrete type — rendered, because two
     /// vilan types that lower to one Rust type must share one impl.
     object_impls: HashSet<(String, String)>,
+    /// F56: the nominal declarations (struct or enum) that implement std's
+    /// `Drop`. A `[resource]` type among them owes a teardown this backend
+    /// does not emit yet (F1's later slice) and is refused; a `[resource]`
+    /// type NOT among them is emitted as an ordinary type. See
+    /// [`drop_implementing_nominals`].
+    drop_nominals: HashSet<Id>,
 }
 
 /// One object type's Rust trait: its name and its slots, each slot's
@@ -565,6 +610,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             copies_elided: 0,
             object_traits: HashMap::default(),
             object_impls: HashSet::new(),
+            drop_nominals: drop_implementing_nominals(program),
         }
     }
 
@@ -851,7 +897,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
     ) -> Result<String, Error> {
         let boxed = self.boxed_parameter_prologue(&closure.parameters);
-        let body = self.expression(closure.return_, depth)?;
+        // An expression body is the closure's VALUE, so it takes what every
+        // value position takes ([`Self::value_of`]); a block body's tail
+        // already did. F53: a concrete value landing at a `dyn` return
+        // (`roots.map(|r| r)` into a `List<dyn Src>`) becomes the object here.
+        // And a read of a CAPTURE handed back (`|| v`, A142's `Switch` node
+        // over a generic `v`) is a copy, or the closure moves its own capture
+        // out and is `FnOnce` where every closure type is a `dyn Fn`.
+        let body = self.value_of(closure.return_, depth)?;
         if closure.parameter_destructures.is_empty() {
             if boxed.is_empty() {
                 return Ok(body);
@@ -2469,7 +2522,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // The refusal comes BEFORE the once-only mark, or a first call that
         // swallowed the error would let a second one through on the mark alone
         // and emit a reference to a type nothing declared.
-        if declaration.resource {
+        // F56: only a resource with a `Drop` impl owes a teardown. A Drop-less
+        // one (A142's pipe nodes) is move-only and nothing more — the
+        // analyzer's move checker enforces that on both backends — so it is
+        // emitted as an ordinary struct. Its resource MEMBERS still ask this
+        // question for themselves when their field types are rendered below,
+        // so a Drop-less wrapper around a `Drop` resource is still refused, at
+        // the member that owes the teardown.
+        if declaration.resource && self.drop_nominals.contains(&id) {
             return Err(unsupported(
                 &format!(
                     "the `resource` type `{}` (destruction.md's teardown is a later slice)",
@@ -2630,7 +2690,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
         self.refuse_an_any_argument(arguments, span)?;
-        if declaration.resource {
+        // F56: as `ensure_struct` — only a `Drop` impl owes a teardown.
+        if declaration.resource && self.drop_nominals.contains(&id) {
             return Err(unsupported(
                 &format!(
                     "the `resource` enum `{}` (destruction.md's teardown is a later slice)",
@@ -2957,8 +3018,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .inferred_return_types
                 .get(call_id)
                 .copied()
+                .or_else(|| self.shared_read_type(*call_id))
                 .or_else(|| self.declared_return_type(*call_id)),
             Expr::Await(awaited) => self.awaited_type(*awaited),
+            _ => None,
+        }
+    }
+
+    /// The element type a `Shared` cell's `read()` answers — the cell's own
+    /// argument. The intrinsic call records no type of its own, so a field
+    /// read off it (`(followed.read().pull)()`, A142's `Switch` node calling
+    /// its current inner instance) had no struct to name the field from.
+    ///
+    /// `read()` only. Natively it is a copy out of the cell (`get()`), so a
+    /// field of it is an ordinary value. A field of `write()` is a place behind
+    /// a live `borrow_mut`, and `a.write().n = a.write().n + 1` (`shared.vl`)
+    /// holds the right side's borrow across the left's — the runtime's
+    /// reentrancy stop, where node prints `2`. That shape stays refused by
+    /// name until it is lowered through a temporary.
+    fn shared_read_type(&self, call_id: Id) -> Option<TypeId> {
+        let call = self.program.function_calls.get(&call_id)?;
+        let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id) else {
+            return None;
+        };
+        if !matches!(
+            self.program.intrinsics.get(subject),
+            Some(Intrinsic::SharedValue)
+        ) {
+            return None;
+        }
+        let cell = self.type_of(*call.argument_ids.first()?)?;
+        match self.resolve(cell)? {
+            Type::Struct(id, arguments)
+                if self.program.structs.get(id).is_some_and(|declaration| {
+                    declaration.external && declaration.name == "Shared"
+                }) =>
+            {
+                arguments.first().copied()
+            }
             _ => None,
         }
     }
@@ -2997,10 +3094,32 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// exactly those sites.
     fn declared_return_type(&self, call_id: Id) -> Option<TypeId> {
         let call = self.program.function_calls.get(&call_id)?;
-        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
-            return None;
+        let target = match self.program.entity_map.get(&call.subject_id) {
+            Some(Expr::Local(target)) | Some(Expr::Parameter(target)) => *target,
+            _ => return None,
         };
-        self.program.functions.get(target)?.return_type_id
+        if let Some(function) = self.program.functions.get(&target) {
+            return function.return_type_id;
+        }
+        // F53: a call through a CLOSURE-typed binding answers the closure
+        // type's return — `erase(r).get()` with `erase: |Root| dyn Src` is a
+        // slot call whose receiver is that call, and it had no type to
+        // dispatch on.
+        let binding_type = self
+            .program
+            .variables
+            .get(&target)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.program
+                    .parameters
+                    .get(&target)
+                    .map(|parameter| parameter.type_id)
+            })?;
+        match self.resolve(binding_type)? {
+            Type::Closure(_, return_type_id, _) => Some(*return_type_id),
+            _ => None,
+        }
     }
 
     // --------------------------------------------------------- functions ---
@@ -4039,7 +4158,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("({text}).clone()"));
         }
         let text = self.expression(id, depth)?;
-        if self.program.clone_sites.contains_key(&id) {
+        if self.copy_applies(self.program.clone_sites.get(&id)) {
             return Ok(format!("({text}).clone()"));
         }
         // F16 / the probe's R-1, from the other side: a closure value is a
@@ -4074,6 +4193,53 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("({text}).clone()"));
         }
         Ok(text)
+    }
+
+    /// Whether a recorded copy decision fires AT THIS EMISSION — the JS
+    /// emitter's `copy_applies`, read under this backend's substitution. A
+    /// value whose type no instantiation can change always copies; a
+    /// generic-dependent one does not when this instance binds one of its
+    /// constraints to a RESOURCE (F56): the read is a move, the source is dead,
+    /// and a copy is a second owner (R11, `docs/spec/memory.md`).
+    fn copy_applies(&self, decision: Option<&CopyDecision>) -> bool {
+        match decision {
+            None => false,
+            Some(CopyDecision::Always) => true,
+            Some(CopyDecision::UnlessResource(constraint_ids)) => {
+                !constraint_ids.iter().any(|constraint_id| {
+                    self.current_substitution
+                        .get(constraint_id)
+                        .is_some_and(|bound| self.is_resource_type(*bound))
+                })
+            }
+        }
+    }
+
+    /// Whether `type_id`, resolved under the active substitution, classifies
+    /// as a resource (destruction.md §3). The analyzer answered the question
+    /// for every type id it minted (`Program::resource_types`), and this
+    /// backend mints none, so the concrete id is looked up directly.
+    fn is_resource_type(&self, type_id: TypeId) -> bool {
+        let concrete = self.concrete(type_id);
+        self.program.resource_types.contains(&concrete)
+    }
+
+    /// F56: whether `id` reads a binding this frame OWNS whose type is a
+    /// resource. Handing one on is a MOVE — the analyzer's move checker has
+    /// already refused any later read — so a copy there is a second owner
+    /// minted for nothing. A loan (`self` by reference, a view) is not owned
+    /// and keeps whatever copy its position owes.
+    fn moves_an_owned_resource(&self, id: Id) -> bool {
+        let binding = match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
+            _ => return false,
+        };
+        !self.reads_a_loaned_parameter(id)
+            && !self.binding_holds_a_view(binding)
+            && !self.reads_a_captured_binding(id)
+            && self
+                .type_of(id)
+                .is_some_and(|type_id| self.is_resource_type(type_id))
     }
 
     /// Whether `id` is a leaf that names STORAGE without being a place — a
@@ -5527,6 +5693,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.program.entity_map.get(&subject),
                 Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
             )
+            && !self.moves_an_owned_resource(subject)
         {
             subject_text = format!("({subject_text}).clone()");
         }
@@ -6343,7 +6510,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // the closure). The parameter types are the literal's own, so a view
         // parameter keeps its higher-ranked `&mut`; the return is left to
         // inference, which the body answers.
-        let as_counted = format!(" as std::rc::Rc<dyn Fn({}) -> _>", signature.join(", "));
+        // F53: ...except where the body is erased to an OBJECT. The object is
+        // then the answer, and a caller that dispatches through it
+        // (`erase(r).get()`) needs the type before the body has settled it —
+        // rustc will not resolve a method on `_`. A synchronous body only: an
+        // async one answers a future of the object.
+        let returns = match self.program.dyn_coercions.get(&closure.return_).cloned() {
+            Some((subject, trait_id, arguments))
+                if !is_async_closure
+                    && !matches!(
+                        self.program
+                            .type_id_to_type_map
+                            .get(&self.concrete(subject)),
+                        Some(Type::Dyn(..))
+                    ) =>
+            {
+                let object = self.ensure_object_trait(trait_id, &arguments, span)?;
+                format!("vilan_rt::Dyn<dyn {}>", object.name)
+            }
+            _ => "_".to_string(),
+        };
+        let as_counted = format!(
+            " as std::rc::Rc<dyn Fn({}) -> {returns}>",
+            signature.join(", ")
+        );
         // A `move` closure takes its captures by value, so a captured CELL has
         // to be a handle of its own — otherwise the binding outside is moved
         // into the closure and every later read of it is a use-after-move.
