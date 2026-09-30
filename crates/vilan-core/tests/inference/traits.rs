@@ -8276,3 +8276,129 @@ fn a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound() {
         "the override\nthe override\n",
     );
 }
+
+// --- One trait at two instantiations: every provider is asked ------------------
+//
+// A type may provide one trait at two instantiations: `impl type T with Into2<T>`
+// gives a `SignalCell<bool>` `Into2<SignalCell<bool>>`, and `impl type F:
+// Flow<type T> with Into2<T>` gives it `Into2<bool>`. Emission and the analyzer
+// each asked only the FIRST applying provider, so a binder bounded `R: Into2<bool>`
+// was turned down for a flow — the impl it guarded fell out of dispatch through a
+// trait default (a body-less requirement, refused at emission) — and a binder
+// bounded `R: Kind<type U>` grounded `U` from the plain blanket where the more
+// specific one applied (collections-44's find; A142 S4's `IntoFlow` and
+// `IntoElement` are the first customers).
+
+/// The bound holds when ANY provider gives the written instantiation: `Holder`'s
+/// impl is admitted for a flow, and a trait default reaches its member.
+#[test]
+fn a_bound_holds_through_a_second_provider_at_its_written_instantiation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Signal, SignalCell };
+
+        trait Into2<T> {
+            fun go(self): i32;
+        }
+        impl type T with Into2<T> {
+            fun go(self): i32 {
+                1
+            }
+        }
+        impl type F: Flow<type T> with Into2<T> {
+            fun go(self): i32 {
+                2
+            }
+        }
+        trait Runs {
+            fun run(self): i32;
+        }
+        struct Holder<R> {
+            r: R,
+        }
+        impl Holder<type R: Into2<bool>> with Runs {
+            fun run(self): i32 {
+                self.r.go()
+            }
+        }
+        trait Outer with Runs {
+            fun twice(self): i32 {
+                self.run() * 2
+            }
+        }
+        impl Holder<type R: Into2<bool>> with Outer {}
+
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            print(Holder { r = true }.run());
+            print(Holder { r = flag }.run());
+            print(Holder { r = true }.twice());
+            print(Holder { r = flag }.twice());
+        }
+        main();
+        "#,
+        "1\n2\n2\n4\n",
+    );
+}
+
+/// A binder written in a bound (`R: Kind<type U>`) grounds from the MOST
+/// SPECIFIC provider that agrees with the bound: the `Wrapped` blanket over the
+/// plain one for a `Cup`, so `U` is `i32` and not `Cup`; the plain one for a
+/// `str`, which nothing else provides for.
+#[test]
+fn a_bound_binder_grounds_from_the_most_specific_provider() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Kind<T> {
+            fun kind(self): str;
+        }
+        trait Wrapped<T> {
+            fun inner(self): T;
+        }
+        impl type T with Kind<T> {
+            fun kind(self): str {
+                "plain"
+            }
+        }
+        impl type W: Wrapped<type T> with Kind<T> {
+            fun kind(self): str {
+                "wrapped"
+            }
+        }
+        struct Cup {
+            v: i32,
+        }
+        impl Cup with Wrapped<i32> {
+            fun inner(self): i32 {
+                self.v
+            }
+        }
+        struct Holder<R> {
+            r: R,
+        }
+        impl Holder<type R: Kind<type U>> {
+            fun nothing(self): Option<U> {
+                None
+            }
+
+            fun which(self): str {
+                self.r.kind()
+            }
+        }
+        fun main() {
+            let held: Option<i32> = Holder { r = Cup { v = 1 } }.nothing();
+            print(held.is_none());
+            print(Holder { r = Cup { v = 1 } }.which());
+            let plain: Option<str> = Holder { r = "x" }.nothing();
+            print(plain.is_none());
+            print(Holder { r = "x" }.which());
+        }
+        main();
+        "#,
+        "true\nwrapped\ntrue\nplain\n",
+    );
+}

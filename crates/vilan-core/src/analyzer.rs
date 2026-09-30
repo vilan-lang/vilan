@@ -20645,7 +20645,7 @@ impl<'src> Analyzer<'src> {
                     Some(caller_generic) => {
                         self.caller_generic_trait_arguments(caller_generic, trait_id)
                     }
-                    None => self.trait_args_for(&concrete, trait_id),
+                    None => self.trait_args_for_pattern(&concrete, trait_id, &bound_arguments),
                 };
                 let Some(provided) = provided else {
                     continue;
@@ -40732,6 +40732,87 @@ impl<'src> Analyzer<'src> {
     /// [`bindings_for_binders`] is what makes it true of a reconciliation that
     /// is merely a unification (B168).
     fn trait_args_for(&mut self, concrete: &Type, trait_id: Id) -> Option<Vec<TypeId>> {
+        let (answered, fallback) = self.trait_args_candidates(concrete, trait_id, true);
+        answered
+            .into_iter()
+            .next()
+            .map(|(_, arguments)| arguments)
+            .or(fallback)
+    }
+
+    /// [`Self::trait_args_for`] for a caller holding the bound that asks — its
+    /// WRITTEN arguments, binders and all (`IntoFlow<Option<type U>>`) — which
+    /// is every binder grounding a subject's bound (collections-44's find).
+    ///
+    /// A type may provide one trait at several instantiations: `impl type T with
+    /// IntoElement<T>` gives a `Derive<..>` `IntoElement<Derive<..>>`, and
+    /// `impl type P: Pipe<type T> with IntoElement<T>` gives it
+    /// `IntoElement<i32>`. The first concrete provider in declaration order is
+    /// not the answer then: the bound's own arguments keep the instantiations it
+    /// can mean (a `bool` written there turns the `SignalCell<bool>` one down),
+    /// and when more than one survives — a bare `type U` agrees with all of
+    /// them — the specificity order picks, as it picks a member's body (§13.4(a)
+    /// tier 3). Unranked survivors keep declaration order, the old answer.
+    fn trait_args_for_pattern(
+        &mut self,
+        concrete: &Type,
+        trait_id: Id,
+        pattern: &[TypeId],
+    ) -> Option<Vec<TypeId>> {
+        let (answered, fallback) = self.trait_args_candidates(concrete, trait_id, false);
+        let agreeing: Vec<(TypeId, Vec<TypeId>)> = answered
+            .into_iter()
+            .filter(|(_, arguments)| {
+                arguments.len() != pattern.len()
+                    || pattern
+                        .iter()
+                        .zip(arguments)
+                        .all(|(written, provided)| self.impl_subject_matches(*written, *provided))
+            })
+            .collect();
+        let maxima: Vec<&(TypeId, Vec<TypeId>)> = agreeing
+            .iter()
+            .filter(|(subject, _)| {
+                !agreeing
+                    .iter()
+                    .any(|(other, _)| self.impl_subjects_outrank(*other, *subject))
+            })
+            .collect();
+        match maxima.as_slice() {
+            [only] => Some(only.1.clone()),
+            _ => agreeing
+                .first()
+                .map(|(_, arguments)| arguments.clone())
+                .or(fallback),
+        }
+    }
+
+    /// [`Self::impl_outranks`] over bare subjects.
+    fn impl_subjects_outrank(&self, subject: TypeId, other_subject: TypeId) -> bool {
+        if subject == other_subject {
+            return false;
+        }
+        let matches_forward = self.impl_subject_matches(subject, other_subject);
+        let matches_backward = self.impl_subject_matches(other_subject, subject);
+        if matches_backward && !matches_forward {
+            return true;
+        }
+        if matches_forward && !matches_backward {
+            return false;
+        }
+        matches_forward && self.subject_bounds_are_stronger(subject, other_subject)
+    }
+
+    /// The providers of `trait_id` for `concrete`: those whose arguments came out
+    /// CONCRETE, with their subjects, in declaration order — stopping at the first
+    /// when `first_only` — and the first one that did not, as the fallback.
+    fn trait_args_candidates(
+        &mut self,
+        concrete: &Type,
+        trait_id: Id,
+        first_only: bool,
+    ) -> (Vec<(TypeId, Vec<TypeId>)>, Option<Vec<TypeId>>) {
+        let mut answered: Vec<(TypeId, Vec<TypeId>)> = Vec::new();
         let candidates: Vec<(TypeId, Vec<TypeId>)> = self
             .implementations
             .iter()
@@ -40810,12 +40891,16 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
                 {
-                    return Some(resolved);
+                    answered.push((subject_id, resolved));
+                    if first_only {
+                        break;
+                    }
+                    continue;
                 }
                 first_match.get_or_insert(resolved);
             }
         }
-        first_match
+        (answered, first_match)
     }
 
     /// The half of a receiver/subject reconciliation that grounds an impl's
