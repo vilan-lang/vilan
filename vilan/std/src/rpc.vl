@@ -3845,7 +3845,7 @@ export impl ReactiveClient {
 		let join_hook: Shared<|| void> = Shared::new(|| {});
 		let join_key_hook: Shared<|Hash| void> = Shared::new(|_key| {});
 		let leases: Shared<List<KeyLease>> = Shared::new([]);
-		let positions: Shared<Map<Hash, usize>> = Shared::new(Map::new());
+		let positions: Shared<HashMap<Hash, usize>> = Shared::new(HashMap::new());
 		// The per-key snapshot (A139): offered for a key while THIS mirror holds
 		// the server's per-key forward for it (`on_wire`: its `Subscribe` went out
 		// and no `Unsubscribe` has). The seed a fresh per-key forward sends is an
@@ -5683,7 +5683,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 						kept.push(element);
 					}
 				}
-				self.positions.write() = Map::new();
+				self.positions.write() = HashMap::new();
 				self.reindex(kept, 0);
 				self.cache.set(Some(kept));
 			},

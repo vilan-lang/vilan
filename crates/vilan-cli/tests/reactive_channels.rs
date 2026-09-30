@@ -4089,7 +4089,7 @@ fn a143_releasing_the_whole_lease_hands_a_held_key_back_without_revoking_the_cha
 /// table event), and restored by `rebind` when a kept handle comes back.
 const A140_PRUNE: &str = r#"import std::io::print;
 import std::json::json_codec;
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::reactive::{ Signal, SignalCell };
 import std::rpc::{ KeyedCell, KeyedSource, ReactiveClient, RemoteSource, duplex_pair, local_rpc, register_session };
 import std::shared::Shared;
@@ -4110,7 +4110,7 @@ impl Row with Keyed<str> {
 
 [service(BoardClient)]
 struct Board {
-	notes: Shared<Map<i32, SignalCell<str>>>,
+	notes: Shared<HashMap<i32, SignalCell<str>>>,
 	rows: KeyedCell<str, Row>,
 }
 
@@ -4142,7 +4142,7 @@ fun settle() {
 }
 
 fun main() {
-	let notes: Map<i32, SignalCell<str>> = Map::new();
+	let notes: HashMap<i32, SignalCell<str>> = HashMap::new();
 	let board = Board { notes = Shared::new(notes), rows = KeyedCell::new([Row { id = "a", text = "one" }]) };
 	mut id = 0;
 	for id < 5 {
@@ -4215,7 +4215,7 @@ fn a140_n_mints_then_n_releases_leave_no_routes_and_no_replays() {
 const A140_PRUNE_SOCKET: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::process::exit;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
@@ -4226,7 +4226,7 @@ import std::time::sleep;
 
 [service(BoardClient)]
 struct Board {
-	notes: Shared<Map<i32, SignalCell<str>>>,
+	notes: Shared<HashMap<i32, SignalCell<str>>>,
 }
 
 impl Board {
@@ -4245,7 +4245,7 @@ impl Board {
 	}
 }
 
-let board: Board = Board { notes = Shared::new(Map::new()) };
+let board: Board = Board { notes = Shared::new(HashMap::new()) };
 
 fun main() {
 	mut id = 0;
@@ -4380,7 +4380,7 @@ fn a133_an_in_process_seed_is_inline_and_a_node_over_the_mirror_sees_it_twice() 
 ///
 /// No stderr: a superseded task's abort is awaited by the seal, not reported.
 const A142_S3_TRANSIENT: &str = r#"import std::io::{ panic, print };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::reactive::{ Flow, Owner, Pipe, Signal, SignalCell, Source, owner_scope };
 import std::result::Result::{ self, Ok, Err };
 import std::shared::Shared;
@@ -4470,7 +4470,7 @@ fun main() {
 		// 3. Latest wins, by DROPPING: tasks made outside the pipe are nobody's
 		//    run's, so nothing cancels them; the slow one's reply comes last and
 		//    is dropped.
-		let replies: Shared<Map<i32, Task<Result<i32, str>>>> = Shared::new(Map::new());
+		let replies: Shared<HashMap<i32, Task<Result<i32, str>>>> = Shared::new(HashMap::new());
 		replies.write().insert(5, async answer(5, 60));
 		replies.write().insert(6, async answer(6, 5));
 		let picked: SignalCell<i32> = Signal::new(5);
@@ -4539,7 +4539,7 @@ fn a142_s3_a_flow_of_tasks_is_a_transient_where_the_latest_task_wins() {
 const A142_S3_REMOTE_SOCKET: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::process::exit;
 import std::reactive::{ Flow, Pipe, Signal, SignalCell, Source, Owner, owner_scope };
 import std::result::Result::{ self, Ok, Err };
@@ -4551,7 +4551,7 @@ import std::transient::{ TransientSource, TransientState };
 
 [service(BoardClient)]
 struct Board {
-	notes: Shared<Map<i32, SignalCell<str>>>,
+	notes: Shared<HashMap<i32, SignalCell<str>>>,
 }
 
 impl Board {
@@ -4570,7 +4570,7 @@ impl Board {
 	}
 }
 
-let board: Board = Board { notes = Shared::new(Map::new()) };
+let board: Board = Board { notes = Shared::new(HashMap::new()) };
 
 fun main() {
 	board.notes.write().insert(1, Signal::new("one"));
@@ -4653,7 +4653,7 @@ fn a142_s3_a_mirror_is_a_transient_absent_versus_pending_over_a_socket() {
 const A145_MEMO_HANDLE_SOCKET: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::http::{ Response, Server };
-import std::map::Map;
+import std::hash_map::HashMap;
 import std::process::exit;
 import std::reactive::{ MemoCell, Pipe, Signal, SignalCell, Source };
 import std::result::Result::{ self, Ok, Err };
@@ -4668,7 +4668,7 @@ import std::time::sleep;
 struct Counter {
 	count: SignalCell<i32>,
 	doubled: MemoCell<i32>,
-	labels: Shared<Map<i32, MemoCell<str>>>,
+	labels: Shared<HashMap<i32, MemoCell<str>>>,
 }
 
 impl Counter {
@@ -4693,7 +4693,7 @@ let count: SignalCell<i32> = Signal::new(1);
 let counter: Counter = Counter {
 	count,
 	doubled = count.derive(|x| x * 2).memo_global(),
-	labels = Shared::new(Map::new()),
+	labels = Shared::new(HashMap::new()),
 };
 
 fun main() {

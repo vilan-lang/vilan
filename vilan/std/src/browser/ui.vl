@@ -61,11 +61,11 @@ import pkg::reactive::{
 	also_releasing,
 	comp,
 	get_owner,
-	mint_subscriber,
 	owner_scope,
 	queue_microtask,
 	reconcile,
 	run_with_owner,
+	subscriber_of,
 	turn,
 	turn_scope,
 };
@@ -1778,8 +1778,10 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	let drain = instance.drain;
 	// Attached WITHOUT an immediate call, then seeded — `map_each`'s order and for
 	// its reason: the input was opened at the state the seed reads, so the seed is
-	// exactly the state its first drain starts from.
-	let handle = (instance.attach)(mint_subscriber(|| {
+	// exactly the state its first drain starts from. An EFFECT's subscriber (the
+	// run writes the DOM), minted here since `mint_subscriber` is reactive.vl's
+	// own.
+	let handle = (instance.attach)(subscriber_of(|| {
 		for op in live_ops(drain()) {
 			match op {
 				// A splice that only removes or only inserts cannot re-meet a key,
@@ -1836,7 +1838,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				},
 			}
 		}
-	}));
+	}, false));
 	also_releasing(handle, instance.release);
 	let _owned = get_owner().take(handle);
 	reconcile_pass((instance.snapshot)());
@@ -2071,7 +2073,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 	// The input, opened as `place_each` opens its own.
 	let instance = source.open_rows();
 	let drain = instance.drain;
-	let handle = (instance.attach)(mint_subscriber(|| {
+	let handle = (instance.attach)(subscriber_of(|| {
 		for op in live_ops(drain()) {
 			match op {
 				// Positional when it only removes or only inserts; the pass over
@@ -2129,7 +2131,7 @@ fun place_each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Slot>(
 				},
 			}
 		}
-	}));
+	}, false));
 	also_releasing(handle, instance.release);
 	let _owned = get_owner().take(handle);
 	reconcile_pass((instance.snapshot)());

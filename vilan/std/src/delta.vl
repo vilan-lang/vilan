@@ -53,7 +53,6 @@ import pkg::reactive::{
 	defer_to_owner,
 	detach,
 	fresh_id,
-	mint_subscriber,
 	observe_flow,
 	owner_scope,
 	reconcile,
@@ -1091,8 +1090,8 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	// `on_change`, through the blanket `Flow` over `Source` (F58 built that hop
 	// natively). Not `attach_observer` directly: through this SUBTRAIT bound a
 	// supertrait default's override is not dispatched (both backends), and
-	// `Source`'s default captures the source, the loop A132 took out; the
-	// blanket's own `Source` bound reaches the cell's override.
+	// `Source`'s default captures the source, the loop A132 took out; the blanket's
+	// own `Source` bound reaches the cell's override.
 	let _owned = register_with_owner(source.on_change(|_published| {
 		for op in read(cursor) {
 			match op {

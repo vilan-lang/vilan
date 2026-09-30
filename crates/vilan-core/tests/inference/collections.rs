@@ -87,10 +87,10 @@ fn a142_s4_a_plain_filter_allocates_nothing_per_element() {
     );
 }
 
-/// The transient stand-in the S4 pins run against: `TransientSource` is
-/// transient-44's (S3) and not on `next` yet, so a `Mirror` is a
-/// `Source<Option<str>>` that is `None` while pending, answers `is_pending()` as a
-/// fresh pipe per call, and counts the subscriptions it holds.
+/// A transient stand-in that COUNTS the subscriptions it holds — what "a removed
+/// element releases its source" is read off: a `Mirror` is a
+/// `Source<Option<str>>` that is `None` while pending and answers `is_pending()`
+/// as a fresh pipe per call. (The real `Transient` is pinned below.)
 const MIRROR: &str = r#"
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ Derive, ListCell, Signal, SignalCell, Source, Subscriber, Subscription, comp };
@@ -137,7 +137,7 @@ fun mirror(value: Option<str>, live: Shared<i32>): Mirror {
 /// The paper's first rough edge (§6.1): `filter_map(|m| m)` over a collection of
 /// `Option`-valued sources keeps the loaded payloads and follows each source, and
 /// a removed element RELEASES its source — the subscription count drops with
-/// it. (B434's shape, on `next`; the transient is the local stand-in above.)
+/// it. (B434's shape, on `next`; the counting stand-in above.)
 #[test]
 fn a142_s4_filter_map_over_transients_follows_and_releases() {
     assert_compiles_and_runs(
@@ -201,6 +201,42 @@ fn a142_s4_any_over_pending_pipes_flips_once_per_element_change() {
             "#
         ),
         "true\nfalse\n1\ntrue\n2\n",
+    );
+}
+
+/// The same two shapes over REAL transients (A142 S3's `Transient`, whose
+/// `is_pending()` answers a `dyn Pipe<bool>` started per element): the loaded
+/// payloads, and a pending flag that clears when the last one settles.
+#[test]
+fn a142_s4_filter_map_and_any_over_transients() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ ListCell, comp };
+        import std::result::Result::{ self, Err, Ok };
+        import std::transient::Transient;
+
+        fun main() {
+            let a: Transient<str, str> = Transient::pending();
+            let b: Transient<str, str> = Transient::pending();
+            let first = a.claim();
+            a.settle(first, Ok("a"));
+            let second = b.claim();
+            let rows: ListCell<Transient<str, str>> = ListCell::of([a, b]);
+            let ((loaded, pending), scope) = comp(|| {
+                let loaded = rows.filter_map(|row| row).memo();
+                let pending = rows.any(|row| row.is_pending()).memo();
+                (loaded, pending)
+            });
+            print(loaded.get());
+            print(pending.get());
+            b.settle(second, Ok("b"));
+            print(loaded.get());
+            print(pending.get());
+            scope.dispose();
+        }
+        main();
+        "#,
+        "[ 'a' ]\ntrue\n[ 'a', 'b' ]\nfalse\n",
     );
 }
 
