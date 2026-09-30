@@ -57763,6 +57763,9 @@ pub struct Program<'src> {
     pub context_run_fn_id: Option<Id>,
     pub context_get_fn_id: Option<Id>,
     pub context_get_safe_fn_id: Option<Id>,
+    /// B458: `Context::clear`, `run`'s inverse — its body runs with the
+    /// context NOT established.
+    pub context_clear_fn_id: Option<Id>,
     // The `std::task` nursery machinery (if `task.vl` loaded): the
     // `ambient_nursery` context binding and the `nursery` function. The
     // context threading pass treats every spawn (`Expr::Async`) as a SAFE
@@ -66500,6 +66503,7 @@ fn analyze_over_world<'src>(
     let mut context_run_fn_id: Option<Id> = None;
     let mut context_get_fn_id: Option<Id> = None;
     let mut context_get_safe_fn_id: Option<Id> = None;
+    let mut context_clear_fn_id: Option<Id> = None;
     if let Some(context_struct_id) = context_struct_id {
         for implementation in &analyzer.implementations {
             let subject_is_context = matches!(
@@ -66527,6 +66531,11 @@ fn analyze_over_world<'src>(
                     .get("get_safe")
                     .copied()
                     .or(context_get_safe_fn_id);
+                context_clear_fn_id = implementation
+                    .declarations
+                    .get("clear")
+                    .copied()
+                    .or(context_clear_fn_id);
             }
         }
     }
@@ -67498,6 +67507,7 @@ fn analyze_over_world<'src>(
         context_run_fn_id,
         context_get_fn_id,
         context_get_safe_fn_id,
+        context_clear_fn_id,
         nursery_ambient_id,
         nursery_fn_id,
         owned_nursery_enter_fn_id,
@@ -69498,6 +69508,7 @@ pub fn check_unlowered_externals(program: &mut Program) {
         program.context_run_fn_id,
         program.context_get_fn_id,
         program.context_get_safe_fn_id,
+        program.context_clear_fn_id,
         program.nursery_fn_id,
         program.owned_nursery_enter_fn_id,
     ];

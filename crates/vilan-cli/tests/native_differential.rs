@@ -1692,6 +1692,50 @@ const B423_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B458: `Context::clear` lowers to a plain call of its body with the value
+/// absent — a `get_safe` inside answers `None`, a closure minted inside keeps
+/// the cleared state, a `run` inside re-establishes — the same on both
+/// backends.
+#[test]
+fn a_cleared_context_reads_as_absent_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b458.vl"), B458_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b458.vl"),
+        Verdict::Identical,
+        "`clear` must read as absent the same way on both backends"
+    );
+}
+
+const B458_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun describe(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"some {value}\",\n",
+    "\t\tNone => \"none\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tcurrent.run(7, || {\n",
+    "\t\tprint(describe());\n",
+    "\t\tcurrent.clear(|| {\n",
+    "\t\t\tprint(describe());\n",
+    "\t\t\tcurrent.run(2, || print(current.get()));\n",
+    "\t\t});\n",
+    "\t\tprint(describe());\n",
+    "\t});\n",
+    "\tlet answer = current.run(5, || current.clear(|| 3) + 1);\n",
+    "\tprint(answer);\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is

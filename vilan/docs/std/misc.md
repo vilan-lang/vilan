@@ -103,6 +103,7 @@ impl Context<type T> {
 	fun run<U>(self, value: T, body: || U): U   // establish for the body's extent
 	fun get(self): T                            // read (compile error if possibly absent)
 	fun get_safe(self): Option<T>               // read, absence as None
+	fun clear<U>(self, body: || U): U           // run `body` with the value NOT established
 }
 ```
 
