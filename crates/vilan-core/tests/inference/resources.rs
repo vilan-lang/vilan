@@ -136,8 +136,10 @@ fn resource_on_a_let_is_rejected() {
 }
 
 #[test]
-fn resource_on_a_trait_is_rejected() {
-    assert_fails_with("[resource] trait Foo {}\n", "may label only a `struct`");
+fn resource_on_a_trait_marks_its_objects() {
+    // B470 (RULED 2026-09-29): `[resource] trait` is the declaration that its
+    // objects may hold a resource — no longer the misplaced-attribute steer.
+    assert_compiles("[resource] trait Foo {}\nfun main() {}\n");
 }
 
 #[test]

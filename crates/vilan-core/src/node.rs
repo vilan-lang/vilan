@@ -1420,6 +1420,11 @@ pub struct Labels<'src> {
     /// with spans — empty when absent. On an `impl` everything inside requires
     /// the platform; on either, the file is analyzed under it.
     pub platform: Vec<Spanned<&'src str>>,
+    /// `[resource]` on a TRAIT (B470, RULED 2026-09-29): its trait objects
+    /// may hold a resource, so `dyn T` is itself move-only. On a struct or an
+    /// enum the attribute is the declaration's own kind flag and never lands
+    /// here.
+    pub resource: bool,
 }
 
 // An explicit enum backing value, `= ( (-)? NUMBER | STRING )`

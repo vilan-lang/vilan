@@ -1692,6 +1692,65 @@ const B423_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
+/// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
+/// native half — building the erased pair for a resource without cloning — is
+/// native-44's, so until it lands the native build must REFUSE BY NAME and
+/// never hand rustc something wrong. When it lands this pin expects identity.
+#[test]
+fn a_resource_erased_into_a_resource_traits_object_is_identical_or_refused_by_name() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b470.vl"), B470_PROBE)
+        .expect("write the probe program");
+    match compare(&staged, "native_probe_b470.vl") {
+        Verdict::Identical | Verdict::Refused(_) => {}
+        Verdict::Broken(detail) => panic!("the native build was accepted and wrong: {detail}"),
+    }
+}
+
+const B470_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "[resource]\n",
+    "trait Run {\n",
+    "\tfun run(own self): i32;\n",
+    "}\n",
+    "\n",
+    "[resource]\n",
+    "struct Node {\n",
+    "\tv: i32,\n",
+    "}\n",
+    "\n",
+    "impl Node with Run {\n",
+    "\tfun run(own self): i32 {\n",
+    "\t\tself.v + 1\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Plain {\n",
+    "\tv: i32,\n",
+    "}\n",
+    "\n",
+    "impl Plain with Run {\n",
+    "\tfun run(own self): i32 {\n",
+    "\t\tself.v * 10\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun pick(on: bool): dyn Run {\n",
+    "\tif on {\n",
+    "\t\tNode { v = 1 }\n",
+    "\t} else {\n",
+    "\t\tPlain { v = 2 }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(pick(true).run());\n",
+    "\tprint(pick(false).run());\n",
+    "}\n",
+);
+
 /// B430: the native build does not yet re-build a tuple erased element-wise
 /// (the JS emitter does, by projection) — it REFUSES by name rather than
 /// handing rustc a bare struct where a `Dyn` is wanted.

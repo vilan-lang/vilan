@@ -356,8 +356,10 @@ The `[resource]` attribute marks a type declaration as a *resource*:
 the owned-resource class, whose semantics are specified in
 [§6.8](memory.md). It closes the label prefix and precedes `external`, so
 the full order is `[resource] external struct`, and it is accepted only on
-`struct` and `enum` declarations; `[resource]` on any other item, a field
-or a variant is a parse error. `resource` is not a keyword (B413 dissolved
+`struct`, `enum` and `trait` declarations; `[resource]` on any other item,
+a field or a variant is a parse error. On a trait it marks the trait's
+OBJECTS: `dyn T` of a `[resource] trait T` is move-only and may hold a
+resource (§5.12). `resource` is not a keyword (B413 dissolved
 it into the attribute): it is an ordinary name everywhere else, and the
 retired spelling `resource struct` is refused with a steer to
 `[resource] struct`.
@@ -367,7 +369,8 @@ retired spelling `resource struct` is refused with a steer to
 ```text
 impl  = [ internal-label ] [ platform-attr ] "impl" type [ "with" type { "+" type } ]
         "{" { statement } "}" ;
-trait = [ deprecated-label ] [ internal-label ] [ platform-attr ] "trait" IDENT
+trait = [ deprecated-label ] [ internal-label ] [ platform-attr ]
+        [ "[" "resource" "]" ] "trait" IDENT
         [ generic-params ]
         [ "with" type { "+" type } ] "{" { function } "}" ;
 ```

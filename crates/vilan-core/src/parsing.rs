@@ -6663,7 +6663,12 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// function declarations only.
     fn parse_trait(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let labels = self.parse_item_labels();
+        let mut labels = self.parse_item_labels();
+        // B470: `[resource] trait` — it closes the label prefix, as it does on
+        // a struct or an enum.
+        if self.eat_marker_attribute("resource") {
+            labels.get_or_insert_with(Default::default).resource = true;
+        }
         self.expect(&Token::Trait)?;
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -7750,6 +7755,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             deprecated,
             internal,
             platform,
+            resource: false,
         }))
     }
 
@@ -7930,7 +7936,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         if matches!(
             self.peek(),
-            Some(Token::External | Token::Struct | Token::Enum)
+            Some(Token::External | Token::Struct | Token::Enum | Token::Trait)
         ) {
             return None;
         }
@@ -7989,8 +7995,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.errors.push(ParseError {
             span,
             reason: ParseErrorReason::Rule(
-                "`[resource]` marks a type as a resource: it may label only a `struct` \
-                 or an `enum` declaration",
+                "`[resource]` marks a type as a resource: it may label only a `struct`, \
+                 an `enum` or a `trait` declaration",
             ),
             context: Vec::new(),
             hint: None,
@@ -9684,13 +9690,18 @@ mod tests {
     }
 
     #[test]
-    fn the_resource_attribute_is_refused_on_everything_but_a_struct_or_an_enum() {
+    fn the_resource_attribute_is_refused_on_everything_but_a_struct_an_enum_or_a_trait() {
         // B413: one rule, at every other position — an item, a local, a field
-        // and a variant.
+        // and a variant. B470 added the trait (its objects may hold a resource).
+        let (_, errors) = parse("[resource] trait Foo {}\n");
+        assert!(
+            errors.is_empty(),
+            "{:?}",
+            errors.iter().map(render).collect::<Vec<_>>()
+        );
         for source in [
             "[resource] fun f() {}\n",
             "[resource] impl Foo {}\n",
-            "[resource] trait Foo {}\n",
             "fun main() {\n\t[resource] let x = 1;\n}\n",
             "struct S {\n\t[resource] handle: i32,\n}\n",
             "enum E {\n\t[resource] Open,\n}\n",
@@ -9699,8 +9710,8 @@ mod tests {
             let rendered: Vec<String> = errors.iter().map(render).collect();
             assert!(
                 rendered.contains(
-                    &"`[resource]` marks a type as a resource: it may label only a `struct` \
-                      or an `enum` declaration"
+                    &"`[resource]` marks a type as a resource: it may label only a `struct`, \
+                      an `enum` or a `trait` declaration"
                         .to_string()
                 ),
                 "{source:?}: {rendered:?}"
@@ -9861,8 +9872,8 @@ mod tests {
         assert_eq!(
             rendered_errors("[resource] fun foo() {}\n"),
             vec![
-                "`[resource]` marks a type as a resource: it may label only a `struct` \
-                 or an `enum` declaration"
+                "`[resource]` marks a type as a resource: it may label only a `struct`, \
+                 an `enum` or a `trait` declaration"
                     .to_string()
             ]
         );

@@ -228,12 +228,14 @@ no table, and is what the language does everywhere else.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is a resource, so it cannot become a `dyn …`"**
-A `resource` has exactly one owner and a destructor that runs at a known
-point. Erasing it into a trait object would make that destructor dynamic —
-dispatched through the table like everything else — where the rest of the
-language keeps teardown static. Hold the resource in a struct field of
-your own and put *that* behind the object, or take it through a generic
-bound, where its type is still known.
+A `resource` with a `Drop` somewhere inside it has a destructor that runs
+at a known point. Erasing it into a trait object would make that destructor
+dynamic — dispatched through the table like everything else — where the
+rest of the language keeps teardown static. Hold the resource in a struct
+field of your own and put *that* behind the object, or take it through a
+generic bound, where its type is still known. (A resource with no `Drop`
+inside may become the object of a `[resource] trait`; erasing one into
+any other trait's object says so: "mark the trait `[resource]`".)
 → [Memory model](../tour/memory-model.md)
 
 **"'…' does not implement trait '…', required by the annotation on '…'"**

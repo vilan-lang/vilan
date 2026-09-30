@@ -4606,6 +4606,9 @@ impl<'src> Printer<'src> {
             // `trait Name[ with A + B] { items }`.
             Node::Trait(name, generics, supertraits, body, labels) => {
                 self.print_item_labels(labels);
+                if labels.as_ref().is_some_and(|labels| labels.resource) {
+                    self.out.push_str("[resource] ");
+                }
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
                 self.print_generic_parameters(generics.as_deref());
@@ -8424,6 +8427,19 @@ mod reformats {
         assert_formats(
             "[resource] external struct Database;\n",
             "[resource] external struct Database;\n",
+        );
+    }
+
+    #[test]
+    fn resource_trait_modifier_round_trips() {
+        // B470: `[resource]` closes a trait's label prefix, as on a struct.
+        assert_formats(
+            "[resource] trait Flow<T>{fun start(own self);}\n",
+            "[resource] trait Flow<T> {\n\tfun start(own self);\n}\n",
+        );
+        assert_formats(
+            "[deprecated(\"use Flow\")] [resource] trait Old{}\n",
+            "[deprecated(\"use Flow\")]\n[resource] trait Old {}\n",
         );
     }
 

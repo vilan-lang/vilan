@@ -1452,14 +1452,24 @@ lands, exactly as `(t.0, t.1)` would. The reverse, nested (`List<dyn
 Src>` where `List<Root>` is wanted), is the narrowing, refused one level
 down as at the top.
 
-**Resources.** A `resource` value may not be coerced into a trait object.
-Teardown through a table would make the destructor dynamic where the rest
-of the language keeps it static (memory.md R7/R10), so the coercion is
-refused and the resource is held in a struct field of its own. The rule
-holds at every instantiation: a generic parameter erased into an object
-(`fun erase<S: Src>(own source: S): dyn Src { source }`) is refused at
-the call that binds it to a resource, directly or through a caller that
-forwards its own parameter.
+**Resources.** A resource with a `Drop` anywhere inside it may not be
+coerced into a trait object: teardown through a table would make the
+destructor dynamic where the rest of the language keeps it static
+(memory.md R7/R10), so the coercion is refused and the resource is held
+in a struct field of its own. A resource with NO `Drop` inside has no
+teardown to dispatch, and may become the object of a trait declared
+`[resource]` (`[resource] trait Flow<T> { … }`): such a trait says its
+objects may hold a resource, so `dyn Flow<T>` — whatever landed in it, a
+data value included — is itself a resource, moved and never copied. A
+trait extending a `[resource]` trait has resource objects too, without
+repeating the attribute. Erasing a `Drop`-free resource into the object
+of an undeclared trait is refused with the steer to declare it; `dyn` of
+an undeclared trait stays data. The rules hold at every instantiation: a
+generic parameter erased into an object (`fun erase<S: Src>(own source:
+S): dyn Src { source }`) is judged at the call that binds it to a
+resource, directly or through a caller that forwards its own parameter.
+Where an `if` or a `match` is expected to produce an object, each arm is
+erased where it lands, so arms of different types meet in the object.
 
 **What reaches an object.** The members its trait and that trait's
 supertraits declare, through the table. Beyond those, only what is written

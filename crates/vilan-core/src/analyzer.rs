@@ -1372,6 +1372,15 @@ impl ResourceMoveViolation {
     }
 }
 
+/// Why B470 refuses a resource erasure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceErasureRefusal {
+    /// A `Drop` sits somewhere inside: today's refusal.
+    Drop,
+    /// `Drop`-free, but the object's trait is not declared `[resource]`.
+    UndeclaredTrait,
+}
+
 /// One generic instantiation to re-check under R11 (destruction.md §4): a
 /// callee whose generic parameters `resources` are bound to resource types at
 /// this instantiation, so its body must be move-clean with those parameters
@@ -2262,6 +2271,10 @@ pub struct Trait<'src> {
     /// `with` clause. A type implementing this trait must also satisfy these,
     /// and their members are inherited for method resolution.
     pub supertraits: Vec<TypeId>,
+    /// `[resource] trait` (B470, RULED 2026-09-29): this trait's objects may
+    /// hold a resource, so `dyn` of it — or of any trait that extends it — is
+    /// itself a resource (move-only).
+    pub resource: bool,
 }
 
 /// What a trait member's signature is being rendered FOR: the trait that
@@ -3315,6 +3328,10 @@ pub struct Analyzer<'src> {
     /// B469: chunk 3's admitted field moves (place -> owned root), published
     /// for the whole-program drop plan beside `resource_value_places`.
     partial_move_roots: HashMap<Id, Id>,
+    /// B470: every resource erased into a `dyn` at a coercion site, as
+    /// `(site, the value's type, the object type)`, for the post-build
+    /// question of whether it may be.
+    resource_erasures: Vec<(Id, TypeId, TypeId)>,
     /// Drop planning (destruction.md §5/§7): resource-typed local bindings still
     /// owned at their declaring scope's fall-through end — dropped there in
     /// reverse declaration order. Ownership at a program point is single-valued
@@ -6101,6 +6118,7 @@ impl<'src> Analyzer<'src> {
             resource_value_places: HashSet::default(),
             trait_self_markers: HashMap::default(),
             partial_move_roots: HashMap::default(),
+            resource_erasures: Vec::new(),
             dropped_bindings: HashSet::default(),
             drop_extents: HashMap::default(),
             declared_binding_extents: HashMap::default(),
@@ -10528,7 +10546,13 @@ impl<'src> Analyzer<'src> {
                 // A124 R3). Answering `false` here without that refusal would be
                 // §2.2's destructor suppression in a new carrier, which is why
                 // the two are written as one rule and pinned together.
-                Type::Dyn(..) => Members::Answer(false, true),
+                //
+                // B470 narrows the enforcement: a `Drop`-free resource may be
+                // erased into the object of a trait DECLARED `[resource]`, and
+                // that object is then move-only — so a `dyn` of such a trait
+                // (or of one extending it) is a resource, whatever landed in
+                // it, and every other `dyn` stays data.
+                Type::Dyn(trait_id, _) => Members::Answer(self.trait_is_resource(*trait_id), true),
                 // Everything else is a non-value or a scalar: never a resource by
                 // containment.
                 Type::Any
@@ -34060,6 +34084,7 @@ impl<'src> Analyzer<'src> {
                         declarations,
                         declared_members,
                         supertraits,
+                        resource: labels.as_ref().is_some_and(|labels| labels.resource),
                     },
                 );
                 Some(Expr::Trait(id))
@@ -37237,26 +37262,17 @@ impl<'src> Analyzer<'src> {
         // choice rather than a gap. Without it, `compute_resource`'s "a `dyn` is
         // never a resource" would be §2.2's destructor suppression wearing a
         // keyword.
+        //
+        // B470 (RULED 2026-09-29): a resource with NO `Drop` anywhere inside it
+        // may be erased into the object of a `[resource] trait` — there is no
+        // teardown to dispatch, and the object is itself move-only. Whether a
+        // `Drop` sits inside is asked after the build
+        // (`refuse_resource_erasures`), when every `impl … with Drop` is on
+        // record; the site is banked here and the pair still built.
         if self.type_is_resource(subject_type_id) {
-            if !self.dyn_refusals_reported.insert(expr_id) {
-                return;
-            }
-            let rendered = self.pretty_print_type(inferred, &HashMap::default());
-            let object = self.pretty_print_type(constraint, &HashMap::default());
-            if let Some(span) = self.span_map.get(&expr_id).map(|span| **span) {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span,
-                    msg: format!(
-                        "`{rendered}` is a resource, so it cannot become a `{object}`: a trait \
-                         object's teardown would have to be dispatched through its table, and \
-                         vilan keeps teardown static (memory.md R7/R10). Holding the resource in \
-                         a struct field of your own is the sanctioned alternative"
-                    ),
-                });
-            }
-            return;
+            let object_type_id = constraint.clone().get_type_id(self);
+            self.resource_erasures
+                .push((expr_id, subject_type_id, object_type_id));
         }
         // B431: a PARAMETER erased here is bound per instance, and Q5 above
         // sees only the parameter. The instantiations are asked after the
@@ -38947,7 +38963,7 @@ impl<'src> Analyzer<'src> {
                             if matches!(inferred, Type::Unresolved) {
                                 return Type::Unresolved;
                             }
-                            inferred
+                            self.arm_erased_to_expected_object(inferred, &constraint)
                         };
                         result = match self.reconcile_type(
                             &result,
@@ -49167,7 +49183,7 @@ impl<'src> Analyzer<'src> {
                 if matches!(inferred, Type::Unresolved) {
                     return None;
                 }
-                inferred
+                self.arm_erased_to_expected_object(inferred, &arm_constraint)
             };
             unified = Some(match unified {
                 None => body_type,
@@ -49198,6 +49214,141 @@ impl<'src> Analyzer<'src> {
         }
         // No arms at all is `void`, the same value an armless construct has.
         Some(unified.unwrap_or(Type::Void))
+    }
+
+    /// An arm of an `if`/`match` whose expected type is a trait OBJECT is
+    /// erased where it lands — each arm's tail builds its own pair
+    /// (`note_dyn_coercion`) — so for the merge it IS the object. Without
+    /// this, `fun pick(on: bool): dyn Run { if on { A {..} } else { B {..} } }`
+    /// was refused as mismatched arms, although each arm erases on its own
+    /// (A142's selectors, B470's mixed-arm shape). An arm that does not
+    /// implement the trait keeps its own type and meets the mismatch.
+    fn arm_erased_to_expected_object(&mut self, arm: Type, expected: &Type) -> Type {
+        let Type::Dyn(trait_id, _) = expected else {
+            return arm;
+        };
+        match &arm {
+            Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+                if self.type_implements_trait(&arm, *trait_id) =>
+            {
+                expected.clone()
+            }
+            _ => arm,
+        }
+    }
+
+    /// B470 (RULED 2026-09-29): the coercion sites' resource erasures. A
+    /// resource with a `Drop` anywhere inside keeps today's refusal — its
+    /// teardown would have to be dispatched through the table. A `Drop`-free
+    /// one may become the object of a trait declared `[resource]`, and is
+    /// steered there when its trait is not.
+    fn refuse_resource_erasures(&mut self) {
+        let erasures = std::mem::take(&mut self.resource_erasures);
+        for (site, subject, object) in erasures {
+            let Some(refusal) = self.resource_erasure_refusal(subject, object) else {
+                continue;
+            };
+            if !self.dyn_refusals_reported.insert(site) {
+                continue;
+            }
+            let msg = match refusal {
+                ResourceErasureRefusal::UndeclaredTrait => {
+                    self.undeclared_resource_trait_refusal(subject, object)
+                }
+                ResourceErasureRefusal::Drop => {
+                    let rendered =
+                        self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+                    let object =
+                        self.pretty_print_type(&object.get_type(self), &HashMap::default());
+                    format!(
+                        "`{rendered}` is a resource, so it cannot become a `{object}`: a trait \
+                         object's teardown would have to be dispatched through its table, and \
+                         vilan keeps teardown static (memory.md R7/R10). Holding the resource in \
+                         a struct field of your own is the sanctioned alternative"
+                    )
+                }
+            };
+            let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg,
+                },
+                site,
+            );
+        }
+    }
+
+    /// Why a resource of type `subject` may not become the object `object`
+    /// (B470), or `None` when it may: nothing inside it has a `Drop` and the
+    /// object's trait is declared `[resource]`.
+    fn resource_erasure_refusal(
+        &mut self,
+        subject: TypeId,
+        object: TypeId,
+    ) -> Option<ResourceErasureRefusal> {
+        let drop_nominals = self.drop_implementing_nominals();
+        if self.type_contains_drop(
+            subject,
+            &HashMap::default(),
+            &drop_nominals,
+            &mut HashSet::default(),
+        ) {
+            return Some(ResourceErasureRefusal::Drop);
+        }
+        match object.get_type(self) {
+            Type::Dyn(trait_id, _) if self.trait_is_resource(trait_id) => None,
+            _ => Some(ResourceErasureRefusal::UndeclaredTrait),
+        }
+    }
+
+    /// B470's steer: the resource could be erased, but the object's trait
+    /// does not say its objects may hold one.
+    fn undeclared_resource_trait_refusal(&self, subject: TypeId, object: TypeId) -> String {
+        let rendered = self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+        let object_type = object.get_type(self);
+        let object_label = self.pretty_print_type(&object_type, &HashMap::default());
+        let trait_name = match object_type {
+            Type::Dyn(trait_id, _) => self
+                .traits
+                .get(&trait_id)
+                .map(|trait_| trait_.name)
+                .unwrap_or("the trait"),
+            _ => "the trait",
+        };
+        format!(
+            "`{rendered}` is a resource, so it can become a `{object_label}` only when \
+             `{trait_name}` is declared `[resource]`: mark the trait `[resource]` — its trait \
+             objects may hold a resource, and are moved, never copied"
+        )
+    }
+
+    /// B470: whether `dyn` of this trait may hold a resource — the trait, or
+    /// one it extends, is declared `[resource]`. A trait extending a
+    /// `[resource]` trait need not repeat the attribute: its objects are
+    /// objects of the supertrait too.
+    fn trait_is_resource(&self, trait_id: Id) -> bool {
+        let mut stack = vec![trait_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.traits.get(&id) else {
+                continue;
+            };
+            if trait_.resource {
+                return true;
+            }
+            for supertrait in &trait_.supertraits {
+                if let Type::Trait(super_id, _) = self.borrow_type_by_type_id(*supertrait) {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        false
     }
 
     /// B431 — trait-objects.md §8.3's Q5 at monomorphisation. B412 erases the
@@ -49245,7 +49396,30 @@ impl<'src> Analyzer<'src> {
                         frontier.push((next, depth + 1));
                         continue;
                     }
-                    if !self.type_is_resource(bound) || !reported.insert((call_id, site)) {
+                    if !self.type_is_resource(bound) {
+                        continue;
+                    }
+                    // B470: a `Drop`-free resource erased into a `[resource]`
+                    // trait's object is allowed; into any other trait's it is
+                    // the steer to declare the trait one.
+                    let Some(refusal) = self.resource_erasure_refusal(bound, object) else {
+                        continue;
+                    };
+                    if !reported.insert((call_id, site)) {
+                        continue;
+                    }
+                    if refusal == ResourceErasureRefusal::UndeclaredTrait {
+                        let message = self.undeclared_resource_trait_refusal(bound, object);
+                        let span = **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN);
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            call_id,
+                        );
                         continue;
                     }
                     let rendered = self.pretty_print_type(&bound_type, &HashMap::default());
@@ -55689,6 +55863,9 @@ impl<'src> Analyzer<'src> {
         // non-literal operand (`z - 1` over `z: usize`) is not a constant and
         // is left to the runtime bounds rule (I5 ruling 2).
         self.refuse_negative_unsigned_constants();
+        // B470: the coercion sites' resource erasures, now that every `Drop`
+        // impl is on record.
+        self.refuse_resource_erasures();
         // B431: Q5 (a `dyn` holds no resource) at every INSTANTIATION of an
         // erased parameter, which the coercion site cannot see.
         self.refuse_resource_parameter_erasures();
