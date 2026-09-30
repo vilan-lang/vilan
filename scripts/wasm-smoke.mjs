@@ -62,7 +62,7 @@ fun main() {
 		let count = Signal::new(0);
 		view("div")
 			.child(view("button").text("+1").on("click", || count.set(count.get() + 1)))
-			.child(view("p").bind_text(count.map(|n| i"clicked {n} times")))
+			.child(view("p").bind_text(count.derive(|n| i"clicked {n} times")))
 	});
 }
 `,
