@@ -1018,11 +1018,10 @@ fn a_library_contract_check_keeps_the_position_in_prose() {
     // without registering any of them as a source and renders MESSAGES only, so
     // there is no file for a span to index into — the file and the position stay
     // in the text, which is exactly what every module parse error used to do.
-    let violations = contract_violations(
-        &[("lib.vl", ""), ("broken.vl", "fun broken( {\n")],
-        &[],
-        &[],
-    );
+    // The mid-edit unclosed `(` at end of input (B446: `fun broken( {` is a
+    // located demand at the `{` now, not an unclosed opener).
+    let violations =
+        contract_violations(&[("lib.vl", ""), ("broken.vl", "fun broken(\n")], &[], &[]);
     assert!(
         violations.iter().any(|violation| {
             violation.contains("parse error in")
@@ -1349,7 +1348,8 @@ fn module_parse_errors_attribute_to_the_broken_module() {
                 "main.vl",
                 "import pkg::util::util;\nfun main() { let _ = util(); }\n",
             ),
-            ("util.vl", "fun util(): i32 { 1 }\nfun broken( {\n"),
+            // An unclosed `(` at end of input (see the B446 note below).
+            ("util.vl", "fun util(): i32 { 1 }\nfun broken(\n"),
         ],
         "main.vl",
         Platform::default(),
@@ -1385,9 +1385,12 @@ fn a_module_parse_error_anchors_at_its_true_position() {
         "main.vl",
         Platform::default(),
     );
+    // B446: the parameter list's located demand, at the `{` it found where a
+    // name or its `)` goes (it said "unclosed `(`" at the opener while the
+    // binder recorded nothing).
     let (message, file, range) = spanned
         .iter()
-        .find(|(message, ..)| message.contains("expected a matching `)`"))
+        .find(|(message, ..)| message.contains("found '{' expected a name or ')'"))
         .expect("the module parse error should be reported");
     assert_eq!(file, "util.vl", "{spanned:?}");
     assert_ne!(*range, 0..0, "an empty span is the bug: {spanned:?}");
@@ -1398,8 +1401,8 @@ fn a_module_parse_error_anchors_at_its_true_position() {
     );
     assert_eq!(
         &helper[range.clone()],
-        "(",
-        "the span covers the unclosed `(`: {spanned:?}"
+        "{",
+        "the span covers the `{{` found in the parameter list: {spanned:?}"
     );
 }
 
@@ -1451,7 +1454,11 @@ fn a_module_parse_error_is_the_parsers_own_error_unaltered() {
     // `parsing::render(error)` as the message — and a loaded module now does
     // exactly the same, so the two are comparable against the same source of
     // truth rather than against each other.
-    let broken = "fun util(): i32 { 1 }\nfun broken( {\n";
+    // B446: the fixture is the mid-edit `fun broken(` at end of input — an
+    // unclosed `(` and nothing else. `fun broken( {` used to be one too, until
+    // the parameter list's binder recorded what it wanted: it is now the
+    // located "found '{' expected a name or ')'" plus the `{` left unclosed.
+    let broken = "fun util(): i32 { 1 }\nfun broken(\n";
     let (_tree, parse_errors) = vilan_core::parsing::parse(broken);
     assert_eq!(parse_errors.len(), 1, "the fixture holds one parse error");
     let expected_message = vilan_core::parsing::render(&parse_errors[0]);

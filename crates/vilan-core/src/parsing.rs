@@ -1834,12 +1834,21 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// begin a binder (a name, `mut`, a destructure's `(`/`[`, a spread's
     /// `...`), and a NAME otherwise (`own: Owner`, `|lazy| lazy.force()`).
     /// Sound because vilan never puts two names side by side.
+    ///
+    /// A spread is all THREE dots (B446): one `.` after the word is a member
+    /// access on a parameter NAMED `own` or `lazy` — `own.x` cannot be a
+    /// binder, and reading the word as the convention there left the binder
+    /// to fail on the `.` and the parameter list to report at the token
+    /// before it.
     fn eat_binder_prefix(&mut self, word: &str) -> bool {
         let prefixes_a_binder = self.peek_is_word(word)
-            && matches!(
-                self.peek_at(1),
-                Some(Token::Ident(_) | Token::Mut | Token::Ctrl('(' | '[' | '.'))
-            );
+            && match self.peek_at(1) {
+                Some(Token::Ident(_) | Token::Mut | Token::Ctrl('(' | '[')) => true,
+                Some(Token::Ctrl('.')) => {
+                    self.peek_at_is_ctrl(2, '.') && self.peek_at_is_ctrl(3, '.')
+                }
+                _ => false,
+            };
         if prefixes_a_binder {
             self.contextual_readings.push(self.position);
             self.bump();
@@ -2157,11 +2166,23 @@ impl<'a, 'src> Parser<'a, 'src> {
             return;
         }
         // `let mut x = …`: two binding forms written as one. The located failure
-        // is on the `let`, which is the token the reader is least likely to
-        // suspect, so the rule replaces the message rather than trailing it.
-        if matches!(self.tokens.get(position), Some((Token::Let, _)))
+        // is on the `let` — or, since the binder records what it wanted
+        // (B446), on the `mut` it found where a name goes — and neither is
+        // the mistake the reader needs named, so the rule replaces the message
+        // rather than trailing it.
+        let let_mut = if matches!(self.tokens.get(position), Some((Token::Let, _)))
             && matches!(self.tokens.get(position + 1), Some((Token::Mut, _)))
         {
+            Some(position)
+        } else if matches!(self.tokens.get(position), Some((Token::Mut, _)))
+            && let Some(previous) = position.checked_sub(1)
+            && matches!(self.tokens.get(previous), Some((Token::Let, _)))
+        {
+            Some(previous)
+        } else {
+            None
+        };
+        if let Some(position) = let_mut {
             let span = (self.token_span(position).start..self.token_span(position + 1).end).into();
             self.errors.push(ParseError {
                 span,
@@ -5852,7 +5873,16 @@ impl<'a, 'src> Parser<'a, 'src> {
                 Some((Pattern::Array(patterns), parser.span_from(start)))
             });
         }
-        let name = self.eat_ident()?;
+        // B446: a binder that is not one RECORDS what it wanted, here, where
+        // the reader went wrong. Without it the farthest failure on record was
+        // whatever the production before had noted — after a generic-typed
+        // parameter, the `,` its argument list could have taken at its `>` —
+        // and `fun f(a: List<i32>, 5)` reported "found '>' expected ','" one
+        // parameter early. A `let` and a `for` binder read the same production.
+        let Some(name) = self.eat_ident() else {
+            self.note_expected("a name");
+            return None;
+        };
         // A binder's own span IS the bare name, so the name span and the pattern
         // span coincide here. They part company one level up, where the match/`is`
         // grammar's `let`/`mut` arm widens the pattern span over the keyword.
@@ -6830,7 +6860,18 @@ impl<'a, 'src> Parser<'a, 'src> {
         // (diagnostics-standard B5).
         let lazy = lazy | self.eat_binder_prefix("lazy");
         let spread = self.eat_spread();
-        let (pattern, pattern_span) = self.parse_binder()?;
+        let Some((pattern, pattern_span)) = self.parse_binder() else {
+            // B446: the binder noted the name it wanted. With nothing of this
+            // parameter read yet, the list's `)` would have done as well — the
+            // list asks for an item only once its closer is not next — so the
+            // report names both: `fun broken( {` is "found '{' expected a name
+            // or ')'", the located demand `recover_statement` ranks above the
+            // bare unclosed `(`.
+            if self.position == start {
+                self.note_expected("')'");
+            }
+            return None;
+        };
         let parameter_type = if self.eat_op(":") {
             Some(Box::new(
                 self.in_context("parameter type", Self::parse_type)?,
@@ -10280,6 +10321,76 @@ mod tests {
         assert_eq!(
             &source[statements[1].1.start..statements[1].1.end],
             "[must_use] export fun b(): i32 { 1 }"
+        );
+    }
+
+    /// The rendered first error of `source` and the text its span covers.
+    fn first_error(source: &str) -> (String, &str) {
+        let (_, errors) = parse(source);
+        let error = errors
+            .first()
+            .unwrap_or_else(|| panic!("{source:?} parsed clean"));
+        (render(error), &source[error.span.start..error.span.end])
+    }
+
+    #[test]
+    fn b446_a_parameter_that_is_no_binder_is_reported_where_it_is_written() {
+        // A parameter NAMED `own` (or `lazy`) after a generic-typed one is a
+        // name: `:` begins no binder, so the word is not the convention.
+        program("fun f(a: Shared<List<Foo>>, own: i32, lazy: i32) {}");
+        program("fun f(xs: List<i32>, own: i32) {}");
+        // One `.` is not a spread's three: `own.x` is the name `own` and a
+        // stray member access, reported at the `.` — not the convention, a
+        // failed binder, and "found '>' expected ','" one parameter early.
+        for source in [
+            "fun f(a: List<i32>, own.x: i32) {}",
+            "fun f(a: List<i32>, lazy.x: i32) {}",
+            "fun f(a: i32, own.x: i32) {}",
+        ] {
+            let (message, at) = first_error(source);
+            assert_eq!(at, ".", "{source}: {message}");
+            // The NAME reading: the parameter ended at `own`, and the list
+            // wanted its next separator — not "expected a name", which is
+            // the convention reading's binder failing on the same `.`.
+            assert!(
+                message.starts_with("found '.' expected ',' or ')'"),
+                "{source}: {message}"
+            );
+        }
+        // A binder that is not one is reported AT it, whatever led it in:
+        // nothing, a convention, `mut`, a view, a spread, a destructure.
+        for (source, offending) in [
+            ("fun f(a: List<i32>, 5) {}", "5"),
+            ("fun f(a: List<List<i32>>, own (5)) {}", "5"),
+            ("fun f(a: List<i32>, own [1]) {}", "1"),
+            ("fun f(a: List<i32>, mut 5) {}", "5"),
+            ("fun f(a: List<i32>, & 5) {}", "5"),
+            ("fun f(a: List<i32>, ...5) {}", "5"),
+            ("fun f(a: List<i32>, lazy (1)) {}", "1"),
+            ("fun g() { let 5 = 1; }", "5"),
+            ("fun g() { let (5, a) = (1, 2); }", "5"),
+        ] {
+            let (message, at) = first_error(source);
+            assert_eq!(at, offending, "{source}: {message}");
+            assert!(message.contains("expected a name"), "{source}: {message}");
+        }
+        // At a parameter's head, with nothing of it read, the list's `)`
+        // would have done as well, and the report says so.
+        let (message, at) = first_error("fun broken( {");
+        assert_eq!(
+            (message.as_str(), at),
+            ("found '{' expected a name or ')'", "{")
+        );
+        let (message, _) = first_error("fun f(a: List<i32>, 5) {}");
+        assert_eq!(message, "found '5' expected a name or ')'");
+        // After a convention the parameter is under way: a name alone.
+        let (message, _) = first_error("fun f(a: List<i32>, mut 5) {}");
+        assert_eq!(message, "found '5' expected a name");
+        // The spread is still the convention's business, and still refused.
+        let (message, _) = first_error("fun f(a: List<i32>, own ...items: (i32, i32)) {}");
+        assert!(
+            message.starts_with("a spread parameter receives a tuple"),
+            "{message}"
         );
     }
 

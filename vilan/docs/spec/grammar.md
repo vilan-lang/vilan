@@ -14,7 +14,9 @@ name can, so the position alone decides. `own` and `lazy` at a parameter's
 head, `lazy` before `let`/`mut`, `jump` before its target and `dyn` at a
 type's head are PREFIXES of a name, and the grammar never puts two names side
 by side, so the word is the keyword when a name follows it (for `dyn`, when
-anything but `::` follows it) and a name otherwise: `fun f(own: Owner)`,
+anything but `::` follows it; for `own` and `lazy`, also when a binder's
+other heads do — `mut`, a destructure's `(` or `[`, a spread's `...` — but
+never a single `.`) and a name otherwise: `fun f(own: Owner)`,
 `|lazy| lazy.force()`, `jump.height`, `dyn::Registry`. `then` follows a
 complete operand (§3.8), which is where no name can stand either.
 
