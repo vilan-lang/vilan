@@ -7372,3 +7372,29 @@ fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
         "a churned map and set must walk in insertion order on both backends"
     );
 }
+
+/// F65 (OPEN, native-45 STOPPED it — the defect is the analyzer's record): a
+/// generic function whose return is inferred, called at two instantiations,
+/// emits ONE instantiation's return type for every instance. `wrap<T>(x: T):
+/// Source<T> { SignalCell::new(x) }` at `i32` and `str` emits both instances
+/// returning the `str` cell, and the `i32` caller's reads meet the wrong
+/// struct (rustc E0308). The same holds with no return written at all, so it
+/// is not B460's opacity: `inferred_return_types` records the function's
+/// return as the LAST call site's `SignalCell<str>` rather than
+/// `SignalCell<T>`, and both call expressions share that one type id — so
+/// nothing per call carries the instance's return for the emitter to read.
+#[test]
+#[ignore = "F65: the analyzer records a generic function's inferred return at one call site's instantiation"]
+fn a_generic_inferred_return_is_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_inferred_return.vl"),
+        include_str!("native/generic_inferred_return.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_inferred_return.vl"),
+        Verdict::Identical,
+        "each instance of a generic inferred-return function returns its own type"
+    );
+}
