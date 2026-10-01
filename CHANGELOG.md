@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**Native builds read and write a FIELD through a `Shared` view: `a.write().count = a.write().count + 1`, `cell.write().inner.depth = 3`, `cell.write().items.push(cell.read().count)` and `let note = s.write().note` build and print node's bytes, where every one was refused by name ("a field read of an unresolved subject").** The view call records no type, so a field off `write()` had no struct to be found in — the reason A142's `OwnerCell` and S6's `TrackRuns` are written whole. The call is typed now, and two rules make the borrows safe. A field READ through either view is one scoped borrow of the cell that copies only the field (`read_with`), so it holds nothing past itself; `cell.read().n` had copied the whole value to read one field. And every site that takes the cell's `borrow_mut` as a PLACE settles what it reads first: an assignment's value is computed in its own statement, a mutating call's arguments are hoisted, and the call's borrow ends with the call — `cell.write().items.pop().unwrap_or(0) + cell.read().n` reads the cell after the pop. The JS backend is unchanged. Pins: `shared.vl` joins the native default suite, and `a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends` (both views, nested fields, a tuple slot, `str`/`Option`/`List` fields, a compound write, the `OwnerCell` shape written field by field through a loaned `self`, a `&mut` field handed on, a `&mut self` method on a field, a closure writing a field, a subscript write). Tracker F62.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

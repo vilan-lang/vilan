@@ -176,6 +176,10 @@ const DEFAULT_SUITE: &[&str] = &[
     // over a `"type"` key — and the Rust emitter's own keywords (`type`,
     // `match`, `if`, `in`, `for`, `ret`) must survive as member names natively.
     "keyword-members.vl",
+    // F62: `a.write().count = a.write().count + 1` — a field read and written
+    // through a `Shared` view, refused by name until the read became a scoped
+    // borrow and the place's statement settled its value first.
+    "shared.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -7030,3 +7034,38 @@ const B470_ONCE_PROBE: &str = concat!(
     "\n",
     "main();\n",
 );
+
+/// F62: a field read or written through a `Shared` view builds natively and
+/// prints what node prints.
+///
+/// It was refused by name ("a field read of an unresolved subject"): the view
+/// call records no type, so the field had no struct to be found in — which is
+/// why A142's `OwnerCell` and S6's `TrackRuns` were written WHOLE. Typing the
+/// call was half of it. A read through the view holds no borrow past itself
+/// now (`read_with`, one borrow per spine, copying only the field), and every
+/// site that takes the cell's `borrow_mut` as a place — an assignment, a
+/// mutating call's receiver, a `&mut` argument — settles what it reads first,
+/// so `a.write().n = a.write().n + 1` and `cell.write().items.push(cell.read()
+/// .n)` meet no live borrow. The second probe is the `OwnerCell` shape written
+/// field by field, the shape reactive-45 may return to.
+#[test]
+fn a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_shared_view_fields.vl",
+            include_str!("native/shared_view_fields.vl"),
+        ),
+        (
+            "native_probe_shared_view_places.vl",
+            include_str!("native/shared_view_places.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: a field through a `Shared` view must read and write the same on both backends"
+        );
+    }
+}

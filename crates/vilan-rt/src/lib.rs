@@ -547,6 +547,25 @@ impl<T> Shared<T> {
         *self.borrow_mut() = value;
     }
 
+    /// A SCOPED read of the cell (F62): `read` sees the value in place and
+    /// answers what it takes out of it — a field, copied — and the borrow ends
+    /// when the call does.
+    ///
+    /// The emitter's spelling of a field read through either view,
+    /// `cell.read().n` and `cell.write().n`. [`Shared::get`] answered the first
+    /// by copying the WHOLE value to read one field of it, and the second had
+    /// no spelling at all: a `borrow_mut()` held as a temporary lives to the
+    /// end of its statement, so `a.write().n = a.write().n + 1` met its own
+    /// live borrow at the left side. A borrow scoped to the closure has nothing
+    /// left to collide with. An aliasing read inside `update` panics here as it
+    /// does in [`Shared::get`].
+    pub fn read_with<R>(&self, read: impl FnOnce(&T) -> R) -> R {
+        match self.inner.value.try_borrow() {
+            Ok(value) => read(&value),
+            Err(_) => panic_with(REENTRANT_READ),
+        }
+    }
+
     /// `Shared::write()` USED AS A PLACE — `cell.write().push(x)`,
     /// `cell.write().field = y` (F20).
     ///

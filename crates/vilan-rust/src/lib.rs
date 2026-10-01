@@ -227,6 +227,13 @@ fn unsupported(what: &str, span: Span) -> Error {
     }
 }
 
+/// One link of a spine read through a `Shared` view (F62): a field, by its
+/// subject and index, or a tuple slot.
+enum Step {
+    Field(Id, usize),
+    Slot(usize),
+}
+
 /// Where in the emitted file one reserved slot's text goes, and under what name.
 struct Reserved {
     name: String,
@@ -3025,36 +3032,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .inferred_return_types
                 .get(call_id)
                 .copied()
-                .or_else(|| self.shared_read_type(*call_id))
+                .or_else(|| self.shared_view_type(*call_id))
                 .or_else(|| self.declared_return_type(*call_id)),
             Expr::Await(awaited) => self.awaited_type(*awaited),
             _ => None,
         }
     }
 
-    /// The element type a `Shared` cell's `read()` answers — the cell's own
-    /// argument. The intrinsic call records no type of its own, so a field
-    /// read off it (`(followed.read().pull)()`, A142's `Switch` node calling
-    /// its current inner instance) had no struct to name the field from.
+    /// The element type a `Shared` cell's view answers — `read()` or
+    /// `write()`, the cell's own argument. The intrinsic call records no type
+    /// of its own, so a field read off it (`(followed.read().pull)()`, A142's
+    /// `Switch` node calling its current inner instance) had no struct to name
+    /// the field from — and `cell.write().n`, read or written, was refused by
+    /// name (F62).
     ///
-    /// `read()` only. Natively it is a copy out of the cell (`get()`), so a
-    /// field of it is an ordinary value. A field of `write()` is a place behind
-    /// a live `borrow_mut`, and `a.write().n = a.write().n + 1` (`shared.vl`)
-    /// holds the right side's borrow across the left's — the runtime's
-    /// reentrancy stop, where node prints `2`. That shape stays refused by
-    /// name until it is lowered through a temporary.
-    fn shared_read_type(&self, call_id: Id) -> Option<TypeId> {
-        let call = self.program.function_calls.get(&call_id)?;
-        let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id) else {
-            return None;
-        };
-        if !matches!(
-            self.program.intrinsics.get(subject),
-            Some(Intrinsic::SharedValue)
-        ) {
-            return None;
-        }
-        let cell = self.type_of(*call.argument_ids.first()?)?;
+    /// A field READ through either view is a scoped borrow
+    /// ([`Self::shared_view_field_read`]); a field of `write()` used as a
+    /// PLACE is a place behind the cell's `borrow_mut`, and every site that
+    /// takes one hoists what it reads first ([`Self::place_lives_in_a_cell`]).
+    fn shared_view_type(&self, call_id: Id) -> Option<TypeId> {
+        let (cell, _) = self.shared_view_of_call(call_id)?;
+        let cell = self.type_of(cell)?;
         match self.resolve(cell)? {
             Type::Struct(id, arguments)
                 if self.program.structs.get(id).is_some_and(|declaration| {
@@ -3065,6 +3063,99 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             _ => None,
         }
+    }
+
+    /// Whether `id` is a field spine read through a `Shared` view — what
+    /// [`Self::shared_view_field_read`] renders.
+    fn reads_through_a_shared_view(&self, id: Id) -> bool {
+        let mut current = id;
+        let mut stepped = false;
+        loop {
+            match self.program.entity_map.get(&current) {
+                Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, 1)) => {
+                    stepped = true;
+                    current = subject;
+                }
+                _ => return stepped && self.shared_view_of(current).is_some(),
+            }
+        }
+    }
+
+    /// The CELL a `Shared` view call reaches — `cell.read()`'s or
+    /// `cell.write()`'s receiver — and whether the view is the WRITE one.
+    fn shared_view_of_call(&self, call_id: Id) -> Option<(Id, bool)> {
+        let call = self.program.function_calls.get(&call_id)?;
+        let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id) else {
+            return None;
+        };
+        let writes = match self.program.intrinsics.get(subject)? {
+            Intrinsic::SharedValue => false,
+            Intrinsic::SharedWrite => true,
+            _ => return None,
+        };
+        Some((*call.argument_ids.first()?, writes))
+    }
+
+    /// [`Self::shared_view_of_call`] for an expression.
+    fn shared_view_of(&self, id: Id) -> Option<(Id, bool)> {
+        match self.program.entity_map.get(&id)? {
+            Expr::Call(call_id) => self.shared_view_of_call(*call_id),
+            _ => None,
+        }
+    }
+
+    /// A field (or tuple slot) READ through a `Shared` view, as a scoped
+    /// borrow (F62): `cell.write().inner.depth` is `(cell).read_with(|view|
+    /// view.inner.depth)`, copied out of the borrow when it is not `Copy`.
+    /// `None` when `id` is not a spine of fields over a view call.
+    ///
+    /// The whole spine is one borrow, so a nested field copies only itself —
+    /// not the struct above it. Both views read this way: on the JS backend
+    /// `read()` and `write()` are the same property access, and natively the
+    /// `read()` spelling had copied the whole value (`get()`) to read one
+    /// field, while the `write()` one had none. The borrow ends with the read,
+    /// so a write of the same cell later in the statement —
+    /// `a.write().n = a.write().n + 1` — finds no live borrow to collide with.
+    fn shared_view_field_read(&mut self, id: Id, depth: usize) -> Result<Option<String>, Error> {
+        let mut steps = Vec::new();
+        let mut current = id;
+        let cell = loop {
+            match self.program.entity_map.get(&current) {
+                Some(&Expr::Field(subject, _, index)) => {
+                    steps.push(Step::Field(subject, index));
+                    current = subject;
+                }
+                Some(&Expr::TupleIndex(subject, offset, 1)) => {
+                    steps.push(Step::Slot(offset));
+                    current = subject;
+                }
+                _ => match self.shared_view_of(current) {
+                    Some((cell, _)) if !steps.is_empty() => break cell,
+                    _ => return Ok(None),
+                },
+            }
+        };
+        let mut path = String::new();
+        for step in steps.iter().rev() {
+            match *step {
+                Step::Field(subject, index) => {
+                    let field = self.field_name(subject, index, self.span_of(id))?;
+                    let _ = write!(path, ".{field}");
+                }
+                Step::Slot(offset) => {
+                    let _ = write!(path, ".{offset}");
+                }
+            }
+        }
+        let cell_text = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
+        let copied = if self.is_natively_copy(id) {
+            ""
+        } else {
+            ".clone()"
+        };
+        Ok(Some(format!(
+            "({cell_text}).read_with(|view| view{path}{copied})"
+        )))
     }
 
     /// The type an `await` produces (J6): a `Task<T>`'s payload.
@@ -3902,6 +3993,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             },
             Expr::Assignment(target, value) => self.assignment(target, value, depth, span)?,
             Expr::Field(subject, _, index) => {
+                if let Some(read) = self.shared_view_field_read(id, depth)? {
+                    return Ok(read);
+                }
                 let subject_text = self.expression(subject, depth)?;
                 let field = self.field_name(subject, index, span)?;
                 format!("{subject_text}.{field}")
@@ -3945,6 +4039,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::TupleIndex(subject, offset, width) => {
                 if width != 1 {
                     return Err(unsupported("a multi-slot tuple element", span));
+                }
+                if let Some(read) = self.shared_view_field_read(id, depth)? {
+                    return Ok(read);
                 }
                 format!("{}.{offset}", self.expression(subject, depth)?)
             }
@@ -4169,6 +4266,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("({text}).clone()"));
         }
         let text = self.expression(id, depth)?;
+        // F62: a field read through a `Shared` view is already a copy out of
+        // the cell's scoped borrow, so rule 1's copy has been taken.
+        if self.reads_through_a_shared_view(id) {
+            return Ok(text);
+        }
         if self.copy_applies(self.program.clone_sites.get(&id)) {
             return Ok(format!("({text}).clone()"));
         }
@@ -4488,6 +4590,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             });
         self.hoisted = saved;
         let (target_text, value_text) = rendered?;
+        // F62: a place behind a cell's borrow — `cell.write().n = ..`, a field
+        // of a boxed or module-level binding — takes that borrow for the rest
+        // of the statement, and every temporary the VALUE leaves (a mutating
+        // call's `borrow_mut` of the same cell, `cell.write().items.pop()`)
+        // lives exactly as long. The value is settled in its own statement
+        // first, which is the order Rust evaluates an assignment in anyway.
+        if self.place_lives_in_a_cell(target) {
+            let _ = write!(prelude, "let __assigned = {value_text}; ");
+            return Ok(format!("{{ {prelude}{target_text} = __assigned; }}"));
+        }
         if prelude.is_empty() {
             return Ok(format!("{target_text} = {value_text}"));
         }
@@ -10122,9 +10234,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // to collide with: its receiver is a reference). The arguments are
         // hoisted into `let`s, which puts every read of the cell before the
         // borrow is taken; the block is an expression, so the call site is
-        // unchanged.
+        // unchanged. The block also ENDS the borrow (F62): a temporary in a
+        // block's tail is dropped with the block (edition 2024), so
+        // `cell.write().items.pop().unwrap_or(0) + cell.read().n` reads the
+        // cell after the pop rather than under its `borrow_mut` — which is why
+        // a receiver-only call takes the block too.
         if mutating
-            && argument_ids.len() > 1
+            && !argument_ids.is_empty()
             && argument_ids
                 .first()
                 .is_some_and(|receiver| self.place_lives_in_a_cell(*receiver))
@@ -10201,6 +10317,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(Expr::Local(binding)) => {
                 self.boxed.contains(binding) || self.module_bindings.contains(binding)
             }
+            // F62: a place reached through a `Shared`'s WRITE view is behind
+            // the cell's `borrow_mut` — `cell.write().items.push(..)`,
+            // `cell.write().n = ..` — which is the same live borrow.
+            Some(Expr::Call(call_id)) => self
+                .shared_view_of_call(*call_id)
+                .is_some_and(|(_, writes)| writes),
             Some(
                 Expr::Field(subject, _, _)
                 | Expr::Index(subject, _)
