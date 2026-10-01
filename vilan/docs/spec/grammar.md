@@ -78,9 +78,9 @@ impl-selector = "(" "impl" type ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
-export      = { lead-attribute }   (* B445: the item's own prefix, written first *)
+export      = { lead-attribute }   (* the item's own prefix: B485's one order *)
               "export" [ "(" "in" path-branch ")" ]
-              [ deprecated-label ]   (* only before `import`: B382's re-export *)
+              [ deprecated-label ]   (* B382's re-export label, the pre-B485 side *)
               statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
 lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
@@ -103,16 +103,17 @@ declaration as the module's surface (or re-exports an import);
 is the one form carrying no inner statement. The wrapper does not change
 the statement's own shape, so a wrapped `let` keeps its terminator —
 `export let registry = …;` — and a wrapped `fun` still takes none. A
-declaration carrying attributes is wrapped as a whole, attributes and all,
-and its attribute run may stand on EITHER side of the marker (B445):
-`export [derive(Wire)] struct Handle { … }` and `[derive(Wire)] export
-struct Handle { … }` are one declaration, as are `[platform("browser")]
-export impl …` and `export [platform("browser")] impl …`. An `attribute`
-written ahead of `export` is read exactly as if it followed the marker
-(and its scope): it joins the item's own prefix, whose order and
-admissions are the item production's (§3.3), and a run may be split across
-the marker. `vilan fmt` prints the run after the marker. Only an attribute
-shape — `[` then a name — leads a marker; `export *;` takes none. A `#` before
+declaration carrying attributes is wrapped as a whole, attributes and all.
+The ONE order (B485) is attributes, then the keywords — `export` first
+among them — then the declaration word: `[derive(Wire)]` ⏎ `export struct
+Handle { … }`, `[platform("browser")]` ⏎ `export impl …`. This release also
+reads the run on the other side of the marker (`export [derive(Wire)]
+struct Handle`, the spelling before B445), and `vilan fmt` rewrites it into
+the order; the release after refuses it. An attribute written on either
+side is read exactly as one after the marker (and its scope) always was: it
+joins the item's own prefix, whose order and admissions are the item
+production's (§3.3), and a run may be split across the marker. Only an
+attribute shape — `[` then a name — leads a marker; `export *;` takes none. A `#` before
 a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
@@ -247,7 +248,7 @@ than the minor release after the warning first shipped.
 
 The same steer labels a **struct**, an **enum**, a **trait** or a module
 binding (leading its prefix, as on a function), and a **re-export**:
-`export [deprecated("use pkg::inner::DeltaCursor")] import
+`[deprecated("use pkg::inner::DeltaCursor")] export import
 pkg::inner::DeltaCursor as KeyedCursor;` deprecates the name `KeyedCursor`
 the re-export publishes, while the item stays exactly the item —
 `KeyedCursor` is still a `DeltaCursor`. A use of a deprecated type in

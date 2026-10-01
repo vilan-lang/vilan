@@ -127,10 +127,12 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
 
 /// Moves a declaration's `export (in PATH)?` marker AHEAD of an attribute run
 /// written before it — `[platform("browser")] export impl …` becomes `export
-/// [platform("browser")] impl …` — so the safety net accepts the printer
-/// giving the marker its one printed place (B445). The parser reads the same
+/// [platform("browser")] impl …` — in BOTH streams, so the safety net reads
+/// the two sides of the marker (B445) as one spelling and accepts the printer
+/// moving it to the ruled side, after the attributes
+/// ([`Printer::print_exported_item`], B485 §6.2). The parser reads the same
 /// rotation (`Parser::lead_export_past_its_attributes`), so the tree the
-/// printer walks already holds the run as the item's prefix.
+/// printer walks holds the run as the item's prefix whichever side it was on.
 ///
 /// Recognized by SHAPE where a statement can begin (the stream's start, or
 /// after a `;`, `{` or `}`): a run of `[name …]` groups ending at `export`.
@@ -3549,6 +3551,23 @@ struct Printer<'src> {
     head_start: Option<usize>,
 }
 
+/// `[resource]` as it prints today: on the declaration line, in the slot the
+/// keyword it was until B413 held. B485's layout (Q10) moves it to a line of
+/// its own; until then it is the one attribute the declaration line opens
+/// with, and an `export` placed on that line goes after it.
+const RESOURCE_ON_THE_HEAD: &str = "[resource] ";
+
+/// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
+/// space before the `(` (`export(in pkg) fun f()`). Empty when the marker
+/// carries no narrowing.
+fn export_scope_text(scope: Option<&ExportScope<'_>>) -> String {
+    let Some(scope) = scope else {
+        return String::new();
+    };
+    let path: Vec<&str> = scope.path.iter().map(|(segment, _)| *segment).collect();
+    format!("(in {})", path.join("::"))
+}
+
 impl<'src> Printer<'src> {
     /// A printer over `source` under `options`, at column zero with nothing
     /// declined and no split armed — the state every entry point starts from,
@@ -4417,31 +4436,60 @@ impl<'src> Printer<'src> {
                 self.out.push(';');
             }
             Node::Export(scope, inner, labels) => {
+                // B485 §6.2 (RULED): the re-export's label, then the marker.
+                self.print_import_labels(labels);
                 self.out.push_str("export");
                 self.print_export_scope(scope.as_deref());
                 self.out.push(' ');
-                self.print_import_labels(labels);
                 self.print_import_like(&inner.0);
             }
             _ => {}
         }
     }
 
-    /// `(in PATH)` after an `export` — printed verbatim, `::`-joined, with no
-    /// space before the `(` (`export(in pkg) fun f()`). Nothing when the marker
-    /// carries no narrowing.
-    fn print_export_scope(&mut self, scope: Option<&ExportScope<'src>>) {
-        let Some(scope) = scope else {
-            return;
-        };
-        self.out.push_str("(in ");
-        for (index, (segment, _)) in scope.path.iter().enumerate() {
-            if index > 0 {
-                self.out.push_str("::");
+    /// An exported declaration in the ONE order B485 ruled (§6.2): its
+    /// attributes, then the keywords — `export` first among them — then the
+    /// declaration word. `[platform("node")]` ⏎ `export async fun f()`, and
+    /// not `export [platform("node")]` ⏎ `async fun f()`, which split the
+    /// signature across lines. The parser reads both (B445).
+    ///
+    /// The item prints its own attribute lines, each ended by
+    /// [`Printer::end_attribute_line`], which marks where the declaration
+    /// line begins; the marker is placed THERE once the item is printed, so
+    /// every item kind — and a derive, a service or a macro attribute
+    /// wrapping one — takes it at its signature without an arm of its own.
+    /// `[resource]`, which still prints on the declaration line, is an
+    /// attribute and stays ahead of it (`[resource] export struct H`). An item
+    /// with no attribute takes the marker at its start, as it always did. The
+    /// declaration line's width rule measures from the same offset, so it
+    /// reads the line with the marker on it.
+    fn print_exported_item(
+        &mut self,
+        scope: Option<&ExportScope<'src>>,
+        exported: &Spanned<Node<'src>>,
+    ) {
+        let start = self.out.len();
+        let enclosing_head = self.head_start.take();
+        self.print_item(exported);
+        let declaration = match self.head_start {
+            Some(head) if head >= start => head,
+            _ => {
+                self.head_start = enclosing_head;
+                start
             }
-            self.out.push_str(segment);
-        }
-        self.out.push(')');
+        };
+        let declaration = if self.out[declaration..].starts_with(RESOURCE_ON_THE_HEAD) {
+            declaration + RESOURCE_ON_THE_HEAD.len()
+        } else {
+            declaration
+        };
+        let marker = format!("export{} ", export_scope_text(scope));
+        self.out.insert_str(declaration, &marker);
+    }
+
+    /// `(in PATH)` after an `export` — see [`export_scope_text`].
+    fn print_export_scope(&mut self, scope: Option<&ExportScope<'src>>) {
+        self.out.push_str(&export_scope_text(scope));
     }
 
     /// Whether `node`, printed as a statement, takes a terminating `;`. Expression
@@ -4528,7 +4576,7 @@ impl<'src> Printer<'src> {
             Node::Struct(name, generics, external, resource, body, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("[resource] ");
+                    self.out.push_str(RESOURCE_ON_THE_HEAD);
                 }
                 if *external {
                     self.out.push_str("external ");
@@ -4606,7 +4654,7 @@ impl<'src> Printer<'src> {
             Node::Enum(name, generics, resource, variants, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("[resource] ");
+                    self.out.push_str(RESOURCE_ON_THE_HEAD);
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
@@ -4701,7 +4749,7 @@ impl<'src> Printer<'src> {
             Node::Trait(name, generics, supertraits, body, labels) => {
                 self.print_item_labels(labels);
                 if labels.as_ref().is_some_and(|labels| labels.resource) {
-                    self.out.push_str("[resource] ");
+                    self.out.push_str(RESOURCE_ON_THE_HEAD);
                 }
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
@@ -4754,11 +4802,8 @@ impl<'src> Printer<'src> {
                 self.print_item(item);
             }
             Node::Export(scope, exported, labels) => {
-                self.out.push_str("export");
-                self.print_export_scope(scope.as_deref());
-                self.out.push(' ');
                 self.print_import_labels(labels);
-                self.print_item(exported);
+                self.print_exported_item(scope.as_deref(), exported);
             }
             // G24's `const fun` — a DECLARATION under a marker, printed the way
             // `export` above prints one (N89). The expression printer's own
@@ -8563,50 +8608,59 @@ mod reformats {
         );
     }
 
-    // B445: an attribute run may stand on either side of `export`, and the
-    // formatter prints ONE side — after the marker, the spelling the estate
-    // already writes (`export [extern(..)]` ⏎ `async external fun …`). Every
-    // item kind a label leads, a run of several, a scoped marker, a
-    // re-export's label, a comment above the statement, a run split across
-    // the marker, and a rotated statement after an untouched one.
+    // B445 + B485 §6.2 (RULED): an attribute run may stand on either side of
+    // `export`, and the formatter prints the ruled order — attributes, then
+    // the keywords with `export` first, then the declaration word — so the
+    // signature is one line. Every item kind a label leads, a run of several,
+    // a scoped marker, a re-export's label, a comment above the statement, a
+    // run split across the marker, `[resource]` on the declaration line, an
+    // unattributed export (unchanged), and a rotated statement after an
+    // untouched one.
     #[test]
-    fn b445_attributes_ahead_of_export_print_after_it() {
-        assert_formats(
-            "[platform(\"browser\")] export impl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n",
-            "export [platform(\"browser\")]\nimpl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n",
-        );
-        for (ahead, after) in [
+    fn b485_an_exported_declarations_attributes_print_ahead_of_export() {
+        let canonical = "[platform(\"browser\")]\nexport impl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n";
+        let body = " impl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n";
+        assert_formats(&format!("[platform(\"browser\")] export{body}"), canonical);
+        assert_formats(&format!("export [platform(\"browser\")]{body}"), canonical);
+        for (written, expected) in [
             (
-                "[deprecated(\"use g()\")] [must_use] export(in pkg) fun f(): i32 { 1 }\n",
-                "export(in pkg) [deprecated(\"use g()\")] [must_use] fun f(): i32 { 1 }\n",
+                "export(in pkg) [deprecated(\"use g()\")] [must_use] async fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g()\")]\n[must_use]\nexport(in pkg) async fun f(): i32 {\n\t1\n}\n",
             ),
             (
-                "[derive(Debug)] export struct S { x: i32 }\n",
+                "[deprecated(\"use g()\")] [must_use] export(in pkg) async fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g()\")]\n[must_use]\nexport(in pkg) async fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
                 "export [derive(Debug)] struct S { x: i32 }\n",
+                "[derive(Debug)]\nexport struct S {\n\tx: i32,\n}\n",
             ),
             (
-                "// the cache\n[internal(\"why\")] export let x = 1;\n",
                 "// the cache\nexport [internal(\"why\")] let x = 1;\n",
+                "// the cache\n[internal(\"why\")]\nexport let x = 1;\n",
             ),
             (
-                "[deprecated(\"use a::c\")] export import a::b;\n",
                 "export [deprecated(\"use a::c\")] import a::b;\n",
+                "[deprecated(\"use a::c\")] export import a::b;\n",
             ),
             (
                 "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }\n",
-                "export [deprecated(\"use g()\")] [platform(\"node\")] fun f(): i32 { 1 }\n",
+                "[deprecated(\"use g()\")]\n[platform(\"node\")]\nexport fun f(): i32 {\n\t1\n}\n",
+            ),
+            (
+                "export [resource] struct Handle { id: i32 }\n",
+                "[resource] export struct Handle {\n\tid: i32,\n}\n",
+            ),
+            (
+                "export [hint(Show)] [resource] external struct Handle;\n",
+                "[hint(Show)]\n[resource] export external struct Handle;\n",
             ),
             (
                 "export fun a() {}\n\n[must_use] export fun b(): i32 { 1 }\n",
-                "export fun a() {}\n\nexport [must_use] fun b(): i32 { 1 }\n",
+                "export fun a() {}\n\n[must_use]\nexport fun b(): i32 {\n\t1\n}\n",
             ),
         ] {
-            let canonical = format(after);
-            assert!(
-                canonical.contains("export") && !canonical.contains("] export"),
-                "the marker leads the run: {canonical:?}"
-            );
-            assert_formats(ahead, &canonical);
+            assert_formats(written, expected);
         }
     }
 
@@ -9233,9 +9287,10 @@ mod idempotency {
     #[test]
     fn a_deprecated_steer_survives_the_reprint_on_a_type_and_a_re_export() {
         // B382: a type's steer on its own line, leading the prefix; a
-        // re-export's on the statement's own line.
+        // re-export's on the statement's own line, ahead of its `export`
+        // (B485 §6.2).
         let source = concat!(
-            "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n\n",
+            "[deprecated(\"use pkg::inner::DeltaCursor\")] export import pkg::inner::DeltaCursor as KeyedCursor;\n\n",
             "[deprecated(\"use Next\")]\n",
             "[internal(\"old plumbing\")]\n",
             "struct Previous {}\n\n",
@@ -9289,8 +9344,8 @@ mod idempotency {
             "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
             "[internal(\"a binding\")]\n",
             "let cache = 3;\n\n",
-            "export [internal(\"exported\")]\n",
-            "struct Marker {}\n\n",
+            "[internal(\"exported\")]\n",
+            "export struct Marker {}\n\n",
             "[derive(Clone)]\n",
             "[internal(\"derived\")]\n",
             "struct Point {\n\tx: i32,\n}\n",
@@ -9308,8 +9363,8 @@ mod idempotency {
         // E227: the argument is a TYPE, printed as types are, between
         // `[internal]` and `[platform]` — the prefix's order.
         let source = concat!(
-            "export [hint(Source<U>)]\n",
-            "struct Map<S, T, U> {\n\tup: S,\n}\n\n",
+            "[hint(Source<U>)]\n",
+            "export struct Map<S, T, U> {\n\tup: S,\n}\n\n",
             "[internal(\"a node\")]\n",
             "[hint(Iterator<(usize, T)>)]\n",
             "[resource] struct Enumerated<I, T> {\n\tupstream: I,\n}\n\n",
