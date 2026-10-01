@@ -10940,17 +10940,7 @@ impl<'src> Analyzer<'src> {
     ) -> (bool, bool) {
         let mut all_complete = true;
         for member in members {
-            // The read is only needed to substitute through a non-empty
-            // context. An unparameterized aggregate's members classify under
-            // their own ids, and reading the type there deep-cloned a value
-            // nothing went on to look at.
-            let member_type_id = if context.is_empty() {
-                *member
-            } else {
-                let member_type = member.get_type(self);
-                self.substitute_type(&member_type, context)
-                    .get_type_id(self)
-            };
+            let member_type_id = self.classification_member_id(*member, context);
             let (is_resource, complete) =
                 self.classify_resource(member_type_id, resource_constraints, memo, visiting);
             if is_resource {
@@ -10959,6 +10949,77 @@ impl<'src> Analyzer<'src> {
             all_complete &= complete;
         }
         (false, all_complete)
+    }
+
+    /// The type slot `member` classifies as under `context` (M95).
+    ///
+    /// The read is only needed to substitute through a non-empty context: an
+    /// unparameterized aggregate's members classify under their own ids, and
+    /// reading the type there deep-cloned a value nothing went on to look at.
+    /// And a substitution that cannot change the member — the member mentions
+    /// no generic, or it is a generic bound to a slot that mentions none —
+    /// answers with the slot it already has rather than minting a copy of it:
+    /// the copy's type is the slot's own, so it classifies identically, and
+    /// minting one per member per classification was most of what
+    /// `compute_resource_types` cost (274k fresh slots over kolt's client's
+    /// 343k).
+    fn classification_member_id(
+        &mut self,
+        member: TypeId,
+        context: &SubstitutionContext,
+    ) -> TypeId {
+        if context.is_empty() {
+            return member;
+        }
+        let unchanged = match self.borrow_type_by_type_id(member) {
+            Type::Generic(constraint) => context
+                .get(constraint)
+                .copied()
+                .filter(|bound| self.substitution_fixed(*bound)),
+            _ => self.substitution_fixed(member).then_some(member),
+        };
+        if let Some(type_id) = unchanged {
+            return type_id;
+        }
+        let member_type = member.get_type(self);
+        self.substitute_type(&member_type, context)
+            .get_type_id(self)
+    }
+
+    /// Whether `substitute_type` hands back `type_id`'s own type, whatever the
+    /// context: no generic anywhere in its arguments, and none of the two
+    /// shapes the substitution rewrites even without one — a mapped tuple
+    /// (which expands once its source is a tuple) and a task handle (whose
+    /// payload is normalized). Conservative: `false` only costs a mint.
+    fn substitution_fixed(&self, type_id: TypeId) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.borrow_type_by_type_id(type_id) {
+            Type::Generic(_) | Type::Mapped(..) => false,
+            Type::Struct(id, _) if self.is_task_handle(*id) => false,
+            Type::Struct(_, arguments)
+            | Type::Enum(_, arguments)
+            | Type::Trait(_, arguments)
+            | Type::Dyn(_, arguments)
+            | Type::Tuple(arguments) => arguments
+                .iter()
+                .all(|argument| self.substitution_fixed(*argument)),
+            Type::Closure(parameters, return_type, _) => {
+                parameters
+                    .iter()
+                    .all(|parameter| self.substitution_fixed(*parameter))
+                    && self.substitution_fixed(*return_type)
+            }
+            Type::Array(element, _) => self.substitution_fixed(*element),
+            Type::Any
+            | Type::Never
+            | Type::Void
+            | Type::Unknown
+            | Type::Unresolved
+            | Type::Function(_)
+            | Type::Module(_) => true,
+        }
     }
 
     /// The HMR transfer classification (`hmr.md` §4) for every module-level `let`
