@@ -259,6 +259,11 @@ written down.
 <!-- family: tooling -->
 **`VILAN_PHASE_TIMING=passes` splits the checks phase per pass, and every phase-timing run names the emission walk and the program's drop.** M98's instrument half. The checks phase is a straight sequence of whole-program passes and its phase line carried one figure for all of them, so the kolt investigation that filed M94–M100 had to hand-patch marks into a private build to learn which pass had moved. With the switch set to `passes`, every pass that costs a millisecond or more prints `[vilan pass] <ms>cpu rss=<MB>MB <pass>` — thread CPU, with the process's resident set beside it — under its own prefix, so the positional readers of `[vilan phase]` lines never see it. Any value of the switch also prints `[vilan phase] emission-walk <wall>ms/<cpu>cpu program-drop <wall>ms/<cpu>cpu` once per leg: `vilan check` still runs the emission walk (`diagnose`) and drops a whole-world program after it. On kolt's client those two costs were ~1.0 s and ~0.33 s that no line reported. Off, it costs one cached `bool` load per pass. Pin: `diagnostics`' `phase_timing_passes_prints_the_per_pass_split_and_the_emission_row` (the split under `passes` with every line at or over its floor, none under `1`, the emission row under both). Tracker M98.
 
+---
+
+<!-- family: tooling -->
+**`HashMap`/`HashSet`'s insertion order is pinned for a key REMOVED and inserted again: it goes to the end, on both backends.** A138 S0 (`proposal/reactive-maps-sets.md` §6.1, I10's order ruling, Q7). The overwrite case ("a re-insert keeps the original position") was pinned; the remove-then-re-insert case, which is where the native map's tombstones live, was not. `native_differential`'s `a_removed_and_reinserted_key_goes_to_the_end_on_both_backends` walks a map through a removal at the front, in the middle and of the last key, then a churn through one key with another arriving and leaving between passes, and a set the same way, printing the order after each step. Red with the native runtime planted to revive a removed key's tombstone (the order a compaction that re-slotted it would also print). No behaviour changes; the tombstone compaction itself is M91's. Tracker A138, I10.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

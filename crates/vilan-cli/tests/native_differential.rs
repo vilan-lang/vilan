@@ -1197,6 +1197,78 @@ const HASH_PROBE: &str = concat!(
     "}\n",
 );
 
+/// A138 S0 (`reactive-maps-sets.md` §6.1, I10): insertion order is the contract
+/// of `HashMap` and `HashSet`, and the case the overwrite pin above does not
+/// reach is a key REMOVED and inserted again — it goes to the END, on both
+/// backends, as a JS `Map` puts it. The native map keeps a tombstone where the
+/// key stood, so a runtime that revived the tombstone (or a compaction that
+/// re-slotted it) would print the key back in its old place; the walks below
+/// print the order after each step, with a removal at the front, in the middle
+/// and of the last key, then a churn through the same key that leaves a hole
+/// behind every pass.
+#[test]
+fn a_removed_and_reinserted_key_goes_to_the_end_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_reinsert.vl"),
+        REINSERT_ORDER_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_reinsert.vl"),
+        Verdict::Identical,
+        "a removed and re-inserted key must go to the end on both backends"
+    );
+}
+
+const REINSERT_ORDER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::hash_map::HashMap;\n",
+    "import std::hash_set::HashSet;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut map: HashMap<str, i32> = HashMap::new();\n",
+    "\tmap.insert(\"a\", 1);\n",
+    "\tmap.insert(\"b\", 2);\n",
+    "\tmap.insert(\"c\", 3);\n",
+    // The front leaves and comes back: the end.
+    "\tmap.remove(\"a\");\n",
+    "\tmap.insert(\"a\", 10);\n",
+    "\tprint(map.keys());\n",
+    // The middle.
+    "\tmap.remove(\"c\");\n",
+    "\tmap.insert(\"d\", 4);\n",
+    "\tmap.insert(\"c\", 30);\n",
+    "\tprint(map.keys());\n",
+    "\tprint(map.values());\n",
+    // The last key, out and back: nothing moves.
+    "\tmap.remove(\"c\");\n",
+    "\tmap.insert(\"c\", 31);\n",
+    "\tprint(map.entries());\n",
+    // A churn through one key, with another arriving between passes.
+    "\tmut pass = 0;\n",
+    "\tfor pass < 3 {\n",
+    "\t\tmap.remove(\"b\");\n",
+    "\t\tmap.insert(\"e\", pass);\n",
+    "\t\tmap.remove(\"e\");\n",
+    "\t\tmap.insert(\"b\", pass);\n",
+    "\t\tpass += 1;\n",
+    "\t}\n",
+    "\tprint(map.keys());\n",
+    "\tprint(map.len());\n",
+    // The set's members, the same way.
+    "\tmut set: HashSet<i32> = [3, 1, 2].to_set();\n",
+    "\tset.remove(3);\n",
+    "\tset.insert(3);\n",
+    "\tset.insert(1);\n",
+    "\tprint(set.values());\n",
+    "\tset.remove(2);\n",
+    "\tset.insert(4);\n",
+    "\tset.insert(2);\n",
+    "\tprint(set.values());\n",
+    "}\n",
+);
+
 /// I9 / Q8: `HashMap` and `HashSet` equality is ORDER-INSENSITIVE on both
 /// backends — the same keys with equal values (the same members), whatever the
 /// insertion order. The native runtime's own `PartialEq for Map` is
