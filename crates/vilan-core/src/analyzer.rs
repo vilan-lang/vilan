@@ -4343,6 +4343,11 @@ pub struct Analyzer<'src> {
     // cache, then reused.
     std_module_files: Vec<(String, PathBuf)>,
     std_export_index: Option<HashMap<String, String>>,
+    /// B472: std's DEPRECATED alias re-exports (`export [deprecated(..)] import
+    /// pkg::hash_map::HashMap as Map;`), alias → (the name it stands for, that
+    /// name's module). Built in the same lazy pass as the export index; an
+    /// alias that is NOT deprecated joins the export index itself.
+    std_deprecated_alias_index: Option<HashMap<String, (String, String)>>,
     /// The names `std::web` makes ambient, read lazily off disk on the first
     /// failed resolution (`prelude.md` §11.4). A package on the base prelude
     /// reaching for `Signal`, `view`, `View`, `style` or `ui` is the one new
@@ -5608,6 +5613,63 @@ fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>
     );
 }
 
+/// One `export import … as Alias;` a module publishes (B472).
+struct AliasReexport<'src> {
+    alias: &'src str,
+    target: &'src str,
+    /// The target's module, `::`-joined below the package root
+    /// (`pkg::hash_map::HashMap` → `hash_map`).
+    target_module: String,
+    deprecated: bool,
+}
+
+/// Every top-level `export import … as Alias;` of a module (B472): the import
+/// steer's index holds DECLARED names, and an alias re-export declares none.
+fn collect_alias_reexports<'src>(items: &NodeList<'src>, out: &mut Vec<AliasReexport<'src>>) {
+    fn walk<'src>(
+        branch: &ImportBranch<'src>,
+        path: &mut Vec<&'src str>,
+        deprecated: bool,
+        out: &mut Vec<AliasReexport<'src>>,
+    ) {
+        match branch {
+            ImportBranch::Path(name, _, tail) => match tail {
+                ImportTail::Leaf => {}
+                ImportTail::Alias(alias, _) => out.push(AliasReexport {
+                    alias,
+                    target: name,
+                    target_module: path.iter().skip(1).copied().collect::<Vec<_>>().join("::"),
+                    deprecated,
+                }),
+                ImportTail::Continue(next) => {
+                    path.push(name);
+                    walk(next, path, deprecated, out);
+                    path.pop();
+                }
+            },
+            ImportBranch::Set(branches) => {
+                for branch in branches {
+                    walk(branch, path, deprecated, out);
+                }
+            }
+            ImportBranch::Reach(_, inner) => walk(inner, path, deprecated, out),
+            ImportBranch::Selector(_) => {}
+        }
+    }
+    for item in items {
+        let Node::Export(_, inner, labels) = &item.0 else {
+            continue;
+        };
+        let Node::Import(branch, _) = &inner.0 else {
+            continue;
+        };
+        let deprecated = labels
+            .as_ref()
+            .is_some_and(|labels| labels.deprecated.is_some());
+        walk(branch, &mut Vec::new(), deprecated, out);
+    }
+}
+
 /// Strips a top-level item's wrappers (`export`, a derive, a service, a macro
 /// attribute) down to the item itself.
 fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
@@ -6535,6 +6597,7 @@ impl<'src> Analyzer<'src> {
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
             std_export_index: None,
+            std_deprecated_alias_index: None,
             web_prelude_index: None,
             entry_prelude_path: None,
             prelude_repair: PreludeRepair::default(),
@@ -49900,6 +49963,7 @@ impl<'src> Analyzer<'src> {
         let mut ambiguous_names: HashSet<String> = HashSet::default();
         let mut method_index: HashMap<(String, String), (String, String)> = HashMap::default();
         let mut ambiguous_methods: HashSet<(String, String)> = HashSet::default();
+        let mut deprecated_aliases: HashMap<String, (String, String)> = HashMap::default();
         let files = self.std_module_files.clone();
         for (module_name, path) in &files {
             let Some(loaded) = load_package_module(path) else {
@@ -49916,6 +49980,29 @@ impl<'src> Analyzer<'src> {
                     None => {
                         export_index.insert(declared.to_string(), module_name.clone());
                     }
+                }
+            }
+            // B472: an ALIAS re-export publishes a name no declaration
+            // carries. A plain one steers like a declaration; a deprecated one
+            // steers to the name it stands for.
+            let mut aliases = Vec::new();
+            collect_alias_reexports(&loaded.ast.0, &mut aliases);
+            for alias in aliases {
+                match alias.deprecated {
+                    true => {
+                        deprecated_aliases
+                            .entry(alias.alias.to_string())
+                            .or_insert((alias.target.to_string(), alias.target_module));
+                    }
+                    false => match export_index.get(alias.alias) {
+                        Some(existing) if existing == module_name => {}
+                        Some(_) => {
+                            ambiguous_names.insert(alias.alias.to_string());
+                        }
+                        None => {
+                            export_index.insert(alias.alias.to_string(), module_name.clone());
+                        }
+                    },
                 }
             }
             let declared: HashSet<&str> = names.into_iter().collect();
@@ -49943,6 +50030,7 @@ impl<'src> Analyzer<'src> {
             method_index.remove(&key);
         }
         self.std_export_index = Some(export_index);
+        self.std_deprecated_alias_index = Some(deprecated_aliases);
         self.std_trait_method_index = Some(method_index);
     }
 
@@ -50026,9 +50114,21 @@ impl<'src> Analyzer<'src> {
                 "; import it first (`import {root}::{module}::{name};`)"
             ));
         }
-        let module = self.std_export_index.as_ref()?.get(name)?;
+        if let Some(module) = self
+            .std_export_index
+            .as_ref()
+            .and_then(|index| index.get(name))
+        {
+            return Some(format!(
+                "; import it first (`import std::{module}::{name};`)"
+            ));
+        }
+        // B472: a deprecated alias steers to the name it stands for — the
+        // import the deprecation itself would ask for.
+        let (target, module) = self.std_deprecated_alias_index.as_ref()?.get(name)?;
         Some(format!(
-            "; import it first (`import std::{module}::{name};`)"
+            "; did you mean `{target}` (`import std::{module}::{target};`)? `{name}` is its \
+             deprecated alias"
         ))
     }
 
