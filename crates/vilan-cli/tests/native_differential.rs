@@ -4804,9 +4804,13 @@ fn an_unconstrained_generic_parameter_is_refused_by_name() {
 /// and it builds and answers node's bytes. The overlap cases keep their copies:
 /// a field read twice, and a nested path followed by its parent.
 ///
-/// The copy count is held too: 5 copied / 3 moved. With the path and the
+/// The copy count is held too: 5 copied / 5 moved. With the path and the
 /// branch halves planted out ("a field never moves, and branches are walked
-/// in sequence") the same program takes 7 copies and moves 1.
+/// in sequence") the same program takes 7 copies and moves 1. (It read 5 / 3
+/// until native-45 made a `match` leg's body and a closure's body consuming
+/// positions (F63, F64): two reads that were already moves — a leg handing
+/// back a binding at its last use — are counted as elided copies now. No copy
+/// was added.)
 #[test]
 fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
     let staged = stage();
@@ -4827,7 +4831,7 @@ fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
     );
     assert_eq!(
         copy_census_of(&staged, "native_probe_moves.vl"),
-        (5, 3),
+        (5, 5),
         "the copies the path- and branch-aware last use leaves"
     );
 }
