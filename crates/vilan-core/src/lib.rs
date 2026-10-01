@@ -1470,6 +1470,70 @@ pub fn phase_timing_enabled() -> bool {
     })
 }
 
+/// Whether `VILAN_PHASE_TIMING=passes` asks for the per-pass split of the
+/// checks phase (M98): one `[vilan pass]` line per pass that cost a
+/// millisecond or more of thread CPU, with the process's resident set beside
+/// it. Its own value of the same switch rather than a second switch — the
+/// split is the phase line's detail, never wanted without it — and its own
+/// line prefix, so the positional readers of `[vilan phase]` never see it.
+/// The checks phase is a straight sequence of whole-program passes, and the
+/// line it prints is the only instrument that says which one moved: the
+/// kolt investigation that filed M94–M100 found its two regressions with it.
+pub fn phase_pass_split_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("VILAN_PHASE_TIMING").is_ok_and(|value| value == "passes"))
+}
+
+thread_local! {
+    /// The thread CPU reading at the previous [`phase_pass_mark`].
+    static PHASE_PASS_LAST: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Starts a per-pass split: the next [`phase_pass_mark`] measures from here.
+pub fn phase_pass_mark_start() {
+    if phase_pass_split_enabled() {
+        PHASE_PASS_LAST.with(|last| last.set(thread_cpu_now().unwrap_or_default()));
+    }
+}
+
+/// Closes the pass that ran since the previous mark, printing it when it
+/// cost at least a millisecond. A no-op unless the split is on.
+pub fn phase_pass_mark(pass: &str) {
+    if !phase_pass_split_enabled() {
+        return;
+    }
+    let now = thread_cpu_now().unwrap_or_default();
+    let spent = now.saturating_sub(PHASE_PASS_LAST.with(|last| last.replace(now)));
+    if spent < std::time::Duration::from_millis(1) {
+        return;
+    }
+    let world = if macros::in_macro_world() {
+        " (macro world)"
+    } else {
+        ""
+    };
+    match resident_megabytes() {
+        Some(megabytes) => eprintln!(
+            "[vilan pass]{world} {:.1}cpu rss={megabytes}MB {pass}",
+            spent.as_secs_f64() * 1000.0
+        ),
+        None => eprintln!(
+            "[vilan pass]{world} {:.1}cpu {pass}",
+            spent.as_secs_f64() * 1000.0
+        ),
+    }
+}
+
+/// The process's resident set in megabytes, where the host says (`VmRSS`).
+fn resident_megabytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kilobytes: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kilobytes / 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

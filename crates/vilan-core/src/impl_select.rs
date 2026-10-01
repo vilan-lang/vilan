@@ -933,6 +933,17 @@ fn ground_id(program: &Program, type_id: TypeId, bindings: &HashMap<TypeId, Type
 /// has none and is also what the estate always gets: nothing in it writes
 /// `only` or a selector, so [`crate::analyzer::ImplAdmission::admits_impl`]
 /// returns `true` without a lookup.
+///
+/// Memoized on the `Program` (M98) where the answer is a function of the
+/// concrete TYPE rather than its id — every question but one naming a trait
+/// AT ARGUMENTS, whose agreement test grounds the impl's written arguments
+/// through the concrete id's own argument ids. The walk reads the concrete
+/// id only through `type_id_to_type_map` and recurses through the argument
+/// ids the resolved `Type` carries (the property `dispatch_refine`'s memos
+/// already rest on), and the impls, the admission map and the type slots are
+/// settled before any post-pass asks. On kolt's client the emission walk
+/// asked this ~1,100 times, ~8M instructions apiece, for a few hundred
+/// distinct answers.
 pub fn applying_implementations<'a, 'src>(
     program: &'a Program<'src>,
     file: Option<SourceId>,
@@ -945,6 +956,69 @@ pub fn applying_implementations<'a, 'src>(
     if !is_resolvable(concrete_type) {
         return Vec::new();
     }
+    let key = match wanted {
+        None => Some((file, concrete_type.clone(), None)),
+        Some(wanted) if wanted.arguments.is_empty() => {
+            Some((file, concrete_type.clone(), Some(wanted.trait_id)))
+        }
+        Some(_) => None,
+    };
+    if let Some(key) = &key
+        && let Some(indices) = program.applying_memo().get(key)
+    {
+        return indices
+            .iter()
+            .map(|index| &program.implementations[*index])
+            .collect();
+    }
+    APPLYING_COMPUTED.with(|count| count.set(count.get() + 1));
+    let applying = applying_implementations_uncached(program, file, concrete, wanted);
+    if let Some(key) = key {
+        let indices = applying
+            .iter()
+            .map(|implementation| {
+                program
+                    .implementations
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, *implementation))
+                    .expect("an applying implementation is one of the program's")
+            })
+            .collect();
+        program.applying_memo().insert(key, indices);
+    }
+    applying
+}
+
+/// The key [`applying_implementations`]' memo reads: (file, resolved concrete
+/// type, the wanted trait when it names no arguments).
+pub(crate) type ApplyingKey = (Option<SourceId>, Type, Option<Id>);
+
+thread_local! {
+    /// How many selections [`applying_implementations`] has COMPUTED on this
+    /// thread since [`reset_applying_computed`], as against served from its
+    /// per-program memo (M98) — the only thing that can see the memo work.
+    static APPLYING_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of selections [`applying_implementations`] computed rather than
+/// served from its memo on this thread since the last
+/// [`reset_applying_computed`].
+pub fn applying_computed() -> usize {
+    APPLYING_COMPUTED.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`applying_computed`].
+pub fn reset_applying_computed() {
+    APPLYING_COMPUTED.with(|count| count.set(0));
+}
+
+/// [`applying_implementations`]' selection itself.
+fn applying_implementations_uncached<'a, 'src>(
+    program: &'a Program<'src>,
+    file: Option<SourceId>,
+    concrete: TypeId,
+    wanted: Option<WantedTrait>,
+) -> Vec<&'a Implementation<'src>> {
     // B318 S4: the per-importer namespace. Asked once for the FILE here rather
     // than once per registered block below — a file that restricts nothing has
     // today's meaning and there is nothing to filter.

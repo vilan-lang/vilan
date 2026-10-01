@@ -1414,6 +1414,86 @@ struct R11Instance {
     site: R11Site,
 }
 
+/// Candidate ids indexed by their source span, so a question about one
+/// region reads the candidates lexically inside it rather than every one in
+/// the program: R11's bindings, place expressions and `is` tests, sliced per
+/// instantiated callee (M94), and B457's calls, sliced per function and per
+/// loop (M96).
+///
+/// A slice comes back in the order the candidates were handed in, which is
+/// what lets a reader that used to filter a whole map keep that map's
+/// iteration order — B457's write summaries memoize as they go, so the order
+/// a function's calls are asked in is part of the answer.
+struct LexicalCandidates {
+    /// Per source, `(start, end, position, id)` sorted by `start`, where
+    /// `position` is the id's place in the order it was handed in.
+    by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>>,
+    unplaced: Vec<Id>,
+    all: Vec<Id>,
+}
+
+impl LexicalCandidates {
+    fn build(analyzer: &Analyzer<'_>, ids: impl Iterator<Item = Id>) -> Self {
+        let mut by_source: HashMap<SourceId, Vec<(usize, usize, usize, Id)>> = HashMap::default();
+        let mut unplaced = Vec::new();
+        let mut all = Vec::new();
+        for (position, id) in ids.enumerate() {
+            all.push(id);
+            match (analyzer.source_of_id(id), analyzer.span_map.get(&id)) {
+                (Some(source), Some(span)) => {
+                    by_source
+                        .entry(source)
+                        .or_default()
+                        .push((span.start, span.end, position, id));
+                }
+                _ => unplaced.push(id),
+            }
+        }
+        for entries in by_source.values_mut() {
+            entries.sort_unstable_by_key(|(start, _, position, _)| (*start, *position));
+        }
+        LexicalCandidates {
+            by_source,
+            unplaced,
+            all,
+        }
+    }
+
+    /// The PLACED candidates whose span lies inside `start..end` of `source`,
+    /// in the order they were handed in.
+    fn inside(&self, source: SourceId, start: usize, end: usize) -> Vec<Id> {
+        let Some(entries) = self.by_source.get(&source) else {
+            return Vec::new();
+        };
+        let first = entries.partition_point(|(entry_start, ..)| *entry_start < start);
+        let mut inside: Vec<(usize, Id)> = entries[first..]
+            .iter()
+            .take_while(|(entry_start, ..)| *entry_start <= end)
+            .filter(|(_, entry_end, ..)| *entry_end <= end)
+            .map(|(_, _, position, id)| (*position, *id))
+            .collect();
+        inside.sort_unstable_by_key(|(position, _)| *position);
+        inside.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// R11's slice (M94): the candidates inside `callee`'s declaration span,
+    /// plus every candidate the index could not place — and every candidate
+    /// at all when the callee itself cannot be placed. Both widen the slice
+    /// back toward the whole-program set R11's readers were always correct
+    /// over, so a missing span costs time, never an answer.
+    fn within(&self, analyzer: &Analyzer<'_>, callee: Id) -> Vec<Id> {
+        let (Some(source), Some(span)) = (
+            analyzer.source_of_id(callee),
+            analyzer.span_map.get(&callee),
+        ) else {
+            return self.all.clone();
+        };
+        let mut within = self.unplaced.clone();
+        within.extend(self.inside(source, span.start, span.end));
+        within
+    }
+}
+
 /// How an [`R11Instance`] was reached (B463).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum R11Site {
@@ -10860,17 +10940,7 @@ impl<'src> Analyzer<'src> {
     ) -> (bool, bool) {
         let mut all_complete = true;
         for member in members {
-            // The read is only needed to substitute through a non-empty
-            // context. An unparameterized aggregate's members classify under
-            // their own ids, and reading the type there deep-cloned a value
-            // nothing went on to look at.
-            let member_type_id = if context.is_empty() {
-                *member
-            } else {
-                let member_type = member.get_type(self);
-                self.substitute_type(&member_type, context)
-                    .get_type_id(self)
-            };
+            let member_type_id = self.classification_member_id(*member, context);
             let (is_resource, complete) =
                 self.classify_resource(member_type_id, resource_constraints, memo, visiting);
             if is_resource {
@@ -10879,6 +10949,77 @@ impl<'src> Analyzer<'src> {
             all_complete &= complete;
         }
         (false, all_complete)
+    }
+
+    /// The type slot `member` classifies as under `context` (M95).
+    ///
+    /// The read is only needed to substitute through a non-empty context: an
+    /// unparameterized aggregate's members classify under their own ids, and
+    /// reading the type there deep-cloned a value nothing went on to look at.
+    /// And a substitution that cannot change the member — the member mentions
+    /// no generic, or it is a generic bound to a slot that mentions none —
+    /// answers with the slot it already has rather than minting a copy of it:
+    /// the copy's type is the slot's own, so it classifies identically, and
+    /// minting one per member per classification was most of what
+    /// `compute_resource_types` cost (274k fresh slots over kolt's client's
+    /// 343k).
+    fn classification_member_id(
+        &mut self,
+        member: TypeId,
+        context: &SubstitutionContext,
+    ) -> TypeId {
+        if context.is_empty() {
+            return member;
+        }
+        let unchanged = match self.borrow_type_by_type_id(member) {
+            Type::Generic(constraint) => context
+                .get(constraint)
+                .copied()
+                .filter(|bound| self.substitution_fixed(*bound)),
+            _ => self.substitution_fixed(member).then_some(member),
+        };
+        if let Some(type_id) = unchanged {
+            return type_id;
+        }
+        let member_type = member.get_type(self);
+        self.substitute_type(&member_type, context)
+            .get_type_id(self)
+    }
+
+    /// Whether `substitute_type` hands back `type_id`'s own type, whatever the
+    /// context: no generic anywhere in its arguments, and none of the two
+    /// shapes the substitution rewrites even without one — a mapped tuple
+    /// (which expands once its source is a tuple) and a task handle (whose
+    /// payload is normalized). Conservative: `false` only costs a mint.
+    fn substitution_fixed(&self, type_id: TypeId) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.borrow_type_by_type_id(type_id) {
+            Type::Generic(_) | Type::Mapped(..) => false,
+            Type::Struct(id, _) if self.is_task_handle(*id) => false,
+            Type::Struct(_, arguments)
+            | Type::Enum(_, arguments)
+            | Type::Trait(_, arguments)
+            | Type::Dyn(_, arguments)
+            | Type::Tuple(arguments) => arguments
+                .iter()
+                .all(|argument| self.substitution_fixed(*argument)),
+            Type::Closure(parameters, return_type, _) => {
+                parameters
+                    .iter()
+                    .all(|parameter| self.substitution_fixed(*parameter))
+                    && self.substitution_fixed(*return_type)
+            }
+            Type::Array(element, _) => self.substitution_fixed(*element),
+            Type::Any
+            | Type::Never
+            | Type::Void
+            | Type::Unknown
+            | Type::Unresolved
+            | Type::Function(_)
+            | Type::Module(_) => true,
+        }
     }
 
     /// The HMR transfer classification (`hmr.md` §4) for every module-level `let`
@@ -12411,19 +12552,31 @@ impl<'src> Analyzer<'src> {
     ///
     /// Only a bare local subject and a variant pattern refine anything; every
     /// other shape is simply absent from the map and exempts nothing.
+    ///
+    /// `candidates` narrows the tests asked about (R11 passes the ones inside
+    /// the instantiated callee, M94); `None` is every test in the program.
     fn collect_is_refinements(
         &mut self,
+        candidates: Option<&[Id]>,
         resource_constraints: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashMap<Id, IsRefinement> {
-        let tests: Vec<(Id, Id, ExprPattern)> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter_map(|(id, expr)| match expr {
-                Expr::Is(subject, pattern) => Some((*id, *subject, pattern.clone())),
-                _ => None,
-            })
-            .collect();
+        let is_test = |(id, expr): (&Id, &Expr)| match expr {
+            Expr::Is(subject, pattern) => Some((*id, *subject, pattern.clone())),
+            _ => None,
+        };
+        let tests: Vec<(Id, Id, ExprPattern)> = match candidates {
+            Some(candidates) => candidates
+                .iter()
+                .filter_map(|id| Some((id, self.expr_id_to_expr_map.get(id)?)))
+                .filter_map(is_test)
+                .collect(),
+            None => self
+                .expr_id_to_expr_map
+                .iter()
+                .filter_map(is_test)
+                .collect(),
+        };
         let mut refinements = HashMap::default();
         for (test_id, subject_id, pattern) in tests {
             let ExprPattern::Variant(pattern_enum_id, variant_index, _) = pattern else {
@@ -12572,7 +12725,7 @@ impl<'src> Analyzer<'src> {
         // The concrete scan knows no generic resources, so the empty constraint
         // set makes `type_is_resource_with` agree with `type_is_resource`.
         let is_refinements =
-            self.collect_is_refinements(&HashSet::default(), &mut HashMap::default());
+            self.collect_is_refinements(None, &HashSet::default(), &mut HashMap::default());
         let value_crossings = self.compute_return_value_crossings();
         // B469: which field moves read as destructures. The concrete scan
         // knows no instantiation, so a generic inside an aggregate's type may
@@ -16583,6 +16736,43 @@ impl<'src> Analyzer<'src> {
             );
         }
 
+        // M94: the three candidate kinds an instantiation classifies, indexed
+        // ONCE by source span. Every reader of what they yield (the body scan,
+        // the exactly-once and partial-move checks) asks only about the
+        // callee's own body and the closures lexical to it, so an instance
+        // slices out the candidates inside the callee's declaration instead
+        // of re-classifying the whole program — which, with `Flow`/`Pipe` as
+        // `[resource]` traits, made R11 O(instances × program).
+        let binding_candidates = LexicalCandidates::build(
+            self,
+            self.variables
+                .values()
+                .map(|variable| variable.id)
+                .chain(self.parameters.values().map(|parameter| parameter.id)),
+        );
+        let place_candidates = LexicalCandidates::build(
+            self,
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(_, expr)| {
+                    matches!(
+                        expr,
+                        Expr::Local(_)
+                            | Expr::Field(_, _, _)
+                            | Expr::TupleIndex(_, _, _)
+                            | Expr::Index(_, _)
+                    )
+                })
+                .map(|(id, _)| *id),
+        );
+        let test_candidates = LexicalCandidates::build(
+            self,
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(_, expr)| matches!(expr, Expr::Is(..)))
+                .map(|(id, _)| *id),
+        );
+
         while let Some(instance) = worklist.pop_front() {
             let resources: HashSet<TypeId> = instance.resources.iter().copied().collect();
             // Delta classification: only the places whose resource-ness is CAUSED
@@ -16592,13 +16782,24 @@ impl<'src> Analyzer<'src> {
             // checked with its own in-body span; re-checking it here would
             // double-report at the instantiation site.
             let mut memo: HashMap<TypeId, bool> = HashMap::default();
-            let resource_bindings = self.collect_instantiation_bindings(&resources, &mut memo);
-            let resource_value_places =
-                self.collect_instantiation_value_places(&resources, &mut memo);
+            let resource_bindings = self.collect_instantiation_bindings(
+                &binding_candidates.within(self, instance.callee),
+                &resources,
+                &mut memo,
+            );
+            let resource_value_places = self.collect_instantiation_value_places(
+                &place_candidates.within(self, instance.callee),
+                &resources,
+                &mut memo,
+            );
             // Per instantiation: `Option<T>`'s `None` is payload-free at every
             // instantiation, but a variant carrying `T` is a resource only at
             // this one, so the refinement is recomputed under the delta set.
-            let is_refinements = self.collect_is_refinements(&resources, &mut memo);
+            let is_refinements = self.collect_is_refinements(
+                Some(&test_candidates.within(self, instance.callee)),
+                &resources,
+                &mut memo,
+            );
             let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
             // B469: a field move out of an owned aggregate is a destructure when
             // the aggregate has no `Drop` anywhere inside at THIS instantiation
@@ -17364,25 +17565,27 @@ impl<'src> Analyzer<'src> {
     /// parameters whose type is a resource UNDER `resources` (the instantiation's
     /// resource parameter set) but NOT without it. The delta keeps concrete-
     /// resource bindings — a resource regardless of `resources` — out: those are
-    /// chunk 3's, already checked with their own in-body span. Collected over the
-    /// whole program, but only bindings named by `Generic(T)` (this generic's own
-    /// parameters and locals) can be delta-resources, and `scan_instantiated_body`
-    /// visits only the callee's body — so the wider set is never queried elsewhere.
+    /// chunk 3's, already checked with their own in-body span. Asked only of
+    /// `candidates`, the bindings lexically inside the callee (M94): only
+    /// bindings named by `Generic(T)` (this generic's own parameters and locals)
+    /// can be delta-resources, and `scan_instantiated_body` visits only the
+    /// callee's body — so a wider set would never be queried.
     fn collect_instantiation_bindings(
         &mut self,
+        candidates: &[Id],
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashSet<Id> {
         let mut bindings = HashSet::default();
-        let entries: Vec<(Id, TypeId)> = self
-            .variables
-            .values()
-            .map(|variable| (variable.id, variable.type_id))
-            .chain(
-                self.parameters
-                    .values()
-                    .map(|parameter| (parameter.id, parameter.type_id)),
-            )
+        let entries: Vec<(Id, TypeId)> = candidates
+            .iter()
+            .filter_map(|id| {
+                let type_id = match self.variables.get(id) {
+                    Some(variable) => variable.type_id,
+                    None => self.parameters.get(id)?.type_id,
+                };
+                Some((*id, type_id))
+            })
             .collect();
         for (id, type_id) in entries {
             if self.type_is_resource_with(type_id, resources, memo)
@@ -17399,34 +17602,24 @@ impl<'src> Analyzer<'src> {
     /// without it (the delta, as `collect_instantiation_bindings`). NOT stored on
     /// the analyzer — clone sites stay a global, concrete-resource computation
     /// (R11 is reject-only: a program that passes has no differently-elided copy).
+    ///
+    /// Asked only of `candidates`, the place expressions lexically inside the
+    /// callee (M94), and of each place's OWN type slot: re-reading the type
+    /// into a freshly minted id cost a slot per place per instantiation (kolt's
+    /// client minted 1.45M of them) and answered the same question.
     fn collect_instantiation_value_places(
         &mut self,
+        candidates: &[Id],
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashSet<Id> {
         let mut places = HashSet::default();
-        let place_ids: Vec<Id> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter(|(_, expr)| {
-                matches!(
-                    expr,
-                    Expr::Local(_)
-                        | Expr::Field(_, _, _)
-                        | Expr::TupleIndex(_, _, _)
-                        | Expr::Index(_, _)
-                )
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in place_ids {
-            if let Some(place_type) = self.place_value_type(id) {
-                let type_id = place_type.get_type_id(self);
-                if self.type_is_resource_with(type_id, resources, memo)
-                    && !self.type_is_resource(type_id)
-                {
-                    places.insert(id);
-                }
+        for id in candidates.iter().copied() {
+            if let Some(type_id) = self.place_value_type_id(id)
+                && self.type_is_resource_with(type_id, resources, memo)
+                && !self.type_is_resource(type_id)
+            {
+                places.insert(id);
             }
         }
         places
@@ -28502,6 +28695,16 @@ impl<'src> Analyzer<'src> {
                 }
             }
         };
+        // M96: B457's call-through test asks, per loop and per function, which
+        // calls lie inside a span. Indexed once here, where the expression map
+        // is iterated and not changed, in that iteration's order.
+        let calls = LexicalCandidates::build(
+            self,
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(_, expr)| matches!(expr, Expr::Call(_)))
+                .map(|(id, _)| *id),
+        );
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
             // M19 T1b: a reused module's decisions are restored below. Every
             // position this loop `consider`s is a sub-expression of the entry it
@@ -28560,7 +28763,7 @@ impl<'src> Analyzer<'src> {
                 Expr::ForEach(iterable_id, _, _) => {
                     if let Some(cell) = self.shared_cells.reads.get(iterable_id).copied()
                         && (self.spans_an_in_place_write(*expr_id, cell)
-                            || self.spans_a_call_reaching_a_write(*expr_id, cell))
+                            || self.spans_a_call_reaching_a_write(*expr_id, cell, &calls))
                     {
                         consider(self, *iterable_id, None);
                     }
@@ -28642,6 +28845,7 @@ impl<'src> Analyzer<'src> {
                                     self.function_reaches_an_in_place_write(
                                         callee_id,
                                         cell,
+                                        &calls,
                                         &mut HashMap::default(),
                                     )
                                 });
@@ -29682,29 +29886,25 @@ impl<'src> Analyzer<'src> {
     /// B457 (RULED 2026-09-29, R-e door (a)): whether a CALL inside
     /// `expr_id`'s source span can reach an in-place write of `cell` — the
     /// call-through half of B400's loop test. Spans, for the same reason.
-    fn spans_a_call_reaching_a_write(&self, expr_id: Id, cell: CellSlot) -> bool {
+    /// `calls` is every call in the program indexed by span (M96).
+    fn spans_a_call_reaching_a_write(
+        &self,
+        expr_id: Id,
+        cell: CellSlot,
+        calls: &LexicalCandidates,
+    ) -> bool {
         let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
         else {
             return true;
         };
-        let (start, end) = (span.start, span.end);
-        let calls: Vec<Id> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter(|(other_id, other)| {
-                matches!(other, Expr::Call(_))
-                    && **other_id != expr_id
-                    && self.source_of_id(**other_id) == Some(source)
-                    && self.span_map.get(other_id).is_some_and(|other_span| {
-                        other_span.start >= start && other_span.end <= end
-                    })
-            })
-            .map(|(other_id, _)| *other_id)
-            .collect();
         let mut summaries: HashMap<Id, bool> = HashMap::default();
         calls
+            .inside(source, span.start, span.end)
             .into_iter()
-            .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, &mut summaries))
+            .filter(|call_id| *call_id != expr_id)
+            .any(|call_id| {
+                self.call_reaches_an_in_place_write(call_id, cell, calls, &mut summaries)
+            })
     }
 
     /// B457: whether one call can reach an in-place write of `cell` — the
@@ -29720,6 +29920,7 @@ impl<'src> Analyzer<'src> {
         &self,
         call_id: Id,
         cell: CellSlot,
+        calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
         if self.shared_cells.reads.contains_key(&call_id)
@@ -29757,9 +29958,9 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|function| function.has_body)
                 })
                 .collect();
-            return candidates
-                .into_iter()
-                .any(|member| self.function_reaches_an_in_place_write(member, cell, summaries));
+            return candidates.into_iter().any(|member| {
+                self.function_reaches_an_in_place_write(member, cell, calls, summaries)
+            });
         }
         match self.expr_id_to_expr_map.get(&function_call.subject_id) {
             Some(Expr::Local(callee)) => {
@@ -29776,7 +29977,8 @@ impl<'src> Analyzer<'src> {
                     .get(callee)
                     .is_some_and(|function| function.has_body)
                 {
-                    return self.function_reaches_an_in_place_write(*callee, cell, summaries);
+                    return self
+                        .function_reaches_an_in_place_write(*callee, cell, calls, summaries);
                 }
                 self.shared_cells.mutated.contains(&cell)
             }
@@ -29785,11 +29987,15 @@ impl<'src> Analyzer<'src> {
     }
 
     /// B457: a function's write summary for `cell` — an in-place write inside
-    /// its span, or a call inside it that reaches one.
+    /// its span, or a call inside it that reaches one. The calls come from
+    /// `calls`' span index (M96): filtering the whole expression map per
+    /// function asked made the summary O(functions × expressions) — 48
+    /// summaries, ~95M instructions each, on kolt's client.
     fn function_reaches_an_in_place_write(
         &self,
         function_id: Id,
         cell: CellSlot,
+        calls: &LexicalCandidates,
         summaries: &mut HashMap<Id, bool>,
     ) -> bool {
         if let Some(answer) = summaries.get(&function_id) {
@@ -29805,22 +30011,10 @@ impl<'src> Analyzer<'src> {
             ) else {
                 return true;
             };
-            let (start, end) = (span.start, span.end);
-            let calls: Vec<Id> = self
-                .expr_id_to_expr_map
-                .iter()
-                .filter(|(other_id, other)| {
-                    matches!(other, Expr::Call(_))
-                        && self.source_of_id(**other_id) == Some(source)
-                        && self.span_map.get(other_id).is_some_and(|other_span| {
-                            other_span.start >= start && other_span.end <= end
-                        })
-                })
-                .map(|(other_id, _)| *other_id)
-                .collect();
             calls
+                .inside(source, span.start, span.end)
                 .into_iter()
-                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, summaries))
+                .any(|call_id| self.call_reaches_an_in_place_write(call_id, cell, calls, summaries))
         };
         summaries.insert(function_id, answer);
         answer
@@ -60072,6 +60266,13 @@ pub struct Program<'src> {
     /// The settled call graph, memoized — see [`Program::call_graph`]. Derived
     /// data, not analysis output: every entry above is its input.
     call_graph_memo: std::sync::OnceLock<crate::call_graph::CallGraph>,
+    /// [`crate::dispatch_refine::impl_members_for_bound`]'s answers, shared by
+    /// every pass that refines dispatch (M97). Derived data, like the graph.
+    bound_selection_memo:
+        std::sync::Mutex<HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>,
+    /// [`crate::impl_select::applying_implementations`]' answers, as indices
+    /// into `implementations` (M98). Derived data, like the graph.
+    applying_memo: std::sync::Mutex<HashMap<crate::impl_select::ApplyingKey, Vec<usize>>>,
 }
 
 /// One module-level binding's HMR transfer descriptor (`hmr.md` §4).
@@ -60501,6 +60702,28 @@ impl<'src> Program<'src> {
     /// graph built at an unknown moment, and the moment is the invariant.
     pub fn install_call_graph(&self, graph: crate::call_graph::CallGraph) {
         let _ = self.call_graph_memo.set(graph);
+    }
+
+    /// [`crate::impl_select::applying_implementations`]' memo (M98), read
+    /// through a poisoned lock for [`Self::bound_selection_memo`]'s reason.
+    pub(crate) fn applying_memo(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<crate::impl_select::ApplyingKey, Vec<usize>>> {
+        self.applying_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`crate::dispatch_refine::impl_members_for_bound`]'s memo (M97). A
+    /// poisoned lock still holds only complete answers — an entry is inserted
+    /// after its selection finishes — so it is read through.
+    pub(crate) fn bound_selection_memo(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>
+    {
+        self.bound_selection_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Every module-level `let` binding of the program: the globals of the
@@ -67851,9 +68074,16 @@ fn analyze_over_world<'src>(
     // `check_generic_bound_satisfaction` checks per call site and
     // `scan_bodies_for_moves` per function, which is what bounds the cancel
     // latency at one of those rather than one whole-program sweep.
+    //
+    // Each call closes a `VILAN_PHASE_TIMING=passes` mark (M98) — a cached
+    // `bool` load when the split is off.
+    crate::phase_pass_mark_start();
     macro_rules! unless_cancelled {
         ($($call:expr;)+) => {
-            $( if !crate::cancel::cancelled() { $call; } )+
+            $( if !crate::cancel::cancelled() {
+                $call;
+                crate::phase_pass_mark(stringify!($call));
+            } )+
         };
     }
     // The S2 pin's switch: a second build over the drained queues must
@@ -68069,6 +68299,7 @@ fn analyze_over_world<'src>(
                 let diagnostics_before = analyzer.diagnostics.len();
                 let warnings_before = analyzer.warnings.len();
                 $call;
+                crate::phase_pass_mark(stringify!($call));
                 analyzer.record_reusable_window(diagnostics_before, warnings_before);
             } )+
         };
@@ -68583,7 +68814,9 @@ fn analyze_over_world<'src>(
     // once the tree is FINAL — the rewrite above moves reads, and a liveness
     // answer about a tree that no longer exists is worse than none. Every
     // elision below reads it.
+    crate::phase_pass_mark("the tables before the last-use dataflow");
     analyzer.last_use = liveness::LastUse::compute(&analyzer);
+    crate::phase_pass_mark("liveness::LastUse::compute");
     // S3 (`lifetimes.md` §6): the same answers, asked for DISPOSAL — where each
     // enrolled binding's teardown `finally` closes. Must follow the dataflow;
     // `plan_resource_drops` (which bindings drop) ran long before it.
@@ -68598,9 +68831,13 @@ fn analyze_over_world<'src>(
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
     let capture_plan = analyzer.compute_capture_clone_sites();
+    crate::phase_pass_mark("the drop extents, shared cells and capture plan");
     let resource_types = analyzer.compute_resource_types();
+    crate::phase_pass_mark("analyzer.compute_resource_types()");
     let clone_sites = analyzer.compute_clone_sites(&capture_plan.shared);
+    crate::phase_pass_mark("analyzer.compute_clone_sites()");
     let (return_clone_sites, return_view_reads) = analyzer.compute_return_clone_sites();
+    crate::phase_pass_mark("analyzer.compute_return_clone_sites()");
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
     let primitive_views = analyzer.compute_primitive_views();
@@ -69042,6 +69279,7 @@ fn analyze_over_world<'src>(
     // TALLIED and printed once, as the worlds' own row below (M33). Stderr for
     // the same reason the leak line is: `build --stdout`'s JavaScript must stay
     // clean.
+    crate::phase_pass_mark("the remaining tables, labels and records");
     let phase_checks = phase_checks_start.elapsed();
     if crate::phase_timing_enabled() && crate::macros::in_macro_world() {
         crate::macros::world_phases_record_analysis(
@@ -69380,6 +69618,8 @@ fn analyze_over_world<'src>(
         scalar_view_calls,
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
+        bound_selection_memo: std::sync::Mutex::default(),
+        applying_memo: std::sync::Mutex::default(),
     })
 }
 
