@@ -9313,3 +9313,42 @@ fn b468_a_default_naming_an_earlier_parameter_and_an_enum_default() {
         "List<i32>",
     );
 }
+
+// --- B454: an argument typed in the callee's own terms binds nothing back ---
+
+/// `ok.and(Ok(5))` — `and<U>(self, b: Result<U, E>)`, whose `E` is `Result`'s
+/// own parameter (an impl subject inherits the declaration's ids). `Ok(5)`
+/// typed against `Result<U, E>` came back `Result<i32, E>`, and reconciling it
+/// bound `E` back to ITSELF over the receiver's `str`, so the call answered
+/// `Result<i32, E>` (natively refused by name). The result is the receiver's
+/// error type now — proven by reading the error out as a `str`.
+#[test]
+fn b454_an_argument_constructor_takes_the_receivers_error_type() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::{ io::print, result::Result::{ self, Err, Ok } };\n",
+            "fun main() {\n",
+            "\tlet ok: Result<i32, str> = Ok(10);\n",
+            "\tlet err: Result<i32, str> = Err(\"boom\");\n",
+            "\tlet both = ok.and(Ok(5));\n",
+            "\tlet typed: Result<i32, str> = both;\n",
+            "\tprint(typed.unwrap_or(0));\n",
+            "\tlet failed = err.and(Ok(\"text\"));\n",
+            "\tlet reason: str = failed.err().unwrap_or(\"none\");\n",
+            "\tprint(reason);\n",
+            "}\n",
+        ),
+        "5\nboom\n",
+    );
+    assert_fails_with(
+        concat!(
+            "import std::{ io::print, result::Result::{ self, Err, Ok } };\n",
+            "fun main() {\n",
+            "\tlet ok: Result<i32, str> = Ok(10);\n",
+            "\tlet wrong: Result<i32, bool> = ok.and(Ok(5));\n",
+            "\tprint(wrong.unwrap_or(0));\n",
+            "}\n",
+        ),
+        "Result<i32, str>",
+    );
+}

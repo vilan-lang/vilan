@@ -38185,11 +38185,23 @@ impl<'src> Analyzer<'src> {
     ) {
         if let Some(existing) = substitution.get(&constraint_id).copied()
             && existing != type_id
-            && self.binding_is_weaker(type_id, existing)
+            && (self.binding_is_weaker(type_id, existing)
+                || self.binds_to_itself(constraint_id, type_id))
         {
             return;
         }
         substitution.insert(constraint_id, type_id);
+    }
+
+    /// B454: a binding of a generic to ITSELF says nothing — and it is what a
+    /// reconcile reports when an argument was typed in the callee's own
+    /// terms. `ok.and(Ok(5))` with `and<U>(self, b: Result<U, E>)`: the
+    /// impl's `E` IS `Result`'s own parameter (an impl subject inherits the
+    /// declaration's ids, B77), so `Ok(5)` typed against `Result<U, E>` comes
+    /// back `Result<i32, E>`, and reconciling it handed `E` back to itself —
+    /// over the receiver's `str`, which the call's result then lost.
+    fn binds_to_itself(&self, constraint_id: TypeId, type_id: TypeId) -> bool {
+        matches!(type_id.borrow_type(self), Type::Generic(bound) if *bound == constraint_id)
     }
 
     /// Whether `candidate` says strictly LESS about a generic than `held` does

@@ -5248,23 +5248,22 @@ const AND_THEN_PROBE: &str = concat!(
     "}\n",
 );
 
-/// F38's boundary, moved by B424: `result-combinators.vl` stopped at
-/// `or_else<F>` over an `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose
-/// `F` nothing in the program constrained. The ruling (R-h, door (b)) gives
-/// that `F` the input's error type, and `err.or(Ok(3))`'s likewise, so both
-/// emit now. The program stops one wall further on: `ok.and(Ok(5))`'s
-/// ARGUMENT, a constructor whose own error parameter the analyzer leaves
-/// open although its landing position (`Result<U, E>` at the receiver's
-/// `E`) fixes it — refused by name, not broken.
+/// F38's boundary, moved by B424 and closed by B454: `result-combinators.vl`
+/// stopped at `or_else<F>` over an `Ok`-only closure (`err.or_else(|e|
+/// Ok(7))`), whose `F` nothing in the program constrained — the ruling (R-h,
+/// door (b)) gives that `F` the input's error type, and `err.or(Ok(3))`'s
+/// likewise — and then at `ok.and(Ok(5))`, whose result lost the receiver's
+/// `E`: the argument, typed in `Result`'s own terms, reconciled `E` back to
+/// itself over the receiver's `str` (a self-binding is no evidence now). The
+/// whole program builds natively and prints node's bytes.
 #[test]
-fn an_unconstrained_generic_parameter_is_refused_by_name() {
+fn result_combinators_is_identical_on_both_backends() {
     let staged = stage();
-    match compare(&staged, "result-combinators.vl") {
-        Verdict::Refused(reason) => {
-            assert!(reason.contains("parameter 2 of enum `Result`"), "{reason}")
-        }
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
+    assert_eq!(
+        compare(&staged, "result-combinators.vl"),
+        Verdict::Identical,
+        "every combinator of `result-combinators.vl` must build natively and agree"
+    );
 }
 
 /// **F37**: a PARTIAL move where the source's order asks for one, and the
