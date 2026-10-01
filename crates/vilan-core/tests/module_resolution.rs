@@ -8190,6 +8190,54 @@ fn b401_a_declared_member_is_narrowed_the_same_way() {
     assert_eq!(run_package(&b401_borrowed(&owned), "c.vl").trim(), "one");
 }
 
+// --- B481: a `for` loop's `next` answers to the file's admission like a call -
+
+/// A custom iterator whose `next` is an INHERITED default, provided by `p1`'s
+/// empty block, and a `c.vl` that loops over it with `imports`.
+fn b481_files(imports: &str) -> Vec<(String, String)> {
+    vec![
+        ("b.vl".to_string(), "export struct Box { n: i32 }\n".to_string()),
+        (
+            "t.vl".to_string(),
+            "import std::option::Option::{ self, None, Some };\nexport trait Counting {\n\tfun next(mut self): Option<i32> { None }\n}\n".to_string(),
+        ),
+        (
+            "p1.vl".to_string(),
+            "import pkg::b::Box;\nimport pkg::t::Counting;\n\nexport impl Box with Counting {}\n".to_string(),
+        ),
+        (
+            "c.vl".to_string(),
+            format!(
+                "import pkg::b::Box;\n{imports}\n\nfun main() {{\n\tmut box = Box {{ n = 1 }};\n\tfor item in box {{\n\t\tprint(item);\n\t}}\n\tprint(\"done\");\n}}\n"
+            ),
+        ),
+    ]
+}
+
+/// The loop drove `next` through the block `import pkg::p1 only;` declined —
+/// compiled and ran, where `box.next()` written as a call was refused. B401's
+/// post-build pass looked only at calls; a loop's `next` is a site now, refused
+/// by the same sentence at the iterable.
+#[test]
+fn b481_a_loops_inherited_next_through_a_declined_block_is_refused() {
+    let owned = b481_files("import pkg::p1 only;");
+    let diagnostics = analyze_package(&b401_borrowed(&owned), "c.vl", Platform::default());
+    assert!(
+        diagnostics.iter().any(|message| message.contains(
+            "'next' is provided by an `impl` in module `p1`, and this file imports that \
+             module `only`, which admits none"
+        )),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The control: the plain import admits the block, and the loop runs.
+#[test]
+fn b481_an_admitted_loop_next_still_runs() {
+    let owned = b481_files("import pkg::p1;");
+    assert_eq!(run_package(&b401_borrowed(&owned), "c.vl").trim(), "done");
+}
+
 #[test]
 fn b455_a_selector_names_a_block_that_only_inherits() {
     // B455: `(impl Box)` reaches `p1`'s default-only block — it admits what

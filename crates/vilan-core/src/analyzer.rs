@@ -4276,6 +4276,9 @@ pub struct Analyzer<'src> {
     // For-each loops whose iterable is a custom iterator: the resolved `next`
     // method id, so codegen emits a `next()`/`Some`-matching loop instead.
     for_each_next: HashMap<Id, Id>,
+    // B481: a for-each loop whose `next` is an INHERITED default → the index of
+    // the implementation that provides it, for the post-build admission pass.
+    for_each_next_providers: HashMap<Id, usize>,
     // For-each loops → the type the iterable INFERRED to, by loop id. The
     // transformer's native lowerings are chosen by that type, and it cannot
     // recover it on its own: an iterable written as a parameter (`self` above
@@ -6521,6 +6524,7 @@ impl<'src> Analyzer<'src> {
             untyped_comprehension_binders: HashSet::default(),
             prepped_for_each: Vec::new(),
             for_each_next: HashMap::default(),
+            for_each_next_providers: HashMap::default(),
             for_each_iterable_types: HashMap::default(),
             for_each_views: HashMap::default(),
             closure_type_parameter_views: HashMap::default(),
@@ -56496,6 +56500,16 @@ impl<'src> Analyzer<'src> {
                             continue;
                         }
                         self.for_each_next.insert(for_each_id, next_id);
+                        // B481: the block that provides the default, for the
+                        // admission pass — the loop's `next` is no call.
+                        if let Some(index) =
+                            self.implementations.iter().position(|implementation| {
+                                implementation.subject == impl_subject_id
+                                    && implementation.trait_ids.contains(&trait_id)
+                            })
+                        {
+                            self.for_each_next_providers.insert(for_each_id, index);
+                        }
                         let receiver_type_id = iterable_type.clone().get_type_id(self);
                         self.generic_dispatch.insert(
                             for_each_id,
@@ -60000,6 +60014,11 @@ pub struct Program<'src> {
     pub traits: IndexMap<Id, Trait<'src>>,
     pub generic_dispatch: HashMap<Id, GenericDispatch<'src>>,
     pub for_each_next: HashMap<Id, Id>,
+    /// B481: a for-each loop whose `next` is an INHERITED default → the index
+    /// (into `implementations`) of the block that provides it — what the
+    /// post-build admission pass checks against the loop's file, as it checks
+    /// a call's.
+    pub for_each_next_providers: HashMap<Id, usize>,
     /// Per `for x in iterable` loop: the type the ITERABLE inferred to. The
     /// native lowerings are chosen by it (`HashSet` walks its backing map's values,
     /// everything else is a plain `for...of`), and emission cannot recover it —
@@ -70049,6 +70068,7 @@ fn analyze_over_world<'src>(
         traits: analyzer.traits,
         generic_dispatch: analyzer.generic_dispatch,
         for_each_next: analyzer.for_each_next,
+        for_each_next_providers: analyzer.for_each_next_providers,
         for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
         closure_type_parameter_views: analyzer.closure_type_parameter_views,
@@ -71051,7 +71071,42 @@ pub fn check_call_site_admission(program: &mut Program) {
         }
     }
     let mut violations: Vec<(Error, SourceId)> = Vec::new();
-    for (call_id, function_call) in &program.function_calls {
+    // The SITES that resolved a member through an implementation: every wired
+    // call, and (B481) every `for` loop over a custom iterator — whose `next`
+    // is the lookup's answer exactly as a call's is, but is no call, so the
+    // pass never saw a loop driving a `next` through a block its file
+    // declined. `(anchor, member, receiver expression, the inherited
+    // default's recorded provider)`.
+    let mut sites: Vec<(Id, Id, Option<Id>, Option<(Id, usize, String)>)> = program
+        .function_calls
+        .iter()
+        .filter_map(|(call_id, function_call)| {
+            let Some(Expr::Local(member_id)) = program.entity_map.get(&function_call.subject_id)
+            else {
+                return None;
+            };
+            Some((
+                *call_id,
+                *member_id,
+                function_call.argument_ids.first().copied(),
+                declined.get(call_id).cloned(),
+            ))
+        })
+        .collect();
+    for (&loop_id, &next_id) in &program.for_each_next {
+        let provided = program
+            .for_each_next_providers
+            .get(&loop_id)
+            .map(|index| (next_id, *index, "next".to_string()));
+        // Anchored at the ITERABLE — the `box` of `for item in box`, the
+        // receiver the loop calls `next` on — rather than the whole loop.
+        let anchor = match program.entity_map.get(&loop_id) {
+            Some(Expr::ForEach(iterable, ..)) => *iterable,
+            _ => loop_id,
+        };
+        sites.push((anchor, next_id, None, provided));
+    }
+    for (call_id, member_id, receiver_expression, provided) in &sites {
         // B391: the file a call is ADMITTED under — for generated code, the
         // module whose attribute generated it (B354's rule, `admitting_file`).
         // `source_of` answers the `DERIVED_SOURCE` sentinel there, which
@@ -71064,17 +71119,17 @@ pub fn check_call_site_admission(program: &mut Program) {
         };
         // A method call's callee is a fresh local bound to the member the
         // lookup found (`wire_method_call`), which is the one place a call
-        // records WHICH implementation answered it.
-        let Some(Expr::Local(member_id)) = program.entity_map.get(&function_call.subject_id) else {
-            continue;
-        };
+        // records WHICH implementation answered it; a loop's is its recorded
+        // `next`.
+        //
         // B401: an inherited DEFAULT is declared by its trait, not by the
         // block that provides it — so its block is the one the lookup recorded
         // when the file had declined it, and a call it did not record was
-        // admitted.
+        // admitted. A loop records its provider whatever the file admits, and
+        // the admission below decides.
         let (index, inherited_name) = match declaring.get(member_id).copied() {
             Some(index) => (index, None),
-            None => match declined.get(call_id) {
+            None => match provided {
                 Some((declined_member, index, name)) if declined_member == member_id => {
                     (*index, Some(name.as_str()))
                 }
@@ -71089,10 +71144,8 @@ pub fn check_call_site_admission(program: &mut Program) {
         if let Some(residue) = residues
             .iter()
             .find(|residue| residue.first == *member_id || residue.second == *member_id)
-            && let Some(receiver) = function_call
-                .argument_ids
-                .first()
-                .and_then(|receiver| receiver_type_id(program, *receiver))
+            && let Some(receiver) =
+                receiver_expression.and_then(|receiver| receiver_type_id(program, receiver))
             && crate::impl_select::is_resolvable(
                 program.type_id_to_type_map.get(&receiver).unwrap_or(&Type::Unknown),
             )
