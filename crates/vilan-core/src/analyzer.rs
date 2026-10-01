@@ -41844,11 +41844,19 @@ impl<'src> Analyzer<'src> {
                 // B286: the argument may itself be a PARAMETER carrying the
                 // bound, and a parameter has no impl to read. Its own declared
                 // bound is the answer, and the only one there is.
+                // B484: a type may provide the bound's trait at SEVERAL
+                // instantiations — a flow is `IntoFlow<itself>` through the
+                // plain blanket and `IntoFlow<its element>` through the flow
+                // one — so the provider is chosen by the bound's own pattern
+                // (`IntoFlow<Option<U>>` keeps the instantiation that IS an
+                // `Option`), as an impl's bound binders are (B408). The first
+                // provider answered `IntoFlow<SignalCell<..>>`, which no
+                // `Option<U>` reconciles with, and `U` went uninferred.
                 let provided = match concrete {
                     Type::Generic(caller_constraint_id) => {
                         self.abstract_trait_arguments(caller_constraint_id, trait_id)
                     }
-                    _ => self.trait_args_for(&concrete, trait_id),
+                    _ => self.trait_args_for_pattern(&concrete, trait_id, &trait_arguments),
                 };
                 let Some(impl_arguments) = provided else {
                     continue;

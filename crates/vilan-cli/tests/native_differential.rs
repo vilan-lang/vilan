@@ -2403,6 +2403,59 @@ const B478_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B480 + B484: a binder bound through a trait ARGUMENT, reached through an
+/// object — `switch`'s `U` from a `dyn Flow<i32>` selector with nothing
+/// written, and a collection pipe over a list of `dyn Source<Option<str>>`
+/// whose `filter_map(|source| source)` binds `R: IntoFlow<Option<U>>`'s `U`
+/// from the object's own trait argument. Natively the second reached the
+/// emitter with `U` unbound and was refused by name.
+#[test]
+fn a_binder_through_an_objects_trait_argument_is_bound_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b480.vl"), B480_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b480.vl"),
+        Verdict::Identical,
+        "a binder through an object's trait argument must bind on both backends"
+    );
+}
+
+const B480_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Flow, ListCell, Signal, SignalCell, Source, comp };\n",
+    "\n",
+    "fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {\n",
+    "\tif on {\n",
+    "\t\tcount.derive(|value| value * 100)\n",
+    "\t} else {\n",
+    "\t\tcount\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet flag = Signal::new(true);\n",
+    "\tlet count = Signal::new(1);\n",
+    "\tlet picked = flag.switch(|on| arm(on, count)).memo();\n",
+    "\tprint(picked.get());\n",
+    "\tflag.set(false);\n",
+    "\tcount.set(3);\n",
+    "\tprint(picked.get());\n",
+    "\tlet a: SignalCell<Option<str>> = Signal::new(Some(\"a\"));\n",
+    "\tlet b: SignalCell<Option<str>> = Signal::new(None);\n",
+    "\tlet first: dyn Source<Option<str>> = a;\n",
+    "\tlet second: dyn Source<Option<str>> = b;\n",
+    "\tlet sources: ListCell<dyn Source<Option<str>>> = ListCell::of([first, second]);\n",
+    "\tlet (loaded, scope) = comp(|| sources.filter_map(|source| source).memo());\n",
+    "\tprint(loaded.get().len());\n",
+    "\tb.set(Some(\"b\"));\n",
+    "\tlet names = loaded.get();\n",
+    "\tprint(names[0] + names[1]);\n",
+    "\tscope.dispose();\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is

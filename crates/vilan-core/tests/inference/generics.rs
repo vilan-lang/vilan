@@ -9176,3 +9176,55 @@ fn b434_filter_map_over_an_into_flow_bound_takes_the_parameter_itself() {
         "2\n20\n",
     );
 }
+
+// --- B484: a binder named only in another binder's bound binds from the ---
+// --- instantiation that MATCHES the bound, when a type provides several.  ---
+
+/// `R: IntoFlow<Option<U>>` with `R` a FLOW: a flow is `IntoFlow<itself>`
+/// (the plain blanket) and `IntoFlow<its element>` (the flow blanket), and
+/// only the second is an `Option`, so `U` is the element's payload — `str`
+/// here, proven by the annotation the last call contradicts. A plain `Option`
+/// answer bound `U` before; a source or a pipe answer left it uninferred.
+#[test]
+fn b484_a_binder_in_a_trait_argument_binds_through_a_flow() {
+    let shape = concat!(
+        "import std::io::print;\n",
+        "import std::option::Option::{ self, None, Some };\n",
+        "import std::reactive::{ IntoFlow, Signal, SignalCell, Source };\n",
+        "struct Picked<U> { found: List<U> }\n",
+        "fun pick<T, U, R: IntoFlow<Option<U>>>(xs: List<T>, select: |T| R): Picked<U> {\n",
+        "\tPicked<U> { found = [] }\n",
+        "}\n",
+    );
+    assert_compiles_and_runs(
+        &format!(
+            "{shape}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet a: SignalCell<Option<str>> = Signal::new(Some(\"a\"));\n",
+                "\tlet sources = [a];\n",
+                "\tlet plain: Picked<str> = pick(sources, |source| source.get());\n",
+                "\tlet flowing = pick(sources, |source| source);\n",
+                "\tlet piped = pick(sources, |source| source.derive(|v| v));\n",
+                "\tlet typed: List<str> = flowing.found;\n",
+                "\tprint(plain.found.len() + typed.len() + piped.found.len());\n",
+                "}\n",
+            )
+        ),
+        "0\n",
+    );
+    assert_fails_with(
+        &format!(
+            "{shape}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet a: SignalCell<Option<str>> = Signal::new(Some(\"a\"));\n",
+                "\tlet wrong: Picked<i32> = pick([a], |source| source);\n",
+                "\tprint(wrong.found.len());\n",
+                "}\n",
+            )
+        ),
+        "'SignalCell<Option<str>>' does not implement trait 'IntoFlow<Option<i32>>'",
+    );
+}
+

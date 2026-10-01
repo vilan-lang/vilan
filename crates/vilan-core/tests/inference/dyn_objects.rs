@@ -1637,9 +1637,9 @@ fn a142_a_mixed_arm_selector_erases_a_pipe_and_a_root_into_one_flow_object() {
     // B470's shape for A142 (R39): `Flow` is declared `[resource]`, so a
     // `switch` selector whose arms are a PIPE (a `Derive`, a `[resource]`
     // stage) and a ROOT (a `SignalCell`) meets them in one `dyn Flow<i32>`,
-    // the arms erasing where they land: `100` then `3`, on both backends. The
-    // explicit `switch<i32, dyn Flow<i32>>` is reactive-44's find 12: `U` is
-    // not bound through the object's trait argument (`cannot infer 'U'`).
+    // the arms erasing where they land: `100` then `3`, on both backends.
+    // Written WITHOUT `switch`'s type arguments (B480): `U` binds from the
+    // object's trait argument, `I: Flow<U>` at `I = dyn Flow<i32>`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -1656,7 +1656,7 @@ fn a142_a_mixed_arm_selector_erases_a_pipe_and_a_root_into_one_flow_object() {
         fun main() {
             let flag = Signal::new(true);
             let count = Signal::new(1);
-            let picked: MemoCell<i32> = flag.switch<i32, dyn Flow<i32>>(|on: bool| arm(on, count)).memo();
+            let picked: MemoCell<i32> = flag.switch(|on: bool| arm(on, count)).memo();
             print(i"{picked.get()}");
             flag.set(false);
             count.set(3);
@@ -1666,6 +1666,48 @@ fn a142_a_mixed_arm_selector_erases_a_pipe_and_a_root_into_one_flow_object() {
         main();
         "#,
         "100\n3\n",
+    );
+}
+
+/// B480: the same selector with NOTHING written — no `switch` type arguments,
+/// an unannotated closure parameter and an unannotated binding — and the user
+/// shape beneath it: a generic `<U, I: Fl<U>>` binding `U` from a `dyn Fl<i32>`
+/// argument's own trait argument, beside a concrete one.
+#[test]
+fn b480_a_bound_through_a_trait_argument_binds_from_an_object() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Flow, Signal, SignalCell, Source };
+
+        fun arm(on: bool, count: SignalCell<i32>): dyn Flow<i32> {
+            if on {
+                count.derive(|value| value * 100)
+            } else {
+                count
+            }
+        }
+
+        trait Fl<T> { fun go(self): T; }
+        struct Cell<T> { v: T }
+        impl Cell<type T> with Fl<T> { fun go(self): T { self.v } }
+        fun pick<U, I: Fl<U>>(i: I): U { i.go() }
+
+        fun main() {
+            let flag = Signal::new(true);
+            let count = Signal::new(1);
+            let picked = flag.switch(|on| arm(on, count)).memo();
+            print(i"{picked.get()}");
+            flag.set(false);
+            count.set(3);
+            print(i"{picked.get() + 1}");
+            let object: dyn Fl<i32> = Cell { v = 5 };
+            print(pick(object) + pick(Cell { v = 6 }));
+        }
+
+        main();
+        "#,
+        "100\n4\n11\n",
     );
 }
 
