@@ -1926,6 +1926,16 @@ fn a135_a_handle_method_whose_tail_is_cell_warns_with_the_memo_steer() {
         found.iter().all(|(_, spanned)| spanned == "cell"),
         "every warning spans the `.cell` name: {found:#?}"
     );
+    let steered = warning_diagnostics(&A135_SERVICE.replace(
+        "{BODY}",
+        "[rpc]\n        fun count(self): SignalCell<usize> {\n            self.names.derive(|names| names.len()).cell()\n        }",
+    ));
+    assert!(
+        steered
+            .iter()
+            .any(|(message, _)| message.contains("a `Memo` whose maker writes `.cell_global()`")),
+        "a `.cell()` tail is steered to `.cell_global()`: {steered:#?}"
+    );
 }
 
 /// A135 (c), the controls: a handle returning a cell that OUTLIVES the call (a
@@ -2103,6 +2113,14 @@ fn a145_a_memo_handle_method_whose_tail_is_memo_warns() {
         .filter(|(message, _)| message.contains("returns a signal handle it builds with"))
         .map(|(message, range)| {
             assert_eq!(&source[range], "memo", "{message}");
+            // The warning names the seal the body wrote, and its program-lifetime
+            // twin (A135's tail, transient-44's find): red when it was hard-coded
+            // to `.cell()` / `.cell_global()`.
+            assert!(
+                message.contains("builds with `.memo()` on every call")
+                    && message.contains("a `Memo` whose maker writes `.memo_global()`"),
+                "{message}"
+            );
             message.split('`').nth(1).unwrap_or_default().to_string()
         })
         .collect();

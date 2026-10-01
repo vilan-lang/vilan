@@ -216,6 +216,11 @@ written down.
 <!-- family: performance -->
 **A tracked read of a `ListCell`, a `KeyedCell` or a remote mirror (`RemoteSource`, `KeyedSource`) keeps ONE edge across runs: the four answer `Source::identity()` with their value cell's identity, where they answered the default `None` and so were re-attached — for a mirror, a lease taken and released — on every run.** A142 S6's tracked reads reuse an edge only to a source that can name itself; the four sources tracking-44 found answering `None` now do (`ListCell` its items cell, `KeyedCell` its elements cell, each mirror its cache cell — shared by every copy of the handle and kept across a reconnect's rebind). Pins: `inference::tracking`'s `a146_a_tracked_list_keyed_or_mirror_read_keeps_one_edge_across_runs` (each source wrapped in a counter that forwards its identity; `attaches=1` for all four over six runs, red at `attaches=7` before), and `native_differential`'s `a_tracked_list_or_keyed_cell_keeps_one_edge_on_both_backends` (`ListCell` and `KeyedCell`; the mirror half is JS-only — the native backend refuses the `duplex_pair` program by name). No golden moves. Docs: the tracked-reads guide and `std/reactive.md` name the sources that answer. Tracker A146.
 
+---
+
+<!-- family: tooling -->
+**The `[rpc]` fresh-handle warning names the seal the method wrote: a handle method whose tail is `.memo()` reads "builds with `.memo()` on every call … a `Memo` whose maker writes `.memo_global()`", where it always said `.cell()` and `.cell_global()`.** A135's tail warning (ledger row 576) found `.memo()` tails since A145 but kept the `.cell()` wording (transient-44's find; papers-45's `o9_rpc_concrete.vl` repro). It reads the called seal now, as A130's refusal and A141's warning do; row 576 is re-keyed with a `{seal}` placeholder. Pins: `inference::lifetimes`' `a145_a_memo_handle_method_whose_tail_is_memo_warns` asserts the `.memo()`/`.memo_global()` wording (red with the seal planted back to `cell`), and `a135_a_handle_method_whose_tail_is_cell_warns_with_the_memo_steer` the `.cell_global()` steer. Tracker A135 (follow-up).
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->
