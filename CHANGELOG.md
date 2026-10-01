@@ -48,6 +48,11 @@ written down.
 <!-- family: fix -->
 **Native builds accept an `Option` of a closure as a field of a generic struct, and a `match` leg that hands back a place: `Hold<V> { pull = None, .. }` pushed through `core.holds.write()` inside a generic function, and `None => self.fallback` over a loaned `self`, build and print node's bytes.** Neither refusal was the field's. The struct literal was refused by name ("an unbound generic type parameter (parameter 1 of struct `Hold`)") because the write view it was pushed through carried no type to close `V` with — the gap F62 closes. And a leg's body was read as a plain value, so a leg handing back a field of a loan (E0507) or a binding read again after the `match` (E0382) moved; a leg is a block tail's position now, and takes rule 1's copy (elided at a last use). std's collection core holds its per-element closures bare for this reason, and builds natively with `Option` fields now. Pin: `an_optional_closure_field_of_a_generic_struct_is_identical_on_both_backends`. The native copy census moves only in elided reads (seven programs, +1 to +3 each). Tracker F64.
 
+---
+
+<!-- family: fix -->
+**Native builds accept a module-level `lazy let` handed to a `lazy` parameter: `lazy let config = load(); .. twice(config)` builds, runs `load` once on the first force, and never runs it for a callee that does not force it — where rustc refused the emitted Rust with "cannot find value `config`".** The analyzer hands a `lazy` binding on to a `lazy` parameter as the cell itself. Natively a module-level binding is a `thread_local!` that initializes at its first read — no cell to hand on — so the forward named a local nothing declared, and a binding reached only that way was never emitted. The parameter takes a thunk that reads the binding. Pin: `a_lazy_module_binding_handed_to_a_lazy_parameter_is_identical_on_both_backends` (never forced, forced twice, forwarded to a second `lazy` parameter, a struct-typed binding, a direct read after). Tracker F52.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

@@ -7278,3 +7278,25 @@ fn an_optional_closure_field_of_a_generic_struct_is_identical_on_both_backends()
         "an `Option<|| V>` field of a generic struct must build and read the same"
     );
 }
+
+/// F52: a module-level `lazy let` handed to a `lazy` parameter. Natively the
+/// binding is a `thread_local!` initialized at its first read — the deferral
+/// `lazy` promises — and not a `Lazy` cell, so the analyzer's FORWARD (hand
+/// the cell on) named a local nothing declares, and a binding reached only
+/// that way was never emitted (rustc E0425). The parameter takes a thunk that
+/// reads the binding: never forced, the initializer never runs; forced twice,
+/// it runs once; forwarded on, it still runs once.
+#[test]
+fn a_lazy_module_binding_handed_to_a_lazy_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_lazy_module_forward.vl"),
+        include_str!("native/lazy_module_forward.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_lazy_module_forward.vl"),
+        Verdict::Identical,
+        "a module `lazy let` at a `lazy` parameter must defer and initialize once"
+    );
+}

@@ -4834,6 +4834,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let Some(&Expr::Local(binding)) = self.program.entity_map.get(&argument_id) else {
                 return None;
             };
+            // F52: a MODULE-level `lazy let` is no `Lazy` cell natively — it is
+            // a `thread_local!`, initialized on its first read, which is already
+            // the deferral `lazy` promises — so there is no cell to forward,
+            // and the forward named a local nothing declares (and the binding,
+            // lowered at its READ, was never emitted at all). The parameter
+            // takes a thunk that reads the binding: forcing it is the binding's
+            // first read, and a callee that never forces it never runs the
+            // initializer.
+            if self.module_bindings.contains(&binding) {
+                let name = self
+                    .program
+                    .variables
+                    .get(&binding)
+                    .map_or("a module binding", |variable| variable.name);
+                return Some(self.lazy_thunk(argument_id, name, depth));
+            }
             // The cell is counted, so forwarding is a handle bump and the
             // forwarding frame keeps its own.
             return Some(Ok(format!("({}).clone()", self.binding_name(binding))));
