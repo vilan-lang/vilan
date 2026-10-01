@@ -60205,6 +60205,10 @@ pub struct Program<'src> {
     /// The settled call graph, memoized — see [`Program::call_graph`]. Derived
     /// data, not analysis output: every entry above is its input.
     call_graph_memo: std::sync::OnceLock<crate::call_graph::CallGraph>,
+    /// [`crate::dispatch_refine::impl_members_for_bound`]'s answers, shared by
+    /// every pass that refines dispatch (M97). Derived data, like the graph.
+    bound_selection_memo:
+        std::sync::Mutex<HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>,
 }
 
 /// One module-level binding's HMR transfer descriptor (`hmr.md` §4).
@@ -60634,6 +60638,18 @@ impl<'src> Program<'src> {
     /// graph built at an unknown moment, and the moment is the invariant.
     pub fn install_call_graph(&self, graph: crate::call_graph::CallGraph) {
         let _ = self.call_graph_memo.set(graph);
+    }
+
+    /// [`crate::dispatch_refine::impl_members_for_bound`]'s memo (M97). A
+    /// poisoned lock still holds only complete answers — an entry is inserted
+    /// after its selection finishes — so it is read through.
+    pub(crate) fn bound_selection_memo(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>
+    {
+        self.bound_selection_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Every module-level `let` binding of the program: the globals of the
@@ -69528,6 +69544,7 @@ fn analyze_over_world<'src>(
         scalar_view_calls,
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
+        bound_selection_memo: std::sync::Mutex::default(),
     })
 }
 
