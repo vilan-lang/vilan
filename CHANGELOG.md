@@ -43,6 +43,11 @@ written down.
 <!-- family: miscompile -->
 **`sub` called through an `S: Source<T>` bound reaches `Flow`'s `sub` again, not `RemoteSource`'s inherent `sub(|T|)`: the observer of `through_the_trait(remote, |value: Option<i32>| ..)` is handed `Some(9)`, where it was handed a bare `9` and read it as `None` (`trait:none`); natively the same dispatch was refused by rustc (E0308).** Since A142 `sub` is a member of `Flow`, a supertrait of `Source`, and the bound recorded `Source` for emission — whose impl on the mirror declares no `sub` — so the mono site fell through to the by-name lookup the inherent member wins. B473's rule (the DECLARING trait answers through a bound) closes it at the root; this entry is its pins. Pins: `markdown::a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none` un-`#[ignore]`d (`trait:9` through the bound, `inherent:9`/`inherent:10` on the concrete mirror); `native_differential`'s `sub_through_a_source_bound_takes_the_trait_member_on_both_backends`. Tracker B474.
 
+---
+
+<!-- family: miscompile -->
+**A view of a tuple POSITION writes and reads through on JS: `let v = &mut pair.1; v = 3` sets `pair.1`, where it threw `TypeError: Cannot create property '0' on number '2'`.** A tuple stores flat, and a view of a scalar slot is the `(base, key)` pair of its container and its position — a struct field's view always was; a tuple position fell to the catch-all arm, which paired the slot's VALUE with `0`, so a write threw and a read answered `undefined`. The view is now the tuple and the position's flat offset, for a local view, a `&mut`/`&` argument and a compound write through it. Native was already right. Pins: `tuples::b453_a_view_of_a_tuple_position_writes_and_reads_through` (red on 0.42.0), `native_differential`'s `a_view_of_a_tuple_position_is_identical_on_both_backends`. No golden moves. Tracker B453.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

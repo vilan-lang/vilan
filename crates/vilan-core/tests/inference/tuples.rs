@@ -8060,3 +8060,44 @@ fn b183_a_tuple_blanket_does_not_shadow_an_iterator_default() {
         "2\n",
     );
 }
+
+/// B453: a view of a TUPLE POSITION (`&mut pair.1`, `&pair.0`) is the tuple's
+/// slot, written and read through on JS as a struct field's view is — a write
+/// threw `Cannot create property '0' on number` (the view was a pair of the
+/// slot's VALUE and `0`). Bound to a local, handed to a `&mut`/`&` parameter,
+/// over a heterogeneous tuple, and with a compound write through the view.
+#[test]
+fn b453_a_view_of_a_tuple_position_writes_and_reads_through() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun bump(slot: &mut i32) {
+            slot += 10;
+        }
+
+        fun read(slot: &i32): i32 {
+            *slot
+        }
+
+        fun main() {
+            mut pair = (1, 2);
+            let v = &mut pair.1;
+            v = 3;
+            print(pair.1);
+            let r = &pair.0;
+            print(*r + 1);
+            bump(&mut pair.0);
+            print(pair.0);
+            print(read(&pair.1));
+            mut triple: (str, i32, bool) = ("a", 5, false);
+            let flag = &mut triple.2;
+            flag = true;
+            let n = &mut triple.1;
+            n += 1;
+            print(i"{triple.0} {triple.1} {triple.2}");
+        }
+        "#,
+        "3\n2\n11\n3\na 6 true\n",
+    );
+}

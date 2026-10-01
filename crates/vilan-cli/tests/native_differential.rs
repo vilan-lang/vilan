@@ -7329,3 +7329,38 @@ const B474_PROBE: &str = concat!(
     "\tpresent.dispose();\n",
     "}\n",
 );
+
+/// B453: a view of a tuple position writes and reads through on both
+/// backends (`inference::tuples`' `b453_*` pin is the JS half; JS threw).
+#[test]
+fn a_view_of_a_tuple_position_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b453.vl"), B453_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b453.vl"),
+        Verdict::Identical,
+        "a view of a tuple position must write through on both backends"
+    );
+}
+
+const B453_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun bump(slot: &mut i32) {\n",
+    "\tslot += 10;\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut pair = (1, 2);\n",
+    "\tlet v = &mut pair.1;\n",
+    "\tv = 3;\n",
+    "\tprint(pair.1);\n",
+    "\tbump(&mut pair.0);\n",
+    "\tprint(pair.0);\n",
+    "\tmut triple: (str, i32, bool) = (\"a\", 5, false);\n",
+    "\tlet flag = &mut triple.2;\n",
+    "\tflag = true;\n",
+    "\tprint(i\"{triple.0} {triple.1} {triple.2}\");\n",
+    "}\n",
+);

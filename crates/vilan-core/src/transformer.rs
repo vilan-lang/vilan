@@ -6127,6 +6127,20 @@ impl<'src> Transformer<'src> {
                             self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
                             js::Node::Number(field_index.to_string(), None),
                         ),
+                        // B453: `&mut pair.1` — a tuple POSITION is a slot of the
+                        // tuple's flat array, exactly as a struct field is a slot
+                        // of its, so the view is the tuple plus the position's
+                        // flat offset. It fell to the arm below, which made a pair
+                        // of the slot's VALUE and `0`: a write through it threw
+                        // (`Cannot create property '0' on number`) and a read gave
+                        // `undefined`. A scalar view is width 1 by construction.
+                        Some(Expr::TupleIndex(subject, offset, width)) => {
+                            let (offset, _) = self.tuple_index_slot(*operand, (*offset, *width));
+                            (
+                                self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
+                                js::Node::Number(offset.to_string(), None),
+                            )
+                        }
                         // `&mut list[i]` — the checked mint (`__at_view`): the
                         // scalar `(base, key)` pair exists only for an in-bounds
                         // element, so a view of an absent element panics at the
