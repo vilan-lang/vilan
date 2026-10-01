@@ -1,0 +1,90 @@
+// F62: places behind a `Shared` write view — the A142 `OwnerCell` shape
+// written field by field through a loaned `self`, a `&mut` view of a field
+// handed to a function, a `&mut self` method on a field, a closure writing
+// a field, a subscript write, and a mutating call (`pop`) inside an
+// expression that reads the same cell after it.
+import std::io::print;
+import std::shared::Shared;
+import std::option::Option::{ self, None, Some };
+
+struct Inner {
+	depth: i32,
+}
+
+impl Inner {
+	fun grow(&mut self, by: i32) {
+		self.depth = self.depth + by;
+	}
+}
+
+struct Cell {
+	epoch: i32,
+	listed: bool,
+	cleanups: Shared<List<|| void>>,
+	items: List<i32>,
+	inner: Inner,
+	pair: (i32, str),
+}
+
+struct Owner {
+	cell: Shared<Cell>,
+}
+
+impl Owner {
+	fun defer(self, cleanup: || void) {
+		if self.cell.read().listed {
+			self.cell.read().cleanups.write().push(cleanup);
+		} else {
+			self.cell.write().cleanups = Shared::new([cleanup]);
+			self.cell.write().listed = true;
+		}
+	}
+
+	fun dispose(self) {
+		let held = self.cell.read().cleanups;
+		self.cell.write().epoch = self.cell.read().epoch + 1;
+		self.cell.write().listed = false;
+		for cleanup in held.read() {
+			cleanup();
+		}
+	}
+}
+
+fun fill(items: &mut List<i32>) {
+	items.push(40);
+}
+
+fun main() {
+	let owner = Owner {
+		cell = Shared::new(Cell {
+			epoch = 0,
+			listed = false,
+			cleanups = Shared::new([]),
+			items = [1, 2, 3],
+			inner = Inner { depth = 0 },
+			pair = (1, "one"),
+		}),
+	};
+	owner.defer(|| print("first"));
+	owner.defer(|| print("second"));
+	owner.dispose();
+	print(i"{owner.cell.read().epoch} {owner.cell.write().listed}");
+	let cell = owner.cell;
+	cell.write().epoch = cell.write().items.pop().unwrap_or(0) + cell.read().epoch;
+	print(cell.read().epoch);
+	fill(&mut cell.write().items);
+	print(cell.read().items[0]);
+	cell.write().inner.grow(cell.read().epoch);
+	print(cell.write().inner.depth);
+	cell.write().pair.0 = cell.read().pair.0 + 5;
+	print(i"{cell.read().pair.0} {cell.write().pair.1}");
+	let bump = || {
+		cell.write().inner.depth = cell.write().inner.depth * 2;
+	};
+	bump();
+	bump();
+	print(cell.read().inner.depth);
+	cell.write().items[0] = cell.read().items[1] + 100;
+	print(cell.read().items[0]);
+	print(cell.write().items.pop().unwrap_or(-1) + cell.read().items[0]);
+}

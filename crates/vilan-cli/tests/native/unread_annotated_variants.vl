@@ -1,0 +1,21 @@
+// F55: an annotated binding nothing reads still builds natively — `Ok` and
+// `Err` at a `Result`, `None` and `Some` at an `Option`, a nested `Option` of
+// a `Result`, and a struct payload — and the read ones beside them print.
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+
+struct Point {
+	x: i32,
+}
+
+fun main() {
+	let ok: Result<i32, str> = Ok(10);
+	let err: Result<i32, str> = Err("boom");
+	let nothing: Option<str> = None;
+	let some: Option<u8> = Some(4);
+	let nested: Option<Result<Point, str>> = Some(Ok(Point { x = 1 }));
+	let failed: Result<List<i32>, Point> = Err(Point { x = 2 });
+	print(err.unwrap_or(1));
+	let read: Option<str> = None;
+	print(read.unwrap_or("none"));
+}

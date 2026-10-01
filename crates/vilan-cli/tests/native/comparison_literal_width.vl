@@ -1,0 +1,27 @@
+// F54: a comparison's literal takes its comparand's type, never the
+// expectation around it — a value `if`'s condition beside `i32` arms, a
+// conjunction and a disjunction beside `i16`/`f64` arms, a `bool` binding,
+// and a `while` condition inside a block valued `i32`.
+import std::io::print;
+
+fun main() {
+	let n: u53 = 5;
+	let two = if n > 2 { 1 } else { 2 };
+	print(two);
+	let small: u8 = 200;
+	let wide: i16 = if small >= 100 && small != 7 { 10 } else { 20 };
+	print(wide);
+	let index: usize = 3;
+	let label: f64 = if index == 3 || index < 1 { 1.5 } else { 2.5 };
+	print(label);
+	let flag: bool = n > 4;
+	print(flag);
+	mut count: u32 = 0;
+	let total: i32 = {
+		for count < 3 {
+			count += 1;
+		}
+		7
+	};
+	print(i"{count} {total}");
+}

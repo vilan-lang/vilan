@@ -176,6 +176,10 @@ const DEFAULT_SUITE: &[&str] = &[
     // over a `"type"` key — and the Rust emitter's own keywords (`type`,
     // `match`, `if`, `in`, `for`, `ret`) must survive as member names natively.
     "keyword-members.vl",
+    // F62: `a.write().count = a.write().count + 1` — a field read and written
+    // through a `Shared` view, refused by name until the read became a scoped
+    // borrow and the place's statement settled its value first.
+    "shared.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -219,6 +223,25 @@ const ASYNC_SUITE: &[&str] = &[
     "reactive-turns.vl",
     "time.vl",
 ];
+
+/// F57: the corpus programs that reach a platform module and that the
+/// backend BUILDS — the ones the platform-free sweep leaves out by
+/// construction, so no gate saw them. `crypto.vl` was rustc E0382 at the
+/// Order 44 seal (a host binding's by-value argument moved its `salt`) behind
+/// an E0308 (a `match` literal pattern written at the arms' width over a
+/// `usize`), and nothing ran it. [`every_platform_bound_program_is_identical_or_named`]
+/// requires these four and classifies the rest.
+const PLATFORM_BOUND_REQUIRED: &[&str] =
+    &["crypto.vl", "db.vl", "asset_bundle.vl", "element-syntax.vl"];
+
+/// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
+/// agree on for a reason that is not the program's, named with the reason.
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
+    "estate.vl",
+    "the JS `vilan run` prints its build's asset report (`Bundled  robots.txt`, ...) on \
+     STDOUT ahead of the program's output, and the native run reports nothing; the \
+     program's own three lines are identical",
+)];
 
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
@@ -287,6 +310,30 @@ pub fn platform_free_programs() -> Vec<String> {
                 .iter()
                 .any(|(excluded, _)| *excluded == name);
             if !reaches_a_platform && !outside {
+                programs.push(name);
+            }
+        }
+    }
+    programs.sort();
+    programs
+}
+
+/// Every corpus program that reaches a platform module and is not one of
+/// [`ASYNC_SUITE`]'s (which has its own gate), in a stable order — the
+/// complement of [`platform_free_programs`] over the same walk.
+fn platform_bound_programs() -> Vec<String> {
+    let free = platform_free_programs();
+    let mut programs = Vec::new();
+    let entries = std::fs::read_dir(corpus_dir()).expect("read the corpus directory");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "vl") {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let outside = OUTSIDE_THE_DIFFERENTIAL
+                .iter()
+                .chain(PLATFORM_BOUND_OUTSIDE)
+                .any(|(excluded, _)| *excluded == name);
+            if !free.contains(&name) && !ASYNC_SUITE.contains(&name.as_str()) && !outside {
                 programs.push(name);
             }
         }
@@ -4757,9 +4804,13 @@ fn an_unconstrained_generic_parameter_is_refused_by_name() {
 /// and it builds and answers node's bytes. The overlap cases keep their copies:
 /// a field read twice, and a nested path followed by its parent.
 ///
-/// The copy count is held too: 5 copied / 3 moved. With the path and the
+/// The copy count is held too: 5 copied / 5 moved. With the path and the
 /// branch halves planted out ("a field never moves, and branches are walked
-/// in sequence") the same program takes 7 copies and moves 1.
+/// in sequence") the same program takes 7 copies and moves 1. (It read 5 / 3
+/// until native-45 made a `match` leg's body and a closure's body consuming
+/// positions (F63, F64): two reads that were already moves — a leg handing
+/// back a binding at its last use — are counted as elided copies now. No copy
+/// was added.)
 #[test]
 fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
     let staged = stage();
@@ -4780,7 +4831,7 @@ fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
     );
     assert_eq!(
         copy_census_of(&staged, "native_probe_moves.vl"),
-        (5, 3),
+        (5, 5),
         "the copies the path- and branch-aware last use leaves"
     );
 }
@@ -7030,3 +7081,321 @@ const B470_ONCE_PROBE: &str = concat!(
     "\n",
     "main();\n",
 );
+
+/// F62: a field read or written through a `Shared` view builds natively and
+/// prints what node prints.
+///
+/// It was refused by name ("a field read of an unresolved subject"): the view
+/// call records no type, so the field had no struct to be found in — which is
+/// why A142's `OwnerCell` and S6's `TrackRuns` were written WHOLE. Typing the
+/// call was half of it. A read through the view holds no borrow past itself
+/// now (`read_with`, one borrow per spine, copying only the field), and every
+/// site that takes the cell's `borrow_mut` as a place — an assignment, a
+/// mutating call's receiver, a `&mut` argument — settles what it reads first,
+/// so `a.write().n = a.write().n + 1` and `cell.write().items.push(cell.read()
+/// .n)` meet no live borrow. The second probe is the `OwnerCell` shape written
+/// field by field, the shape reactive-45 may return to.
+#[test]
+fn a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends() {
+    let staged = stage();
+    for (name, program) in [
+        (
+            "native_probe_shared_view_fields.vl",
+            include_str!("native/shared_view_fields.vl"),
+        ),
+        (
+            "native_probe_shared_view_places.vl",
+            include_str!("native/shared_view_places.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        assert_eq!(
+            compare(&staged, name),
+            Verdict::Identical,
+            "{name}: a field through a `Shared` view must read and write the same on both backends"
+        );
+    }
+}
+
+/// F57: every platform-bound corpus program the backend ACCEPTS prints what
+/// node prints, the ones it refuses say which construct stopped them, and the
+/// ones it builds today ([`PLATFORM_BOUND_REQUIRED`]) stay built. The census is
+/// printed, as the corpus sweep's is: its refusals are the work list.
+#[test]
+fn every_platform_bound_program_is_identical_or_named() {
+    let staged = stage();
+    let programs = platform_bound_programs();
+    let mut identical_programs: Vec<String> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut broken = Vec::new();
+    for program in &programs {
+        match compare(&staged, program) {
+            Verdict::Identical => identical_programs.push(program.clone()),
+            Verdict::Refused(reason) => refused.push((program.clone(), reason)),
+            Verdict::Broken(detail) => broken.push(format!("{program}: {detail}")),
+        }
+    }
+    eprintln!(
+        "platform-bound differential: {} enumerated, {} identical, {} refused by name, {} broken",
+        programs.len(),
+        identical_programs.len(),
+        refused.len(),
+        broken.len()
+    );
+    for (program, reason) in &refused {
+        eprintln!("  refused  {program}: {reason}");
+    }
+    for program in &identical_programs {
+        eprintln!("  identical  {program}");
+    }
+    assert!(
+        broken.is_empty(),
+        "platform-bound programs the native backend ACCEPTED and then got wrong:\n{}",
+        broken.join("\n")
+    );
+    for required in PLATFORM_BOUND_REQUIRED {
+        assert!(
+            identical_programs.iter().any(|program| program == required),
+            "{required} builds natively and prints node's bytes; it must stay that way"
+        );
+    }
+    for (program, _) in PLATFORM_BOUND_OUTSIDE {
+        assert!(
+            corpus_dir().join(program).is_file(),
+            "{program} is named outside the platform-bound differential but is not a corpus program"
+        );
+    }
+}
+
+/// F57's second defect: a `match` literal pattern takes the SUBJECT's width,
+/// never the expectation around the `match` (the arms' type). It stood behind
+/// `crypto.vl`'s E0382 in `std::base64::decode_url`, so the platform-bound pin
+/// reaches it only through a platform; this probe holds it platform-free.
+#[test]
+fn a_literal_pattern_takes_its_subjects_width_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_literal_pattern_width.vl"),
+        include_str!("native/literal_pattern_width.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_literal_pattern_width.vl"),
+        Verdict::Identical,
+        "a literal pattern over a `usize`/`u8`/`u53` subject must build and match the same"
+    );
+}
+
+/// F60, R-d door (a)'s native half: a pipe that is never consumed — built as a
+/// statement and dropped — builds natively and the program runs as it does on
+/// JS. The pipe nodes' `[must_use]` (reactive-45) makes the drop a WARNING on
+/// both backends; this pin holds the build.
+///
+/// The item's repro, `outer.flatten();` over a `SignalCell<SignalCell<i32>>`,
+/// is not a dropped-pipe defect: KEPT (`let kept = outer.flatten();`) it is
+/// refused natively the same way, because the `flatten` it selects is the
+/// blanket over `Flow<Option<I: Source<U>>>`, whose bound that receiver does
+/// not meet, so `I` and `U` bind to nothing. B476/B477 refuse that selection in
+/// the analyzer. Every well-typed dropped pipe already built; this keeps it so.
+#[test]
+fn a_dropped_pipe_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_dropped_pipes.vl"),
+        include_str!("native/dropped_pipes.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_dropped_pipes.vl"),
+        Verdict::Identical,
+        "a pipe built and dropped must build and run the same on both backends"
+    );
+}
+
+/// F61: an injected closure's hidden parameters take ONE order natively — the
+/// contexts' declaration order, the context pass's own — at the closure literal
+/// and at the closure TYPE. The type had followed the clause as written, so a
+/// clause out of declaration order (`context (second, first)`) typed its slots
+/// `(str, i32)` while the literal landing there took `(i32, str)`, and rustc
+/// refused it; std wrote every clause in declaration order, with a comment, to
+/// keep out of the way. Two contexts backwards, three rotated with a value
+/// parameter ahead of them, and a struct field carrying a backwards clause.
+#[test]
+fn an_injected_clause_written_out_of_order_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_clause_order.vl"),
+        include_str!("native/clause_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_clause_order.vl"),
+        Verdict::Identical,
+        "a `context` clause in any written order must build and thread the same values"
+    );
+}
+
+/// F63: a closure's expression body is the value it hands back, a CONSUMING
+/// position like a function body's tail, so a place read there takes rule 1's
+/// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured
+/// `Vec` (rustc E0507), and `|| row.name` moved a field out of its capture,
+/// which made the closure `FnOnce` where every closure type is a `dyn Fn`.
+#[test]
+fn a_closure_handing_back_an_indexed_element_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_indexed_closure_reads.vl"),
+        include_str!("native/indexed_closure_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_indexed_closure_reads.vl"),
+        Verdict::Identical,
+        "a closure handing back an element or a field of a capture must copy it"
+    );
+}
+
+/// F64: an `Option` of a closure as a field of a GENERIC struct builds natively
+/// — stored through a cell's write view, pulled per element, read by a
+/// `match` — and a `match` leg handing back a place copies it.
+///
+/// Two defects stood in front of the field, and neither was the field. A struct
+/// literal pushed through `core.holds.write()` had no element type to close
+/// `Hold<V>`'s `V` with, because the view call recorded none — refused by name
+/// as "an unbound generic type parameter (parameter 1 of struct `Hold`)"; F62
+/// typed the view. And a leg's body was read as a plain value, so `None =>
+/// self.fallback` over a loaned `self` (E0507) and `None => before` read again
+/// after the `match` (E0382) moved; a leg is a block tail's position now.
+/// std's collection core (`ElementHold`) holds its closures bare to avoid this
+/// shape; with `Option` fields it builds and prints node's bytes.
+#[test]
+fn an_optional_closure_field_of_a_generic_struct_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_option_closure_fields.vl"),
+        include_str!("native/option_closure_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_option_closure_fields.vl"),
+        Verdict::Identical,
+        "an `Option<|| V>` field of a generic struct must build and read the same"
+    );
+}
+
+/// F52: a module-level `lazy let` handed to a `lazy` parameter. Natively the
+/// binding is a `thread_local!` initialized at its first read — the deferral
+/// `lazy` promises — and not a `Lazy` cell, so the analyzer's FORWARD (hand
+/// the cell on) named a local nothing declares, and a binding reached only
+/// that way was never emitted (rustc E0425). The parameter takes a thunk that
+/// reads the binding: never forced, the initializer never runs; forced twice,
+/// it runs once; forwarded on, it still runs once.
+#[test]
+fn a_lazy_module_binding_handed_to_a_lazy_parameter_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_lazy_module_forward.vl"),
+        include_str!("native/lazy_module_forward.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_lazy_module_forward.vl"),
+        Verdict::Identical,
+        "a module `lazy let` at a `lazy` parameter must defer and initialize once"
+    );
+}
+
+/// F54: a comparison answers a `bool`, so the expectation around it is never
+/// its operands' — a literal in it takes its comparand's type.
+/// `let two = if n > 2 { 1 } else { 2 }` over `n: u53` rendered `2` at the
+/// arms' `i32` (the `if`'s value expectation reached its condition), and rustc
+/// refused `u64 > i32` (E0308). `&&`/`||` beside `i16`/`f64` arms, a `bool`
+/// binding, and a `while` condition inside an `i32`-valued block hold the same
+/// rule.
+#[test]
+fn a_comparison_literal_takes_its_comparands_width_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_comparison_literal_width.vl"),
+        include_str!("native/comparison_literal_width.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_comparison_literal_width.vl"),
+        Verdict::Identical,
+        "a comparison's literal must take its comparand's width"
+    );
+}
+
+/// F55: an annotated `Option`/`Result` binding nothing reads builds natively.
+/// The binding's annotation is not written (a view binding's type is its
+/// pointee's, so writing every annotation would be wrong), and `Option` and
+/// `Result` are Rust's own enums, whose bare path names no instance — so
+/// `let ok: Result<i32, str> = Ok(10)`, never read, left `E` open (rustc
+/// E0282). A written annotation over an `Option`/`Result` variant is written
+/// natively now. (Writing the variant's own type arguments instead —
+/// `Ok::<i32, Str>(10)` everywhere — was tried and is wrong: the arguments a
+/// constructor records inside a generic instance are not reliable, and Rust's
+/// inference had been covering for them.)
+#[test]
+fn an_unread_annotated_variant_binding_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_unread_annotated_variants.vl"),
+        include_str!("native/unread_annotated_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_unread_annotated_variants.vl"),
+        Verdict::Identical,
+        "an annotated `Option`/`Result` binding nothing reads must build"
+    );
+}
+
+/// M91: a churned native `HashMap`/`HashSet` walks its live entries in the
+/// order node's `Map` does — insertion order, a removed-then-re-inserted key at
+/// the end, an overwritten one in place — through the compactions the native
+/// map makes as its removed slots come to outnumber its live ones. The bound
+/// itself (slots at most twice the live count, the storage released) is
+/// `vilan-rt`'s `a_churned_map_compacts_and_keeps_insertion_order`: this suite
+/// reads no clock (N116), so the 2,000 walks here are the shape, not a timing.
+#[test]
+fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_churned_map_walk.vl"),
+        include_str!("native/churned_map_walk.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_churned_map_walk.vl"),
+        Verdict::Identical,
+        "a churned map and set must walk in insertion order on both backends"
+    );
+}
+
+/// F65 (OPEN, native-45 STOPPED it — the defect is the analyzer's record): a
+/// generic function whose return is inferred, called at two instantiations,
+/// emits ONE instantiation's return type for every instance. `wrap<T>(x: T):
+/// Source<T> { SignalCell::new(x) }` at `i32` and `str` emits both instances
+/// returning the `str` cell, and the `i32` caller's reads meet the wrong
+/// struct (rustc E0308). The same holds with no return written at all, so it
+/// is not B460's opacity: `inferred_return_types` records the function's
+/// return as the LAST call site's `SignalCell<str>` rather than
+/// `SignalCell<T>`, and both call expressions share that one type id — so
+/// nothing per call carries the instance's return for the emitter to read.
+#[test]
+#[ignore = "F65: the analyzer records a generic function's inferred return at one call site's instantiation"]
+fn a_generic_inferred_return_is_per_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_inferred_return.vl"),
+        include_str!("native/generic_inferred_return.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_inferred_return.vl"),
+        Verdict::Identical,
+        "each instance of a generic inferred-return function returns its own type"
+    );
+}

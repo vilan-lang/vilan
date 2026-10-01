@@ -23,6 +23,51 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**Native builds read and write a FIELD through a `Shared` view: `a.write().count = a.write().count + 1`, `cell.write().inner.depth = 3`, `cell.write().items.push(cell.read().count)` and `let note = s.write().note` build and print node's bytes, where every one was refused by name ("a field read of an unresolved subject").** The view call records no type, so a field off `write()` had no struct to be found in — the reason A142's `OwnerCell` and S6's `TrackRuns` are written whole. The call is typed now, and two rules make the borrows safe. A field READ through either view is one scoped borrow of the cell that copies only the field (`read_with`), so it holds nothing past itself; `cell.read().n` had copied the whole value to read one field. And every site that takes the cell's `borrow_mut` as a PLACE settles what it reads first: an assignment's value is computed in its own statement, a mutating call's arguments are hoisted, and the call's borrow ends with the call — `cell.write().items.pop().unwrap_or(0) + cell.read().n` reads the cell after the pop. The JS backend is unchanged. Pins: `shared.vl` joins the native default suite, and `a_field_read_or_written_through_a_shared_view_is_identical_on_both_backends` (both views, nested fields, a tuple slot, `str`/`Option`/`List` fields, a compound write, the `OwnerCell` shape written field by field through a loaned `self`, a `&mut` field handed on, a `&mut self` method on a field, a closure writing a field, a subscript write). Tracker F62.
+
+---
+
+<!-- family: fix -->
+**Native builds of `crypto.vl` — PBKDF2 hashing twice over one `salt`, base64url decoding, HS512 JWTs — print node's bytes; rustc had refused the emitted Rust twice over (E0382 and E0308), and no gate ran it because the native sweep skips platform-bound programs.** Two defects. A host binding's by-value argument is a CONSUMING position, and the runtime functions behind `std::crypto`, `std::db`, `std::http` and the executor take theirs by value, so the second `pbkdf2_sha512(.., salt, ..)` read a moved `salt`; rule 1's copy is taken there now as at every other consuming position (elided at a last use), and the members that take a reference read their argument as a place and owe nothing. And a `match` literal pattern took the expectation around the `match` — the arms' type — instead of its subject's: `std::base64::decode_url`'s `match rest { 2 => 1, 3 => 2, _ => 0 }` over a `usize` remainder emitted `(2i32)`. A literal pattern is written at its subject's width. Pins: `every_platform_bound_program_is_identical_or_named`, a new native gate over the corpus programs that reach a platform module (outside the async suite): `crypto.vl`, `db.vl`, `asset_bundle.vl` and `element-syntax.vl` are required identical, the four it refuses are printed by name, and `estate.vl` is named outside it (the JS `vilan run` prints its asset report on stdout); and `a_literal_pattern_takes_its_subjects_width_on_both_backends` (a `usize`, a `u8` and a `u53` subject). Tracker F57.
+
+---
+
+<!-- family: fix -->
+**Native builds accept a `context` clause written in any order: `fun both(body: (|| str) context (second, first))` handed `|| i"{first.get()} {second.get()}"` builds and prints node's bytes, where rustc refused it ("expected `Rc<dyn Fn(Rc<str>, i32)>`, found `Rc<dyn Fn(i32, Rc<str>)>`").** The context pass appends an injected closure's hidden parameters, and a call's hidden arguments, in the contexts' declaration order; the native closure TYPE listed them in the clause's written order, so the slots disagreed with the literal whenever the two orders differed. The type takes the pass's order now. std's clauses had been written in declaration order to stay clear of it, with a comment saying so; the comment is gone. Pin: `an_injected_clause_written_out_of_order_is_identical_on_both_backends` (two contexts backwards, three rotated behind a value parameter, a struct field carrying a backwards clause). Tracker F61.
+
+---
+
+<!-- family: fix -->
+**Native builds accept a closure that hands back an element read by index or a field of what it captured: `id.derive(|index| cells[index])` over a `List<str>`, `apply(1, |index| rows[index])`, and `name_via(|| row.name)` build and print node's bytes, where rustc refused the first two with E0507 ("cannot move out of index") and the third with E0525 (a closure moving out of its capture is `FnOnce`).** A closure's expression body is the value it hands back — a consuming position, like a function body's tail, where a place read takes rule 1's copy; it was read as a plain value, so the read moved. It is a consuming position now (elided at a last use, as everywhere). Pin: `a_closure_handing_back_an_indexed_element_is_identical_on_both_backends` (a `str`, a struct and a list element by index, a block body's tail, a capture handed back whole, a field of a capture). The native copy census moves by one elided read (`reactive-flatten`). Tracker F63.
+
+---
+
+<!-- family: fix -->
+**Native builds accept an `Option` of a closure as a field of a generic struct, and a `match` leg that hands back a place: `Hold<V> { pull = None, .. }` pushed through `core.holds.write()` inside a generic function, and `None => self.fallback` over a loaned `self`, build and print node's bytes.** Neither refusal was the field's. The struct literal was refused by name ("an unbound generic type parameter (parameter 1 of struct `Hold`)") because the write view it was pushed through carried no type to close `V` with — the gap F62 closes. And a leg's body was read as a plain value, so a leg handing back a field of a loan (E0507) or a binding read again after the `match` (E0382) moved; a leg is a block tail's position now, and takes rule 1's copy (elided at a last use). std's collection core holds its per-element closures bare for this reason, and builds natively with `Option` fields now. Pin: `an_optional_closure_field_of_a_generic_struct_is_identical_on_both_backends`. The native copy census moves only in elided reads (seven programs, +1 to +3 each). Tracker F64.
+
+---
+
+<!-- family: fix -->
+**Native builds accept a module-level `lazy let` handed to a `lazy` parameter: `lazy let config = load(); .. twice(config)` builds, runs `load` once on the first force, and never runs it for a callee that does not force it — where rustc refused the emitted Rust with "cannot find value `config`".** The analyzer hands a `lazy` binding on to a `lazy` parameter as the cell itself. Natively a module-level binding is a `thread_local!` that initializes at its first read — no cell to hand on — so the forward named a local nothing declared, and a binding reached only that way was never emitted. The parameter takes a thunk that reads the binding. Pin: `a_lazy_module_binding_handed_to_a_lazy_parameter_is_identical_on_both_backends` (never forced, forced twice, forwarded to a second `lazy` parameter, a struct-typed binding, a direct read after). Tracker F52.
+
+---
+
+<!-- family: fix -->
+**Native builds accept a value `if` whose condition compares against a literal of a different width than its arms: `let two = if n > 2 { 1 } else { 2 }` over `n: u53` builds and prints `1`, where rustc refused `u64 > i32` (E0308).** The `if`'s value expectation (`i32`, from the arms) reached the comparison in its condition, and the literal `2` took it. A comparison, `&&` and `||` answer a `bool`, so the expectation around them is never their operands': the operands are rendered with it cleared, each at its partner's type. Pin: `a_comparison_literal_takes_its_comparands_width_on_both_backends` (a `u53`, a `u8` and a `usize` condition beside `i32`, `i16` and `f64` arms, a `bool` binding, a `while` condition inside an `i32`-valued block). Tracker F54.
+
+---
+
+<!-- family: fix -->
+**Native builds accept an annotated `Option` or `Result` binding that nothing reads: `let ok: Result<i32, str> = Ok(10);` and `let nothing: Option<str> = None;` build, where rustc refused them ("type annotations needed", E0282).** `Option` and `Result` are Rust's own enums natively, so `Ok(10)` names no instance and Rust closes the missing parameter from whatever reads the binding — and the native backend writes a binding's annotation only where the initializer cannot type it, so an unread binding left `E` open. A written annotation over an `Option`/`Result` variant is written natively now. Pin: `an_unread_annotated_variant_binding_is_identical_on_both_backends` (`Ok`, `Err`, `None`, `Some` at `u8`, an `Option` of a `Result` of a struct, a `Result` of a list). Tracker F55.
+
+---
+
+<!-- family: performance -->
+**Native `HashMap`s and `HashSet`s give back what they remove: a map that churned through 200,000 keys and holds one walks one entry, not 200,000 empty slots, and releases the memory it peaked at.** A removal emptied its slot and nothing ever reclaimed it, so every walk of a churned map — `keys()`, `values()`, `entries()`, a `for` — visited every key it had ever held (0.13–0.16 s for 2,000 walks of a one-entry map, against 0.001 s for a fresh one). The map now compacts once its removed slots outnumber its live entries, keeping the live ones in insertion order (the iteration contract, a re-inserted key at the end, as on JS); the cost is amortized over the removals. Pins: `vilan-rt`'s `a_churned_map_compacts_and_keeps_insertion_order` (slots at most twice the live count through 200,000 churns, the storage released, the order and the index after compaction; red with the compaction planted out) and `a_churned_hash_map_walks_in_insertion_order_on_both_backends`. Tracker M91 (taken by native-45, so `reactive-maps-sets.md`'s S0 does not carry it).
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->
