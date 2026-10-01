@@ -231,12 +231,8 @@ const ASYNC_SUITE: &[&str] = &[
 /// an E0308 (a `match` literal pattern written at the arms' width over a
 /// `usize`), and nothing ran it. [`every_platform_bound_program_is_identical_or_named`]
 /// requires these four and classifies the rest.
-const PLATFORM_BOUND_REQUIRED: &[&str] = &[
-    "crypto.vl",
-    "db.vl",
-    "asset_bundle.vl",
-    "element-syntax.vl",
-];
+const PLATFORM_BOUND_REQUIRED: &[&str] =
+    &["crypto.vl", "db.vl", "asset_bundle.vl", "element-syntax.vl"];
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
 /// agree on for a reason that is not the program's, named with the reason.
@@ -7209,5 +7205,28 @@ fn a_dropped_pipe_builds_the_same_on_both_backends() {
         compare(&staged, "native_probe_dropped_pipes.vl"),
         Verdict::Identical,
         "a pipe built and dropped must build and run the same on both backends"
+    );
+}
+
+/// F61: an injected closure's hidden parameters take ONE order natively — the
+/// contexts' declaration order, the context pass's own — at the closure literal
+/// and at the closure TYPE. The type had followed the clause as written, so a
+/// clause out of declaration order (`context (second, first)`) typed its slots
+/// `(str, i32)` while the literal landing there took `(i32, str)`, and rustc
+/// refused it; std wrote every clause in declaration order, with a comment, to
+/// keep out of the way. Two contexts backwards, three rotated with a value
+/// parameter ahead of them, and a struct field carrying a backwards clause.
+#[test]
+fn an_injected_clause_written_out_of_order_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_clause_order.vl"),
+        include_str!("native/clause_order.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_clause_order.vl"),
+        Verdict::Identical,
+        "a `context` clause in any written order must build and thread the same values"
     );
 }

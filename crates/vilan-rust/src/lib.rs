@@ -2157,6 +2157,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // wrong arity. The value type is the context binding's, under
                 // an `Option` for the safe flavour, and the flavour is the one
                 // the closures themselves settled.
+                //
+                // F61: in the PASS's order — by declaration (`Plan::contexts`,
+                // sorted by id), which is how it appends a literal's hidden
+                // parameters and a call's hidden arguments — and never the
+                // clause as written: `context (second, first)` typed the
+                // slots `(str, i32)` while the literal landing there took
+                // `(i32, str)`, and rustc refused it.
+                let mut contexts = contexts;
+                contexts.sort_by_key(|context| context.0);
                 for context in &contexts {
                     parts.push(self.context_clause_type(*context, span)?);
                 }

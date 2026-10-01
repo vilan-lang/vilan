@@ -1349,10 +1349,6 @@ export fun comp<T>(body: (sync || T) context owner_scope): (T, Owner) {
 // INJECTED (`context (owner_scope, tracking, ambient_nursery)`), so the literal at
 // the user's call site reads the scope of the run it is in, not the one it was
 // written under.
-// (`tracking` sits between the other two because that is their DECLARATION order:
-// the native backend orders an injected literal's hidden parameters by it and a
-// closure type's by the clause as written, so a clause out of that order builds on
-// JS and is refused by rustc — tracking-44's find, `finds/clause_order`.)
 //
 // **A stage's dependencies are its LAST run's reads.** Each run collects its reads
 // in order; when it returns, the stage compares them with the edges it holds —
