@@ -435,8 +435,56 @@ fn bounds_are_stronger(program: &Program, stronger: TypeId, weaker: TypeId) -> b
         {
             strictly = true;
         }
+        // B477, the analyzer's `bound_arguments_order` read here: one trait at
+        // narrower ARGUMENTS is the stronger bound (`Pipe<Task<Result<T, E>>>`
+        // over `Pipe<Task<T>>`), and arguments that are not an instance of the
+        // other's pattern rank neither way.
+        match bound_arguments_narrower(program, *stronger_id, *weaker_id) {
+            Some(true) => strictly = true,
+            Some(false) => {}
+            None => return false,
+        }
     }
     strictly
+}
+
+/// Whether `left`'s bound arguments are NARROWER than `right`'s, trait by trait
+/// where both name the same one: `Some(true)` when every argument is an
+/// instance of `right`'s pattern and one strictly, `Some(false)` when they
+/// match each other (or share no trait), `None` when one is not an instance.
+fn bound_arguments_narrower(program: &Program, left: TypeId, right: TypeId) -> Option<bool> {
+    let trait_application = |type_id: &TypeId| match program.type_id_to_type_map.get(type_id) {
+        Some(Type::Trait(trait_id, arguments)) => Some((*trait_id, arguments.clone())),
+        _ => None,
+    };
+    let right_bounds: Vec<(Id, Vec<TypeId>)> = bound_type_ids(program, right)
+        .iter()
+        .filter_map(trait_application)
+        .collect();
+    let mut narrower = false;
+    for (trait_id, left_arguments) in bound_type_ids(program, left)
+        .iter()
+        .filter_map(trait_application)
+    {
+        let Some((_, right_arguments)) = right_bounds
+            .iter()
+            .find(|(right_trait, _)| *right_trait == trait_id)
+        else {
+            continue;
+        };
+        if left_arguments.len() != right_arguments.len() {
+            continue;
+        }
+        for (left_argument, right_argument) in left_arguments.iter().zip(right_arguments) {
+            if !subject_shape_matches(program, *right_argument, *left_argument) {
+                return None;
+            }
+            if !subject_shape_matches(program, *left_argument, *right_argument) {
+                narrower = true;
+            }
+        }
+    }
+    Some(narrower)
 }
 
 /// A binder's declared bounds CLOSED over the supertrait graph — the emission

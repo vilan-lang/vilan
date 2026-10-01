@@ -672,6 +672,17 @@ pub enum ExprPattern {
     Literal(Id),
 }
 
+/// How one binder's bound arguments rank against another's
+/// (`Analyzer::bound_arguments_order`, B477).
+enum ArgumentOrder {
+    /// Every argument is an instance of the other's pattern, one strictly.
+    Narrower,
+    /// Each matches the other, or the two share no trait to compare.
+    Same,
+    /// Some argument is not an instance of the other's pattern.
+    Unranked,
+}
+
 /// Whether a pattern matches every value of its type — the grammar's
 /// "irrefutable subset" (spec §3.10: the `let`/parameter binder forms). A tuple
 /// destructure qualifies only when every element does, so `(let a, let b)` is a
@@ -7060,7 +7071,18 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            let binding_context: SubstitutionContext = bindings.iter().copied().collect();
+            let mut binding_context: SubstitutionContext = bindings.iter().copied().collect();
+            // B476: a binder written only INSIDE another binder's bound — the
+            // `T` of `impl type S: Src<type T> with Fl<T>` — is bound from what
+            // the value provides at that bound, so the arguments the impl
+            // provides below (`Fl<T>`) are read at the value's own `T`. Left
+            // open, `T` read as indeterminate and every instantiation of `Fl`
+            // passed: a `Cell<i32>` met `: Fl<str>` through the blanket.
+            if self.bound_argument_grounding_depth < 4 {
+                self.bound_argument_grounding_depth += 1;
+                self.bind_subject_bound_binders(subject_id, value_type, &mut binding_context);
+                self.bound_argument_grounding_depth -= 1;
+            }
             for (binder_constraint_id, argument_type_id) in bindings {
                 let binder_traits = self.generic_bound_traits(binder_constraint_id);
                 if binder_traits.is_empty() {
@@ -7519,7 +7541,9 @@ impl<'src> Analyzer<'src> {
                     } else {
                         format!(
                             "'{type_label}' does not implement trait '{trait_label}', \
-                             required by a generic bound of this call"
+                             required by a generic bound of this call{}",
+                            self.total_join_steer(call_id, *required_trait_id)
+                                .unwrap_or_default()
                         )
                     };
                     errors.push((
@@ -7879,6 +7903,31 @@ impl<'src> Analyzer<'src> {
                 a_source == b_source && a_span == b_span && a_msg == b_msg
             },
         );
+        // B476: the SAME sentence at a site that ENCLOSES another site saying
+        // it is the inner one's cascade, not a second finding — a refused
+        // `outer.flatten()` hands its wrong stage on, and every call chained
+        // onto it fails the very bound the inner call did, about the very same
+        // type (`outer.flatten().on_change(..)` said it twice). The innermost
+        // site is where the author wrote the mistake, so it alone stays. The
+        // inner sentence may carry a steer the outer one does not (it is the
+        // call the steer is about), so it repeats the outer when it STARTS
+        // with it.
+        let enclosed_repeats: Vec<bool> = errors
+            .iter()
+            .map(|(source, _, span, msg, _)| {
+                errors
+                    .iter()
+                    .any(|(other_source, _, other_span, other_msg, _)| {
+                        other_source == source
+                            && other_msg.starts_with(msg.as_str())
+                            && other_span != span
+                            && other_span.start >= span.start
+                            && other_span.end <= span.end
+                    })
+            })
+            .collect();
+        let mut repeats = enclosed_repeats.into_iter();
+        errors.retain(|_| !repeats.next().unwrap_or(false));
         // Note WHERE the failing bound is declared (`T: Feed` in the
         // callee's signature — cross-file when the callee is std's): the
         // generic's registration entity carries the declaration's name span.
@@ -19680,7 +19729,6 @@ impl<'src> Analyzer<'src> {
         else {
             return true;
         };
-        let bindings: Vec<(TypeId, TypeId)> = bindings.into_iter().collect();
         // A bound's arguments are written in the impl's own binders
         // (`impl KeyedSource<type K, type T: Keyed<K>>`), so they are read
         // through what THIS receiver binds those to — `Keyed<str>` on a
@@ -19688,7 +19736,24 @@ impl<'src> Analyzer<'src> {
         // `Keyed<str>` and the impl answered "does not hold" for its own
         // receiver (B395, where an inherited default is carried by an impl
         // whose bounds hold and the false no handed it to a blanket).
-        let context: SubstitutionContext = bindings.iter().copied().collect();
+        let mut context: SubstitutionContext = bindings.into_iter().collect();
+        // B476: a binder written only INSIDE a bound — the `I` of `impl type F:
+        // Fl<Option<type I: Src<type U>>>` — is bound from what the receiver
+        // provides at that bound, and then its OWN bounds are checked like the
+        // subject's: a `Cell<Cell<i32>>` binds nothing at `Fl<Option<I>>` (its
+        // `Fl` argument is no `Option`), so that arm does not hold, and a
+        // `Cell<Option<i32>>` binds `I = i32`, which is no `Src`. Left open, the
+        // inner binder read as a hole and the arm held for every flow.
+        if self.bound_argument_grounding_depth < 4 {
+            self.bound_argument_grounding_depth += 1;
+            self.bind_subject_bound_binders(impl_subject, subject_type, &mut context);
+            self.bound_argument_grounding_depth -= 1;
+        }
+        let mut bindings: Vec<(TypeId, TypeId)> = context
+            .iter()
+            .map(|(binder, bound)| (*binder, *bound))
+            .collect();
+        bindings.sort_by_key(|(binder, _)| binder.0);
         for (constraint_id, bound_id) in bindings {
             let bound = bound_id.get_type(self);
             // A122: a binder's TUPLE bound holds for a tuple of an admitted
@@ -19776,8 +19841,12 @@ impl<'src> Analyzer<'src> {
                 .then(|| (implementation.subject, provided.clone()))
             })
             .collect();
+        // No provider at all is DECIDED, not undecided (B476): a nominal
+        // receiver nothing implements the trait for does not meet the bound at
+        // any arguments — `Option<Cell<i32>>` at a binder `I: Src<U>` — and only
+        // an object, whose table is its implementation, still can.
         if providers.is_empty() {
-            return true;
+            return self.type_implements_trait(subject_type, trait_id);
         }
         let mut decided = false;
         for (provider_subject, written) in providers {
@@ -19902,18 +19971,39 @@ impl<'src> Analyzer<'src> {
             return effective;
         }
         let impl_subject_type = impl_subject.get_type(self);
-        let bindings: SubstitutionContext = self
+        let mut bindings: SubstitutionContext = self
             .reconcile_declaration(&impl_subject_type, subject_type, &impl_subject_type)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
-        effective
-            .into_iter()
-            .map(|argument_id| {
-                let argument = argument_id.get_type(self);
-                let resolved = self.substitute_type(&argument, &bindings);
-                resolved.get_type_id(self)
-            })
-            .collect()
+        let substitute = |analyzer: &mut Self, bindings: &SubstitutionContext| -> Vec<TypeId> {
+            effective
+                .iter()
+                .map(|argument_id| {
+                    let argument = argument_id.get_type(analyzer);
+                    let resolved = analyzer.substitute_type(&argument, bindings);
+                    resolved.get_type_id(analyzer)
+                })
+                .collect()
+        };
+        let resolved = substitute(self, &bindings);
+        // B476: a BLANKET writes its home's arguments in a binder its subject
+        // does not carry — `impl type S: Src<type T> with Fl<T>` provides
+        // `Fl<T>`, `T` living in `S`'s bound — so the substitution above leaves
+        // `T` abstract, and an abstract argument agreed with every bound: a
+        // `Cell<i32>` met `S: Fl<str>` and `S: Fl<i32>` alike, and two arms
+        // over `Fl<X>` collided on every receiver. The receiver's own impl of
+        // the bound's trait decides `T` (B379's grounding, for the home).
+        if self.bound_argument_grounding_depth < 4
+            && resolved
+                .iter()
+                .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
+        {
+            self.bound_argument_grounding_depth += 1;
+            self.bind_subject_bound_binders(impl_subject, subject_type, &mut bindings);
+            self.bound_argument_grounding_depth -= 1;
+            return substitute(self, &bindings);
+        }
+        resolved
     }
 
     /// The precedence rule of `proposal/method-resolution.md` §3, for a
@@ -19950,11 +20040,30 @@ impl<'src> Analyzer<'src> {
                 Type::Generic(_)
             )
         };
+        // B477: between BLANKETS the specificity order decides, not the order
+        // they were declared in — a bound narrower at its arguments
+        // (`Pipe<Task<Result<T, E>>>` over `Pipe<Task<T>>`) wins either way
+        // round. Two that do not rank keep the first declared, and the
+        // post-build pass reports that pair at the call (B330's residue).
+        let inherent_blankets: Vec<&ImplMemberCandidate> = candidates
+            .iter()
+            .filter(inherent)
+            .filter(|candidate| blanket(candidate))
+            .collect();
+        let most_specific_blanket = inherent_blankets
+            .iter()
+            .copied()
+            .find(|candidate| {
+                !inherent_blankets
+                    .iter()
+                    .any(|other| self.impl_outranks(other, candidate))
+            })
+            .or_else(|| inherent_blankets.first().copied());
         if let Some(winner) = candidates
             .iter()
             .filter(inherent)
             .find(|candidate| !blanket(candidate))
-            .or_else(|| candidates.iter().find(inherent))
+            .or(most_specific_blanket)
         {
             return ImplMemberResolution::Found(winner.member_id, winner.impl_subject);
         }
@@ -20129,6 +20238,13 @@ impl<'src> Analyzer<'src> {
     /// aligned binder, with at least one position strictly larger; two binders
     /// bounded by unrelated traits are neither, which is the residue R3 reports
     /// rather than ranks.
+    ///
+    /// B477: one trait bounding both binders at different ARGUMENTS ranks by
+    /// those arguments' shapes, as subjects do — `type P: Pipe<Task<Result<T,
+    /// E>>>` ≻ `type P: Pipe<Task<T>>`, because the second's argument pattern
+    /// matches the first's and not the other way round. Without it the pair
+    /// ranked neither way, and an inherent member was taken from whichever
+    /// block was declared first.
     fn subject_bounds_are_stronger(&self, stronger: TypeId, weaker: TypeId) -> bool {
         let mut stronger_binders = Vec::new();
         let mut weaker_binders = Vec::new();
@@ -20153,8 +20269,47 @@ impl<'src> Analyzer<'src> {
             {
                 strictly = true;
             }
+            match self.bound_arguments_order(*stronger_id, *weaker_id) {
+                ArgumentOrder::Narrower => strictly = true,
+                ArgumentOrder::Same => {}
+                ArgumentOrder::Unranked => return false,
+            }
         }
         strictly
+    }
+
+    /// How a binder's bound ARGUMENTS compare with another's, trait by trait
+    /// where both binders name the same trait directly (B477): `Narrower` when
+    /// every argument of `left`'s is matched by `right`'s pattern and one is
+    /// not matched back, `Same` when each matches the other (or no trait is
+    /// shared), `Unranked` when some argument of `left`'s is not an instance of
+    /// `right`'s. Binders inside the arguments (`Option<type I>`) are holes.
+    fn bound_arguments_order(&self, left: TypeId, right: TypeId) -> ArgumentOrder {
+        let right_bounds = self.generic_bound_traits(right);
+        let mut narrower = false;
+        for (trait_id, left_arguments) in self.generic_bound_traits(left) {
+            let Some((_, right_arguments)) = right_bounds
+                .iter()
+                .find(|(right_trait, _)| *right_trait == trait_id)
+            else {
+                continue;
+            };
+            if left_arguments.len() != right_arguments.len() {
+                continue;
+            }
+            for (left_argument, right_argument) in left_arguments.iter().zip(right_arguments) {
+                if !self.impl_subject_matches(*right_argument, *left_argument) {
+                    return ArgumentOrder::Unranked;
+                }
+                if !self.impl_subject_matches(*left_argument, *right_argument) {
+                    narrower = true;
+                }
+            }
+        }
+        match narrower {
+            true => ArgumentOrder::Narrower,
+            false => ArgumentOrder::Same,
+        }
     }
 
     /// A binder's declared bounds CLOSED over the supertrait graph — the set
@@ -31363,6 +31518,37 @@ impl<'src> Analyzer<'src> {
              style values' `css` members were renamed out of its way: `Length::css(…)` is now \
              `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now `.text`"
         ))
+    }
+
+    /// B476's steer: std's `flatten` is the `Option` join over a flow of
+    /// `Option<source>` (A142 §3.2), and a flow of plain sources — the total
+    /// join A4's `flatten` used to be — meets its `Flow<Option<..>>` bound no
+    /// more. The refusal names the spelling the total join took. Keyed on
+    /// std's own `flatten` failing std's `Flow`: a user's `flatten` is
+    /// answered by the ordinary sentence.
+    fn total_join_steer(&self, call_id: Id, required_trait_id: Id) -> Option<String> {
+        let from_std = |id: Id| {
+            self.source_of_id(id)
+                .is_some_and(|source| self.std_sources.contains(&source))
+        };
+        let trait_ = self.traits.get(&required_trait_id)?;
+        if trait_.name != "Flow" || !from_std(required_trait_id) {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        let Some(Expr::Local(member_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return None;
+        };
+        let function = self.functions.get(member_id)?;
+        if function.name != "flatten" || !from_std(*member_id) {
+            return None;
+        }
+        Some(
+            "; `flatten` joins a flow of `Option<source>` (a `None` reads `None`), and a flow \
+             of plain sources is followed with `.switch(|inner| inner)`"
+                .to_string(),
+        )
     }
 
     /// A142 §3.3's steer: a receiver that implements the PIPE trait, asked for
