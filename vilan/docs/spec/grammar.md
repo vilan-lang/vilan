@@ -76,10 +76,15 @@ impl-selector = "(" "impl" type ")"
                 [ "::" ( MEMBER | "{" MEMBER { "," MEMBER } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
-export      = "export" [ "(" "in" path-branch ")" ]
+export      = { lead-attribute }   (* B445: the item's own prefix, written first *)
+              "export" [ "(" "in" path-branch ")" ]
               [ deprecated-label ]   (* only before `import`: B382's re-export *)
               statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
+lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
+               | resource-attr | extern-attr | "[" "must_use" "]" | "[" "rpc" "]"
+               | "[" "trait_only" "]" | derive-attr | service-attr
+               | client-service-attr | macro-attr ;
 ```
 
 `import` brings names from another module into scope; `use` brings names
@@ -96,8 +101,16 @@ declaration as the module's surface (or re-exports an import);
 is the one form carrying no inner statement. The wrapper does not change
 the statement's own shape, so a wrapped `let` keeps its terminator —
 `export let registry = …;` — and a wrapped `fun` still takes none. A
-declaration carrying attributes is wrapped as a whole, with the marker
-ahead of them: `export [derive(Wire)] struct Handle { … }`. A `#` before
+declaration carrying attributes is wrapped as a whole, attributes and all,
+and its attribute run may stand on EITHER side of the marker (B445):
+`export [derive(Wire)] struct Handle { … }` and `[derive(Wire)] export
+struct Handle { … }` are one declaration, as are `[platform("browser")]
+export impl …` and `export [platform("browser")] impl …`. An `attribute`
+written ahead of `export` is read exactly as if it followed the marker
+(and its scope): it joins the item's own prefix, whose order and
+admissions are the item production's (§3.3), and a run may be split across
+the marker. `vilan fmt` prints the run after the marker. Only an attribute
+shape — `[` then a name — leads a marker; `export *;` takes none. A `#` before
 a path element is the **reach** marker:
 `import pkg::a::{ #hidden };` imports an item the module does not export,
 deliberately (§4.3, §4.8).
@@ -433,15 +446,15 @@ optionally, each element (`T: (2..)`, `T: (..: Display)`); see §5.9.
 ### Attributes and macro items
 
 ```text
-derived-item   = "[" "derive" "(" IDENT { "," IDENT } [ "," ] ")" "]"
-                 ( struct | enum ) ;
+derived-item   = derive-attr ( struct | enum ) ;
+derive-attr    = "[" "derive" "(" IDENT { "," IDENT } [ "," ] ")" "]" ;
 service-item   = { service-attr | client-service-attr }- struct ;
 service-attr   = "[" "service" [ "(" service-args ")" ] "]" ;
 service-args   = service-arg { "," service-arg } ;   (* a client name leads or is absent; each other arg at most once *)
 service-arg    = IDENT | "http" | "client" "=" IDENT ;
 client-service-attr = "[" "client_service" "]" ;
-macro-attributed-item = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]"
-                        ( struct | enum | function ) ;
+macro-attributed-item = macro-attr ( struct | enum | function ) ;
+macro-attr       = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]" ;
 macro-fun        = "macro" function ;
 macro-invocation = "macro" IDENT "(" [ expr-span { "," expr-span } ] ")" ;
 macro-block      = "macro" block ;

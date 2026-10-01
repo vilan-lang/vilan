@@ -97,9 +97,10 @@ fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
-/// nothing but trivia and the five canonical orders. Six order-insensitivities
+/// nothing but trivia and the canonical orders. Order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
-/// (dropped), the canonical ordering of a top-level import run (see the
+/// (dropped), an `export` marker written after its item's attributes (moved
+/// ahead of them, B445), the canonical ordering of a top-level import run (see the
 /// canonical-import-order section below), the canonical ordering of an ELEMENT
 /// HEAD's items (see the canonical-element-head-order section), the canonical
 /// ordering of an `on` HEAD's condition values (see the canonical-on-head-order
@@ -116,10 +117,86 @@ fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
         sort_import_runs(&hoist_export_all_markers(drop_redundant_import_aliases(
             canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
-                collapse_field_shorthands(drop_trailing_commas(tokens)),
+                collapse_field_shorthands(lead_export_past_attribute_runs(drop_trailing_commas(
+                    tokens,
+                ))),
             )),
         ))),
     ))))
+}
+
+/// Moves a declaration's `export (in PATH)?` marker AHEAD of an attribute run
+/// written before it — `[platform("browser")] export impl …` becomes `export
+/// [platform("browser")] impl …` — so the safety net accepts the printer
+/// giving the marker its one printed place (B445). The parser reads the same
+/// rotation (`Parser::lead_export_past_its_attributes`), so the tree the
+/// printer walks already holds the run as the item's prefix.
+///
+/// Recognized by SHAPE where a statement can begin (the stream's start, or
+/// after a `;`, `{` or `}`): a run of `[name …]` groups ending at `export`.
+/// A relocation, not a deletion, so the net still sees every attribute and
+/// the marker survive; it runs over both streams.
+fn lead_export_past_attribute_runs(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let at_statement_head = matches!(result.last(), None | Some(Token::Ctrl(';' | '{' | '}')));
+        if at_statement_head
+            && let Some((marker, past_marker)) = attribute_run_before_export(&tokens, index)
+        {
+            result.extend(tokens[marker..past_marker].iter().cloned());
+            result.extend(tokens[index..marker].iter().cloned());
+            index = past_marker;
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// When a run of `[name …]` groups starting at `start` ends at an `export`
+/// marker, the marker's index and the index just past it (and past its `(in
+/// PATH)` scope); `None` otherwise, and for `export *;`, which takes no
+/// attributes.
+fn attribute_run_before_export(tokens: &[Token<'_>], start: usize) -> Option<(usize, usize)> {
+    let past_group = |open: usize| -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = open;
+        loop {
+            match tokens.get(at)? {
+                Token::Ctrl('[' | '(' | '{') => depth += 1,
+                Token::Ctrl(']' | ')' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    };
+    let mut at = start;
+    while tokens.get(at) == Some(&Token::Ctrl('['))
+        && matches!(tokens.get(at + 1), Some(Token::Ident(_)))
+    {
+        at = past_group(at)?;
+    }
+    if at == start || tokens.get(at) != Some(&Token::Export) {
+        return None;
+    }
+    let marker = at;
+    let mut past_marker = marker + 1;
+    if tokens.get(past_marker) == Some(&Token::Ctrl('('))
+        && tokens.get(past_marker + 1) == Some(&Token::In)
+    {
+        past_marker = past_group(past_marker)?;
+    }
+    if tokens.get(past_marker) == Some(&Token::Op("*")) {
+        return None;
+    }
+    Some((marker, past_marker))
 }
 
 /// Moves every bare `export *;` to the FRONT of the token stream, so the safety
@@ -8484,6 +8561,53 @@ mod reformats {
             "fun first(xs: &mut List<i32>): &mut i32 context (a, b) borrows xs {\n\t&mut xs[0]\n}\n",
             "fun first(xs: &mut List<i32>): &mut i32 borrows xs context (a, b) {\n\t&mut xs[0]\n}\n",
         );
+    }
+
+    // B445: an attribute run may stand on either side of `export`, and the
+    // formatter prints ONE side — after the marker, the spelling the estate
+    // already writes (`export [extern(..)]` ⏎ `async external fun …`). Every
+    // item kind a label leads, a run of several, a scoped marker, a
+    // re-export's label, a comment above the statement, a run split across
+    // the marker, and a rotated statement after an untouched one.
+    #[test]
+    fn b445_attributes_ahead_of_export_print_after_it() {
+        assert_formats(
+            "[platform(\"browser\")] export impl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n",
+            "export [platform(\"browser\")]\nimpl P with Show {\n\tfun show(self): str {\n\t\t\"p\"\n\t}\n}\n",
+        );
+        for (ahead, after) in [
+            (
+                "[deprecated(\"use g()\")] [must_use] export(in pkg) fun f(): i32 { 1 }\n",
+                "export(in pkg) [deprecated(\"use g()\")] [must_use] fun f(): i32 { 1 }\n",
+            ),
+            (
+                "[derive(Debug)] export struct S { x: i32 }\n",
+                "export [derive(Debug)] struct S { x: i32 }\n",
+            ),
+            (
+                "// the cache\n[internal(\"why\")] export let x = 1;\n",
+                "// the cache\nexport [internal(\"why\")] let x = 1;\n",
+            ),
+            (
+                "[deprecated(\"use a::c\")] export import a::b;\n",
+                "export [deprecated(\"use a::c\")] import a::b;\n",
+            ),
+            (
+                "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }\n",
+                "export [deprecated(\"use g()\")] [platform(\"node\")] fun f(): i32 { 1 }\n",
+            ),
+            (
+                "export fun a() {}\n\n[must_use] export fun b(): i32 { 1 }\n",
+                "export fun a() {}\n\nexport [must_use] fun b(): i32 { 1 }\n",
+            ),
+        ] {
+            let canonical = format(after);
+            assert!(
+                canonical.contains("export") && !canonical.contains("] export"),
+                "the marker leads the run: {canonical:?}"
+            );
+            assert_formats(ahead, &canonical);
+        }
     }
 
     // E146 rule 3, in full: both written orders in, ONE order out, for a

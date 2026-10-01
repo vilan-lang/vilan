@@ -1096,15 +1096,15 @@ fn parse_with(
     source: &str,
     preserve_paren_groups: bool,
 ) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
-    let (tokens, lex_errors) = lexing::tokenize(source);
+    let (mut tokens, lex_errors) = lexing::tokenize(source);
+    let token_count = tokens.len();
 
-    let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
+    let mut parser = Parser::new(&mut tokens, source, preserve_paren_groups);
     let root = parser.parse_program();
     let mut then_form_errors = Vec::new();
     refuse_then_forms_read_as_values(&root, &mut then_form_errors);
     debug_assert_eq!(
-        parser.position,
-        tokens.len(),
+        parser.position, token_count,
         "the statement/item synchronizer consumes the whole token stream: an \
          unparseable statement is reported and skipped past, never left over",
     );
@@ -1154,8 +1154,8 @@ fn parse_with(
 /// binds no entity. Sorted, without duplicates; a recovered parse answers for
 /// what it recovered.
 pub fn contextual_keyword_readings(source: &str) -> Vec<Span> {
-    let (tokens, _) = lexing::tokenize(source);
-    let mut parser = Parser::new(&tokens, source, false);
+    let (mut tokens, _) = lexing::tokenize(source);
+    let mut parser = Parser::new(&mut tokens, source, false);
     parser.parse_program();
     let mut indices = std::mem::take(&mut parser.contextual_readings);
     indices.sort_unstable();
@@ -1173,8 +1173,8 @@ pub fn contextual_keyword_readings(source: &str) -> Vec<Span> {
 /// token, so a keyword hover would otherwise answer for every one of them.
 /// Sorted, without duplicates.
 pub fn keyword_member_readings(source: &str) -> Vec<Span> {
-    let (tokens, _) = lexing::tokenize(source);
-    let mut parser = Parser::new(&tokens, source, false);
+    let (mut tokens, _) = lexing::tokenize(source);
+    let mut parser = Parser::new(&mut tokens, source, false);
     parser.parse_program();
     let mut indices = std::mem::take(&mut parser.member_readings);
     indices.sort_unstable();
@@ -1186,7 +1186,11 @@ pub fn keyword_member_readings(source: &str) -> Vec<Span> {
 }
 
 struct Parser<'a, 'src> {
-    tokens: &'a [Spanned<Token<'src>>],
+    /// The token stream, in SOURCE order but for one rewrite: an attribute run
+    /// written ahead of `export` is rotated behind the marker as the statement
+    /// is reached ([`Parser::lead_export_past_its_attributes`], B445), which is
+    /// why the parser holds it mutably. Every token keeps its own span.
+    tokens: &'a mut [Spanned<Token<'src>>],
     position: usize,
     /// The source the tokens index into — read only to place the **gap anchor** of
     /// a missing statement terminator on the last CHARACTER of the preceding token
@@ -1528,17 +1532,18 @@ fn assignment_reachable(tokens: &[Spanned<Token<'_>>]) -> Vec<bool> {
 
 impl<'a, 'src> Parser<'a, 'src> {
     fn new(
-        tokens: &'a [Spanned<Token<'src>>],
+        tokens: &'a mut [Spanned<Token<'src>>],
         source: &'src str,
         preserve_paren_groups: bool,
     ) -> Self {
+        let assignment_reachable = assignment_reachable(tokens);
         Parser {
             tokens,
             position: 0,
             source,
             eoi: source.len(),
             errors: Vec::new(),
-            assignment_reachable: assignment_reachable(tokens),
+            assignment_reachable,
             farthest_failure: None,
             context_stack: Vec::new(),
             preserve_paren_groups,
@@ -2858,6 +2863,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // host of F27 R1's platform). Taken here, once, so every statement
         // nested inside this one reads false.
         let file_head = std::mem::take(&mut self.file_head);
+        self.lead_export_past_its_attributes();
         if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
@@ -2954,6 +2960,81 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some(item);
         }
         None
+    }
+
+    /// B445: a declaration's attribute run may be written AHEAD of its
+    /// `export` — `[platform("browser")] export impl P with Show { … }` — as
+    /// well as after it, and either way the run is the ITEM's prefix: the
+    /// marker wraps the declaration whole (§3.2), attributes and all.
+    ///
+    /// Read by rotating the tokens, once, where the statement begins: the
+    /// run `[..] [..]` and the marker `export (in PATH)?` after it trade
+    /// places, so every production downstream reads the one spelling it
+    /// always read, `export [..] item`, and the attribute prefixes keep the
+    /// single order each already states rather than gaining a second. Each
+    /// token keeps its own span; [`Parser::parse_export`] widens the export's
+    /// span back over the run, so the statement still begins where it was
+    /// written. The assignment table rotates with the tokens it describes.
+    ///
+    /// Only an ATTRIBUTE run leads: each group is `[` followed by a name, and
+    /// the run must end at the marker. A list literal there (`[1] export …`)
+    /// is the expression statement it always was, and a run before `export
+    /// *;` is left for the statement reader to refuse — `*;` takes no
+    /// attributes. Nothing else in the grammar puts a `[name …]` group in
+    /// front of `export`, so a rotation is never undone: a later alternative
+    /// at this position reads the same rotated stream, and finds no run to
+    /// rotate again.
+    fn lead_export_past_its_attributes(&mut self) {
+        let start = self.position;
+        let mut at = start;
+        while self.tokens.get(at).map(|(token, _)| token) == Some(&Token::Ctrl('['))
+            && matches!(self.tokens.get(at + 1), Some((Token::Ident(_), _)))
+        {
+            let Some(after) = self.past_balanced_group(at) else {
+                return;
+            };
+            at = after;
+        }
+        let marker = at;
+        if marker == start
+            || self.tokens.get(marker).map(|(token, _)| token) != Some(&Token::Export)
+        {
+            return;
+        }
+        let mut past_marker = marker + 1;
+        if self.tokens.get(past_marker).map(|(token, _)| token) == Some(&Token::Ctrl('('))
+            && self.tokens.get(past_marker + 1).map(|(token, _)| token) == Some(&Token::In)
+        {
+            let Some(after) = self.past_balanced_group(past_marker) else {
+                return;
+            };
+            past_marker = after;
+        }
+        if matches!(self.tokens.get(past_marker), Some((Token::Op("*"), _))) {
+            return;
+        }
+        self.tokens[start..past_marker].rotate_left(marker - start);
+        self.assignment_reachable[start..past_marker].rotate_left(marker - start);
+    }
+
+    /// The index just past the bracket group opening at `open` (a `[`, `(` or
+    /// `{`), counting every bracket kind, or `None` if the stream ends first.
+    fn past_balanced_group(&self, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = open;
+        loop {
+            match &self.tokens.get(at)?.0 {
+                Token::Ctrl('[' | '(' | '{') => depth += 1,
+                Token::Ctrl(']' | ')' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
     }
 
     // --- Expressions ---------------------------------------------------------
@@ -7535,10 +7616,13 @@ impl<'a, 'src> Parser<'a, 'src> {
                 hint: None,
             });
         }
-        Some((
-            Node::Export(scope, Box::new(inner), labels),
-            self.span_from(start),
-        ))
+        // B445: an attribute run written ahead of the marker was rotated
+        // behind it ([`Parser::lead_export_past_its_attributes`]), so the
+        // inner item begins EARLIER in the source than the marker does; the
+        // statement begins where the author began it.
+        let span = self.span_from(start);
+        let span = Span::from(span.start.min(inner.1.start)..span.end);
+        Some((Node::Export(scope, Box::new(inner), labels), span))
     }
 
     /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
@@ -8860,13 +8944,13 @@ mod tests {
     }
 
     fn expr_in_mode(source: &str, preserve_paren_groups: bool) -> Spanned<Node<'_>> {
-        let (tokens, errors) = lexing::tokenize(source);
+        let (mut tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, preserve_paren_groups);
         let node = parser.parse_expression().expect("expression did not parse");
         assert_eq!(
-            parser.position,
-            tokens.len(),
+            parser.position, token_count,
             "unconsumed tokens parsing {source:?}: {node:?}"
         );
         node
@@ -8874,13 +8958,13 @@ mod tests {
 
     /// Parse `source` as a condition-position expression (§H.1: struct-literal-free).
     fn condition(source: &str) -> Spanned<Node<'_>> {
-        let (tokens, errors) = lexing::tokenize(source);
+        let (mut tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source, false);
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
         let node = parser.parse_condition().expect("condition did not parse");
         assert_eq!(
-            parser.position,
-            tokens.len(),
+            parser.position, token_count,
             "unconsumed parsing {source:?}"
         );
         node
@@ -8888,13 +8972,13 @@ mod tests {
 
     /// Parse `source` as a type, asserting a clean full-consumption parse.
     fn type_(source: &str) -> Spanned<Node<'_>> {
-        let (tokens, errors) = lexing::tokenize(source);
+        let (mut tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source, false);
+        let token_count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
         let node = parser.parse_type().expect("type did not parse");
         assert_eq!(
-            parser.position,
-            tokens.len(),
+            parser.position, token_count,
             "unconsumed parsing {source:?}"
         );
         node
@@ -9234,9 +9318,9 @@ mod tests {
         // comparison. As a whole expression the `>` is left dangling, so only the
         // expression prefix is checked here; the generics-attach-to-a-call contrast
         // is `default<Id>()` above.
-        let (tokens, errors) = lexing::tokenize("foo<T>");
+        let (mut tokens, errors) = lexing::tokenize("foo<T>");
         assert!(errors.is_empty());
-        let mut parser = Parser::new(&tokens, "foo<T>", false);
+        let mut parser = Parser::new(&mut tokens, "foo<T>", false);
         let node = parser.parse_expression().expect("prefix parses");
         assert!(matches!(node.0, Node::Binary(BinaryOp::Lt, _, _)));
     }
@@ -10097,6 +10181,116 @@ mod tests {
             }
             other => panic!("expected a fully-attributed Func, got {other:?}"),
         }
+    }
+
+    /// The exported item under an `Export` with no scope and no re-export
+    /// label, or a panic naming what came back instead.
+    fn exported(node: Node<'_>) -> Node<'_> {
+        match node {
+            Node::Export(None, inner, None) => inner.0,
+            other => panic!("expected a plain `export` of an item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attributes_written_before_export_are_the_exported_items_own() {
+        // B445: the attribute run may stand on either side of `export`, and
+        // either way it is the ITEM's prefix — the tree is the one `export
+        // [..] item` builds. The issue's own program first.
+        match exported(only_item(
+            "[platform(\"browser\")] export impl P with Show { fun show(self): str { \"p\" } }",
+        )) {
+            Node::Impl(_, traits, _, Some(labels)) => {
+                assert_eq!(traits.len(), 1);
+                let patterns: Vec<&str> = labels
+                    .platform
+                    .iter()
+                    .map(|(pattern, _)| *pattern)
+                    .collect();
+                assert_eq!(patterns, ["browser"]);
+            }
+            other => panic!("expected a labelled Impl, got {other:?}"),
+        }
+        // A RUN, in the function prefix's order, before a scoped export.
+        match only_item("[deprecated(\"use g()\")] [must_use] export(in pkg) fun f(): i32 { 1 }") {
+            Node::Export(Some(scope), inner, None) => {
+                assert_eq!(scope.path.len(), 1);
+                match inner.0 {
+                    Node::Func(function) => {
+                        assert_eq!(function.deprecated, Some("use g()"));
+                        assert!(function.must_use);
+                    }
+                    other => panic!("expected a Func, got {other:?}"),
+                }
+            }
+            other => panic!("expected a scoped Export, got {other:?}"),
+        }
+        // A wrapper attribute: the derive still wraps the struct.
+        match exported(only_item("[derive(Debug)] export struct S { x: i32 }")) {
+            Node::Derive(names, inner) => {
+                assert_eq!(names[0].0, "Debug");
+                assert!(matches!(inner.0, Node::Struct(..)));
+            }
+            other => panic!("expected a Derive, got {other:?}"),
+        }
+        // A module binding's label.
+        match exported(only_item("[internal(\"why\")] export let x = 1;")) {
+            Node::Let(_, _, _, _, _, Some(labels)) => assert_eq!(labels.internal, Some("why")),
+            other => panic!("expected a labelled Let, got {other:?}"),
+        }
+        // `[resource]` closes the type's prefix from either side.
+        match exported(only_item("[resource] export struct Handle { id: i32 }")) {
+            Node::Struct(_, _, external, resource, ..) => assert!(resource && !external),
+            other => panic!("expected a resource Struct, got {other:?}"),
+        }
+        // Both sides at once: one prefix, read in its order.
+        match exported(only_item(
+            "[deprecated(\"use g()\")] export [platform(\"node\")] fun f(): i32 { 1 }",
+        )) {
+            Node::Func(function) => {
+                assert_eq!(function.deprecated, Some("use g()"));
+                assert_eq!(function.platform_fence.len(), 1);
+            }
+            other => panic!("expected a Func, got {other:?}"),
+        }
+        // B382's re-export label, written ahead of the marker: still the
+        // EXPORT's (it deprecates the name the re-export publishes).
+        match only_item("[deprecated(\"use a::c\")] export import a::b;") {
+            Node::Export(None, inner, Some(labels)) => {
+                assert!(matches!(inner.0, Node::Import(..)));
+                assert_eq!(labels.deprecated, Some("use a::c"));
+            }
+            other => panic!("expected a labelled re-export, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_export_written_after_its_attributes_spans_them() {
+        // The statement begins at the attribute: a diagnostic about the whole
+        // export, a folding range and the formatter's comment placement all
+        // read the Export's span, and it must cover what the author wrote.
+        let source = "[platform(\"node\")] export fun f(): i32 { 1 }";
+        let (statements, _) = program(source);
+        assert_eq!(statements[0].1.start, 0);
+        assert_eq!(statements[0].1.end, source.len());
+        // Two statements in a row, the second attributed ahead of its marker.
+        let source = "export fun a() {}\n[must_use] export fun b(): i32 { 1 }\nfun c() {}";
+        let (statements, _) = program(source);
+        assert_eq!(statements.len(), 3);
+        assert_eq!(
+            &source[statements[1].1.start..statements[1].1.end],
+            "[must_use] export fun b(): i32 { 1 }"
+        );
+    }
+
+    #[test]
+    fn a_list_before_export_is_not_an_attribute_run() {
+        // Only an ATTRIBUTE shape (`[` then a name) leads a marker; a list
+        // literal there is the expression statement it always was, refused
+        // for its missing `;`.
+        assert!(declines("[1] export fun f() {}"));
+        // An attribute run before `export *;` is not an item's prefix.
+        assert!(declines("[platform(\"node\")] export *;"));
     }
 
     #[test]
