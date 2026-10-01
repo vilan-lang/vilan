@@ -42260,7 +42260,16 @@ impl<'src> Analyzer<'src> {
             .return_inference_stack
             .pop()
             .is_some_and(|(_, exact)| exact);
-        if exact && !matches!(inference.type_, Type::Unresolved) {
+        // F65: and only an answer in the function's OWN terms is the
+        // function's. One inferred under a caller's substitution is that
+        // caller's instantiation (`SignalCell<str>` for `cell("s")`), and the
+        // record is keyed by the function alone: the read above never serves
+        // it across callers, but the Program's consumers read the record as
+        // THE return type — the Rust backend's `return_type_of`, per instance —
+        // and every instance of a generic function returned the LAST caller's
+        // type (rustc E0308).
+        if exact && substitution_context.is_empty() && !matches!(inference.type_, Type::Unresolved)
+        {
             let type_id = inference.type_.clone().get_type_id(self);
             self.inferred_return_types.insert(function_id, type_id);
         }
