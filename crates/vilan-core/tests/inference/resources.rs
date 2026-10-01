@@ -8971,3 +8971,61 @@ fn r11_instantiations_do_not_mint_a_type_slot_per_place_in_the_program() {
          (and minting for) places outside the instantiated callee (M94)"
     );
 }
+
+// --- M95: resource classification mints no slot a substitution cannot change ---
+//
+// `compute_resource_types` classifies every type slot, and classifying an
+// instantiation (`Holder<i32>`) substitutes the declaration's members through
+// its arguments. Each substitution minted a fresh slot, even where it changed
+// nothing — the member mentioned no generic, or was a generic bound to a
+// concrete slot — and slots are not interned, so the classification memo
+// missed on every copy: 274k fresh slots over kolt's client's 343k roots.
+// The member's own (or its bound's) slot classifies identically. Only a count
+// can see the difference.
+
+#[test]
+fn classifying_an_instantiation_mints_no_slot_its_substitution_cannot_change() {
+    const SMALL: usize = 10;
+    const LARGE: usize = 60;
+    let program = |declaration: &str, literal: &str, functions: usize| {
+        let mut source = format!("import std::io::print;\n{declaration}\n");
+        for index in 0..functions {
+            source.push_str(&format!(
+                "fun filler_{index}(): i32 {{ let held = {literal}; held.a + held.b + held.c }}\n"
+            ));
+        }
+        source.push_str("fun main() { print(filler_0()); }\n");
+        source
+    };
+    let generic = |functions| {
+        program(
+            "struct Holder<T> { a: T, b: T, c: T }",
+            "Holder { a = 1, b = 2, c = 3 }",
+            functions,
+        )
+    };
+    let plain = |functions| {
+        program(
+            "struct Plain { a: i32, b: i32, c: i32 }",
+            "Plain { a = 1, b = 2, c = 3 }",
+            functions,
+        )
+    };
+    let plain_growth =
+        type_slots_after_one_analysis(&plain(LARGE)) - type_slots_after_one_analysis(&plain(SMALL));
+    let generic_growth = type_slots_after_one_analysis(&generic(LARGE))
+        - type_slots_after_one_analysis(&generic(SMALL));
+    // The generic program's own analysis mints four more slots per function
+    // than the plain one (the instantiation and its substituted reads); the
+    // classification's copies added six more — two `Holder<i32>` roots per
+    // function, three members each — reading 10.0 with them planted back.
+    let added = LARGE - SMALL;
+    let extra_per_function = generic_growth.saturating_sub(plain_growth) as f64 / added as f64;
+    assert!(
+        extra_per_function < 7.0,
+        "adding {added} functions that each build a `Holder<i32>` grew the program by \
+         {generic_growth} type slots against {plain_growth} for the same functions over a \
+         non-generic struct ({extra_per_function:.1} extra per function): classification is \
+         minting a slot per member it substitutes without changing (M95)"
+    );
+}
