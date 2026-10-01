@@ -107,6 +107,18 @@ fn analyze_on_64_mib(source: String) -> Analysis {
         .expect("worker panicked — the depth bound must refuse, never overflow")
 }
 
+/// The WALK canary's thread size (the parser canary has no such margin in a
+/// debug build and stays at 2 MiB): libtest's own 2 MiB, or `VILAN_CANARY_STACK_KIB`
+/// when the seal asks for the MARGIN (it runs them at 1536). Order 44 grew
+/// the walk's frame past the 2 MiB thread and only Windows CI saw it; a run
+/// at three quarters of the size says so a whole order earlier.
+fn canary_stack_bytes() -> usize {
+    std::env::var("VILAN_CANARY_STACK_KIB")
+        .ok()
+        .and_then(|kib| kib.parse::<usize>().ok())
+        .map_or(2 * 1024 * 1024, |kib| kib * 1024)
+}
+
 #[test]
 fn a_5000_deep_expression_is_refused_cleanly() {
     // A method chain nests the walk once per link (each call's subject is the
@@ -286,7 +298,7 @@ fn a_thirty_level_chain_still_fits_libtests_own_two_mib_thread() {
         ".trim()".repeat(30)
     );
     let produced = std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
+        .stack_size(canary_stack_bytes())
         .spawn(move || {
             let leaked: &'static str = Box::leak(source.into_boxed_str());
             let (program, _errors) = analyze_source(
