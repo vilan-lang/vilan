@@ -41657,6 +41657,9 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         let mut first_match: Option<Vec<TypeId>> = None;
+        // The generics the receiver itself carries (B479, below).
+        let mut receiver_generics = Vec::new();
+        self.collect_generics(concrete, 0, &mut receiver_generics);
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
             // B390: a refused subject provides nothing (`impl_subject_admits`).
@@ -41719,10 +41722,19 @@ impl<'src> Analyzer<'src> {
                 // out concrete answered the question; one that did not is kept
                 // only as the fallback, which is exactly what this returned
                 // before there was anything to prefer.
-                if !resolved
-                    .iter()
-                    .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
-                {
+                //
+                // B479: a generic the RECEIVER itself carries is an answer, not
+                // a hole — inside a generic body, `Derive<S, A, J>` provides
+                // `Flow<J>`, `J` the caller's own parameter. Read as a hole, that
+                // answer lost to the Source blanket's ungrounded `T` (registered
+                // first), and a selector's parameter in the body was typed as
+                // that bare `T`.
+                if !resolved.iter().any(|argument| {
+                    matches!(
+                        argument.get_type(self),
+                        Type::Generic(binder) if !receiver_generics.contains(&binder)
+                    )
+                }) {
                     answered.push((subject_id, resolved));
                     if first_only {
                         break;
