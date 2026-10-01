@@ -43,6 +43,11 @@ written down.
 <!-- family: fix -->
 **Native builds accept a closure that hands back an element read by index or a field of what it captured: `id.derive(|index| cells[index])` over a `List<str>`, `apply(1, |index| rows[index])`, and `name_via(|| row.name)` build and print node's bytes, where rustc refused the first two with E0507 ("cannot move out of index") and the third with E0525 (a closure moving out of its capture is `FnOnce`).** A closure's expression body is the value it hands back — a consuming position, like a function body's tail, where a place read takes rule 1's copy; it was read as a plain value, so the read moved. It is a consuming position now (elided at a last use, as everywhere). Pin: `a_closure_handing_back_an_indexed_element_is_identical_on_both_backends` (a `str`, a struct and a list element by index, a block body's tail, a capture handed back whole, a field of a capture). The native copy census moves by one elided read (`reactive-flatten`). Tracker F63.
 
+---
+
+<!-- family: fix -->
+**Native builds accept an `Option` of a closure as a field of a generic struct, and a `match` leg that hands back a place: `Hold<V> { pull = None, .. }` pushed through `core.holds.write()` inside a generic function, and `None => self.fallback` over a loaned `self`, build and print node's bytes.** Neither refusal was the field's. The struct literal was refused by name ("an unbound generic type parameter (parameter 1 of struct `Hold`)") because the write view it was pushed through carried no type to close `V` with — the gap F62 closes. And a leg's body was read as a plain value, so a leg handing back a field of a loan (E0507) or a binding read again after the `match` (E0382) moved; a leg is a block tail's position now, and takes rule 1's copy (elided at a last use). std's collection core holds its per-element closures bare for this reason, and builds natively with `Option` fields now. Pin: `an_optional_closure_field_of_a_generic_struct_is_identical_on_both_backends`. The native copy census moves only in elided reads (seven programs, +1 to +3 each). Tracker F64.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

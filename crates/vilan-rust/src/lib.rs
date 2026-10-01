@@ -5878,7 +5878,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // than a safety net.
                 has_catch_all = true;
             }
-            let body = self.expression(leg.body, depth + 1)?;
+            // A leg's body is what the `match` evaluates to, which is a block
+            // tail's position: rule 1's copy is owed at a place read there
+            // (`None => self.fallback` over a loaned `self`, `None => before`
+            // read again after the `match`). A BLOCK body takes it at its own
+            // tail ([`Self::emit_block`]); a `borrows` function's leg hands its
+            // loan on, as its tail does.
+            let body = if self.current_returns_view
+                || matches!(self.program.entity_map.get(&leg.body), Some(Expr::Block(_)))
+            {
+                self.expression(leg.body, depth + 1)?
+            } else {
+                let expecting = self.expected_type;
+                self.consumed_value_of_expecting(leg.body, expecting, depth + 1)?
+            };
             let _ = writeln!(out, "{leg_pad}{pattern} => {body},");
         }
         // vilan's exhaustiveness is checked by vilan; rustc re-checks it over a

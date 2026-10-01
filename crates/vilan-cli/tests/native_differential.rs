@@ -7250,3 +7250,31 @@ fn a_closure_handing_back_an_indexed_element_is_identical_on_both_backends() {
         "a closure handing back an element or a field of a capture must copy it"
     );
 }
+
+/// F64: an `Option` of a closure as a field of a GENERIC struct builds natively
+/// — stored through a cell's write view, pulled per element, read by a
+/// `match` — and a `match` leg handing back a place copies it.
+///
+/// Two defects stood in front of the field, and neither was the field. A struct
+/// literal pushed through `core.holds.write()` had no element type to close
+/// `Hold<V>`'s `V` with, because the view call recorded none — refused by name
+/// as "an unbound generic type parameter (parameter 1 of struct `Hold`)"; F62
+/// typed the view. And a leg's body was read as a plain value, so `None =>
+/// self.fallback` over a loaned `self` (E0507) and `None => before` read again
+/// after the `match` (E0382) moved; a leg is a block tail's position now.
+/// std's collection core (`ElementHold`) holds its closures bare to avoid this
+/// shape; with `Option` fields it builds and prints node's bytes.
+#[test]
+fn an_optional_closure_field_of_a_generic_struct_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_option_closure_fields.vl"),
+        include_str!("native/option_closure_fields.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_option_closure_fields.vl"),
+        Verdict::Identical,
+        "an `Option<|| V>` field of a generic struct must build and read the same"
+    );
+}
