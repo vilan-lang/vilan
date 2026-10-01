@@ -7300,3 +7300,24 @@ fn a_lazy_module_binding_handed_to_a_lazy_parameter_is_identical_on_both_backend
         "a module `lazy let` at a `lazy` parameter must defer and initialize once"
     );
 }
+
+/// F54: a comparison answers a `bool`, so the expectation around it is never
+/// its operands' — a literal in it takes its comparand's type. `let two = if n
+/// > 2 { 1 } else { 2 }` over `n: u53` rendered `2` at the arms' `i32` (the
+/// `if`'s value expectation reached its condition), and rustc refused `u64 >
+/// i32` (E0308). `&&`/`||` beside `i16`/`f64` arms, a `bool` binding, and a
+/// `while` condition inside an `i32`-valued block hold the same rule.
+#[test]
+fn a_comparison_literal_takes_its_comparands_width_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_comparison_literal_width.vl"),
+        include_str!("native/comparison_literal_width.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_comparison_literal_width.vl"),
+        Verdict::Identical,
+        "a comparison's literal must take its comparand's width"
+    );
+}

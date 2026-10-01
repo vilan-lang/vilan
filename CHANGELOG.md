@@ -53,6 +53,11 @@ written down.
 <!-- family: fix -->
 **Native builds accept a module-level `lazy let` handed to a `lazy` parameter: `lazy let config = load(); .. twice(config)` builds, runs `load` once on the first force, and never runs it for a callee that does not force it — where rustc refused the emitted Rust with "cannot find value `config`".** The analyzer hands a `lazy` binding on to a `lazy` parameter as the cell itself. Natively a module-level binding is a `thread_local!` that initializes at its first read — no cell to hand on — so the forward named a local nothing declared, and a binding reached only that way was never emitted. The parameter takes a thunk that reads the binding. Pin: `a_lazy_module_binding_handed_to_a_lazy_parameter_is_identical_on_both_backends` (never forced, forced twice, forwarded to a second `lazy` parameter, a struct-typed binding, a direct read after). Tracker F52.
 
+---
+
+<!-- family: fix -->
+**Native builds accept a value `if` whose condition compares against a literal of a different width than its arms: `let two = if n > 2 { 1 } else { 2 }` over `n: u53` builds and prints `1`, where rustc refused `u64 > i32` (E0308).** The `if`'s value expectation (`i32`, from the arms) reached the comparison in its condition, and the literal `2` took it. A comparison, `&&` and `||` answer a `bool`, so the expectation around them is never their operands': the operands are rendered with it cleared, each at its partner's type. Pin: `a_comparison_literal_takes_its_comparands_width_on_both_backends` (a `u53`, a `u8` and a `usize` condition beside `i32`, `i16` and `f64` arms, a `bool` binding, a `while` condition inside an `i32`-valued block). Tracker F54.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

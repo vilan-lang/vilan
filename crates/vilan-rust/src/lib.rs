@@ -5426,6 +5426,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // is itself a bare literal says nothing (its record is the advisory
         // one). The shifts are left alone: a shift COUNT is its own type.
         let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
+        // F54: a comparison or a logical operator answers a `bool`, so the
+        // expectation around it is never its operands' — it belongs to the
+        // position the `bool` lands in, or, in `let two = if n > 2 { 1 } else
+        // { 2 }`, to the `if`'s VALUE: `2` took the arms' `i32` against an
+        // `n: u53` and rustc refused `u64 > i32`. The operands are rendered
+        // with it cleared, each at its partner's type.
+        let answers_bool = matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::LtEq
+                | BinaryOp::GtEq
+                | BinaryOp::And
+                | BinaryOp::Or
+        );
+        let saved_expected = if answers_bool {
+            self.expected_type.take()
+        } else {
+            self.expected_type
+        };
         let inherited = self
             .expected_type
             .filter(|type_id| self.is_numeric_scalar(*type_id));
@@ -5438,13 +5460,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let left_position = partner_position(self, right);
         let right_position = partner_position(self, left);
         let left_text = match left_position {
-            Some(position) => self.value_of_expecting(left, Some(position), depth)?,
-            None => self.value_of(left, depth)?,
+            Some(position) => self.value_of_expecting(left, Some(position), depth),
+            None => self.value_of(left, depth),
         };
         let right_text = match right_position {
-            Some(position) => self.value_of_expecting(right, Some(position), depth)?,
-            None => self.value_of(right, depth)?,
+            Some(position) => self.value_of_expecting(right, Some(position), depth),
+            None => self.value_of(right, depth),
         };
+        self.expected_type = saved_expected;
+        let (left_text, right_text) = (left_text?, right_text?);
         Ok(format!("({left_text} {symbol} {right_text})"))
     }
 
