@@ -194,7 +194,12 @@ const DELIBERATE_NON_BUG_IGNORES: &[&str] = &[
 /// like adding a member to [`DELIBERATE_NON_BUG_IGNORES`]. What it buys is the
 /// refusal the shape alone could not make: `ARM64`, `UTF8`, `ES6` and `ISO8601`
 /// are all "capitals then a digit", and none of them points anywhere.
-const TRACKER_FAMILIES: &[char] = &['A', 'B', 'C', 'D', 'E', 'G', 'I', 'J', 'K', 'L', 'M', 'N'];
+///
+/// `F` joined when the native backend's items (F1, "Native targets &
+/// rendering") first needed an ignored pin: F65, native-45.
+const TRACKER_FAMILIES: &[char] = &[
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'I', 'J', 'K', 'L', 'M', 'N',
+];
 
 /// Whether `reason` LEADS with a tracker item id — a single family letter, one
 /// to three digits, and then the end of the id (`B154: …`, `C13 — …`).
@@ -527,7 +532,7 @@ fn the_item_id_shape_accepts_an_id_and_refuses_prose() {
         "waiting on N31",
         "not C12's hole — the capture here is a view parameter",
         "P4c: a proposal slice label is not a tracker item",
-        "F14: an audit finding is not a tracker item either",
+        "Q14: no tracker section uses this letter",
     ] {
         assert!(
             !names_a_tracker_item(reason),
