@@ -7350,3 +7350,25 @@ fn an_unread_annotated_variant_binding_is_identical_on_both_backends() {
         "an annotated `Option`/`Result` binding nothing reads must build"
     );
 }
+
+/// M91: a churned native `HashMap`/`HashSet` walks its live entries in the
+/// order node's `Map` does — insertion order, a removed-then-re-inserted key at
+/// the end, an overwritten one in place — through the compactions the native
+/// map makes as its removed slots come to outnumber its live ones. The bound
+/// itself (slots at most twice the live count, the storage released) is
+/// `vilan-rt`'s `a_churned_map_compacts_and_keeps_insertion_order`: this suite
+/// reads no clock (N116), so the 2,000 walks here are the shape, not a timing.
+#[test]
+fn a_churned_hash_map_walks_in_insertion_order_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_churned_map_walk.vl"),
+        include_str!("native/churned_map_walk.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_churned_map_walk.vl"),
+        Verdict::Identical,
+        "a churned map and set must walk in insertion order on both backends"
+    );
+}

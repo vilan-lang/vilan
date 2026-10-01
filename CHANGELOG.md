@@ -63,6 +63,11 @@ written down.
 <!-- family: fix -->
 **Native builds accept an annotated `Option` or `Result` binding that nothing reads: `let ok: Result<i32, str> = Ok(10);` and `let nothing: Option<str> = None;` build, where rustc refused them ("type annotations needed", E0282).** `Option` and `Result` are Rust's own enums natively, so `Ok(10)` names no instance and Rust closes the missing parameter from whatever reads the binding — and the native backend writes a binding's annotation only where the initializer cannot type it, so an unread binding left `E` open. A written annotation over an `Option`/`Result` variant is written natively now. Pin: `an_unread_annotated_variant_binding_is_identical_on_both_backends` (`Ok`, `Err`, `None`, `Some` at `u8`, an `Option` of a `Result` of a struct, a `Result` of a list). Tracker F55.
 
+---
+
+<!-- family: performance -->
+**Native `HashMap`s and `HashSet`s give back what they remove: a map that churned through 200,000 keys and holds one walks one entry, not 200,000 empty slots, and releases the memory it peaked at.** A removal emptied its slot and nothing ever reclaimed it, so every walk of a churned map — `keys()`, `values()`, `entries()`, a `for` — visited every key it had ever held (0.13–0.16 s for 2,000 walks of a one-entry map, against 0.001 s for a fresh one). The map now compacts once its removed slots outnumber its live entries, keeping the live ones in insertion order (the iteration contract, a re-inserted key at the end, as on JS); the cost is amortized over the removals. Pins: `vilan-rt`'s `a_churned_map_compacts_and_keeps_insertion_order` (slots at most twice the live count through 200,000 churns, the storage released, the order and the index after compaction; red with the compaction planted out) and `a_churned_hash_map_walks_in_insertion_order_on_both_backends`. Tracker M91 (taken by native-45, so `reactive-maps-sets.md`'s S0 does not carry it).
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

@@ -1067,7 +1067,37 @@ impl<K: std::hash::Hash + Eq + Clone, V> Map<K, V> {
             && self.entries[slot].take().is_some()
         {
             self.live -= 1;
+            if self.entries.len() - self.live > self.live {
+                self.compact();
+            }
         }
+    }
+
+    /// Drops the removed entries' slots once they outnumber the live ones
+    /// (M91), keeping the live ones in INSERTION order — the order a walk
+    /// answers is the contract (`reactive-maps-sets.md` Q7), so this must not
+    /// move one live entry past another.
+    ///
+    /// A removal only empties its slot, so without this a map that churned
+    /// through 200,000 keys and holds one walked 200,000 slots on every
+    /// iteration (0.13–0.16 s for 2,000 walks against 0.001 s fresh) and held
+    /// its high-water memory for good. Compacting when the tombstones exceed
+    /// the live entries keeps a walk within twice the live count, at a cost
+    /// amortized over the removals that made the tombstones: each compaction
+    /// is O(slots) and follows at least as many removals as live entries
+    /// remain. The storage is released down to twice what is live.
+    fn compact(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        let mut kept = Vec::with_capacity(self.live);
+        for (key, value) in entries.into_iter().flatten() {
+            if let Some(slot) = self.index.get_mut(&key) {
+                *slot = kept.len();
+            }
+            kept.push(Some((key, value)));
+        }
+        self.entries = kept;
+        let floor = self.live.max(8) * 2;
+        self.index.shrink_to(floor);
     }
 
     pub fn len(&self) -> usize {
@@ -2054,6 +2084,57 @@ mod tests {
         assert_eq!(str_code_at("\u{1f600}", 0), 0xd83d);
         assert_eq!(str_code_at("\u{1f600}", 1), 0xde00);
         assert_eq!(str_code_at("abc", 3), 0, "past the end");
+    }
+
+    /// M91: a map that churned keeps no more slots than twice what it holds,
+    /// so a walk is bounded by its live entries — and it walks them in
+    /// INSERTION order through every compaction, a re-inserted key at the end
+    /// (a JS `Map`'s order, which `native_differential` holds the program-level
+    /// walk to).
+    #[test]
+    fn a_churned_map_compacts_and_keeps_insertion_order() {
+        let mut map: Map<i32, i32> = Map::new();
+        map.insert(-1, -1);
+        for key in 0..200_000 {
+            map.insert(key, key * 2);
+            map.remove(&key);
+            assert!(
+                map.entries.len() <= 2 * map.len() + 1,
+                "{} slots for {} live entries after removing {key}",
+                map.entries.len(),
+                map.len()
+            );
+        }
+        assert_eq!(map.len(), 1);
+        assert!(
+            map.entries.capacity() <= 16,
+            "the churned storage is released"
+        );
+        for key in 0..10 {
+            map.insert(key, key);
+        }
+        for key in [3, 0, 7, 8, 1] {
+            map.remove(&key);
+        }
+        map.insert(3, 33);
+        map.insert(9, 99);
+        let walked: Vec<(i32, i32)> = map.iter().map(|(key, value)| (*key, *value)).collect();
+        assert_eq!(
+            walked,
+            vec![(-1, -1), (2, 2), (4, 4), (5, 5), (6, 6), (9, 99), (3, 33)]
+        );
+        for (key, value) in &walked {
+            assert_eq!(map.get(key), Some(value), "the index follows each move");
+        }
+        let mut set: Set<i32> = Set::new();
+        for value in 0..1_000 {
+            set.insert(value);
+        }
+        for value in 0..999 {
+            set.remove(&value);
+        }
+        assert_eq!(set.values(), vec![999]);
+        assert!(set.entries.entries.len() <= 3);
     }
 
     #[test]
