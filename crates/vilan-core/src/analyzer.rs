@@ -32338,6 +32338,61 @@ impl<'src> Analyzer<'src> {
         false
     }
 
+    /// R-e (B468, RULED door (a)): a written application of a struct or an
+    /// enum that leaves a DEFAULTED parameter out takes the default there —
+    /// `Ordered<str, i32>` IS `Ordered<str, i32, Insertion>` for `struct
+    /// Ordered<K, V, O = Insertion>`, where it was a different, shorter type
+    /// that met the full spelling nowhere. The declaration's own parameter list
+    /// holds a defaulted parameter's DEFAULT type (B188), and a default written
+    /// in terms of an EARLIER parameter (`O = Key<K>`) reads
+    /// it at the argument written for that parameter. Anything but an
+    /// under-supply the defaults cover is returned as written — the arity
+    /// check refuses it.
+    fn with_defaulted_arguments(
+        &mut self,
+        declaration_id: Id,
+        written: Vec<TypeId>,
+    ) -> Vec<TypeId> {
+        let Some(declared) = self.declared_generic_parameters.get(&declaration_id) else {
+            return written;
+        };
+        // The declaration's own list: a REFERENCE's type carries none.
+        let carried: Vec<TypeId> = self
+            .structs
+            .get(&declaration_id)
+            .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            .or_else(|| {
+                self.enums
+                    .get(&declaration_id)
+                    .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            })
+            .unwrap_or_default();
+        if written.len() >= declared.len()
+            || declared.len() != carried.len()
+            || !declared[written.len()..]
+                .iter()
+                .all(|parameter| parameter.has_default)
+        {
+            return written;
+        }
+        // An undefaulted parameter's entry IS its constraint id — the key a
+        // mention of it (`Type::Generic`) substitutes through.
+        let substitution: SubstitutionContext = carried
+            .iter()
+            .zip(declared.iter())
+            .zip(written.iter())
+            .filter(|((_, parameter), _)| !parameter.has_default)
+            .map(|((constraint_id, _), argument)| (*constraint_id, *argument))
+            .collect();
+        let mut arguments = written;
+        for default_id in &carried[arguments.len()..] {
+            let default = default_id.get_type(self);
+            let grounded = self.substitute_type(&default, &substitution);
+            arguments.push(grounded.get_type_id(self));
+        }
+        arguments
+    }
+
     /// The refusal a WRITTEN type application earns when the arguments it
     /// spells do not match the arity its declaration declares (B188), or `None`
     /// when they do. `subject_id` is the entity the head name resolved to and
@@ -54311,8 +54366,12 @@ impl<'src> Analyzer<'src> {
                     // keeps whatever the reference resolved to.
                     let no_written_arguments = argument_type_ids.is_empty();
                     let subject_type = match (subject_type, argument_type_ids.is_empty()) {
-                        (Type::Enum(id, _), false) => Type::Enum(id, argument_type_ids),
-                        (Type::Struct(id, _), false) => Type::Struct(id, argument_type_ids),
+                        (Type::Enum(id, _), false) => {
+                            Type::Enum(id, self.with_defaulted_arguments(id, argument_type_ids))
+                        }
+                        (Type::Struct(id, _), false) => {
+                            Type::Struct(id, self.with_defaulted_arguments(id, argument_type_ids))
+                        }
                         // A parameterized trait bound/template (`Into<bool>`,
                         // `Readable<U>`) keeps its arguments for impl selection.
                         (Type::Trait(id, _), false) => Type::Trait(id, argument_type_ids),

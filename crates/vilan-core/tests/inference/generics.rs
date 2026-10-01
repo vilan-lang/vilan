@@ -9228,3 +9228,88 @@ fn b484_a_binder_in_a_trait_argument_binds_through_a_flow() {
     );
 }
 
+// --- B468 (R-e, RULED door (a)): a DEFAULTED struct or enum parameter left ---
+// --- out of a written application takes its default there.                ---
+
+const B468_ORDERED: &str = concat!(
+    "import std::io::print;\n",
+    "struct Insertion {}\n",
+    "struct Sorted {}\n",
+    "struct Ordered<K, V, O = Insertion> { keys: List<K>, values: List<V>, order: O }\n",
+    "fun count(ordered: Ordered<str, i32, Insertion>): usize { ordered.keys.len() }\n",
+);
+
+/// The signature's `Ordered<str, i32>` and the literal's `Ordered<str, i32,
+/// Insertion>` are ONE type, in both directions: a short annotation handed to
+/// the full parameter, and a full literal returned through a short return.
+#[test]
+fn b468_an_omitted_defaulted_argument_takes_its_default() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B468_ORDERED}{}",
+            concat!(
+                "fun make(): Ordered<str, i32> {\n",
+                "\tOrdered<str, i32, Insertion> { keys = [\"a\", \"b\"], values = [1, 2], order = Insertion {} }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tlet short: Ordered<str, i32> = Ordered { keys = [\"c\"], values = [3], order = Insertion {} };\n",
+                "\tprint(count(make()) + count(short));\n",
+                "}\n",
+            )
+        ),
+        "3\n",
+    );
+}
+
+/// The default is a TYPE, not a hole: a value at another argument there is
+/// refused where the short annotation meets it.
+#[test]
+fn b468_the_default_is_checked_not_inferred() {
+    assert_fails_with(
+        &format!(
+            "{B468_ORDERED}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet wrong: Ordered<str, i32> = Ordered { keys = [], values = [], order = Sorted {} };\n",
+                "\tprint(wrong.keys.len());\n",
+                "}\n",
+            )
+        ),
+        "Sorted",
+    );
+}
+
+/// A default written in an EARLIER parameter reads it at that parameter's
+/// argument, and an enum's default applies the same way.
+#[test]
+fn b468_a_default_naming_an_earlier_parameter_and_an_enum_default() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "struct Keyed<K, I = List<K>> { items: I }\n",
+            "enum Either<L, R = str> { Left(L), Right(R) }\n",
+            "fun size(keyed: Keyed<i32, List<i32>>): usize { keyed.items.len() }\n",
+            "fun main() {\n",
+            "\tlet keyed: Keyed<i32> = Keyed { items = [1, 2, 3] };\n",
+            "\tprint(size(keyed));\n",
+            "\tlet either: Either<i32> = Either::Right(\"r\");\n",
+            "\tmatch either {\n",
+            "\t\tEither::Left(let n) => print(n),\n",
+            "\t\tEither::Right(let text) => print(text),\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "3\nr\n",
+    );
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "struct Keyed<K, I = List<K>> { items: I }\n",
+            "fun main() {\n",
+            "\tlet keyed: Keyed<i32> = Keyed { items = [\"a\"] };\n",
+            "\tprint(keyed.items.len());\n",
+            "}\n",
+        ),
+        "List<i32>",
+    );
+}
