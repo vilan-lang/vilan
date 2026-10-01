@@ -1414,6 +1414,71 @@ struct R11Instance {
     site: R11Site,
 }
 
+/// Candidate ids (bindings, place expressions, `is` tests) indexed by their
+/// declaration span, so an R11 instantiation reads the ones lexically inside
+/// its callee rather than every one in the program (M94).
+///
+/// An id the index cannot place — no source, or no span — is returned for
+/// EVERY callee, and a callee it cannot place gets every candidate: both
+/// widen the slice back toward the whole-program set the readers were always
+/// correct over, so a missing span can cost time but never an answer.
+struct LexicalCandidates {
+    /// Per source, `(start, end, id)` sorted by `start`.
+    by_source: HashMap<SourceId, Vec<(usize, usize, Id)>>,
+    unplaced: Vec<Id>,
+    all: Vec<Id>,
+}
+
+impl LexicalCandidates {
+    fn build(analyzer: &Analyzer<'_>, ids: impl Iterator<Item = Id>) -> Self {
+        let mut by_source: HashMap<SourceId, Vec<(usize, usize, Id)>> = HashMap::default();
+        let mut unplaced = Vec::new();
+        let mut all = Vec::new();
+        for id in ids {
+            all.push(id);
+            match (analyzer.source_of_id(id), analyzer.span_map.get(&id)) {
+                (Some(source), Some(span)) => {
+                    by_source
+                        .entry(source)
+                        .or_default()
+                        .push((span.start, span.end, id));
+                }
+                _ => unplaced.push(id),
+            }
+        }
+        for entries in by_source.values_mut() {
+            entries.sort_unstable_by_key(|(start, end, id)| (*start, *end, id.0));
+        }
+        LexicalCandidates {
+            by_source,
+            unplaced,
+            all,
+        }
+    }
+
+    /// The candidates inside `callee`'s declaration span, plus the unplaced.
+    fn within(&self, analyzer: &Analyzer<'_>, callee: Id) -> Vec<Id> {
+        let (Some(source), Some(span)) = (
+            analyzer.source_of_id(callee),
+            analyzer.span_map.get(&callee),
+        ) else {
+            return self.all.clone();
+        };
+        let mut inside = self.unplaced.clone();
+        if let Some(entries) = self.by_source.get(&source) {
+            let first = entries.partition_point(|(start, _, _)| *start < span.start);
+            inside.extend(
+                entries[first..]
+                    .iter()
+                    .take_while(|(start, _, _)| *start <= span.end)
+                    .filter(|(_, end, _)| *end <= span.end)
+                    .map(|(_, _, id)| *id),
+            );
+        }
+        inside
+    }
+}
+
 /// How an [`R11Instance`] was reached (B463).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum R11Site {
@@ -12411,19 +12476,31 @@ impl<'src> Analyzer<'src> {
     ///
     /// Only a bare local subject and a variant pattern refine anything; every
     /// other shape is simply absent from the map and exempts nothing.
+    ///
+    /// `candidates` narrows the tests asked about (R11 passes the ones inside
+    /// the instantiated callee, M94); `None` is every test in the program.
     fn collect_is_refinements(
         &mut self,
+        candidates: Option<&[Id]>,
         resource_constraints: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashMap<Id, IsRefinement> {
-        let tests: Vec<(Id, Id, ExprPattern)> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter_map(|(id, expr)| match expr {
-                Expr::Is(subject, pattern) => Some((*id, *subject, pattern.clone())),
-                _ => None,
-            })
-            .collect();
+        let is_test = |(id, expr): (&Id, &Expr)| match expr {
+            Expr::Is(subject, pattern) => Some((*id, *subject, pattern.clone())),
+            _ => None,
+        };
+        let tests: Vec<(Id, Id, ExprPattern)> = match candidates {
+            Some(candidates) => candidates
+                .iter()
+                .filter_map(|id| Some((id, self.expr_id_to_expr_map.get(id)?)))
+                .filter_map(is_test)
+                .collect(),
+            None => self
+                .expr_id_to_expr_map
+                .iter()
+                .filter_map(is_test)
+                .collect(),
+        };
         let mut refinements = HashMap::default();
         for (test_id, subject_id, pattern) in tests {
             let ExprPattern::Variant(pattern_enum_id, variant_index, _) = pattern else {
@@ -12572,7 +12649,7 @@ impl<'src> Analyzer<'src> {
         // The concrete scan knows no generic resources, so the empty constraint
         // set makes `type_is_resource_with` agree with `type_is_resource`.
         let is_refinements =
-            self.collect_is_refinements(&HashSet::default(), &mut HashMap::default());
+            self.collect_is_refinements(None, &HashSet::default(), &mut HashMap::default());
         let value_crossings = self.compute_return_value_crossings();
         // B469: which field moves read as destructures. The concrete scan
         // knows no instantiation, so a generic inside an aggregate's type may
@@ -16583,6 +16660,43 @@ impl<'src> Analyzer<'src> {
             );
         }
 
+        // M94: the three candidate kinds an instantiation classifies, indexed
+        // ONCE by source span. Every reader of what they yield (the body scan,
+        // the exactly-once and partial-move checks) asks only about the
+        // callee's own body and the closures lexical to it, so an instance
+        // slices out the candidates inside the callee's declaration instead
+        // of re-classifying the whole program — which, with `Flow`/`Pipe` as
+        // `[resource]` traits, made R11 O(instances × program).
+        let binding_candidates = LexicalCandidates::build(
+            self,
+            self.variables
+                .values()
+                .map(|variable| variable.id)
+                .chain(self.parameters.values().map(|parameter| parameter.id)),
+        );
+        let place_candidates = LexicalCandidates::build(
+            self,
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(_, expr)| {
+                    matches!(
+                        expr,
+                        Expr::Local(_)
+                            | Expr::Field(_, _, _)
+                            | Expr::TupleIndex(_, _, _)
+                            | Expr::Index(_, _)
+                    )
+                })
+                .map(|(id, _)| *id),
+        );
+        let test_candidates = LexicalCandidates::build(
+            self,
+            self.expr_id_to_expr_map
+                .iter()
+                .filter(|(_, expr)| matches!(expr, Expr::Is(..)))
+                .map(|(id, _)| *id),
+        );
+
         while let Some(instance) = worklist.pop_front() {
             let resources: HashSet<TypeId> = instance.resources.iter().copied().collect();
             // Delta classification: only the places whose resource-ness is CAUSED
@@ -16592,13 +16706,24 @@ impl<'src> Analyzer<'src> {
             // checked with its own in-body span; re-checking it here would
             // double-report at the instantiation site.
             let mut memo: HashMap<TypeId, bool> = HashMap::default();
-            let resource_bindings = self.collect_instantiation_bindings(&resources, &mut memo);
-            let resource_value_places =
-                self.collect_instantiation_value_places(&resources, &mut memo);
+            let resource_bindings = self.collect_instantiation_bindings(
+                &binding_candidates.within(self, instance.callee),
+                &resources,
+                &mut memo,
+            );
+            let resource_value_places = self.collect_instantiation_value_places(
+                &place_candidates.within(self, instance.callee),
+                &resources,
+                &mut memo,
+            );
             // Per instantiation: `Option<T>`'s `None` is payload-free at every
             // instantiation, but a variant carrying `T` is a resource only at
             // this one, so the refinement is recomputed under the delta set.
-            let is_refinements = self.collect_is_refinements(&resources, &mut memo);
+            let is_refinements = self.collect_is_refinements(
+                Some(&test_candidates.within(self, instance.callee)),
+                &resources,
+                &mut memo,
+            );
             let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
             // B469: a field move out of an owned aggregate is a destructure when
             // the aggregate has no `Drop` anywhere inside at THIS instantiation
@@ -17364,25 +17489,27 @@ impl<'src> Analyzer<'src> {
     /// parameters whose type is a resource UNDER `resources` (the instantiation's
     /// resource parameter set) but NOT without it. The delta keeps concrete-
     /// resource bindings — a resource regardless of `resources` — out: those are
-    /// chunk 3's, already checked with their own in-body span. Collected over the
-    /// whole program, but only bindings named by `Generic(T)` (this generic's own
-    /// parameters and locals) can be delta-resources, and `scan_instantiated_body`
-    /// visits only the callee's body — so the wider set is never queried elsewhere.
+    /// chunk 3's, already checked with their own in-body span. Asked only of
+    /// `candidates`, the bindings lexically inside the callee (M94): only
+    /// bindings named by `Generic(T)` (this generic's own parameters and locals)
+    /// can be delta-resources, and `scan_instantiated_body` visits only the
+    /// callee's body — so a wider set would never be queried.
     fn collect_instantiation_bindings(
         &mut self,
+        candidates: &[Id],
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashSet<Id> {
         let mut bindings = HashSet::default();
-        let entries: Vec<(Id, TypeId)> = self
-            .variables
-            .values()
-            .map(|variable| (variable.id, variable.type_id))
-            .chain(
-                self.parameters
-                    .values()
-                    .map(|parameter| (parameter.id, parameter.type_id)),
-            )
+        let entries: Vec<(Id, TypeId)> = candidates
+            .iter()
+            .filter_map(|id| {
+                let type_id = match self.variables.get(id) {
+                    Some(variable) => variable.type_id,
+                    None => self.parameters.get(id)?.type_id,
+                };
+                Some((*id, type_id))
+            })
             .collect();
         for (id, type_id) in entries {
             if self.type_is_resource_with(type_id, resources, memo)
@@ -17399,34 +17526,24 @@ impl<'src> Analyzer<'src> {
     /// without it (the delta, as `collect_instantiation_bindings`). NOT stored on
     /// the analyzer — clone sites stay a global, concrete-resource computation
     /// (R11 is reject-only: a program that passes has no differently-elided copy).
+    ///
+    /// Asked only of `candidates`, the place expressions lexically inside the
+    /// callee (M94), and of each place's OWN type slot: re-reading the type
+    /// into a freshly minted id cost a slot per place per instantiation (kolt's
+    /// client minted 1.45M of them) and answered the same question.
     fn collect_instantiation_value_places(
         &mut self,
+        candidates: &[Id],
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashSet<Id> {
         let mut places = HashSet::default();
-        let place_ids: Vec<Id> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter(|(_, expr)| {
-                matches!(
-                    expr,
-                    Expr::Local(_)
-                        | Expr::Field(_, _, _)
-                        | Expr::TupleIndex(_, _, _)
-                        | Expr::Index(_, _)
-                )
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in place_ids {
-            if let Some(place_type) = self.place_value_type(id) {
-                let type_id = place_type.get_type_id(self);
-                if self.type_is_resource_with(type_id, resources, memo)
-                    && !self.type_is_resource(type_id)
-                {
-                    places.insert(id);
-                }
+        for id in candidates.iter().copied() {
+            if let Some(type_id) = self.place_value_type_id(id)
+                && self.type_is_resource_with(type_id, resources, memo)
+                && !self.type_is_resource(type_id)
+            {
+                places.insert(id);
             }
         }
         places
