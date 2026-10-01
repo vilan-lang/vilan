@@ -34,7 +34,7 @@ function set_attribute(attributes, name2, value) {
 	attributes.v = updated;
 }
 function place(self, parent) {
-	parent[2].v.push([ 0, __clone(self) ]);
+	parent[2].v.push([ 0, self ]);
 }
 function place2(self, parent) {
 	parent[2].v.push([ 1, self ]);
@@ -113,7 +113,7 @@ function row(label) {
 }
 function $b(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	return [ __shared_new(__clone(value)), __shared_new(subscribers) ];
 }
 function $a(value) {
 	return $b(value);
@@ -139,41 +139,41 @@ function $g(self) {
 	} ];
 }
 function $f(flow) {
-	const instance = $g(__clone(flow));
+	const instance = $g(flow);
 	const value = instance[0]();
 	instance[2]();
 	return value;
 }
 function $e(flow, parent, name2) {
-	set_attribute(parent[1], name2, $f(__clone(flow)));
+	set_attribute(parent[1], name2, $f(flow));
 }
 function $d(self, parent, name2) {
-	$e(__clone(self), parent, name2);
+	$e(self, parent, name2);
 }
 function $c(self, name2, value) {
-	$d(__clone(value), self, name2);
+	$d(value, self, name2);
 	return __clone(self);
 }
 function $k(self, name2, value) {
-	apply(__clone(value), self, name2);
+	apply(value, self, name2);
 	return __clone(self);
 }
 function $l(self, content) {
-	place2(__clone(content), self);
+	place2(content, self);
 	return __clone(self);
 }
 function $m(self, content) {
-	place(__clone(content), self);
+	place(content, self);
 	return __clone(self);
 }
 function $p(flow, parent) {
-	parent[2].v.push([ 1, $f(__clone(flow)) ]);
+	parent[2].v.push([ 1, $f(flow) ]);
 }
 function $o(self, parent) {
-	$p(__clone(self), parent);
+	$p(self, parent);
 }
 function $n(self, content) {
-	$o(__clone(content), self);
+	$o(content, self);
 	return __clone(self);
 }
 const name = $a("world & <you>");

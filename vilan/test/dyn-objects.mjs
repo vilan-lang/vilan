@@ -241,7 +241,7 @@ function $d(shapes2) {
 }
 function $e(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	return [ __shared_new(__clone(value)), __shared_new(subscribers) ];
 }
 function $g(self) {
 	return __clone(self[0].v);

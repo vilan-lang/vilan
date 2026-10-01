@@ -10763,3 +10763,242 @@ fn b467_a_closure_capturing_an_outer_view_parameter_still_cannot_be_stored() {
         "a view cannot escape its scope",
     );
 }
+
+// ---------------------------------------------------------------------------
+// R-c (Order 45): a value taken out of a place the binding does not own is
+// copied — B483 (a constructor that STORES its argument takes it `own`), B466
+// (`*view` of an aggregate), B465 (a closure's view parameter is a view). The
+// native halves are `native_differential`'s
+// `a_value_taken_out_of_a_place_it_does_not_own_is_copied_on_both_backends`.
+// ---------------------------------------------------------------------------
+
+/// B483: `Shared::new`, `ListCell::of` and `ListCell::with_limit` keep what
+/// they are given, so they take it `own`: a value the caller still reads is
+/// copied in, and a write through the new cell never reaches the caller's
+/// binding (JS printed `3`, the caller's list grown through the cell). At the
+/// argument's last use it is moved in — no copy is emitted for `last`.
+#[test]
+fn b483_a_storing_constructor_copies_an_argument_the_caller_still_reads() {
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        import std::delta::ListCell;
+
+        struct P { x: i32, tags: List<i32> }
+
+        fun main() {
+            let xs: List<i32> = [1, 2];
+            let cell = Shared::new(xs);
+            cell.write().push(3);
+            print(i"shared {xs.len()} {cell.read().len()}");
+            let p = P { x = 1, tags = [] };
+            let held = Shared::new(p);
+            held.write().tags.push(4);
+            print(i"struct {p.tags.len()} {held.read().tags.len()}");
+            let ys: List<i32> = [1, 2];
+            let list = ListCell::of(ys);
+            list.push(3);
+            print(i"of {ys.len()} {list.get().len()}");
+            let zs: List<i32> = [1];
+            let limited = ListCell::with_limit(zs, 4);
+            limited.push(2);
+            print(i"with_limit {zs.len()} {limited.get().len()}");
+            let last: List<i32> = [5];
+            let moved = Shared::new(last);
+            print(i"last {moved.read().len()}");
+        }
+        "#;
+    assert_compiles_and_runs(
+        source,
+        "shared 2 3\nstruct 0 1\nof 2 3\nwith_limit 1 2\nlast 1\n",
+    );
+}
+
+/// B466: `*view` of an aggregate is a place the binding does not own, so
+/// binding it, returning it, or wrapping it copies — JS bound the caller's
+/// storage itself (`c.x = 99` wrote the caller's `P`, and a snapshot
+/// `Some(*v)` changed with the next in-place write through `v`).
+#[test]
+fn b466_a_dereferenced_aggregate_is_a_copy() {
+    let source = r#"
+        import std::io::print;
+
+        struct P { x: i32, tags: List<i32> }
+
+        fun copy_out(v: &P): P {
+            mut c: P = *v;
+            c.x = 99;
+            c.tags.push(5);
+            c
+        }
+
+        fun returned(v: &P): P {
+            *v
+        }
+
+        fun snapshot(v: &mut P): Option<P> {
+            let snap = Some(*v);
+            v.x = 7;
+            v.tags.push(8);
+            snap
+        }
+
+        fun assigned(v: &mut P): P {
+            mut out = P { x = 0, tags = [] };
+            out = *v;
+            v.tags.push(1);
+            out
+        }
+
+        fun main() {
+            let p = P { x = 1, tags = [] };
+            let c = copy_out(&p);
+            print(i"binding {p.x} {p.tags.len()} {c.x} {c.tags.len()}");
+            mut r = returned(&p);
+            r.tags.push(1);
+            print(i"returned {p.tags.len()} {r.tags.len()}");
+            mut q = P { x = 2, tags = [] };
+            match snapshot(&mut q) {
+                Some(let s) => print(i"snapshot {s.x} {s.tags.len()} {q.x} {q.tags.len()}"),
+                None => print("none"),
+            }
+            mut w = P { x = 3, tags = [] };
+            let out = assigned(&mut w);
+            print(i"assigned {out.tags.len()} {w.tags.len()}");
+        }
+        "#;
+    assert_compiles_and_runs(
+        source,
+        "binding 1 0 99 1\nreturned 0 1\nsnapshot 2 0 7 1\nassigned 0 1\n",
+    );
+}
+
+/// B465: a closure literal handed where a closure type takes a VIEW has view
+/// parameters there, written or not. `|c|` given `&a.city` reads the element
+/// through `*c` — JS stored the view's `(base, key)` pair
+/// (`[ [ 'Oslo', '1' ], 0 ]`) — for a scalar view, a `bool` and an aggregate
+/// alike, and as a struct field's closure type.
+#[test]
+fn b465_a_closure_literal_at_a_view_position_reads_through_its_view() {
+    let source = r#"
+        import std::io::print;
+
+        struct Address { city: str, zip: str }
+
+        struct Visitor { visit: |&str| void }
+
+        fun with_city(a: Address, f: |&str| void) {
+            f(&a.city);
+        }
+
+        fun with_flag(f: |&bool| void) {
+            let flag = true;
+            f(&flag);
+        }
+
+        fun with_address(a: Address, f: |&Address| void) {
+            f(&a);
+        }
+
+        fun main() {
+            let home = Address { city = "Oslo", zip = "1" };
+            mut out = "";
+            with_city(home, |c| {
+                out = *c;
+            });
+            print(out);
+            mut seen = false;
+            with_flag(|b| {
+                seen = *b;
+            });
+            print(seen);
+            mut zip = "";
+            with_address(home, |address| {
+                zip = address.zip;
+            });
+            print(zip);
+            mut visited = "";
+            let visitor = Visitor { visit = |city| {
+                visited = *city;
+            } };
+            (visitor.visit)(&home.city);
+            print(visited);
+        }
+        "#;
+    assert_compiles_and_runs(source, "Oslo\ntrue\n1\nOslo\n");
+}
+
+/// B465 (R-c): a view read into a `T` place takes `*` — the `let out: str = c`
+/// refusal (R1) at an ASSIGNMENT, for a `fun`'s view parameter and a closure's
+/// alike, scalar and aggregate. `out = c` was accepted and stored the view
+/// itself: the `(base, key)` pair for a scalar, the caller's storage for an
+/// aggregate.
+#[test]
+fn b465_a_view_assigned_to_a_value_place_is_refused_without_a_star() {
+    assert_fails_with(
+        r#"
+        fun take(c: &str): str {
+            mut out = "";
+            out = c;
+            out
+        }
+        "#,
+        "a view can't be read as a value here; write `*` to copy the value out",
+    );
+    assert_fails_with(
+        r#"
+        struct P { x: i32 }
+
+        fun take(p: &P): P {
+            mut out = P { x = 0 };
+            out = p;
+            out
+        }
+        "#,
+        "a view can't be read as a value here; write `*` to copy the value out",
+    );
+    assert_fails_with(
+        r#"
+        struct Address { city: str, zip: str }
+
+        fun with_city(a: Address, f: |&str| void) {
+            f(&a.city);
+        }
+
+        fun main() {
+            let home = Address { city = "Oslo", zip = "1" };
+            mut out = "";
+            with_city(home, |c| {
+                out = c;
+            });
+        }
+        "#,
+        "a view can't be read as a value here; write `*` to copy the value out",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let city = "Oslo";
+            mut out = "";
+            let read = |c: &str| {
+                out = c;
+            };
+            read(&city);
+        }
+        "#,
+        "a view can't be read as a value here; write `*` to copy the value out",
+    );
+    // The spelled copy compiles, and a write THROUGH a view stays the
+    // ordinary write it always was.
+    assert_compiles(
+        r#"
+        fun take(c: &str, slot: &mut str) {
+            mut out = "";
+            out = *c;
+            slot = out;
+        }
+
+        fun main() {}
+        "#,
+    );
+}

@@ -23438,6 +23438,13 @@ impl<'src> Analyzer<'src> {
                     .or_else(|| self.place_value_type_id(leaf_id))
                     .or_else(|| self.call_declared_return_type_id(call_id))
             }
+            // B466: `*view` hands back its pointee, whose type the view's own
+            // binding carries (references are transparent in the type system).
+            Some(Expr::Dereference(operand)) => {
+                let operand = *operand;
+                self.place_value_type_id(leaf_id)
+                    .or_else(|| self.place_value_type_id(operand))
+            }
             _ => self.place_value_type_id(leaf_id),
         }
     }
@@ -27748,6 +27755,16 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Whether an expression reads a view BINDING or `&`/`&mut` parameter — of
+    /// any pointee, aggregate included — rather than a value (B465). The
+    /// compiler-synthesized re-read of a compound write-through is a sanctioned
+    /// view use (R5), not a value read.
+    fn is_view_binding_read(&self, expr_id: Id, view_bindings: &HashSet<Id>) -> bool {
+        !self.compound_reread_ids.contains(&expr_id)
+            && matches!(self.expr_id_to_expr_map.get(&expr_id), Some(Expr::Local(_)))
+            && self.is_view_expr(expr_id, view_bindings)
+    }
+
     /// Whether an expression is a **scalar** view being read as a value — a bare
     /// view binding / `&[mut] place` whose element is a scalar primitive, so its
     /// runtime form is the `(base, key)` pair rather than the value. Reading it
@@ -27808,6 +27825,22 @@ impl<'src> Analyzer<'src> {
                         if self.is_scalar_view_read(operand, &view_bindings) {
                             leaks.push(operand);
                         }
+                    }
+                }
+                // B465 (R-c): the value an assignment stores is a VALUE, so a
+                // view binding or parameter on its right reads into a `T`
+                // place only through `*` — `out = c` with `c: &str` is the
+                // `let out: str = c` refusal (R1) at an assignment, for a
+                // `fun`'s view parameter and a closure's alike. An aggregate
+                // view is included: it is the caller's own storage on JS, so
+                // `out = c` aliased it where `out = *c` copies (rule 1). A
+                // compound write's synthesized re-read is excluded inside
+                // `is_scalar_view_read`, and it is a binary operand anyway.
+                Expr::Assignment(_, value) => {
+                    if self.is_scalar_view_read(*value, &view_bindings)
+                        || self.is_view_binding_read(*value, &view_bindings)
+                    {
+                        leaks.push(*value);
                     }
                 }
                 // A call argument whose parameter is NOT a view (`&[mut] T`) wants
@@ -28061,13 +28094,151 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// B400: the per-parameter view conventions of a call whose callee is a
-    /// CLOSURE-typed value — a parameter, a local, or a field holding one —
-    /// read off the closure type as written (`|&List<T>| U`). `None` for a
-    /// named function (its parameters carry their conventions) and for a
-    /// closure type with no view parameter.
-    fn closure_callee_views(&self, subject_id: Id) -> Option<Vec<Option<bool>>> {
-        let type_id = match self.expr_id_to_expr_map.get(&subject_id)? {
+    /// B465 (R-c): a closure LITERAL that lands where a closure type takes a
+    /// VIEW (`f: |&str| void`, `update(f: |&mut T| void)`) has view
+    /// parameters there, written or not. `|c|` handed to `f` receives the
+    /// view the caller passes (`f(&a.city)`), so `c` IS a `&str` and reading
+    /// its value takes `*c`, as it does for a `fun`'s `&` parameter. Its
+    /// convention was the bare one the literal was written with, so the JS
+    /// emitter read the view's `(base, key)` pair as the value (`out = *c`
+    /// stored `[ [ 'Oslo', '1' ], 0 ]`), the checker took `out = c` without
+    /// the `*`, and the native emitter passed a value where the literal's type
+    /// wanted a reference.
+    ///
+    /// The positions read are the ones a closure type is WRITTEN at, which is
+    /// where `closure_type_parameter_views` records a view: a parameter of
+    /// the callee a call resolves to (a function, an external, a method, or a
+    /// closure-typed value whose own parameter is a closure type), a field of
+    /// the struct a literal builds, and an annotated binding. A literal
+    /// reached through a `let` (`let f = |c| ..; with_city(home, f)`) adopts
+    /// at the position it is handed to. A parameter the literal spells with
+    /// `&`/`&mut` already has its convention; only a bare one adopts.
+    ///
+    /// Runs once, after inference and before every pass that reads a
+    /// parameter's convention (`infer_borrows`, the view checks, the
+    /// primitive-view classification the emitters read). Whole-program and
+    /// deterministic, so a reused module's literals adopt exactly as they did
+    /// when the module was recorded.
+    fn adopt_closure_parameter_views(&mut self) {
+        let mut adoptions: Vec<(Id, Vec<Option<bool>>)> = Vec::new();
+        let mut call_ids: Vec<Id> = self.function_calls.keys().copied().collect();
+        call_ids.sort_unstable_by_key(|call_id| call_id.0);
+        for call_id in call_ids {
+            let Some(function_call) = self.function_calls.get(&call_id) else {
+                continue;
+            };
+            let argument_ids = function_call.argument_ids.clone();
+            let subject_id = function_call.subject_id;
+            let position_type_ids = self.callee_parameter_type_ids(subject_id);
+            for (type_id, argument_id) in position_type_ids.iter().zip(&argument_ids) {
+                if let Some(views) = self.closure_type_parameter_views.get(type_id)
+                    && let Some(closure_id) = self.closure_behind_callee(*argument_id)
+                {
+                    adoptions.push((closure_id, views.clone()));
+                }
+            }
+        }
+        for (expr_id, expr) in &self.expr_id_to_expr_map {
+            match expr {
+                Expr::StructInitializer(_, fields) => {
+                    let Some(Type::Struct(struct_id, _)) = self
+                        .type_id_of_expr(*expr_id)
+                        .and_then(|type_id| self.type_id_to_type_map.get(&type_id))
+                    else {
+                        continue;
+                    };
+                    let Some(struct_) = self.structs.get(struct_id) else {
+                        continue;
+                    };
+                    for (index, value_id) in fields {
+                        if let Some(field) = struct_.fields.get(*index)
+                            && let Some(views) =
+                                self.closure_type_parameter_views.get(&field.type_id)
+                            && let Some(closure_id) = self.closure_behind_callee(*value_id)
+                        {
+                            adoptions.push((closure_id, views.clone()));
+                        }
+                    }
+                }
+                Expr::Variable(variable_id) => {
+                    if let Some(variable) = self.variables.get(variable_id)
+                        && variable.annotated
+                        && let Some(initial) = variable.initial
+                        && let Some(views) =
+                            self.closure_type_parameter_views.get(&variable.type_id)
+                        && let Some(closure_id) = self.closure_behind_callee(initial)
+                    {
+                        adoptions.push((closure_id, views.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (closure_id, views) in adoptions {
+            let Some(parameter_ids) = self
+                .closures
+                .get(&closure_id)
+                .map(|closure| closure.parameters.clone())
+            else {
+                continue;
+            };
+            if parameter_ids.len() != views.len() {
+                continue;
+            }
+            for (parameter_id, view) in parameter_ids.iter().zip(views) {
+                let Some(mutable) = view else {
+                    continue;
+                };
+                if let Some(parameter) = self.parameters.get_mut(parameter_id)
+                    && parameter.convention == Convention::Bare
+                {
+                    parameter.convention = if mutable {
+                        Convention::RefMut
+                    } else {
+                        Convention::Ref
+                    };
+                }
+            }
+        }
+    }
+
+    /// The written TYPE of each parameter position of the callee `subject_id`
+    /// names — a function's or an external's declared parameters (the receiver
+    /// first for a method), or the parameter types of a closure-typed value's
+    /// closure type. Empty when the callee is neither.
+    fn callee_parameter_type_ids(&self, subject_id: Id) -> Vec<TypeId> {
+        if let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) {
+            let parameter_ids = self
+                .functions
+                .get(callee_id)
+                .map(|function| &function.parameters)
+                .or_else(|| {
+                    self.external_functions
+                        .get(callee_id)
+                        .map(|external| &external.parameters)
+                });
+            if let Some(parameter_ids) = parameter_ids {
+                return parameter_ids
+                    .iter()
+                    .filter_map(|parameter_id| self.parameters.get(parameter_id))
+                    .map(|parameter| parameter.type_id)
+                    .collect();
+            }
+        }
+        match self
+            .closure_value_type_id(subject_id)
+            .and_then(|type_id| self.type_id_to_type_map.get(&type_id))
+        {
+            Some(Type::Closure(parameter_type_ids, _, _)) => parameter_type_ids.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The closure TYPE a closure-typed value carries — a parameter, a local,
+    /// or a field holding one: the type as written, which is where
+    /// `closure_type_parameter_views` keys its views.
+    fn closure_value_type_id(&self, subject_id: Id) -> Option<TypeId> {
+        match self.expr_id_to_expr_map.get(&subject_id)? {
             Expr::Local(binding_id) | Expr::Parameter(binding_id) => self
                 .parameters
                 .get(binding_id)
@@ -28076,10 +28247,44 @@ impl<'src> Analyzer<'src> {
                     self.variables
                         .get(binding_id)
                         .map(|variable| variable.type_id)
-                })?,
-            Expr::Field(..) => self.expr_id_to_type_id_map.get(&subject_id).copied()?,
-            _ => return None,
-        };
+                }),
+            Expr::Field(..) => self.expr_id_to_type_id_map.get(&subject_id).copied(),
+            _ => None,
+        }
+    }
+
+    /// B400: the per-parameter view conventions of a call whose callee is a
+    /// CLOSURE-typed value — a parameter, a local, or a field holding one —
+    /// read off the closure type as written (`|&List<T>| U`). `None` for a
+    /// named function (its parameters carry their conventions) and for a
+    /// closure type with no view parameter.
+    ///
+    /// B465: a callee that IS a closure literal (through `let` bindings,
+    /// `let f = |c: &str| ..; f(..)`) answers from the literal's own
+    /// parameters — written with `&`/`&mut` or adopted from where the literal
+    /// was handed — since its type was never written.
+    fn closure_callee_views(&self, subject_id: Id) -> Option<Vec<Option<bool>>> {
+        if let Some(closure_id) = self.closure_behind_callee(subject_id)
+            && let Some(closure) = self.closures.get(&closure_id)
+        {
+            let views: Vec<Option<bool>> = closure
+                .parameters
+                .iter()
+                .map(|parameter_id| {
+                    match self
+                        .parameters
+                        .get(parameter_id)
+                        .map(|parameter| parameter.convention)
+                    {
+                        Some(Convention::Ref) => Some(false),
+                        Some(Convention::RefMut) => Some(true),
+                        _ => None,
+                    }
+                })
+                .collect();
+            return views.iter().any(Option::is_some).then_some(views);
+        }
+        let type_id = self.closure_value_type_id(subject_id)?;
         self.closure_type_parameter_views.get(&type_id).cloned()
     }
 
@@ -28729,7 +28934,19 @@ impl<'src> Analyzer<'src> {
         // here rather than inside `is_elidable_copy` because its answer is
         // about the BINDING this read initializes, not about a dying
         // source.
+        // B466 (R-c): `*view` is a place too — the storage a VIEW names, which
+        // the binding taking it does not own. Rule 1 copies a value taken out
+        // of such a place: `mut c: P = *v; c.x = 99` must not write the
+        // caller's `P`, and `Some(*v)` is a snapshot a later write through `v`
+        // does not reach. `is_place_expr` stays as it is (rule 3's binding
+        // question, B81's note); the dereference is admitted here, at the copy
+        // positions, and is never an elidable dying source.
+        let is_dereference = matches!(
+            self.expr_id_to_expr_map.get(&value_id),
+            Some(Expr::Dereference(_))
+        );
         if !(self.is_place_expr(value_id)
+            || is_dereference
             || (self.is_shared_read(value_id) && !self.elided_shared_reads.contains(&value_id)))
         {
             return None;
@@ -28749,6 +28966,12 @@ impl<'src> Analyzer<'src> {
         declared_type
             .or_else(|| self.shared_read_value_type_id(value_id))
             .or_else(|| self.place_value_type_id(value_id))
+            .or_else(|| match self.expr_id_to_expr_map.get(&value_id) {
+                // A view's type is its pointee's (references are transparent in
+                // the type system), so the operand answers for `*v`.
+                Some(Expr::Dereference(operand)) => self.place_value_type_id(*operand),
+                _ => None,
+            })
     }
 
     /// B418: the expressions a CHOOSING value can hand back — the tail of a
@@ -29978,7 +30201,28 @@ impl<'src> Analyzer<'src> {
         if shared_captures.contains(binding_id) || self.shared_read_bindings.contains(binding_id) {
             return false;
         }
-        self.variables.contains_key(binding_id) && self.last_use.is_last_use(value_id, *binding_id)
+        // An `own` PARAMETER is a dead owner at its last use exactly as a local
+        // is (R-c): the callee owns its storage — the caller copied it in at a
+        // use that was not its last, or donated one that was — so a storing
+        // constructor written over `own` (`ListCell::of` handing `elements` on
+        // to `list_cell`, and that to `Shared::new`) moves it down the chain
+        // instead of copying at every hop, as the native backend does. A bare
+        // or view parameter is a LOAN, the caller's storage, and never donates.
+        //
+        // Only at a type the CALLER copies, though: rule 1's argument copy is
+        // taken of a cloneable aggregate (or a generic, copied whole at every
+        // instantiation), and an enum is passed as it stands — `held.unwrap()`
+        // hands `own self` the caller's `Option<List<i32>>` itself, so the
+        // payload capture inside is the one copy that keeps `held` intact.
+        let owned = self.variables.contains_key(binding_id)
+            || self.parameters.get(binding_id).is_some_and(|parameter| {
+                parameter.convention == Convention::Own && {
+                    let parameter_type = parameter.type_id.get_type(self);
+                    self.is_cloneable_aggregate(&parameter_type)
+                        || matches!(parameter_type, Type::Generic(_))
+                }
+            });
+        owned && self.last_use.is_last_use(value_id, *binding_id)
     }
 
     /// Resolves a value-name USE at a byte offset, honoring positional
@@ -68003,6 +68247,9 @@ fn analyze_over_world<'src>(
         // The splice (§3.2). Before every check that could add to the lists,
         // and the published order is `sort_in_step`'s either way.
         analyzer.replay_world_diagnostics(&replay_records);
+        // B465: a closure literal at a view position of a written closure type
+        // takes view parameters there — before anything reads a convention.
+        analyzer.adopt_closure_parameter_views();
         // Infer the `borrows` effect before any check reads it (readonly-mutation
         // and the scalar-view lowering both consult `Function.borrows`).
         analyzer.infer_borrows();

@@ -7179,3 +7179,107 @@ const B467_PROBE: &str = concat!(
     "\tprint(edits.len());\n",
     "}\n",
 );
+
+/// R-c (B483 + B466 + B465): a value taken out of a place the binding does not
+/// own is copied, on both backends. `Shared::new`/`ListCell::of`/`with_limit`
+/// take their argument `own` (natively the constructor's argument was MOVED,
+/// rustc E0382 at the caller's next read); `*view` of an aggregate is copied
+/// where it is bound, returned or wrapped (natively a move out of a reference,
+/// E0507); and a closure literal at a view position of its closure type reads
+/// the element through `*c` (natively a value was passed where the type wants
+/// a reference). `inference::borrows`' `b483_*`/`b466_*`/`b465_*` pins hold
+/// the JS values.
+#[test]
+fn a_value_taken_out_of_a_place_it_does_not_own_is_copied_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_rc.vl"), RC_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_rc.vl"),
+        Verdict::Identical,
+        "a value taken out of a place it does not own must be a copy on both backends"
+    );
+}
+
+const RC_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "import std::delta::ListCell;\n",
+    "\n",
+    "struct P { x: i32, tags: List<i32> }\n",
+    "\n",
+    "struct Address { city: str, zip: str }\n",
+    "\n",
+    "fun copy_out(v: &P): P {\n",
+    "\tmut c: P = *v;\n",
+    "\tc.x = 99;\n",
+    "\tc.tags.push(5);\n",
+    "\tc\n",
+    "}\n",
+    "\n",
+    "fun returned(v: &P): P {\n",
+    "\t*v\n",
+    "}\n",
+    "\n",
+    "fun snapshot(v: &mut P): Option<P> {\n",
+    "\tlet snap = Some(*v);\n",
+    "\tv.x = 7;\n",
+    "\tv.tags.push(8);\n",
+    "\tsnap\n",
+    "}\n",
+    "\n",
+    "fun with_city(a: Address, f: |&str| void) {\n",
+    "\tf(&a.city);\n",
+    "}\n",
+    "\n",
+    "fun with_flag(f: |&bool| void) {\n",
+    "\tlet flag = true;\n",
+    "\tf(&flag);\n",
+    "}\n",
+    "\n",
+    "fun with_point(p: P, f: |&P| void) {\n",
+    "\tf(&p);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs: List<i32> = [1, 2];\n",
+    "\tlet cell = Shared::new(xs);\n",
+    "\tcell.write().push(3);\n",
+    "\tprint(i\"shared {xs.len()} {cell.read().len()}\");\n",
+    "\tlet ys: List<i32> = [1, 2];\n",
+    "\tlet list = ListCell::of(ys);\n",
+    "\tlist.push(3);\n",
+    "\tprint(i\"list {ys.len()} {list.get().len()}\");\n",
+    "\tlet zs: List<i32> = [1];\n",
+    "\tlet limited = ListCell::with_limit(zs, 4);\n",
+    "\tlimited.push(2);\n",
+    "\tprint(i\"limited {zs.len()} {limited.get().len()}\");\n",
+    "\tlet p = P { x = 1, tags = [] };\n",
+    "\tlet c = copy_out(&p);\n",
+    "\tprint(i\"deref {p.x} {p.tags.len()} {c.x} {c.tags.len()}\");\n",
+    "\tmut r = returned(&p);\n",
+    "\tr.tags.push(1);\n",
+    "\tprint(i\"returned {p.tags.len()} {r.tags.len()}\");\n",
+    "\tmut q = P { x = 2, tags = [] };\n",
+    "\tlet snap = snapshot(&mut q);\n",
+    "\tmatch snap {\n",
+    "\t\tSome(let s) => print(i\"snapshot {s.x} {s.tags.len()} {q.x} {q.tags.len()}\"),\n",
+    "\t\tNone => print(\"none\"),\n",
+    "\t}\n",
+    "\tlet home = Address { city = \"Oslo\", zip = \"1\" };\n",
+    "\tmut out = \"\";\n",
+    "\twith_city(home, |c| {\n",
+    "\t\tout = *c;\n",
+    "\t});\n",
+    "\tprint(out);\n",
+    "\tmut seen = false;\n",
+    "\twith_flag(|b| {\n",
+    "\t\tseen = *b;\n",
+    "\t});\n",
+    "\tprint(seen);\n",
+    "\tmut total = 0;\n",
+    "\twith_point(p, |point| {\n",
+    "\t\ttotal = point.x;\n",
+    "\t});\n",
+    "\tprint(total);\n",
+    "}\n",
+);

@@ -1024,7 +1024,7 @@ function eq(self, other) {
 }
 function $a(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	return [ __shared_new(__clone(value)), __shared_new(subscribers) ];
 }
 function $m(self) {
 	return self.length === 0;
@@ -1074,7 +1074,7 @@ function $t(policy, body) {
 	return result;
 }
 function $A(self, transform) {
-	return [ __clone(self), transform ];
+	return [ self, transform ];
 }
 function $G(self) {
 	return __clone(self[0].v);
@@ -1216,7 +1216,7 @@ function $B(self, $C, $D) {
 	return cached;
 }
 function $bv(self, name, value, $bw, $bx) {
-	apply(__clone(value), self, name, $bw, $bx);
+	apply(value, self, name, $bw, $bx);
 	return __clone(self);
 }
 function $bq(self, route2, $br, $bs) {
@@ -1233,7 +1233,7 @@ function $bn(label, route2, $bo, $bp) {
 	return text($bq(view("a"), route2, $bo, $bp), label);
 }
 function $bB(self, content, $bC, $bD) {
-	place(__clone(content), self, $bC, $bD);
+	place(content, self, $bC, $bD);
 	return __clone(self);
 }
 function $bV(self, subscriber) {
@@ -1438,7 +1438,7 @@ function $df(self, observer) {
 	return $dg(self, observer, true);
 }
 function $de(flow, observer, $bN, $bO) {
-	$bb(get_owner($bO), $df(__clone(flow), observer), $bN);
+	$bb(get_owner($bO), $df(flow, observer), $bN);
 }
 function $cH(source, render, $cI) {
 	const gated = $a($G(source));
@@ -1490,12 +1490,12 @@ function $dJ(self, content, end, $dK, $dL) {
 	const marker = document.createTextNode("");
 	host(self).insertBefore(marker, end);
 	const staging = document.createDocumentFragment();
-	place(__clone(content), [ __clone(staging) ], $dK, $dL);
+	place(content, [ __clone(staging) ], $dK, $dL);
 	host(self).insertBefore(staging, end);
 	return [ marker ];
 }
 function $dG(self, content, $dH, $dI) {
-	return $dJ(self, __clone(content), self[0], $dH, $dI);
+	return $dJ(self, content, self[0], $dH, $dI);
 }
 function $dM(owner, body) {
 	return body(owner);
@@ -1517,7 +1517,7 @@ function $dr(parent, source, render, armed, $ds, $dt) {
 		close(region);
 		return;
 	});
-	$de(__clone(source), (value) => {
+	$de(source, (value) => {
 		const $dx = last_value.v;
 		let $dy = null;
 		if ($dx[0] === 0) {
@@ -1582,7 +1582,7 @@ function $dm(self, parent, $dn, $do) {
 	return $dq;
 }
 function $dl(self, content, $bC, $bD) {
-	$dm(__clone(content), self, $bC, $bD);
+	$dm(content, self, $bC, $bD);
 	return __clone(self);
 }
 function $dQ(body) {

@@ -84,10 +84,10 @@
 //! **Parameters are walked too** (they reach expression position as
 //! `Expr::Local` of the parameter's id), because an `own` resource parameter is
 //! one of the three teardown classes §6 moves. They are declared at their
-//! function's entry, which a backward walk reaches last. Elision does not read
-//! their answers (`is_elidable_copy` gates on `variables`), and
-//! `compute_view_origins` never keys a parameter, so nothing about the elision
-//! answers moves when they join the walk.
+//! function's entry, which a backward walk reaches last. Elision reads their
+//! answers for an `own` parameter only (`is_elidable_copy`: the callee owns
+//! that storage, R-c); a bare or view parameter is a loan and never donates,
+//! and `compute_view_origins` never keys a parameter.
 
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;

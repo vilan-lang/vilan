@@ -621,7 +621,7 @@ function detached_nursery() {
 }
 function $b(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
+	return [ __shared_new(__clone(value)), __shared_new(subscribers) ];
 }
 function $a(value) {
 	return $b(value);
@@ -630,7 +630,7 @@ function $c(value) {
 	return $b(value);
 }
 function $i(self, select) {
-	return [ __clone(self), select ];
+	return [ self, select ];
 }
 function $r(self) {
 	return __clone(self[0].v);
@@ -829,7 +829,7 @@ function $bk(self, value, $aO) {
 	$aP(self, $aO);
 }
 function $bu(self, transform) {
-	return [ __clone(self), transform ];
+	return [ self, transform ];
 }
 function $bz(self, subscriber) {
 	return $t(self[0], subscriber);

@@ -710,8 +710,9 @@ export struct Tracked<T> {
 }
 
 export impl Tracked<type T> {
-	/// A recorder over `elements`, with nothing recorded yet.
-	fun new(elements: List<T>): Tracked<T> {
+	/// A recorder over `elements`, with nothing recorded yet. It keeps the list it
+	/// is given (`own`, R-c): the caller's binding is not the recorder's.
+	fun new(own elements: List<T>): Tracked<T> {
 		Tracked { elements, ops = [] }
 	}
 }
@@ -768,7 +769,7 @@ export struct ListCell<T> {
 
 /// The one constructor body: every `ListCell` is a list, a notification and a log,
 /// and the three public constructors differ only in the list and the log.
-fun list_cell<T>(elements: List<T>, log: DeltaLog<SeqOp<T>>): ListCell<T> {
+fun list_cell<T>(own elements: List<T>, log: DeltaLog<SeqOp<T>>): ListCell<T> {
 	ListCell { items = Shared::new(elements), published = SignalCell::new(0), log }
 }
 
@@ -786,14 +787,16 @@ export impl ListCell<type T> {
 	}
 
 	/// A cell holding `elements`. Nothing is recorded: a cursor minted after this
-	/// reads the collection as its own starting point.
-	fun of(elements: List<T>): ListCell<T> {
+	/// reads the collection as its own starting point. The cell keeps the list it
+	/// is given (`own`, R-c): a list the caller still reads is copied in, so a
+	/// later `push` grows the cell and never the caller's binding.
+	fun of(own elements: List<T>): ListCell<T> {
 		list_cell(elements, DeltaLog<SeqOp<T>>::new())
 	}
 
 	/// A cell whose log has a ceiling other than `delta_log_limit` — what a test
 	/// that wants to reach the lag path without writing a thousand ops asks for.
-	fun with_limit(elements: List<T>, limit: usize): ListCell<T> {
+	fun with_limit(own elements: List<T>, limit: usize): ListCell<T> {
 		list_cell(elements, DeltaLog<SeqOp<T>>::with_limit(limit))
 	}
 

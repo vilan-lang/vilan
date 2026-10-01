@@ -54,8 +54,11 @@ export *;
 external struct Shared<T>;
 
 impl Shared<type T> {
-	/// Wrap `value` in a fresh shared cell.
-	external fun new(value: T): Shared<T>;
+	/// Wrap `value` in a fresh shared cell. The cell KEEPS what it is given, so the
+	/// parameter is `own` (R-c, B483): a value the caller still reads afterwards is
+	/// copied in (rule 1), and a write through the cell never reaches the caller's
+	/// binding; at its last use the value is moved in.
+	external fun new(own value: T): Shared<T>;
 
 	/// Another handle to the *same* cell (shared, not copied).
 	external fun clone(self): Shared<T>;
