@@ -7283,3 +7283,49 @@ const RC_PROBE: &str = concat!(
     "\tprint(total);\n",
     "}\n",
 );
+
+/// B474: `sub` called through an `S: Source<T>` bound is `Flow`'s member (the
+/// trait answers through a bound, B408's rule) — not `RemoteSource`'s
+/// inherent `sub(|T|)`, which the native emitter picked by name and rustc
+/// refused (E0308) — while the same `sub` on the concrete mirror is still the
+/// inherent one. `inference::markdown`'s
+/// `a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none` is
+/// the JS half.
+#[test]
+fn sub_through_a_source_bound_takes_the_trait_member_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b474.vl"), B474_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b474.vl"),
+        Verdict::Identical,
+        "`sub` through a `Source` bound must dispatch to the trait's member on both backends"
+    );
+}
+
+const B474_PROBE: &str = concat!(
+    "import std::json::json_codec;\n",
+    "import std::io::print;\n",
+    "import std::option::Option::{ None, Some, self };\n",
+    "import std::reactive::{ Signal, SignalCell, Source };\n",
+    "import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };\n",
+    "\n",
+    "fun through_the_trait<T, S: Source<T>>(source: S, observe: |T| void) {\n",
+    "\tlet live = source.sub(observe);\n",
+    "\tlive.dispose();\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet (client_end, server_end) = duplex_pair();\n",
+    "\tlet counter: SignalCell<i32> = Signal::new(9);\n",
+    "\tlet channel = ReactiveServer::new(server_end, json_codec()).expose(counter);\n",
+    "\tlet remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);\n",
+    "\tthrough_the_trait(remote, |value: Option<i32>| match value {\n",
+    "\t\tSome(let n) => print(i\"trait:{n}\"),\n",
+    "\t\tNone => print(\"trait:none\"),\n",
+    "\t});\n",
+    "\tlet present = remote.sub(|value: i32| print(i\"inherent:{value}\"));\n",
+    "\tcounter.set(10);\n",
+    "\tpresent.dispose();\n",
+    "}\n",
+);
