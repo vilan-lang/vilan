@@ -503,6 +503,28 @@ fn adoptable_closure(program: &Program, source: Id) -> Option<Id> {
     }
 }
 
+/// A NAMED FUNCTION or a tuple VARIANT standing where a closure is expected
+/// (B478): `root.effect(show)`, `count.derive(Some)`. Neither carries a clause
+/// of its own, and neither needs one at such a position: the clause is the
+/// CALLER's promise to supply the contexts at each call through the value, and
+/// a callee that reads none of them simply does not look at what it is handed
+/// — exactly as at a plain closure position. A function that does read a
+/// context is not admitted by this: its own coverage is the pass's ordinary
+/// question (a function reached only through a value cannot be supplied).
+///
+/// A closure PARAMETER, or a binding of a closure VALUE, is not one of these:
+/// its type says what it was built under, and that type has no clause.
+fn names_a_callable(program: &Program, entity: Id) -> bool {
+    match program.entity_map.get(&entity) {
+        Some(Expr::EnumVariant(..)) => true,
+        Some(Expr::Local(source)) => {
+            program.functions.contains_key(source)
+                || matches!(program.entity_map.get(source), Some(Expr::EnumVariant(..)))
+        }
+        _ => false,
+    }
+}
+
 /// The clause a VALUE carries wherever this pass can see one (B309): a
 /// reference to a clause-typed binding or parameter, or a read of a
 /// clause-typed field. `None` is an ordinary value.
@@ -542,7 +564,7 @@ fn landing_refusal(
             clause_spelling(program, expected),
         ),
         None => format!(
-            "a `context`-typed {position} takes a closure literal, or a value with the same `context` clause"
+            "a `context`-typed {position} takes a closure literal, a named function or variant, or a value with the same `context` clause"
         ),
     }
 }
@@ -1476,6 +1498,10 @@ fn analyze(
                 Some(expr) if field_read_clause(program, expr).as_deref() == Some(&clause[..]) => {
                     allowed_forwards.insert(initial);
                 }
+                // B478: a named function or a variant, at the fourth landing.
+                _ if names_a_callable(program, initial) => {
+                    allowed_forwards.insert(initial);
+                }
                 _ => {
                     let found =
                         clause_carried_by(program, &value_contexts, &injected_values, initial);
@@ -1552,6 +1578,10 @@ fn analyze(
                 _ if call_return_clause(program, value).as_deref() == Some(&clause[..]) => {
                     allowed_forwards.insert(value);
                 }
+                // B478: a named function or a variant.
+                _ if names_a_callable(program, value) => {
+                    allowed_forwards.insert(value);
+                }
                 _ => {
                     let found =
                         clause_carried_by(program, &value_contexts, &injected_values, value);
@@ -1608,6 +1638,10 @@ fn analyze(
                 // B333: the callee's declared return — a function handing on
                 // what another function promised.
                 _ if call_return_clause(program, value).as_deref() == Some(&clause[..]) => {
+                    allowed_forwards.insert(value);
+                }
+                // B478: a named function or a variant.
+                _ if names_a_callable(program, value) => {
                     allowed_forwards.insert(value);
                 }
                 _ => {
@@ -1671,6 +1705,11 @@ fn analyze(
                     _ if call_return_clause(program, *argument).as_deref() == Some(&clause[..]) => {
                         allowed_forwards.insert(*argument);
                     }
+                    // B478: a named function or a variant at the parameter —
+                    // `root.effect(show)`, `count.derive(Some)`.
+                    _ if names_a_callable(program, *argument) => {
+                        allowed_forwards.insert(*argument);
+                    }
                     _ => {
                         let found = clause_carried_by(
                             program,
@@ -1686,7 +1725,7 @@ fn analyze(
                                 landing_refusal(program, "parameter", &clause, Some(&found)),
                             ));
                         } else {
-                            errors.push(anchored(program, *argument, "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)"
+                            errors.push(anchored(program, *argument, "a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause, or a local closure binding (which adopts the clause)"
                                     .to_string()));
                         }
                     }

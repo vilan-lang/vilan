@@ -2359,6 +2359,50 @@ const B475_PROBE: &str = concat!(
     "}\n",
 );
 
+/// B478: a named function and a variant at a `context`-typed closure position
+/// — `count.derive(Some)`, `count.derive(double)`, `count.effect(show)`. JS
+/// ignores the hidden context arguments the caller appends; natively the value
+/// is adapted to the position's arity (the function item alone was refused by
+/// rustc, E0593).
+#[test]
+fn a_named_function_at_a_context_typed_position_runs_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b478.vl"), B478_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b478.vl"),
+        Verdict::Identical,
+        "a named function or a variant must stand for a context-typed body on both backends"
+    );
+}
+
+const B478_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Owner, SignalCell, Source, run_with_owner };\n",
+    "\n",
+    "fun show(value: i32) {\n",
+    "\tprint(i\"show {value}\");\n",
+    "}\n",
+    "\n",
+    "fun double(value: i32): i32 {\n",
+    "\tvalue * 2\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = SignalCell::new(4);\n",
+    "\tlet wrapped = count.derive(Some).memo();\n",
+    "\tlet doubled = count.derive(double).memo();\n",
+    "\tlet owner = Owner::new();\n",
+    "\trun_with_owner(owner, || {\n",
+    "\t\tcount.effect(show);\n",
+    "\t});\n",
+    "\tcount.set(5);\n",
+    "\tprint(wrapped.get().unwrap() + doubled.get());\n",
+    "\towner.dispose();\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is

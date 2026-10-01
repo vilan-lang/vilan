@@ -4987,11 +4987,85 @@ impl<'a, 'src> Emitter<'a, 'src> {
             names.push(name);
         }
         let path = self.variant_path(enum_id, index, &arguments, span)?;
+        // B478: a `context`-typed position calls through the value with one
+        // hidden argument per clause entry; the variant reads none of them. The
+        // recorded closure type is the variant's eta-expansion, which carries
+        // no clause, so the position's own type says how many there are.
+        if let Some(expected) = self.expected_type {
+            typed.extend(self.ignored_context_parameters(expected, span)?);
+        }
         Ok(format!(
             "std::rc::Rc::new(move |{}| {path}({}))",
             typed.join(", "),
             names.join(", ")
         ))
+    }
+
+    /// B478: the hidden parameters a `context`-typed closure position hands
+    /// every call through its value (`context::thread_contexts` appends one per
+    /// clause entry), as ignored closure parameters — what a named function or
+    /// a variant standing at such a position takes and drops, since neither
+    /// reads the contexts the caller supplies. Empty for a plain closure type.
+    fn ignored_context_parameters(
+        &mut self,
+        closure_type: TypeId,
+        span: Span,
+    ) -> Result<Vec<String>, Error> {
+        let Some(Type::Closure(_, _, contexts)) = self.resolve(closure_type).cloned() else {
+            return Ok(Vec::new());
+        };
+        let mut parameters = Vec::with_capacity(contexts.len());
+        for (position, context) in contexts.iter().enumerate() {
+            let rendered = self.context_clause_type(*context, span)?;
+            parameters.push(format!("_context_{position}: {rendered}"));
+        }
+        Ok(parameters)
+    }
+
+    /// B478: a named function at a `context`-typed closure position, adapted
+    /// to the position's arity — its own parameters forwarded, typed by its
+    /// own (non-generic) signature, and the clause's hidden ones dropped.
+    /// `None` when the position carries no clause, where the function item
+    /// itself is the value (F35).
+    fn context_adapted_function(
+        &mut self,
+        function_id: Id,
+        instance: &str,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        let Some(expected) = self.expected_type else {
+            return Ok(None);
+        };
+        let Some(Type::Closure(_, _, contexts)) = self.resolve(expected).cloned() else {
+            return Ok(None);
+        };
+        if contexts.is_empty() {
+            return Ok(None);
+        }
+        let Some(function) = self.program.functions.get(&function_id).cloned() else {
+            return Ok(None);
+        };
+        let mut typed = Vec::new();
+        let mut names = Vec::new();
+        for (position, parameter_id) in function.parameters.iter().enumerate() {
+            let Some(parameter) = self.program.parameters.get(parameter_id).cloned() else {
+                return Err(unsupported("an unresolved parameter", span));
+            };
+            let name = format!("function_arg_{position}");
+            let rendered = self.rust_type(parameter.type_id, span)?;
+            typed.push(match self.receiving_form(&parameter) {
+                Receiving::RefMut => format!("{name}: &mut {rendered}"),
+                Receiving::Ref => format!("{name}: &{rendered}"),
+                Receiving::ByValue => format!("{name}: {rendered}"),
+            });
+            names.push(name);
+        }
+        typed.extend(self.ignored_context_parameters(expected, span)?);
+        Ok(Some(format!(
+            "std::rc::Rc::new(move |{}| {instance}({}))",
+            typed.join(", "),
+            names.join(", ")
+        )))
     }
 
     fn function_value(&mut self, function_id: Id, span: Span) -> Result<String, Error> {
@@ -5038,6 +5112,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             );
         }
         let instance = self.ensure_function(function_id, &HashMap::default())?;
+        if let Some(adapted) = self.context_adapted_function(function_id, &instance.name, span)? {
+            return Ok(adapted);
+        }
         Ok(format!("std::rc::Rc::new({})", instance.name))
     }
 

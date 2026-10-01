@@ -251,8 +251,8 @@ row	flagship	key
 216	-	`run` must be called on a named context with a closure literal body
 217	-	`run` must be called on a named context with a closure literal body, or a closure value whose type is `context`-annotated with exactly this context
 218	-	this parameter's `context` clause names a value that is not a context
-219	-	a `context`-typed {position} takes a closure literal, or a value with the same `context` clause
-220	-	a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)
+219	-	a `context`-typed {position} takes a closure literal, a named function or variant, or a value with the same `context` clause
+220	-	a `context`-typed parameter takes a closure literal, a named function or variant, a value with the same `context` clause, or a local closure binding (which adopts the clause)
 221	flagship	an injected (`context`-typed) closure can only be called, forwarded to a position with the same `context` clause, or passed to `run`
 222	flagship	context `{}` is read here, but this code can be reached without an enclosing `run`
 223	-	an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`
