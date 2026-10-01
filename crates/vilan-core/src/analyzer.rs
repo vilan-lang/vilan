@@ -60270,6 +60270,9 @@ pub struct Program<'src> {
     /// every pass that refines dispatch (M97). Derived data, like the graph.
     bound_selection_memo:
         std::sync::Mutex<HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>,
+    /// [`crate::impl_select::applying_implementations`]' answers, as indices
+    /// into `implementations` (M98). Derived data, like the graph.
+    applying_memo: std::sync::Mutex<HashMap<crate::impl_select::ApplyingKey, Vec<usize>>>,
 }
 
 /// One module-level binding's HMR transfer descriptor (`hmr.md` §4).
@@ -60699,6 +60702,16 @@ impl<'src> Program<'src> {
     /// graph built at an unknown moment, and the moment is the invariant.
     pub fn install_call_graph(&self, graph: crate::call_graph::CallGraph) {
         let _ = self.call_graph_memo.set(graph);
+    }
+
+    /// [`crate::impl_select::applying_implementations`]' memo (M98), read
+    /// through a poisoned lock for [`Self::bound_selection_memo`]'s reason.
+    pub(crate) fn applying_memo(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<crate::impl_select::ApplyingKey, Vec<usize>>> {
+        self.applying_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// [`crate::dispatch_refine::impl_members_for_bound`]'s memo (M97). A
@@ -69606,6 +69619,7 @@ fn analyze_over_world<'src>(
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
         bound_selection_memo: std::sync::Mutex::default(),
+        applying_memo: std::sync::Mutex::default(),
     })
 }
 
