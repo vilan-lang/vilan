@@ -6960,6 +6960,10 @@ fn compile_to_js(
             );
         }
 
+        // The emission walk's own span (M98): `check` runs it too, through
+        // `diagnose`, and on kolt's client it is ~0.85 s that no phase line
+        // named. Zero when the walk does not run (an unclean analysis).
+        let mut phase_emission = vilan_core::PhaseSpan::ZERO;
         // Never emit from a recovered tree — `check` reaches here with one, and
         // codegen over a tree with statements missing would describe a program
         // nobody wrote. (`clean` below already refuses to RETURN the output; this
@@ -7002,6 +7006,7 @@ fn compile_to_js(
             // A `split = true` leg emits through the same walk and the same
             // rename; `transform_split` returns the eager bundle where
             // `transform` returns the whole one, plus the chunk files.
+            let emission_clock = vilan_core::PhaseClock::now();
             let emitted = match split {
                 // A module of a package, addressed by path: analysis is the
                 // whole job (E113). Emission's one diagnostic is the missing
@@ -7062,6 +7067,7 @@ fn compile_to_js(
                 }
                 None => transform(&program, options),
             };
+            phase_emission = emission_clock.elapsed();
             match emitted {
                 // The leg's source set — each path paired with the content
                 // hash it was COMPILED from — which the watch loop verifies
@@ -7132,6 +7138,16 @@ fn compile_to_js(
                     analyzer_errors.push((located, error.span.into_range(), error.msg));
                 }
             }
+        }
+        // And the program's drop, timed by making it explicit: a whole-world
+        // analysis frees its tables here, ~0.3 s on kolt's client (M98).
+        let drop_clock = vilan_core::PhaseClock::now();
+        drop(program);
+        if vilan_core::phase_timing_enabled() {
+            eprintln!(
+                "[vilan phase] emission-walk {phase_emission} program-drop {}",
+                drop_clock.elapsed()
+            );
         }
     } else {
         // No tree to analyse — `build`'s parse failed and its diagnostics are
