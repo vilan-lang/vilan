@@ -507,6 +507,13 @@ pub fn nursery_new_detached() -> Nursery {
     Nursery::body(None, true)
 }
 
+/// `__nursery_has_spawned(n)` — whether any task ever registered with the
+/// nursery, a settled one included (M92: a pipe stage carries a nursery no task
+/// registered with into its next run).
+pub fn nursery_has_spawned(nursery: &Nursery) -> bool {
+    !nursery.0.children.borrow().is_empty()
+}
+
 /// `__nursery_run(n, body)` — the join, reproduced exactly.
 ///
 /// Run the body, then drain the children; the child list may GROW while

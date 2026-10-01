@@ -2198,16 +2198,22 @@ fn a136_a_maker_that_builds_what_outlives_the_caller_does_not_warn() {
 
 #[test]
 fn a142_s2_a_body_that_registers_nothing_allocates_no_owner() {
-    // `owner_lists_allocated` counts every cleanup list an owner ever made. Ten
-    // changes through a sealed two-stage chain and a plain effect allocate NONE
-    // (`quiet=0`); the same ten through an effect whose body registers one
-    // cleanup per run allocate one list per run (`busy=10`). Red when the run's
-    // owner allocates its list up front: `quiet=30` (a list per run per body).
+    // `owner_lists_allocated` counts every cleanup list an owner ever made, and
+    // `run_nurseries_allocated` every nursery a pipe run made (M92). Ten changes
+    // through a sealed two-stage chain and a plain effect allocate NEITHER
+    // (`quiet=0 nurseries=0`); the same ten through an effect whose body
+    // registers one cleanup per run allocate one list per run (`busy=10`) and
+    // still no nursery; ten through an effect whose body starts a task allocate
+    // one nursery per run (`spawning=10`): a nursery a task registered with is
+    // cancelled with its run. Red when the run's owner allocates its list up
+    // front: `quiet=30`; red when every run makes a nursery (before M92):
+    // `nurseries=30` and `busy_nurseries=10`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{
-            Owner, Signal, SignalCell, Source, on_cleanup, owner_lists_allocated, run_with_owner,
+            Owner, Signal, SignalCell, Source, on_cleanup, owner_lists_allocated, run_nurseries_allocated,
+            run_with_owner,
         };
 
         fun main() {
@@ -2220,30 +2226,46 @@ fn a142_s2_a_body_that_registers_nothing_allocates_no_owner() {
                 root.derive(|value| value + 1).derive(|value| value * 2).memo()
             });
             let before = owner_lists_allocated();
+            let before_nurseries = run_nurseries_allocated();
             mut step = 1;
             for step <= 10 {
                 root.set(step);
                 step += 1;
             }
-            print(i"quiet={owner_lists_allocated() - before} value={sealed.get()}");
+            print(i"quiet={owner_lists_allocated() - before} nurseries={run_nurseries_allocated() - before_nurseries} value={sealed.get()}");
             let noisy = Owner::new();
             run_with_owner(noisy, || {
                 root.effect(|_value: i32| on_cleanup(|| {}));
             });
             let before_busy = owner_lists_allocated();
+            let before_busy_nurseries = run_nurseries_allocated();
             step = 1;
             for step <= 10 {
                 root.set(step);
                 step += 1;
             }
-            print(i"busy={owner_lists_allocated() - before_busy}");
+            print(i"busy={owner_lists_allocated() - before_busy} busy_nurseries={run_nurseries_allocated() - before_busy_nurseries}");
             noisy.dispose();
+            let spawning = Owner::new();
+            run_with_owner(spawning, || {
+                root.effect(|value: i32| {
+                    let _task = async value;
+                });
+            });
+            let before_spawning = run_nurseries_allocated();
+            step = 1;
+            for step <= 10 {
+                root.set(step);
+                step += 1;
+            }
+            print(i"spawning={run_nurseries_allocated() - before_spawning}");
+            spawning.dispose();
             boundary.dispose();
         }
 
         main();
         "#,
-        "quiet=0 value=22\nbusy=10\n",
+        "quiet=0 nurseries=0 value=22\nbusy=10 busy_nurseries=0\nspawning=10\n",
     );
 }
 
@@ -2415,13 +2437,13 @@ fn a142_s2_a_derive_bodys_superseded_task_is_cancelled() {
 }
 
 #[test]
-#[ignore = "A142: reactive-44 find — a spawn inside a user-written `context ambient_nursery` closure is not registered with the injected nursery, so a cancelled run's task is reported as an unhandled task error"]
 fn a142_s2_a_cancelled_runs_task_is_owned_and_reports_nothing() {
-    // The ownership half of the pin above: the run's task is REGISTERED with the
-    // run's nursery, so its cancellation is absorbed like every owned task's.
-    // Today the spawn is not connected to the injected nursery: the task is
-    // cancelled through the ambient signal (its sleep aborts) but it is unowned,
-    // so its AbortError is reported on stderr.
+    // The ownership half of the pin above (J7): the run's task is REGISTERED with
+    // the run's nursery, so its cancellation is absorbed like every owned task's.
+    // Red when a spawn in a literal born under `context ambient_nursery` is not
+    // connected to the nursery its caller injects (the program calls no
+    // `nursery`): the task is cancelled through the ambient signal (its sleep
+    // aborts) but it is unowned, so its AbortError is reported on stderr.
     let (stdout, stderr) = compile_and_run_capturing_stderr(
         r#"
         import std::io::print;
@@ -2453,6 +2475,139 @@ fn a142_s2_a_cancelled_runs_task_is_owned_and_reports_nothing() {
     assert!(
         stderr.trim().is_empty(),
         "a cancelled owned task reports nothing: {stderr}"
+    );
+}
+
+#[test]
+fn j7_a_spawn_in_a_user_written_ambient_nursery_closure_is_owned_by_the_injected_nursery() {
+    // J7 (native-44's divergence): a function whose body parameter is typed
+    // `context ambient_nursery` establishes a detached nursery for it and cancels
+    // the nursery after. The task the literal spawned belongs to that nursery, so
+    // it is cancelled (neither `survived` prints) and its cancellation is
+    // absorbed. Red before J7 — the program calls no `nursery`, so the spawn was
+    // never connected: two "unhandled task error … AbortError" lines on stderr.
+    // Both shapes: the clause alone, and beside `owner_scope` (a pipe body's).
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, owner_scope };
+        import std::task::{ ambient_nursery, detached_nursery };
+        import std::time::sleep;
+
+        fun single(body: (|| void) context ambient_nursery) {
+            let held = detached_nursery();
+            ambient_nursery.run(held, body);
+            held.cancel();
+        }
+
+        fun double(body: (|| void) context (owner_scope, ambient_nursery)) {
+            let held = detached_nursery();
+            owner_scope.run(Owner::new(), || ambient_nursery.run(held, || body()));
+            held.cancel();
+        }
+
+        fun main() {
+            single(|| {
+                let _task = async {
+                    sleep(20);
+                    print("single survived");
+                };
+            });
+            double(|| {
+                let _task = async {
+                    sleep(20);
+                    print("double survived");
+                };
+            });
+            sleep(60);
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "done\n");
+    assert!(
+        stderr.trim().is_empty(),
+        "a cancelled owned task reports nothing: {stderr}"
+    );
+}
+
+#[test]
+fn j7_a_spawn_in_a_function_an_effect_body_calls_is_owned_by_the_run() {
+    // The dynamic extent, not the literal: a spawn inside a helper the body CALLS
+    // registers with the run's nursery too (the helper is threaded the nursery
+    // like any function a `nursery` body calls), so a superseded run's task is
+    // cancelled AND absorbed. Red when only a spawn written in the literal itself
+    // registers: `fetched 1` stays cancelled through the signal but its
+    // AbortError reaches stderr.
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::time::sleep;
+
+        fun fetch_later(value: i32) {
+            let _pending = async {
+                sleep(30);
+                print(i"fetched {value}");
+            };
+        }
+
+        fun main() {
+            let id = Signal::new(1);
+            let boundary = Owner::new();
+            run_with_owner(boundary, || {
+                id.effect(|value: i32| fetch_later(value));
+            });
+            id.set(2);
+            sleep(120);
+            boundary.dispose();
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "fetched 2\ndone\n");
+    assert!(
+        stderr.trim().is_empty(),
+        "a cancelled owned task reports nothing: {stderr}"
+    );
+}
+
+#[test]
+fn j7_a_spawn_with_no_nursery_establishing_site_stays_free_floating() {
+    // The engagement is still gated: a program that only loads `std::task` and
+    // spawns (no `nursery`, no `enter`, no literal at a `context ambient_nursery`
+    // position) keeps the unstructured behaviour — its failing task, never
+    // awaited, reports on stderr with its origin.
+    let (stdout, stderr) = compile_and_run_capturing_stderr(
+        r#"
+        import std::io::{ panic, print };
+        import std::task::Task;
+        import std::time::sleep;
+
+        fun fail(): i32 {
+            panic("boom")
+        }
+
+        fun main() {
+            let _task: Task<i32> = async fail();
+            sleep(20);
+            print("done");
+        }
+
+        main();
+        "#,
+    )
+    .expect("compiles and runs");
+    assert_eq!(stdout, "done\n");
+    assert!(
+        stderr.contains("unhandled task error") && stderr.contains("boom"),
+        "a free task's failure reports: {stderr}"
     );
 }
 

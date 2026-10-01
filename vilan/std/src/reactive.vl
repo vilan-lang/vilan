@@ -991,6 +991,16 @@ fun owner_lists_allocated(): i32 {
 	owner_lists_allocated_count.read()
 }
 
+/// How many nurseries pipe runs have allocated since the program started — the
+/// instrument behind "a run that starts no task allocates no nursery" (M92).
+let run_nurseries_allocated_count: Shared<i32> = Shared::new(0);
+
+/// `run_nurseries_allocated_count`, read. A pin's instrument, not an application's.
+export [internal("an instrument for the lazy-nursery pin (M92); it counts, it decides nothing")]
+fun run_nurseries_allocated(): i32 {
+	run_nurseries_allocated_count.read()
+}
+
 export impl Owner {
 	fun new(): Owner {
 		Owner {
@@ -1047,25 +1057,40 @@ export impl Owner {
 	}
 
 	/// The owner of this cell's NEXT run: the live epoch is released (its cleanups
-	/// run, its nursery is cancelled) and the epoch after it opened, with a fresh
-	/// nursery for its tasks when `with_nursery` — a pipe stage's per-run owner
-	/// (A142 §4). Reached from any epoch of the cell: a stage keeps the cell and
-	/// renews through whichever epoch it last handed out.
+	/// run, its nursery is cancelled) and the epoch after it opened, with a nursery
+	/// for its tasks — a pipe stage's per-run owner (A142 §4). Reached from any
+	/// epoch of the cell: a stage keeps the cell and renews through whichever epoch
+	/// it last handed out.
+	///
+	/// **A run that starts no task allocates no nursery (M92).** A nursery no task
+	/// has registered with has nothing to cancel, so it is CARRIED into the next
+	/// epoch instead of cancelled and replaced: a stage makes a nursery at its
+	/// first run and again only after a run that spawned. (A task spawned later
+	/// through a closure the carried run minted joins the live run's nursery and is
+	/// cancelled with it — one run late, never leaked; the stage's last release
+	/// cancels it whatever it holds.)
 	[internal("a pipe stage's per-run owner (A142 §4); an application disposes an owner and makes a new one")]
-	fun renew(self, with_nursery: bool): Owner {
-		let live = Owner { cell = self.cell, epoch = self.cell.read().epoch };
-		live.dispose();
-		let next = self.cell.read().epoch;
-		if with_nursery {
-			let held = self.cell.read();
-			self.cell.write() = OwnerCell {
-				epoch = held.epoch,
-				cleanups = held.cleanups,
-				listed = held.listed,
-				nursery = Some(detached_nursery()),
-			};
+	fun renew(self): Owner {
+		let live = self.cell.read();
+		let carried: Option<Nursery> = match live.nursery {
+			Some(let nursery) => if nursery.has_spawned() { None } else { Some(nursery) },
+			None => None,
+		};
+		Owner { cell = self.cell, epoch = self.cell.read().epoch }.advance(carried);
+		let opened = self.cell.read();
+		match opened.nursery {
+			Some(_) => {},
+			None => {
+				run_nurseries_allocated_count.write() = run_nurseries_allocated_count.read() + 1;
+				self.cell.write() = OwnerCell {
+					epoch = opened.epoch,
+					cleanups = opened.cleanups,
+					listed = opened.listed,
+					nursery = Some(detached_nursery()),
+				};
+			},
 		}
-		Owner { cell = self.cell, epoch = next }
+		Owner { cell = self.cell, epoch = opened.epoch }
 	}
 
 	/// The live epoch's nursery, made at the first ask — a collection stage's one
@@ -1135,18 +1160,32 @@ export impl Owner with Disposable {
 	/// instead of landing on the emptied list — and so does a late registration
 	/// made through this epoch's handle after a newer epoch opened.
 	fun dispose(self) {
+		self.advance(None);
+	}
+}
+
+impl Owner {
+	/// Release this epoch — `dispose`, carrying `carried` (the epoch's own nursery,
+	/// which no task registered with) into the next epoch uncancelled: `renew`'s
+	/// M92 reuse. Nothing when this epoch is already over.
+	fun advance(self, carried: Option<Nursery>) {
 		if !self.is_disposed() {
 			let held = self.cell.read();
 			self.cell.write() = OwnerCell {
 				epoch = self.epoch + 1,
 				cleanups = no_cleanups,
 				listed = false,
-				nursery = None,
+				nursery = carried,
 			};
 			// Tasks first: a cancelled task's in-flight IO rejects at once, and a
-			// cleanup below that inspects what the run left sees it settled.
+			// cleanup below that inspects what the run left sees it settled. A
+			// carried nursery holds no task, and stays live for the next epoch.
 			match held.nursery {
-				Some(let nursery) => nursery.cancel(),
+				Some(let nursery) => {
+					if carried.is_none() {
+						nursery.cancel();
+					}
+				},
 				None => {},
 			}
 			// Every cleanup runs, even past a throwing one (tracker B292).
@@ -1272,11 +1311,13 @@ export fun on_cleanup(cleanup: || void) {
 ///
 /// Nothing here allocates an owner: the run's owner is the next epoch of the one
 /// cell the stage already holds, and its cleanup list is allocated at the run's
-/// first registration (`Owner::defer`). The nursery IS allocated per run — the
-/// host's spawn machinery registers a task with the ambient nursery at the `async`
-/// expression, so one has to exist before the body runs.
+/// first registration (`Owner::defer`). A nursery has to exist before the body
+/// runs — the spawn machinery registers a task with the ambient nursery at the
+/// `async` expression (J7: the body is born under `ambient_nursery`, so the task
+/// is OWNED, and its cancellation is absorbed) — but a run that started no task
+/// hands its nursery on to the next run (M92, `Owner::renew`).
 fun run_body<T>(runs: Owner, body: (|| T) context (owner_scope, ambient_nursery)): T {
-	let run = runs.renew(true);
+	let run = runs.renew();
 	match run.nursery() {
 		Some(let nursery) => owner_scope.run(run, || ambient_nursery.run(nursery, || body())),
 		None => panic("a renewed run carries its nursery"),

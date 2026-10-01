@@ -564,16 +564,19 @@ an `owner.take`, a mirror's lease — is released before the next run, and the
 last run's when the consumer is released (the enclosing boundary, for an
 `effect` or a `.memo()`; the call itself, for `.sample()`). A task the body
 starts runs in the run's nursery and is **cancelled** when the run is released,
-so a superseded fetch stops rather than landing late. A pipe has exactly one
+so a superseded fetch stops rather than landing late. The task is OWNED by that
+nursery — spawned in the body or in anything the body calls — so its
+cancellation is absorbed, never reported as an unhandled task error. A pipe has exactly one
 consumer, so every body runs once per change inside one instance, and "a run"
 always means "one run per change".
 
 The owner is allocated LAZILY: a stage keeps one owner cell for the life of its
 instance, each run is the next epoch of it, and the cleanup list is made at the
 run's first registration — a body that registers nothing costs a read and a
-write, and allocates no owner. (A run's nursery is created per run: the host's
-spawn machinery registers a task at the `async` expression, so one has to
-exist before the body runs.) The bindings in `std::ui` do not pay even that:
+write, and allocates no owner. A run's nursery has to exist before the body
+runs (the spawn machinery registers a task at the `async` expression), but a
+run that started no task hands its nursery on to the next run: a stage makes a
+nursery at its first run, and again only after a run that spawned. The bindings in `std::ui` do not pay even that:
 their bodies write the DOM and register nothing, so they attach plainly.
 
 ```vilan

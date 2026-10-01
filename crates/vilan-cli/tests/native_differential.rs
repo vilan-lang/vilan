@@ -2510,6 +2510,88 @@ const B482_PROBE: &str = concat!(
     "}\n",
 );
 
+/// J7 + M92: a spawn in a literal born under `context ambient_nursery` — a
+/// user-written clause, and a pipe body's — is OWNED by the nursery its caller
+/// injects: cancelled with it, and its cancellation absorbed (native-44 found JS
+/// reporting two "unhandled task error … AbortError" lines here and native none).
+/// A run that starts no task hands its nursery on (`nurseries=0`). Stdout the
+/// same on both backends, and stderr empty on both.
+#[test]
+fn an_injected_nurserys_spawn_is_owned_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_j7.vl"), J7_PROBE).expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_j7.vl"),
+        Verdict::Identical,
+        "an injected nursery's spawn must be owned the same way on both backends"
+    );
+    for backend in [None, Some("rust")] {
+        let mut command = vilan(&staged);
+        command.arg("run");
+        if let Some(backend) = backend {
+            command.args(["--backend", backend]);
+        }
+        let output = command
+            .arg("native_probe_j7.vl")
+            .output()
+            .expect("run the probe");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "nurseries=0 value=12\nfetched 3\ndone\n",
+            "backend {backend:?}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "a cancelled owned task reports nothing (backend {backend:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+const J7_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Owner, Signal, SignalCell, Source, run_nurseries_allocated, run_with_owner };\n",
+    "import std::task::{ ambient_nursery, detached_nursery };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "fun single(body: (|| void) context ambient_nursery) {\n",
+    "\tlet held = detached_nursery();\n",
+    "\tambient_nursery.run(held, body);\n",
+    "\theld.cancel();\n",
+    "}\n",
+    "\n",
+    "fun fetch_later(value: i32) {\n",
+    "\tlet _pending = async {\n",
+    "\t\tsleep(30);\n",
+    "\t\tprint(i\"fetched {value}\");\n",
+    "\t};\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tsingle(|| {\n",
+    "\t\tlet _task = async {\n",
+    "\t\t\tsleep(20);\n",
+    "\t\t\tprint(\"single survived\");\n",
+    "\t\t};\n",
+    "\t});\n",
+    "\tlet id: SignalCell<i32> = Signal::new(1);\n",
+    "\tlet boundary = Owner::new();\n",
+    "\tlet sealed = run_with_owner(boundary, || id.derive(|value: i32| value * 4).memo());\n",
+    "\tlet before = run_nurseries_allocated();\n",
+    "\tid.set(2);\n",
+    "\tid.set(3);\n",
+    "\tprint(i\"nurseries={run_nurseries_allocated() - before} value={sealed.get()}\");\n",
+    "\trun_with_owner(boundary, || {\n",
+    "\t\tid.effect(|value: i32| fetch_later(value));\n",
+    "\t});\n",
+    "\tid.set(4);\n",
+    "\tid.set(3);\n",
+    "\tsleep(120);\n",
+    "\tboundary.dispose();\n",
+    "\tprint(\"done\");\n",
+    "}\n",
+);
+
 /// B470: a `Drop`-free resource erased into a `[resource] trait`'s object.
 /// The analyzer admits it (pinned on JS in `inference::dyn_objects`); the
 /// native half — building the erased pair for a resource without cloning — is
