@@ -58,6 +58,11 @@ written down.
 <!-- family: fix -->
 **Native builds accept a value `if` whose condition compares against a literal of a different width than its arms: `let two = if n > 2 { 1 } else { 2 }` over `n: u53` builds and prints `1`, where rustc refused `u64 > i32` (E0308).** The `if`'s value expectation (`i32`, from the arms) reached the comparison in its condition, and the literal `2` took it. A comparison, `&&` and `||` answer a `bool`, so the expectation around them is never their operands': the operands are rendered with it cleared, each at its partner's type. Pin: `a_comparison_literal_takes_its_comparands_width_on_both_backends` (a `u53`, a `u8` and a `usize` condition beside `i32`, `i16` and `f64` arms, a `bool` binding, a `while` condition inside an `i32`-valued block). Tracker F54.
 
+---
+
+<!-- family: fix -->
+**Native builds accept an annotated `Option` or `Result` binding that nothing reads: `let ok: Result<i32, str> = Ok(10);` and `let nothing: Option<str> = None;` build, where rustc refused them ("type annotations needed", E0282).** `Option` and `Result` are Rust's own enums natively, so `Ok(10)` names no instance and Rust closes the missing parameter from whatever reads the binding — and the native backend writes a binding's annotation only where the initializer cannot type it, so an unread binding left `E` open. A written annotation over an `Option`/`Result` variant is written natively now. Pin: `an_unread_annotated_variant_binding_is_identical_on_both_backends` (`Ok`, `Err`, `None`, `Some` at `u8`, an `Option` of a `Result` of a struct, a `Result` of a list). Tracker F55.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

@@ -5127,6 +5127,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let annotation = if initializer_needs_a_type {
             let rendered = self.rust_type(variable.type_id, self.span_of(binding))?;
             format!(": {rendered}")
+        } else if variable.annotated
+            && variable
+                .initial
+                .is_some_and(|initial| self.builds_a_host_variant(initial))
+            && self.is_grounded(variable.type_id)
+        {
+            // F55: and an `Option`/`Result` VARIANT under a written annotation.
+            // Those two are Rust's own enums, so `Ok(10)` names no instance,
+            // and Rust closes `E` from whatever reads the binding — a binding
+            // nothing reads (`let ok: Result<i32, str> = Ok(10);`) left it
+            // open and rustc refused it (E0282). The written annotation is the
+            // answer the program gave; a variant's initializer is never a view.
+            // A closure type is left to the literal, whose async reading the
+            // position owns.
+            let rendered = self.rust_type(variable.type_id, self.span_of(binding))?;
+            if mentions_a_closure(&rendered) {
+                String::new()
+            } else {
+                format!(": {rendered}")
+            }
         } else {
             String::new()
         };
@@ -5176,6 +5196,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.span_of(binding),
             )),
         }
+    }
+
+    /// Whether `id` builds an `Option` or a `Result` variant directly — `None`,
+    /// `Some(x)`, `Ok(x)`, `Err(e)` — whose Rust path names no instance (F55).
+    fn builds_a_host_variant(&self, id: Id) -> bool {
+        let variant = match self.program.entity_map.get(&id) {
+            Some(Expr::EnumVariant(..)) => Some(id),
+            Some(Expr::Local(binding)) => Some(*binding),
+            Some(Expr::Call(call_id)) => {
+                self.program.function_calls.get(call_id).and_then(|call| {
+                    match self.program.entity_map.get(&call.subject_id) {
+                        Some(Expr::Local(target)) => Some(*target),
+                        _ => None,
+                    }
+                })
+            }
+            _ => None,
+        };
+        let Some(Expr::EnumVariant(enum_id, _)) =
+            variant.and_then(|variant| self.program.entity_map.get(&variant))
+        else {
+            return false;
+        };
+        self.program
+            .enums
+            .get(enum_id)
+            .is_some_and(|declaration| matches!(declaration.name, "Option" | "Result"))
     }
 
     /// Whether a type is one of the numeric scalar primitives — the set

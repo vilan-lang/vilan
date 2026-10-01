@@ -7325,3 +7325,28 @@ fn a_comparison_literal_takes_its_comparands_width_on_both_backends() {
         "a comparison's literal must take its comparand's width"
     );
 }
+
+/// F55: an annotated `Option`/`Result` binding nothing reads builds natively.
+/// The binding's annotation is not written (a view binding's type is its
+/// pointee's, so writing every annotation would be wrong), and `Option` and
+/// `Result` are Rust's own enums, whose bare path names no instance — so
+/// `let ok: Result<i32, str> = Ok(10)`, never read, left `E` open (rustc
+/// E0282). A written annotation over an `Option`/`Result` variant is written
+/// natively now. (Writing the variant's own type arguments instead —
+/// `Ok::<i32, Str>(10)` everywhere — was tried and is wrong: the arguments a
+/// constructor records inside a generic instance are not reliable, and Rust's
+/// inference had been covering for them.)
+#[test]
+fn an_unread_annotated_variant_binding_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_unread_annotated_variants.vl"),
+        include_str!("native/unread_annotated_variants.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_unread_annotated_variants.vl"),
+        Verdict::Identical,
+        "an annotated `Option`/`Result` binding nothing reads must build"
+    );
+}
