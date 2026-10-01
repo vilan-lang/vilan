@@ -7410,3 +7410,42 @@ const B444_PROBE: &str = concat!(
     "\tprint(*v);\n",
     "}\n",
 );
+
+/// B464: a closure's `&mut` parameter called with `&mut <place>` — a field,
+/// a local, a subscript — writes through the same on both backends (the bare
+/// spelling is refused; JS threw on it).
+#[test]
+fn a_closure_view_parameter_takes_a_view_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b464.vl"), B464_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b464.vl"),
+        Verdict::Identical,
+        "a closure's view parameter must write through on both backends"
+    );
+}
+
+const B464_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct A { x: i32, s: str }\n",
+    "\n",
+    "fun apply(f: sync |&mut str| void) {\n",
+    "\tmut a = A { x = 1, s = \"old\" };\n",
+    "\tf(&mut a.s);\n",
+    "\tprint(a.s);\n",
+    "\tmut s = \"old\";\n",
+    "\tf(&mut s);\n",
+    "\tprint(s);\n",
+    "\tmut xs = [\"old\"];\n",
+    "\tf(&mut xs[0]);\n",
+    "\tprint(xs[0]);\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tapply(|&mut p| {\n",
+    "\t\tp = \"new\";\n",
+    "\t});\n",
+    "}\n",
+);

@@ -28032,23 +28032,22 @@ impl<'src> Analyzer<'src> {
             // argument, and a write to the cell inside showed through it (JS
             // `seen=3`, native `seen=2`).
             //
-            // SCOPED to that hazard (the owner's ruling, 2026-09-26): a CALL's
-            // result — a temporary, which for `Shared::read()` is the cell's
-            // own storage, uncopied — at a closure's view parameter. A PLACE
-            // (`mutate(list[at])` at a `|&mut T|`, std's `KeyedCell::update`)
-            // names storage the caller holds, and is not refused here, where a
-            // `fun`'s parameter still asks for the `&`-spelling below.
+            // B464 (Order 45): the rule is the `fun` path's WHOLE rule, not the
+            // temporary-only scope it first shipped with (the owner's
+            // 2026-09-26 ruling, superseded at Order 45's GO). A bare PLACE at
+            // a closure's view parameter (`f(a.s)` at a `|&mut str|`) was
+            // accepted, and the JS build handed the VALUE to a body that
+            // writes through a `(base, key)` pair — `TypeError: Cannot create
+            // property` — while native printed the right answer. One rule: a
+            // view parameter takes a view (`&mut a.s`, or an existing view),
+            // for a `fun` and a closure alike.
             if let Some(views) = self.closure_callee_views(function_call.subject_id) {
                 for (view, argument_id) in views.iter().zip(argument_ids.iter()) {
                     let Some(mutable) = view else {
                         continue;
                     };
                     let kind = if *mutable { "&mut" } else { "&" };
-                    let temporary = matches!(
-                        self.expr_id_to_expr_map.get(argument_id),
-                        Some(Expr::Call(_))
-                    );
-                    if temporary && !self.assignment_target_is_view(*argument_id) {
+                    if !self.assignment_target_is_view(*argument_id) {
                         self.push_anchored(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(

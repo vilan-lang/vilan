@@ -10447,15 +10447,29 @@ fn b400_a_view_argument_to_a_closure_view_parameter_still_runs() {
     );
 }
 
-/// The owner's scoping (2026-09-26): a PLACE fed to a closure's `&mut`
-/// parameter is not the temporary-read hazard — std's `KeyedCell::update`
-/// passes `mutate(list[at])` — and is not refused.
+/// The owner's scoping (2026-09-26) let a PLACE fed to a closure's `&mut`
+/// parameter through — std's `KeyedCell::update` passed `mutate(list[at])`.
+/// B464 (Order 45's GO) superseded it: the `fun` path's rule holds for a
+/// closure too, so the place is refused with the steer, and the `&mut`
+/// spelling (which `KeyedCell::update` now writes) compiles.
 #[test]
-fn b400_a_place_at_a_closure_view_parameter_is_not_refused() {
+fn b400_a_place_at_a_closure_view_parameter_takes_the_fun_rule() {
+    assert_fails_with(
+        concat!(
+            "fun update(items: List<i32>, at: usize, mutate: |&mut i32| void) {\n",
+            "\tmut list = items;\n",
+            "\tmutate(list[at]);\n",
+            "}\n",
+            "fun main() {\n",
+            "\tupdate([1, 2], 0, |&mut value| { value += 1; });\n",
+            "}\n",
+        ),
+        "a `&mut` parameter takes a view; pass `&mut <place>` (there is no implicit borrow).",
+    );
     assert_compiles(concat!(
         "fun update(items: List<i32>, at: usize, mutate: |&mut i32| void) {\n",
         "\tmut list = items;\n",
-        "\tmutate(list[at]);\n",
+        "\tmutate(&mut list[at]);\n",
         "}\n",
         "fun main() {\n",
         "\tupdate([1, 2], 0, |&mut value| { value += 1; });\n",
@@ -11047,5 +11061,102 @@ fn b444_a_scalar_view_read_as_a_value_prints_the_element() {
         }
         "#,
         "7\nv=7\n8\n14\n7\nlab!\n7\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B464: a closure's view parameter takes a view, as a `fun`'s does.
+// ---------------------------------------------------------------------------
+
+/// B464: a closure-typed callee whose parameter is `&mut T` (or `&T`) called
+/// with a BARE place — a field, a local, a subscript — is refused with the
+/// `fun` path's steer, where it was accepted and the JS build threw
+/// (`TypeError: Cannot create property ..`) handing the body a value it
+/// writes through as a `(base, key)` pair.
+#[test]
+fn b464_a_closure_view_parameter_called_with_a_bare_place_is_refused() {
+    for (call, setup) in [
+        ("f(a.s);", "mut a = A { x = 1, s = \"old\" };"),
+        ("f(s);", "mut s = \"old\";"),
+        ("f(xs[0]);", "mut xs = [\"old\"];"),
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"
+                struct A {{ x: i32, s: str }}
+
+                fun apply(f: |&mut str| void) {{
+                    {setup}
+                    {call}
+                }}
+
+                fun main() {{}}
+                "#
+            ),
+            "a `&mut` parameter takes a view; pass `&mut <place>` (there is no implicit borrow).",
+        );
+    }
+    assert_fails_with(
+        r#"
+        fun apply(f: |&str| void) {
+            let s = "old";
+            f(s);
+        }
+
+        fun main() {}
+        "#,
+        "a `&` parameter takes a view; pass `& <place>` (there is no implicit borrow).",
+    );
+}
+
+/// B464: spelled with the view, the same calls write through on JS (and on
+/// both backends — `native_differential`'s
+/// `a_closure_view_parameter_takes_a_view_on_both_backends`), and a closure
+/// held in a `let` takes the same rule from its own parameters.
+#[test]
+fn b464_a_closure_view_parameter_called_with_a_view_writes_through() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct A { x: i32, s: str }
+
+        fun apply(f: sync |&mut str| void) {
+            mut a = A { x = 1, s = "old" };
+            f(&mut a.s);
+            print(a.s);
+            mut s = "old";
+            f(&mut s);
+            print(s);
+            mut xs = ["old"];
+            f(&mut xs[0]);
+            print(xs[0]);
+        }
+
+        fun main() {
+            apply(|&mut p| {
+                p = "new";
+            });
+            let set = |&mut p: &mut str| {
+                p = "let";
+            };
+            mut t = "old";
+            set(&mut t);
+            print(t);
+        }
+        "#,
+        "new\nnew\nnew\nlet\n",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            let set = |&mut p: &mut str| {
+                p = "let";
+            };
+            mut t = "old";
+            set(t);
+        }
+        "#,
+        "a `&mut` parameter takes a view; pass `&mut <place>` (there is no implicit borrow).",
     );
 }
