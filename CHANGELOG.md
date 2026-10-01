@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: miscompile -->
+**A member a supertrait declares, reached through one of its SUB-traits, runs the receiver's override: through `S: Sub` (with `trait Sub with Base`), `value.name()` called `Base`'s default even where the type overrides `name`, on both backends.** The analyzer recorded the BOUND's trait for emission (`Sub`), so both emitters looked for `name` in the receiver's impl of `Sub`, found nothing there, and took the default the chain reached. The trait that answers is now the one that DECLARES the member, at the arguments the bound's chain passes it (`Sub<i32>` passes `Base<i32>`): its impl's override first, the default second. The same holds for a qualified call (`Sub::name(value)`, at a generic receiver and at a concrete one, whatever order the two impls were written in — the impl that declares the member answers; `Sub::name` on a type that implements only `Base` is still refused), and for a `for` loop over a sub-trait bound (its `next`). The rule that a member may be provided through a sub-trait's own clause (B359) is one function both emitters call (`mono::select_member_through_subtraits`); the native emitter did not ask it before. A142 met the bug as `map_each` taking `ListCell`'s lazy default instead of its observer (A132's leak, routed around in reactive-44); `RemoteSource`/`KeyedSource` were exposed the same way. Pins: `traits::a_supertrait_defaults_override_is_dispatched_through_a_subtrait_bound` un-`#[ignore]`d; `b473_a_parameterized_supertraits_override_answers_through_a_deeper_bound` (a parameterized chain, two levels deep, the qualified spelling, and a type with no override still taking the default); `b473_a_qualified_call_and_a_for_loop_through_a_subtrait_take_the_override`; `b473_a_qualified_subtrait_call_on_a_type_without_the_subtrait_is_refused`; `native_differential`'s `a_supertrait_override_is_dispatched_through_a_subtrait_on_both_backends` — each red on the 0.42.0 toolchain. Tracker B473.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

@@ -9809,8 +9809,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 trait_id,
                 arguments: &arguments,
             };
+            // The impl's override — of the trait itself, then through a
+            // sub-trait's clause (B359, shared with the JS emitter) — and only
+            // then the trait's default (B473).
             if let Some(selected) =
                 impl_select::select_member(self.program, None, type_id, member, Some(wanted))
+                    .or_else(|| {
+                        mono::select_member_through_subtraits(
+                            self.program,
+                            None,
+                            type_id,
+                            trait_id,
+                            member,
+                        )
+                    })
             {
                 return self
                     .dispatch_to_member(selected, type_id, own_generic_values)

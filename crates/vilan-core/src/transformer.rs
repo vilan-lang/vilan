@@ -10159,68 +10159,20 @@ impl<'src> Transformer<'src> {
         ) {
             return Some((selected.member_id, selected.impl_subject));
         }
-        // B359: the member may be declared by a SUPERTRAIT while the
-        // implementor named only a sub-trait of it — `Source<T>::sub`'s body
-        // calls `self.on_change(..)`, and a type that writes `impl C with
-        // Signal<T>` provides `Source`'s members through that clause and never
-        // names `Source`. The wanted-trait filter is a membership test on the
-        // clause's own traits, so it turns that impl down and the caller falls
-        // to the by-name lookup — which is exactly the lookup an inherent
-        // member of the same name wins. So ask the type's PROVIDED traits
-        // (most specific first) for the ones whose supertrait closure reaches
-        // `trait_id`, and take the member from there.
-        //
-        // The retries go through `impl_select::select_member` rather than
-        // `select_member_here`: a failed scoped lookup RECORDS an admission
-        // miss (E185's plumbing), and a probe that is expected to miss must not
-        // leave one behind.
-        for provided in
-            impl_select::applying_trait_ids(self.program, self.current_admitting_file, type_id)
-        {
-            if provided == trait_id || !self.trait_reaches_supertrait(provided, trait_id) {
-                continue;
-            }
-            if let Some(selected) = impl_select::select_member(
-                self.program,
-                self.current_admitting_file,
-                type_id,
-                member,
-                Some(impl_select::WantedTrait {
-                    trait_id: provided,
-                    arguments: &[],
-                }),
-            ) {
-                return Some((selected.member_id, selected.impl_subject));
-            }
-        }
-        None
-    }
-
-    /// Whether `trait_id`'s supertrait closure contains `supertrait_id` — "is
-    /// an impl of `trait_id` also an impl of `supertrait_id`'s surface"
-    /// (B359's supertrait face).
-    fn trait_reaches_supertrait(&self, trait_id: Id, supertrait_id: Id) -> bool {
-        let mut stack = vec![trait_id];
-        let mut seen = HashSet::default();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            if id == supertrait_id {
-                return true;
-            }
-            let Some(trait_) = self.program.traits.get(&id) else {
-                continue;
-            };
-            for supertrait_type_id in &trait_.supertraits {
-                if let Some(Type::Trait(super_id, _)) =
-                    self.program.type_id_to_type_map.get(supertrait_type_id)
-                {
-                    stack.push(*super_id);
-                }
-            }
-        }
-        false
+        // B359: the member may be provided through a SUB-trait's clause —
+        // [`crate::mono::select_member_through_subtraits`] has the rule, shared
+        // with the native emitter. It goes through `impl_select::select_member`
+        // rather than `select_member_here`: a failed scoped lookup RECORDS an
+        // admission miss (E185's plumbing), and a probe that is expected to
+        // miss must not leave one behind.
+        crate::mono::select_member_through_subtraits(
+            self.program,
+            self.current_admitting_file,
+            type_id,
+            trait_id,
+            member,
+        )
+        .map(|selected| (selected.member_id, selected.impl_subject))
     }
 
     /// Lowers a resolved [`Dispatch`] to its call node with `args` (the receiver

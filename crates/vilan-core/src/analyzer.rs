@@ -45212,6 +45212,14 @@ impl<'src> Analyzer<'src> {
         // No receiver at all: the trait member takes `self`, so the ordinary
         // arity check reports it — and better than a bespoke message would.
         let receiver_id = *argument_ids.first()?;
+        // B473: the trait that ANSWERS is the one in the named trait's chain
+        // that DECLARES the member — `Sub::name(value)` over a `name` that
+        // `Base` declares is answered out of the receiver's impl of `Base`, its
+        // override first and the default second, exactly as `value.name()`
+        // through a `Sub` bound is.
+        let declaring_trait_id = self
+            .method_member_in_trait_at(trait_id, &[], member_name)
+            .map_or(trait_id, |(_, declaring_trait_id, _)| declaring_trait_id);
         let receiver_type = self.infer_type(receiver_id, &Type::Unknown, &HashMap::default());
         if matches!(receiver_type, Type::Unresolved) {
             return Some(Resolution::Deferred);
@@ -45229,7 +45237,7 @@ impl<'src> Analyzer<'src> {
             // The qualified spelling names a trait and no arguments, so the
             // instantiation is left unconstrained (B73 R1's empty-list case).
             self.bound_dispatch_traits
-                .insert(call_id, (trait_id, Vec::new()));
+                .insert(call_id, (declaring_trait_id, Vec::new()));
             return None;
         }
         if !matches!(receiver_type, Type::Struct(..) | Type::Enum(..)) {
@@ -45237,34 +45245,51 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         self.trait_qualified_calls.remove(&subject_id);
-        // Every impl of the named trait whose subject matches, not just the
+        // Every impl of the DECLARING trait whose subject matches, not just the
         // first: one subject may implement the trait at two instantiations
         // (`Into<Bar>` beside `Into<str>`), and naming the trait says
         // nothing about which — §3.1's spelling has no argument slot (B73 R2).
-        let providers: Vec<(Option<Id>, TypeId)> = self
-            .implementations
-            .iter()
-            .filter(|implementation| {
-                self.impl_subject_admits(
-                    &receiver_type,
-                    implementation.subject.borrow_type(self),
-                    &HashMap::default(),
-                )
-            })
-            .filter(|implementation| {
-                implementation.trait_ids.iter().any(|id| {
-                    // A supertrait's member counts: `PartialEq::eq` is provided
-                    // by `impl Point with Ord`, which lists only `Ord`.
-                    self.trait_with_supertraits(*id).contains(&trait_id)
+        // The receiver must implement the NAMED trait as well: `Sub::name` on
+        // a type that implements only `Base` is still refused below.
+        let implements_named_trait = self.implementations.iter().any(|implementation| {
+            self.impl_subject_admits(
+                &receiver_type,
+                implementation.subject.borrow_type(self),
+                &HashMap::default(),
+            ) && implementation
+                .trait_ids
+                .iter()
+                .any(|id| self.trait_with_supertraits(*id).contains(&trait_id))
+        });
+        let providers: Vec<(Option<Id>, TypeId)> = match implements_named_trait {
+            false => Vec::new(),
+            true => self
+                .implementations
+                .iter()
+                .filter(|implementation| {
+                    self.impl_subject_admits(
+                        &receiver_type,
+                        implementation.subject.borrow_type(self),
+                        &HashMap::default(),
+                    )
                 })
-            })
-            .map(|implementation| {
-                (
-                    implementation.declarations.get(member_name).copied(),
-                    implementation.subject,
-                )
-            })
-            .collect();
+                .filter(|implementation| {
+                    implementation.trait_ids.iter().any(|id| {
+                        // A supertrait's member counts: `PartialEq::eq` is
+                        // provided by `impl Point with Ord`, which lists only
+                        // `Ord`.
+                        self.trait_with_supertraits(*id)
+                            .contains(&declaring_trait_id)
+                    })
+                })
+                .map(|implementation| {
+                    (
+                        implementation.declarations.get(member_name).copied(),
+                        implementation.subject,
+                    )
+                })
+                .collect(),
+        };
         let declaring: Vec<(Id, TypeId)> = providers
             .iter()
             .filter_map(|(member_id, impl_subject)| {
@@ -45276,12 +45301,22 @@ impl<'src> Analyzer<'src> {
         // the first-declared still wins, as it always has — the reported
         // ambiguity belongs to `receiver.member()`, which is where a reader can
         // act on it; there is no *further* spelling to steer a qualified call to.
+        //
+        // One declaring impl answers whatever order the blocks were written
+        // in: an impl of a SUBTRAIT that inherits the member is a provider too
+        // (B473's `impl Mine with Sub` beside `impl Mine with Base { name }`),
+        // and the override outranks the default it would inherit.
+        let first_declaring = || {
+            declaring
+                .first()
+                .map(|(member_id, impl_subject)| (Some(*member_id), *impl_subject))
+        };
         let provider = match declaring.len() > 1 {
             true => self
                 .select_home_by_expected_type(call_id, &receiver_type, &declaring)
                 .map(|(member_id, impl_subject)| (Some(member_id), impl_subject))
-                .or_else(|| providers.first().copied()),
-            false => providers.first().copied(),
+                .or_else(first_declaring),
+            false => first_declaring().or_else(|| providers.first().copied()),
         };
         match provider {
             Some((Some(member_id), impl_subject)) => {
@@ -45319,7 +45354,7 @@ impl<'src> Analyzer<'src> {
                 // share a name are exactly the case the call named one to
                 // resolve, so a by-name lookup would undo the disambiguation.
                 self.bound_dispatch_traits
-                    .insert(call_id, (trait_id, Vec::new()));
+                    .insert(call_id, (declaring_trait_id, Vec::new()));
                 let rest: Vec<Id> = argument_ids[1..].to_vec();
                 self.constraints.push(Constraint::MethodArgCheck {
                     call_id,
@@ -46822,7 +46857,16 @@ impl<'src> Analyzer<'src> {
                             continue;
                         };
                         member = Some(found_member);
-                        member_trait = Some((*trait_id, trait_arguments.clone()));
+                        // B473: the trait that ANSWERS is the one that declares
+                        // the member, at the arguments the bound's chain passes
+                        // it — not the bound's own trait. Through `S: Sub` a
+                        // member `Base` declares is selected out of the
+                        // receiver's impl OF `Base` (its override first, the
+                        // default second); recorded as `Sub`, emission looked
+                        // for it in the impl of `Sub`, found nothing there and
+                        // took the default the chain reached, on both
+                        // backends — over a type that overrides it.
+                        member_trait = Some((declaring_trait_id, declaring_arguments.clone()));
                         // A parameterized bound (`F: Feed<T>`) substitutes the trait's
                         // parameters with the bound's arguments, so a method parameter
                         // typed in the trait's terms (`each(observer: |T| ..)`) is typed
@@ -46856,9 +46900,10 @@ impl<'src> Analyzer<'src> {
                             GenericDispatch::OnConstraint(*constraint_id, member_name),
                         );
                         if let Some((trait_id, trait_arguments)) = member_trait {
-                            // The bound's own arguments (`T: Conv<Baz>` -> `[Baz]`)
-                            // travel with the trait, so codegen re-dispatches into
-                            // the impl of THAT instantiation (B73 R1, row 20).
+                            // The bound's own arguments (`T: Conv<Baz>` -> `[Baz]`,
+                            // carried up the chain to the declaring trait) travel
+                            // with the trait, so codegen re-dispatches into the
+                            // impl of THAT instantiation (B73 R1, row 20).
                             self.bound_dispatch_traits
                                 .insert(id, (trait_id, trait_arguments));
                         }
@@ -55789,18 +55834,19 @@ impl<'src> Analyzer<'src> {
                         .generic_bound_traits(constraint_id)
                         .into_iter()
                         .find_map(|(trait_id, trait_arguments)| {
-                            self.method_member_in_trait(trait_id, next_method)
-                                .map(|next_id| (trait_id, trait_arguments, next_id))
+                            self.method_member_in_trait_at(trait_id, &trait_arguments, next_method)
                         });
                     match resolved {
-                        Some((trait_id, trait_arguments, next_id)) => {
+                        Some((next_id, declaring_trait_id, declaring_arguments)) => {
                             self.for_each_next.insert(for_each_id, next_id);
                             self.generic_dispatch.insert(
                                 for_each_id,
                                 GenericDispatch::OnConstraint(constraint_id, next_method),
                             );
+                            // B473: the DECLARING trait answers, as for a
+                            // `value.next()` through the same bound.
                             self.bound_dispatch_traits
-                                .insert(for_each_id, (trait_id, trait_arguments));
+                                .insert(for_each_id, (declaring_trait_id, declaring_arguments));
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
