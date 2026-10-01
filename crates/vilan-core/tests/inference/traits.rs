@@ -8486,3 +8486,63 @@ fn e227_a_hint_on_a_trait_a_binding_or_an_impl_is_refused() {
         );
     }
 }
+
+// --- M98: impl selection answers once per program ---
+//
+// `impl_select::applying_implementations` is the scan under every member
+// selection the emission walk makes (`select_member`, `applying_trait_ids`):
+// every implementation, each tested with `subject_applies`, which recurses
+// through blanket bounds. Its answer is a function of the concrete TYPE, and
+// on kolt's client the walk asked it ~1,100 times at ~8M instructions apiece
+// for a few hundred answers. It is memoized on the `Program` now, so a second
+// emission of one program asks every question again and computes none of
+// them. Only a counter can see that; the output does not move.
+#[test]
+fn a_second_emission_of_one_program_computes_no_impl_selection() {
+    let source = r#"
+        import std::io::print;
+        trait Describe { fun describe(self): str; }
+        struct Badge { size: i32 }
+        impl Badge with Describe { fun describe(self): str { "badge" } }
+        fun tell<V: Describe>(value: V) { print(value.describe()); }
+        fun main() {
+            tell(Badge { size = 1 });
+            print(Badge { size = 2 }.describe());
+        }
+        "#;
+    let (first, second, same_output) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let options = BuildOptions::default();
+            vilan_core::impl_select::reset_applying_computed();
+            let first_output = transform(&program, &options).expect("the program emits");
+            let first = vilan_core::impl_select::applying_computed();
+            vilan_core::impl_select::reset_applying_computed();
+            let second_output = transform(&program, &options).expect("the program emits");
+            let second = vilan_core::impl_select::applying_computed();
+            (first, second, first_output == second_output)
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+    assert!(same_output, "the memo must change no emitted byte");
+    assert_eq!(
+        second, 0,
+        "the second emission computed {second} impl selections (the first computed \
+         {first}): every one was already answered for this program (M98)"
+    );
+}
