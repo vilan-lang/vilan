@@ -7141,3 +7141,41 @@ const B473_PROBE: &str = concat!(
     "\tprint(walk(Count { n = 0 }));\n",
     "}\n",
 );
+
+/// B467: a closure whose `&mut` is its own PARAMETER is stored in a struct
+/// field and called through it on both backends — the analyzer refused it as a
+/// view escape before. (`inference::borrows`' `b467_*` pin covers the other
+/// depths on JS; natively a closure VALUE reached through a match capture, a
+/// loop binding or a nested closure parameter does not yet carry its view
+/// parameters to the call site — a native find filed from this lane.)
+#[test]
+fn a_closure_with_its_own_view_parameter_is_stored_in_a_field_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b467.vl"), B467_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b467.vl"),
+        Verdict::Identical,
+        "a closure with its own view parameter must store and run the same on both backends"
+    );
+}
+
+const B467_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Holder {\n",
+    "\tf: |&mut str| void,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet h = Holder { f = |&mut p| {\n",
+    "\t\tp = \"direct ok\";\n",
+    "\t} };\n",
+    "\tmut s = \"old\";\n",
+    "\t(h.f)(&mut s);\n",
+    "\tprint(s);\n",
+    "\tmut edits: List<|&mut List<i32>| void> = [];\n",
+    "\tedits.push(|&mut list| list.push(7));\n",
+    "\tprint(edits.len());\n",
+    "}\n",
+);

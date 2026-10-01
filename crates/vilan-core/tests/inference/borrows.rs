@@ -10673,3 +10673,93 @@ fn b418_a_branch_of_fresh_values_copies_nothing() {
         "a branch of fresh values must not copy:\n{emitted}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// B439 + B467: a closure's OWN view parameter is not a capture, so the escape
+// rule answers the same at every depth.
+// ---------------------------------------------------------------------------
+
+/// B439/B467: a closure whose `&mut` is its own PARAMETER captures nothing,
+/// and may be stored like any closure — in a struct field directly, in an
+/// `Option` payload, in a list (`edits.push(|&mut list| ..)`), or as a nested
+/// closure type's argument. The direct field and the list were refused ("a
+/// view cannot escape its scope") while the nested forms were accepted.
+#[test]
+fn b467_a_closure_whose_view_is_its_own_parameter_is_stored_at_every_depth() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder {
+            f: |&mut str| void,
+        }
+
+        struct Nested {
+            g: |(|&mut str| void)| void,
+        }
+
+        struct Maybe {
+            f: Option<|&mut str| void>,
+        }
+
+        fun main() {
+            let n = Nested { g = |f| {
+                mut s = "old";
+                f(&mut s);
+                print(s);
+            } };
+            (n.g)(|&mut p| {
+                p = "nested ok";
+            });
+            let h = Holder { f = |&mut p| {
+                p = "direct ok";
+            } };
+            mut s = "old";
+            (h.f)(&mut s);
+            print(s);
+            let m = Maybe { f = Some(|&mut p| {
+                p = "option ok";
+            }) };
+            match m.f {
+                Some(let f) => {
+                    mut t = "old";
+                    f(&mut t);
+                    print(t);
+                },
+                None => {},
+            }
+            mut edits: List<|&mut List<i32>| void> = [];
+            edits.push(|&mut list| list.push(7));
+            mut xs: List<i32> = [];
+            for edit in edits {
+                edit(&mut xs);
+            }
+            print(xs.len());
+        }
+        "#,
+        "nested ok\ndirect ok\noption ok\n1\n",
+    );
+}
+
+/// The control for B467: a closure that CAPTURES an enclosing function's view
+/// parameter is still second-class, so storing it in a field is still the
+/// escape it always was — only the closure's own parameters stopped counting.
+#[test]
+fn b467_a_closure_capturing_an_outer_view_parameter_still_cannot_be_stored() {
+    assert_fails_with(
+        r#"
+        struct Holder {
+            f: || void,
+        }
+
+        fun make(v: &mut i32): Holder {
+            Holder { f = || {
+                v = 5;
+            } }
+        }
+
+        fun main() {}
+        "#,
+        "a view cannot escape its scope",
+    );
+}

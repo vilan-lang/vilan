@@ -25205,28 +25205,48 @@ impl<'src> Analyzer<'src> {
     fn derives_from_view_param(&self, expr_id: Id) -> bool {
         let mut found = false;
         let mut visited = HashSet::default();
-        self.scan_view_param_ref(expr_id, &mut found, &mut visited);
+        self.scan_view_param_ref(&[], expr_id, &mut found, &mut visited);
         found
     }
 
-    /// Whether a closure body references a `&` / `&mut` parameter — necessarily
-    /// one captured from an enclosing function, since closure parameters are
-    /// always bare. That capture stays legal (the parameter views the CALLER's
-    /// place, which outlives the call); making the closure second-class is the
-    /// whole of its policing. An outer view *BINDING* is a different matter and
-    /// no longer reaches here at all: `check_closure_view_capture_ban` refuses
-    /// it at the capture (C12), so nothing is left for the escape rule to catch.
+    /// Whether a closure body references a `&` / `&mut` parameter it CAPTURES —
+    /// one declared by an enclosing function (or enclosing closure). That
+    /// capture stays legal (the parameter views the CALLER's place, which
+    /// outlives the call); making the closure second-class is the whole of its
+    /// policing. An outer view *BINDING* is a different matter and no longer
+    /// reaches here at all: `check_closure_view_capture_ban` refuses it at the
+    /// capture (C12), so nothing is left for the escape rule to catch.
+    ///
+    /// B439/B467: the closure's OWN view parameters are not captures. A
+    /// closure parameter is not always bare — `|&mut list|` declares a view,
+    /// and so does a literal at a view position of its closure type (B465) —
+    /// and a view parameter is lent per CALL, which is the very form the
+    /// escape message recommends. Counted as a capture, `edits.push(|&mut
+    /// list| list.push(7))` and `Holder { f = |&mut p| .. }` were refused
+    /// while the same closure one level down (an `Option`'s payload, a nested
+    /// closure type) was accepted; the answer is now the same at every depth.
     fn closure_captures_view_param(&self, closure_id: Id) -> bool {
         let Some(closure) = self.closures.get(&closure_id) else {
             return false;
         };
         let mut captured = false;
         let mut visited = HashSet::default();
-        self.scan_view_param_ref(closure.return_, &mut captured, &mut visited);
+        self.scan_view_param_ref(
+            &closure.parameters,
+            closure.return_,
+            &mut captured,
+            &mut visited,
+        );
         captured
     }
 
-    fn scan_view_param_ref(&self, expr_id: Id, captured: &mut bool, visited: &mut HashSet<Id>) {
+    fn scan_view_param_ref(
+        &self,
+        own_parameters: &[Id],
+        expr_id: Id,
+        captured: &mut bool,
+        visited: &mut HashSet<Id>,
+    ) {
         if *captured || !visited.insert(expr_id) {
             return;
         }
@@ -25235,9 +25255,11 @@ impl<'src> Analyzer<'src> {
         };
         match expr {
             Expr::Local(binding_id) => {
-                if self.parameters.get(&binding_id).is_some_and(|parameter| {
-                    matches!(parameter.convention, Convention::Ref | Convention::RefMut)
-                }) {
+                if !own_parameters.contains(&binding_id)
+                    && self.parameters.get(&binding_id).is_some_and(|parameter| {
+                        matches!(parameter.convention, Convention::Ref | Convention::RefMut)
+                    })
+                {
                     *captured = true;
                 }
             }
@@ -25246,106 +25268,109 @@ impl<'src> Analyzer<'src> {
             Expr::Closure(_) | Expr::Async(_) => {}
             Expr::Variable(variable_id) => {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
-                    self.scan_view_param_ref(initial, captured, visited);
+                    self.scan_view_param_ref(own_parameters, initial, captured, visited);
                 }
             }
             Expr::Reference(operand, _) | Expr::Dereference(operand) | Expr::Unary(_, operand) => {
-                self.scan_view_param_ref(operand, captured, visited)
+                self.scan_view_param_ref(own_parameters, operand, captured, visited)
             }
             Expr::Binary(_, lhs, rhs) => {
-                self.scan_view_param_ref(lhs, captured, visited);
-                self.scan_view_param_ref(rhs, captured, visited);
+                self.scan_view_param_ref(own_parameters, lhs, captured, visited);
+                self.scan_view_param_ref(own_parameters, rhs, captured, visited);
             }
             Expr::Assignment(target, value) => {
-                self.scan_view_param_ref(target, captured, visited);
-                self.scan_view_param_ref(value, captured, visited);
+                self.scan_view_param_ref(own_parameters, target, captured, visited);
+                self.scan_view_param_ref(own_parameters, value, captured, visited);
             }
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
-                self.scan_view_param_ref(subject, captured, visited)
+                self.scan_view_param_ref(own_parameters, subject, captured, visited)
             }
             Expr::Index(subject, index) => {
-                self.scan_view_param_ref(subject, captured, visited);
-                self.scan_view_param_ref(index, captured, visited);
+                self.scan_view_param_ref(own_parameters, subject, captured, visited);
+                self.scan_view_param_ref(own_parameters, index, captured, visited);
             }
             Expr::FunctionReturn(Some(value)) | Expr::Await(value) => {
-                self.scan_view_param_ref(value, captured, visited)
+                self.scan_view_param_ref(own_parameters, value, captured, visited)
             }
             Expr::Call(call_id) => {
                 if let Some(function_call) = self.function_calls.get(&call_id) {
                     for argument in function_call.argument_ids.clone() {
-                        self.scan_view_param_ref(argument, captured, visited);
+                        self.scan_view_param_ref(own_parameters, argument, captured, visited);
                     }
                 }
             }
             Expr::Block((statements, tail)) => {
                 for statement in statements {
-                    self.scan_view_param_ref(statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, statement, captured, visited);
                 }
-                self.scan_view_param_ref(tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, tail, captured, visited);
             }
             Expr::For(condition, (statements, tail)) => {
                 if let Some(condition) = condition {
-                    self.scan_view_param_ref(condition, captured, visited);
+                    self.scan_view_param_ref(own_parameters, condition, captured, visited);
                 }
                 for statement in statements {
-                    self.scan_view_param_ref(statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, statement, captured, visited);
                 }
-                self.scan_view_param_ref(tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, tail, captured, visited);
             }
             Expr::ForEach(iterable, _, (statements, tail)) => {
-                self.scan_view_param_ref(iterable, captured, visited);
+                self.scan_view_param_ref(own_parameters, iterable, captured, visited);
                 for statement in statements {
-                    self.scan_view_param_ref(statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, statement, captured, visited);
                 }
-                self.scan_view_param_ref(tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, tail, captured, visited);
             }
             Expr::Match(subject, legs) => {
-                self.scan_view_param_ref(subject, captured, visited);
+                self.scan_view_param_ref(own_parameters, subject, captured, visited);
                 for leg in legs {
                     if let Some(guard) = leg.guard {
-                        self.scan_view_param_ref(guard, captured, visited);
+                        self.scan_view_param_ref(own_parameters, guard, captured, visited);
                     }
-                    self.scan_view_param_ref(leg.body, captured, visited);
+                    self.scan_view_param_ref(own_parameters, leg.body, captured, visited);
                 }
             }
             Expr::List(ids) | Expr::Tuple(ids) => {
                 for id in ids {
-                    self.scan_view_param_ref(id, captured, visited);
+                    self.scan_view_param_ref(own_parameters, id, captured, visited);
                 }
             }
             Expr::StructInitializer(_, fields) => {
                 for value in fields.values() {
-                    self.scan_view_param_ref(*value, captured, visited);
+                    self.scan_view_param_ref(own_parameters, *value, captured, visited);
                 }
             }
             // `If` is the one branch form left; walk it explicitly.
-            Expr::If(branch) => self.scan_view_param_ref_if(&branch, captured, visited),
+            Expr::If(branch) => {
+                self.scan_view_param_ref_if(own_parameters, &branch, captured, visited)
+            }
             _ => {}
         }
     }
 
     fn scan_view_param_ref_if(
         &self,
+        own_parameters: &[Id],
         branch: &ExprIfBranch,
         captured: &mut bool,
         visited: &mut HashSet<Id>,
     ) {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.scan_view_param_ref(*condition, captured, visited);
+                self.scan_view_param_ref(own_parameters, *condition, captured, visited);
                 for statement in statements {
-                    self.scan_view_param_ref(*statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, *statement, captured, visited);
                 }
-                self.scan_view_param_ref(*tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, *tail, captured, visited);
                 if let Some(else_branch) = else_branch {
-                    self.scan_view_param_ref_if(else_branch, captured, visited);
+                    self.scan_view_param_ref_if(own_parameters, else_branch, captured, visited);
                 }
             }
             ExprIfBranch::Else((statements, tail)) => {
                 for statement in statements {
-                    self.scan_view_param_ref(*statement, captured, visited);
+                    self.scan_view_param_ref(own_parameters, *statement, captured, visited);
                 }
-                self.scan_view_param_ref(*tail, captured, visited);
+                self.scan_view_param_ref(own_parameters, *tail, captured, visited);
             }
         }
     }
