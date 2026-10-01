@@ -117,6 +117,24 @@ thread_local! {
     /// field and an analysis is single-threaded while the suite is not.
     static FALLBACK_SITES: std::cell::RefCell<Vec<(Id, Vec<Id>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// How many selections [`impl_members_for_bound`] has COMPUTED on this
+    /// thread since [`reset_bound_selections_computed`], as against served
+    /// from its per-program memo (M97) — the count that shows the context
+    /// pass and the const pass sharing one answer, which no output can.
+    static BOUND_SELECTIONS_COMPUTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The number of selections [`impl_members_for_bound`] computed rather than
+/// served from its memo on this thread since the last
+/// [`reset_bound_selections_computed`]. See [`BOUND_SELECTIONS_COMPUTED`].
+pub fn bound_selections_computed() -> usize {
+    BOUND_SELECTIONS_COMPUTED.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`bound_selections_computed`].
+pub fn reset_bound_selections_computed() {
+    BOUND_SELECTIONS_COMPUTED.with(|count| count.set(0));
 }
 
 /// The number of impl selections [`refined_edges`] has evaluated on this
@@ -294,6 +312,17 @@ pub fn impl_members_for(
 /// An empty `traits` keeps the unfiltered reading, and so does a filter that
 /// selects nothing: this narrows where the language says it may, and widens
 /// back wherever it cannot tell.
+///
+/// Memoized on the `Program` (M97), keyed by everything the selection reads:
+/// the admitting file, the RESOLVED type (not the id — see `refined_edges`'
+/// per-site memo for why the type is exact), the member and the traits. The
+/// selection is a scan of every implementation, each entry of which may
+/// recurse into another, and its two big callers — the context pass and the
+/// const pass, each refining its dispatch sites — asked the same questions:
+/// on kolt's client ~5.9G instructions each, ~10% of a `check` apiece. The
+/// program's impls, admission map and type slots are settled before the
+/// post-passes begin and nothing after analysis writes them, so an answer
+/// stays an answer for the life of the program.
 pub fn impl_members_for_bound(
     program: &Program,
     file: Option<SourceId>,
@@ -304,6 +333,30 @@ pub fn impl_members_for_bound(
     let Some(resolved) = program.type_id_to_type_map.get(&subject_type_id) else {
         return Vec::new();
     };
+    let key: BoundSelectionKey = (file, resolved.clone(), member.to_string(), traits.to_vec());
+    if let Some(selected) = program.bound_selection_memo().get(&key) {
+        return selected.clone();
+    }
+    BOUND_SELECTIONS_COMPUTED.with(|count| count.set(count.get() + 1));
+    let selected =
+        impl_members_for_bound_uncached(program, file, subject_type_id, resolved, member, traits);
+    program.bound_selection_memo().insert(key, selected.clone());
+    selected
+}
+
+/// The key [`impl_members_for_bound`]'s memo reads: (admitting file, resolved
+/// subject type, member, bound traits).
+pub(crate) type BoundSelectionKey = (Option<SourceId>, Type, String, Vec<Id>);
+
+/// [`impl_members_for_bound`]'s selection itself.
+fn impl_members_for_bound_uncached(
+    program: &Program,
+    file: Option<SourceId>,
+    subject_type_id: TypeId,
+    resolved: &Type,
+    member: &str,
+    traits: &[Id],
+) -> Vec<Id> {
     // B318 S4: asked once for the FILE, not once per registered block (std
     // registers hundreds, and this loop runs per dispatch site).
     let scope = file.filter(|file| program.impl_admission.restricts(*file));
