@@ -11002,3 +11002,50 @@ fn b465_a_view_assigned_to_a_value_place_is_refused_without_a_star() {
         "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// B444: a scalar view read where a VALUE is read prints the element.
+// ---------------------------------------------------------------------------
+
+/// B444: a `borrows` call answering a scalar view (`&i32`, `&str`), and a
+/// binding it initialized, read where a value is read — an i-string hole, a
+/// `+` operand, a by-value argument, `print` — is read THROUGH on JS, as the
+/// native backend reads it (B109). JS printed the view's `(base, key)` pair:
+/// `7,8,0` for `i"{first(&xs)}"`. (A view binding made with `&` is still
+/// refused there without `*`, C5.1.)
+#[test]
+fn b444_a_scalar_view_read_as_a_value_prints_the_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Box2 { n: i32, label: str }
+
+        fun first(xs: &List<i32>): &i32 borrows xs {
+            &xs[0]
+        }
+
+        fun label_of(b: &Box2): &str borrows b {
+            &b.label
+        }
+
+        fun twice(n: i32): i32 {
+            n * 2
+        }
+
+        fun main() {
+            let xs = [7, 8];
+            print(i"{first(&xs)}");
+            let v = first(&xs);
+            print(i"v={v}");
+            print(v + 1);
+            print(twice(first(&xs)));
+            print(first(&xs));
+            let b = Box2 { n = 1, label = "lab" };
+            print(i"{label_of(&b)}!");
+            print(*v);
+        }
+        "#,
+        "7\nv=7\n8\n14\n7\nlab!\n7\n",
+    );
+}

@@ -4318,6 +4318,58 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// B444: per argument position of the callee `subject_id` names, whether
+    /// the parameter there takes a VALUE (bare or `own`) — known only for a
+    /// callee that resolves to a declared function or external; empty (every
+    /// position unknown, nothing read through) for any other callee.
+    fn by_value_argument_positions(&self, subject_id: Id) -> Vec<bool> {
+        let Some(Expr::Local(callee_id)) = self.program.entity_map.get(&subject_id) else {
+            return Vec::new();
+        };
+        let parameter_ids = self
+            .program
+            .functions
+            .get(callee_id)
+            .map(|function| &function.parameters)
+            .or_else(|| {
+                self.program
+                    .external_functions
+                    .get(callee_id)
+                    .map(|external| &external.parameters)
+            });
+        parameter_ids
+            .map(|parameter_ids| {
+                parameter_ids
+                    .iter()
+                    .map(|parameter_id| {
+                        self.program
+                            .parameters
+                            .get(parameter_id)
+                            .is_some_and(|parameter| {
+                                matches!(parameter.convention, Convention::Bare | Convention::Own)
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// B444: `node`, the emission of `id`, read THROUGH when it is a scalar
+    /// view's `(base, key)` pair standing where a VALUE is read (an operand, a
+    /// by-value argument); anything else passes through untouched.
+    fn read_through_a_scalar_view(
+        &mut self,
+        id: Id,
+        node: js::Node<'src>,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if self.emits_scalar_view_pair(id) {
+            self.emit_scalar_view_read(id, node, block)
+        } else {
+            node
+        }
+    }
+
     /// Read the value out of a scalar `(base, key)` view: `view[0][view[1]]`.
     /// A view produced by a CALL is bound to a temp first, so the two reads do
     /// not evaluate it twice; a plain binding or reference is cheap to repeat.
@@ -5172,6 +5224,7 @@ impl<'src> Transformer<'src> {
             }
             Expr::Call(id) => {
                 let function_call = self.program.function_calls.get(id).unwrap().clone();
+                let value_positions = self.by_value_argument_positions(function_call.subject_id);
                 // B452: in source order, an argument that needs statements
                 // spilling the ones before it.
                 let args = self
@@ -5190,8 +5243,19 @@ impl<'src> Transformer<'src> {
                             }
                             // An argument to an `own` parameter is copied (marked in
                             // `clone_sites`), like a binding copy.
-                            this.walk_entity(arg, block)
-                                .map(|node| this.maybe_clone(arg, node))
+                            let node = this.walk_entity(arg, block)?;
+                            // B444: a scalar view handed to a BY-VALUE parameter
+                            // is read through — the callee wants the value.
+                            let position = function_call
+                                .argument_ids
+                                .iter()
+                                .position(|argument| *argument == arg);
+                            let node =
+                                match position.and_then(|position| value_positions.get(position)) {
+                                    Some(true) => this.read_through_a_scalar_view(arg, node, block),
+                                    _ => node,
+                                };
+                            Some(this.maybe_clone(arg, node))
                         },
                     )
                     .into_iter()
@@ -5925,9 +5989,17 @@ impl<'src> Transformer<'src> {
                 }
                 // B452: the left operand runs first, so a right operand that
                 // needs statements spills it ahead of them.
+                //
+                // B444: an operand is a VALUE, so a scalar view reaching one —
+                // a `borrows` call answering `&i32`, or a binding it
+                // initialized, which the checker's `*` rule (C5.1) does not
+                // see — reads through its `(base, key)` pair, as the native
+                // backend reads it (B109). The i-string hole is this operand
+                // (`("" + part + ..)`), which printed `7,8,0` for `{first(&xs)}`.
                 let mut operands = self
                     .walk_siblings_in_order(&[*lhs_id, *rhs_id], block, |this, id, block| {
-                        Some(this.walk_entity(id, block).unwrap_or(js::Node::Void))
+                        let node = this.walk_entity(id, block).unwrap_or(js::Node::Void);
+                        Some(this.read_through_a_scalar_view(id, node, block))
                     })
                     .into_iter()
                     .map(|(_, node)| node);

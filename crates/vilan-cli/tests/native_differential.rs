@@ -7364,3 +7364,49 @@ const B453_PROBE: &str = concat!(
     "\tprint(i\"{triple.0} {triple.1} {triple.2}\");\n",
     "}\n",
 );
+
+/// B444: a scalar view read where a value is read prints the element on both
+/// backends (`inference::borrows`' `b444_*` pin is the JS half; JS printed the
+/// `(base, key)` pair).
+#[test]
+fn a_scalar_view_read_as_a_value_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_b444.vl"), B444_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_b444.vl"),
+        Verdict::Identical,
+        "a scalar view read as a value must print the element on both backends"
+    );
+}
+
+const B444_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Box2 { n: i32, label: str }\n",
+    "\n",
+    "fun first(xs: &List<i32>): &i32 borrows xs {\n",
+    "\t&xs[0]\n",
+    "}\n",
+    "\n",
+    "fun label_of(b: &Box2): &str borrows b {\n",
+    "\t&b.label\n",
+    "}\n",
+    "\n",
+    "fun twice(n: i32): i32 {\n",
+    "\tn * 2\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet xs = [7, 8];\n",
+    "\tprint(i\"{first(&xs)}\");\n",
+    "\tlet v = first(&xs);\n",
+    "\tprint(i\"v={v}\");\n",
+    "\tprint(v + 1);\n",
+    "\tprint(twice(first(&xs)));\n",
+    "\tprint(first(&xs));\n",
+    "\tlet b = Box2 { n = 1, label = \"lab\" };\n",
+    "\tprint(i\"{label_of(&b)}!\");\n",
+    "\tprint(*v);\n",
+    "}\n",
+);

@@ -25649,8 +25649,14 @@ impl<'src> Analyzer<'src> {
     /// clause and its return type's pointee is a scalar (`&mut i32` collapses to
     /// `i32`, so the scalar check is on the collapsed `return_type_id`).
     fn function_returns_scalar_view(&self, function_id: Id) -> bool {
+        // B444: the RETURN TYPE says whether a view comes back, not the
+        // inferred `borrows` set — `fun get(h: &Holder): i32 { peek(h) }`
+        // infers `borrows h` from the projection it reads, yet hands back an
+        // `i32` (the return seam reads the pair through, B108), so its call is
+        // a value, never a `(base, key)` pair to read again.
         self.functions.get(&function_id).is_some_and(|function| {
             !function.borrows.is_empty()
+                && (function.returns_view || function.returns_mut_view)
                 && function
                     .return_type_id
                     .map(|type_id| type_id.get_type(self))

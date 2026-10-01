@@ -48,6 +48,11 @@ written down.
 <!-- family: miscompile -->
 **A view of a tuple POSITION writes and reads through on JS: `let v = &mut pair.1; v = 3` sets `pair.1`, where it threw `TypeError: Cannot create property '0' on number '2'`.** A tuple stores flat, and a view of a scalar slot is the `(base, key)` pair of its container and its position — a struct field's view always was; a tuple position fell to the catch-all arm, which paired the slot's VALUE with `0`, so a write threw and a read answered `undefined`. The view is now the tuple and the position's flat offset, for a local view, a `&mut`/`&` argument and a compound write through it. Native was already right. Pins: `tuples::b453_a_view_of_a_tuple_position_writes_and_reads_through` (red on 0.42.0), `native_differential`'s `a_view_of_a_tuple_position_is_identical_on_both_backends`. No golden moves. Tracker B453.
 
+---
+
+<!-- family: miscompile -->
+**A scalar view read where a VALUE is read prints the element on JS: `i"{first(&xs)}"`, with `first` answering a `&i32` view (`borrows xs`), prints `7` where it printed `7,8,0` — the view's `(base, key)` pair.** A `borrows` call answering a scalar view, and a binding it initialized, are views the checker's `*` rule (C5.1) does not see, and an i-string hole is a `+` operand (`("" + part + ..)`); the native backend reads such a view through in a value position (B109), and the JS emitter now does too: a binary operand and an argument at a by-value (`bare`/`own`) parameter read the pair through. A view binding made with `&` is still refused there without `*`. One misreading underneath went with it: a function answering a VALUE whose inferred `borrows` set was non-empty (`fun get(h: &Holder): i32 { peek(h) }`) was classified as answering a scalar view, so a binding of its call was taken for a pair; the declared return type decides now. Pins: `borrows::b444_a_scalar_view_read_as_a_value_prints_the_element` (a hole, a hole over a binding, a `+` operand, a by-value argument, `print`, a `&str` view — red on 0.42.0), `native_differential`'s `a_scalar_view_read_as_a_value_is_identical_on_both_backends`. No golden moves. Tracker B444.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->
