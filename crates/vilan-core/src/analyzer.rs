@@ -67851,9 +67851,16 @@ fn analyze_over_world<'src>(
     // `check_generic_bound_satisfaction` checks per call site and
     // `scan_bodies_for_moves` per function, which is what bounds the cancel
     // latency at one of those rather than one whole-program sweep.
+    //
+    // Each call closes a `VILAN_PHASE_TIMING=passes` mark (M98) — a cached
+    // `bool` load when the split is off.
+    crate::phase_pass_mark_start();
     macro_rules! unless_cancelled {
         ($($call:expr;)+) => {
-            $( if !crate::cancel::cancelled() { $call; } )+
+            $( if !crate::cancel::cancelled() {
+                $call;
+                crate::phase_pass_mark(stringify!($call));
+            } )+
         };
     }
     // The S2 pin's switch: a second build over the drained queues must
@@ -68069,6 +68076,7 @@ fn analyze_over_world<'src>(
                 let diagnostics_before = analyzer.diagnostics.len();
                 let warnings_before = analyzer.warnings.len();
                 $call;
+                crate::phase_pass_mark(stringify!($call));
                 analyzer.record_reusable_window(diagnostics_before, warnings_before);
             } )+
         };
@@ -68583,7 +68591,9 @@ fn analyze_over_world<'src>(
     // once the tree is FINAL — the rewrite above moves reads, and a liveness
     // answer about a tree that no longer exists is worse than none. Every
     // elision below reads it.
+    crate::phase_pass_mark("the tables before the last-use dataflow");
     analyzer.last_use = liveness::LastUse::compute(&analyzer);
+    crate::phase_pass_mark("liveness::LastUse::compute");
     // S3 (`lifetimes.md` §6): the same answers, asked for DISPOSAL — where each
     // enrolled binding's teardown `finally` closes. Must follow the dataflow;
     // `plan_resource_drops` (which bindings drop) ran long before it.
@@ -68598,9 +68608,13 @@ fn analyze_over_world<'src>(
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
     let capture_plan = analyzer.compute_capture_clone_sites();
+    crate::phase_pass_mark("the drop extents, shared cells and capture plan");
     let resource_types = analyzer.compute_resource_types();
+    crate::phase_pass_mark("analyzer.compute_resource_types()");
     let clone_sites = analyzer.compute_clone_sites(&capture_plan.shared);
+    crate::phase_pass_mark("analyzer.compute_clone_sites()");
     let (return_clone_sites, return_view_reads) = analyzer.compute_return_clone_sites();
+    crate::phase_pass_mark("analyzer.compute_return_clone_sites()");
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
     let primitive_views = analyzer.compute_primitive_views();
@@ -69042,6 +69056,7 @@ fn analyze_over_world<'src>(
     // TALLIED and printed once, as the worlds' own row below (M33). Stderr for
     // the same reason the leak line is: `build --stdout`'s JavaScript must stay
     // clean.
+    crate::phase_pass_mark("the remaining tables, labels and records");
     let phase_checks = phase_checks_start.elapsed();
     if crate::phase_timing_enabled() && crate::macros::in_macro_world() {
         crate::macros::world_phases_record_analysis(
