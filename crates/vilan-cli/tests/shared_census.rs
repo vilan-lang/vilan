@@ -72,6 +72,15 @@ const CENSUS: &[(&str, usize, &str)] = &[
          against (O, per instance).",
     ),
     (
+        "map_cell.vl",
+        3,
+        "E (A138 S1): a `MapCell`'s own map, a `KeySlots` table, and each \
+         watched key's subscription count. Each is minted by the cell (or the \
+         first subscription on a key) and read and written through every copy \
+         of the handle and by the slot's release, which a disposal elsewhere \
+         runs: the E class, as `ListCell`'s list is",
+    ),
+    (
         "memo.vl",
         1,
         "E: the memo cache outlives every maker's scope",
@@ -140,6 +149,12 @@ const CENSUS: &[(&str, usize, &str)] = &[
          client's wire demand (R: one per `ReactiveClient`, every mirror's \
          `Subscribe`/`Unsubscribe` registered in it, cleared by a reconnect \
          and by `dispose`).",
+    ),
+    (
+        "set_cell.vl",
+        1,
+        "E (A138 S1): a `SetCell`'s own set, as `MapCell`'s map (its slots are \
+         a `KeySlots`, counted in `map_cell.vl`)",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     (
@@ -261,7 +276,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 178,
+        total, 182,
         "the total number of `Shared` construction sites in std changed"
     );
 

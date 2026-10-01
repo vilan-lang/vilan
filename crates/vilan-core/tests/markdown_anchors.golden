@@ -443,6 +443,7 @@ std/reactive.md h2 listcell--a-list-whose-writes-are-its-deltas
 std/reactive.md h2 map_each--the-first-derivative
 std/reactive.md h2 collection-pipes--operators-per-shape
 std/reactive.md h2 coll-and-coll_by--coarse-into-granular
+std/reactive.md h2 mapcell-and-setcell--maps-and-sets-whose-writes-are-their-deltas
 std/reactive.md h2 reconcile-keyed-list-diffing
 std/rpc.md h1 stdrpc-reference
 std/rpc.md h2 the-generated-surface-service

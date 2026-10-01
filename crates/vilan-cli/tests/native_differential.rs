@@ -1362,6 +1362,45 @@ fn a142_collection_pipes_build_the_same_on_both_backends() {
     }
 }
 
+/// A138 S1: `MapCell` on both backends — its seeded random walk
+/// (`inference/maps.rs` runs the same program on JS), checked against a plain
+/// `HashMap` after every write: the map and its order, a mirror replayed from the
+/// drained `MapOp`s, every watched key's handle and how often it woke.
+///
+/// `SetCell` is REFUSED natively, by name, and this pin holds the refusal to a
+/// name rather than letting it become a wrong answer: the native backend types a
+/// variant constructor of a ONE-parameter enum whose parameter is bounded
+/// (`SetOp<T: Hashable>`'s `Add(value)`) as a bare trait object (`MapOp<K: Hashable,
+/// V>` has two parameters and builds). When that lands, the set's walk is expected
+/// to be identical, and this pin says so.
+#[test]
+fn a138_map_and_set_cells_build_the_same_on_both_backends_or_are_refused_by_name() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_map_walk.vl"),
+        include_str!("native/map_walk.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_map_walk.vl"),
+        Verdict::Identical,
+        "a MapCell must build and answer the same on both backends"
+    );
+    std::fs::write(
+        staged.join("native_probe_set_walk.vl"),
+        include_str!("native/set_walk.vl"),
+    )
+    .expect("write the probe program");
+    match compare(&staged, "native_probe_set_walk.vl") {
+        Verdict::Identical => {}
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a trait object"),
+            "the set's native refusal moved to another construct: {reason}"
+        ),
+        Verdict::Broken(detail) => panic!("a SetCell was accepted natively and wrong: {detail}"),
+    }
+}
+
 /// F23: a context-threaded hidden parameter is typed from the flavour the
 /// CONTEXT PASS recorded, and one program carries both readings.
 ///
