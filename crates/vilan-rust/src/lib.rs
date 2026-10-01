@@ -916,7 +916,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // And a read of a CAPTURE handed back (`|| v`, A142's `Switch` node
         // over a generic `v`) is a copy, or the closure moves its own capture
         // out and is `FnOnce` where every closure type is a `dyn Fn`.
-        let body = self.value_of(closure.return_, depth)?;
+        //
+        // F63: the body's value is handed BACK, which is a consuming position
+        // like a function body's tail, so a place read there takes rule 1's
+        // copy — `|index| cells[index]` moved an element out of the captured
+        // `Vec` (E0507), and `|| row.name` a field out of the captured `row`.
+        let expecting = self.expected_type;
+        let body = self.value_of_expecting_in(closure.return_, expecting, depth, true)?;
         if closure.parameter_destructures.is_empty() {
             if boxed.is_empty() {
                 return Ok(body);

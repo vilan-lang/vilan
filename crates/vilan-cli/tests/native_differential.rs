@@ -7230,3 +7230,23 @@ fn an_injected_clause_written_out_of_order_is_identical_on_both_backends() {
         "a `context` clause in any written order must build and thread the same values"
     );
 }
+
+/// F63: a closure's expression body is the value it hands back, a CONSUMING
+/// position like a function body's tail, so a place read there takes rule 1's
+/// copy. `id.derive(|index| cells[index])` moved a `str` out of the captured
+/// `Vec` (rustc E0507), and `|| row.name` moved a field out of its capture,
+/// which made the closure `FnOnce` where every closure type is a `dyn Fn`.
+#[test]
+fn a_closure_handing_back_an_indexed_element_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_indexed_closure_reads.vl"),
+        include_str!("native/indexed_closure_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_indexed_closure_reads.vl"),
+        Verdict::Identical,
+        "a closure handing back an element or a field of a capture must copy it"
+    );
+}

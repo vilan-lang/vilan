@@ -38,6 +38,11 @@ written down.
 <!-- family: fix -->
 **Native builds accept a `context` clause written in any order: `fun both(body: (|| str) context (second, first))` handed `|| i"{first.get()} {second.get()}"` builds and prints node's bytes, where rustc refused it ("expected `Rc<dyn Fn(Rc<str>, i32)>`, found `Rc<dyn Fn(i32, Rc<str>)>`").** The context pass appends an injected closure's hidden parameters, and a call's hidden arguments, in the contexts' declaration order; the native closure TYPE listed them in the clause's written order, so the slots disagreed with the literal whenever the two orders differed. The type takes the pass's order now. std's clauses had been written in declaration order to stay clear of it, with a comment saying so; the comment is gone. Pin: `an_injected_clause_written_out_of_order_is_identical_on_both_backends` (two contexts backwards, three rotated behind a value parameter, a struct field carrying a backwards clause). Tracker F61.
 
+---
+
+<!-- family: fix -->
+**Native builds accept a closure that hands back an element read by index or a field of what it captured: `id.derive(|index| cells[index])` over a `List<str>`, `apply(1, |index| rows[index])`, and `name_via(|| row.name)` build and print node's bytes, where rustc refused the first two with E0507 ("cannot move out of index") and the third with E0525 (a closure moving out of its capture is `FnOnce`).** A closure's expression body is the value it hands back — a consuming position, like a function body's tail, where a place read takes rule 1's copy; it was read as a plain value, so the read moved. It is a consuming position now (elided at a last use, as everywhere). Pin: `a_closure_handing_back_an_indexed_element_is_identical_on_both_backends` (a `str`, a struct and a list element by index, a block body's tail, a capture handed back whole, a field of a capture). The native copy census moves by one elided read (`reactive-flatten`). Tracker F63.
+
 ## v0.42.0 — 2026-09-30
 
 <!-- family: breaking -->

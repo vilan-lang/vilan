@@ -1,0 +1,48 @@
+// F63: a closure's body is handed BACK — a consuming position — so a place
+// read there copies: an operator closure reading a non-`Copy` element by index
+// (`|index| cells[index]`, a `str`, a struct and a list element), a block
+// body's tail, a captured struct handed back whole, and a field of a capture.
+import std::io::print;
+import std::reactive::{ Flow, Signal, SignalCell, Source };
+
+struct Row {
+	name: str,
+	tags: List<str>,
+}
+
+fun pick(rows: List<Row>, index: usize): Row {
+	rows[index]
+}
+
+fun apply(index: usize, read: |usize| Row): Row {
+	read(index)
+}
+
+fun name_via(read: || str): str {
+	read()
+}
+
+fun main() {
+	let cells: List<str> = ["a", "b", "c"];
+	let id: SignalCell<usize> = Signal::new(1);
+	let picked = id.derive(|index| cells[index]).memo();
+	print(picked.get());
+	id.set(2);
+	print(picked.get());
+	let rows: List<Row> = [Row { name = "x", tags = ["t"] }, Row { name = "y", tags = [] }];
+	print(pick(rows, 0).name);
+	print(apply(1, |index| rows[index]).name);
+	let nested: List<List<i32>> = [[1, 2], [3]];
+	let lengths = id.derive(|index| nested[index - 1]).memo();
+	print(lengths.get().len());
+	print(apply(0, |index| {
+		let shown = index + 1;
+		print(shown);
+		rows[index]
+	}).tags.len());
+	let row = Row { name = "kept", tags = ["k"] };
+	print(name_via(|| row.name));
+	print(apply(0, |index| row).name);
+	print(row.name);
+	print(rows.len());
+}

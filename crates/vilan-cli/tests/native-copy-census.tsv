@@ -29,7 +29,7 @@ unsigned-saturate	0	17
 bytes-aliasing	3	8
 delta-law	21	60
 reactive-on-change	30	74
-reactive-flatten	41	80
+reactive-flatten	41	81
 list-cell	66	180
 reactive-selector	10	28
 f64-print-boundary	0	0
