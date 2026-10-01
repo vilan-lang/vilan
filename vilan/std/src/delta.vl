@@ -1398,8 +1398,8 @@ export impl type P: Pipe<type T> with IntoElement<T> {
 /// the owner its run's registrations were split into. A plain element that
 /// registered nothing has no record; one that registered something and answered a
 /// plain value has a record that follows nothing (`follows` false, a `pull` that
-/// answers the value, a `release` that does nothing). Closures are held bare rather
-/// than as `Option`s, which the native backend does not hold.
+/// answers the value, a `release` that does nothing): its closures are held bare,
+/// as no-ops where there is nothing to call, rather than as `Option`s.
 struct ElementHold<V> {
 	follows: bool,
 	pull: || V,

@@ -969,9 +969,8 @@ export struct Owner {
 /// false) and no nursery; each is its own only once something needs it.
 export struct OwnerCell {
 	epoch: i32,
-	// Its own cell once `listed`, so a registration pushes in place. Not an
-	// `Option`: the native backend holds a closure list in a `Shared` but not an
-	// `Option` of one.
+	// Its own cell once `listed`, so a registration pushes in place; until then
+	// the shared `no_cleanups`, which nothing pushes to.
 	cleanups: Shared<List<|| void>>,
 	listed: bool,
 	nursery: Option<Nursery>,
@@ -1041,17 +1040,12 @@ export impl Owner {
 		if self.is_disposed() {
 			cleanup();
 		} else {
-			let held = self.cell.read();
-			if held.listed {
-				held.cleanups.write().push(cleanup);
+			if self.cell.read().listed {
+				self.cell.read().cleanups.write().push(cleanup);
 			} else {
 				owner_lists_allocated_count.write() = owner_lists_allocated_count.read() + 1;
-				self.cell.write() = OwnerCell {
-					epoch = held.epoch,
-					cleanups = Shared::new([cleanup]),
-					listed = true,
-					nursery = held.nursery,
-				};
+				self.cell.write().cleanups = Shared::new([cleanup]);
+				self.cell.write().listed = true;
 			}
 		}
 	}
@@ -1071,26 +1065,16 @@ export impl Owner {
 	/// cancels it whatever it holds.)
 	[internal("a pipe stage's per-run owner (A142 §4); an application disposes an owner and makes a new one")]
 	fun renew(self): Owner {
-		let live = self.cell.read();
-		let carried: Option<Nursery> = match live.nursery {
+		let carried: Option<Nursery> = match self.cell.read().nursery {
 			Some(let nursery) => if nursery.has_spawned() { None } else { Some(nursery) },
 			None => None,
 		};
 		Owner { cell = self.cell, epoch = self.cell.read().epoch }.advance(carried);
-		let opened = self.cell.read();
-		match opened.nursery {
-			Some(_) => {},
-			None => {
-				run_nurseries_allocated_count.write() = run_nurseries_allocated_count.read() + 1;
-				self.cell.write() = OwnerCell {
-					epoch = opened.epoch,
-					cleanups = opened.cleanups,
-					listed = opened.listed,
-					nursery = Some(detached_nursery()),
-				};
-			},
+		if self.cell.read().nursery.is_none() {
+			run_nurseries_allocated_count.write() = run_nurseries_allocated_count.read() + 1;
+			self.cell.write().nursery = Some(detached_nursery());
 		}
-		Owner { cell = self.cell, epoch = opened.epoch }
+		Owner { cell = self.cell, epoch = self.cell.read().epoch }
 	}
 
 	/// The live epoch's nursery, made at the first ask — a collection stage's one
@@ -1102,13 +1086,7 @@ export impl Owner {
 			Some(let held) => held,
 			None => {
 				let made = detached_nursery();
-				let held = self.cell.read();
-				self.cell.write() = OwnerCell {
-					epoch = held.epoch,
-					cleanups = held.cleanups,
-					listed = held.listed,
-					nursery = Some(made),
-				};
+				self.cell.write().nursery = Some(made);
 				made
 			},
 		}
@@ -1121,20 +1099,16 @@ export impl Owner {
 	/// own run registered.
 	[internal("a collection stage's per-element owner (A142 §6.4)")]
 	fun split_registrations(self): Option<Owner> {
-		let held = self.cell.read();
-		if !held.listed || self.is_disposed() {
+		if !self.cell.read().listed || self.is_disposed() {
 			ret None;
 		}
-		self.cell.write() = OwnerCell {
-			epoch = held.epoch,
-			cleanups = no_cleanups,
-			listed = false,
-			nursery = held.nursery,
-		};
+		let cleanups = self.cell.read().cleanups;
+		self.cell.write().cleanups = no_cleanups;
+		self.cell.write().listed = false;
 		Some(Owner {
 			cell = Shared::new(OwnerCell {
 				epoch = 0,
-				cleanups = held.cleanups,
+				cleanups,
 				listed = true,
 				nursery = None,
 			}),
@@ -1439,8 +1413,7 @@ export struct Tracker {
 	target: Shared<Option<Subscriber>>,
 }
 
-/// Where a tracker's runs stand. Written whole, by the transitions below (a field
-/// write through a cell's view is not one the native backend emits).
+/// Where a tracker's runs stand, written field by field through the cell.
 export struct TrackRuns {
 	/// The last run's epoch; `open` while that run is in progress.
 	epoch: i32,
@@ -1484,62 +1457,6 @@ fun new_tracker(): Tracker {
 	}
 }
 
-/// The next run begins: a fresh epoch, open, nothing changed since.
-fun opened(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch + 1,
-		open = true,
-		dirty = false,
-		connecting = held.connecting,
-		missed = held.missed,
-	}
-}
-
-/// The run in progress ended.
-fun closed(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = false,
-		dirty = held.dirty,
-		connecting = held.connecting,
-		missed = held.missed,
-	}
-}
-
-/// A dependency changed: the stage is dirty, and the wake is `missed` while edges
-/// are being attached.
-fun dirtied(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = held.open,
-		dirty = true,
-		connecting = held.connecting,
-		missed = held.missed || held.connecting,
-	}
-}
-
-/// Edges start (`true`) or finish (`false`) going up.
-fun connecting(held: TrackRuns, now: bool): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = held.open,
-		dirty = held.dirty,
-		connecting = now,
-		missed = held.missed,
-	}
-}
-
-/// A missed wake answered.
-fun answered(held: TrackRuns): TrackRuns {
-	TrackRuns {
-		epoch = held.epoch,
-		open = held.open,
-		dirty = held.dirty,
-		connecting = held.connecting,
-		missed = false,
-	}
-}
-
 /// Run `body` as the next run of a stage body that can track: the run's owner is
 /// `run_body`'s (A142 §4), and its scope is the next epoch of `tracker`. When the
 /// body returns, its reads become the stage's dependencies.
@@ -1558,12 +1475,12 @@ fun run_tracked<T>(
 	mut value = run_once(runs, tracker, || body());
 	mut rounds = 0;
 	for tracker.runs.read().missed && rounds < 100 {
-		tracker.runs.write() = answered(tracker.runs.read());
+		tracker.runs.write().missed = false;
 		value = run_once(runs, tracker, || body());
 		rounds += 1;
 	}
 	if tracker.runs.read().missed {
-		tracker.runs.write() = answered(tracker.runs.read());
+		tracker.runs.write().missed = false;
 	}
 	value
 }
@@ -1587,9 +1504,10 @@ fun has_run(tracker: Tracker): bool {
 
 /// Begin the next run: a fresh epoch, no reads yet, nothing changed since.
 fun open_run(tracker: Tracker): TrackScope {
-	let next = opened(tracker.runs.read());
-	let epoch = next.epoch;
-	tracker.runs.write() = next;
+	let epoch = tracker.runs.read().epoch + 1;
+	tracker.runs.write().epoch = epoch;
+	tracker.runs.write().open = true;
+	tracker.runs.write().dirty = false;
 	if !tracker.reading.write().is_empty() {
 		tracker.reading.write() = [];
 	}
@@ -1599,7 +1517,7 @@ fun open_run(tracker: Tracker): TrackScope {
 /// End the run in progress: its reads become the dependencies — wired against the
 /// edges when attached, kept for the attach when not.
 fun close_run(tracker: Tracker) {
-	tracker.runs.write() = closed(tracker.runs.read());
+	tracker.runs.write().open = false;
 	match tracker.target.read() {
 		Some(let target) => reconnect(tracker, target),
 		None => {
@@ -1632,7 +1550,7 @@ fun reconnect(tracker: Tracker, target: Subscriber) {
 		kept.push(false);
 	}
 	mut next: List<TrackedEdge> = [];
-	tracker.runs.write() = connecting(tracker.runs.read(), true);
+	tracker.runs.write().connecting = true;
 	mut position: usize = 0;
 	for dependency in reading {
 		match reusable(held, kept, dependency.identity, position) {
@@ -1659,7 +1577,7 @@ fun reconnect(tracker: Tracker, target: Subscriber) {
 	}
 	// A relay that fired while the edges went up is `missed`, and `run_tracked`
 	// answers it by running again — not by a wake (see there).
-	tracker.runs.write() = connecting(tracker.runs.read(), false);
+	tracker.runs.write().connecting = false;
 }
 
 /// The held edge a read of `identity` at `position` reuses, if any: the one at its
@@ -1705,9 +1623,11 @@ fun same_identity(identity: Option<i32>, wanted: i32): bool {
 /// they stand.
 fun relay_for(tracker: Tracker, target: Subscriber): Subscriber {
 	subscriber_of(|| {
-		let held = tracker.runs.read();
-		tracker.runs.write() = dirtied(held);
-		if !held.connecting {
+		let connecting = tracker.runs.read().connecting;
+		tracker.runs.write().dirty = true;
+		if connecting {
+			tracker.runs.write().missed = true;
+		} else {
 			wake(target);
 		}
 	}, true)
@@ -1722,7 +1642,7 @@ fun attach_tracker(tracker: Tracker, target: Subscriber) {
 	if !tracker.read.write().is_empty() {
 		let read = tracker.read.read();
 		tracker.read.write() = [];
-		tracker.runs.write() = connecting(tracker.runs.read(), true);
+		tracker.runs.write().connecting = true;
 		mut edges: List<TrackedEdge> = [];
 		for dependency in read {
 			edges.push(TrackedEdge {
@@ -1731,9 +1651,9 @@ fun attach_tracker(tracker: Tracker, target: Subscriber) {
 			});
 		}
 		tracker.edges.write() = edges;
-		tracker.runs.write() = connecting(tracker.runs.read(), false);
+		tracker.runs.write().connecting = false;
 		if tracker.runs.read().missed {
-			tracker.runs.write() = answered(tracker.runs.read());
+			tracker.runs.write().missed = false;
 			wake(target);
 		}
 	}
