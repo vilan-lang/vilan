@@ -578,3 +578,60 @@ fn a142_s6_a_dependency_that_notifies_as_it_is_attached_is_read_again() {
         "saw 42\n",
     );
 }
+
+#[test]
+fn m93_a_body_that_never_tracks_allocates_no_tracker() {
+    // `trackers_allocated` counts every stage that made its dependency lists.
+    // A sealed two-stage chain, a switch and an effect whose bodies never call
+    // `track()` — built, then changed ten times — make NONE (`quiet=0`); a
+    // `derive` stage, an effect and a free `derive` that track make one each
+    // when they first track, and ten more changes make no more (`tracking=3
+    // after=0`). The effect's tracked re-run still runs with its latest input.
+    // Red when every stage instance makes its lists at `start` (before M93):
+    // `quiet=5` (the effect, the selector, the stage it builds, the two derives).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{
+            Owner, Signal, SignalCell, Source, derive, run_with_owner, trackers_allocated,
+        };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(0);
+            let other: SignalCell<i32> = Signal::new(100);
+            let flag: SignalCell<bool> = Signal::new(true);
+            let before = trackers_allocated();
+            let boundary = Owner::new();
+            let sealed = run_with_owner(boundary, || {
+                root.effect(|value: i32| {
+                    let _ignored = value + 1;
+                });
+                flag.switch(|on: bool| root.derive(|value| if on { value } else { 0 })).memo();
+                root.derive(|value| value + 1).derive(|value| value * 2).memo()
+            });
+            mut step = 1;
+            for step <= 10 {
+                root.set(step);
+                step += 1;
+            }
+            print(i"quiet={trackers_allocated() - before} value={sealed.get()}");
+            let tracked_before = trackers_allocated();
+            let tracking = Owner::new();
+            let summed = run_with_owner(tracking, || {
+                root.effect(|value: i32| print(i"effect {value} {other.track()}"));
+                let _free = derive(|| root.track() + other.track()).memo();
+                root.derive(|value| value + other.track()).memo()
+            });
+            let tracked_after = trackers_allocated();
+            other.set(200);
+            root.set(11);
+            print(i"tracking={tracked_after - tracked_before} after={trackers_allocated() - tracked_after} summed={summed.get()}");
+            tracking.dispose();
+            boundary.dispose();
+        }
+
+        main();
+        "#,
+        "quiet=0 value=22\neffect 10 100\neffect 10 200\neffect 11 200\ntracking=3 after=0 summed=211\n",
+    );
+}

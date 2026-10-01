@@ -1395,22 +1395,17 @@ export struct TrackScope {
 	epoch: i32,
 }
 
-/// A stage's tracked dependencies, across its runs: where its runs stand, what the
-/// run in progress has read, what the last run read, the edges attached to them,
-/// and the subscriber a change of any of them wakes. One per stage instance; a
-/// copy is a handle to the same cells.
+/// A stage's tracked dependencies, across its runs: ONE cell per stage instance,
+/// holding where its runs stand, the subscriber a change wakes, and — from the
+/// stage's first tracked read on — the lists of what it read. A copy is a handle to
+/// the same cell.
+///
+/// **A body that never tracks allocates no lists (M93).** Most bodies read their
+/// input and nothing else; their stage holds this one cell and never more. The
+/// first `track()` any run admits makes the lists' cell (`trackers_allocated`
+/// counts it), and they live as long as the stage instance.
 export struct Tracker {
 	runs: Shared<TrackRuns>,
-	/// The reads of the run in progress, in order, one per source.
-	reading: Shared<List<Dependency>>,
-	/// The last run's reads, while nothing is attached to follow them — what an
-	/// attach wires. Emptied at the attach: from then on `edges` holds them.
-	read: Shared<List<Dependency>>,
-	/// One edge per dependency of the last run, while attached.
-	edges: Shared<List<TrackedEdge>>,
-	/// What a change of a dependency wakes: the stage's consumer, a selector's
-	/// re-selection, an effect's re-run. `None` until attached.
-	target: Shared<Option<Subscriber>>,
 }
 
 /// Where a tracker's runs stand, written field by field through the cell.
@@ -1425,6 +1420,22 @@ export struct TrackRuns {
 	/// meanwhile is `missed`, answered once the edges stand.
 	connecting: bool,
 	missed: bool,
+	/// What a change of a dependency wakes: the stage's consumer, a selector's
+	/// re-selection, an effect's re-run. `None` until attached.
+	target: Option<Subscriber>,
+	/// The dependency lists, made at the stage's first tracked read (M93).
+	lists: Option<Shared<TrackLists>>,
+}
+
+/// A tracking stage's dependency lists, in ONE cell of their own.
+export struct TrackLists {
+	/// The reads of the run in progress, in order, one per source.
+	reading: List<Dependency>,
+	/// The last run's reads, while nothing is attached to follow them — what an
+	/// attach wires. Emptied at the attach: from then on `edges` holds them.
+	read: List<Dependency>,
+	/// One edge per dependency of the last run, while attached.
+	edges: List<TrackedEdge>,
 }
 
 /// One tracked read: the source's identity when it can name one, and how to attach
@@ -1440,7 +1451,18 @@ export struct TrackedEdge {
 	handle: Subscription,
 }
 
-/// A fresh tracker: no runs, no reads, nothing attached.
+/// How many trackers have made their dependency lists since the program started —
+/// the instrument behind "a body that never tracks allocates no tracker" (M93).
+let trackers_allocated_count: Shared<i32> = Shared::new(0);
+
+/// `trackers_allocated_count`, read. A pin's instrument, not an application's.
+export [internal("an instrument for the lazy-tracker pin (M93); it counts, it decides nothing")]
+fun trackers_allocated(): i32 {
+	trackers_allocated_count.read()
+}
+
+/// A fresh tracker: no runs, nothing attached, and no lists until something is
+/// tracked.
 fun new_tracker(): Tracker {
 	Tracker {
 		runs = Shared::new(TrackRuns {
@@ -1449,11 +1471,22 @@ fun new_tracker(): Tracker {
 			dirty = false,
 			connecting = false,
 			missed = false,
+			target = None,
+			lists = None,
 		}),
-		reading = Shared::new([]),
-		read = Shared::new([]),
-		edges = Shared::new([]),
-		target = Shared::new(None),
+	}
+}
+
+/// The tracker's lists, made now if this is the stage's first tracked read.
+fun lists_of(tracker: Tracker): Shared<TrackLists> {
+	match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			trackers_allocated_count.write() = trackers_allocated_count.read() + 1;
+			let made = Shared::new(TrackLists { reading = [], read = [], edges = [] });
+			tracker.runs.write().lists = Some(made);
+			made
+		},
 	}
 }
 
@@ -1508,8 +1541,13 @@ fun open_run(tracker: Tracker): TrackScope {
 	tracker.runs.write().epoch = epoch;
 	tracker.runs.write().open = true;
 	tracker.runs.write().dirty = false;
-	if !tracker.reading.write().is_empty() {
-		tracker.reading.write() = [];
+	match tracker.runs.read().lists {
+		Some(let lists) => {
+			if !lists.write().reading.is_empty() {
+				lists.write().reading = [];
+			}
+		},
+		None => {},
 	}
 	TrackScope { tracker, epoch }
 }
@@ -1518,16 +1556,23 @@ fun open_run(tracker: Tracker): TrackScope {
 /// edges when attached, kept for the attach when not.
 fun close_run(tracker: Tracker) {
 	tracker.runs.write().open = false;
-	match tracker.target.read() {
-		Some(let target) => reconnect(tracker, target),
+	// A stage that has never tracked has no reads and no edges: nothing to wire.
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
 		None => {
-			if !tracker.reading.write().is_empty() || !tracker.read.write().is_empty() {
-				tracker.read.write() = tracker.reading.read();
+			ret;
+		},
+	};
+	match tracker.runs.read().target {
+		Some(let target) => reconnect(tracker, lists, target),
+		None => {
+			if !lists.write().reading.is_empty() || !lists.write().read.is_empty() {
+				lists.write().read = lists.read().reading;
 			}
 		},
 	}
-	if !tracker.reading.write().is_empty() {
-		tracker.reading.write() = [];
+	if !lists.write().reading.is_empty() {
+		lists.write().reading = [];
 	}
 }
 
@@ -1539,12 +1584,12 @@ fun close_run(tracker: Tracker) {
 ///
 /// Both lists are read out of their cells first: an attach may notify inside the
 /// call, and what that reaches may reach this tracker.
-fun reconnect(tracker: Tracker, target: Subscriber) {
-	if tracker.reading.write().is_empty() && tracker.edges.write().is_empty() {
+fun reconnect(tracker: Tracker, lists: Shared<TrackLists>, target: Subscriber) {
+	if lists.write().reading.is_empty() && lists.write().edges.is_empty() {
 		ret;
 	}
-	let held = tracker.edges.read();
-	let reading = tracker.reading.read();
+	let held = lists.read().edges;
+	let reading = lists.read().reading;
 	mut kept: List<bool> = [];
 	for _edge in held {
 		kept.push(false);
@@ -1567,7 +1612,7 @@ fun reconnect(tracker: Tracker, target: Subscriber) {
 		}
 		position += 1;
 	}
-	tracker.edges.write() = next;
+	lists.write().edges = next;
 	mut index: usize = 0;
 	for edge in held {
 		if !kept[index] {
@@ -1638,10 +1683,16 @@ fun relay_for(tracker: Tracker, target: Subscriber): Subscriber {
 /// while they are wired wakes the target once they stand — no run is in progress
 /// here to answer it by running again.
 fun attach_tracker(tracker: Tracker, target: Subscriber) {
-	tracker.target.write() = Some(target);
-	if !tracker.read.write().is_empty() {
-		let read = tracker.read.read();
-		tracker.read.write() = [];
+	tracker.runs.write().target = Some(target);
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			ret;
+		},
+	};
+	if !lists.write().read.is_empty() {
+		let read = lists.read().read;
+		lists.write().read = [];
 		tracker.runs.write().connecting = true;
 		mut edges: List<TrackedEdge> = [];
 		for dependency in read {
@@ -1650,7 +1701,7 @@ fun attach_tracker(tracker: Tracker, target: Subscriber) {
 				handle = (dependency.attach)(relay_for(tracker, target)),
 			});
 		}
-		tracker.edges.write() = edges;
+		lists.write().edges = edges;
 		tracker.runs.write().connecting = false;
 		if tracker.runs.read().missed {
 			tracker.runs.write().missed = false;
@@ -1663,21 +1714,27 @@ fun attach_tracker(tracker: Tracker, target: Subscriber) {
 /// `switch_some` whose outer went `None` ran no selector, so it depends on nothing
 /// its last selection read.
 fun forget_reads(tracker: Tracker) {
-	if !tracker.edges.write().is_empty() {
-		let edges = tracker.edges.read();
-		tracker.edges.write() = [];
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			ret;
+		},
+	};
+	if !lists.write().edges.is_empty() {
+		let edges = lists.read().edges;
+		lists.write().edges = [];
 		for edge in edges {
 			detach(edge.handle);
 		}
 	}
-	if !tracker.read.write().is_empty() {
-		tracker.read.write() = [];
+	if !lists.write().read.is_empty() {
+		lists.write().read = [];
 	}
 }
 
 /// Stop following: every edge detached, nothing to wake. Idempotent.
 fun detach_tracker(tracker: Tracker) {
-	tracker.target.write() = None;
+	tracker.runs.write().target = None;
 	forget_reads(tracker);
 }
 
@@ -1686,16 +1743,21 @@ fun detach_tracker(tracker: Tracker) {
 /// not read this source already.
 fun admits(scope: TrackScope, identity: Option<i32>): bool {
 	let tracker = scope.tracker;
-	let runs = tracker.runs.read();
-	if !runs.open || runs.epoch != scope.epoch {
+	if !tracker.runs.read().open || tracker.runs.read().epoch != scope.epoch {
 		ret false;
 	}
+	let lists = match tracker.runs.read().lists {
+		Some(let lists) => lists,
+		None => {
+			ret true;
+		},
+	};
 	match identity {
 		Some(let wanted) => {
-			let count = tracker.reading.write().len();
+			let count = lists.write().reading.len();
 			mut index: usize = 0;
 			for index < count {
-				if same_identity(tracker.reading.write()[index].identity, wanted) {
+				if same_identity(lists.write().reading[index].identity, wanted) {
 					ret false;
 				}
 				index += 1;
@@ -1724,8 +1786,9 @@ export impl type S: Source<type T> {
 		let scope = tracking.get();
 		let identity = self.identity();
 		if admits(scope, identity) {
-			scope.tracker.reading
+			lists_of(scope.tracker)
 				.write()
+				.reading
 				.push(Dependency {
 					identity,
 					attach = |subscriber: Subscriber| self.on_settle(subscriber),
@@ -2002,28 +2065,30 @@ export [resource] trait Flow<T> {
 	fun effect(own self, body: (|T| void) context (owner_scope, tracking, ambient_nursery)) {
 		let runs = Owner::new();
 		let tracker = new_tracker();
-		let latest: Shared<Option<T>> = Shared::new(None);
+		// The value the input delivered last, which a tracked re-run runs with: a
+		// binding the two closures capture (spec §6.9), not a cell (M93).
+		mut latest: Option<T> = None;
 		// `sub`'s immediate call happens INSIDE `sub`, before the re-run record
 		// exists: until the first run (`has_run`) a delivery only records the
 		// value, and the first run follows below — so the re-run's id is below
 		// everything a run creates, and a tracked re-run releases the run's
 		// children before they would run (parent before child).
 		let subscription = self.sub(|value: T| {
-			latest.write() = Some(value);
+			latest = Some(value);
 			if has_run(tracker) {
 				run_tracked(runs, tracker, || body(value));
 			}
 		});
 		let rerun = subscriber_of(|| {
 			if tracker.runs.read().dirty {
-				match latest.read() {
+				match latest {
 					Some(let value) => run_tracked(runs, tracker, || body(value)),
 					None => {},
 				}
 			}
 		}, false);
 		attach_tracker(tracker, rerun);
-		match latest.read() {
+		match latest {
 			Some(let value) => run_tracked(runs, tracker, || body(value)),
 			None => {},
 		}

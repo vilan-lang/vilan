@@ -694,8 +694,9 @@ fun main() {
 }
 ```
 
-`TrackScope`, `Tracker`, `Dependency` and `TrackedEdge` are the layer's own
-records (a run's scope, a stage's dependencies across runs, one read, one edge);
+`TrackScope`, `Tracker`, `TrackRuns`, `TrackLists`, `Dependency` and `TrackedEdge`
+are the layer's own records (a run's scope, a stage's dependencies across runs —
+its lists made at the stage's first `track()` — one read, one edge);
 an application never builds them.
 
 ## selector — per-key selection

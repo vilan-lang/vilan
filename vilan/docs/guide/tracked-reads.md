@@ -183,9 +183,10 @@ for every element of every list.
 
 ## What it costs
 
-- A stage whose body tracks nothing pays a tracker per instance (a few cells,
-  made when a consumer starts it) and, per run, an epoch bump and a scope value:
-  no edge, no relay, no allocation per read.
+- A stage whose body tracks nothing pays one cell per instance (where its runs
+  stand, made when a consumer starts it) and, per run, an epoch bump and a scope
+  value: no edge, no relay, no list. The lists that record what a body read are
+  made at its first `track()`.
 - Each tracked source holds one edge per body that tracked it, reused across
   runs when the source can name its identity.
 - A tracked read is checked against the run's earlier reads, so reading one
